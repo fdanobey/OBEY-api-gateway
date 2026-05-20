@@ -400,6 +400,20 @@ pub struct Provider {
     /// Replace the Codex system prompt entirely for this provider.
     #[serde(default)]
     pub instructions_override: Option<String>,
+
+    /// Per-provider maximum cooldown (seconds) for upstream-driven
+    /// rate-limit windows. Use this to opt a provider into very long
+    /// cooldowns without changing the global default.
+    ///
+    /// Concrete examples:
+    /// - Nano-GPT (weekly account quotas): `604800` (7d).
+    /// - OpenAI / Anthropic (minute-bucket): leave unset; the global
+    ///   default of 24h is enough headroom.
+    ///
+    /// Falls back to `RetryConfig.max_rate_limit_cooldown_seconds` when
+    /// unset.
+    #[serde(default)]
+    pub max_rate_limit_cooldown_seconds: Option<u64>,
 }
 
 impl Provider {
@@ -652,6 +666,21 @@ pub struct RetryConfig {
     pub jitter_enabled: bool,
     #[serde(default = "default_retry_jitter_ratio")]
     pub jitter_ratio: f64,
+    /// Default upper bound (seconds) for an upstream-driven rate-limit
+    /// cooldown. A provider that returns 429 with `Retry-After: 86400` is
+    /// kept out of failover for up to this many seconds.
+    ///
+    /// Default: 86400 (24h). Cap covers daily quotas without burning
+    /// weekly quotas. Override per-provider via
+    /// `Provider.max_rate_limit_cooldown_seconds` for accounts with
+    /// longer reset windows (e.g. Nano-GPT weekly).
+    #[serde(default = "default_max_rate_limit_cooldown")]
+    pub max_rate_limit_cooldown_seconds: u64,
+    /// Cooldown applied when the upstream signals a rate-limit but
+    /// provides no usable `Retry-After` / `retry_after_ms` value.
+    /// Default: 30s.
+    #[serde(default = "default_rate_limit_cooldown_default")]
+    pub default_rate_limit_cooldown_seconds: u64,
 }
 
 impl Default for RetryConfig {
@@ -661,6 +690,8 @@ impl Default for RetryConfig {
             backoff_sequence_seconds: vec![1, 2, 4],
             jitter_enabled: true,
             jitter_ratio: 0.2,
+            max_rate_limit_cooldown_seconds: default_max_rate_limit_cooldown(),
+            default_rate_limit_cooldown_seconds: default_rate_limit_cooldown_default(),
         }
     }
 }
@@ -679,6 +710,14 @@ fn default_retry_jitter_enabled() -> bool {
 
 fn default_retry_jitter_ratio() -> f64 {
     0.2
+}
+
+fn default_max_rate_limit_cooldown() -> u64 {
+    24 * 60 * 60 // 24h: covers daily quotas, leaves weekly for per-provider override
+}
+
+fn default_rate_limit_cooldown_default() -> u64 {
+    30
 }
 
 /// Logging configuration
@@ -926,6 +965,7 @@ mod runtime_resolution_tests {
             codex_base_url_override: None,
             codex_model_override: None,
             instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
         };
         
         assert_eq!(provider.resolve_api_key(), Some("sk-test123".to_string()));
@@ -964,6 +1004,7 @@ mod runtime_resolution_tests {
             codex_base_url_override: None,
             codex_model_override: None,
             instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
         };
         
         assert_eq!(provider.resolve_api_key(), None);
@@ -1006,6 +1047,7 @@ mod runtime_resolution_tests {
             codex_base_url_override: None,
             codex_model_override: None,
             instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
         };
         
         let resolved = provider.resolve_custom_headers();
@@ -1046,6 +1088,7 @@ mod runtime_resolution_tests {
             codex_base_url_override: None,
             codex_model_override: None,
             instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
         };
 
         assert_eq!(provider.resolve_api_key(), Some("decrypted-key".to_string()));
@@ -1082,6 +1125,7 @@ mod runtime_resolution_tests {
             codex_base_url_override: None,
             codex_model_override: None,
             instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
         };
 
         assert!(provider.has_plaintext_api_key_input());

@@ -1218,6 +1218,7 @@ mod tests {
             codex_base_url_override: None,
             codex_model_override: None,
             instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
         })
     }
 
@@ -1520,6 +1521,7 @@ retry:
                 codex_base_url_override: None,
                 codex_model_override: None,
                 instructions_override: None,
+                max_rate_limit_cooldown_seconds: None,
             }],
             model_groups: vec![ModelGroup {
                 name: "test-group".to_string(),

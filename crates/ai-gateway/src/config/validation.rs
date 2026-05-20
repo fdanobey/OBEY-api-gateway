@@ -457,6 +457,7 @@ mod property_tests {
                 codex_base_url_override: None,
                 codex_model_override: None,
                 instructions_override: None,
+                max_rate_limit_cooldown_seconds: None,
             }],
             model_groups: vec![ModelGroup {
                 name: "test-group".to_string(),
@@ -840,6 +841,7 @@ model_groups:
                 codex_base_url_override: None,
                 codex_model_override: None,
                 instructions_override: None,
+                max_rate_limit_cooldown_seconds: None,
             };
 
             // Serialize to YAML

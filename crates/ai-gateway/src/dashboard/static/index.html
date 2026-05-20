@@ -63,6 +63,11 @@ tbody tr:hover{background:rgba(59,130,246,.06)}
 .badge-open{background:rgba(239,68,68,.15);color:var(--danger)}
 .badge-halfopen{background:rgba(245,158,11,.15);color:var(--warning)}
 
+/* Last failure reason cell */
+.failure-reason{display:inline-block;max-width:32rem;color:var(--text-muted);font-size:.85rem;line-height:1.3;white-space:normal;word-break:break-word}
+.failure-reason-cooldown{color:var(--warning);font-weight:500}
+.failure-reason-none{color:var(--text-muted);opacity:.6}
+
 /* Charts */
 .chart-row{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:1.5rem}
 .chart-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;box-shadow:var(--shadow)}
@@ -144,6 +149,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
             <th data-sort="success_rate">Success Rate <span class="sort-arrow"></span></th>
             <th data-sort="avg_rt">Avg Response Time <span class="sort-arrow"></span></th>
             <th data-sort="last_success">Last Success <span class="sort-arrow"></span></th>
+            <th data-sort="last_failure_reason">Last Failure Reason <span class="sort-arrow"></span></th>
           </tr>
         </thead>
         <tbody id="provider-tbody"></tbody>
@@ -367,6 +373,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
         case 'success_rate':va=a.success_rate;vb=b.success_rate;break;
         case 'avg_rt':va=a.avg_response_time_ms;vb=b.avg_response_time_ms;break;
         case 'last_success':va=a.last_success_timestamp||0;vb=b.last_success_timestamp||0;break;
+        case 'last_failure_reason':va=a.last_failure_reason||'';vb=b.last_failure_reason||'';break;
         default:va=a.provider;vb=b.provider;
       }
       if(typeof va==='string') return sortAsc?va.localeCompare(vb):vb.localeCompare(va);
@@ -378,19 +385,45 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     $('provider-empty').style.display='none';
 
     var html='';
+    var nowSec = Math.floor(Date.now()/1000);
     data.forEach(function(p){
       var statusCls = p.status==='healthy'?'badge-healthy':p.status==='degraded'?'badge-degraded':'badge-unhealthy';
       var cbState = p.circuit_breaker_state||'closed';
       var cbCls = cbState==='closed'?'badge-closed':cbState==='open'?'badge-open':'badge-halfopen';
       // Display provider name; if it contains ":" from per-model CB keys, show just the provider part
       var displayName = p.provider;
+
+      // Build the "Last Failure Reason" cell. If a cooldown deadline is in
+      // the future, show a live "Pausing for ~Ns" suffix so operators can
+      // see when the provider will be retried; otherwise show the reason
+      // text or an em-dash placeholder.
+      var reasonText = p.last_failure_reason || '';
+      var cooldownUntil = p.cooldown_until_timestamp || 0;
+      var reasonHtml;
+      if (cooldownUntil > nowSec) {
+        var remaining = cooldownUntil - nowSec;
+        var human = remaining >= 3600
+          ? Math.round(remaining/3600)+'h'
+          : remaining >= 60
+            ? Math.round(remaining/60)+'m'
+            : remaining+'s';
+        reasonHtml = '<span class="failure-reason failure-reason-cooldown" title="'
+          + esc(reasonText)
+          + '">Pausing for ~'+esc(human)+' (rate limited)</span>';
+      } else if (reasonText) {
+        reasonHtml = '<span class="failure-reason" title="'+esc(reasonText)+'">'+esc(reasonText)+'</span>';
+      } else {
+        reasonHtml = '<span class="failure-reason failure-reason-none">—</span>';
+      }
+
       html+='<tr><td>'+esc(displayName)+'</td>'
         +'<td><span class="badge '+statusCls+'">'+esc(p.status)+'</span></td>'
         +'<td><span class="badge '+cbCls+'">'+esc(cbState)+'</span></td>'
         +'<td>'+p.total_requests+'</td>'
         +'<td>'+fmtPct(p.success_rate)+'</td>'
         +'<td>'+fmtMs(p.avg_response_time_ms)+'</td>'
-        +'<td>'+fmtTime(p.last_success_timestamp)+'</td></tr>';
+        +'<td>'+fmtTime(p.last_success_timestamp)+'</td>'
+        +'<td>'+reasonHtml+'</td></tr>';
     });
     tbody.innerHTML=html;
   }

@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Thread-safe metrics tracking for the gateway
@@ -57,6 +57,15 @@ pub struct ProviderHealth {
     pub last_success_timestamp: AtomicU64,
     /// Last failed request timestamp (Unix epoch seconds)
     pub last_failure_timestamp: AtomicU64,
+    /// Human-friendly description of the most recent failure. Cleared
+    /// when the provider next succeeds. Surfaced by the dashboard so
+    /// operators can see why a provider is currently failing without
+    /// digging through logs.
+    pub last_failure_reason: Mutex<Option<String>>,
+    /// Unix epoch seconds at which an upstream-driven cooldown
+    /// (e.g. a `Retry-After` from a 429) expires. `None` when no
+    /// cooldown is active. Used to render a countdown in the UI.
+    pub cooldown_until_timestamp: AtomicU64,
 }
 
 /// Snapshot of current metrics for serialization
@@ -134,6 +143,17 @@ pub struct ProviderHealthSnapshot {
     /// doesn't own the circuit breakers.
     #[serde(default = "default_cb_state")]
     pub circuit_breaker_state: String,
+    /// Human-friendly description of the most recent failure (e.g.
+    /// "Rate limited by provider — pausing for ~30s", "Provider returned
+    /// an authentication error", "Network timeout"). `None` once the
+    /// provider has succeeded again.
+    #[serde(default)]
+    pub last_failure_reason: Option<String>,
+    /// Unix epoch seconds at which an upstream-driven cooldown ends.
+    /// Only set while a cooldown is active. The dashboard can use this
+    /// to render a live countdown.
+    #[serde(default)]
+    pub cooldown_until_timestamp: Option<u64>,
 }
 
 fn default_cb_state() -> String {
@@ -203,6 +223,8 @@ impl Metrics {
                 total_response_time_ms: AtomicU64::new(0),
                 last_success_timestamp: AtomicU64::new(0),
                 last_failure_timestamp: AtomicU64::new(0),
+                last_failure_reason: Mutex::new(None),
+                cooldown_until_timestamp: AtomicU64::new(0),
             }
         });
 
@@ -215,10 +237,33 @@ impl Metrics {
             .unwrap()
             .as_secs();
         health.last_success_timestamp.store(now, Ordering::Relaxed);
+
+        // Provider is healthy again — clear the last failure reason and any
+        // active cooldown marker so the dashboard reflects recovery.
+        if let Ok(mut reason) = health.last_failure_reason.lock() {
+            *reason = None;
+        }
+        health.cooldown_until_timestamp.store(0, Ordering::Relaxed);
     }
 
     /// Record failed provider request
     pub fn record_provider_failure(&self, provider: &str) {
+        self.record_provider_failure_with_reason(provider, None, None);
+    }
+
+    /// Record failed provider request with an optional human-friendly
+    /// reason and an optional cooldown deadline (Unix epoch seconds).
+    ///
+    /// `reason` is shown verbatim on the Provider Health dashboard,
+    /// so the caller is responsible for keeping it user-readable.
+    /// Pass `None` to leave the previous reason untouched, or pass
+    /// `Some("")` to clear it.
+    pub fn record_provider_failure_with_reason(
+        &self,
+        provider: &str,
+        reason: Option<String>,
+        cooldown_until_unix: Option<u64>,
+    ) {
         let health = self.provider_health.entry(provider.to_string()).or_insert_with(|| {
             ProviderHealth {
                 total_requests: AtomicU64::new(0),
@@ -227,6 +272,8 @@ impl Metrics {
                 total_response_time_ms: AtomicU64::new(0),
                 last_success_timestamp: AtomicU64::new(0),
                 last_failure_timestamp: AtomicU64::new(0),
+                last_failure_reason: Mutex::new(None),
+                cooldown_until_timestamp: AtomicU64::new(0),
             }
         });
 
@@ -238,6 +285,84 @@ impl Metrics {
             .unwrap()
             .as_secs();
         health.last_failure_timestamp.store(now, Ordering::Relaxed);
+
+        if let Some(text) = reason {
+            if let Ok(mut slot) = health.last_failure_reason.lock() {
+                *slot = if text.is_empty() { None } else { Some(text) };
+            }
+        }
+        if let Some(deadline) = cooldown_until_unix {
+            health.cooldown_until_timestamp.store(deadline, Ordering::Relaxed);
+        }
+    }
+
+    /// Note that an upstream-driven cooldown is active for `provider`,
+    /// without recording a new failure (the failure was already recorded
+    /// in the same code path). Updates the dashboard's "last failure
+    /// reason" to reflect the rate-limit pause and stores the deadline.
+    pub fn set_provider_cooldown(
+        &self,
+        provider: &str,
+        reason: String,
+        cooldown_until_unix: u64,
+    ) {
+        let health = self.provider_health.entry(provider.to_string()).or_insert_with(|| {
+            ProviderHealth {
+                total_requests: AtomicU64::new(0),
+                successful_requests: AtomicU64::new(0),
+                failed_requests: AtomicU64::new(0),
+                total_response_time_ms: AtomicU64::new(0),
+                last_success_timestamp: AtomicU64::new(0),
+                last_failure_timestamp: AtomicU64::new(0),
+                last_failure_reason: Mutex::new(None),
+                cooldown_until_timestamp: AtomicU64::new(0),
+            }
+        });
+
+        if let Ok(mut slot) = health.last_failure_reason.lock() {
+            *slot = Some(reason);
+        }
+        health.cooldown_until_timestamp.store(cooldown_until_unix, Ordering::Relaxed);
+    }
+
+    /// Number of seconds remaining on an upstream-driven cooldown for
+    /// `provider`, or `None` if no cooldown is active.
+    ///
+    /// This is the routing-side authority for "is this provider paused
+    /// because it returned a 429 / Retry-After recently?". The metrics
+    /// store survives `Router::clear_rate_limiters()` (which is called
+    /// on every config hot-reload), so the routing gate must consult
+    /// it in addition to the per-`Router` `RateLimiter::cooldown_until`.
+    /// Without that, a config save (admin UI / `/admin/config/reload`)
+    /// silently re-routes traffic to a provider the dashboard is still
+    /// showing as "Pausing for ~23h (rate limited)".
+    pub fn provider_cooldown_remaining_secs(&self, provider: &str) -> Option<u64> {
+        let entry = self.provider_health.get(provider)?;
+        let deadline = entry.value().cooldown_until_timestamp.load(Ordering::Relaxed);
+        if deadline == 0 {
+            return None;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if deadline > now {
+            Some(deadline - now)
+        } else {
+            None
+        }
+    }
+
+    /// Clear `provider`'s cooldown deadline and last-failure reason.
+    /// Called by the routing layer when a request to the provider
+    /// succeeds, so the dashboard reflects recovery immediately.
+    pub fn clear_provider_cooldown(&self, provider: &str) {
+        if let Some(entry) = self.provider_health.get(provider) {
+            entry.value().cooldown_until_timestamp.store(0, Ordering::Relaxed);
+            if let Ok(mut slot) = entry.value().last_failure_reason.lock() {
+                *slot = None;
+            }
+        }
     }
 
     /// Add cost to cumulative total and per-provider tracking
@@ -355,6 +480,25 @@ impl Metrics {
                     HealthStatus::Unhealthy
                 };
 
+                let last_failure_reason = health
+                    .last_failure_reason
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone());
+
+                let cooldown_until_raw = health.cooldown_until_timestamp.load(Ordering::Relaxed);
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // Treat past cooldowns as inactive: don't render stale
+                // "Pausing until..." text on the dashboard.
+                let cooldown_until_timestamp = if cooldown_until_raw > now_secs {
+                    Some(cooldown_until_raw)
+                } else {
+                    None
+                };
+
                 ProviderHealthSnapshot {
                     provider,
                     total_requests: total,
@@ -366,6 +510,8 @@ impl Metrics {
                     last_failure_timestamp: if last_failure > 0 { Some(last_failure) } else { None },
                     status,
                     circuit_breaker_state: "closed".to_string(),
+                    last_failure_reason,
+                    cooldown_until_timestamp,
                 }
             })
             .collect();

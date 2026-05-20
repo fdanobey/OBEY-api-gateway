@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <a href="https://railway.app/template/obey-api-gateway?referralCode=obey"><img src="https://railway.app/button.svg" alt="Deploy on Railway" /></a>
+  <a href="https://railway.com/deploy?template=https%3A%2F%2Fgithub.com%2Ffdanobey%2FOBEY-api-gateway"><img src="https://railway.com/button.svg" alt="Deploy on Railway" /></a>
 </p>
 
 ---
@@ -36,6 +36,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Drop-in OpenAI replacement** — full `/v1/*` API compatibility (chat, completions, embeddings, images, audio, assistants)
 - **Multi-provider routing** — OpenAI, Ollama, AWS Bedrock, Groq, Together AI, NVIDIA NIM, vLLM, LM Studio
 - **Automatic failover** — circuit breakers + retry with exponential backoff across providers
+- **Smart rate-limit failover** — instantly skips providers that return 429 (or rate-limit-shaped 200 envelopes), honors `Retry-After` / `X-RateLimit-Reset` / Anthropic ISO reset headers, and supports weekly-quota providers like Nano-GPT through per-provider cooldown overrides
 - **Priority & cost-aware routing** — configure model groups with priority, cost, and latency-based selection
 - **Context window management** — automatic truncation when requests exceed model limits
 - **Response caching** — built-in two-tier cache: in-memory exact-match (default-on, no setup) plus optional semantic Qdrant tier; works for both streaming and non-streaming requests, including tool-using clients
@@ -58,7 +59,7 @@ Grab the [latest release](https://github.com/fdanobey/OBEY-api-gateway/releases/
 
 ### Option 2: Deploy to Railway
 
-Click the button above or use the [Railway template](https://railway.app/template/obey-api-gateway). Set your provider API keys as environment variables in the Railway dashboard and you're live in under a minute.
+Click the button above to deploy directly from this repo. Railway picks up the included [`Dockerfile`](Dockerfile) and [`railway.toml`](railway.toml) automatically. Set your provider API keys (`OPENAI_API_KEY`, etc.) as environment variables in the Railway dashboard and you're live in under a minute.
 
 ### Option 3: Docker
 
@@ -79,7 +80,7 @@ docker run -d \
 ```bash
 # Clone
 git clone https://github.com/fdanobey/OBEY-api-gateway.git
-cd ai-gateway
+cd OBEY-api-gateway
 
 # Build (headless)
 cargo build --release -p ai-gateway
@@ -345,6 +346,48 @@ All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` re
 
 Each provider has an independent circuit breaker. After `failure_threshold` consecutive failures, the circuit opens and the provider is temporarily removed from rotation. Backoff follows a configurable sequence (e.g. 5s → 10s → 20s → 40s → 300s). Circuit breakers reset on config hot-reload.
 
+### Rate Limit Handling
+
+When a provider returns a 429 (or a rate-limit-shaped HTTP 200 envelope from providers like Nano-GPT and OpenRouter), the gateway:
+
+1. Fails over to the next provider immediately — no retry against the rate-limited one
+2. Parses the upstream's reset signal and applies a per-provider cooldown
+3. Skips the cooled-down provider in `select_provider_order` until the window expires
+
+Signals consulted, in order of preference:
+
+| Source | Examples |
+|--------|----------|
+| `Retry-After` header | seconds (`Retry-After: 60`) or RFC 2822 date |
+| `retry-after-ms` header | millisecond precision (Anthropic) |
+| `X-RateLimit-Reset` / `X-RateLimit-Reset-After` | epoch seconds or relative seconds (OpenAI, GitHub-style) |
+| `anthropic-ratelimit-*-reset` | RFC 3339 ISO timestamps |
+| `error.retry_after` / `retry_after_ms` body fields | numeric seconds / ms |
+| `error.reset_at` / `reset` body fields | epoch seconds or RFC 3339 |
+| Period markers in error message | "weekly limit" → 7d, "daily limit" → 24h, "hourly limit" → 1h |
+
+The chosen cooldown is bounded by, in order: per-provider `max_rate_limit_cooldown_seconds`, the global `retry.max_rate_limit_cooldown_seconds` cap, and a hard 7-day safety backstop in the limiter.
+
+```yaml
+retry:
+  # Global policy cap for rate-limit cooldowns.
+  # 24h covers daily quotas without burning weekly ones.
+  max_rate_limit_cooldown_seconds: 86400
+  # Cooldown applied when no upstream signal is parseable.
+  default_rate_limit_cooldown_seconds: 30
+
+providers:
+  - name: "nano-gpt"
+    type: "openai"
+    base_url: "https://nano-gpt.com/api/v1"
+    api_key_env: "NANO_GPT_API_KEY"
+    # Opt this provider into a 7-day cooldown for weekly quota windows.
+    # Without this, "weekly limit reached" gets clamped to the 24h global cap.
+    max_rate_limit_cooldown_seconds: 604800
+```
+
+Per-provider rate limiting is also enforced internally via a token bucket (`rate_limit_per_minute`), independent of upstream signals.
+
 ### Context Management
 
 When a provider returns a context-length error, the gateway can automatically truncate the conversation and retry:
@@ -508,6 +551,7 @@ This project is licensed under the [MIT License](LICENSE).
 | `Connection refused` on startup | Port already in use | Change `server.port` in config or stop the conflicting process |
 | Provider returns 401 | API key not resolved | Check that `api_key_env` matches an exported env var, or use the Admin UI to set it |
 | All providers circuit-broken | Sustained upstream failures | Use `/admin/config/reload` to reset breakers, or check provider status pages |
+| Provider hammered with 429s every few minutes | Weekly-quota provider (Nano-GPT etc.) capped at the 24h global default | Set `max_rate_limit_cooldown_seconds: 604800` on that provider so its cooldown can extend to a full week when the upstream signals "weekly limit reached" |
 | Context-length errors loop | Truncation disabled or max retries hit | Enable `context.enabled: true` and increase `max_truncation_retries` |
 | Dashboard shows no data | WebSocket blocked by proxy | Ensure your reverse proxy passes `Upgrade: websocket` headers |
 | Cache Hit Rate stuck on `N/A` | Zero eligible requests observed yet | `N/A` means the cache has never been consulted. Send two identical requests with `temperature ≤ 0.15` and `n: 1`. Tool-using requests are eligible too. |

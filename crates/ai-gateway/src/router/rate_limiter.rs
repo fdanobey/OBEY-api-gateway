@@ -1,12 +1,18 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-#[cfg(test)]
-use std::time::Duration;
-
-#[cfg(test)]
-use proptest::prelude::*;
+/// Hard upper bound that any cooldown is clamped to before being applied.
+///
+/// This is a safety backstop, not a policy: it bounds against negative,
+/// nonsense, or malicious upstream values, but is intentionally large
+/// enough to accommodate weekly-quota providers (e.g. Nano-GPT) that
+/// legitimately want a multi-day cooldown.
+///
+/// The *policy* cap (per-provider / global) is enforced earlier, in
+/// `Router::parse_rate_limit_cooldown`. By the time `apply_cooldown` is
+/// called, the value should already match operator policy.
+pub const MAX_COOLDOWN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Internal state for the rate limiter, protected by a single mutex
 /// to avoid potential deadlocks from acquiring multiple locks
@@ -16,6 +22,10 @@ struct RateLimiterState {
     tokens: f64,
     /// Last refill timestamp
     last_refill: Instant,
+    /// Optional upstream-driven cooldown deadline. While `Some(deadline)`
+    /// and `now < deadline`, the limiter reports unavailable so failover
+    /// skips this provider without round-tripping it.
+    cooldown_until: Option<Instant>,
 }
 
 /// Token bucket rate limiter for per-provider rate limiting
@@ -41,36 +51,104 @@ impl RateLimiter {
             state: Arc::new(Mutex::new(RateLimiterState {
                 tokens: requests_per_minute as f64,
                 last_refill: Instant::now(),
+                cooldown_until: None,
             })),
         }
     }
 
+    /// Returns `Some(remaining)` if the limiter is in an upstream-driven
+    /// cooldown, `None` otherwise. Used by failover to skip providers that
+    /// recently returned a rate-limit signal without re-issuing the request.
+    pub async fn cooldown_remaining(&self) -> Option<Duration> {
+        let state = self.state.lock().await;
+        match state.cooldown_until {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now < deadline {
+                    Some(deadline - now)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    }
+
+    /// Apply an upstream-driven cooldown. Subsequent `check_available` /
+    /// `consume` / `cooldown_remaining` calls report the provider as
+    /// unavailable until `duration` has elapsed.
+    ///
+    /// If a longer cooldown is already in effect it is preserved; otherwise
+    /// the new (clamped) deadline replaces it. The cooldown duration is
+    /// always clamped to [`MAX_COOLDOWN`].
+    pub async fn apply_cooldown(&self, duration: Duration) {
+        let clamped = duration.min(MAX_COOLDOWN);
+        let new_deadline = Instant::now() + clamped;
+        let mut state = self.state.lock().await;
+        match state.cooldown_until {
+            Some(existing) if existing >= new_deadline => {
+                // Keep the longer cooldown.
+            }
+            _ => {
+                state.cooldown_until = Some(new_deadline);
+            }
+        }
+    }
+
+    /// Clear any active upstream cooldown. Called on successful provider
+    /// responses so we don't carry stale rate-limit windows across config
+    /// reloads or after the upstream recovers early.
+    pub async fn clear_cooldown(&self) {
+        let mut state = self.state.lock().await;
+        state.cooldown_until = None;
+    }
+
     /// Check if a request can be made without consuming a token
-    /// 
-    /// Returns true if tokens are available, false otherwise
+    ///
+    /// Returns true if tokens are available (or the bucket is unlimited)
+    /// AND the limiter is not in an upstream-driven cooldown.
     pub async fn check_available(&self) -> bool {
+        let mut state = self.state.lock().await;
+
+        // Honor upstream-driven cooldown regardless of bucket capacity.
+        if let Some(deadline) = state.cooldown_until {
+            if Instant::now() < deadline {
+                return false;
+            }
+            state.cooldown_until = None;
+        }
+
         // Unlimited rate limit
         if self.requests_per_minute == 0 {
             return true;
         }
 
-        let mut state = self.state.lock().await;
         self.refill_tokens_internal(&mut state);
         state.tokens >= 1.0
     }
 
     /// Consume a token for a request
-    /// 
-    /// Returns true if token was consumed, false if no tokens available
+    ///
+    /// Returns true if a token was consumed (or the bucket is unlimited)
+    /// AND the limiter is not in an upstream-driven cooldown.
     pub async fn consume(&self) -> bool {
+        let mut state = self.state.lock().await;
+
+        // Honor upstream-driven cooldown regardless of bucket capacity.
+        if let Some(deadline) = state.cooldown_until {
+            if Instant::now() < deadline {
+                return false;
+            }
+            state.cooldown_until = None;
+        }
+
         // Unlimited rate limit
         if self.requests_per_minute == 0 {
             return true;
         }
 
-        let mut state = self.state.lock().await;
         self.refill_tokens_internal(&mut state);
-        
+
         if state.tokens >= 1.0 {
             state.tokens -= 1.0;
             true
@@ -108,6 +186,72 @@ impl RateLimiter {
 mod tests {
     use super::*;
     use tokio::time::sleep;
+
+    #[tokio::test]
+    async fn test_cooldown_blocks_unlimited_bucket() {
+        // Even providers with no per-minute limit must honor an
+        // upstream-driven cooldown window.
+        let limiter = RateLimiter::new(0);
+        assert!(limiter.consume().await);
+
+        limiter.apply_cooldown(Duration::from_millis(80)).await;
+        assert!(!limiter.check_available().await);
+        assert!(!limiter.consume().await);
+        assert!(limiter.cooldown_remaining().await.is_some());
+
+        sleep(Duration::from_millis(120)).await;
+        assert!(limiter.cooldown_remaining().await.is_none());
+        assert!(limiter.check_available().await);
+        assert!(limiter.consume().await);
+    }
+
+    #[tokio::test]
+    async fn test_cooldown_blocks_token_bucket() {
+        let limiter = RateLimiter::new(60);
+        assert!(limiter.consume().await);
+
+        limiter.apply_cooldown(Duration::from_millis(80)).await;
+        assert!(!limiter.consume().await);
+
+        sleep(Duration::from_millis(120)).await;
+        assert!(limiter.consume().await);
+    }
+
+    #[tokio::test]
+    async fn test_cooldown_keeps_longer_existing_window() {
+        let limiter = RateLimiter::new(0);
+        limiter.apply_cooldown(Duration::from_secs(5)).await;
+        limiter.apply_cooldown(Duration::from_millis(10)).await;
+
+        // Should still be in the longer (5s) cooldown.
+        let remaining = limiter.cooldown_remaining().await.unwrap();
+        assert!(remaining > Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn test_cooldown_clamped_to_max() {
+        let limiter = RateLimiter::new(0);
+        // Anything beyond MAX_COOLDOWN (7 days) is the limiter's hard
+        // backstop — anything larger gets clamped here. Operator-policy
+        // caps are enforced earlier in the router.
+        let huge = MAX_COOLDOWN + Duration::from_secs(60);
+        limiter.apply_cooldown(huge).await;
+
+        let remaining = limiter.cooldown_remaining().await.unwrap();
+        assert!(remaining <= MAX_COOLDOWN);
+        assert!(remaining > MAX_COOLDOWN - Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_clear_cooldown_restores_availability() {
+        let limiter = RateLimiter::new(0);
+        limiter.apply_cooldown(Duration::from_secs(30)).await;
+        assert!(!limiter.check_available().await);
+
+        limiter.clear_cooldown().await;
+        assert!(limiter.cooldown_remaining().await.is_none());
+        assert!(limiter.check_available().await);
+    }
 
     #[tokio::test]
     async fn test_unlimited_rate_limit() {

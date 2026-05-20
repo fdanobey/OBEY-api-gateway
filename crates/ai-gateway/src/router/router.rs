@@ -118,10 +118,13 @@ impl Router {
     }
 
     /// Select provider order based on priority, cost, latency, and availability
-    /// 
+    ///
     /// Algorithm:
-    /// 1. Filter by circuit breaker status (remove open circuits)
-    /// 2. Filter by rate limits (remove exhausted providers)
+    /// 1. Filter out providers whose circuit breaker is open
+    /// 2. Filter out providers in an upstream-driven rate-limit cooldown
+    ///    (set by a recent 429 / `Retry-After`). Internal token-bucket
+    ///    exhaustion is *not* used as a pre-filter — `route_with_failover`
+    ///    handles that with proper attempt logging so failover is visible.
     /// 3. Sort by priority (ascending - lower priority value = higher priority)
     /// 4. Within same priority, sort by cost (ascending - lower cost first)
     /// 5. Within similar costs (±10%), sort by latency (ascending - lower latency first)
@@ -135,13 +138,36 @@ impl Router {
                 Some(cb) => cb.value().is_available().await,
                 None => true,
             };
-            
-            let rl_ok = cb_ok && match self.rate_limiters.get(&m.provider) {
-                Some(rl) => rl.value().check_available().await,
+
+            // Only treat upstream-driven cooldown as a pre-filter signal.
+            // The internal token bucket is left to the failover path so an
+            // exhausted bucket on one provider doesn't silently re-route
+            // traffic to a different model under the same operator
+            // (see `route_with_failover`).
+            //
+            // We consult two stores:
+            //   1. `RateLimiter::cooldown_until` — the per-`Router` source
+            //      of truth, populated when a 429/Retry-After lands.
+            //   2. `Metrics::provider_cooldown_remaining_secs` — the
+            //      durable epoch-seconds copy that backs the dashboard.
+            //
+            // Both must agree that the provider is eligible. The metrics
+            // store is the *survivor* across config hot-reloads
+            // (`apply_runtime_config_update` clears the router's
+            // rate_limiters DashMap but cannot clear the metrics map,
+            // which is shared state). Without this second check, every
+            // config save re-opens routing to providers the operator is
+            // still seeing rendered as "Pausing for ~Nh (rate limited)"
+            // in the UI, producing a fresh 429 within seconds.
+            let cooldown_ok = match self.rate_limiters.get(&m.provider) {
+                Some(rl) => rl.value().cooldown_remaining().await.is_none(),
                 None => true,
-            };
-            
-            if cb_ok && rl_ok {
+            } && self
+                .metrics
+                .provider_cooldown_remaining_secs(&m.provider)
+                .is_none();
+
+            if cb_ok && cooldown_ok {
                 filtered.push(m.clone());
             }
         }
@@ -325,6 +351,431 @@ impl Router {
     /// Check if an error indicates a context length problem
     pub fn is_context_length_error(&self, status: u16, body: &str) -> bool {
         self.context_manager.is_context_length_error(status, body)
+    }
+
+    /// Detect a rate-limit signal from any source.
+    ///
+    /// Returns `true` when:
+    /// - the upstream HTTP status is 429, or
+    /// - the response body contains a recognizable rate-limit / quota
+    ///   marker (covering providers that wrap rate limits inside HTTP 200
+    ///   error envelopes, e.g. Nano-GPT / OpenRouter style).
+    ///
+    /// Used to unify backoff suppression and cooldown application across
+    /// the inner retry loop.
+    pub(crate) fn is_rate_limited(status_code: u16, body: &str) -> bool {
+        if status_code == 429 {
+            return true;
+        }
+
+        // Cheap fast path: skip body sniffing when the status is clearly
+        // unrelated to rate limiting.
+        if status_code != 200 && !(400..500).contains(&status_code) {
+            return false;
+        }
+
+        // Try a structured parse first; fall back to a case-insensitive
+        // substring check so providers with varied error envelopes still
+        // get caught (e.g. plain text bodies).
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+            let err = json.get("error").unwrap_or(&json);
+
+            for field in ["code", "type", "status", "reason"] {
+                if let Some(v) = err.get(field).and_then(|x| x.as_str()) {
+                    let v = v.to_ascii_lowercase();
+                    if v.contains("rate_limit")
+                        || v.contains("rate-limit")
+                        || v.contains("ratelimit")
+                        || v.contains("rate_limited")
+                        || v.contains("quota")
+                        || v.contains("insufficient_quota")
+                        || v == "429"
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            if let Some(code) = err.get("code").and_then(|c| c.as_i64()) {
+                if code == 429 {
+                    return true;
+                }
+            }
+
+            if let Some(msg) = err.get("message").and_then(|m| m.as_str()) {
+                if Self::message_indicates_rate_limit(msg) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        Self::message_indicates_rate_limit(body)
+    }
+
+    /// Substring check for rate-limit phrases. Centralized so the JSON
+    /// and plain-text paths agree on the same vocabulary.
+    fn message_indicates_rate_limit(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("rate limit")
+            || lower.contains("rate-limit")
+            || lower.contains("rate_limit")
+            || lower.contains("ratelimit")
+            || lower.contains("too many requests")
+            || lower.contains("quota exceeded")
+            || lower.contains("insufficient_quota")
+            || lower.contains("quota_exceeded")
+    }
+
+    /// Translate an upstream failure into a short, plain-English sentence
+    /// suitable for the Provider Health dashboard.
+    ///
+    /// The goal is for a non-technical operator to understand at a glance
+    /// *why* a provider is currently failing, without needing to read
+    /// status codes, JSON envelopes, or stack traces. Detailed diagnostics
+    /// still live in the logs and Recent Errors tab.
+    pub(crate) fn friendly_failure_reason(
+        status_code: Option<u16>,
+        body_or_message: &str,
+    ) -> String {
+        // Try to extract the provider's own error message, if any. Most
+        // OpenAI-compatible envelopes look like {"error":{"message": "..."}}.
+        let provider_msg: Option<String> = serde_json::from_str::<serde_json::Value>(body_or_message)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+            });
+
+        let snippet = provider_msg
+            .as_deref()
+            .map(Self::truncate_for_display)
+            .unwrap_or_default();
+
+        match status_code {
+            Some(code) if Self::is_rate_limited(code, body_or_message) => {
+                "Rate limited by provider — pausing until the limit resets".to_string()
+            }
+            Some(401) => "Authentication failed — check the provider's API key".to_string(),
+            Some(403) => "Provider refused the request (forbidden) — check account permissions".to_string(),
+            Some(402) => "Billing issue at the provider (payment required)".to_string(),
+            Some(404) => "Provider could not find the requested model or endpoint".to_string(),
+            Some(408) => "Provider took too long to respond (request timeout)".to_string(),
+            Some(413) => "Request was too large for the provider".to_string(),
+            Some(code) if (500..600).contains(&code) => {
+                if code == 503 {
+                    "Provider is temporarily unavailable".to_string()
+                } else {
+                    format!("Provider had a server error (HTTP {})", code)
+                }
+            }
+            Some(code) if (400..500).contains(&code) => {
+                if snippet.is_empty() {
+                    format!("Provider rejected the request (HTTP {})", code)
+                } else {
+                    format!("Provider rejected the request: {}", snippet)
+                }
+            }
+            None => {
+                // Network / timeout / unparsed error message fell into the
+                // "no status code" bucket. Reuse the message text directly
+                // when it's already friendly (e.g. our TtfbTimeout text),
+                // otherwise normalize the most common cases.
+                let lower = body_or_message.to_ascii_lowercase();
+                if lower.contains("timeout") || lower.contains("timed out") {
+                    "Network timeout while contacting provider".to_string()
+                } else if lower.contains("dns")
+                    || lower.contains("connection refused")
+                    || lower.contains("connect error")
+                    || lower.contains("could not resolve")
+                {
+                    "Could not reach provider (network error)".to_string()
+                } else if !snippet.is_empty() {
+                    format!("Provider error: {}", snippet)
+                } else {
+                    "Provider request failed (network error)".to_string()
+                }
+            }
+            Some(code) => format!("Provider returned an unexpected response (HTTP {})", code),
+        }
+    }
+
+    /// Trim provider-supplied error text to a single short line so the
+    /// dashboard cell stays readable.
+    fn truncate_for_display(text: &str) -> String {
+        const MAX: usize = 140;
+        let one_line: String = text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(MAX)
+            .collect();
+        if one_line.chars().count() == MAX {
+            format!("{}…", one_line)
+        } else {
+            one_line
+        }
+    }
+
+    /// Compute the cooldown duration to apply for a rate-limit response.
+    ///
+    /// Looks at, in order of preference:
+    /// 1. `Retry-After` HTTP header (seconds, or HTTP-date)
+    /// 2. `retry-after-ms` HTTP header
+    /// 3. `X-RateLimit-Reset` HTTP header (Unix epoch seconds — OpenAI,
+    ///    Nano-GPT, OpenRouter, etc.) and `X-RateLimit-Reset-After`
+    ///    (relative seconds — GitHub-style)
+    /// 4. Anthropic-style `anthropic-ratelimit-*-reset` headers (RFC 3339)
+    /// 5. `error.retry_after` / `error.retry_after_ms` body fields
+    /// 6. `error.reset_at` / `error.reset` body fields (epoch seconds
+    ///    or RFC 3339)
+    /// 7. Period markers in the error message text:
+    ///    - "weekly" / "per week"  -> 7d
+    ///    - "daily" / "per day"    -> 24h
+    ///    - "hourly" / "per hour"  -> 1h
+    ///    - "monthly" / "per month"-> 30d
+    ///
+    /// Falls back to `retry.default_rate_limit_cooldown_seconds`
+    /// (default 30s) when no signal is present.
+    ///
+    /// The returned value is clamped to:
+    /// `min(provider.max_rate_limit_cooldown_seconds,
+    ///      retry.max_rate_limit_cooldown_seconds,
+    ///      rate_limiter::MAX_COOLDOWN)`.
+    pub(crate) async fn parse_rate_limit_cooldown(
+        &self,
+        provider_name: &str,
+        headers: Option<&reqwest::header::HeaderMap>,
+        body: &str,
+    ) -> Duration {
+        let config = self.config.read().await;
+        let global_cap_secs = config.retry.max_rate_limit_cooldown_seconds;
+        let default_cooldown = Duration::from_secs(
+            config.retry.default_rate_limit_cooldown_seconds,
+        );
+        let provider_cap_secs = config
+            .providers
+            .iter()
+            .find(|p| p.name == provider_name)
+            .and_then(|p| p.max_rate_limit_cooldown_seconds);
+        drop(config);
+
+        Self::compute_rate_limit_cooldown(
+            headers,
+            body,
+            default_cooldown,
+            provider_cap_secs,
+            global_cap_secs,
+        )
+    }
+
+    /// Pure cooldown computation — no I/O. Exposed for unit testing the
+    /// header / body / period-marker parsing without spinning up a router.
+    pub(crate) fn compute_rate_limit_cooldown(
+        headers: Option<&reqwest::header::HeaderMap>,
+        body: &str,
+        default_cooldown: Duration,
+        provider_cap_secs: Option<u64>,
+        global_cap_secs: u64,
+    ) -> Duration {
+        let cap = {
+            // Operator policy: per-provider override wins over global,
+            // since operators set the per-provider value specifically to
+            // raise (or lower) the cooldown for that provider. If no
+            // provider override is set, use the global cap.
+            //
+            // The limiter backstop is a separate, hard ceiling that
+            // protects against runaway / nonsense values regardless of
+            // operator config.
+            let chosen_secs = provider_cap_secs.unwrap_or(global_cap_secs);
+            let backstop = crate::router::rate_limiter::MAX_COOLDOWN.as_secs();
+            Duration::from_secs(chosen_secs.min(backstop))
+        };
+
+        if let Some(h) = headers {
+            if let Some(d) = Self::cooldown_from_headers(h) {
+                return d.min(cap);
+            }
+        }
+
+        if let Some(d) = Self::cooldown_from_body(body) {
+            return d.min(cap);
+        }
+
+        if let Some(d) = Self::cooldown_from_period_marker(body) {
+            return d.min(cap);
+        }
+
+        default_cooldown.min(cap)
+    }
+
+    fn cooldown_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+        // Millisecond-precision retry-after first (Anthropic, some
+        // OpenAI-compatible providers).
+        if let Some(v) = headers.get("retry-after-ms").and_then(|h| h.to_str().ok()) {
+            if let Ok(ms) = v.trim().parse::<u64>() {
+                return Some(Duration::from_millis(ms));
+            }
+        }
+
+        // Standard Retry-After: seconds or HTTP-date.
+        if let Some(v) = headers.get(reqwest::header::RETRY_AFTER).and_then(|h| h.to_str().ok()) {
+            let trimmed = v.trim();
+            if let Ok(secs) = trimmed.parse::<u64>() {
+                return Some(Duration::from_secs(secs));
+            }
+            if let Ok(when) = chrono::DateTime::parse_from_rfc2822(trimmed) {
+                let now = chrono::Utc::now();
+                let delta = when.with_timezone(&chrono::Utc) - now;
+                if let Ok(std_dur) = delta.to_std() {
+                    return Some(std_dur);
+                }
+                return Some(Duration::from_secs(0));
+            }
+        }
+
+        // X-RateLimit-Reset-After: relative seconds (GitHub style, some
+        // OpenAI-compatible providers also emit it).
+        for name in ["x-ratelimit-reset-after", "ratelimit-reset"] {
+            if let Some(v) = headers.get(name).and_then(|h| h.to_str().ok()) {
+                if let Ok(secs) = v.trim().parse::<u64>() {
+                    // `ratelimit-reset` (RFC draft) is "delta seconds";
+                    // some implementations emit epoch instead. Treat
+                    // values smaller than 1e9 as relative.
+                    if secs < 1_000_000_000 {
+                        return Some(Duration::from_secs(secs));
+                    }
+                }
+            }
+        }
+
+        // X-RateLimit-Reset: Unix epoch seconds (OpenAI, OpenRouter,
+        // Nano-GPT for weekly/daily quotas).
+        for name in [
+            "x-ratelimit-reset",
+            "x-rate-limit-reset",
+            "x-ratelimit-reset-requests",
+            "x-ratelimit-reset-tokens",
+        ] {
+            if let Some(v) = headers.get(name).and_then(|h| h.to_str().ok()) {
+                if let Some(d) = Self::duration_until_epoch_or_relative(v.trim()) {
+                    return Some(d);
+                }
+            }
+        }
+
+        // Anthropic-style ISO-8601 reset headers.
+        for name in [
+            "anthropic-ratelimit-requests-reset",
+            "anthropic-ratelimit-tokens-reset",
+            "anthropic-ratelimit-input-tokens-reset",
+            "anthropic-ratelimit-output-tokens-reset",
+        ] {
+            if let Some(v) = headers.get(name).and_then(|h| h.to_str().ok()) {
+                if let Ok(when) = chrono::DateTime::parse_from_rfc3339(v.trim()) {
+                    let now = chrono::Utc::now();
+                    let delta = when.with_timezone(&chrono::Utc) - now;
+                    if let Ok(std_dur) = delta.to_std() {
+                        return Some(std_dur);
+                    }
+                    return Some(Duration::from_secs(0));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Interpret a header value as either an epoch-seconds timestamp
+    /// (large number) or a relative-seconds delta (small number). Returns
+    /// the resulting `Duration` from "now" until the reset.
+    fn duration_until_epoch_or_relative(v: &str) -> Option<Duration> {
+        let secs: u64 = v.parse().ok()?;
+        let now_epoch = chrono::Utc::now().timestamp() as u64;
+        if secs > now_epoch.saturating_sub(60 * 60 * 24)
+            && secs < now_epoch.saturating_add(60 * 60 * 24 * 365)
+        {
+            // Plausible epoch timestamp.
+            let delta = secs.saturating_sub(now_epoch);
+            return Some(Duration::from_secs(delta));
+        }
+        // Otherwise treat as relative seconds.
+        Some(Duration::from_secs(secs))
+    }
+
+    fn cooldown_from_body(body: &str) -> Option<Duration> {
+        let json = serde_json::from_str::<serde_json::Value>(body).ok()?;
+        let err = json.get("error").unwrap_or(&json);
+
+        for field in ["retry_after_ms", "retry-after-ms"] {
+            if let Some(ms) = err.get(field).and_then(|v| v.as_u64()) {
+                return Some(Duration::from_millis(ms));
+            }
+        }
+        for field in ["retry_after", "retry-after"] {
+            if let Some(secs) = err.get(field).and_then(|v| v.as_u64()) {
+                return Some(Duration::from_secs(secs));
+            }
+            if let Some(secs) = err.get(field).and_then(|v| v.as_f64()) {
+                if secs.is_finite() && secs >= 0.0 {
+                    return Some(Duration::from_secs_f64(secs));
+                }
+            }
+        }
+        // Reset-at fields: epoch seconds or RFC 3339 string.
+        for field in ["reset_at", "resets_at", "reset"] {
+            if let Some(v) = err.get(field) {
+                if let Some(secs) = v.as_u64() {
+                    if let Some(d) = Self::duration_until_epoch_or_relative(&secs.to_string()) {
+                        return Some(d);
+                    }
+                }
+                if let Some(s) = v.as_str() {
+                    if let Ok(when) = chrono::DateTime::parse_from_rfc3339(s) {
+                        let now = chrono::Utc::now();
+                        let delta = when.with_timezone(&chrono::Utc) - now;
+                        if let Ok(std_dur) = delta.to_std() {
+                            return Some(std_dur);
+                        }
+                        return Some(Duration::from_secs(0));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Last-resort signal extraction: scan the error message for period
+    /// keywords. Useful for providers like Nano-GPT that surface "weekly
+    /// limit reached" in plain text without machine-readable headers.
+    fn cooldown_from_period_marker(body: &str) -> Option<Duration> {
+        let lower = body.to_ascii_lowercase();
+
+        // Order matters: check the longer windows first so "monthly"
+        // doesn't get caught by a "month" substring inside "monthly
+        // active users" etc.
+        const HOUR: u64 = 60 * 60;
+        const DAY: u64 = 24 * HOUR;
+
+        if lower.contains("per month") || lower.contains("monthly limit") || lower.contains("monthly quota") {
+            return Some(Duration::from_secs(30 * DAY));
+        }
+        if lower.contains("per week") || lower.contains("weekly limit") || lower.contains("weekly quota") {
+            return Some(Duration::from_secs(7 * DAY));
+        }
+        if lower.contains("per day") || lower.contains("daily limit") || lower.contains("daily quota") {
+            return Some(Duration::from_secs(DAY));
+        }
+        if lower.contains("per hour") || lower.contains("hourly limit") || lower.contains("hourly quota") {
+            return Some(Duration::from_secs(HOUR));
+        }
+        None
     }
 
     /// Check and potentially truncate context before routing
@@ -651,6 +1102,27 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         
         for attempt in 0..=max_retries {
             if attempt > 0 {
+                // Defense-in-depth: never burn backoff time on a
+                // rate-limit-class error from the previous attempt. The
+                // explicit branches above already short-circuit, but if a
+                // future change adds another rate-limit code path this
+                // guard ensures we don't accidentally sleep through it.
+                if let Some(GatewayError::Provider {
+                    status_code: Some(code),
+                    message: prev_msg,
+                    ..
+                }) = &last_error
+                {
+                    if Self::is_rate_limited(*code, prev_msg) {
+                        debug!(
+                            provider = provider_name,
+                            status = *code,
+                            "Skipping retry backoff for rate-limit-class error"
+                        );
+                        break;
+                    }
+                }
+
                 let backoff_secs = backoff_sequence
                     .get((attempt - 1) as usize)
                     .copied()
@@ -700,6 +1172,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                 Ok(response) => {
                     let status = response.status();
                     let status_code = status.as_u16();
+                    let response_headers = response.headers().clone();
                     
                     // Read body with remaining total timeout budget
                     let elapsed = request_start.elapsed();
@@ -743,6 +1216,52 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                                 let err_msg = parsed["error"]["message"]
                                     .as_str()
                                     .unwrap_or("unknown error in 200 response");
+
+                                // Promote rate-limit-shaped 200 to a real 429.
+                                // This unifies failover with proper HTTP 429
+                                // handling: cooldown the provider and bail
+                                // out of the inner retry loop immediately.
+                                if Self::is_rate_limited(200, &body_text) {
+                                    let cooldown = self
+                                        .parse_rate_limit_cooldown(
+                                            provider_name,
+                                            Some(&response_headers),
+                                            &body_text,
+                                        )
+                                        .await;
+                                    let rate_limiter = self
+                                        .get_rate_limiter(provider_name)
+                                        .await;
+                                    rate_limiter.apply_cooldown(cooldown).await;
+                                    self.metrics.record_provider_rate_limit_exhausted(provider_name);
+                                    let now_secs = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+                                    let deadline = now_secs.saturating_add(cooldown.as_secs());
+                                    self.metrics.set_provider_cooldown(
+                                        provider_name,
+                                        Self::friendly_failure_reason(Some(429), &body_text),
+                                        deadline,
+                                    );
+
+                                    warn!(
+                                        provider = provider_name,
+                                        cooldown_ms = cooldown.as_millis() as u64,
+                                        error = %err_msg,
+                                        "Provider returned rate-limit-shaped HTTP 200, failing over"
+                                    );
+
+                                    return Err(GatewayError::Provider {
+                                        provider: provider_name.to_string(),
+                                        message: format!(
+                                            "Rate limited (HTTP 200 envelope): {}",
+                                            err_msg
+                                        ),
+                                        status_code: Some(429),
+                                    });
+                                }
+
                                 warn!(
                                     provider = provider_name,
                                     attempt,
@@ -897,7 +1416,46 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                     // 429 (rate limit) should fail over to next provider, not retry same one
                     // 503 (service unavailable) signals provider is down — fail over immediately
                     if status_code >= 400 && status_code < 500 && status_code != 408 {
-                        warn!(provider = provider_name, status = status_code, "Non-retryable client error, failing over");
+                        // For rate-limit signals, parse Retry-After /
+                        // retry_after_ms and put the provider in a
+                        // bounded cooldown window so subsequent requests
+                        // skip it via select_provider_order without
+                        // re-issuing.
+                        if Self::is_rate_limited(status_code, &body_text) {
+                            let cooldown = self
+                                .parse_rate_limit_cooldown(
+                                    provider_name,
+                                    Some(&response_headers),
+                                    &body_text,
+                                )
+                                .await;
+                            let rate_limiter = self.get_rate_limiter(provider_name).await;
+                            rate_limiter.apply_cooldown(cooldown).await;
+                            self.metrics.record_provider_rate_limit_exhausted(provider_name);
+                            let now_secs = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let deadline = now_secs.saturating_add(cooldown.as_secs());
+                            self.metrics.set_provider_cooldown(
+                                provider_name,
+                                Self::friendly_failure_reason(Some(status_code), &body_text),
+                                deadline,
+                            );
+
+                            warn!(
+                                provider = provider_name,
+                                status = status_code,
+                                cooldown_ms = cooldown.as_millis() as u64,
+                                "Rate limited, failing over and cooling down provider"
+                            );
+                        } else {
+                            warn!(
+                                provider = provider_name,
+                                status = status_code,
+                                "Non-retryable client error, failing over"
+                            );
+                        }
                         return Err(err);
                     }
                     if status_code == 503 {
@@ -1232,7 +1790,37 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                 ));
                 continue;
             }
-            
+
+            // Defense-in-depth: re-check the durable upstream-driven
+            // cooldown that backs the dashboard. `select_provider_order`
+            // already filters on this, but a config hot-reload between
+            // selection and failover (or any direct call to
+            // `route_with_failover`) could leave a stale provider in the
+            // candidate list. The metrics store survives
+            // `clear_rate_limiters()`, so it is the authoritative gate
+            // for "this provider returned 429 / Retry-After recently".
+            if let Some(remaining) = self
+                .metrics
+                .provider_cooldown_remaining_secs(&provider_model.provider)
+            {
+                debug!(
+                    provider = %provider_model.provider,
+                    model = %provider_model.model,
+                    cooldown_remaining_secs = remaining,
+                    "Upstream rate-limit cooldown active, skipping provider"
+                );
+                attempts.push(ProviderAttempt::new(
+                    provider_model.provider.clone(),
+                    provider_model.model.clone(),
+                    format!(
+                        "Provider in upstream rate-limit cooldown ({}s remaining)",
+                        remaining
+                    ),
+                    Some(429),
+                ));
+                continue;
+            }
+
             // Consume rate limit token before attempting request
             let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
             if !rate_limiter.consume().await {
@@ -1260,7 +1848,14 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                             "Provider returned empty response (no assistant content), failing over"
                         );
                         cb.record_failure().await;
-                        self.metrics.record_provider_failure(&provider_model.provider);
+                        self.metrics.record_provider_failure_with_reason(
+                            &provider_model.provider,
+                            Some(
+                                "Provider returned an empty response — no answer text or tool calls"
+                                    .to_string(),
+                            ),
+                            None,
+                        );
                         attempts.push(ProviderAttempt::new(
                             provider_model.provider.clone(),
                             provider_model.model.clone(),
@@ -1277,6 +1872,22 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                     self.metrics.record_provider_success(&provider_model.provider, duration_ms);
                     
                     cb.record_success().await;
+
+                    // Provider recovered — clear any upstream-driven cooldown
+                    // so we don't keep skipping it after it has come back.
+                    let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
+                    rate_limiter.clear_cooldown().await;
+                    // The metrics store also holds an independent
+                    // cooldown deadline (durable across config reloads)
+                    // and feeds both the dashboard countdown and the
+                    // routing gate in `select_provider_order` /
+                    // `route_with_failover`. Clear it here so a recovered
+                    // provider stops being filtered out and the UI
+                    // reflects recovery immediately. (record_provider_success
+                    // also clears it, but only when we actually report a
+                    // success — keep this explicit for readability.)
+                    self.metrics
+                        .clear_provider_cooldown(&provider_model.provider);
 
                     // Calculate and record cost from token usage
                     let usage_known = response.usage.total_tokens > 0
@@ -1331,13 +1942,33 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                 Err(e) => {
                     // Record failure
                     cb.record_failure().await;
-                    self.metrics.record_provider_failure(&provider_model.provider);
-                    
+
                     // Extract status code from the error when available
                     let attempt_status = match &e {
                         GatewayError::Provider { status_code, .. } => *status_code,
                         _ => None,
                     };
+                    let raw_message = match &e {
+                        GatewayError::Provider { message, .. } => message.clone(),
+                        _ => e.to_string(),
+                    };
+                    // Don't overwrite a fresh "Pausing until …" message
+                    // that the rate-limit path just set: when this branch
+                    // sees the same 429 the rate-limit code already wrote
+                    // the friendlier countdown text.
+                    let friendly = if attempt_status == Some(429) {
+                        None
+                    } else {
+                        Some(Self::friendly_failure_reason(
+                            attempt_status,
+                            &raw_message,
+                        ))
+                    };
+                    self.metrics.record_provider_failure_with_reason(
+                        &provider_model.provider,
+                        friendly,
+                        None,
+                    );
 
                     // Collect attempt for aggregated error
                     attempts.push(ProviderAttempt::new(
@@ -3055,6 +3686,7 @@ mod tests {
             codex_base_url_override: None,
             codex_model_override: None,
             instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
         }];
         let router_metrics = test_metrics();
         router_metrics.add_cost("budgeted-provider", 1.25);
@@ -3293,5 +3925,475 @@ mod property_tests {
         config2.model_groups = vec![invalid_group2];
         
         assert!(config2.model_groups[0].models[0].model.is_empty());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Rate-limit detection & cooldown parsing
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_rate_limited_status_429() {
+        assert!(Router::is_rate_limited(429, ""));
+        assert!(Router::is_rate_limited(429, "anything goes"));
+    }
+
+    #[test]
+    fn test_is_rate_limited_non_rate_limit_4xx() {
+        assert!(!Router::is_rate_limited(400, r#"{"error":{"message":"bad request"}}"#));
+        assert!(!Router::is_rate_limited(401, r#"{"error":{"message":"unauthorized"}}"#));
+        assert!(!Router::is_rate_limited(404, r#"{"error":{"message":"not found"}}"#));
+    }
+
+    #[test]
+    fn test_is_rate_limited_5xx_ignored() {
+        // 5xx aren't rate-limit signals even if message mentions limits.
+        assert!(!Router::is_rate_limited(503, "service unavailable"));
+        assert!(!Router::is_rate_limited(500, r#"{"error":{"message":"internal"}}"#));
+    }
+
+    #[test]
+    fn test_is_rate_limited_200_with_rate_limit_envelope() {
+        let body = r#"{"error":{"message":"You are sending requests too fast","type":"rate_limit_error","code":"rate_limited"}}"#;
+        assert!(Router::is_rate_limited(200, body));
+    }
+
+    #[test]
+    fn test_is_rate_limited_200_with_quota_message() {
+        let body = r#"{"error":{"message":"Quota exceeded for this account"}}"#;
+        assert!(Router::is_rate_limited(200, body));
+    }
+
+    #[test]
+    fn test_is_rate_limited_200_with_insufficient_quota() {
+        let body = r#"{"error":{"code":"insufficient_quota","message":"You ran out of credits"}}"#;
+        assert!(Router::is_rate_limited(200, body));
+    }
+
+    #[test]
+    fn test_is_rate_limited_200_with_numeric_429_code() {
+        let body = r#"{"error":{"code":429,"message":"Too Many Requests"}}"#;
+        assert!(Router::is_rate_limited(200, body));
+    }
+
+    #[test]
+    fn test_is_rate_limited_200_normal_response_not_flagged() {
+        let body = r#"{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
+        assert!(!Router::is_rate_limited(200, body));
+    }
+
+    #[test]
+    fn test_is_rate_limited_200_unrelated_error_not_flagged() {
+        let body = r#"{"error":{"message":"context length exceeded","type":"invalid_request_error"}}"#;
+        assert!(!Router::is_rate_limited(200, body));
+    }
+
+    #[test]
+    fn test_is_rate_limited_plain_text_too_many_requests() {
+        assert!(Router::is_rate_limited(200, "Too Many Requests"));
+        assert!(Router::is_rate_limited(429, "Too Many Requests"));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_cooldown_from_retry_after_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            Some(&headers),
+            "",
+            Duration::from_secs(30),
+            None,
+            24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_cooldown_from_retry_after_ms_header() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after-ms", "1500".parse().unwrap());
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            Some(&headers),
+            "",
+            Duration::from_secs(30),
+            None,
+            24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_cooldown_clamped_to_global_cap() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        // Provider tries to ask for 30 days, global cap is 24h.
+        headers.insert(reqwest::header::RETRY_AFTER, "2592000".parse().unwrap());
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            Some(&headers),
+            "",
+            Duration::from_secs(30),
+            None,
+            24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_cooldown_provider_override_raises_cap() {
+        // Nano-GPT-style weekly quota: provider override = 7d, global = 24h.
+        // Provider's Retry-After of 6 days should be honored, not clamped to 24h.
+        let mut headers = reqwest::header::HeaderMap::new();
+        let six_days = 6 * 24 * 60 * 60;
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            six_days.to_string().parse().unwrap(),
+        );
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            Some(&headers),
+            "",
+            Duration::from_secs(30),
+            Some(7 * 24 * 60 * 60),
+            24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_secs(six_days));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_cooldown_clamped_to_limiter_backstop() {
+        // Even if both operator caps are absurdly large, the limiter
+        // backstop (7 days) wins.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "99999999".parse().unwrap());
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            Some(&headers),
+            "",
+            Duration::from_secs(30),
+            Some(99_999_999),
+            99_999_999,
+        );
+        assert_eq!(cooldown, crate::router::rate_limiter::MAX_COOLDOWN);
+    }
+
+    #[test]
+    fn test_parse_rate_limit_cooldown_from_body_retry_after_seconds() {
+        let body = r#"{"error":{"message":"slow down","retry_after":12}}"#;
+        let cooldown = Router::compute_rate_limit_cooldown(
+            None,
+            body,
+            Duration::from_secs(30),
+            None,
+            24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_secs(12));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_cooldown_from_body_retry_after_ms() {
+        let body = r#"{"error":{"message":"slow down","retry_after_ms":2500}}"#;
+        let cooldown = Router::compute_rate_limit_cooldown(
+            None,
+            body,
+            Duration::from_secs(30),
+            None,
+            24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_cooldown_default_when_missing() {
+        let cooldown = Router::compute_rate_limit_cooldown(
+            None,
+            "{}",
+            Duration::from_secs(30),
+            None,
+            24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_cooldown_header_takes_precedence_over_body() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+        let body = r#"{"error":{"retry_after":99}}"#;
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            Some(&headers),
+            body,
+            Duration::from_secs(30),
+            None,
+            24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn test_cooldown_from_xratelimit_reset_epoch() {
+        // OpenAI-style epoch-seconds reset header.
+        let future = (chrono::Utc::now().timestamp() + 3600) as u64;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-reset", future.to_string().parse().unwrap());
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            Some(&headers),
+            "",
+            Duration::from_secs(30),
+            Some(7 * 24 * 60 * 60),
+            7 * 24 * 60 * 60,
+        );
+        // Should be ~1h, allow ±5s for clock skew during the test.
+        assert!(cooldown > Duration::from_secs(3590));
+        assert!(cooldown <= Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn test_cooldown_from_xratelimit_reset_after_relative() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-reset-after", "120".parse().unwrap());
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            Some(&headers),
+            "",
+            Duration::from_secs(30),
+            None,
+            24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_cooldown_from_anthropic_iso_reset() {
+        let when = chrono::Utc::now() + chrono::Duration::seconds(45);
+        let header_val = when.to_rfc3339();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-requests-reset",
+            header_val.parse().unwrap(),
+        );
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            Some(&headers),
+            "",
+            Duration::from_secs(30),
+            None,
+            24 * 60 * 60,
+        );
+        assert!(cooldown > Duration::from_secs(40));
+        assert!(cooldown <= Duration::from_secs(45));
+    }
+
+    #[test]
+    fn test_cooldown_from_period_marker_weekly() {
+        // Nano-GPT-style "weekly limit reached" with no machine-readable
+        // retry-after. Operator has opted into weekly cooldown via the
+        // per-provider override.
+        let body = r#"{"error":{"message":"You have reached your weekly limit. Please try again later."}}"#;
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            None,
+            body,
+            Duration::from_secs(30),
+            Some(7 * 24 * 60 * 60),
+            24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_secs(7 * 24 * 60 * 60));
+    }
+
+    #[test]
+    fn test_cooldown_from_period_marker_weekly_clamped_when_no_override() {
+        // Same body, but provider has no override. Global default cap of
+        // 24h prevents us from holding the provider out for a full week.
+        let body = r#"{"error":{"message":"You have reached your weekly limit."}}"#;
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            None,
+            body,
+            Duration::from_secs(30),
+            None,
+            24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[test]
+    fn test_cooldown_from_period_marker_daily() {
+        let body = r#"{"error":{"message":"Daily quota exceeded"}}"#;
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            None,
+            body,
+            Duration::from_secs(30),
+            None,
+            48 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[test]
+    fn test_cooldown_from_body_reset_at_rfc3339() {
+        let when = chrono::Utc::now() + chrono::Duration::seconds(90);
+        let body = format!(r#"{{"error":{{"reset_at":"{}"}}}}"#, when.to_rfc3339());
+
+        let cooldown = Router::compute_rate_limit_cooldown(
+            None,
+            &body,
+            Duration::from_secs(30),
+            None,
+            24 * 60 * 60,
+        );
+        assert!(cooldown > Duration::from_secs(85));
+        assert!(cooldown <= Duration::from_secs(90));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Pre-filter behavior of select_provider_order
+    // ────────────────────────────────────────────────────────────────────
+
+    fn build_two_provider_group() -> (Config, ModelGroup) {
+        let mut config = create_test_config();
+
+        let make_provider = |name: &str| crate::config::Provider {
+            name: name.to_string(),
+            provider_type: "openai".to_string(),
+            base_url: Some("http://localhost:1234".to_string()),
+            api_key_env: None,
+            api_key_encrypted: None,
+            api_secret_env: None,
+            api_secret_encrypted: None,
+            auth_method: None,
+            resolved_api_key: None,
+            resolved_api_secret: None,
+            region: None,
+            timeout_seconds: 30,
+            ttfb_timeout_seconds: None,
+            total_timeout_seconds: None,
+            max_connections: 10,
+            // Tight bucket so check_available() trivially returns false
+            // after a single consume.
+            rate_limit_per_minute: 1,
+            custom_headers: Default::default(),
+            connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+            budget: None,
+            manual_models: vec![],
+            global_inference_profile: false,
+            cross_region_inference: false,
+            prompt_caching: false,
+            reasoning: false,
+            custom_vpc_endpoint: false,
+            codex_base_url_override: None,
+            codex_model_override: None,
+            instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
+        };
+
+        config.providers = vec![make_provider("primary"), make_provider("backup")];
+
+        let group = ModelGroup {
+            name: "test-group".to_string(),
+            version_fallback_enabled: false,
+            models: vec![
+                ProviderModel {
+                    provider: "primary".to_string(),
+                    model: "model-1".to_string(),
+                    cost_per_million_input_tokens: 10.0,
+                    cost_per_million_output_tokens: 30.0,
+                    priority: 1,
+                },
+                ProviderModel {
+                    provider: "backup".to_string(),
+                    model: "model-1".to_string(),
+                    cost_per_million_input_tokens: 11.0,
+                    cost_per_million_output_tokens: 31.0,
+                    priority: 2,
+                },
+            ],
+        };
+        config.model_groups = vec![group.clone()];
+        (config, group)
+    }
+
+    #[tokio::test]
+    async fn test_select_provider_order_does_not_filter_on_token_bucket() {
+        let (config, group) = build_two_provider_group();
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        // Drain the primary provider's token bucket entirely.
+        let limiter = router.get_rate_limiter("primary").await;
+        assert!(limiter.consume().await);
+        assert!(!limiter.check_available().await);
+
+        // Even with the bucket exhausted, primary stays in the list.
+        // The failover path is responsible for handling bucket exhaustion
+        // visibly; pre-filtering here would silently shift traffic.
+        let order = router.select_provider_order(&group).await;
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0].provider, "primary");
+        assert_eq!(order[1].provider, "backup");
+    }
+
+    #[tokio::test]
+    async fn test_select_provider_order_filters_on_upstream_cooldown() {
+        let (config, group) = build_two_provider_group();
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        // An upstream-driven cooldown DOES remove the provider. This is
+        // the signal a real 429 / Retry-After produces.
+        let limiter = router.get_rate_limiter("primary").await;
+        limiter.apply_cooldown(Duration::from_secs(5)).await;
+
+        let order = router.select_provider_order(&group).await;
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0].provider, "backup");
+    }
+
+    #[tokio::test]
+    async fn test_cooldown_in_metrics_filters_after_clear_rate_limiters() {
+        // Regression: a long-running cooldown (e.g. Nano-GPT weekly
+        // quota at 23h) was being silently bypassed after any config
+        // hot-reload. `apply_runtime_config_update` calls
+        // `clear_rate_limiters()`, which wipes the per-`Router`
+        // cooldown but cannot wipe the metrics map (shared, durable).
+        // The dashboard kept rendering "Pausing for ~23h (rate
+        // limited)" while the router happily routed new traffic to the
+        // provider, which immediately 429'd again — exactly the user
+        // bug report. The fix is for `select_provider_order` to also
+        // consult the metrics-side cooldown.
+        let (config, group) = build_two_provider_group();
+        let metrics = test_metrics();
+        let router = Router::new(Arc::new(RwLock::new(config)), metrics.clone());
+
+        // Simulate a 429 with a long Retry-After landing on `primary`.
+        // Both stores get written, just like the real 429 handler does.
+        let limiter = router.get_rate_limiter("primary").await;
+        limiter.apply_cooldown(Duration::from_secs(60 * 60 * 23)).await;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        metrics.set_provider_cooldown(
+            "primary",
+            "Rate limited by provider — pausing until the limit resets".to_string(),
+            now_secs + 60 * 60 * 23,
+        );
+
+        // Now simulate a config hot-reload, which clears the router-side
+        // rate_limiters DashMap but leaves the metrics store intact.
+        router.clear_rate_limiters();
+
+        // The cooldown must STILL be honored — primary stays out of the
+        // candidate list. Without the metrics check, primary would be
+        // reinstated here (None => true), and a request would be issued.
+        let order = router.select_provider_order(&group).await;
+        assert_eq!(order.len(), 1, "primary must still be filtered after reload");
+        assert_eq!(order[0].provider, "backup");
+
+        // Sanity: clearing the metrics cooldown restores eligibility.
+        metrics.clear_provider_cooldown("primary");
+        let order = router.select_provider_order(&group).await;
+        assert_eq!(order.len(), 2);
     }
 }
