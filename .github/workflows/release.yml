@@ -13,6 +13,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -66,10 +68,19 @@ jobs:
           Copy-Item "dist/*" "release/" -Recurse -Force
           & $iscc "scripts/installer.iss"
 
+      - name: Extract tag annotation
+        id: tag_body
+        shell: pwsh
+        run: |
+          $body = git tag -l --format='%(contents)' $env:GITHUB_REF_NAME
+          if (-not $body) { $body = "Release $env:GITHUB_REF_NAME" }
+          # Write to file to avoid multiline env var issues
+          $body | Set-Content "release-notes.md" -Encoding utf8
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: release-notes.md
           files: |
             ai-gateway-windows-x86_64.zip
             release/OBEY-API-Gateway-Setup-*.exe
