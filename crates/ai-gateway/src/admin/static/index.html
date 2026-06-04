@@ -737,6 +737,11 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
 
   // --- Bedrock Built-in Model Catalog (fallback when /v1/models is unreachable) ---
   var BEDROCK_BUILTIN_MODELS = [
+    // OpenAI (hosted on Bedrock via the Mantle endpoint)
+    'openai.gpt-5.5',
+    'openai.gpt-5.4',
+    'openai.gpt-oss-120b-1:0',
+    'openai.gpt-oss-20b-1:0',
     // Anthropic Claude 4.x family
     'anthropic.claude-opus-4-7',
     'anthropic.claude-sonnet-4-6',
@@ -796,6 +801,25 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
     var page = document.getElementById('page-' + pageId);
     if (tab) tab.setAttribute('aria-selected', 'true');
     if (page) page.classList.add('active');
+    // Re-fetch model lists whenever the Model Groups page is opened so newly
+    // released provider models (e.g. new Bedrock OpenAI models) appear without
+    // a manual refresh.
+    if (pageId === 'model-groups') { refreshModelGroupModels(); }
+  }
+
+  /** Re-fetch each model row's provider model list, preserving the current selection. */
+  function refreshModelGroupModels() {
+    document.querySelectorAll('#groups-list .models-container .form-row').forEach(function(row) {
+      var provSel = row.querySelector('.mdl-provider');
+      var mdlSel = row.querySelector('.mdl-name');
+      if (!provSel || !mdlSel || !provSel.value) { return; }
+      // Only refresh dropdowns; skip rows that fell back to a free-text input
+      // so we don't clobber a manually typed model name.
+      if (mdlSel.tagName !== 'SELECT') { return; }
+      // Preserve whatever is currently selected/typed so the refresh is non-destructive.
+      var current = mdlSel.value || '';
+      fetchModelsForProvider(provSel.value, mdlSel, current);
+    });
   }
 
   tabs.forEach(function(tab) {

@@ -644,6 +644,95 @@ impl BedrockProvider {
         })
     }
 
+    /// Static backup catalog used when the live Mantle `/models` listing is
+    /// unavailable (AWS SDK mode, network failure, or empty response).
+    ///
+    /// Kept current with the models OBEY commonly routes to so the dashboard
+    /// and `/v1/models` aggregation stay useful offline.
+    fn backup_models() -> Vec<Model> {
+        const BACKUP: &[(&str, &str)] = &[
+            // OpenAI models hosted on Bedrock (Mantle endpoint)
+            ("openai.gpt-5.5", "openai"),
+            ("openai.gpt-5.4", "openai"),
+            ("openai.gpt-oss-120b-1:0", "openai"),
+            ("openai.gpt-oss-20b-1:0", "openai"),
+            // Anthropic Claude
+            ("anthropic.claude-3-5-sonnet-20241022-v2:0", "anthropic"),
+            ("anthropic.claude-3-opus-20240229-v1:0", "anthropic"),
+            ("anthropic.claude-3-sonnet-20240229-v1:0", "anthropic"),
+            ("anthropic.claude-3-haiku-20240307-v1:0", "anthropic"),
+            // Amazon
+            ("amazon.nova-pro-v1:0", "amazon"),
+            ("amazon.nova-lite-v1:0", "amazon"),
+            ("amazon.titan-text-express-v1", "amazon"),
+        ];
+
+        BACKUP
+            .iter()
+            .map(|(id, owner)| Model {
+                id: (*id).to_string(),
+                object: "model".to_string(),
+                owned_by: (*owner).to_string(),
+                created: None,
+                context_window: None,
+                max_completion_tokens: None,
+            })
+            .collect()
+    }
+
+    /// Query the OpenAI-compatible `/models` endpoint on the Bedrock Mantle
+    /// endpoint (API key mode only). Returns the live list of available models.
+    async fn list_models_api_key(
+        &self,
+        http_client: &Client,
+        api_key: &str,
+        base_url: &str,
+        custom_headers: &HashMap<String, String>,
+    ) -> Result<Vec<Model>, GatewayError> {
+        let url = format!("{}/models", base_url.trim_end_matches('/'));
+
+        let mut req_builder = http_client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", api_key));
+
+        // Apply custom headers with environment variable resolution
+        for (key, value) in custom_headers {
+            let resolved = resolve_header_value(value);
+            req_builder = req_builder.header(key.as_str(), resolved);
+        }
+
+        let response = req_builder
+            .send()
+            .await
+            .map_err(|e| GatewayError::Network(format!("Request to {} failed: {}", url, e)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(GatewayError::Provider {
+                provider: self.name.clone(),
+                message: format!("HTTP {}: {}", status.as_u16(), error_text),
+                status_code: Some(status.as_u16()),
+            });
+        }
+
+        #[derive(Deserialize)]
+        struct ModelsResponse {
+            #[serde(default)]
+            data: Vec<Model>,
+        }
+
+        let parsed: ModelsResponse = response
+            .json()
+            .await
+            .map_err(|e| GatewayError::Network(format!("Failed to parse models response: {}", e)))?;
+
+        Ok(parsed.data)
+    }
+
     /// Perform chat completion using API key authentication via HTTP.
     /// Sends request to the Bedrock Mantle endpoint which is OpenAI-compatible.
     async fn chat_completion_api_key(
@@ -911,33 +1000,40 @@ impl ProviderClient for BedrockProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<Model>, GatewayError> {
-        // Bedrock doesn't have a list models API, return static list
-        Ok(vec![
-            Model {
-                id: "claude-3-opus".to_string(),
-                object: "model".to_string(),
-                owned_by: "anthropic".to_string(),
-                created: None,
-                context_window: None,
-                max_completion_tokens: None,
-            },
-            Model {
-                id: "claude-3-sonnet".to_string(),
-                object: "model".to_string(),
-                owned_by: "anthropic".to_string(),
-                created: None,
-                context_window: None,
-                max_completion_tokens: None,
-            },
-            Model {
-                id: "titan-text-express".to_string(),
-                object: "model".to_string(),
-                owned_by: "amazon".to_string(),
-                created: None,
-                context_window: None,
-                max_completion_tokens: None,
-            },
-        ])
+        // API key mode talks to the OpenAI-compatible Bedrock Mantle endpoint,
+        // which exposes a live `/models` listing. Query it so newly released
+        // models (e.g. openai.gpt-5.5 / openai.gpt-5.4) are picked up
+        // automatically without a code change.
+        if let BedrockAuthMode::ApiKey {
+            http_client,
+            api_key,
+            base_url,
+            custom_headers,
+        } = &self.auth_mode
+        {
+            match self
+                .list_models_api_key(http_client, api_key, base_url, custom_headers)
+                .await
+            {
+                Ok(models) if !models.is_empty() => return Ok(models),
+                Ok(_) => {
+                    // Empty response — fall through to the static backup list.
+                }
+                Err(e) => {
+                    // Network/endpoint failure — log and fall back so the
+                    // dashboard still shows a useful catalog.
+                    tracing::warn!(
+                        provider = %self.name,
+                        error = %e,
+                        "Bedrock Mantle /models listing failed, using static backup list"
+                    );
+                }
+            }
+        }
+
+        // Backup list (used for AWS SDK mode and whenever the live listing is
+        // unavailable). Kept current with the models OBEY commonly routes to.
+        Ok(Self::backup_models())
     }
 
     fn provider_name(&self) -> &str {
@@ -1440,6 +1536,80 @@ mod tests {
             }
             other => panic!("Expected provider error, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_list_models_api_key_live_listing() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mantle exposes an OpenAI-compatible /models listing. Verify the
+        // provider reads it live so new models (e.g. openai.gpt-5.5) appear.
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("Authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "openai.gpt-5.5", "object": "model", "owned_by": "openai"},
+                    {"id": "openai.gpt-5.4", "object": "model", "owned_by": "openai"}
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = create_api_key_mode_provider_for_base_url(
+            "bedrock-test",
+            mock_server.uri(),
+            "test-api-key",
+        );
+
+        let models = provider.list_models().await.expect("list_models should succeed");
+        let ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
+        assert!(ids.contains(&"openai.gpt-5.5".to_string()));
+        assert!(ids.contains(&"openai.gpt-5.4".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_models_falls_back_to_backup_on_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Simulate the live listing being unavailable.
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("error"))
+            .mount(&mock_server)
+            .await;
+
+        let provider = create_api_key_mode_provider_for_base_url(
+            "bedrock-test",
+            mock_server.uri(),
+            "test-api-key",
+        );
+
+        let models = provider.list_models().await.expect("list_models should fall back");
+        let ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
+        // Backup catalog must still surface the new OpenAI models.
+        assert!(ids.contains(&"openai.gpt-5.5".to_string()));
+        assert!(ids.contains(&"openai.gpt-5.4".to_string()));
+    }
+
+    #[test]
+    fn test_backup_models_includes_new_openai_models() {
+        let ids: Vec<String> = BedrockProvider::backup_models()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(ids.contains(&"openai.gpt-5.5".to_string()));
+        assert!(ids.contains(&"openai.gpt-5.4".to_string()));
+        assert!(ids.contains(&"openai.gpt-oss-120b-1:0".to_string()));
+        assert!(ids.contains(&"openai.gpt-oss-20b-1:0".to_string()));
     }
 
     #[tokio::test]
