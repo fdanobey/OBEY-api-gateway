@@ -6,7 +6,7 @@
 ;   2. Compile this script:  iscc scripts/installer.iss
 
 #define MyAppName      "OBEY API Gateway"
-#define MyAppVersion   "0.2.1"
+#define MyAppVersion   "0.2.2"
 #define MyAppPublisher "OBEY"
 #define MyAppExeName   "ai-gateway.exe"
 #define MyAppURL       "https://github.com/fdanobey/OBEY-api-gateway"
