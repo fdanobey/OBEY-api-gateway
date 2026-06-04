@@ -61,6 +61,8 @@ Grab the [latest release](https://github.com/fdanobey/OBEY-api-gateway/releases/
 
 Click the button above to deploy directly from this repo. Railway picks up the included [`Dockerfile`](Dockerfile) and [`railway.toml`](railway.toml) automatically. Set your provider API keys (`OPENAI_API_KEY`, etc.) as environment variables in the Railway dashboard and you're live in under a minute.
 
+> **Persist your keys on Railway:** attach a Railway Volume mounted at `/data` (the image's `AI_GATEWAY_DATA_DIR`). Railway's container filesystem is ephemeral, so without a volume the encryption master key is regenerated on every redeploy and previously saved `api_key_encrypted` values can no longer be decrypted. Alternatively, supply keys via plain environment variables (`OPENAI_API_KEY`, etc.), which never touch the encrypted store.
+
 ### Option 3: Docker
 
 ```bash
@@ -72,8 +74,11 @@ docker run -d \
   -p 8080:8080 \
   -e OPENAI_API_KEY=sk-... \
   -v $(pwd)/config.yaml:/app/config.yaml \
+  -v ai-gateway-data:/data \
   obey-api-gateway --config /app/config.yaml
 ```
+
+> **Persist your keys:** the image sets `AI_GATEWAY_DATA_DIR=/data` and declares it as a volume. Mount a named volume (or host path) at `/data` as shown above so the encryption master key survives container restarts and rebuilds. Without it, the key regenerates on each container recreation and any `api_key_encrypted` values already saved in your `config.yaml` become undecryptable.
 
 ### Option 4: Build from Source
 
@@ -304,6 +309,7 @@ When a timeout fires, the error response tells the user exactly which timeout wa
 | Variable | Purpose |
 |----------|---------|
 | `CONFIG_PATH` | Override config file location |
+| `AI_GATEWAY_DATA_DIR` | Override the secrets/master-key directory (recommended for Docker; mount a volume so encrypted keys persist) |
 | `OPENAI_API_KEY` | Provider API key (name matches `api_key_env` in config) |
 | `ADMIN_USERNAME` | Admin panel username |
 | `ADMIN_PASSWORD` | Admin panel password |

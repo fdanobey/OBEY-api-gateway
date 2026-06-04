@@ -5,6 +5,11 @@ use std::fs;
 use std::path::PathBuf;
 
 const APP_DIR_NAME: &str = "ai-gateway";
+/// Explicit override for the secrets/master-key directory. Recommended for
+/// containers (Docker) where `HOME`/`XDG_CONFIG_HOME`/`APPDATA` are unset;
+/// point it at a mounted volume so the master key (and encrypted secrets)
+/// persist across restarts.
+const DATA_DIR_ENV: &str = "AI_GATEWAY_DATA_DIR";
 const MASTER_KEY_FILE: &str = "master.key";
 const ENCRYPTED_PREFIX: &str = "enc-v1:";
 const NONCE_SIZE: usize = NONCE_LEN;
@@ -181,20 +186,62 @@ pub(crate) fn storage_dir_path() -> Result<PathBuf, SecretError> {
 /// Resolve the per-user secrets directory (colocated with the master key and
 /// OAuth token store). Crate-visible so the Codex `InstructionsStore` can
 /// colocate its disk cache with the OAuth blob (design §5).
+///
+/// Resolution order:
+/// 1. `AI_GATEWAY_DATA_DIR` (explicit override; recommended for containers)
+/// 2. `%APPDATA%/ai-gateway` (Windows)
+/// 3. `$XDG_CONFIG_HOME/ai-gateway`
+/// 4. `$HOME/.config/ai-gateway`
+/// 5. `./.ai-gateway` relative to the current working directory (fallback so
+///    headless/container environments without HOME never hard-fail)
 pub(crate) fn storage_dir() -> Result<PathBuf, SecretError> {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return Ok(PathBuf::from(appdata).join(APP_DIR_NAME));
-        }
+    let appdata = if cfg!(target_os = "windows") {
+        std::env::var("APPDATA").ok()
+    } else {
+        None
+    };
+
+    resolve_storage_dir(
+        std::env::var(DATA_DIR_ENV).ok(),
+        appdata,
+        std::env::var("XDG_CONFIG_HOME").ok(),
+        std::env::var("HOME").ok(),
+        std::env::current_dir().ok(),
+    )
+}
+
+/// Pure resolution of the secrets directory from candidate inputs. Separated
+/// from environment lookups so the precedence rules are unit-testable.
+fn resolve_storage_dir(
+    data_dir_override: Option<String>,
+    appdata: Option<String>,
+    xdg_config_home: Option<String>,
+    home: Option<String>,
+    current_dir: Option<PathBuf>,
+) -> Result<PathBuf, SecretError> {
+    let is_set = |value: &str| !value.trim().is_empty();
+
+    if let Some(dir) = data_dir_override.filter(|v| is_set(v)) {
+        return Ok(PathBuf::from(dir));
     }
 
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+    if let Some(appdata) = appdata.filter(|v| is_set(v)) {
+        return Ok(PathBuf::from(appdata).join(APP_DIR_NAME));
+    }
+
+    if let Some(xdg) = xdg_config_home.filter(|v| is_set(v)) {
         return Ok(PathBuf::from(xdg).join(APP_DIR_NAME));
     }
 
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = home.filter(|v| is_set(v)) {
         return Ok(PathBuf::from(home).join(".config").join(APP_DIR_NAME));
+    }
+
+    // Final fallback: keep secrets next to the working directory so headless
+    // and container deployments (no HOME/XDG/APPDATA) still function. Operators
+    // should mount AI_GATEWAY_DATA_DIR for durable, owner-scoped storage.
+    if let Some(cwd) = current_dir {
+        return Ok(cwd.join(".ai-gateway"));
     }
 
     Err(SecretError::StorageDirectoryUnavailable)
@@ -281,5 +328,45 @@ mod tests {
         let key = [9u8; KEY_SIZE];
         let err = decrypt_provider_secret_with_key(&key, "bad-value").unwrap_err();
         assert!(matches!(err, SecretError::InvalidEncryptedFormat));
+    }
+
+    #[test]
+    fn test_resolve_storage_dir_prefers_explicit_override() {
+        let dir = resolve_storage_dir(
+            Some("/data/secrets".to_string()),
+            Some("C:/AppData".to_string()),
+            Some("/xdg".to_string()),
+            Some("/home/user".to_string()),
+            Some(PathBuf::from("/cwd")),
+        )
+        .unwrap();
+        assert_eq!(dir, PathBuf::from("/data/secrets"));
+    }
+
+    #[test]
+    fn test_resolve_storage_dir_falls_back_to_cwd_when_env_unset() {
+        // Reproduces the Docker case: no APPDATA/XDG/HOME set.
+        let dir = resolve_storage_dir(None, None, None, None, Some(PathBuf::from("/app")))
+            .unwrap();
+        assert_eq!(dir, PathBuf::from("/app").join(".ai-gateway"));
+    }
+
+    #[test]
+    fn test_resolve_storage_dir_ignores_blank_values() {
+        let dir = resolve_storage_dir(
+            Some("   ".to_string()),
+            None,
+            Some(String::new()),
+            Some("/home/user".to_string()),
+            Some(PathBuf::from("/cwd")),
+        )
+        .unwrap();
+        assert_eq!(dir, PathBuf::from("/home/user").join(".config").join(APP_DIR_NAME));
+    }
+
+    #[test]
+    fn test_resolve_storage_dir_unavailable_without_any_source() {
+        let err = resolve_storage_dir(None, None, None, None, None).unwrap_err();
+        assert!(matches!(err, SecretError::StorageDirectoryUnavailable));
     }
 }

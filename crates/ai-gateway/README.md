@@ -158,6 +158,7 @@ context:
 | Variable | Purpose |
 |---|---|
 | `CONFIG_PATH` | Override config file location |
+| `AI_GATEWAY_DATA_DIR` | Override the secrets/master-key directory (recommended for Docker; mount a volume so encrypted keys persist) |
 | `OPENAI_API_KEY` | OpenAI provider API key (name matches `api_key_env` in config) |
 | `ADMIN_USERNAME` | Admin panel username (when `admin.auth.enabled: true`) |
 | `ADMIN_PASSWORD` | Admin panel password (when `admin.auth.enabled: true`) |

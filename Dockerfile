@@ -17,6 +17,13 @@ COPY --from=builder /app/target/release/ai-gateway /usr/local/bin/ai-gateway
 COPY crates/ai-gateway/config.example.yaml /app/config.yaml
 
 WORKDIR /app
+
+# Persist the encryption master key (and encrypted secrets) outside the
+# container layer. Mount a volume here so keys survive restarts/rebuilds.
+ENV AI_GATEWAY_DATA_DIR=/data
+RUN mkdir -p /data
+VOLUME ["/data"]
+
 EXPOSE 8080
 
 ENTRYPOINT ["ai-gateway"]
