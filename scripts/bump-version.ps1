@@ -51,24 +51,31 @@ $lastTag = git describe --tags --abbrev=0 HEAD~ 2>$null
 if (-not $lastTag) { $lastTag = (git rev-list --max-parents=0 HEAD) }
 
 $commits = git log "$lastTag..HEAD" --pretty=format:"- %s" --no-merges | Where-Object { $_ -notmatch "^- chore: bump version" }
-$changelog = "## What's Changed`n`n"
+
+$lines = @("## What's Changed", "")
 $features = $commits | Where-Object { $_ -match "^- feat" }
 $fixes    = $commits | Where-Object { $_ -match "^- fix" }
 $other    = $commits | Where-Object { $_ -notmatch "^- feat" -and $_ -notmatch "^- fix" }
 
-if ($features) { $changelog += "### Features`n$($features -join "`n")`n`n" }
-if ($fixes)    { $changelog += "### Fixes`n$($fixes -join "`n")`n`n" }
-if ($other)    { $changelog += "### Other`n$($other -join "`n")`n`n" }
+if ($features) { $lines += "### Features"; $lines += $features; $lines += "" }
+if ($fixes)    { $lines += "### Fixes";    $lines += $fixes;    $lines += "" }
+if ($other)    { $lines += "### Other";    $lines += $other;    $lines += "" }
 
-$changelog += "**Full Changelog**: https://github.com/fdanobey/OBEY-api-gateway/compare/$lastTag...v$newVersion"
+$lines += "**Full Changelog**: https://github.com/fdanobey/OBEY-api-gateway/compare/$lastTag...v$newVersion"
+
+$changelog = $lines -join "`n"
 
 Write-Host "`nChangelog:" -ForegroundColor Cyan
 Write-Host $changelog
 
-# --- Git commit + tag (annotated with changelog) ---
+# --- Git commit + tag (annotated with changelog via temp file) ---
 git add $cargoPath $issPath
 git commit -m "chore: bump version to $newVersion"
-git tag -a "v$newVersion" -m $changelog
+
+$tagMsgFile = [System.IO.Path]::GetTempFileName()
+Set-Content $tagMsgFile -Value $changelog -Encoding utf8NoBOM
+git tag -a "v$newVersion" -F $tagMsgFile
+Remove-Item $tagMsgFile -Force
 Write-Host "  Tagged v$newVersion (annotated)" -ForegroundColor Green
 
 if (-not $NoPush) {

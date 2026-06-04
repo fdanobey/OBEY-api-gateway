@@ -72,10 +72,17 @@ jobs:
         id: tag_body
         shell: pwsh
         run: |
-          $body = git tag -l --format='%(contents)' $env:GITHUB_REF_NAME
-          if (-not $body) { $body = "Release $env:GITHUB_REF_NAME" }
-          # Write to file to avoid multiline env var issues
-          $body | Set-Content "release-notes.md" -Encoding utf8
+          # Use git tag -l with double-quoted format so PowerShell resolves it
+          $body = git tag -l --format="%(contents)" $env:GITHUB_REF_NAME
+          if (-not $body -or $body.Trim() -eq "") {
+            # Fallback: generate notes from commits since the previous tag
+            $prevTag = git describe --tags --abbrev=0 "$env:GITHUB_REF_NAME^" 2>$null
+            if ($prevTag) {
+              $body = git log "$prevTag..$env:GITHUB_REF_NAME" --pretty=format:"- %s" --no-merges
+            }
+            if (-not $body) { $body = "Release $env:GITHUB_REF_NAME" }
+          }
+          $body | Set-Content "release-notes.md" -Encoding utf8NoBOM
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
