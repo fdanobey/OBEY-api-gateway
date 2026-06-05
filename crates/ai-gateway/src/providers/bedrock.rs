@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
+use aws_sdk_bedrock::Client as BedrockControlClient;
 use aws_sdk_bedrockruntime::{
     operation::invoke_model::InvokeModelOutput,
     primitives::Blob,
@@ -22,6 +23,7 @@ const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 /// Supported AWS Bedrock regions.
 pub const BEDROCK_REGIONS: &[&str] = &[
     "us-east-1",
+    "us-east-2",
     "us-west-2",
     "eu-west-1",
     "eu-west-3",
@@ -146,8 +148,10 @@ pub enum BedrockAuthMode {
     },
     /// AWS SDK authentication using credential chain (environment variables, credentials file, IAM role)
     AwsSdk {
-        /// AWS Bedrock Runtime client
+        /// AWS Bedrock Runtime client (inference)
         client: BedrockClient,
+        /// AWS Bedrock control-plane client (ListFoundationModels)
+        control_client: BedrockControlClient,
     },
 }
 
@@ -219,7 +223,8 @@ impl BedrockProvider {
                 .await;
 
             let client = BedrockClient::new(&config);
-            BedrockAuthMode::AwsSdk { client }
+            let control_client = BedrockControlClient::new(&config);
+            BedrockAuthMode::AwsSdk { client, control_client }
         };
 
         Ok(Self {
@@ -233,7 +238,7 @@ impl BedrockProvider {
     /// Returns None if using API key authentication.
     fn get_sdk_client(&self) -> Option<&BedrockClient> {
         match &self.auth_mode {
-            BedrockAuthMode::AwsSdk { client } => Some(client),
+            BedrockAuthMode::AwsSdk { client, .. } => Some(client),
             BedrockAuthMode::ApiKey { .. } => None,
         }
     }
@@ -682,6 +687,10 @@ impl BedrockProvider {
 
     /// Query the OpenAI-compatible `/models` endpoint on the Bedrock Mantle
     /// endpoint (API key mode only). Returns the live list of available models.
+    ///
+    /// Queries both the standard path (`/v1/models` for GPT-OSS, Claude, etc.)
+    /// and the OpenAI-specific path (`/openai/v1/models` for GPT-5.5, GPT-5.4)
+    /// and merges the results.
     async fn list_models_api_key(
         &self,
         http_client: &Client,
@@ -689,13 +698,73 @@ impl BedrockProvider {
         base_url: &str,
         custom_headers: &HashMap<String, String>,
     ) -> Result<Vec<Model>, GatewayError> {
-        let url = format!("{}/models", base_url.trim_end_matches('/'));
+        #[derive(Deserialize)]
+        struct ModelsResponse {
+            #[serde(default)]
+            data: Vec<Model>,
+        }
+
+        let mut all_models: Vec<Model> = Vec::new();
+
+        // 1) Standard Mantle path: /v1/models (GPT-OSS, open-weight models, etc.)
+        let standard_url = format!("{}/models", base_url.trim_end_matches('/'));
+        if let Ok(models) = self
+            .fetch_models_from_url(http_client, api_key, &standard_url, custom_headers)
+            .await
+        {
+            all_models.extend(models);
+        }
+
+        // 2) OpenAI-specific Mantle path: /openai/v1/models (GPT-5.5, GPT-5.4)
+        // The base_url is typically https://bedrock-mantle.{region}.api.aws/v1
+        // We need https://bedrock-mantle.{region}.api.aws/openai/v1/models
+        let openai_base = base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1");
+        let openai_url = format!("{}/openai/v1/models", openai_base);
+        if let Ok(models) = self
+            .fetch_models_from_url(http_client, api_key, &openai_url, custom_headers)
+            .await
+        {
+            // Deduplicate by model ID
+            let existing_ids: std::collections::HashSet<String> =
+                all_models.iter().map(|m| m.id.clone()).collect();
+            for m in models {
+                if !existing_ids.contains(&m.id) {
+                    all_models.push(m);
+                }
+            }
+        }
+
+        if all_models.is_empty() {
+            return Err(GatewayError::Provider {
+                provider: self.name.clone(),
+                message: "Both Mantle /models endpoints returned empty".to_string(),
+                status_code: None,
+            });
+        }
+
+        Ok(all_models)
+    }
+
+    /// Fetch models from a single URL endpoint. Returns Ok(vec) or Err on failure.
+    async fn fetch_models_from_url(
+        &self,
+        http_client: &Client,
+        api_key: &str,
+        url: &str,
+        custom_headers: &HashMap<String, String>,
+    ) -> Result<Vec<Model>, GatewayError> {
+        #[derive(Deserialize)]
+        struct ModelsResponse {
+            #[serde(default)]
+            data: Vec<Model>,
+        }
 
         let mut req_builder = http_client
-            .get(&url)
+            .get(url)
             .header("Authorization", format!("Bearer {}", api_key));
 
-        // Apply custom headers with environment variable resolution
         for (key, value) in custom_headers {
             let resolved = resolve_header_value(value);
             req_builder = req_builder.header(key.as_str(), resolved);
@@ -717,12 +786,6 @@ impl BedrockProvider {
                 message: format!("HTTP {}: {}", status.as_u16(), error_text),
                 status_code: Some(status.as_u16()),
             });
-        }
-
-        #[derive(Deserialize)]
-        struct ModelsResponse {
-            #[serde(default)]
-            data: Vec<Model>,
         }
 
         let parsed: ModelsResponse = response
@@ -906,7 +969,7 @@ impl ProviderClient for BedrockProvider {
                 // API key mode: use HTTP to Bedrock Mantle endpoint (OpenAI-compatible)
                 self.chat_completion_api_key(request, http_client, api_key, base_url, custom_headers).await
             }
-            BedrockAuthMode::AwsSdk { client } => {
+            BedrockAuthMode::AwsSdk { client, .. } => {
                 // AWS SDK mode: use traditional Bedrock API with request translation
                 let start = Instant::now();
                 let model_id = self.translate_model_id(&request.model);
@@ -948,7 +1011,7 @@ impl ProviderClient for BedrockProvider {
                 stream_request.stream = true;
                 self.chat_completion_stream_api_key(stream_request, http_client, api_key, base_url, custom_headers).await
             }
-            BedrockAuthMode::AwsSdk { client } => {
+            BedrockAuthMode::AwsSdk { client, .. } => {
                 // AWS SDK mode: use traditional Bedrock API with request translation
                 let model_id = self.translate_model_id(&request.model);
                 let body = self.translate_request(&request, &model_id)?;
@@ -1000,39 +1063,70 @@ impl ProviderClient for BedrockProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<Model>, GatewayError> {
-        // API key mode talks to the OpenAI-compatible Bedrock Mantle endpoint,
-        // which exposes a live `/models` listing. Query it so newly released
-        // models (e.g. openai.gpt-5.5 / openai.gpt-5.4) are picked up
-        // automatically without a code change.
-        if let BedrockAuthMode::ApiKey {
-            http_client,
-            api_key,
-            base_url,
-            custom_headers,
-        } = &self.auth_mode
-        {
-            match self
-                .list_models_api_key(http_client, api_key, base_url, custom_headers)
-                .await
-            {
-                Ok(models) if !models.is_empty() => return Ok(models),
-                Ok(_) => {
-                    // Empty response — fall through to the static backup list.
+        match &self.auth_mode {
+            // API key mode: query the OpenAI-compatible Bedrock Mantle /models endpoint.
+            BedrockAuthMode::ApiKey {
+                http_client,
+                api_key,
+                base_url,
+                custom_headers,
+            } => {
+                match self
+                    .list_models_api_key(http_client, api_key, base_url, custom_headers)
+                    .await
+                {
+                    Ok(models) if !models.is_empty() => return Ok(models),
+                    Ok(_) => {} // Empty response — fall through to backup
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = %self.name,
+                            error = %e,
+                            "Bedrock Mantle /models listing failed, using static backup list"
+                        );
+                    }
                 }
-                Err(e) => {
-                    // Network/endpoint failure — log and fall back so the
-                    // dashboard still shows a useful catalog.
-                    tracing::warn!(
-                        provider = %self.name,
-                        error = %e,
-                        "Bedrock Mantle /models listing failed, using static backup list"
-                    );
+            }
+            // SDK mode: use the ListFoundationModels control-plane API.
+            BedrockAuthMode::AwsSdk { control_client, .. } => {
+                match control_client
+                    .list_foundation_models()
+                    .send()
+                    .await
+                {
+                    Ok(output) => {
+                        let summaries = output.model_summaries();
+                        if !summaries.is_empty() {
+                            let models: Vec<Model> = summaries
+                                .iter()
+                                .map(|s| {
+                                    let id = s.model_id().to_string();
+                                    let owner = s.provider_name().unwrap_or("unknown").to_string();
+                                    Model {
+                                        id,
+                                        object: "model".to_string(),
+                                        owned_by: owner,
+                                        created: None,
+                                        context_window: None,
+                                        max_completion_tokens: None,
+                                    }
+                                })
+                                .collect();
+                            return Ok(models);
+                        }
+                        // Empty — fall through
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = %self.name,
+                            error = %e,
+                            "Bedrock ListFoundationModels failed, using static backup list"
+                        );
+                    }
                 }
             }
         }
 
-        // Backup list (used for AWS SDK mode and whenever the live listing is
-        // unavailable). Kept current with the models OBEY commonly routes to.
+        // Backup list (used whenever the live listing is unavailable).
         Ok(Self::backup_models())
     }
 
@@ -1137,10 +1231,15 @@ mod tests {
                 .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
                 .build()
         );
+        let control_client = BedrockControlClient::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .build()
+        );
         BedrockProvider {
             name: name.to_string(),
             region: region.to_string(),
-            auth_mode: BedrockAuthMode::AwsSdk { client },
+            auth_mode: BedrockAuthMode::AwsSdk { client, control_client },
         }
     }
 
@@ -1313,7 +1412,7 @@ mod tests {
 
     #[test]
     fn test_bedrock_regions_count() {
-        assert_eq!(BEDROCK_REGIONS.len(), 12);
+        assert_eq!(BEDROCK_REGIONS.len(), 13);
     }
 
     #[test]
@@ -1670,10 +1769,15 @@ mod property_tests {
                 .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
                 .build()
         );
+        let control_client = BedrockControlClient::from_conf(
+            aws_sdk_bedrock::Config::builder()
+                .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
+                .build()
+        );
         BedrockProvider {
             name: name.to_string(),
             region: region.to_string(),
-            auth_mode: BedrockAuthMode::AwsSdk { client },
+            auth_mode: BedrockAuthMode::AwsSdk { client, control_client },
         }
     }
 

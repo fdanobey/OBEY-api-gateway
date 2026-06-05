@@ -346,6 +346,7 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
               <select class="prov-region" aria-describedby="">
                 <option value="" disabled>-- select region --</option>
                 <option value="us-east-1" selected>us-east-1</option>
+                <option value="us-east-2">us-east-2</option>
                 <option value="us-west-2">us-west-2</option>
                 <option value="eu-west-1">eu-west-1</option>
                 <option value="eu-west-3">eu-west-3</option>
@@ -1504,18 +1505,40 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
     selectEl.innerHTML = '<option value="">Loading…</option>';
     // Proxy through backend to avoid CORS issues with external provider APIs
     var apiKey = getProviderApiKey(providerName);
+
+    // For Bedrock, query both the standard /v1 and the OpenAI-specific /openai/v1 paths
+    if (provType === 'bedrock') {
+      var openaiBase = baseUrl.replace(/\/v1\/?$/, '/openai/v1');
+      var proxyUrl1 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName);
+      var proxyUrl2 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(openaiBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName);
+      Promise.all([
+        fetch(proxyUrl1, { signal: AbortSignal.timeout(12000) }).then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};}),
+        fetch(proxyUrl2, { signal: AbortSignal.timeout(12000) }).then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};})
+      ]).then(function(results) {
+        var seen = {};
+        var models = [];
+        results.forEach(function(data) {
+          (data.data || []).forEach(function(m) {
+            var id = m.id || m.name || '';
+            if (id && !seen[id]) { seen[id] = true; models.push(id); }
+          });
+        });
+        if (!models.length) models = BEDROCK_BUILTIN_MODELS.slice();
+        populateSelect(models);
+      }).catch(function() {
+        populateSelect(BEDROCK_BUILTIN_MODELS.slice());
+      });
+      return;
+    }
+
     var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName);
     fetch(proxyUrl, { signal: AbortSignal.timeout(12000) })
       .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function(data) {
         var models = (data.data || []).map(function(m) { return m.id || m.name || ''; }).filter(Boolean);
-        // If API returned nothing for bedrock, use built-in catalog
-        if (!models.length && provType === 'bedrock') models = BEDROCK_BUILTIN_MODELS.slice();
         populateSelect(models);
       })
       .catch(function() {
-        // For bedrock, fall back to built-in catalog
-        if (provType === 'bedrock') { populateSelect(BEDROCK_BUILTIN_MODELS.slice()); return; }
         if (manualModels.length) { populateSelect([]); return; }
         // Fallback: replace select with text input for manual model entry
         var textInput = document.createElement('input');
@@ -1535,7 +1558,7 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
   // --- Bedrock Region Group Prefix (Req 4.3, 4.4) ---
   function getBedrockRegionPrefix(region) {
     var regionMap = {
-      'us-east-1': 'us.', 'us-west-2': 'us.',
+      'us-east-1': 'us.', 'us-east-2': 'us.', 'us-west-2': 'us.',
       'eu-west-1': 'eu.', 'eu-west-3': 'eu.', 'eu-central-1': 'eu.',
       'ap-northeast-1': 'ap.', 'ap-southeast-1': 'ap.', 'ap-southeast-2': 'ap.', 'ap-south-1': 'ap.'
     };
@@ -1545,21 +1568,33 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
   // --- Bedrock Model Auto-Discovery (Req 5.1, 5.2, 5.3, 5.4, 5.5) ---
   function fetchModelsForBedrock(region, apiKey, globalInference, selectEl, currentModel, manualModels, providerName) {
     var mantleBase = 'https://bedrock-mantle.' + region + '.api.aws/v1';
+    var openaiBase = 'https://bedrock-mantle.' + region + '.api.aws/openai/v1';
     selectEl.innerHTML = '<option value="">Loading…</option>';
 
-    // Proxy through backend to avoid CORS issues
-    var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(mantleBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName || '');
-    fetch(proxyUrl, { signal: AbortSignal.timeout(12000) })
-      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(function(data) {
-        var models = (data.data || []).map(function(m) { return m.id || m.name || ''; }).filter(Boolean);
-        if (!models.length) throw new Error('empty');
-        populateBedrockModelSelect(models, globalInference, region, selectEl, currentModel, manualModels);
-      })
-      .catch(function() {
-        // Fall back to built-in catalog
-        populateBedrockModelSelect(BEDROCK_BUILTIN_MODELS.slice(), globalInference, region, selectEl, currentModel, manualModels);
+    // Query both Mantle paths: /v1/models (open-weight) and /openai/v1/models (GPT-5.5, GPT-5.4)
+    var proxyUrl1 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(mantleBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName || '');
+    var proxyUrl2 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(openaiBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName || '');
+
+    var fetches = [
+      fetch(proxyUrl1, { signal: AbortSignal.timeout(12000) }).then(function(r) { return r.ok ? r.json() : { data: [] }; }).catch(function() { return { data: [] }; }),
+      fetch(proxyUrl2, { signal: AbortSignal.timeout(12000) }).then(function(r) { return r.ok ? r.json() : { data: [] }; }).catch(function() { return { data: [] }; })
+    ];
+
+    Promise.all(fetches).then(function(results) {
+      var seen = {};
+      var models = [];
+      results.forEach(function(data) {
+        (data.data || []).forEach(function(m) {
+          var id = m.id || m.name || '';
+          if (id && !seen[id]) { seen[id] = true; models.push(id); }
+        });
       });
+      if (!models.length) throw new Error('empty');
+      populateBedrockModelSelect(models, globalInference, region, selectEl, currentModel, manualModels);
+    }).catch(function() {
+      // Fall back to built-in catalog
+      populateBedrockModelSelect(BEDROCK_BUILTIN_MODELS.slice(), globalInference, region, selectEl, currentModel, manualModels);
+    });
   }
 
   function populateBedrockModelSelect(models, globalInference, region, selectEl, currentModel, manualModels) {

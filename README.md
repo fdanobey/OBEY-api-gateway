@@ -488,7 +488,7 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 | Vector DB | Qdrant (optional, for semantic cache) |
 | Crypto | ring + base64 |
 | TLS | rustls via axum-server |
-| AWS | aws-sdk-bedrockruntime + aws-config |
+| AWS | aws-sdk-bedrockruntime + aws-sdk-bedrock + aws-config |
 | CLI | clap |
 | Logging | tracing + tracing-subscriber |
 | Asset embedding | rust-embed |
