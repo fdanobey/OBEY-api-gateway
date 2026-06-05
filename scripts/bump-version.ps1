@@ -73,7 +73,7 @@ git add $cargoPath $issPath
 git commit -m "chore: bump version to $newVersion"
 
 $tagMsgFile = [System.IO.Path]::GetTempFileName()
-Set-Content $tagMsgFile -Value $changelog -Encoding utf8NoBOM
+[System.IO.File]::WriteAllText($tagMsgFile, $changelog, (New-Object System.Text.UTF8Encoding($false)))
 git tag -a "v$newVersion" -F $tagMsgFile
 Remove-Item $tagMsgFile -Force
 Write-Host "  Tagged v$newVersion (annotated)" -ForegroundColor Green
