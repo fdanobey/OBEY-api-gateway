@@ -400,6 +400,19 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
             <span class="oauth-state-label">Status:</span>
             <span class="oauth-state-badge state-unauthenticated prov-oauth-badge">Checking…</span>
           </div>
+          <div class="oauth-usage" style="display:none;margin:.75rem 0;padding:.6rem .75rem;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);font-size:.8rem">
+            <div style="font-weight:600;margin-bottom:.4rem;font-size:.8rem">Usage Limits</div>
+            <div class="oauth-usage-requests" style="margin-bottom:.35rem">
+              <span class="oauth-usage-req-label">Requests:</span>
+              <span class="oauth-usage-req-value" style="font-weight:500">—</span>
+              <span class="oauth-usage-req-reset" style="color:var(--text-muted);margin-left:.4rem"></span>
+            </div>
+            <div class="oauth-usage-tokens">
+              <span class="oauth-usage-tok-label">Tokens:</span>
+              <span class="oauth-usage-tok-value" style="font-weight:500">—</span>
+              <span class="oauth-usage-tok-reset" style="color:var(--text-muted);margin-left:.4rem"></span>
+            </div>
+          </div>
           <div class="oauth-fields-actions">
             <button type="button" class="btn btn-primary btn-sm prov-oauth-login">Sign in with OpenAI</button>
             <button type="button" class="btn btn-danger btn-sm prov-oauth-logout" style="display:none">Sign Out</button>
@@ -1789,11 +1802,65 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
         badge.className = 'oauth-state-badge prov-oauth-badge state-' + state;
         loginBtn.style.display = (state === 'authenticated' || state === 'refreshing') ? 'none' : '';
         logoutBtn.style.display = (state === 'authenticated' || state === 'refreshing') ? '' : 'none';
+        // Fetch usage when authenticated
+        if (state === 'authenticated' || state === 'refreshing') {
+          fetchOAuthUsageForCard(card);
+        } else {
+          var usageEl = card.querySelector('.oauth-usage');
+          if (usageEl) usageEl.style.display = 'none';
+        }
       })
       .catch(function() {
         badge.textContent = 'Unavailable';
         badge.className = 'oauth-state-badge prov-oauth-badge state-unauthenticated';
       });
+  }
+
+  function formatResetTime(resets_at) {
+    if (!resets_at) return '';
+    var now = Math.floor(Date.now() / 1000);
+    var secs = resets_at - now;
+    if (secs <= 0) return '(resetting…)';
+    if (secs < 60) return '(resets in ' + secs + 's)';
+    if (secs < 3600) return '(resets in ' + Math.ceil(secs / 60) + 'm)';
+    var h = Math.floor(secs / 3600);
+    var m = Math.ceil((secs % 3600) / 60);
+    return '(resets in ' + h + 'h' + (m > 0 ? ' ' + m + 'm' : '') + ')';
+  }
+
+  function formatUsageWindow(window) {
+    if (!window || window.limit == null || window.remaining == null) return '—';
+    var used = window.limit - window.remaining;
+    return used + ' / ' + window.limit;
+  }
+
+  function fetchOAuthUsageForCard(card) {
+    var usageEl = card.querySelector('.oauth-usage');
+    if (!usageEl) return;
+    fetch(apiUrl('oauth/openai/usage'))
+      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function(data) {
+        if (!data.updated_at) { usageEl.style.display = 'none'; return; }
+        usageEl.style.display = 'block';
+        var reqVal = card.querySelector('.oauth-usage-req-value');
+        var reqReset = card.querySelector('.oauth-usage-req-reset');
+        var tokVal = card.querySelector('.oauth-usage-tok-value');
+        var tokReset = card.querySelector('.oauth-usage-tok-reset');
+        reqVal.textContent = formatUsageWindow(data.requests);
+        reqReset.textContent = formatResetTime(data.requests && data.requests.resets_at);
+        tokVal.textContent = formatUsageWindow(data.tokens);
+        tokReset.textContent = formatResetTime(data.tokens && data.tokens.resets_at);
+        // Color code when usage is high
+        if (data.requests && data.requests.limit && data.requests.remaining != null) {
+          var pct = ((data.requests.limit - data.requests.remaining) / data.requests.limit) * 100;
+          reqVal.style.color = pct >= 90 ? 'var(--danger)' : pct >= 70 ? '#856404' : 'var(--text)';
+        }
+        if (data.tokens && data.tokens.limit && data.tokens.remaining != null) {
+          var pct = ((data.tokens.limit - data.tokens.remaining) / data.tokens.limit) * 100;
+          tokVal.style.color = pct >= 90 ? 'var(--danger)' : pct >= 70 ? '#856404' : 'var(--text)';
+        }
+      })
+      .catch(function() { usageEl.style.display = 'none'; });
   }
 
   function wireOAuthButtons(card) {

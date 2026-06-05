@@ -48,6 +48,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/test-connection", post(test_connection))
         .route("/oauth/openai/login", post(oauth_login))
         .route("/oauth/openai/status", get(oauth_status))
+        .route("/oauth/openai/usage", get(oauth_usage))
         .route("/oauth/openai/logout", post(oauth_logout))
         .route("/", get(index_handler))
         .route("/{*path}", get(static_handler))
@@ -1013,6 +1014,15 @@ async fn oauth_status(State(state): State<AppState>) -> Response {
         })),
     )
         .into_response()
+}
+
+/// GET /admin/oauth/openai/usage — Return current rate-limit usage snapshot.
+///
+/// Returns the captured `x-ratelimit-*` header data so the admin UI can
+/// display the 5h / weekly usage windows for browser-login accounts.
+async fn oauth_usage(State(state): State<AppState>) -> Response {
+    let snapshot = state.oauth_usage_tracker.snapshot().await;
+    (StatusCode::OK, Json(json!(snapshot))).into_response()
 }
 
 /// POST /admin/oauth/openai/logout — Clear stored tokens (Req 7.3)
@@ -2008,6 +2018,7 @@ retry:
         let endpoints: &[(&str, &str)] = &[
             ("POST", "/admin/oauth/openai/login"),
             ("GET", "/admin/oauth/openai/status"),
+            ("GET", "/admin/oauth/openai/usage"),
             ("POST", "/admin/oauth/openai/logout"),
         ];
 

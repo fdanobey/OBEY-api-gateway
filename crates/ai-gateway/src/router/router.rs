@@ -33,6 +33,10 @@ pub struct Router {
     /// Codex system instructions store. Populated at startup when at least one
     /// Codex-capable provider (oauth+openai) is configured.
     instructions_store: Option<Arc<crate::codex::InstructionsStore>>,
+    /// Tracks OpenAI rate-limit headers for OAuth providers (browser login).
+    /// Used to display usage in admin UI and as fallback cooldown when
+    /// no Retry-After header is present on 429 responses.
+    oauth_usage_tracker: Option<Arc<crate::oauth::UsageTracker>>,
 }
 
 impl Router {
@@ -52,6 +56,7 @@ impl Router {
             metrics,
             oauth_manager: None,
             instructions_store: None,
+            oauth_usage_tracker: None,
         }
     }
 
@@ -67,6 +72,7 @@ impl Router {
             metrics,
             oauth_manager: None,
             instructions_store: None,
+            oauth_usage_tracker: None,
         }
     }
 
@@ -75,6 +81,12 @@ impl Router {
     /// per request. Called once during gateway startup (task 14.1).
     pub fn set_oauth_manager(&mut self, manager: Arc<crate::oauth::OAuthManager>) {
         self.oauth_manager = Some(manager);
+    }
+
+    /// Attach a [`UsageTracker`](crate::oauth::UsageTracker) for capturing
+    /// OpenAI rate-limit headers from OAuth provider responses.
+    pub fn set_oauth_usage_tracker(&mut self, tracker: Arc<crate::oauth::UsageTracker>) {
+        self.oauth_usage_tracker = Some(tracker);
     }
 
     /// Attach an [`InstructionsStore`](crate::codex::InstructionsStore) for
@@ -693,20 +705,75 @@ impl Router {
     }
 
     /// Interpret a header value as either an epoch-seconds timestamp
-    /// (large number) or a relative-seconds delta (small number). Returns
-    /// the resulting `Duration` from "now" until the reset.
+    /// (large number), a relative-seconds delta (small number), or a
+    /// Go-style duration string (e.g. "6m0s", "4h32m10s"). Returns the
+    /// resulting `Duration` from "now" until the reset.
     fn duration_until_epoch_or_relative(v: &str) -> Option<Duration> {
-        let secs: u64 = v.parse().ok()?;
-        let now_epoch = chrono::Utc::now().timestamp() as u64;
-        if secs > now_epoch.saturating_sub(60 * 60 * 24)
-            && secs < now_epoch.saturating_add(60 * 60 * 24 * 365)
-        {
-            // Plausible epoch timestamp.
-            let delta = secs.saturating_sub(now_epoch);
-            return Some(Duration::from_secs(delta));
+        // Try plain integer first (epoch or relative seconds).
+        if let Ok(secs) = v.parse::<u64>() {
+            let now_epoch = chrono::Utc::now().timestamp() as u64;
+            if secs > now_epoch.saturating_sub(60 * 60 * 24)
+                && secs < now_epoch.saturating_add(60 * 60 * 24 * 365)
+            {
+                // Plausible epoch timestamp.
+                let delta = secs.saturating_sub(now_epoch);
+                return Some(Duration::from_secs(delta));
+            }
+            // Otherwise treat as relative seconds.
+            return Some(Duration::from_secs(secs));
         }
-        // Otherwise treat as relative seconds.
-        Some(Duration::from_secs(secs))
+
+        // Try Go-style duration format: "4h32m10s", "6m0s", "12ms", etc.
+        Self::parse_go_duration(v)
+    }
+
+    /// Parse a Go-style duration string like "4h32m10s", "6m0s", "12ms".
+    /// Returns None if the string cannot be parsed.
+    fn parse_go_duration(s: &str) -> Option<Duration> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let mut total_secs: u64 = 0;
+        let mut current_num = String::new();
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c.is_ascii_digit() || c == '.' {
+                current_num.push(c);
+                i += 1;
+            } else if c == 'm' && i + 1 < chars.len() && chars[i + 1] == 's' {
+                // milliseconds — round up to at least 1s
+                if let Ok(ms) = current_num.parse::<f64>() {
+                    total_secs += (ms / 1000.0).ceil().max(1.0) as u64;
+                }
+                current_num.clear();
+                i += 2;
+            } else {
+                if let Ok(num) = current_num.parse::<f64>() {
+                    match c {
+                        'd' => total_secs += (num * 86400.0) as u64,
+                        'h' => total_secs += (num * 3600.0) as u64,
+                        'm' => total_secs += (num * 60.0) as u64,
+                        's' => total_secs += num as u64,
+                        _ => {}
+                    }
+                }
+                current_num.clear();
+                i += 1;
+            }
+        }
+        if !current_num.is_empty() {
+            if let Ok(num) = current_num.parse::<u64>() {
+                total_secs += num;
+            }
+        }
+        if total_secs > 0 {
+            Some(Duration::from_secs(total_secs))
+        } else {
+            None
+        }
     }
 
     fn cooldown_from_body(body: &str) -> Option<Duration> {
@@ -1173,6 +1240,17 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                     let status = response.status();
                     let status_code = status.as_u16();
                     let response_headers = response.headers().clone();
+
+                    // Capture rate-limit headers for OAuth provider usage tracking.
+                    if oauth_bearer.is_some() {
+                        if let Some(tracker) = &self.oauth_usage_tracker {
+                            let tracker = tracker.clone();
+                            let hdrs = response_headers.clone();
+                            tokio::spawn(async move {
+                                tracker.update_from_headers(&hdrs).await;
+                            });
+                        }
+                    }
                     
                     // Read body with remaining total timeout budget
                     let elapsed = request_start.elapsed();

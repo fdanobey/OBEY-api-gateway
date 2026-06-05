@@ -37,6 +37,7 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub shutting_down: Arc<AtomicBool>,
     pub oauth_manager: Option<Arc<OAuthManager>>,
+    pub oauth_usage_tracker: Arc<crate::oauth::UsageTracker>,
     pub codex_models_discovery: Arc<crate::codex::models_discovery::ModelsDiscovery>,
 }
 
@@ -133,6 +134,10 @@ impl GatewayServer {
             }
         }
 
+        // --- OAuth UsageTracker wiring ---
+        let oauth_usage_tracker = Arc::new(crate::oauth::UsageTracker::new());
+        router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
+
         let state = AppState {
             config: config_arc,
             config_path: Arc::new(config_path.unwrap_or_else(|| std::path::PathBuf::from("./config.yaml"))),
@@ -143,6 +148,7 @@ impl GatewayServer {
             metrics,
             shutting_down: Arc::new(AtomicBool::new(false)),
             oauth_manager,
+            oauth_usage_tracker,
             codex_models_discovery: Arc::new(crate::codex::models_discovery::ModelsDiscovery::new()),
         };
 

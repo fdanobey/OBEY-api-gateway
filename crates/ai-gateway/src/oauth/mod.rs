@@ -18,6 +18,7 @@ pub mod manager;
 pub mod pkce;
 pub mod store;
 pub mod token;
+pub mod usage_tracker;
 
 pub use callback::{start_callback_server, AuthorizationCode};
 pub use error::OAuthError;
@@ -34,6 +35,7 @@ pub use store::OAuthTokenStore;
 pub use token::{
     exchange_code, refresh_access_token, TokenResponse, OPENAI_CLIENT_ID, TOKEN_ENDPOINT,
 };
+pub use usage_tracker::UsageTracker;
 
 // Additional re-exports are added as each submodule lands in subsequent tasks
 // (5.x flow).
