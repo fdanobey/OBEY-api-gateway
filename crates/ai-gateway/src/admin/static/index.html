@@ -1517,13 +1517,15 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
       ]).then(function(results) {
         var seen = {};
         var models = [];
+        // Always include the built-in catalog so new models always appear
+        BEDROCK_BUILTIN_MODELS.forEach(function(id) { if (!seen[id]) { seen[id] = true; models.push(id); } });
+        // Merge any live-discovered models on top
         results.forEach(function(data) {
           (data.data || []).forEach(function(m) {
             var id = m.id || m.name || '';
             if (id && !seen[id]) { seen[id] = true; models.push(id); }
           });
         });
-        if (!models.length) models = BEDROCK_BUILTIN_MODELS.slice();
         populateSelect(models);
       }).catch(function() {
         populateSelect(BEDROCK_BUILTIN_MODELS.slice());
@@ -1583,13 +1585,15 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
     Promise.all(fetches).then(function(results) {
       var seen = {};
       var models = [];
+      // Always include the built-in catalog so new models are guaranteed visible
+      BEDROCK_BUILTIN_MODELS.forEach(function(id) { if (!seen[id]) { seen[id] = true; models.push(id); } });
+      // Merge in live-discovered models
       results.forEach(function(data) {
         (data.data || []).forEach(function(m) {
           var id = m.id || m.name || '';
           if (id && !seen[id]) { seen[id] = true; models.push(id); }
         });
       });
-      if (!models.length) throw new Error('empty');
       populateBedrockModelSelect(models, globalInference, region, selectEl, currentModel, manualModels);
     }).catch(function() {
       // Fall back to built-in catalog

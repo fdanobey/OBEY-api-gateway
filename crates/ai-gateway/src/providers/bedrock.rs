@@ -1063,6 +1063,8 @@ impl ProviderClient for BedrockProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<Model>, GatewayError> {
+        let mut live_models: Vec<Model> = Vec::new();
+
         match &self.auth_mode {
             // API key mode: query the OpenAI-compatible Bedrock Mantle /models endpoint.
             BedrockAuthMode::ApiKey {
@@ -1075,13 +1077,12 @@ impl ProviderClient for BedrockProvider {
                     .list_models_api_key(http_client, api_key, base_url, custom_headers)
                     .await
                 {
-                    Ok(models) if !models.is_empty() => return Ok(models),
-                    Ok(_) => {} // Empty response — fall through to backup
+                    Ok(models) => { live_models = models; }
                     Err(e) => {
                         tracing::warn!(
                             provider = %self.name,
                             error = %e,
-                            "Bedrock Mantle /models listing failed, using static backup list"
+                            "Bedrock Mantle /models listing failed, merging backup list only"
                         );
                     }
                 }
@@ -1095,39 +1096,46 @@ impl ProviderClient for BedrockProvider {
                 {
                     Ok(output) => {
                         let summaries = output.model_summaries();
-                        if !summaries.is_empty() {
-                            let models: Vec<Model> = summaries
-                                .iter()
-                                .map(|s| {
-                                    let id = s.model_id().to_string();
-                                    let owner = s.provider_name().unwrap_or("unknown").to_string();
-                                    Model {
-                                        id,
-                                        object: "model".to_string(),
-                                        owned_by: owner,
-                                        created: None,
-                                        context_window: None,
-                                        max_completion_tokens: None,
-                                    }
-                                })
-                                .collect();
-                            return Ok(models);
-                        }
-                        // Empty — fall through
+                        live_models = summaries
+                            .iter()
+                            .map(|s| {
+                                let id = s.model_id().to_string();
+                                let owner = s.provider_name().unwrap_or("unknown").to_string();
+                                Model {
+                                    id,
+                                    object: "model".to_string(),
+                                    owned_by: owner,
+                                    created: None,
+                                    context_window: None,
+                                    max_completion_tokens: None,
+                                }
+                            })
+                            .collect();
                     }
                     Err(e) => {
                         tracing::warn!(
                             provider = %self.name,
                             error = %e,
-                            "Bedrock ListFoundationModels failed, using static backup list"
+                            "Bedrock ListFoundationModels failed, merging backup list only"
                         );
                     }
                 }
             }
         }
 
-        // Backup list (used whenever the live listing is unavailable).
-        Ok(Self::backup_models())
+        // Always merge the backup catalog so models like openai.gpt-5.5 / openai.gpt-5.4
+        // are guaranteed to appear even if the live listing doesn't include them
+        // (they live on a separate /openai/v1 Mantle path that ListFoundationModels
+        // and the standard /v1/models may not cover).
+        let existing_ids: std::collections::HashSet<String> =
+            live_models.iter().map(|m| m.id.clone()).collect();
+        for backup in Self::backup_models() {
+            if !existing_ids.contains(&backup.id) {
+                live_models.push(backup);
+            }
+        }
+
+        Ok(live_models)
     }
 
     fn provider_name(&self) -> &str {
