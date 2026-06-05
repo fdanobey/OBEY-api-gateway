@@ -47,6 +47,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/providers/models", get(proxy_provider_models))
         .route("/test-connection", post(test_connection))
         .route("/oauth/openai/login", post(oauth_login))
+        .route("/oauth/openai/complete", post(oauth_complete))
         .route("/oauth/openai/status", get(oauth_status))
         .route("/oauth/openai/usage", get(oauth_usage))
         .route("/oauth/openai/logout", post(oauth_logout))
@@ -964,6 +965,78 @@ async fn oauth_login(State(state): State<AppState>) -> Response {
             Json(json!({
                 "error": {
                     "message": format!("Failed to initiate OAuth login: {}", e),
+                    "type": "oauth_error"
+                }
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /admin/oauth/openai/complete — Complete login with a manually-pasted
+/// authorization code (headless / remote Docker case).
+///
+/// Body: `{ "code": "<authorization code or full redirect URL>" }`
+///
+/// When the gateway runs in a container on a different host than the user's
+/// browser, OpenAI's redirect to `http://localhost:1455/...` cannot reach the
+/// container. The user copies the resulting URL (or just the `code`) and
+/// submits it here. Requires a prior `POST /admin/oauth/openai/login` so the
+/// PKCE verifier is available.
+async fn oauth_complete(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let manager = match &state.oauth_manager {
+        Some(m) => m.clone(),
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {
+                        "message": "OAuth not configured",
+                        "type": "configuration_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let code = body
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if code.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": "Missing 'code' — paste the authorization code or the full redirect URL",
+                    "type": "invalid_request"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    match manager.complete_login_with_code(&code).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "authenticated",
+                "message": "Sign-in completed"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": format!("Failed to complete OAuth login: {}", e),
                     "type": "oauth_error"
                 }
             })),

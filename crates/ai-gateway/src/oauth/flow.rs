@@ -270,6 +270,13 @@ impl OAuthFlow {
         self.redirect_uri.as_deref()
     }
 
+    /// CSRF `state` value captured by the most recent [`Self::initiate`] call,
+    /// if any. Used by the manual authorization-code entry path to validate
+    /// the `state` pasted back by the user (headless / remote Docker case).
+    pub(crate) fn expected_state(&self) -> Option<&str> {
+        self.expected_state.as_deref()
+    }
+
     /// Kick off an OAuth login attempt (task 5.3).
     ///
     /// Steps, per design §2:

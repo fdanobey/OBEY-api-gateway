@@ -417,6 +417,13 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
             <button type="button" class="btn btn-primary btn-sm prov-oauth-login">Sign in with OpenAI</button>
             <button type="button" class="btn btn-danger btn-sm prov-oauth-logout" style="display:none">Sign Out</button>
           </div>
+          <div class="oauth-manual" style="display:none;margin-top:.6rem">
+            <div class="hint" style="margin-bottom:.3rem">Running headless or in Docker? After signing in, your browser will be redirected to a <code>localhost:1455</code> page that fails to load. Copy that full URL (or just the <code>code</code> value) from the address bar and paste it here:</div>
+            <div style="display:flex;gap:.5rem;align-items:flex-start">
+              <input type="text" class="prov-oauth-code" placeholder="http://localhost:1455/auth/callback?code=… or the code value" autocomplete="off" style="flex:1;padding:.4rem .6rem;border:1px solid var(--border);border-radius:var(--radius);font-size:.8rem;font-family:monospace">
+              <button type="button" class="btn btn-secondary btn-sm prov-oauth-submit-code">Submit Code</button>
+            </div>
+          </div>
           <div class="oauth-fields-msg prov-oauth-msg" style="display:none"></div>
         </div>
         <div style="margin-top:.5rem">
@@ -1867,6 +1874,9 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
     var loginBtn = card.querySelector('.prov-oauth-login');
     var logoutBtn = card.querySelector('.prov-oauth-logout');
     var msgEl = card.querySelector('.prov-oauth-msg');
+    var manualEl = card.querySelector('.oauth-manual');
+    var codeInput = card.querySelector('.prov-oauth-code');
+    var submitCodeBtn = card.querySelector('.prov-oauth-submit-code');
 
     loginBtn.addEventListener('click', function() {
       loginBtn.disabled = true;
@@ -1882,17 +1892,22 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
             setStatus('OAuth login failed');
             return;
           }
+          // Always reveal the manual code-entry fallback: in Docker/headless
+          // setups the localhost:1455 callback can't reach the gateway, so the
+          // user completes the flow by pasting the code back.
+          if (manualEl) manualEl.style.display = 'block';
           if (res.data.status === 'manual_required') {
-            msgEl.textContent = 'Browser could not open. ';
+            msgEl.textContent = 'Browser could not open automatically. ';
             msgEl.className = 'oauth-fields-msg prov-oauth-msg msg-info';
             var link = document.createElement('a');
             link.href = res.data.auth_url; link.target = '_blank'; link.rel = 'noopener';
             link.textContent = 'Click here to sign in';
             msgEl.appendChild(link);
+            msgEl.appendChild(document.createTextNode(' then paste the resulting URL below.'));
             msgEl.style.display = 'block';
             setStatus('OAuth: manual browser navigation required');
           } else {
-            msgEl.textContent = 'Browser opened — complete sign-in there.';
+            msgEl.textContent = 'Browser opened — complete sign-in there. If the callback page fails to load (Docker/remote), paste its URL below.';
             msgEl.className = 'oauth-fields-msg prov-oauth-msg msg-success';
             msgEl.style.display = 'block';
             setStatus('OAuth login initiated');
@@ -1903,6 +1918,7 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
               var badge = card.querySelector('.prov-oauth-badge');
               if (badge.textContent === 'Authenticated') {
                 clearInterval(pollInterval);
+                if (manualEl) manualEl.style.display = 'none';
                 msgEl.textContent = 'Signed in successfully.';
                 msgEl.className = 'oauth-fields-msg prov-oauth-msg msg-success';
                 setStatus('OAuth login complete');
@@ -1918,6 +1934,48 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
         })
         .finally(function() { loginBtn.disabled = false; });
     });
+
+    if (submitCodeBtn) {
+      submitCodeBtn.addEventListener('click', function() {
+        var code = (codeInput.value || '').trim();
+        if (!code) {
+          msgEl.textContent = 'Paste the redirect URL or authorization code first.';
+          msgEl.className = 'oauth-fields-msg prov-oauth-msg msg-error';
+          msgEl.style.display = 'block';
+          return;
+        }
+        submitCodeBtn.disabled = true;
+        msgEl.textContent = 'Completing sign-in…';
+        msgEl.className = 'oauth-fields-msg prov-oauth-msg msg-info';
+        msgEl.style.display = 'block';
+        setStatus('Completing OAuth sign-in…');
+        fetch(apiUrl('oauth/openai/complete'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: code })
+        })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+          .then(function(res) {
+            if (!res.ok) {
+              msgEl.textContent = res.data.error ? res.data.error.message : 'Sign-in failed';
+              msgEl.className = 'oauth-fields-msg prov-oauth-msg msg-error';
+              setStatus('OAuth sign-in failed');
+              return;
+            }
+            codeInput.value = '';
+            if (manualEl) manualEl.style.display = 'none';
+            msgEl.textContent = 'Signed in successfully.';
+            msgEl.className = 'oauth-fields-msg prov-oauth-msg msg-success';
+            setStatus('OAuth login complete');
+            fetchOAuthStatusForCard(card);
+          })
+          .catch(function(err) {
+            msgEl.textContent = 'Request failed: ' + err.message;
+            msgEl.className = 'oauth-fields-msg prov-oauth-msg msg-error';
+          })
+          .finally(function() { submitCodeBtn.disabled = false; });
+      });
+    }
 
     logoutBtn.addEventListener('click', function() {
       logoutBtn.disabled = true;
