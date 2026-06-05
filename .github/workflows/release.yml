@@ -68,21 +68,45 @@ jobs:
           Copy-Item "dist/*" "release/" -Recurse -Force
           & $iscc "scripts/installer.iss"
 
-      - name: Extract tag annotation
-        id: tag_body
+      - name: Generate release notes
+        id: notes
         shell: pwsh
         run: |
-          # Use git tag -l with double-quoted format so PowerShell resolves it
-          $body = git tag -l --format="%(contents)" $env:GITHUB_REF_NAME
-          if (-not $body -or $body.Trim() -eq "") {
-            # Fallback: generate notes from commits since the previous tag
-            $prevTag = git describe --tags --abbrev=0 "$env:GITHUB_REF_NAME^" 2>$null
-            if ($prevTag) {
-              $body = git log "$prevTag..$env:GITHUB_REF_NAME" --pretty=format:"- %s" --no-merges
-            }
-            if (-not $body) { $body = "Release $env:GITHUB_REF_NAME" }
+          # Source of truth is git history, NOT the tag annotation.
+          # actions/checkout replaces annotated tags with lightweight tags,
+          # so the annotation is not reliable in CI. We rebuild notes here.
+          $tag  = $env:GITHUB_REF_NAME
+          $repo = $env:GITHUB_REPOSITORY
+
+          # Previous tag reachable from this tag's parent (linear history).
+          $prevTag = git describe --tags --abbrev=0 "$tag^" 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not $prevTag) {
+            $range   = $tag                       # first release: everything up to tag
+            $prevTag = $null
+          } else {
+            $range = "$prevTag..$tag"
           }
-          $body | Set-Content "release-notes.md" -Encoding utf8NoBOM
+
+          $commits = @(git log $range --pretty=format:"- %s" --no-merges |
+                       Where-Object { $_ -notmatch "^- chore: bump version" })
+
+          $features = @($commits | Where-Object { $_ -match "^- feat" })
+          $fixes    = @($commits | Where-Object { $_ -match "^- fix" })
+          $other    = @($commits | Where-Object { $_ -notmatch "^- feat" -and $_ -notmatch "^- fix" })
+
+          $lines = @("## What's Changed", "")
+          if ($features) { $lines += "### Features"; $lines += $features; $lines += "" }
+          if ($fixes)    { $lines += "### Fixes";    $lines += $fixes;    $lines += "" }
+          if ($other)    { $lines += "### Other";    $lines += $other;    $lines += "" }
+          if (-not ($features -or $fixes -or $other)) { $lines += "_No notable changes._"; $lines += "" }
+
+          if ($prevTag) {
+            $lines += "**Full Changelog**: https://github.com/$repo/compare/$prevTag...$tag"
+          }
+
+          $body = $lines -join "`n"
+          Write-Host $body
+          Set-Content -Path "release-notes.md" -Value $body -Encoding utf8NoBOM
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
