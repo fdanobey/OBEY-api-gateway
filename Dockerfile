@@ -24,7 +24,11 @@ ENV AI_GATEWAY_DATA_DIR=/data
 RUN mkdir -p /data
 VOLUME ["/data"]
 
-EXPOSE 8080
+# Bind the OAuth callback server to all interfaces so the host browser
+# redirect to localhost:1455 can reach the container.
+ENV OAUTH_CALLBACK_BIND_HOST=0.0.0.0
+
+EXPOSE 8080 1455
 
 ENTRYPOINT ["ai-gateway"]
 CMD ["--config", "/app/config.yaml"]

@@ -310,8 +310,14 @@ impl OAuthFlow {
 
         // 2. Bind the callback server FIRST so we know the actual port.
         //    Port 0 means the OS assigns an ephemeral port.
-        let addr: std::net::SocketAddr =
-            (std::net::Ipv4Addr::LOCALHOST, callback_port).into();
+        //    In container environments (e.g. Docker), the callback must be
+        //    reachable from the host browser, so we bind to 0.0.0.0 when
+        //    OAUTH_CALLBACK_BIND_HOST is set (Dockerfile sets this).
+        let bind_host: std::net::Ipv4Addr = std::env::var("OAUTH_CALLBACK_BIND_HOST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+        let addr: std::net::SocketAddr = (bind_host, callback_port).into();
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|source| OAuthError::CallbackBindFailed {
