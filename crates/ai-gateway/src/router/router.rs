@@ -1,4 +1,4 @@
-use crate::config::{Config, ContextConfig, ModelGroup, ProviderModel};
+use crate::config::{Config, ContextConfig, ModelGroup, Provider, ProviderModel};
 use crate::context::ContextManager;
 use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
 use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
@@ -37,6 +37,29 @@ pub struct Router {
     /// Used to display usage in admin UI and as fallback cooldown when
     /// no Retry-After header is present on 429 responses.
     oauth_usage_tracker: Option<Arc<crate::oauth::UsageTracker>>,
+}
+
+/// Result of [`Router::route_request_streaming`].
+///
+/// Either a live upstream streaming body that the handler relays chunk-by-chunk
+/// (true pass-through), or a fully buffered response produced by the existing
+/// non-streaming path when the provider needs response transformation or
+/// pass-through is disabled.
+///
+/// No derives: `reqwest::Response` is not `Clone` and carries a live body, so
+/// the variant must be consumed by the streaming relay (task 5.3).
+///
+/// Requirements: 3.1, 3.8, 3.9
+// Consumed by the streaming handler wired up in task 5.5.
+pub enum StreamingResponse {
+    /// True streaming pass-through: forward the upstream SSE body as-is.
+    PassThrough {
+        byte_stream: reqwest::Response,
+        provider: String,
+        model: String,
+    },
+    /// Buffer-and-replay fallback: a complete response the handler re-chunks.
+    Buffered(OpenAIResponse),
 }
 
 impl Router {
@@ -284,6 +307,29 @@ impl Router {
         
         self.circuit_breakers.insert(provider.to_string(), cb.clone());
         cb
+    }
+
+    /// Record a circuit-breaker failure for a provider that disconnected or
+    /// errored during a true-streaming pass-through relay (Req 4.5).
+    ///
+    /// The pass-through path in [`Self::route_request_streaming_excluding`]
+    /// hands the live body to the handler without observing mid-stream
+    /// failures, so the handler calls this when the relay fails — either before
+    /// any content was forwarded (task 6.1, transparent failover) or after
+    /// content was already sent (task 6.2, error event + close). In both cases
+    /// the breaker must account for the failed attempt. The circuit-breaker key
+    /// matches the gating key (`"{provider}:{model}"`).
+    ///
+    /// `reason` is recorded verbatim on the Provider Health dashboard via
+    /// [`Metrics::record_provider_failure_with_reason`], keeping the streaming
+    /// failure path consistent with the non-streaming failover path. Pass
+    /// `None` to leave the previous dashboard reason untouched.
+    pub async fn record_streaming_failure(&self, provider: &str, model: &str, reason: Option<String>) {
+        let cb_key = format!("{}:{}", provider, model);
+        let cb = self.get_circuit_breaker(&cb_key).await;
+        cb.record_failure().await;
+        self.metrics
+            .record_provider_failure_with_reason(provider, reason, None);
     }
 
     /// Get or create rate limiter for a provider
@@ -1133,36 +1179,7 @@ impl Router {
         // It is appended as the last system message so it doesn't override the
         // client's system prompt.
         if has_tools {
-            outgoing.messages.push(Message {
-                role: "system".to_string(),
-                content: serde_json::Value::String(
-                    r#"TOOL CALLING RULES:
-You have access to tools through the API's native function-calling interface.
-If you need a tool, respond with native `tool_calls` only. Do not write XML tags, pseudo-XML, markdown code fences, or plain-text tool instructions.
-
-Use the exact tool name from the provided tools list. Arguments must be valid JSON and must match the tool schema exactly. Include only the fields the tool needs; do not repeat large amounts of context unnecessarily.
-
-Correct single-tool example:
-{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/main.rs\"}"}}]}
-
-Best practice for multi-step work:
-1. Call one tool to inspect or gather information.
-2. Wait for the tool result.
-3. Then decide the next tool call or give a normal text answer.
-4. Finish with plain assistant text only when no more tools are needed.
-
-Common mistakes to avoid:
-- Do NOT output <use_tool>...</use_tool>, <tool_call>...</tool_call>, <function_call>...</function_call>, <tool_calls><invoke>...</invoke></tool_calls>, or direct tags like <read_file>.
-- Do NOT put tool JSON inside markdown fences or regular message text.
-- Do NOT mix fake textual tool calls with native `tool_calls`.
-- Do NOT invent argument names or guess missing required inputs; request the missing information with an appropriate question tool instead.
-- Do NOT call multiple tools in one response unless they are independent and parallel tool calling is explicitly supported.
-
-If no tool is needed, respond normally with plain assistant text and no `tool_calls`."#
-                        .to_string(),
-                ),
-                extra: serde_json::Map::new(),
-            });
+            outgoing.messages.push(Self::tool_calling_system_hint());
         }
         
         let mut last_error = None;
@@ -1582,7 +1599,11 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
     /// Some providers ignore `stream: false` and return chunked SSE anyway.
     /// This parses all `data: {...}` lines, concatenates delta content, and builds
     /// a complete response object.
-    fn reassemble_sse_response(body: &str) -> Result<OpenAIResponse, String> {
+    ///
+    /// `pub(crate)` so the streaming pass-through relay (task 5.4) can reuse the
+    /// same accumulation logic to assemble a cacheable response from forwarded
+    /// SSE chunks.
+    pub(crate) fn reassemble_sse_response(body: &str) -> Result<OpenAIResponse, String> {
         let mut full_content = String::new();
         let mut reasoning_content = String::new();
         let mut response_id = String::new();
@@ -1822,6 +1843,10 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         providers: Vec<ProviderModel>,
     ) -> Result<OpenAIResponse, GatewayError> {
         let mut attempts = Vec::new();
+        // Partial responses kept when a provider truncates (finish_reason=length
+        // well below max_tokens). Task 7.2 returns the longest of these instead
+        // of an error when every provider truncates (Req 6.2).
+        let mut truncated_candidates: Vec<OpenAIResponse> = Vec::new();
         let config = self.config.read().await;
         let provider_budgets: std::collections::HashMap<String, f64> = config
             .providers
@@ -1833,6 +1858,13 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                     .map(|budget| (provider.name.clone(), budget.limit_usd))
             })
             .collect();
+        // Effective truncation-retry setting (Req 6.4). Defaults to true when
+        // no `streaming` section is configured.
+        let retry_on_truncation = config
+            .streaming
+            .clone()
+            .unwrap_or_default()
+            .retry_on_truncation;
         drop(config);
         
         for provider_model in providers {
@@ -1940,6 +1972,89 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                             "Provider returned empty response with no assistant content".to_string(),
                             Some(200),
                         ));
+                        continue;
+                    }
+
+                    // --- Truncation detection and retry (Req 6.1, 6.3, 6.4) ---
+                    // A provider can return HTTP 200 with finish_reason="length"
+                    // yet stop well short of the client's requested max_tokens —
+                    // a sign it hit an internal cap rather than the legitimate
+                    // limit. When `retry_on_truncation` is enabled, treat this as
+                    // a failure and fail over to the next provider, keeping the
+                    // partial response as a fallback candidate (consumed by task
+                    // 7.2). When `retry_on_truncation` is false we skip detection
+                    // entirely and return the response as-is (prior behavior).
+                    let is_truncated = retry_on_truncation
+                        && response
+                            .choices
+                            .first()
+                            .and_then(|choice| choice.finish_reason.as_deref())
+                            == Some("length")
+                        && match request.max_tokens {
+                            // Req 6.3: only suspicious when the response stopped
+                            // well short of the requested limit. If
+                            // completion_tokens reached (within 50 of) max_tokens,
+                            // the response legitimately hit the requested limit.
+                            Some(max_tokens) => {
+                                response.usage.completion_tokens
+                                    < max_tokens.saturating_sub(50)
+                            }
+                            None => false,
+                        };
+
+                    if is_truncated {
+                        let max_tokens = request.max_tokens.unwrap_or(0);
+                        let completion_tokens = response.usage.completion_tokens;
+                        warn!(
+                            provider = %provider_model.provider,
+                            model = %provider_model.model,
+                            completion_tokens,
+                            max_tokens,
+                            "Provider returned a truncated response (finish_reason=length), failing over"
+                        );
+                        cb.record_failure().await;
+                        self.metrics.record_provider_failure_with_reason(
+                            &provider_model.provider,
+                            Some(format!(
+                                "Provider returned a truncated response (finish_reason=length, {}/{} tokens)",
+                                completion_tokens, max_tokens
+                            )),
+                            None,
+                        );
+                        attempts.push(ProviderAttempt::new(
+                            provider_model.provider.clone(),
+                            provider_model.model.clone(),
+                            format!(
+                                "Response truncated at {}/{} tokens (finish_reason=length)",
+                                completion_tokens, max_tokens
+                            ),
+                            Some(200),
+                        ));
+
+                        // Preserve this partial response as a fallback candidate
+                        // so task 7.2 can return the longest truncated response
+                        // if every provider truncates. Annotate it with the same
+                        // gateway metadata + cost the success path attaches, so it
+                        // can be returned directly without reprocessing.
+                        let mut candidate = response;
+                        let input_cost = candidate.usage.prompt_tokens as f64
+                            * provider_model.cost_per_million_input_tokens / 1_000_000.0;
+                        let output_cost = candidate.usage.completion_tokens as f64
+                            * provider_model.cost_per_million_output_tokens / 1_000_000.0;
+                        let candidate_cost = input_cost + output_cost;
+                        candidate.extra.insert(
+                            "gateway_provider".to_string(),
+                            serde_json::Value::String(provider_model.provider.clone()),
+                        );
+                        candidate.extra.insert(
+                            "gateway_responded_model".to_string(),
+                            serde_json::Value::String(provider_model.model.clone()),
+                        );
+                        candidate.extra.insert(
+                            "gateway_cost".to_string(),
+                            serde_json::json!(candidate_cost),
+                        );
+                        truncated_candidates.push(candidate);
                         continue;
                     }
 
@@ -2059,7 +2174,30 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             }
         }
         
-        // All providers failed
+        // All providers failed.
+        // Req 6.2: when every provider truncated with finish_reason=length we
+        // return the longest partial (highest completion_tokens) rather than an
+        // error. These candidates already carry gateway_provider/responded_model/
+        // cost metadata and their finish_reason=length is preserved verbatim, so
+        // the client sees the partial content and the truncation reason.
+        if let Some(longest) = truncated_candidates
+            .into_iter()
+            .max_by_key(|r| r.usage.completion_tokens)
+        {
+            let chosen_provider = longest
+                .extra
+                .get("gateway_provider")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            info!(
+                provider = %chosen_provider,
+                completion_tokens = longest.usage.completion_tokens,
+                "All providers truncated (finish_reason=length); returning longest partial response"
+            );
+            return Ok(longest);
+        }
+
         Err(GatewayError::AllProvidersFailed(AggregatedError::new(attempts)))
     }
 
@@ -3393,6 +3531,50 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         }
     }
 
+    /// Determine whether a provider requires response transformation that
+    /// makes true streaming pass-through impossible.
+    ///
+    /// Providers returning `true` here must be served via buffer-and-replay
+    /// because their responses need server-side rewriting before they are
+    /// OpenAI-compatible:
+    /// - Bedrock providers require format translation.
+    /// - Providers that emit XML-style tool calls need post-processing when
+    ///   the request carries `tools` (see [`Self::translate_xml_tool_calls`]).
+    /// - Kimi / Nano-GPT models leak special tokenizer tokens that must be
+    ///   sanitized (see [`Self::sanitize_kimi_tokens_in_response`]).
+    ///
+    /// Requirements: 3.8
+    // Wired into the streaming pass-through path by task 5.2.
+    #[allow(dead_code)]
+    fn provider_needs_transformation(&self, provider: &Provider, request: &OpenAIRequest) -> bool {
+        // Bedrock requires format translation — cannot pass-through stream.
+        if provider.provider_type == "bedrock" {
+            return true;
+        }
+        // Providers that emit XML tool calls need post-processing when the
+        // request includes tools.
+        if self.provider_uses_xml_tools(provider) && request.extra.contains_key("tools") {
+            return true;
+        }
+        // Kimi / Nano-GPT models need special-token sanitization.
+        let name = provider.name.to_lowercase();
+        if name.contains("kimi") || name.contains("nano-gpt") {
+            return true;
+        }
+        false
+    }
+
+    /// Name-based heuristic for providers that emit XML-style tool calls
+    /// instead of native OpenAI `tool_calls` (e.g. GLM, Kimi via Nano-GPT).
+    ///
+    /// Requirements: 3.8
+    // Wired into the streaming pass-through path by task 5.2.
+    #[allow(dead_code)]
+    fn provider_uses_xml_tools(&self, provider: &Provider) -> bool {
+        let name = provider.name.to_lowercase();
+        name.contains("glm") || name.contains("kimi") || name.contains("nano-gpt")
+    }
+
     /// Route non-streaming request
     /// 
     /// Integrates provider selection, retry, failover, and cost calculation
@@ -3426,6 +3608,317 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         let response = self.route_with_failover(&prepared_request, providers).await?;
         
         Ok(response)
+    }
+
+    /// Build the native tool-calling system hint appended to outgoing requests
+    /// that carry `tools`. Shared by the buffered ([`Self::attempt_with_retry`])
+    /// and streaming pass-through ([`Self::route_request_streaming`]) paths so
+    /// both send identical guidance to the provider.
+    fn tool_calling_system_hint() -> Message {
+        Message {
+            role: "system".to_string(),
+            content: serde_json::Value::String(
+                r#"TOOL CALLING RULES:
+You have access to tools through the API's native function-calling interface.
+If you need a tool, respond with native `tool_calls` only. Do not write XML tags, pseudo-XML, markdown code fences, or plain-text tool instructions.
+
+Use the exact tool name from the provided tools list. Arguments must be valid JSON and must match the tool schema exactly. Include only the fields the tool needs; do not repeat large amounts of context unnecessarily.
+
+Correct single-tool example:
+{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/main.rs\"}"}}]}
+
+Best practice for multi-step work:
+1. Call one tool to inspect or gather information.
+2. Wait for the tool result.
+3. Then decide the next tool call or give a normal text answer.
+4. Finish with plain assistant text only when no more tools are needed.
+
+Common mistakes to avoid:
+- Do NOT output <use_tool>...</use_tool>, <tool_call>...</tool_call>, <function_call>...</function_call>, <tool_calls><invoke>...</invoke></tool_calls>, or direct tags like <read_file>.
+- Do NOT put tool JSON inside markdown fences or regular message text.
+- Do NOT mix fake textual tool calls with native `tool_calls`.
+- Do NOT invent argument names or guess missing required inputs; request the missing information with an appropriate question tool instead.
+- Do NOT call multiple tools in one response unless they are independent and parallel tool calling is explicitly supported.
+
+If no tool is needed, respond normally with plain assistant text and no `tool_calls`."#
+                    .to_string(),
+            ),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// Route a streaming request, returning a [`StreamingResponse`].
+    ///
+    /// Follows the same provider selection / circuit-breaker / cooldown path as
+    /// [`Self::route_request`], but prefers true streaming pass-through:
+    ///
+    /// - When `streaming.passthrough_enabled` is false → buffer the whole
+    ///   request via [`Self::route_request`] (`Buffered`).
+    /// - When the first eligible provider needs response transformation
+    ///   (Bedrock / XML-tool rewrite / Kimi-Nano sanitization) or is a Codex
+    ///   OAuth provider → buffer the whole request (`Buffered`).
+    /// - Otherwise → send the request upstream with `stream: true`, apply the
+    ///   TTFB timeout to the initial response headers, and hand the live body
+    ///   to the caller (`PassThrough`) without consuming it.
+    ///
+    /// Mid-stream relay, inter-chunk timeouts, accumulation, and failover are
+    /// the responsibility of the streaming handler (tasks 5.3–5.6).
+    ///
+    /// Requirements: 3.1, 3.8, 3.9
+    // Wired into the streaming handler by task 5.5.
+    pub async fn route_request_streaming(
+        &self,
+        request: &OpenAIRequest,
+    ) -> Result<StreamingResponse, GatewayError> {
+        self.route_request_streaming_excluding(request, &[]).await
+    }
+
+    /// Like [`Self::route_request_streaming`], but skips any provider whose name
+    /// appears in `exclude` when picking the first eligible pass-through
+    /// provider. Used by the streaming handler's pre-content failover loop
+    /// (task 6.1, Req 4.1) to retry the next provider after one disconnects or
+    /// errors before any content was forwarded.
+    ///
+    /// The buffered fallbacks are intentionally left intact: when no eligible
+    /// pass-through provider remains (all excluded / circuit-open / cooled
+    /// down), this returns a `Buffered` response via [`Self::route_request`],
+    /// which performs its own gating, retry, and failover. Task 6.3 refines the
+    /// failover limits and aggregated-error reporting.
+    ///
+    /// Requirements: 3.1, 3.8, 3.9, 4.1
+    pub async fn route_request_streaming_excluding(
+        &self,
+        request: &OpenAIRequest,
+        exclude: &[String],
+    ) -> Result<StreamingResponse, GatewayError> {
+        // Pre-flight context check/truncation before provider selection.
+        let (prepared_request, truncated) = self.check_and_truncate_context(request);
+        if truncated {
+            info!(model = %request.model, "Applied pre-flight context truncation (streaming)");
+        }
+
+        // Effective streaming configuration (defaults when section absent).
+        let streaming_config = self
+            .config
+            .read()
+            .await
+            .streaming
+            .clone()
+            .unwrap_or_default();
+
+        // Model group + provider order (same selection path as route_request).
+        let model_group = self.find_model_group(&prepared_request.model).await?;
+        let providers = self.select_provider_order(&model_group).await;
+        if providers.is_empty() {
+            return Err(GatewayError::InvalidRequest(
+                "No available providers for model".to_string(),
+            ));
+        }
+
+        // Pass-through disabled globally → buffer the whole request.
+        if !streaming_config.passthrough_enabled {
+            debug!("Streaming pass-through disabled, using buffered path");
+            return Ok(StreamingResponse::Buffered(
+                self.route_request(request).await?,
+            ));
+        }
+
+        // Find the first provider eligible to serve (circuit breaker closed and
+        // not in an upstream rate-limit cooldown). Mirrors the gating in
+        // `route_with_failover` but stops at the first candidate; failover for
+        // the streaming relay is handled by task 5.6.
+        let mut chosen: Option<ProviderModel> = None;
+        for provider_model in &providers {
+            // Req 4.1: skip providers already tried in the failover loop.
+            if exclude.iter().any(|p| p == &provider_model.provider) {
+                debug!(provider = %provider_model.provider, "Excluded by failover, skipping (streaming)");
+                continue;
+            }
+            let cb_key = format!("{}:{}", provider_model.provider, provider_model.model);
+            let cb = self.get_circuit_breaker(&cb_key).await;
+            if !cb.is_available().await {
+                debug!(provider = %provider_model.provider, model = %provider_model.model, "Circuit breaker open, skipping (streaming)");
+                continue;
+            }
+            if let Some(remaining) = self
+                .metrics
+                .provider_cooldown_remaining_secs(&provider_model.provider)
+            {
+                debug!(provider = %provider_model.provider, cooldown_remaining_secs = remaining, "Upstream cooldown active, skipping (streaming)");
+                continue;
+            }
+            chosen = Some(provider_model.clone());
+            break;
+        }
+
+        // No eligible provider for pass-through → buffered path performs its own
+        // gating, retry, and failover.
+        let provider_model = match chosen {
+            Some(pm) => pm,
+            None => {
+                debug!("No eligible pass-through provider, using buffered path");
+                return Ok(StreamingResponse::Buffered(
+                    self.route_request(request).await?,
+                ));
+            }
+        };
+
+        // Inspect the chosen provider config. Clone every field needed for the
+        // outgoing request before dropping the config guard — the guard must
+        // not be held across the network `.await`.
+        let config = self.config.read().await;
+        let provider_cfg = match config
+            .providers
+            .iter()
+            .find(|p| p.name == provider_model.provider)
+        {
+            Some(p) => p,
+            None => {
+                drop(config);
+                return Err(GatewayError::Configuration(format!(
+                    "Provider '{}' not found in config",
+                    provider_model.provider
+                )));
+            }
+        };
+
+        // Codex (oauth + openai) is handled end-to-end by CodexProviderClient
+        // and cannot pass-through; providers needing response transformation
+        // (Bedrock / XML-tool rewrite / Kimi-Nano) likewise must buffer.
+        let is_codex = provider_cfg.auth_method.as_deref() == Some("oauth")
+            && provider_cfg.provider_type == "openai";
+        if is_codex || self.provider_needs_transformation(provider_cfg, &prepared_request) {
+            drop(config);
+            debug!(provider = %provider_model.provider, "Provider needs transformation or is Codex, using buffered path");
+            return Ok(StreamingResponse::Buffered(
+                self.route_request(request).await?,
+            ));
+        }
+
+        // Snapshot config fields for the outgoing pass-through request.
+        let api_key = provider_cfg.resolve_api_key().unwrap_or_default();
+        let is_oauth_provider = provider_cfg.auth_method.as_deref() == Some("oauth");
+        let provider_type = provider_cfg.provider_type.clone();
+        let custom_vpc_endpoint = provider_cfg.custom_vpc_endpoint;
+        let provider_region = provider_cfg.region.clone();
+        let configured_base_url = provider_cfg.base_url.clone();
+        let custom_headers = provider_cfg.custom_headers.clone();
+        let pool_config = provider_cfg.connection_pool.clone();
+        let ttfb_timeout_secs = provider_cfg.effective_ttfb_timeout(&provider_model.model);
+        let ttfb_timeout = Duration::from_secs(ttfb_timeout_secs);
+        drop(config);
+
+        // OAuth bearer resolution (after dropping the config guard).
+        let oauth_bearer: Option<String> = if is_oauth_provider {
+            match &self.oauth_manager {
+                Some(manager) => manager.get_access_token().await,
+                None => None,
+            }
+        } else {
+            None
+        };
+        // OAuth provider without a usable token → fall back to the buffered
+        // path so the auth failure surfaces consistently via failover.
+        if is_oauth_provider && oauth_bearer.is_none() {
+            debug!(provider = %provider_model.provider, "OAuth session unusable, using buffered path");
+            return Ok(StreamingResponse::Buffered(
+                self.route_request(request).await?,
+            ));
+        }
+
+        // Base URL normalization — strip trailing '/', ensure '/v1'; Bedrock
+        // Mantle special-case kept for parity (Bedrock never reaches here).
+        let mut base_url = if provider_type == "bedrock"
+            && !api_key.is_empty()
+            && !custom_vpc_endpoint
+        {
+            let region = provider_region.as_deref().unwrap_or("us-east-1");
+            format!("https://bedrock-mantle.{}.api.aws/v1", region)
+        } else {
+            configured_base_url.unwrap_or_default()
+        };
+        base_url = base_url.trim_end_matches('/').to_string();
+        if !base_url.ends_with("/v1") {
+            base_url.push_str("/v1");
+        }
+        let url = format!("{}/chat/completions", base_url);
+
+        // Build the outgoing request the same way attempt_with_retry does, but
+        // request streaming from the provider.
+        let mut outgoing = prepared_request.clone();
+        outgoing.model = provider_model.model.clone();
+        outgoing.stream = true;
+        let stripped = Self::sanitize_request_for_provider(&mut outgoing, &provider_type);
+        if stripped > 0 {
+            info!(provider = %provider_model.provider, provider_type = %provider_type, fields_removed = stripped, "Sanitized streaming request for provider");
+        }
+        Self::normalize_message_tool_calls(&mut outgoing.messages);
+        if outgoing.extra.contains_key("tools") {
+            Self::reverse_translate_tool_history(&mut outgoing.messages);
+            outgoing.messages.push(Self::tool_calling_system_hint());
+        }
+
+        let http_client = self.get_or_create_http_client(&provider_model.provider, &pool_config)?;
+
+        let mut req_builder = http_client
+            .post(&url)
+            .header("Content-Type", "application/json");
+        if let Some(ref bearer) = oauth_bearer {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", bearer));
+        } else if !api_key.is_empty() {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+        }
+        for (k, v) in &custom_headers {
+            req_builder = req_builder.header(k.as_str(), v.as_str());
+        }
+
+        tracing::info!(provider = %provider_model.provider, %url, model = %provider_model.model, ttfb_timeout_secs, "Calling provider (streaming pass-through)");
+
+        // Apply the TTFB timeout to the initial response headers only. The
+        // inter-chunk timeout is applied to the body by the relay loop (5.3).
+        let send_result =
+            tokio::time::timeout(ttfb_timeout, req_builder.json(&outgoing).send()).await;
+        let response = match send_result {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                warn!(provider = %provider_model.provider, error = %e, "Streaming request send failed");
+                return Err(GatewayError::Provider {
+                    provider: provider_model.provider.clone(),
+                    message: format!("Streaming request failed: {}", e),
+                    status_code: None,
+                });
+            }
+            Err(_) => {
+                warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — provider did not respond in time");
+                return Err(GatewayError::TtfbTimeout(ttfb_timeout_secs));
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let status_code = status.as_u16();
+            // Drain a bounded slice of the error body for diagnostics. The
+            // streaming handler (5.3) decides how to surface this to the client.
+            let body_text = response.text().await.unwrap_or_default();
+            let snippet: String = body_text.chars().take(500).collect();
+            warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming)");
+            return Err(GatewayError::Provider {
+                provider: provider_model.provider.clone(),
+                message: format!(
+                    "Provider returned HTTP {} for streaming request: {}",
+                    status_code, snippet
+                ),
+                status_code: Some(status_code),
+            });
+        }
+
+        // Success — hand the live streaming body to the caller without
+        // consuming it. The handler (5.3) relays chunks and accumulates.
+        Ok(StreamingResponse::PassThrough {
+            byte_stream: response,
+            provider: provider_model.provider.clone(),
+            model: provider_model.model.clone(),
+        })
     }
 
     fn get_or_create_http_client(
@@ -3498,6 +3991,7 @@ mod tests {
             first_launch_completed: false,
             tray: crate::config::TrayConfig::default(),
             codex_instructions_url: None,
+            streaming: None,
         }
     }
 
@@ -4473,5 +4967,80 @@ mod property_tests {
         metrics.clear_provider_cooldown("primary");
         let order = router.select_provider_order(&group).await;
         assert_eq!(order.len(), 2);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // provider_needs_transformation (task 5.1, Requirements: 3.8)
+    // ────────────────────────────────────────────────────────────────────
+
+    fn make_provider_named(name: &str, provider_type: &str) -> Provider {
+        Provider {
+            name: name.to_string(),
+            provider_type: provider_type.to_string(),
+            base_url: Some("http://localhost:1234".to_string()),
+            api_key_env: None,
+            api_key_encrypted: None,
+            api_secret_env: None,
+            api_secret_encrypted: None,
+            auth_method: None,
+            resolved_api_key: None,
+            resolved_api_secret: None,
+            region: None,
+            timeout_seconds: 30,
+            ttfb_timeout_seconds: None,
+            total_timeout_seconds: None,
+            max_connections: 10,
+            rate_limit_per_minute: 0,
+            custom_headers: Default::default(),
+            connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+            budget: None,
+            manual_models: vec![],
+            global_inference_profile: false,
+            cross_region_inference: false,
+            custom_vpc_endpoint: false,
+            prompt_caching: false,
+            reasoning: false,
+            codex_base_url_override: None,
+            codex_model_override: None,
+            instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
+        }
+    }
+
+    fn request_with_tools(with_tools: bool) -> OpenAIRequest {
+        let mut extra = serde_json::Map::new();
+        if with_tools {
+            extra.insert("tools".to_string(), serde_json::json!([]));
+        }
+        OpenAIRequest {
+            model: "test-model".to_string(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            stream: true,
+            extra,
+        }
+    }
+
+    #[test]
+    fn test_provider_needs_transformation() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+
+        // Bedrock always needs transformation, regardless of tools.
+        let bedrock = make_provider_named("aws-bedrock", "bedrock");
+        assert!(router.provider_needs_transformation(&bedrock, &request_with_tools(false)));
+
+        // Plain OpenAI provider without tools passes through.
+        let openai = make_provider_named("openai-main", "openai");
+        assert!(!router.provider_needs_transformation(&openai, &request_with_tools(false)));
+
+        // Kimi providers need token sanitization even without tools.
+        let kimi = make_provider_named("kimi-k2", "openai");
+        assert!(router.provider_needs_transformation(&kimi, &request_with_tools(false)));
+
+        // XML-tool providers (e.g. GLM) only need transformation when tools present.
+        let glm = make_provider_named("glm-provider", "openai");
+        assert!(!router.provider_needs_transformation(&glm, &request_with_tools(false)));
+        assert!(router.provider_needs_transformation(&glm, &request_with_tools(true)));
     }
 }

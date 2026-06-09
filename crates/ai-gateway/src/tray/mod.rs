@@ -265,6 +265,7 @@ mod tests {
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,
+            streaming: None,
         }
     }
 
