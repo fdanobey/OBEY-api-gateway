@@ -153,6 +153,7 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="logging" id="tab-logging" aria-controls="page-logging">Logging</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="caching" id="tab-caching" aria-controls="page-caching">Caching</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="context" id="tab-context" aria-controls="page-context">Context</button></li>
+    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="streaming" id="tab-streaming" aria-controls="page-streaming">Streaming</button></li>
   </ul>
   <div class="nav-footer">
     <a href="/dashboard" id="dashboard-link">Open Dashboard &rarr;</a>
@@ -744,6 +745,50 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
       <button class="btn btn-secondary" data-action="reset">Reset</button>
     </div>
   </section>
+
+  <!-- Streaming Reliability -->
+  <section class="page" id="page-streaming" role="tabpanel" aria-labelledby="tab-streaming">
+    <h2>Streaming Reliability</h2>
+    <fieldset><legend>Early Event &amp; Keep-Alive</legend>
+      <div class="form-check">
+        <input type="checkbox" id="stream-early-event" checked>
+        <label for="stream-early-event">Emit early synthetic SSE event</label>
+      </div>
+      <div class="hint" style="margin-top:-.5rem;margin-bottom:1rem;margin-left:1.5rem">Sends a <code>role: assistant</code> chunk within ~500ms to prevent client idle timeouts on slow/thinking models.</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="stream-keepalive">Keep-Alive Interval (seconds)</label>
+          <input type="number" id="stream-keepalive" value="5" min="0" max="60">
+          <div class="hint">0–60. Set to 0 to disable (use axum default).</div>
+        </div>
+      </div>
+    </fieldset>
+    <fieldset><legend>True Streaming Pass-Through</legend>
+      <div class="form-check">
+        <input type="checkbox" id="stream-passthrough" checked>
+        <label for="stream-passthrough">Enable pass-through for compatible providers</label>
+      </div>
+      <div class="hint" style="margin-top:-.5rem;margin-bottom:1rem;margin-left:1.5rem">Relays SSE chunks from the provider in real time. Providers needing response transformation (Bedrock, XML tool rewrite, Kimi/Nano-GPT) automatically fall back to buffer-and-replay.</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="stream-chunk-timeout">Inter-Chunk Timeout (seconds)</label>
+          <input type="number" id="stream-chunk-timeout" value="60" min="5">
+          <div class="hint">Max gap between SSE data events before treating the stream as stalled (min 5).</div>
+        </div>
+      </div>
+    </fieldset>
+    <fieldset><legend>Truncation Retry</legend>
+      <div class="form-check">
+        <input type="checkbox" id="stream-retry-truncation" checked>
+        <label for="stream-retry-truncation">Retry on truncated responses</label>
+      </div>
+      <div class="hint" style="margin-top:-.5rem;margin-bottom:1rem;margin-left:1.5rem">When a provider returns <code>finish_reason: "length"</code> well short of max_tokens, fail over to the next provider. If all truncate, returns the longest partial.</div>
+    </fieldset>
+    <div class="actions">
+      <button class="btn btn-primary" data-action="save">Save</button>
+      <button class="btn btn-secondary" data-action="reset">Reset</button>
+    </div>
+  </section>
 </main>
 
 <div class="status-bar" role="status" aria-live="polite">
@@ -1155,6 +1200,17 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
     return ok;
   }
 
+  function validateStreamingPage() {
+    var ok = true;
+    var ka = document.getElementById('stream-keepalive');
+    var ct = document.getElementById('stream-chunk-timeout');
+    if (!validateNonNegativeInt(ka, 'Keep-alive interval')) ok = false;
+    else if (parseInt(ka.value, 10) > 60) { showError(ka, 'Must be between 0 and 60'); ok = false; }
+    if (!validatePositiveInt(ct, 'Chunk timeout')) ok = false;
+    else if (parseInt(ct.value, 10) < 5) { showError(ct, 'Must be at least 5 seconds'); ok = false; }
+    return ok;
+  }
+
     /** Map page id to its validator. */
     var pageValidators = {
         'page-server': validateServerPage,
@@ -1164,7 +1220,8 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
         'page-circuit-breaker': validateCircuitBreakerPage,
         'page-logging': validateLoggingPage,
         'page-caching': validateCachingPage,
-        'page-context': validateContextPage
+        'page-context': validateContextPage,
+        'page-streaming': validateStreamingPage
     };
 
   /** Validate the currently active page. Returns true if valid. */
@@ -1753,6 +1810,7 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
     if(cfg.logging){document.getElementById('log-request-body').checked=!!cfg.logging.request_body_logging; document.getElementById('log-response-body').checked=!!cfg.logging.response_body_logging; document.getElementById('log-max-body').value=cfg.logging.max_body_size_bytes||10240; document.getElementById('log-db-path').value=cfg.logging.database_path||'logs.db'; document.getElementById('log-excluded-fields').value=(cfg.logging.excluded_fields||[]).join(', '); document.getElementById('log-retention').value=cfg.logging.retention_days||30; document.getElementById('log-cleanup').value=cfg.logging.cleanup_schedule_hours||24;}
     if(cfg.semantic_cache){document.getElementById('cache-enabled').checked=!!cfg.semantic_cache.enabled; document.getElementById('cache-qdrant-url').value=cfg.semantic_cache.qdrant_url||''; document.getElementById('cache-collection').value=cfg.semantic_cache.collection_name||'ai_gateway_cache'; document.getElementById('cache-threshold').value=cfg.semantic_cache.similarity_threshold||0.95; document.getElementById('cache-ttl').value=cfg.semantic_cache.ttl_seconds||3600; document.getElementById('cache-max-entries').value=cfg.semantic_cache.max_cache_size||10000;}
     if(cfg.context){document.getElementById('context-enabled').checked=!!cfg.context.enabled; document.getElementById('context-strategy').value=cfg.context.truncation_strategy||'remove_oldest'; document.getElementById('context-window-size').value=cfg.context.sliding_window_size||10; document.getElementById('context-cache-ttl').value=cfg.context.capabilities_cache_ttl_seconds||3600; document.getElementById('context-max-retries').value=cfg.context.max_truncation_retries||3;}
+    var sc=cfg.streaming||{};document.getElementById('stream-early-event').checked=sc.emit_early_event!==false;document.getElementById('stream-keepalive').value=sc.keepalive_interval_seconds!=null?sc.keepalive_interval_seconds:5;document.getElementById('stream-passthrough').checked=sc.passthrough_enabled!==false;document.getElementById('stream-chunk-timeout').value=sc.chunk_timeout_seconds||60;document.getElementById('stream-retry-truncation').checked=sc.retry_on_truncation!==false;
     populateProviderSelects();
     if(cfg.semantic_cache&&cfg.semantic_cache.embedding_provider){
       document.getElementById('cache-embed-provider').value=cfg.semantic_cache.embedding_provider;
@@ -1778,6 +1836,7 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
     cfg.logging={request_body_logging:document.getElementById('log-request-body').checked,response_body_logging:document.getElementById('log-response-body').checked,max_body_size_bytes:parseInt(document.getElementById('log-max-body').value,10),database_path:document.getElementById('log-db-path').value.trim(),excluded_fields:document.getElementById('log-excluded-fields').value.split(',').map(function(s){return s.trim();}).filter(Boolean),retention_days:parseInt(document.getElementById('log-retention').value,10),cleanup_schedule_hours:parseInt(document.getElementById('log-cleanup').value,10)};
     cfg.semantic_cache={enabled:document.getElementById('cache-enabled').checked,qdrant_url:document.getElementById('cache-qdrant-url').value.trim(),collection_name:document.getElementById('cache-collection').value.trim(),embedding_provider:document.getElementById('cache-embed-provider').value,embedding_model:document.getElementById('cache-embed-model').value.trim(),similarity_threshold:parseFloat(document.getElementById('cache-threshold').value),ttl_seconds:parseInt(document.getElementById('cache-ttl').value,10),max_cache_size:parseInt(document.getElementById('cache-max-entries').value,10)};
     cfg.context={enabled:document.getElementById('context-enabled').checked,truncation_strategy:document.getElementById('context-strategy').value,sliding_window_size:parseInt(document.getElementById('context-window-size').value,10),capabilities_cache_ttl_seconds:parseInt(document.getElementById('context-cache-ttl').value,10),max_truncation_retries:parseInt(document.getElementById('context-max-retries').value,10)};
+    cfg.streaming={emit_early_event:document.getElementById('stream-early-event').checked,keepalive_interval_seconds:parseInt(document.getElementById('stream-keepalive').value,10),passthrough_enabled:document.getElementById('stream-passthrough').checked,chunk_timeout_seconds:parseInt(document.getElementById('stream-chunk-timeout').value,10),retry_on_truncation:document.getElementById('stream-retry-truncation').checked};
     return cfg;
   }
 
