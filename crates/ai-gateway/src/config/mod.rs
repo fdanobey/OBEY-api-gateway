@@ -68,6 +68,11 @@ pub struct Config {
     /// at fetch time when absent. See [`crate::codex::instructions`].
     #[serde(default)]
     pub codex_instructions_url: Option<String>,
+    /// Streaming reliability settings (early SSE events, keep-alive, true
+    /// streaming pass-through, truncation retry). Absent section applies
+    /// [`StreamingConfig::default`]. See [`StreamingConfig`].
+    #[serde(default)]
+    pub streaming: Option<StreamingConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -925,6 +930,138 @@ fn default_max_truncation_retries() -> usize {
 
 fn default_context_window() -> u32 {
     32768
+}
+
+/// Streaming reliability configuration.
+///
+/// Controls early synthetic SSE events, keep-alive cadence, true streaming
+/// pass-through, inter-chunk timeouts, and truncation retry. All fields have
+/// defaults matching the gateway's safe behavior so existing configs continue
+/// working without a `streaming` section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamingConfig {
+    /// Emit a synthetic `role: assistant` event before the provider responds,
+    /// resetting the client's idle timer.
+    #[serde(default = "default_true")]
+    pub emit_early_event: bool,
+
+    /// Keep-alive interval in seconds (0 = disabled, use axum default).
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval_seconds: u64,
+
+    /// Enable true streaming pass-through for compatible providers.
+    #[serde(default = "default_true")]
+    pub passthrough_enabled: bool,
+
+    /// Inter-chunk timeout: max seconds between SSE data events from provider.
+    #[serde(default = "default_chunk_timeout")]
+    pub chunk_timeout_seconds: u64,
+
+    /// Retry with next provider when `finish_reason` is "length" and the
+    /// response appears truncated.
+    #[serde(default = "default_true")]
+    pub retry_on_truncation: bool,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            emit_early_event: true,
+            keepalive_interval_seconds: default_keepalive_interval(),
+            passthrough_enabled: true,
+            chunk_timeout_seconds: default_chunk_timeout(),
+            retry_on_truncation: true,
+        }
+    }
+}
+
+fn default_keepalive_interval() -> u64 {
+    5
+}
+
+fn default_chunk_timeout() -> u64 {
+    60
+}
+
+#[cfg(test)]
+mod streaming_config_tests {
+    use super::*;
+
+    // Streaming Reliability, Task 1.3: StreamingConfig deserialization
+    // **Validates: Requirements 7.3**
+
+    #[test]
+    fn test_streaming_config_deserialize_all_fields_present() {
+        let yaml = r#"
+emit_early_event: false
+keepalive_interval_seconds: 10
+passthrough_enabled: false
+chunk_timeout_seconds: 30
+retry_on_truncation: false
+"#;
+        let cfg: StreamingConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg,
+            StreamingConfig {
+                emit_early_event: false,
+                keepalive_interval_seconds: 10,
+                passthrough_enabled: false,
+                chunk_timeout_seconds: 30,
+                retry_on_truncation: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_streaming_config_deserialize_empty_section_applies_defaults() {
+        // An empty `streaming: {}` section should fill every field from defaults.
+        let cfg: StreamingConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg, StreamingConfig::default());
+        assert!(cfg.emit_early_event);
+        assert_eq!(cfg.keepalive_interval_seconds, 5);
+        assert!(cfg.passthrough_enabled);
+        assert_eq!(cfg.chunk_timeout_seconds, 60);
+        assert!(cfg.retry_on_truncation);
+    }
+
+    #[test]
+    fn test_streaming_config_deserialize_partial_fields_default_the_rest() {
+        // Fields omitted from a present section fall back to their defaults.
+        let yaml = "keepalive_interval_seconds: 15";
+        let cfg: StreamingConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.keepalive_interval_seconds, 15);
+        assert!(cfg.emit_early_event);
+        assert!(cfg.passthrough_enabled);
+        assert_eq!(cfg.chunk_timeout_seconds, 60);
+        assert!(cfg.retry_on_truncation);
+    }
+
+    #[test]
+    fn test_config_missing_streaming_section_defaults_to_none() {
+        // A config document with no top-level `streaming` key deserializes to
+        // `None`; callers fall back to `StreamingConfig::default()` at use time.
+        let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers:
+  - name: "openai"
+    type: "openai"
+    base_url: "https://api.openai.com/v1"
+    timeout_seconds: 30
+model_groups:
+  - name: "default"
+    version_fallback_enabled: false
+    models:
+      - provider: "openai"
+        model: "gpt-4"
+        priority: 100
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.streaming.is_none());
+    }
 }
 
 #[cfg(test)]

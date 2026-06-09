@@ -606,6 +606,7 @@ mod tests {
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,
+            streaming: None,
         }
     }
 
@@ -857,6 +858,7 @@ mod tests {
                     first_launch_completed: false,
                     tray: TrayConfig::default(),
                     codex_instructions_url: None,
+                    streaming: None,
                 };
 
                 let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -1426,6 +1428,7 @@ mod tests {
                     first_launch_completed: false,
                     tray: TrayConfig::default(),
                     codex_instructions_url: None,
+                    streaming: None,
                 };
 
                 // Write new config to disk

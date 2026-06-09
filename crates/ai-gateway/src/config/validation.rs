@@ -266,6 +266,29 @@ impl Config {
                 expected: "a positive integer in milliseconds".to_string(),
             });
         }
+
+        // Validate streaming config (Req 7.4, 7.5).
+        // The whole `streaming` section is re-read on hot-reload via
+        // `apply_runtime_config_update`, which validates through this path.
+        if let Some(ref streaming) = self.streaming {
+            // keepalive_interval_seconds must be within 0–60 (0 = disabled).
+            if streaming.keepalive_interval_seconds > 60 {
+                errors.push(ValidationError::InvalidValue {
+                    field: "streaming.keepalive_interval_seconds".to_string(),
+                    value: streaming.keepalive_interval_seconds.to_string(),
+                    expected: "a value between 0 and 60 seconds".to_string(),
+                });
+            }
+
+            // chunk_timeout_seconds must be at least 5 seconds.
+            if streaming.chunk_timeout_seconds < 5 {
+                errors.push(ValidationError::InvalidValue {
+                    field: "streaming.chunk_timeout_seconds".to_string(),
+                    value: streaming.chunk_timeout_seconds.to_string(),
+                    expected: "at least 5 seconds".to_string(),
+                });
+            }
+        }
         
         // Validate admin auth env vars (21.5)
         if self.admin.auth.enabled {
@@ -480,6 +503,7 @@ mod property_tests {
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,
+            streaming: None,
         }
     }
 
@@ -733,6 +757,97 @@ model_groups:
             }),
             "Should contain InvalidValue error for auth_method"
         );
+    }
+
+    // Streaming Reliability, Task 1.3: StreamingConfig validation
+    // **Validates: Requirements 7.4**
+
+    #[test]
+    fn test_streaming_keepalive_above_max_rejected() {
+        let mut config = minimal_valid_config();
+        config.streaming = Some(StreamingConfig {
+            keepalive_interval_seconds: 61,
+            ..StreamingConfig::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err(), "keepalive_interval_seconds > 60 should be rejected");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, .. }
+                    if field == "streaming.keepalive_interval_seconds"
+            )),
+            "Should contain InvalidValue error for keepalive_interval_seconds"
+        );
+    }
+
+    #[test]
+    fn test_streaming_keepalive_at_max_accepted() {
+        let mut config = minimal_valid_config();
+        config.streaming = Some(StreamingConfig {
+            keepalive_interval_seconds: 60,
+            ..StreamingConfig::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_ok(), "keepalive_interval_seconds == 60 should be accepted: {:?}", result);
+    }
+
+    #[test]
+    fn test_streaming_keepalive_zero_accepted() {
+        // 0 disables keep-alive (axum default) and is within the valid range.
+        let mut config = minimal_valid_config();
+        config.streaming = Some(StreamingConfig {
+            keepalive_interval_seconds: 0,
+            ..StreamingConfig::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_ok(), "keepalive_interval_seconds == 0 should be accepted: {:?}", result);
+    }
+
+    #[test]
+    fn test_streaming_chunk_timeout_below_min_rejected() {
+        let mut config = minimal_valid_config();
+        config.streaming = Some(StreamingConfig {
+            chunk_timeout_seconds: 4,
+            ..StreamingConfig::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err(), "chunk_timeout_seconds < 5 should be rejected");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, .. }
+                    if field == "streaming.chunk_timeout_seconds"
+            )),
+            "Should contain InvalidValue error for chunk_timeout_seconds"
+        );
+    }
+
+    #[test]
+    fn test_streaming_chunk_timeout_at_min_accepted() {
+        let mut config = minimal_valid_config();
+        config.streaming = Some(StreamingConfig {
+            chunk_timeout_seconds: 5,
+            ..StreamingConfig::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_ok(), "chunk_timeout_seconds == 5 should be accepted: {:?}", result);
+    }
+
+    #[test]
+    fn test_streaming_default_config_accepted() {
+        let mut config = minimal_valid_config();
+        config.streaming = Some(StreamingConfig::default());
+
+        let result = config.validate();
+        assert!(result.is_ok(), "Default StreamingConfig should be accepted: {:?}", result);
     }
 
     #[test]

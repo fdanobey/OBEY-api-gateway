@@ -39,6 +39,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Smart rate-limit failover** — instantly skips providers that return 429 (or rate-limit-shaped 200 envelopes), honors `Retry-After` / `X-RateLimit-Reset` / Anthropic ISO reset headers, and supports weekly-quota providers like Nano-GPT through per-provider cooldown overrides
 - **Priority & cost-aware routing** — configure model groups with priority, cost, and latency-based selection
 - **Context window management** — automatic truncation when requests exceed model limits
+- **Streaming reliability** — true SSE pass-through for capable providers with early synthetic events (sub-500ms TTFB), configurable keep-alive, graceful in-stream error frames, mid-stream failover, and inter-chunk/total timeouts (see [Streaming Reliability](#streaming-reliability))
 - **Response caching** — built-in two-tier cache: in-memory exact-match (default-on, no setup) plus optional semantic Qdrant tier; works for both streaming and non-streaming requests, including tool-using clients
 - **OpenAI OAuth login** — browser-based sign-in with your ChatGPT Plus/Pro subscription (PKCE flow, automatic token refresh)
 - **Codex backend translation** — transparently routes OAuth-authenticated requests through the ChatGPT Codex backend, translating Chat Completions ↔ Responses API on the fly
@@ -279,6 +280,28 @@ exact_cache:
 ```
 
 The dashboard's **Cache Hit Rate** card stays at `N/A` until the first eligible request is observed, then switches to a percentage. To force traffic through the cache, send the same request twice with `temperature: 0` (or omit it).
+
+### Streaming Reliability
+
+When a client requests `stream: true`, the gateway improves perceived reliability for slow/thinking models and flaky upstreams:
+
+- **Early synthetic event** — emits a `role: assistant` SSE chunk within ~500ms so clients don't idle-timeout while the model "thinks" (skipped on cache hits).
+- **Configurable keep-alive** — periodic SSE comments keep client connections from timing out during long generations.
+- **True streaming pass-through** — for OpenAI-compatible providers, upstream SSE chunks are relayed in real time; providers needing response transformation (Bedrock, XML-tool rewrite, Kimi/Nano-GPT token sanitization) and Codex OAuth providers automatically fall back to buffer-and-replay.
+- **Graceful error frames** — TTFB / total / inter-chunk timeouts and mid-stream failures are surfaced as `{"error":{...}}` SSE events followed by `[DONE]`, never a silent disconnect.
+- **Mid-stream failover** — if a provider fails *before* any content reaches the client, the gateway transparently retries the next provider (no duplicate role event); after content has been sent it emits an error and closes.
+- **Truncation retry** — a `finish_reason: "length"` response that stops well short of the requested `max_tokens` is treated as a truncation and retried on the next provider; if every provider truncates, the longest partial is returned.
+
+All fields are optional with safe defaults, so existing configs keep working unchanged:
+
+```yaml
+streaming:
+  emit_early_event: true            # synthetic role:assistant chunk before upstream responds
+  keepalive_interval_seconds: 5     # 0–60; 0 disables (axum default)
+  passthrough_enabled: true         # true SSE relay for capable providers
+  chunk_timeout_seconds: 60         # max gap between SSE chunks (min 5)
+  retry_on_truncation: true         # failover on suspicious finish_reason=length
+```
 
 ### Timeout Configuration
 

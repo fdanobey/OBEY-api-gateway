@@ -83,6 +83,7 @@ fn test_config() -> Config {
         first_launch_completed: false,
         tray: ai_gateway::config::TrayConfig::default(),
         codex_instructions_url: None,
+        streaming: None,
     }
 }
 
