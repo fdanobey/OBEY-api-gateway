@@ -244,6 +244,8 @@ Bedrock-specific options:
 | `custom_vpc_endpoint` | `false` | Use `base_url` as-is instead of auto-generating the Mantle endpoint |
 | `reasoning` | `true` | Enable extended thinking for supported models |
 
+> **Claude Fable 5 prerequisite:** Before you can invoke Claude Fable 5 through Bedrock, you must opt into data sharing via the AWS Data Retention API by enabling `provider_data_share` on your account. There is no console UI for this at launch — it must be done programmatically (e.g. via the AWS CLI or SDK). This is a one-time, account-level setting; once enabled, the model works through the gateway like any other Bedrock model with no router-side changes needed.
+
 ### Response Caching
 
 The gateway runs a two-tier response cache for chat completions. Both tiers cache the same key space, so a single entry serves streaming and non-streaming callers.
