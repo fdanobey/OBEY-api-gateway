@@ -180,6 +180,42 @@ impl IntoResponse for GatewayError {
     }
 }
 
+/// Drop guard that ensures `metrics.complete_request()` is called even when an
+/// SSE stream is cancelled (client disconnect, timeout, connection reset).
+/// Without this, `active_requests` increments on `start_request()` but never
+/// decrements when the stream generator is dropped mid-flight.
+struct RequestCompleteGuard {
+    metrics: Arc<Metrics>,
+    start: std::time::Instant,
+    completed: bool,
+}
+
+impl RequestCompleteGuard {
+    fn new(metrics: Arc<Metrics>, start: std::time::Instant) -> Self {
+        Self { metrics, start, completed: false }
+    }
+
+    /// Mark the request as completed normally (prevents the Drop impl from
+    /// double-decrementing).
+    fn complete(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            self.metrics.complete_request(self.start.elapsed().as_millis() as u64);
+        }
+    }
+}
+
+impl Drop for RequestCompleteGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            let duration_ms = self.start.elapsed().as_millis() as u64;
+            tracing::debug!(duration_ms, "Stream dropped before completion, completing request metrics via guard");
+            self.metrics.complete_request(duration_ms);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GET /health  (Req 20.1-20.3)
 // ---------------------------------------------------------------------------
@@ -361,6 +397,10 @@ async fn chat_completions_stream(state: AppState, request: OpenAIRequest, trace_
 
         let streaming_config_relay = streaming_config.clone();
         let stream = async_stream::stream! {
+            // Drop guard: ensures active_requests is decremented even if the
+            // client disconnects and the stream is cancelled mid-flight.
+            let mut _guard = RequestCompleteGuard::new(state.metrics.clone(), start);
+
             // Early synthetic event (Req 1.1, 1.2, 1.3).
             yield Ok::<_, Infallible>(Event::default().data(early_chunk.to_string()));
 
@@ -641,7 +681,7 @@ async fn chat_completions_stream(state: AppState, request: OpenAIRequest, trace_
                 }
             }
 
-            state.metrics.complete_request(start.elapsed().as_millis() as u64);
+            _guard.complete();
         };
 
         let mut sse = Sse::new(stream).keep_alive(build_keepalive(&streaming_config)).into_response();
