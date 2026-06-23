@@ -1267,6 +1267,28 @@ fn relay_passthrough_stream(
         // Req 3.6: always terminate with `[DONE]`, unless an error path already
         // appended one via `emit_sse_error_event`.
         if !terminated {
+            // Guard: if the upstream closed cleanly but never sent any content
+            // delta (e.g. provider returned HTTP 200 then immediately closed,
+            // sent only role-only/empty frames, or only non-data lines), treat
+            // this as a pre-content failure so the failover loop can retry the
+            // next provider. Without this, the client would see only the early
+            // event (+ maybe a duplicate role delta) + [DONE] — an apparently
+            // empty response with no error.
+            if !content_forwarded {
+                tracing::warn!(
+                    trace_id = %trace_id,
+                    sse_accumulator_len = sse_accumulator.len(),
+                    "Upstream closed cleanly but sent no content delta; treating as pre-content failure for failover"
+                );
+                *outcome.lock().await = RelayOutcome::FailedBeforeContent(
+                    "Provider stream ended without sending any content".to_string(),
+                );
+                // Stay silent (no error event, no [DONE]) so handler can retry.
+                // Any role-only chunks we already forwarded are idempotent with
+                // the early event and won't confuse the client on retry.
+                return;
+            }
+
             // Task 6.1: a clean finish — record the outcome so the handler's
             // failover loop stops here (no retry).
             *outcome.lock().await = RelayOutcome::Completed;
@@ -2226,6 +2248,7 @@ pub async fn completions(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct EmbeddingRequest {
     pub model: String,
     pub input: serde_json::Value,
@@ -2253,6 +2276,7 @@ pub async fn embeddings(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ImageGenerationRequest {
     pub model: Option<String>,
     pub prompt: String,
@@ -2690,6 +2714,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
 /// On success the new config is applied to future requests, circuit breaker
 /// states are reset, and the models list cache is invalidated.
 /// On validation failure the existing config is kept and an error is returned.
+#[allow(dead_code)]
 pub async fn reload_config(State(state): State<AppState>) -> Response {
     let config_path = state.config_path.as_ref();
 

@@ -28,6 +28,7 @@ pub struct CircuitBreaker {
 
 impl CircuitBreaker {
     /// Create a new circuit breaker with default backoff sequence [5s, 10s, 20s, 40s, 300s]
+    #[allow(dead_code)]
     pub fn new(failure_threshold: u32) -> Self {
         Self::with_backoff_sequence(
             failure_threshold,

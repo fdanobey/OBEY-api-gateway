@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Exact-match in-memory response cache (Tier 1).
 //!
 //! Complements the semantic [`super::SemanticCache`] (Tier 2) by catching

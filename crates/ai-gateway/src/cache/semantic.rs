@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use qdrant_client::qdrant::{CreateCollectionBuilder, Distance, VectorParamsBuilder};
 use qdrant_client::Qdrant;
 use reqwest::Client;

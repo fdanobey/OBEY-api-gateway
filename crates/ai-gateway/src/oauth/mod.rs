@@ -20,8 +20,10 @@ pub mod store;
 pub mod token;
 pub mod usage_tracker;
 
+#[allow(unused_imports)]
 pub use callback::{start_callback_server, AuthorizationCode};
 pub use error::OAuthError;
+#[allow(unused_imports)]
 pub use flow::{FlowState, InitiationOutcome, OAuthFlow, OAuthSessionState};
 // Re-exported for internal consumers in later subtasks (token exchange step).
 #[allow(unused_imports)]
@@ -30,8 +32,10 @@ pub use manager::OAuthManager;
 // Re-exported for the Property 8 test in task 5.9.
 #[allow(unused_imports)]
 pub(crate) use manager::backoff_delay_secs;
+#[allow(unused_imports)]
 pub use pkce::{generate_pkce, generate_state, PkceChallenge};
 pub use store::OAuthTokenStore;
+#[allow(unused_imports)]
 pub use token::{
     exchange_code, refresh_access_token, TokenResponse, OPENAI_CLIENT_ID, TOKEN_ENDPOINT,
 };

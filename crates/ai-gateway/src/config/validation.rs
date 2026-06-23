@@ -7,6 +7,7 @@ use crate::secrets;
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../config.example.yaml");
 
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum ValidationError {
     #[error("Missing required field: {0}")]
     MissingField(String),

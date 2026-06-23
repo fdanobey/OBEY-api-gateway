@@ -12,11 +12,9 @@ use std::time::{Duration, Instant};
 
 use super::strategies::{apply_truncation_strategy, TruncationResult, TruncationStrategy};
 
-/// Default time-to-live for cached model capabilities (1 hour)
-const DEFAULT_CAPABILITIES_TTL: Duration = Duration::from_secs(3600);
-
 /// Model capabilities discovered from provider
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ModelCapabilities {
     /// Model identifier
     pub model_id: String,
@@ -28,6 +26,7 @@ pub struct ModelCapabilities {
     pub discovered_at: Instant,
 }
 
+#[allow(dead_code)]
 impl ModelCapabilities {
     /// Create new model capabilities
     pub fn new(model_id: String, context_window: u32, max_completion_tokens: Option<u32>) -> Self {
@@ -94,12 +93,14 @@ impl ContextManager {
     }
 
     /// Store capabilities for a model
+    #[allow(dead_code)]
     pub fn store_capabilities(&self, capabilities: ModelCapabilities) {
         self.capabilities_cache
             .insert(capabilities.model_id.clone(), capabilities);
     }
 
     /// Store capabilities from a provider Model
+    #[allow(dead_code)]
     pub fn store_model(&self, model: &Model) {
         if let Some(caps) = ModelCapabilities::from_model(model) {
             self.store_capabilities(caps);
@@ -107,6 +108,7 @@ impl ContextManager {
     }
 
     /// Store multiple models at once
+    #[allow(dead_code)]
     pub fn store_models(&self, models: &[Model]) {
         for model in models {
             self.store_model(model);
@@ -281,6 +283,7 @@ impl ContextManager {
     }
 
     /// Get the current configuration
+    #[allow(dead_code)]
     pub fn config(&self) -> &ContextConfig {
         &self.config
     }
@@ -294,6 +297,7 @@ impl Default for ContextManager {
 
 /// Errors that can occur during context management
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ContextError {
     /// Maximum truncation retries exceeded
     MaxRetriesExceeded,

@@ -27,6 +27,7 @@ use crate::oauth::OAuthError;
 /// The [`std::fmt::Display`] impl (provided by `thiserror`) is safe to log —
 /// no variant embeds token or body bytes.
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum CodexError {
     /// A Chat Completions request referenced a feature that the Codex
     /// translation layer does not support in this iteration (e.g. audio

@@ -23,6 +23,7 @@ use crate::codex::errors::CodexError;
 /// `response.custom_tool_call_input.*`) so the response translator can
 /// silently skip them while preserving stream ordering — see Req 4.13 / 14.5.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ResponsesEvent {
     Created {
         id: String,
@@ -140,6 +141,7 @@ pub struct IncompleteDetails {
 /// upstream Codex shapes vary across event flavours and we never want to
 /// fail-stop the stream on a missing diagnostic field.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ErrorPayload {
     #[serde(default)]
     pub message: Option<String>,

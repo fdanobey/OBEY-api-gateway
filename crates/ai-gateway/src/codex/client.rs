@@ -40,6 +40,7 @@ pub struct CodexProviderClient {
     base_url: String,
     instructions_override: Option<String>,
     model_override: Option<String>,
+    #[allow(dead_code)] // stored for future use; not yet read
     metrics: Arc<Metrics>,
     /// Operator-configured allowlists (from gateway config).
     xhigh_models_allowlist: Vec<String>,
@@ -204,6 +205,7 @@ impl CodexProviderClient {
 // ─── Retry logic and dispatch (Task 15.3) ────────────────────────────────────
 
 impl CodexProviderClient {
+    #[allow(dead_code)]
     fn resolve_model_for_request(&self, req: &OpenAIRequest) -> String {
         resolve_model(&req.model, self.model_override.as_deref()).to_string()
     }
@@ -395,6 +397,7 @@ impl CodexProviderClient {
     }
 
     /// Dispatch a streaming request and return a stream of `ResponsesEvent`.
+    #[allow(dead_code)]
     async fn dispatch_streaming(
         &self,
         req: &OpenAIRequest,

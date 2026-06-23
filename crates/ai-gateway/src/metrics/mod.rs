@@ -247,6 +247,7 @@ impl Metrics {
     }
 
     /// Record failed provider request
+    #[allow(dead_code)]
     pub fn record_provider_failure(&self, provider: &str) {
         self.record_provider_failure_with_reason(provider, None, None);
     }

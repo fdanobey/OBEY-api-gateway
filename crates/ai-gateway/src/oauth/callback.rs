@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Loopback HTTP callback server for the OpenAI OAuth + PKCE flow.
 //!
 //! Per design §3, this module runs a minimal `axum` server bound exclusively

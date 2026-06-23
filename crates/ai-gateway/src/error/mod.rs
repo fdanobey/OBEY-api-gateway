@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Main gateway error type
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum GatewayError {
     #[error("Configuration error: {0}")]
     Configuration(String),

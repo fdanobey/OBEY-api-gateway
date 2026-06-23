@@ -107,6 +107,7 @@ impl RateLimiter {
     ///
     /// Returns true if tokens are available (or the bucket is unlimited)
     /// AND the limiter is not in an upstream-driven cooldown.
+    #[allow(dead_code)]
     pub async fn check_available(&self) -> bool {
         let mut state = self.state.lock().await;
 
@@ -175,6 +176,7 @@ impl RateLimiter {
     }
 
     /// Get current token count (for testing/monitoring)
+    #[allow(dead_code)]
     pub async fn get_tokens(&self) -> f64 {
         let mut state = self.state.lock().await;
         self.refill_tokens_internal(&mut state);

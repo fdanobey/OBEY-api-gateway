@@ -9,6 +9,7 @@ pub use validation::{bootstrap_config_if_missing, load_and_validate_config, reso
 
 /// Pre-compiled regex for environment variable substitution
 /// Compiled once at startup using LazyLock for thread-safe lazy initialization
+#[allow(dead_code)]
 static ENV_VAR_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"\$\{([A-Z_][A-Z0-9_]*)\}")
         .expect("Invalid regex pattern for environment variable substitution")
@@ -16,6 +17,7 @@ static ENV_VAR_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
 
 /// Resolve environment variable references in a string
 /// Supports ${ENV_VAR} syntax
+#[allow(dead_code)]
 fn resolve_env_var_in_string(value: &str) -> String {
     let mut result = value.to_string();
     
@@ -231,6 +233,7 @@ impl Default for AdminAuthConfig {
 impl AdminAuthConfig {
     /// Resolve admin username from environment variable at runtime
     /// Returns None if no username_env is configured or the environment variable is unset
+    #[allow(dead_code)]
     pub fn resolve_username(&self) -> Option<String> {
         self.username_env
             .as_ref()
@@ -239,6 +242,7 @@ impl AdminAuthConfig {
 
     /// Resolve admin password from environment variable at runtime
     /// Returns None if no password_env is configured or the environment variable is unset
+    #[allow(dead_code)]
     pub fn resolve_password(&self) -> Option<String> {
         self.password_env
             .as_ref()
@@ -534,6 +538,7 @@ impl Provider {
 
     /// Resolve custom headers with environment variable substitution
     /// Supports ${ENV_VAR} syntax in header values
+    #[allow(dead_code)]
     pub fn resolve_custom_headers(&self) -> HashMap<String, String> {
         self.custom_headers
             .iter()

@@ -15,5 +15,5 @@
 pub mod exact;
 pub mod semantic;
 
-pub use exact::{is_cache_eligible, ExactCache};
-pub use semantic::{CacheEntry, CachePayload, SemanticCache};
+pub use exact::ExactCache;
+pub use semantic::SemanticCache;

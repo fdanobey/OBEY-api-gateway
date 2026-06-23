@@ -84,6 +84,7 @@ impl Router {
     }
 
     /// Create a new Router with explicit context configuration
+    #[allow(dead_code)]
     pub fn with_context_config(config: Arc<RwLock<Config>>, context_config: ContextConfig, metrics: Arc<crate::metrics::Metrics>) -> Self {
         Self {
             config,
@@ -119,6 +120,7 @@ impl Router {
     }
 
     /// Get the context manager
+    #[allow(dead_code)]
     pub fn context_manager(&self) -> Arc<ContextManager> {
         self.context_manager.clone()
     }
@@ -353,6 +355,7 @@ impl Router {
     }
 
     /// Get latency tracker
+    #[allow(dead_code)]
     pub fn get_latency_tracker(&self) -> Arc<LatencyTracker> {
         self.latency_tracker.clone()
     }
@@ -388,6 +391,7 @@ impl Router {
         self.http_clients.clear();
     }
 
+    #[allow(dead_code)] // reserved for future budget enforcement
     fn get_provider_budget_limit_usd(config: &Config, provider_name: &str) -> Option<f64> {
         config
             .providers
@@ -397,6 +401,7 @@ impl Router {
     }
 
     /// Store model capabilities from provider's list_models response
+    #[allow(dead_code)]
     pub fn store_model_capabilities(&self, models: &[crate::providers::Model]) {
         self.context_manager.store_models(models);
     }
@@ -3465,10 +3470,23 @@ impl Router {
     ///   - Single object with `id`+`function` → wrap in a one-element array.
     ///   - Null / other → remove the key entirely.
     fn normalize_message_tool_calls(messages: &mut [Message]) {
-        for msg in messages.iter_mut() {
+        for (idx, msg) in messages.iter_mut().enumerate() {
             let Some(tc_val) = msg.extra.remove("tool_calls") else {
                 continue;
             };
+            debug!(
+                message_index = idx,
+                role = %msg.role,
+                tool_calls_type = %match &tc_val {
+                    serde_json::Value::Array(a) => format!("array(len={})", a.len()),
+                    serde_json::Value::Object(o) => format!("object(keys={})", o.len()),
+                    serde_json::Value::Null => "null".to_string(),
+                    serde_json::Value::String(_) => "string".to_string(),
+                    serde_json::Value::Bool(_) => "bool".to_string(),
+                    serde_json::Value::Number(_) => "number".to_string(),
+                },
+                "normalize_message_tool_calls: processing tool_calls"
+            );
             match tc_val {
                 serde_json::Value::Array(arr) => {
                     // Already correct shape — put it back.
@@ -3480,27 +3498,94 @@ impl Router {
                     }
                     // Empty array → drop it to avoid confusing providers.
                 }
-                serde_json::Value::Object(ref obj)
-                    if obj.contains_key("id") || obj.contains_key("function") =>
-                {
+                serde_json::Value::Object(obj) => {
                     // Single tool_call object → wrap in array.
-                    warn!(
-                        role = %msg.role,
-                        "tool_calls was a single object, wrapping in array"
-                    );
-                    msg.extra.insert(
-                        "tool_calls".to_string(),
-                        serde_json::Value::Array(vec![tc_val]),
-                    );
+                    // Accept any object shape that looks like a tool_call
+                    // (has id, function, type, or name keys).
+                    let looks_like_tool_call = obj.contains_key("id")
+                        || obj.contains_key("function")
+                        || obj.contains_key("type")
+                        || obj.contains_key("name");
+                    if looks_like_tool_call {
+                        warn!(
+                            role = %msg.role,
+                            "tool_calls was a single object, wrapping in array"
+                        );
+                        msg.extra.insert(
+                            "tool_calls".to_string(),
+                            serde_json::Value::Array(vec![serde_json::Value::Object(obj)]),
+                        );
+                    } else if !obj.is_empty() {
+                        // Non-empty object without recognized keys — could be
+                        // an indexed map like {"0": {...}, "1": {...}}. Try to
+                        // convert numeric-keyed objects into an array ordered
+                        // by key.
+                        let all_numeric_keys = obj.keys().all(|k| k.parse::<usize>().is_ok());
+                        if all_numeric_keys {
+                            let mut entries: Vec<(usize, serde_json::Value)> = obj
+                                .into_iter()
+                                .filter_map(|(k, v)| k.parse::<usize>().ok().map(|idx| (idx, v)))
+                                .collect();
+                            entries.sort_by_key(|(idx, _)| *idx);
+                            let arr: Vec<serde_json::Value> = entries.into_iter().map(|(_, v)| v).collect();
+                            if !arr.is_empty() {
+                                warn!(
+                                    role = %msg.role,
+                                    count = arr.len(),
+                                    "tool_calls was an indexed object map, converted to array"
+                                );
+                                msg.extra.insert(
+                                    "tool_calls".to_string(),
+                                    serde_json::Value::Array(arr),
+                                );
+                            }
+                        } else {
+                            warn!(
+                                role = %msg.role,
+                                keys = ?obj.keys().take(5).collect::<Vec<_>>(),
+                                "Dropping unrecognized tool_calls object (no tool_call keys found)"
+                            );
+                        }
+                    }
+                    // Empty object → drop silently.
                 }
                 serde_json::Value::Null => {
                     // Null → just drop it.
+                }
+                serde_json::Value::String(s) => {
+                    // Some clients serialize tool_calls as a JSON string.
+                    // Attempt to parse it back.
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s) {
+                        match parsed {
+                            serde_json::Value::Array(arr) if !arr.is_empty() => {
+                                warn!(
+                                    role = %msg.role,
+                                    "tool_calls was a JSON-encoded string, parsed back to array"
+                                );
+                                msg.extra.insert(
+                                    "tool_calls".to_string(),
+                                    serde_json::Value::Array(arr),
+                                );
+                            }
+                            _ => {
+                                warn!(
+                                    role = %msg.role,
+                                    "Dropping tool_calls string that did not parse to a non-empty array"
+                                );
+                            }
+                        }
+                    } else {
+                        warn!(
+                            role = %msg.role,
+                            "Dropping tool_calls string (not valid JSON)"
+                        );
+                    }
                 }
                 other => {
                     warn!(
                         role = %msg.role,
                         value_type = %other,
-                        "Dropping malformed tool_calls (not an array or object)"
+                        "Dropping malformed tool_calls (not an array, object, or string)"
                     );
                     // Drop it — better to omit than send garbage.
                 }

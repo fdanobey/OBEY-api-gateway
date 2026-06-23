@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! OAuth flow orchestration and session state machine.
 //!
 //! This module owns the end-to-end lifecycle of the OpenAI OAuth 2.0

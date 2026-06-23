@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Tracks OpenAI rate-limit usage for OAuth (browser-login) providers.
 //!
 //! OpenAI returns `x-ratelimit-*` headers on every response. For ChatGPT Plus

@@ -452,6 +452,7 @@ impl GatewayServer {
     }
 
     /// Reload configuration from disk (Req 26.1-26.7).
+    #[allow(dead_code)]
     pub async fn reload_config(&self, new_config: Config) -> Result<(), GatewayError> {
         apply_runtime_config_update(&self.state, new_config).await;
         Ok(())

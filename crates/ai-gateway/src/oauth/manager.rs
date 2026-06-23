@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! OAuth session manager — wraps flow + token store + background refresh task.
 //!
 //! Owns the runtime-shared [`OAuthSessionState`] and the on-disk

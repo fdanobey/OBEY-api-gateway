@@ -162,7 +162,8 @@ pub enum BedrockAuthMode {
 pub struct BedrockProvider {
     /// Provider name for identification
     name: String,
-    /// AWS region
+    /// AWS region (used in tests for assertions)
+    #[allow(dead_code)]
     region: String,
     /// Authentication mode (API key or AWS SDK)
     auth_mode: BedrockAuthMode,
@@ -236,6 +237,7 @@ impl BedrockProvider {
 
     /// Get a reference to the AWS SDK client if using SDK authentication mode.
     /// Returns None if using API key authentication.
+    #[allow(dead_code)] // used in tests
     fn get_sdk_client(&self) -> Option<&BedrockClient> {
         match &self.auth_mode {
             BedrockAuthMode::AwsSdk { client, .. } => Some(client),
@@ -698,12 +700,6 @@ impl BedrockProvider {
         base_url: &str,
         custom_headers: &HashMap<String, String>,
     ) -> Result<Vec<Model>, GatewayError> {
-        #[derive(Deserialize)]
-        struct ModelsResponse {
-            #[serde(default)]
-            data: Vec<Model>,
-        }
-
         let mut all_models: Vec<Model> = Vec::new();
 
         // 1) Standard Mantle path: /v1/models (GPT-OSS, open-weight models, etc.)

@@ -1,10 +1,18 @@
+#[allow(dead_code)]
 pub mod openai_compatible;
+#[allow(dead_code)]
 pub mod bedrock;
+#[allow(dead_code)]
 pub mod ollama;
+#[allow(dead_code)]
 pub mod groq;
+#[allow(dead_code)]
 pub mod together;
+#[allow(dead_code)]
 pub mod vllm;
+#[allow(dead_code)]
 pub mod lmstudio;
+#[allow(dead_code)]
 pub mod nvidia_nim;
 
 use async_trait::async_trait;
@@ -17,6 +25,7 @@ use crate::models::openai::{OpenAIRequest, OpenAIResponse};
 
 /// Server-Sent Event for streaming responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct SSEEvent {
     /// Event type (e.g., "message", "error", "done")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -28,6 +37,7 @@ pub struct SSEEvent {
     pub id: Option<String>,
 }
 
+#[allow(dead_code)]
 impl SSEEvent {
     /// Create a new SSE event with data
     pub fn new(data: String) -> Self {
@@ -94,6 +104,7 @@ pub struct Model {
 
 /// Provider response wrapper
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ProviderResponse {
     /// The OpenAI-formatted response
     pub response: OpenAIResponse,
@@ -106,6 +117,7 @@ pub struct ProviderResponse {
 /// Unified provider client trait
 /// All provider implementations must implement this trait
 #[async_trait]
+#[allow(dead_code)]
 pub trait ProviderClient: Send + Sync {
     /// Execute a non-streaming chat completion request
     ///

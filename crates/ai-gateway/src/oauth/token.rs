@@ -18,6 +18,7 @@
 // `codex-backend-translation` spec: the JWT claim extractor is callable as
 // `crate::oauth::token::extract_chatgpt_account_id`. The implementation lives
 // in `crate::codex::jwt` to keep Codex-specific logic co-located.
+#[allow(unused_imports)]
 pub use crate::codex::jwt::extract_chatgpt_account_id;
 
 use serde::Deserialize;

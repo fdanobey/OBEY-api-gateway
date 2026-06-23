@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Encrypted at-rest persistence for OpenAI OAuth tokens.
 //!
 //! Tokens are persisted to a single file on disk, encrypted with the router's

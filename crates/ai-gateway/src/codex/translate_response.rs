@@ -308,6 +308,7 @@ where
 // ─── stream_translate ────────────────────────────────────────────────────────
 
 /// Internal state for the streaming translator state machine.
+#[allow(dead_code)]
 struct StreamTranslatorState {
     response_id: String,
     model: String,
@@ -326,6 +327,7 @@ struct StreamTranslatorState {
 /// `data: [DONE]\n\n` sentinel. The `resolved_model` is used as the
 /// `model` field in every emitted chunk (Req 4.11).
 #[tracing::instrument(skip_all)]
+#[allow(dead_code)]
 pub fn stream_translate<S>(
     upstream: S,
     resolved_model: String,
@@ -380,6 +382,7 @@ where
 }
 
 /// Translates a single `ResponsesEvent` into zero or more SSE chunk strings.
+#[allow(dead_code)]
 fn translate_event(
     state: &mut StreamTranslatorState,
     event: ResponsesEvent,
@@ -495,6 +498,7 @@ fn translate_event(
 }
 
 /// Formats a single SSE chunk line: `data: <json>\n\n`.
+#[allow(dead_code)]
 fn format_chunk(
     state: &StreamTranslatorState,
     delta: serde_json::Value,

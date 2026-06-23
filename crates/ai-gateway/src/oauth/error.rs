@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! OAuth error type covering every failure mode of the OpenAI OAuth + PKCE flow.
 //!
 //! # Security invariant
