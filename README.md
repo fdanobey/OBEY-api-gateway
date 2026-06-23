@@ -81,6 +81,54 @@ docker run -d \
 
 > **Persist your keys:** the image sets `AI_GATEWAY_DATA_DIR=/data` and declares it as a volume. Mount a named volume (or host path) at `/data` as shown above so the encryption master key survives container restarts and rebuilds. Without it, the key regenerates on each container recreation and any `api_key_encrypted` values already saved in your `config.yaml` become undecryptable.
 
+#### Updating (Docker)
+
+To update to the latest version:
+
+```bash
+# Pull latest source and rebuild
+git pull origin master
+docker build -t obey-api-gateway .
+
+# Stop and remove the old container (data volume is preserved)
+docker stop obey-api-gateway && docker rm obey-api-gateway
+
+# Start with the new image
+docker run -d --name obey-api-gateway \
+  -p 8080:8080 \
+  -e OPENAI_API_KEY=sk-... \
+  -v $(pwd)/config.yaml:/app/config.yaml \
+  -v ai-gateway-data:/data \
+  obey-api-gateway --config /app/config.yaml
+```
+
+If you're using Docker Compose:
+
+```yaml
+# docker-compose.yml
+services:
+  obey-api-gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ai-gateway-data:/data
+    environment:
+      - OPENAI_API_KEY=sk-...
+
+volumes:
+  ai-gateway-data:
+```
+
+```bash
+# Update with Compose
+git pull origin master
+docker compose up -d --build
+```
+
+> **Note:** Your encrypted keys and config persist in the `ai-gateway-data` volume across rebuilds. Never `docker volume rm ai-gateway-data` unless you intend to reset all stored secrets.
+
 ### Option 4: Build from Source
 
 ```bash
