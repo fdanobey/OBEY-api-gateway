@@ -4010,35 +4010,29 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         let response = match send_result {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
-                warn!(provider = %provider_model.provider, error = %e, "Streaming request send failed");
-                return Err(GatewayError::Provider {
-                    provider: provider_model.provider.clone(),
-                    message: format!("Streaming request failed: {}", e),
-                    status_code: None,
-                });
+                warn!(provider = %provider_model.provider, error = %e, "Streaming pass-through send failed, falling back to buffered path with full failover");
+                return Ok(StreamingResponse::Buffered(
+                    self.route_request(request).await?,
+                ));
             }
             Err(_) => {
-                warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — provider did not respond in time");
-                return Err(GatewayError::TtfbTimeout(ttfb_timeout_secs));
+                warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — falling back to buffered path with full failover");
+                return Ok(StreamingResponse::Buffered(
+                    self.route_request(request).await?,
+                ));
             }
         };
 
         let status = response.status();
         if !status.is_success() {
             let status_code = status.as_u16();
-            // Drain a bounded slice of the error body for diagnostics. The
-            // streaming handler (5.3) decides how to surface this to the client.
-            let body_text = response.text().await.unwrap_or_default();
-            let snippet: String = body_text.chars().take(500).collect();
-            warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming)");
-            return Err(GatewayError::Provider {
-                provider: provider_model.provider.clone(),
-                message: format!(
-                    "Provider returned HTTP {} for streaming request: {}",
-                    status_code, snippet
-                ),
-                status_code: Some(status_code),
-            });
+            // Drain the error body so the connection can be reused, then fall
+            // back to the buffered path which has full multi-provider failover.
+            let _ = response.text().await;
+            warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
+            return Ok(StreamingResponse::Buffered(
+                self.route_request(request).await?,
+            ));
         }
 
         // Success — hand the live streaming body to the caller without
