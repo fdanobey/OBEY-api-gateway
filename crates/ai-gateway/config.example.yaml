@@ -146,3 +146,11 @@ tray:
   show_notifications: true
   auto_open_browser: true
   splash_duration_ms: 3000
+
+# Streaming reliability. The whole section is optional; defaults are shown.
+# streaming:
+#   emit_early_event: true            # send a synthetic role event so clients don't time out
+#   keepalive_interval_seconds: 5     # SSE keep-alive (0 = axum default)
+#   passthrough_enabled: true         # true token-by-token streaming for compatible providers
+#   chunk_timeout_seconds: 60         # max gap between provider SSE chunks
+#   retry_on_truncation: true         # fail over when a response is truncated (finish_reason=length)

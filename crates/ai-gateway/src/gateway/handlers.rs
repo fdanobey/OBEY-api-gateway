@@ -531,6 +531,20 @@ async fn chat_completions_stream(state: AppState, request: OpenAIRequest, trace_
 
                         // Shared handle the relay writes its terminal outcome to.
                         let outcome = Arc::new(tokio::sync::Mutex::new(RelayOutcome::Completed));
+                        // Enable adaptive XML-tool detection only when the
+                        // request carries `tools` (XML tool use is irrelevant
+                        // otherwise). A learned combo would already have been
+                        // routed to the buffered path, so here it is always an
+                        // as-yet-unlearned combo.
+                        let xml_detect = if request.extra.contains_key("tools") {
+                            Some(XmlToolDetect {
+                                router: state.router.clone(),
+                                provider: current_provider.clone(),
+                                model: current_model.clone(),
+                            })
+                        } else {
+                            None
+                        };
                         let relay = relay_passthrough_stream(
                             current_stream,
                             streaming_config_relay.clone(),
@@ -540,6 +554,7 @@ async fn chat_completions_stream(state: AppState, request: OpenAIRequest, trace_
                             state.metrics.clone(),
                             request.clone(),
                             outcome.clone(),
+                            xml_detect,
                         );
                         // The relay emits its own terminal `[DONE]` (or a graceful
                         // error event that appends one, or — on pre-content
@@ -1131,6 +1146,17 @@ fn chunk_carries_content(payload: &str) -> bool {
 /// metrics/logging (Req 3.7). Partial or errored streams are never cached.
 ///
 // Wired into `chat_completions_stream` by task 5.5; failover wiring task 6.1.
+/// Inputs the streaming relay needs to adaptively learn that a provider/model
+/// combo emits XML-style tool calls. When `Some` (the request carried `tools`),
+/// a clean pass-through completion is scanned for XML tool use; if found, the
+/// combo is recorded via [`Router::mark_xml_tool_combo`] so future tool requests
+/// for it take the buffer-and-translate path.
+struct XmlToolDetect {
+    router: Arc<crate::router::router::Router>,
+    provider: String,
+    model: String,
+}
+
 fn relay_passthrough_stream(
     upstream: reqwest::Response,
     streaming_config: StreamingConfig,
@@ -1140,6 +1166,7 @@ fn relay_passthrough_stream(
     metrics: Arc<Metrics>,
     request: OpenAIRequest,
     outcome: Arc<tokio::sync::Mutex<RelayOutcome>>,
+    xml_detect: Option<XmlToolDetect>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         let chunk_timeout = Duration::from_secs(streaming_config.chunk_timeout_seconds);
@@ -1337,6 +1364,33 @@ fn relay_passthrough_stream(
             if !sse_accumulator.is_empty() {
                 match crate::router::router::Router::reassemble_sse_response(&sse_accumulator) {
                     Ok(assembled) => {
+                        // Adaptive XML-tool detection (only when the request
+                        // carried `tools`): if this provider/model streamed
+                        // XML-style tool calls in plain text instead of native
+                        // `tool_calls`, learn the combo so the NEXT tool request
+                        // for it takes the buffer-and-translate path. This one
+                        // request still streamed the raw XML — learning is for
+                        // subsequent requests.
+                        if let Some(det) = xml_detect.as_ref() {
+                            let choice = assembled.choices.first();
+                            let has_native_tc = choice
+                                .map(|c| c.message.extra.contains_key("tool_calls"))
+                                .unwrap_or(false);
+                            let content_text = choice
+                                .map(|c| c.message.content_as_text())
+                                .unwrap_or_default();
+                            if !has_native_tc
+                                && crate::router::router::Router::looks_like_xml_tool_use(&content_text)
+                            {
+                                det.router.mark_xml_tool_combo(&det.provider, &det.model);
+                                tracing::warn!(
+                                    trace_id = %trace_id,
+                                    provider = %det.provider,
+                                    model = %det.model,
+                                    "Detected XML-style tool use in streamed response; future tool requests for this provider/model will use the buffered translate path"
+                                );
+                            }
+                        }
                         // Req 3.7: surface usage from the final chunk in logs.
                         tracing::info!(
                             trace_id = %trace_id,
@@ -1996,6 +2050,7 @@ mod tests {
             metrics,
             request,
             mk_outcome(),
+            None,
         );
         let events: Vec<_> = stream.collect().await;
         // 2 forwarded chunks + 1 terminal [DONE]. Malformed + upstream [DONE] dropped.
@@ -2020,6 +2075,7 @@ mod tests {
             metrics,
             request,
             mk_outcome(),
+            None,
         );
         let events: Vec<_> = stream.collect().await;
         // 1 forwarded chunk + error event + [DONE] (the error path's own DONE).
@@ -2045,6 +2101,7 @@ mod tests {
             metrics,
             request.clone(),
             mk_outcome(),
+            None,
         );
         let _events: Vec<_> = stream.collect().await;
 
@@ -2071,6 +2128,7 @@ mod tests {
             metrics,
             request.clone(),
             mk_outcome(),
+            None,
         );
         let _events: Vec<_> = stream.collect().await;
         assert!(
@@ -2134,6 +2192,7 @@ mod tests {
             metrics,
             request,
             mk_outcome(),
+            None,
         );
 
         let text = relay_to_sse_text(stream).await;
@@ -2170,6 +2229,7 @@ mod tests {
             metrics,
             request,
             mk_outcome(),
+            None,
         );
 
         let text = relay_to_sse_text(stream).await;
@@ -2233,6 +2293,7 @@ mod tests {
             metrics,
             request,
             outcome.clone(),
+            None,
         );
         let events: Vec<_> = stream.collect().await;
         assert!(events.is_empty(), "pre-content failure must emit no SSE events");
@@ -2261,6 +2322,7 @@ mod tests {
             metrics,
             request,
             outcome.clone(),
+            None,
         );
         let _events: Vec<_> = stream.collect().await;
         assert!(matches!(&*outcome.lock().await, RelayOutcome::Completed));

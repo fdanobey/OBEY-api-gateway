@@ -4,6 +4,7 @@ use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
 use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
 use crate::providers::bedrock::{apply_global_inference_prefix, model_supports_reasoning};
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use std::error::Error as StdError;
@@ -37,6 +38,13 @@ pub struct Router {
     /// Used to display usage in admin UI and as fallback cooldown when
     /// no Retry-After header is present on 429 responses.
     oauth_usage_tracker: Option<Arc<crate::oauth::UsageTracker>>,
+    /// Adaptively learned set of `provider::model` combinations whose model
+    /// emits XML-style tool calls (instead of native `tool_calls`). Populated
+    /// at runtime when a streaming pass-through response is detected to contain
+    /// XML tool use. Subsequent tool requests for a learned combo take the
+    /// buffer-and-translate path so the XML is rewritten into native
+    /// `tool_calls`. In-memory only — resets on process restart.
+    xml_tool_combos: Arc<std::sync::RwLock<HashSet<String>>>,
 }
 
 /// Result of [`Router::route_request_streaming`].
@@ -80,6 +88,7 @@ impl Router {
             oauth_manager: None,
             instructions_store: None,
             oauth_usage_tracker: None,
+            xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
         }
     }
 
@@ -97,6 +106,7 @@ impl Router {
             oauth_manager: None,
             instructions_store: None,
             oauth_usage_tracker: None,
+            xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
         }
     }
 
@@ -3631,17 +3641,13 @@ impl Router {
     /// Requirements: 3.8
     // Wired into the streaming pass-through path by task 5.2.
     #[allow(dead_code)]
-    fn provider_needs_transformation(&self, provider: &Provider, request: &OpenAIRequest) -> bool {
+    fn provider_needs_transformation(&self, provider: &Provider, _request: &OpenAIRequest) -> bool {
         // Bedrock requires format translation — cannot pass-through stream.
         if provider.provider_type == "bedrock" {
             return true;
         }
-        // Providers that emit XML tool calls need post-processing when the
-        // request includes tools.
-        if self.provider_uses_xml_tools(provider) && request.extra.contains_key("tools") {
-            return true;
-        }
-        // Kimi / Nano-GPT models need special-token sanitization.
+        // Kimi / Nano-GPT models need special-token sanitization regardless of
+        // tools, so they always take the buffered path.
         let name = provider.name.to_lowercase();
         if name.contains("kimi") || name.contains("nano-gpt") {
             return true;
@@ -3649,15 +3655,42 @@ impl Router {
         false
     }
 
-    /// Name-based heuristic for providers that emit XML-style tool calls
-    /// instead of native OpenAI `tool_calls` (e.g. GLM, Kimi via Nano-GPT).
-    ///
-    /// Requirements: 3.8
-    // Wired into the streaming pass-through path by task 5.2.
-    #[allow(dead_code)]
-    fn provider_uses_xml_tools(&self, provider: &Provider) -> bool {
-        let name = provider.name.to_lowercase();
-        name.contains("glm") || name.contains("kimi") || name.contains("nano-gpt")
+    /// Cache key for the adaptively-learned XML-tool combo set.
+    fn xml_combo_key(provider: &str, model: &str) -> String {
+        format!("{}::{}", provider, model)
+    }
+
+    /// True if this exact `provider`/`model` combo has been observed emitting
+    /// XML-style tool calls during a streaming pass-through (see
+    /// [`Self::mark_xml_tool_combo`]). Such combos take the buffer-and-translate
+    /// path when the request carries `tools`.
+    pub fn is_xml_tool_combo(&self, provider: &str, model: &str) -> bool {
+        self.xml_tool_combos
+            .read()
+            .map(|set| set.contains(&Self::xml_combo_key(provider, model)))
+            .unwrap_or(false)
+    }
+
+    /// Record a `provider`/`model` combo as one that emits XML-style tool calls.
+    /// Idempotent. Called from the streaming relay when XML tool use is detected
+    /// in an otherwise native-streamed response.
+    pub fn mark_xml_tool_combo(&self, provider: &str, model: &str) {
+        if let Ok(mut set) = self.xml_tool_combos.write() {
+            set.insert(Self::xml_combo_key(provider, model));
+        }
+    }
+
+    /// Heuristic: does `text` contain XML/pseudo-XML tool-call markers that some
+    /// models emit instead of native OpenAI `tool_calls`? Shared by the
+    /// streaming detector and the non-streaming diagnostic path.
+    pub fn looks_like_xml_tool_use(text: &str) -> bool {
+        text.contains("<use_tool")
+            || text.contains("<tool_call")
+            || text.contains("<function_call")
+            || text.contains("<invoke ")
+            || text.contains("<tool_calls>")
+            || text.contains("<execute_command")
+            || text.contains("<|tool_call")
     }
 
     /// Route non-streaming request
@@ -3872,7 +3905,18 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         // (Bedrock / XML-tool rewrite / Kimi-Nano) likewise must buffer.
         let is_codex = provider_cfg.auth_method.as_deref() == Some("oauth")
             && provider_cfg.provider_type == "openai";
-        if is_codex || self.provider_needs_transformation(provider_cfg, &prepared_request) {
+        // A provider/model combo previously observed emitting XML-style tool
+        // calls takes the buffer-and-translate path when the request carries
+        // `tools`, so the XML can be rewritten into native `tool_calls`. Unknown
+        // combos stream optimistically; the relay learns and marks them if XML
+        // tool use is detected (see `relay_passthrough_stream`).
+        let tools_present = prepared_request.extra.contains_key("tools");
+        let known_xml_combo = tools_present
+            && self.is_xml_tool_combo(&provider_model.provider, &provider_model.model);
+        if is_codex
+            || self.provider_needs_transformation(provider_cfg, &prepared_request)
+            || known_xml_combo
+        {
             drop(config);
             debug!(provider = %provider_model.provider, "Provider needs transformation or is Codex, using buffered path");
             return Ok(StreamingResponse::Buffered(
@@ -5123,9 +5167,45 @@ mod property_tests {
         let kimi = make_provider_named("kimi-k2", "openai");
         assert!(router.provider_needs_transformation(&kimi, &request_with_tools(false)));
 
-        // XML-tool providers (e.g. GLM) only need transformation when tools present.
+        // XML tool use is no longer inferred from the provider name: a GLM
+        // provider streams optimistically (with or without tools) until the
+        // relay learns it emits XML — see `is_xml_tool_combo` learning below.
         let glm = make_provider_named("glm-provider", "openai");
         assert!(!router.provider_needs_transformation(&glm, &request_with_tools(false)));
-        assert!(router.provider_needs_transformation(&glm, &request_with_tools(true)));
+        assert!(!router.provider_needs_transformation(&glm, &request_with_tools(true)));
+    }
+
+    #[test]
+    fn test_xml_tool_combo_learning_is_scoped_per_provider_model() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+
+        // Unknown combos stream by default.
+        assert!(!router.is_xml_tool_combo("glm-provider", "glm-5.2"));
+
+        // Learning is scoped to the exact provider/model pair.
+        router.mark_xml_tool_combo("glm-provider", "glm-5.2");
+        assert!(router.is_xml_tool_combo("glm-provider", "glm-5.2"));
+        assert!(!router.is_xml_tool_combo("glm-provider", "glm-4.6"));
+        assert!(!router.is_xml_tool_combo("other-provider", "glm-5.2"));
+
+        // Idempotent.
+        router.mark_xml_tool_combo("glm-provider", "glm-5.2");
+        assert!(router.is_xml_tool_combo("glm-provider", "glm-5.2"));
+    }
+
+    #[test]
+    fn test_looks_like_xml_tool_use_detects_common_markers() {
+        assert!(Router::looks_like_xml_tool_use(
+            "sure<tool_call>{\"name\":\"read_file\"}</tool_call>"
+        ));
+        assert!(Router::looks_like_xml_tool_use(
+            "<use_tool name=\"execute_command\">{}</use_tool>"
+        ));
+        assert!(Router::looks_like_xml_tool_use(
+            "<tool_calls><invoke name=\"x\"></invoke></tool_calls>"
+        ));
+        assert!(!Router::looks_like_xml_tool_use(
+            "Here is a normal answer with no tool use."
+        ));
     }
 }
