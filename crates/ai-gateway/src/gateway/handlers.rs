@@ -196,12 +196,14 @@ impl RequestCompleteGuard {
     }
 
     /// Mark the request as completed normally (prevents the Drop impl from
-    /// double-decrementing).
-    fn complete(&mut self) {
+    /// double-decrementing) and return the measured duration.
+    fn complete(&mut self) -> u64 {
+        let duration_ms = self.start.elapsed().as_millis() as u64;
         if !self.completed {
             self.completed = true;
-            self.metrics.complete_request(self.start.elapsed().as_millis() as u64);
+            self.metrics.complete_request(duration_ms);
         }
+        duration_ms
     }
 }
 
@@ -251,6 +253,7 @@ pub async fn chat_completions(
 async fn chat_completions_non_stream(state: AppState, request: OpenAIRequest, trace_id: String) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
+    let mut request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
     tracing::debug!(model = %request.model, "Routing non-stream request");
 
     // Tier-1: exact-match in-memory cache.  Lookup is always safe — eligibility
@@ -260,7 +263,7 @@ async fn chat_completions_non_stream(state: AppState, request: OpenAIRequest, tr
     if let Some(cached_json) = state.exact_cache.get(&request) {
         if let Ok(resp) = serde_json::from_str::<crate::models::openai::OpenAIResponse>(&cached_json) {
             state.metrics.record_cache_hit();
-            state.metrics.complete_request(start.elapsed().as_millis() as u64);
+            request_guard.complete();
             let mut http = Json(resp).into_response();
             attach_trace_id_header(&mut http, &trace_id);
             return http;
@@ -278,9 +281,9 @@ async fn chat_completions_non_stream(state: AppState, request: OpenAIRequest, tr
             match cache.get(&request).await {
                 Ok(Some(cached_response)) => {
                     state.metrics.record_cache_hit();
-                    state.metrics.complete_request(start.elapsed().as_millis() as u64);
                     match serde_json::from_str::<crate::models::openai::OpenAIResponse>(&cached_response) {
                         Ok(resp) => {
+                            request_guard.complete();
                             let mut response = Json(resp).into_response();
                             attach_trace_id_header(&mut response, &trace_id);
                             return response;
@@ -319,8 +322,7 @@ async fn chat_completions_non_stream(state: AppState, request: OpenAIRequest, tr
                     }
                 }
             }
-            let duration_ms = start.elapsed().as_millis() as u64;
-            state.metrics.complete_request(duration_ms);
+            let duration_ms = request_guard.complete();
             let log_context = RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
             log_request(&state, &request, &log_context);
             let mut http_response = Json(response).into_response();
@@ -328,8 +330,7 @@ async fn chat_completions_non_stream(state: AppState, request: OpenAIRequest, tr
             http_response
         }
         Err(e) => {
-            let duration_ms = start.elapsed().as_millis() as u64;
-            state.metrics.complete_request(duration_ms);
+            let duration_ms = request_guard.complete();
             let log_context = RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
             log_request(&state, &request, &log_context);
             let mut response = e.into_response();
@@ -396,10 +397,13 @@ async fn chat_completions_stream(state: AppState, request: OpenAIRequest, trace_
         let stream_trace_id = trace_id.clone();
 
         let streaming_config_relay = streaming_config.clone();
+        // Construct the guard before building the lazy SSE generator so dropping
+        // an unpolled body still decrements `active_requests`.
+        let request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
         let stream = async_stream::stream! {
             // Drop guard: ensures active_requests is decremented even if the
             // client disconnects and the stream is cancelled mid-flight.
-            let mut _guard = RequestCompleteGuard::new(state.metrics.clone(), start);
+            let mut _guard = request_guard;
 
             // Early synthetic event (Req 1.1, 1.2, 1.3).
             yield Ok::<_, Infallible>(Event::default().data(early_chunk.to_string()));
@@ -717,11 +721,11 @@ async fn chat_completions_stream(state: AppState, request: OpenAIRequest, trace_
     // Route the request first (provider always returns non-streaming JSON).
     // Errors here happen BEFORE any SSE chunks are sent, so we return a
     // normal JSON error response with the proper HTTP status code.
+    let mut request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
     let response = match state.router.route_request(&request).await {
         Ok(resp) => resp,
         Err(e) => {
-            let duration_ms = start.elapsed().as_millis() as u64;
-            state.metrics.complete_request(duration_ms);
+            let duration_ms = request_guard.complete();
             let log_context = RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
             log_request(&state, &request, &log_context);
             let mut response = e.into_response();
@@ -799,7 +803,7 @@ async fn chat_completions_stream(state: AppState, request: OpenAIRequest, trace_
         yield Ok(Event::default().data("[DONE]"));
     };
 
-    state.metrics.complete_request(start.elapsed().as_millis() as u64);
+    request_guard.complete();
 
     Sse::new(stream)
         .keep_alive(build_keepalive(&streaming_config))

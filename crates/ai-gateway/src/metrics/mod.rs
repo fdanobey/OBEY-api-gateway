@@ -208,7 +208,22 @@ impl Metrics {
     /// Record completed request with response time
     #[inline]
     pub fn complete_request(&self, duration_ms: u64) {
-        self.active_requests.fetch_sub(1, Ordering::Relaxed);
+        let mut current = self.active_requests.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                tracing::warn!(duration_ms, "Ignoring request completion because active request count is already zero");
+                return;
+            }
+            match self.active_requests.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
         self.total_response_time_ms.fetch_add(duration_ms, Ordering::Relaxed);
         self.completed_requests.fetch_add(1, Ordering::Relaxed);
     }
@@ -639,6 +654,22 @@ mod tests {
         metrics.complete_request(100);
         assert_eq!(metrics.snapshot().active_requests, 0);
         assert_eq!(metrics.snapshot().avg_response_time_ms, 100.0);
+    }
+
+    #[test]
+    fn test_request_completion_does_not_underflow_active_requests() {
+        let metrics = Metrics::new();
+
+        metrics.complete_request(100);
+        assert_eq!(metrics.snapshot().active_requests, 0);
+        assert_eq!(metrics.snapshot().avg_response_time_ms, 0.0);
+
+        metrics.start_request();
+        metrics.complete_request(50);
+        metrics.complete_request(75);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.active_requests, 0);
+        assert_eq!(snapshot.avg_response_time_ms, 50.0);
     }
 
     #[test]
