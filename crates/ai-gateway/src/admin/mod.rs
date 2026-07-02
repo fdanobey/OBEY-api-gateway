@@ -42,8 +42,15 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/export", get(export_config))
         .route("/import", post(import_config));
 
+    // Virtual key admin API (Req 10.1-10.6). Self-contained router owning an
+    // `Arc<VirtualKeyManager>`; nested here so the admin auth `route_layer`
+    // below protects every `/keys` endpoint (Req 10.2).
+    let virtual_keys_api =
+        crate::virtual_keys::admin::routes(std::sync::Arc::clone(&state.virtual_key_manager));
+
     Router::new()
         .nest("/config", config_api)
+        .nest_service("/keys", virtual_keys_api)
         .route("/providers/models", get(proxy_provider_models))
         .route("/test-connection", post(test_connection))
         .route("/oauth/openai/login", post(oauth_login))
@@ -1357,6 +1364,7 @@ mod tests {
                     tray: TrayConfig::default(),
                     codex_instructions_url: None,
                     streaming: None,
+                    virtual_keys: Default::default(),
                 })
             })
         })
@@ -1629,6 +1637,7 @@ retry:
             tray: TrayConfig::default(),
             codex_instructions_url: None,
             streaming: None,
+            virtual_keys: Default::default(),
         }
     }
 

@@ -28,6 +28,7 @@ use crate::models::openai::{Choice, OpenAIRequest, OpenAIResponse};
 use crate::providers::Model;
 use crate::router::trace_id::generate_trace_id;
 use crate::router::StreamingResponse;
+use crate::virtual_keys::models::AuthenticatedKey;
 
 #[derive(Debug, Clone)]
 struct RequestLogContext {
@@ -2447,7 +2448,14 @@ pub struct ModelsListResponse {
 }
 
 /// Aggregated models endpoint — queries all configured providers.
-pub async fn list_models(State(state): State<AppState>) -> Response {
+pub async fn list_models(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Response {
+    // Extract the authenticated key from request extensions (set by the vk
+    // auth middleware when a valid virtual key is presented).
+    let authenticated_key = request.extensions().get::<AuthenticatedKey>().cloned();
+
     let config = state.config.read().await;
     let mut all_models: Vec<Model> = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
@@ -2495,6 +2503,27 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
                     max_completion_tokens: None,
                 });
             }
+        }
+    }
+
+    // When the caller authenticated with a virtual key that has a model_access
+    // restriction, filter the list to only models/groups in the allowed set.
+    // A permitted model group name also grants visibility to all individual
+    // models within that group.
+    if let Some(ref authenticated) = authenticated_key {
+        if let Some(ref allowed) = authenticated.model_access {
+            // Build the expanded set: explicit allowed entries + all individual
+            // model IDs belonging to allowed model groups.
+            let mut visible: std::collections::HashSet<&str> =
+                allowed.iter().map(|s| s.as_str()).collect();
+            for group in &config.model_groups {
+                if allowed.iter().any(|a| a == &group.name) {
+                    for pm in &group.models {
+                        visible.insert(&pm.model);
+                    }
+                }
+            }
+            all_models.retain(|m| visible.contains(m.id.as_str()));
         }
     }
 

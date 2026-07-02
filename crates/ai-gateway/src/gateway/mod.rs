@@ -22,6 +22,7 @@ use crate::logger::RequestLogger;
 use crate::metrics::Metrics;
 use crate::oauth::{OAuthManager, OAuthTokenStore};
 use crate::router::router::Router as RequestRouter;
+use crate::virtual_keys::VirtualKeyManager;
 
 /// Shared application state accessible by all route handlers.
 #[derive(Clone)]
@@ -39,6 +40,10 @@ pub struct AppState {
     pub oauth_manager: Option<Arc<OAuthManager>>,
     pub oauth_usage_tracker: Arc<crate::oauth::UsageTracker>,
     pub codex_models_discovery: Arc<crate::codex::models_discovery::ModelsDiscovery>,
+    /// Virtual key manager: caller authentication and usage governance.
+    /// Always present; enforcement is gated by `config.virtual_keys.enforcement`
+    /// (default `disabled`), so an unconfigured deployment is unaffected.
+    pub virtual_key_manager: Arc<VirtualKeyManager>,
 }
 
 /// Core HTTP server wrapping Axum with middleware and integrated components.
@@ -138,6 +143,17 @@ impl GatewayServer {
         let oauth_usage_tracker = Arc::new(crate::oauth::UsageTracker::new());
         router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
 
+        // --- Virtual key manager construction (Req 2.1, 11.1-11.5) ---
+        // Backed by the SQLite key store at `virtual_keys.database_path`. Built
+        // unconditionally; enforcement is gated per-request by the configured
+        // mode (default `disabled`). A store-open failure aborts startup.
+        let virtual_key_manager = {
+            let db_path = config.virtual_keys.database_path.clone();
+            let manager = VirtualKeyManager::new(std::path::Path::new(&db_path))
+                .map_err(|e| GatewayError::Database(e.to_string()))?;
+            Arc::new(manager)
+        };
+
         let state = AppState {
             config: config_arc,
             config_path: Arc::new(config_path.unwrap_or_else(|| std::path::PathBuf::from("./config.yaml"))),
@@ -150,6 +166,7 @@ impl GatewayServer {
             oauth_manager,
             oauth_usage_tracker,
             codex_models_discovery: Arc::new(crate::codex::models_discovery::ModelsDiscovery::new()),
+            virtual_key_manager,
         };
 
         Ok(Self { state })
@@ -245,6 +262,16 @@ impl GatewayServer {
                 "/v1/fine_tuning/jobs/{fine_tuning_id}/events",
                 get(list_fine_tuning_events),
             );
+
+        // --- Virtual key authentication + enforcement (Req 2.1, 2.4, 5.5, 6.4,
+        // 11.1-11.5) --- Layer runs BEFORE the routing handlers above. In
+        // `disabled` mode it is a no-op passthrough; in `optional`/`required`
+        // it authenticates `vk_` bearer tokens, enforces model access, budget,
+        // and rate limits, and records usage after the response.
+        let api_routes = api_routes.layer(axum::middleware::from_fn_with_state(
+            self.state.clone(),
+            crate::virtual_keys::auth::virtual_key_auth_middleware,
+        ));
 
         // --- Admin panel (Req 13.1-13.18) ---
         let (admin_enabled, admin_path, dashboard_enabled, dashboard_path, prometheus_cfg) = {
@@ -608,6 +635,7 @@ mod tests {
             tray: TrayConfig::default(),
             codex_instructions_url: None,
             streaming: None,
+            virtual_keys: Default::default(),
         }
     }
 
@@ -860,6 +888,7 @@ mod tests {
                     tray: TrayConfig::default(),
                     codex_instructions_url: None,
                     streaming: None,
+                    virtual_keys: Default::default(),
                 };
 
                 let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -1430,6 +1459,7 @@ mod tests {
                     tray: TrayConfig::default(),
                     codex_instructions_url: None,
                     streaming: None,
+                    virtual_keys: Default::default(),
                 };
 
                 // Write new config to disk

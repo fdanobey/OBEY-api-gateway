@@ -13,5 +13,6 @@ pub mod oauth;
 pub mod providers;
 pub mod router;
 pub mod secrets;
+pub mod virtual_keys;
 #[cfg(feature = "tray")]
 pub mod tray;

@@ -19,6 +19,7 @@ mod gateway;
 mod metrics;
 mod oauth;
 mod secrets;
+mod virtual_keys;
 #[cfg(feature = "tray")]
 mod tray;
 

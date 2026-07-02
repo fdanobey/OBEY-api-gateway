@@ -138,6 +138,66 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
 .oauth-fields-msg.msg-info{background:rgba(13,110,253,.05);border-color:rgba(13,110,253,.2);color:var(--primary)}
 .oauth-fields-msg.msg-error{background:rgba(220,53,69,.05);border-color:rgba(220,53,69,.2);color:var(--danger)}
 .oauth-fields-msg.msg-success{background:rgba(25,135,84,.05);border-color:rgba(25,135,84,.2);color:var(--success)}
+
+/* Virtual Keys (Req 12.1, 12.2, 12.8, 12.9, 12.10) */
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.vk-controls{display:flex;flex-wrap:wrap;gap:1rem;align-items:flex-end;margin-bottom:1rem}
+.vk-controls .form-group{margin-bottom:0}
+.vk-enforcement{min-width:180px}
+.vk-search-group{flex:1;min-width:220px}
+.vk-toolbar{display:flex;justify-content:flex-end;gap:.5rem;margin-bottom:.75rem;min-height:1px}
+.vk-table-wrap{overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
+table.vk-table{width:100%;border-collapse:collapse;font-size:.8rem}
+table.vk-table th,table.vk-table td{padding:.5rem .6rem;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}
+table.vk-table th{background:var(--bg);font-weight:600}
+table.vk-table th.sortable{cursor:pointer;user-select:none}
+table.vk-table th.sortable:hover,table.vk-table th.sortable:focus-visible{color:var(--primary);outline:none}
+table.vk-table th.sortable:focus-visible{box-shadow:inset 0 0 0 2px var(--primary)}
+table.vk-table th[aria-sort="ascending"]::after{content:" \25B2";font-size:.7em}
+table.vk-table th[aria-sort="descending"]::after{content:" \25BC";font-size:.7em}
+table.vk-table tbody tr:hover{background:rgba(13,110,253,.04)}
+.vk-key-prefix{font-family:monospace}
+.vk-empty{padding:2rem 1rem;text-align:center;color:var(--text-muted)}
+.vk-status-badge{font-size:.7rem;padding:.15rem .5rem;border-radius:999px;font-weight:600;text-transform:capitalize}
+.vk-status-active{background:rgba(25,135,84,.1);color:var(--success);border:1px solid rgba(25,135,84,.25)}
+.vk-status-expired{background:rgba(108,117,125,.12);color:var(--text-muted);border:1px solid rgba(108,117,125,.3)}
+.vk-status-revoked{background:rgba(220,53,69,.1);color:var(--danger);border:1px solid rgba(220,53,69,.25)}
+.vk-warn{color:#664d03;background:#fff3cd;border:1px solid #ffe69c;border-radius:var(--radius);padding:.1rem .4rem;font-weight:600}
+.vk-pagination{display:flex;align-items:center;gap:1rem;margin-top:1rem}
+.vk-pagination .vk-page-info{font-size:.8rem;color:var(--text-muted)}
+/* Virtual Keys create/edit modal (Req 12.3, 12.4, 12.5, 12.11) */
+.vk-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:flex-start;justify-content:center;z-index:200;overflow-y:auto;padding:2rem 1rem}
+.vk-modal-backdrop.open{display:flex}
+.vk-modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:0 10px 30px rgba(0,0,0,.25);width:100%;max-width:560px;padding:1.5rem;margin:auto}
+.vk-modal h3{font-size:1.1rem;margin-bottom:1rem;padding-bottom:.5rem;border-bottom:2px solid var(--primary)}
+.vk-modal select[multiple]{min-height:6rem}
+.vk-key-reveal{background:#fff3cd;border:1px solid #ffe69c;border-radius:var(--radius);padding:1rem;margin-bottom:1rem}
+.vk-key-reveal .vk-key-warn{color:#664d03;font-weight:600;font-size:.85rem;margin-bottom:.6rem}
+.vk-key-reveal-row{display:flex;gap:.5rem;align-items:center}
+.vk-key-reveal-row input{flex:1;font-family:monospace;font-size:.8rem;padding:.5rem .6rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);color:var(--text)}
+/* Virtual Keys row actions + usage detail + confirm dialog (task 14.3, Req 12.6, 12.7) */
+.vk-row-actions{display:flex;gap:.35rem;flex-wrap:wrap}
+.vk-confirm-modal{max-width:440px}
+.vk-confirm-modal p{margin-bottom:1rem;font-size:.9rem}
+#vk-detail{margin-top:1.5rem}
+.vk-detail-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem}
+.vk-detail-title{font-size:1.05rem;padding-bottom:.4rem;border-bottom:2px solid var(--primary);flex:1;margin-right:1rem}
+.vk-detail-loading,.vk-detail-error{font-size:.85rem;color:var(--text-muted)}
+.vk-detail-error{color:var(--danger)}
+.vk-usage-card{display:flex;flex-wrap:wrap;gap:1rem;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:1rem;margin-bottom:1rem}
+.vk-stat{flex:1;min-width:110px}
+.vk-stat-val{font-size:1.2rem;font-weight:700;color:var(--text)}
+.vk-stat-label{font-size:.75rem;color:var(--text-muted);margin-top:.15rem}
+.vk-chart-controls{display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem}
+.vk-chart-controls label{font-size:.8rem;font-weight:600}
+.vk-chart-controls select{width:auto;padding:.3rem .5rem;border:1px solid var(--border);border-radius:var(--radius);font-size:.8rem;background:var(--surface);color:var(--text)}
+.vk-chart-wrap{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:1rem}
+svg.vk-chart{width:100%;height:auto;display:block}
+svg.vk-chart .vk-chart-bar{fill:var(--primary)}
+svg.vk-chart .vk-chart-bar:hover{fill:var(--primary-hover)}
+svg.vk-chart .vk-chart-axis{stroke:var(--border);stroke-width:1}
+svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
+.vk-chart-empty{font-size:.8rem;color:var(--text-muted);margin-top:.5rem}
 </style>
 </head>
 <body>
@@ -154,6 +214,7 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="caching" id="tab-caching" aria-controls="page-caching">Caching</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="context" id="tab-context" aria-controls="page-context">Context</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="streaming" id="tab-streaming" aria-controls="page-streaming">Streaming</button></li>
+    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="virtual-keys" id="tab-virtual-keys" aria-controls="page-virtual-keys">Virtual Keys</button></li>
   </ul>
   <div class="nav-footer">
     <a href="/dashboard" id="dashboard-link">Open Dashboard &rarr;</a>
@@ -789,6 +850,137 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
       <button class="btn btn-secondary" data-action="reset">Reset</button>
     </div>
   </section>
+
+  <!-- Virtual Keys (Req 12.1, 12.2, 12.8, 12.9, 12.10) -->
+  <section class="page" id="page-virtual-keys" role="tabpanel" aria-labelledby="tab-virtual-keys">
+    <h2>Virtual Keys</h2>
+    <div class="vk-controls">
+      <div class="form-group vk-enforcement">
+        <label for="vk-enforcement">Enforcement Mode</label>
+        <select id="vk-enforcement" aria-describedby="vk-enforcement-hint">
+          <option value="disabled">Disabled</option>
+          <option value="optional">Optional</option>
+          <option value="required">Required</option>
+        </select>
+        <div class="hint" id="vk-enforcement-hint">Whether callers must present a valid virtual key to authenticate.</div>
+      </div>
+      <div class="form-group vk-search-group">
+        <label for="vk-search">Search</label>
+        <input type="search" id="vk-search" placeholder="Filter by name or key prefix" autocomplete="off">
+        <div class="hint">Filters the currently loaded page of keys.</div>
+      </div>
+    </div>
+    <!-- Seam for task 14.2: "Create Key" button/form mounts inside this toolbar. -->
+    <div class="vk-toolbar" id="vk-toolbar"></div>
+    <div class="vk-table-wrap">
+      <table class="vk-table" id="vk-table">
+        <caption class="sr-only">List of virtual keys with usage and limits</caption>
+        <thead>
+          <tr>
+            <th class="sortable" data-sort="key_prefix" aria-sort="none" role="button" tabindex="0">Key Prefix</th>
+            <th class="sortable" data-sort="name" aria-sort="none" role="button" tabindex="0">Name</th>
+            <th class="sortable" data-sort="status" aria-sort="none" role="button" tabindex="0">Status</th>
+            <th class="sortable" data-sort="spend" aria-sort="none" role="button" tabindex="0">Spend / Budget</th>
+            <th class="sortable" data-sort="tokens" aria-sort="none" role="button" tabindex="0">Tokens / Token Budget</th>
+            <th scope="col">Model Access</th>
+            <th class="sortable" data-sort="expires_at" aria-sort="none" role="button" tabindex="0">Expiration</th>
+            <th class="sortable" data-sort="last_used_at" aria-sort="none" role="button" tabindex="0">Last Used</th>
+            <th scope="col">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="vk-tbody"></tbody>
+      </table>
+    </div>
+    <div class="vk-empty" id="vk-empty" hidden>No virtual keys exist yet.</div>
+    <div class="vk-pagination">
+      <button class="btn btn-secondary btn-sm" id="vk-prev" disabled>&larr; Prev</button>
+      <button class="btn btn-secondary btn-sm" id="vk-next" disabled>Next &rarr;</button>
+      <span class="vk-page-info" id="vk-page-info" aria-live="polite"></span>
+    </div>
+    <!-- Seam for task 14.3: per-key usage detail view / charts mount here. -->
+    <div id="vk-detail"></div>
+
+    <!-- Create / Edit Key modal (task 14.2, Req 12.3, 12.4, 12.5, 12.11) -->
+    <div class="vk-modal-backdrop" id="vk-modal-backdrop">
+      <div class="vk-modal" role="dialog" aria-modal="true" aria-labelledby="vk-modal-title" id="vk-modal">
+        <h3 id="vk-modal-title">Create Virtual Key</h3>
+
+        <!-- One-time key reveal (Req 12.4); hidden until a key is created -->
+        <div class="vk-key-reveal" id="vk-key-reveal" hidden>
+          <div class="vk-key-warn">Copy this key now. For security it cannot be shown again.</div>
+          <div class="vk-key-reveal-row">
+            <label class="sr-only" for="vk-created-key">Generated virtual key</label>
+            <input type="text" id="vk-created-key" readonly>
+            <button type="button" class="btn btn-secondary btn-sm" id="vk-copy-key">Copy</button>
+          </div>
+          <div class="actions">
+            <button type="button" class="btn btn-primary" id="vk-reveal-close">Done</button>
+          </div>
+        </div>
+
+        <form id="vk-form" novalidate>
+          <div class="form-group">
+            <label for="vk-f-name">Name</label>
+            <input type="text" id="vk-f-name" maxlength="64" autocomplete="off" aria-describedby="vk-f-name-error">
+            <div class="hint">Optional label, 1&ndash;64 characters.</div>
+            <div class="error" id="vk-f-name-error" role="alert"></div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="vk-f-budget">Budget Limit (USD)</label>
+              <input type="number" id="vk-f-budget" min="0.01" max="999999.99" step="0.01" placeholder="Unlimited" aria-describedby="vk-f-budget-error">
+              <div class="hint">0.01&ndash;999,999.99. Blank = unlimited.</div>
+              <div class="error" id="vk-f-budget-error" role="alert"></div>
+            </div>
+            <div class="form-group">
+              <label for="vk-f-token-budget">Token Budget</label>
+              <input type="number" id="vk-f-token-budget" min="1" max="999999999" step="1" placeholder="Unlimited" aria-describedby="vk-f-token-budget-error">
+              <div class="hint">1&ndash;999,999,999. Blank = unlimited.</div>
+              <div class="error" id="vk-f-token-budget-error" role="alert"></div>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="vk-f-window">Budget Window</label>
+              <select id="vk-f-window">
+                <option value="none">None (lifetime)</option>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="vk-f-expires">Expiration</label>
+              <select id="vk-f-expires"></select>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="vk-f-rpm">Requests / minute</label>
+              <input type="number" id="vk-f-rpm" min="1" max="100000" step="1" placeholder="Unlimited" aria-describedby="vk-f-rpm-error">
+              <div class="hint">1&ndash;100,000. Blank = unlimited.</div>
+              <div class="error" id="vk-f-rpm-error" role="alert"></div>
+            </div>
+            <div class="form-group">
+              <label for="vk-f-tpm">Tokens / minute</label>
+              <input type="number" id="vk-f-tpm" min="1" max="10000000" step="1" placeholder="Unlimited" aria-describedby="vk-f-tpm-error">
+              <div class="hint">1&ndash;10,000,000. Blank = unlimited.</div>
+              <div class="error" id="vk-f-tpm-error" role="alert"></div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="vk-f-models">Model Access</label>
+            <select id="vk-f-models" multiple aria-describedby="vk-f-models-hint"></select>
+            <div class="hint" id="vk-f-models-hint">Select allowed model groups. Leave empty to allow all.</div>
+          </div>
+          <div class="actions">
+            <button type="submit" class="btn btn-primary" id="vk-form-submit">Create Key</button>
+            <button type="button" class="btn btn-secondary" id="vk-form-cancel">Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </section>
 </main>
 
 <div class="status-bar" role="status" aria-live="polite">
@@ -871,6 +1063,7 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
     // released provider models (e.g. new Bedrock OpenAI models) appear without
     // a manual refresh.
     if (pageId === 'model-groups') { refreshModelGroupModels(); }
+    if (pageId === 'virtual-keys') { vkOnOpen(); }
   }
 
   /** Re-fetch each model row's provider model list, preserving the current selection. */
@@ -2094,6 +2287,1024 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
         .finally(function() { logoutBtn.disabled = false; });
     });
   }
+
+  // ===== Virtual Keys section (Req 12.1, 12.2, 12.8, 12.9, 12.10) =====
+  // Task 14.1 renders the list + enforcement control. Tasks 14.2 (create/edit
+  // forms) and 14.3 (row actions + usage charts) extend the seams below:
+  //   #vk-toolbar        -> Create Key button/form (14.2)
+  //   vkRenderRowActions -> Edit/Revoke/Delete buttons per row (14.3)
+  //   #vk-detail         -> usage summary + 30-day chart (14.3)
+  //   vkReload()         -> refresh the list after a mutation (14.2/14.3)
+  var vkState = { offset: 0, limit: 25, total: 0, keys: [], sortKey: null, sortDir: 1, search: '', loaded: false };
+  var VK_INFINITY = '\u221E';
+
+  function vkFmtUsd(n) { var num = Number(n); if (!isFinite(num)) num = 0; return '$' + num.toFixed(2); }
+  function vkFmtNum(n) { var num = Number(n); if (!isFinite(num)) num = 0; return num.toLocaleString(); }
+  function vkTd(text) { var td = document.createElement('td'); td.textContent = text; return td; }
+
+  // ===== Task 14.3: row actions, confirm dialog, per-key usage detail (Req 12.6, 12.7, 12.12) =====
+
+  /** Human-readable label for a key: its name, or its masked prefix when unnamed. */
+  function vkKeyLabel(key) {
+    if (key && key.name) { return key.name; }
+    if (key && key.key_prefix) { return key.key_prefix + '\u2026'; }
+    return 'this key';
+  }
+
+  /**
+   * Populate a row's Actions cell with Usage / Edit / Revoke / Delete buttons (Req 12.6).
+   * Edit opens the 14.2 form; Revoke/Delete require an explicit confirmation.
+   */
+  function vkRenderRowActions(cell, key) {
+    var status = key.status || 'active';
+    var label = vkKeyLabel(key);
+
+    var view = document.createElement('button');
+    view.type = 'button';
+    view.className = 'btn btn-secondary btn-sm';
+    view.textContent = 'Usage';
+    view.setAttribute('aria-label', 'View usage details for ' + label);
+    view.addEventListener('click', function (e) { e.stopPropagation(); vkShowUsage(key); });
+    cell.appendChild(view);
+
+    var edit = document.createElement('button');
+    edit.type = 'button';
+    edit.className = 'btn btn-secondary btn-sm';
+    edit.textContent = 'Edit';
+    edit.setAttribute('aria-label', 'Edit ' + label);
+    if (status === 'revoked') { edit.disabled = true; edit.title = 'Revoked keys cannot be edited'; }
+    edit.addEventListener('click', function (e) { e.stopPropagation(); vkOpenEditForm(key); });
+    cell.appendChild(edit);
+
+    var revoke = document.createElement('button');
+    revoke.type = 'button';
+    revoke.className = 'btn btn-secondary btn-sm';
+    revoke.textContent = 'Revoke';
+    revoke.setAttribute('aria-label', 'Revoke ' + label);
+    if (status === 'revoked') { revoke.disabled = true; revoke.title = 'Key is already revoked'; }
+    revoke.addEventListener('click', function (e) { e.stopPropagation(); vkRevoke(key); });
+    cell.appendChild(revoke);
+
+    var del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'btn btn-danger btn-sm';
+    del.textContent = 'Delete';
+    del.setAttribute('aria-label', 'Delete ' + label);
+    del.addEventListener('click', function (e) { e.stopPropagation(); vkDelete(key); });
+    cell.appendChild(del);
+  }
+
+  // ---- Accessible confirmation dialog (focus-trapped, Escape/Cancel) ----
+  var vkConfirmState = { lastFocus: null, onConfirm: null, keydown: null };
+
+  function vkConfirmClose() {
+    var bd = document.getElementById('vk-confirm-backdrop');
+    if (bd) { bd.classList.remove('open'); }
+    if (vkConfirmState.keydown) { document.removeEventListener('keydown', vkConfirmState.keydown, true); }
+    vkConfirmState.keydown = null;
+    var restore = vkConfirmState.lastFocus;
+    vkConfirmState.onConfirm = null;
+    if (restore && typeof restore.focus === 'function') { restore.focus(); }
+  }
+
+  function vkConfirmTrap(e) {
+    var modal = document.getElementById('vk-confirm');
+    if (!modal) { return; }
+    var nodes = modal.querySelectorAll('button:not([disabled])');
+    if (!nodes.length) { return; }
+    var first = nodes[0], last = nodes[nodes.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+
+  function vkEnsureConfirmEls() {
+    if (document.getElementById('vk-confirm-backdrop')) { return; }
+    var bd = document.createElement('div');
+    bd.className = 'vk-modal-backdrop vk-confirm-backdrop';
+    bd.id = 'vk-confirm-backdrop';
+
+    var modal = document.createElement('div');
+    modal.className = 'vk-modal vk-confirm-modal';
+    modal.id = 'vk-confirm';
+    modal.setAttribute('role', 'alertdialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-labelledby', 'vk-confirm-title');
+    modal.setAttribute('aria-describedby', 'vk-confirm-msg');
+
+    var title = document.createElement('h3');
+    title.id = 'vk-confirm-title';
+    modal.appendChild(title);
+
+    var msg = document.createElement('p');
+    msg.id = 'vk-confirm-msg';
+    modal.appendChild(msg);
+
+    var actions = document.createElement('div');
+    actions.className = 'actions';
+    var ok = document.createElement('button');
+    ok.type = 'button'; ok.className = 'btn btn-danger'; ok.id = 'vk-confirm-ok';
+    var cancel = document.createElement('button');
+    cancel.type = 'button'; cancel.className = 'btn btn-secondary'; cancel.id = 'vk-confirm-cancel';
+    cancel.textContent = 'Cancel';
+    actions.appendChild(ok);
+    actions.appendChild(cancel);
+    modal.appendChild(actions);
+
+    bd.appendChild(modal);
+    document.body.appendChild(bd);
+
+    ok.addEventListener('click', function () {
+      var cb = vkConfirmState.onConfirm;
+      vkConfirmClose();
+      if (cb) { cb(); }
+    });
+    cancel.addEventListener('click', vkConfirmClose);
+    bd.addEventListener('click', function (e) { if (e.target === bd) { vkConfirmClose(); } });
+  }
+
+  /** Show an accessible confirm dialog. opts: {title, message, confirmLabel, danger, onConfirm}. */
+  function vkConfirm(opts) {
+    vkEnsureConfirmEls();
+    var bd = document.getElementById('vk-confirm-backdrop');
+    document.getElementById('vk-confirm-title').textContent = opts.title || 'Confirm';
+    document.getElementById('vk-confirm-msg').textContent = opts.message || '';
+    var ok = document.getElementById('vk-confirm-ok');
+    ok.textContent = opts.confirmLabel || 'Confirm';
+    ok.className = 'btn ' + (opts.danger ? 'btn-danger' : 'btn-primary');
+    vkConfirmState.lastFocus = document.activeElement;
+    vkConfirmState.onConfirm = opts.onConfirm || null;
+    vkConfirmState.keydown = function (e) {
+      if (e.key === 'Escape') { e.preventDefault(); vkConfirmClose(); }
+      else if (e.key === 'Tab') { vkConfirmTrap(e); }
+    };
+    bd.classList.add('open');
+    document.addEventListener('keydown', vkConfirmState.keydown, true);
+    document.getElementById('vk-confirm-cancel').focus();
+  }
+
+  /** Revoke a key after explicit confirmation (Req 12.6, 12.12). */
+  function vkRevoke(key) {
+    var label = vkKeyLabel(key);
+    vkConfirm({
+      title: 'Revoke virtual key',
+      message: 'Revoke key "' + label + '"? Callers using this key will be rejected immediately.',
+      confirmLabel: 'Revoke', danger: true,
+      onConfirm: function () {
+        setStatus('Revoking virtual key\u2026');
+        fetch(apiUrl('keys/' + encodeURIComponent(key.id) + '/revoke'), { method: 'POST' })
+          .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json().catch(function () { return {}; }); })
+          .then(function () { setStatus('Virtual key revoked'); showToast('Virtual key revoked'); vkReload(); })
+          .catch(function (err) {
+            setStatus('Failed to revoke key: ' + err.message);
+            showToast('Failed to revoke key: ' + err.message, true);
+          });
+      }
+    });
+  }
+
+  /** Delete a key after explicit confirmation (Req 12.6, 12.12). */
+  function vkDelete(key) {
+    var label = vkKeyLabel(key);
+    vkConfirm({
+      title: 'Delete virtual key',
+      message: 'Delete key "' + label + '"? This permanently removes the key and its usage history and cannot be undone.',
+      confirmLabel: 'Delete', danger: true,
+      onConfirm: function () {
+        setStatus('Deleting virtual key\u2026');
+        fetch(apiUrl('keys/' + encodeURIComponent(key.id)), { method: 'DELETE' })
+          .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } })
+          .then(function () {
+            setStatus('Virtual key deleted');
+            showToast('Virtual key deleted');
+            if (vkDetailState.id === key.id) { vkClearDetail(); }
+            vkReload();
+          })
+          .catch(function (err) {
+            setStatus('Failed to delete key: ' + err.message);
+            showToast('Failed to delete key: ' + err.message, true);
+          });
+      }
+    });
+  }
+
+  // ---- Per-key usage detail: summary card + 30-day daily chart (Req 12.7) ----
+  var vkDetailState = { id: null, key: null, days: null, metric: 'spend' };
+  var VK_SVGNS = 'http://www.w3.org/2000/svg';
+
+  function vkSvgEl(name, attrs) {
+    var el = document.createElementNS(VK_SVGNS, name);
+    if (attrs) { Object.keys(attrs).forEach(function (k) { el.setAttribute(k, attrs[k]); }); }
+    return el;
+  }
+  function vkDayStartUtc(d) { return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())); }
+  function vkFmtDateShort(d) { return (d.getUTCMonth() + 1) + '/' + d.getUTCDate(); }
+  function vkFmtDateFull(d) {
+    return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
+  }
+  function vkMetricLabel(m) { return m === 'spend' ? 'Spend (USD)' : (m === 'requests' ? 'Requests' : 'Tokens'); }
+  function vkMetricFmt(m, v) { return m === 'spend' ? vkFmtUsd(v) : vkFmtNum(v); }
+  function vkDayMetric(agg, m) {
+    if (!agg) { return 0; }
+    if (m === 'spend') { return Number(agg.total_spend_usd || 0); }
+    if (m === 'requests') { return Number(agg.total_requests || 0); }
+    return Number(agg.total_input_tokens || 0) + Number(agg.total_output_tokens || 0);
+  }
+
+  /** Clear the usage detail panel. */
+  function vkClearDetail() {
+    vkDetailState = { id: null, key: null, days: null, metric: 'spend' };
+    var el = document.getElementById('vk-detail');
+    if (el) { el.textContent = ''; }
+  }
+
+  /** Fetch a usage aggregate for [start, end) (RFC3339 timestamps). */
+  function vkFetchUsage(id, start, end) {
+    var url = apiUrl('keys/' + encodeURIComponent(id) + '/usage') +
+      '?start=' + encodeURIComponent(start.toISOString()) +
+      '&end=' + encodeURIComponent(end.toISOString());
+    return fetch(url).then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json(); });
+  }
+
+  /** Load and render per-key usage for the most recent 30 days into #vk-detail. */
+  function vkShowUsage(key) {
+    var container = document.getElementById('vk-detail');
+    if (!container) { return; }
+    var id = key.id;
+    vkDetailState = { id: id, key: key, days: null, metric: 'spend' };
+    container.textContent = '';
+
+    var head = document.createElement('div');
+    head.className = 'vk-detail-head';
+    var h3 = document.createElement('h3');
+    h3.className = 'vk-detail-title';
+    h3.textContent = 'Usage \u2014 ' + vkKeyLabel(key);
+    var closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'btn btn-secondary btn-sm';
+    closeBtn.textContent = 'Close';
+    closeBtn.setAttribute('aria-label', 'Close usage details');
+    closeBtn.addEventListener('click', vkClearDetail);
+    head.appendChild(h3);
+    head.appendChild(closeBtn);
+    container.appendChild(head);
+
+    var body = document.createElement('div');
+    body.id = 'vk-detail-body';
+    var loading = document.createElement('p');
+    loading.className = 'vk-detail-loading';
+    loading.setAttribute('aria-live', 'polite');
+    loading.textContent = 'Loading usage for the last 30 days\u2026';
+    body.appendChild(loading);
+    container.appendChild(body);
+
+    if (container.scrollIntoView) { container.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+    setStatus('Loading usage for the last 30 days\u2026');
+
+    // Build 30 calendar-day (UTC) windows ending today.
+    var todayStart = vkDayStartUtc(new Date());
+    var days = [];
+    for (var i = 29; i >= 0; i--) {
+      var s = new Date(todayStart.getTime() - i * 86400000);
+      days.push({ start: s, end: new Date(s.getTime() + 86400000), agg: null });
+    }
+    var now = new Date();
+    var rangeStart = days[0].start;
+
+    var summaryP = vkFetchUsage(id, rangeStart, now);
+    var dailyP = Promise.all(days.map(function (d) {
+      return vkFetchUsage(id, d.start, d.end).then(function (a) { d.agg = a; return a; });
+    }));
+
+    Promise.all([summaryP, dailyP]).then(function (results) {
+      if (vkDetailState.id !== id) { return; } // stale: user closed or opened another
+      vkDetailState.days = days;
+      vkRenderDetail(results[0], days);
+      setStatus('Loaded usage details');
+    }).catch(function (err) {
+      if (vkDetailState.id !== id) { return; }
+      var b = document.getElementById('vk-detail-body');
+      if (b) {
+        b.textContent = '';
+        var errP = document.createElement('p');
+        errP.className = 'vk-detail-error';
+        errP.setAttribute('role', 'alert');
+        errP.textContent = 'Failed to load usage details: ' + err.message;
+        b.appendChild(errP);
+      }
+      setStatus('Failed to load usage: ' + err.message);
+      showToast('Failed to load usage: ' + err.message, true);
+    });
+  }
+
+  /** Render the summary card, chart controls, and chart from loaded data. */
+  function vkRenderDetail(summary, days) {
+    var body = document.getElementById('vk-detail-body');
+    if (!body) { return; }
+    body.textContent = '';
+    summary = summary || {};
+
+    function stat(label, value) {
+      var d = document.createElement('div'); d.className = 'vk-stat';
+      var v = document.createElement('div'); v.className = 'vk-stat-val'; v.textContent = value;
+      var l = document.createElement('div'); l.className = 'vk-stat-label'; l.textContent = label;
+      d.appendChild(v); d.appendChild(l); return d;
+    }
+    var inTok = Number(summary.total_input_tokens || 0);
+    var outTok = Number(summary.total_output_tokens || 0);
+    var card = document.createElement('div');
+    card.className = 'vk-usage-card';
+    card.appendChild(stat('Total spend', vkFmtUsd(summary.total_spend_usd)));
+    card.appendChild(stat('Total tokens', vkFmtNum(inTok + outTok)));
+    card.appendChild(stat('Input tokens', vkFmtNum(inTok)));
+    card.appendChild(stat('Output tokens', vkFmtNum(outTok)));
+    card.appendChild(stat('Requests', vkFmtNum(summary.total_requests)));
+    body.appendChild(card);
+
+    var controls = document.createElement('div');
+    controls.className = 'vk-chart-controls';
+    var lbl = document.createElement('label');
+    lbl.setAttribute('for', 'vk-chart-metric');
+    lbl.textContent = 'Chart metric';
+    var sel = document.createElement('select');
+    sel.id = 'vk-chart-metric';
+    [['spend', 'Spend (USD)'], ['requests', 'Requests'], ['tokens', 'Tokens']].forEach(function (o) {
+      var op = document.createElement('option'); op.value = o[0]; op.textContent = o[1]; sel.appendChild(op);
+    });
+    sel.value = vkDetailState.metric || 'spend';
+    sel.addEventListener('change', function () { vkDetailState.metric = this.value; vkRenderChart(days); });
+    controls.appendChild(lbl);
+    controls.appendChild(sel);
+    body.appendChild(controls);
+
+    var chartWrap = document.createElement('div');
+    chartWrap.id = 'vk-chart-wrap';
+    chartWrap.className = 'vk-chart-wrap';
+    body.appendChild(chartWrap);
+
+    vkRenderChart(days);
+  }
+
+  /** Render the 30-day daily bar chart (inline SVG) plus a visually-hidden data table. */
+  function vkRenderChart(days) {
+    var wrap = document.getElementById('vk-chart-wrap');
+    if (!wrap) { return; }
+    wrap.textContent = '';
+    var metric = vkDetailState.metric || 'spend';
+    var values = days.map(function (d) { return vkDayMetric(d.agg, metric); });
+    var maxV = values.reduce(function (m, v) { return v > m ? v : m; }, 0);
+    var total = values.reduce(function (a, b) { return a + b; }, 0);
+
+    var W = 640, H = 180, padL = 8, padR = 8, padT = 10, padB = 22;
+    var innerW = W - padL - padR, innerH = H - padT - padB;
+    var n = days.length, gap = 2, bw = (innerW / n) - gap;
+
+    var svg = vkSvgEl('svg', {
+      viewBox: '0 0 ' + W + ' ' + H,
+      'class': 'vk-chart',
+      role: 'img',
+      'aria-label': vkMetricLabel(metric) + ' per day for the last 30 days. Total ' + vkMetricFmt(metric, total) + '.'
+    });
+    svg.appendChild(vkSvgEl('line', {
+      x1: padL, y1: (padT + innerH), x2: (W - padR), y2: (padT + innerH), 'class': 'vk-chart-axis'
+    }));
+    days.forEach(function (d, i) {
+      var v = values[i];
+      var h = maxV > 0 ? (v / maxV) * innerH : 0;
+      var x = padL + i * (bw + gap);
+      var y = padT + innerH - h;
+      var rect = vkSvgEl('rect', {
+        x: x.toFixed(1), y: y.toFixed(1),
+        width: Math.max(1, bw).toFixed(1), height: h.toFixed(1),
+        'class': 'vk-chart-bar', rx: 1
+      });
+      var t = vkSvgEl('title', {});
+      t.textContent = vkFmtDateFull(d.start) + ': ' + vkMetricFmt(metric, v);
+      rect.appendChild(t);
+      svg.appendChild(rect);
+      if (i % 5 === 0) {
+        var lab = vkSvgEl('text', {
+          x: (x + bw / 2).toFixed(1), y: (H - 6).toFixed(1),
+          'class': 'vk-chart-xlabel', 'text-anchor': 'middle'
+        });
+        lab.textContent = vkFmtDateShort(d.start);
+        svg.appendChild(lab);
+      }
+    });
+    wrap.appendChild(svg);
+
+    if (maxV === 0) {
+      var note = document.createElement('p');
+      note.className = 'vk-chart-empty';
+      note.textContent = 'No ' + vkMetricLabel(metric).toLowerCase() + ' recorded in the last 30 days.';
+      wrap.appendChild(note);
+    }
+
+    // Visually-hidden data table as a text alternative to the chart.
+    var tbl = document.createElement('table');
+    tbl.className = 'sr-only';
+    var cap = document.createElement('caption');
+    cap.textContent = vkMetricLabel(metric) + ' per day, last 30 days';
+    tbl.appendChild(cap);
+    var thead = document.createElement('thead');
+    var htr = document.createElement('tr');
+    ['Date', vkMetricLabel(metric)].forEach(function (hh) {
+      var th = document.createElement('th'); th.scope = 'col'; th.textContent = hh; htr.appendChild(th);
+    });
+    thead.appendChild(htr);
+    tbl.appendChild(thead);
+    var tb = document.createElement('tbody');
+    days.forEach(function (d, i) {
+      var tr = document.createElement('tr');
+      var td1 = document.createElement('td'); td1.textContent = vkFmtDateFull(d.start);
+      var td2 = document.createElement('td'); td2.textContent = vkMetricFmt(metric, values[i]);
+      tr.appendChild(td1); tr.appendChild(td2); tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    wrap.appendChild(tbl);
+  }
+
+  /** Comparable sort value for a column key. */
+  function vkSortVal(k, key) {
+    switch (key) {
+      case 'spend': return Number(k.current_spend_usd || 0);
+      case 'tokens': return Number(k.current_tokens_used || 0);
+      case 'expires_at': return k.expires_at ? new Date(k.expires_at).getTime() : Number.POSITIVE_INFINITY;
+      case 'last_used_at': return k.last_used_at ? new Date(k.last_used_at).getTime() : 0;
+      default: return String(k[key] == null ? '' : k[key]).toLowerCase();
+    }
+  }
+
+  /** Build a table row for a single key using textContent only (XSS-safe). */
+  function vkRenderRow(k) {
+    var tr = document.createElement('tr');
+
+    var tdPrefix = document.createElement('td');
+    tdPrefix.className = 'vk-key-prefix';
+    tdPrefix.textContent = k.key_prefix || '';
+    tr.appendChild(tdPrefix);
+
+    tr.appendChild(vkTd(k.name || ''));
+
+    var tdStatus = document.createElement('td');
+    var st = k.status || 'active';
+    var badge = document.createElement('span');
+    badge.className = 'vk-status-badge vk-status-' + st;
+    badge.textContent = st;
+    tdStatus.appendChild(badge);
+    tr.appendChild(tdStatus);
+
+    // Spend / Budget (Req 12.9: warn when spend > 80% of budget)
+    var tdSpend = document.createElement('td');
+    var budget = k.budget_limit_usd;
+    var spendText = vkFmtUsd(k.current_spend_usd) + ' / ' + (budget != null ? vkFmtUsd(budget) : VK_INFINITY);
+    var overBudget = budget != null && Number(budget) > 0 && Number(k.current_spend_usd || 0) / Number(budget) > 0.8;
+    if (overBudget) {
+      var ws = document.createElement('span');
+      ws.className = 'vk-warn';
+      ws.title = 'Spend exceeds 80% of budget';
+      ws.textContent = spendText;
+      tdSpend.appendChild(ws);
+    } else {
+      tdSpend.textContent = spendText;
+    }
+    tr.appendChild(tdSpend);
+
+    // Tokens / Token Budget
+    tr.appendChild(vkTd(vkFmtNum(k.current_tokens_used) + ' / ' + (k.token_budget != null ? vkFmtNum(k.token_budget) : VK_INFINITY)));
+
+    // Model access scope
+    var ma = k.model_access;
+    tr.appendChild(vkTd(ma && ma.length ? ma.join(', ') : 'All'));
+
+    // Expiration (Req 12.8: warn when expiring within 7 days)
+    var tdExp = document.createElement('td');
+    if (!k.expires_at) {
+      tdExp.textContent = 'Never';
+    } else {
+      var expDate = new Date(k.expires_at);
+      var expText = expDate.toLocaleDateString();
+      var days = (expDate.getTime() - Date.now()) / 86400000;
+      if (st === 'active' && days >= 0 && days <= 7) {
+        var we = document.createElement('span');
+        we.className = 'vk-warn';
+        we.title = 'Expires within 7 days';
+        we.textContent = expText;
+        tdExp.appendChild(we);
+      } else {
+        tdExp.textContent = expText;
+      }
+    }
+    tr.appendChild(tdExp);
+
+    // Last used
+    var tdLast = document.createElement('td');
+    tdLast.textContent = k.last_used_at ? new Date(k.last_used_at).toLocaleString() : 'Never';
+    tr.appendChild(tdLast);
+
+    // Actions (seam for 14.3)
+    var tdAct = document.createElement('td');
+    tdAct.className = 'vk-row-actions';
+    vkRenderRowActions(tdAct, k);
+    tr.appendChild(tdAct);
+
+    return tr;
+  }
+
+  function vkRenderPagination() {
+    var prev = document.getElementById('vk-prev');
+    var next = document.getElementById('vk-next');
+    var info = document.getElementById('vk-page-info');
+    var start = vkState.total === 0 ? 0 : vkState.offset + 1;
+    var end = Math.min(vkState.offset + vkState.limit, vkState.total);
+    info.textContent = 'Showing ' + start + '\u2013' + end + ' of ' + vkState.total;
+    prev.disabled = vkState.offset <= 0;
+    next.disabled = vkState.offset + vkState.limit >= vkState.total;
+  }
+
+  function vkRender() {
+    var tbody = document.getElementById('vk-tbody');
+    var empty = document.getElementById('vk-empty');
+    tbody.innerHTML = '';
+
+    var rows = vkState.keys.slice();
+    // Client-side search over the loaded page (Req 12.2)
+    var q = vkState.search.trim().toLowerCase();
+    if (q) {
+      rows = rows.filter(function (k) {
+        return (k.name || '').toLowerCase().indexOf(q) !== -1 ||
+               (k.key_prefix || '').toLowerCase().indexOf(q) !== -1;
+      });
+    }
+    // Client-side sort of the loaded rows
+    if (vkState.sortKey) {
+      rows.sort(function (a, b) {
+        var av = vkSortVal(a, vkState.sortKey), bv = vkSortVal(b, vkState.sortKey);
+        if (av < bv) return -1 * vkState.sortDir;
+        if (av > bv) return 1 * vkState.sortDir;
+        return 0;
+      });
+    }
+
+    if (vkState.total === 0) {
+      empty.textContent = 'No virtual keys exist yet.';
+      empty.hidden = false;
+    } else if (rows.length === 0) {
+      empty.textContent = 'No keys match your search.';
+      empty.hidden = false;
+    } else {
+      empty.hidden = true;
+    }
+
+    rows.forEach(function (k) { tbody.appendChild(vkRenderRow(k)); });
+    vkRenderPagination();
+  }
+
+  /** Fetch the current page of keys from GET /admin/keys. */
+  function vkLoad() {
+    setStatus('Loading virtual keys\u2026');
+    fetch(apiUrl('keys') + '?limit=' + vkState.limit + '&offset=' + vkState.offset)
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (data) {
+        vkState.keys = (data && data.keys) || [];
+        vkState.total = (data && typeof data.total === 'number') ? data.total : vkState.keys.length;
+        vkState.loaded = true;
+        vkRender();
+        setStatus('Loaded ' + vkState.keys.length + ' virtual key(s)');
+      })
+      .catch(function (err) {
+        vkState.keys = []; vkState.total = 0;
+        vkRender();
+        setStatus('Failed to load virtual keys: ' + err.message);
+        showToast('Failed to load virtual keys: ' + err.message, true);
+      });
+  }
+
+  /** Seam for tasks 14.2/14.3: reload the list after a mutation. */
+  function vkReload() { vkLoad(); }
+
+  // ---- Create / Edit Key forms (task 14.2, Req 12.3, 12.4, 12.5, 12.11, 12.12) ----
+  var vkModalState = { mode: 'create', id: null, lastFocus: null };
+
+  function vkFormEls() {
+    return {
+      name: document.getElementById('vk-f-name'),
+      budget: document.getElementById('vk-f-budget'),
+      tokenBudget: document.getElementById('vk-f-token-budget'),
+      window: document.getElementById('vk-f-window'),
+      rpm: document.getElementById('vk-f-rpm'),
+      tpm: document.getElementById('vk-f-tpm'),
+      models: document.getElementById('vk-f-models'),
+      expires: document.getElementById('vk-f-expires')
+    };
+  }
+
+  /** Map a server error field name to its form input element. */
+  function vkFieldEl(field) {
+    var map = { name: 'vk-f-name', budget_limit_usd: 'vk-f-budget', token_budget: 'vk-f-token-budget',
+      budget_window: 'vk-f-window', requests_per_minute: 'vk-f-rpm', tokens_per_minute: 'vk-f-tpm',
+      model_access: 'vk-f-models', expires_in: 'vk-f-expires' };
+    return map[field] ? document.getElementById(map[field]) : null;
+  }
+
+  /** Ensure global config (with model_groups) is loaded, then run cb. */
+  function vkEnsureConfig(cb) {
+    if (config && config.model_groups) { cb(); return; }
+    fetch(apiUrl('config'))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (cfg) { if (cfg) { config = cfg; } cb(); })
+      .catch(function () { cb(); });
+  }
+
+  /** Populate the expiration dropdown. Edit mode adds a "Keep current" option. */
+  function vkPopulateExpires(mode) {
+    var sel = document.getElementById('vk-f-expires');
+    sel.textContent = '';
+    var opts = [];
+    if (mode === 'edit') { opts.push(['keep', 'Keep current']); }
+    opts = opts.concat([['never', 'Never expire'], ['1_year', '1 year'], ['6_months', '6 months'],
+      ['3_months', '3 months'], ['1_month', '1 month'], ['2_weeks', '2 weeks'], ['1_week', '1 week'],
+      ['3_days', '3 days'], ['1_day', '1 day']]);
+    opts.forEach(function (o) {
+      var op = document.createElement('option');
+      op.value = o[0]; op.textContent = o[1];
+      sel.appendChild(op);
+    });
+  }
+
+  /** Populate the model-access multi-select from config.model_groups. */
+  function vkPopulateModels(selected) {
+    var sel = document.getElementById('vk-f-models');
+    sel.textContent = '';
+    var groups = (config && config.model_groups) || [];
+    var selSet = {}; (selected || []).forEach(function (s) { selSet[s] = true; });
+    groups.forEach(function (g) {
+      if (!g || !g.name) { return; }
+      var op = document.createElement('option');
+      op.value = g.name; op.textContent = g.name;
+      if (selSet[g.name]) { op.selected = true; }
+      sel.appendChild(op);
+    });
+    // Preserve any previously-assigned names no longer present in config.
+    (selected || []).forEach(function (s) {
+      var present = groups.some(function (g) { return g && g.name === s; });
+      if (!present) {
+        var op = document.createElement('option');
+        op.value = s; op.textContent = s + ' (not in config)'; op.selected = true;
+        sel.appendChild(op);
+      }
+    });
+  }
+
+  /** Reset the form to a clean create state and hide the reveal panel. */
+  function vkResetForm() {
+    var form = document.getElementById('vk-form');
+    form.style.display = '';
+    form.reset();
+    clearAllErrors(form);
+    document.getElementById('vk-key-reveal').hidden = true;
+    document.getElementById('vk-created-key').value = '';
+    document.getElementById('vk-form-submit').disabled = false;
+  }
+
+  /** Fill the form fields from a VirtualKeyInfo-shaped object (edit mode). */
+  function vkFillForm(d) {
+    var f = vkFormEls();
+    f.name.value = d.name || '';
+    f.budget.value = (d.budget_limit_usd != null) ? d.budget_limit_usd : '';
+    f.tokenBudget.value = (d.token_budget != null) ? d.token_budget : '';
+    f.window.value = d.budget_window || 'none';
+    f.rpm.value = (d.requests_per_minute != null) ? d.requests_per_minute : '';
+    f.tpm.value = (d.tokens_per_minute != null) ? d.tokens_per_minute : '';
+    vkPopulateModels(d.model_access || []);
+    // Expiration stays on "Keep current" unless the admin picks a new value.
+  }
+
+  /** Client-side validation mirroring the API rules (Req 12.11). */
+  function vkValidateForm() {
+    var f = vkFormEls();
+    var form = document.getElementById('vk-form');
+    clearAllErrors(form);
+    var ok = true;
+
+    var nameV = f.name.value.trim();
+    if (nameV.length > 64) { showError(f.name, 'Name must be 1\u201364 characters'); ok = false; }
+
+    var budgetRaw = f.budget.value.trim();
+    if (budgetRaw !== '') {
+      var b = Number(budgetRaw);
+      if (!isFinite(b) || b < 0.01 || b > 999999.99) { showError(f.budget, 'Budget must be between 0.01 and 999,999.99'); ok = false; }
+    }
+
+    var tbRaw = f.tokenBudget.value.trim();
+    if (tbRaw !== '') {
+      var tb = Number(tbRaw);
+      if (!Number.isInteger(tb) || tb < 1 || tb > 999999999) { showError(f.tokenBudget, 'Token budget must be an integer between 1 and 999,999,999'); ok = false; }
+    }
+
+    var rpmRaw = f.rpm.value.trim();
+    if (rpmRaw !== '') {
+      var rpm = Number(rpmRaw);
+      if (!Number.isInteger(rpm) || rpm < 1 || rpm > 100000) { showError(f.rpm, 'Requests/minute must be an integer between 1 and 100,000'); ok = false; }
+    }
+
+    var tpmRaw = f.tpm.value.trim();
+    if (tpmRaw !== '') {
+      var tpm = Number(tpmRaw);
+      if (!Number.isInteger(tpm) || tpm < 1 || tpm > 10000000) { showError(f.tpm, 'Tokens/minute must be an integer between 1 and 10,000,000'); ok = false; }
+    }
+
+    return ok;
+  }
+
+  /** Build the JSON request body from the form for the given mode. */
+  function vkBuildBody(mode) {
+    var f = vkFormEls();
+    var nameV = f.name.value.trim();
+    var budgetRaw = f.budget.value.trim();
+    var tbRaw = f.tokenBudget.value.trim();
+    var win = f.window.value;
+    var rpmRaw = f.rpm.value.trim();
+    var tpmRaw = f.tpm.value.trim();
+    var models = Array.prototype.slice.call(f.models.selectedOptions).map(function (o) { return o.value; });
+    var expires = f.expires.value;
+    var body = {};
+
+    if (mode === 'create') {
+      // Omit blank optional fields; blank => server default (unlimited/all/none).
+      if (nameV !== '') { body.name = nameV; }
+      if (budgetRaw !== '') { body.budget_limit_usd = Number(budgetRaw); }
+      if (tbRaw !== '') { body.token_budget = parseInt(tbRaw, 10); }
+      if (win !== 'none') { body.budget_window = win; }
+      if (rpmRaw !== '') { body.requests_per_minute = parseInt(rpmRaw, 10); }
+      if (tpmRaw !== '') { body.tokens_per_minute = parseInt(tpmRaw, 10); }
+      if (models.length) { body.model_access = models; }
+      body.expires_in = (expires && expires !== 'never') ? expires : 'never';
+    } else {
+      // Edit: what you see is what you set. Blank clears the limit (null).
+      if (nameV !== '') { body.name = nameV; }
+      body.budget_limit_usd = budgetRaw !== '' ? Number(budgetRaw) : null;
+      body.token_budget = tbRaw !== '' ? parseInt(tbRaw, 10) : null;
+      body.budget_window = win !== 'none' ? win : null;
+      body.requests_per_minute = rpmRaw !== '' ? parseInt(rpmRaw, 10) : null;
+      body.tokens_per_minute = tpmRaw !== '' ? parseInt(tpmRaw, 10) : null;
+      body.model_access = models.length ? models : null;
+      // Only send expires_in when the admin explicitly picked a new value.
+      if (expires && expires !== 'keep') { body.expires_in = expires; }
+    }
+    return body;
+  }
+
+  /** Render a failed create/edit response, mapping field errors (Req 12.12). */
+  function vkHandleError(res) {
+    var msg = 'Request failed (HTTP ' + res.status + ')';
+    if (res.data && Array.isArray(res.data.errors) && res.data.errors.length) {
+      res.data.errors.forEach(function (er) {
+        var el = vkFieldEl(er.field);
+        if (el) { showError(el, er.message || 'Invalid value'); }
+      });
+      msg = (res.status === 409)
+        ? (res.data.errors[0].message || 'Key is revoked and cannot be modified')
+        : 'Please correct the highlighted fields';
+    } else if (res.data && res.data.error) {
+      msg = res.data.error;
+    } else if (res.text) {
+      msg = res.text;
+    }
+    // Input is intentionally preserved (form is not cleared) on error.
+    setStatus('Operation failed: ' + msg);
+    showToast(msg, true);
+  }
+
+  /** Show the one-time created key value in the copyable reveal panel (Req 12.4). */
+  function vkShowCreatedKey(data) {
+    var input = document.getElementById('vk-created-key');
+    input.value = (data && data.key) || '';
+    document.getElementById('vk-form').style.display = 'none';
+    document.getElementById('vk-key-reveal').hidden = false;
+    document.getElementById('vk-modal-title').textContent = 'Virtual Key Created';
+    input.focus();
+    input.select();
+  }
+
+  /** Copy the one-time key to the clipboard (keyboard-operable button). */
+  function vkCopyKey() {
+    var input = document.getElementById('vk-created-key');
+    input.focus();
+    input.select();
+    var done = function () { showToast('Key copied to clipboard'); };
+    var fallback = function () {
+      try { document.execCommand('copy'); done(); }
+      catch (_) { showToast('Copy failed \u2014 select and copy manually', true); }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(input.value).then(done).catch(fallback);
+    } else { fallback(); }
+  }
+
+  function vkTrapFocus(e) {
+    var modal = document.getElementById('vk-modal');
+    var nodes = modal.querySelectorAll('button,input,select,textarea,[tabindex]:not([tabindex="-1"])');
+    var focusables = Array.prototype.filter.call(nodes, function (el) { return !el.disabled && el.offsetParent !== null; });
+    if (!focusables.length) { return; }
+    var first = focusables[0], last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+
+  function vkModalKeydown(e) {
+    if (e.key === 'Escape') { e.preventDefault(); vkHideModal(); return; }
+    if (e.key === 'Tab') { vkTrapFocus(e); }
+  }
+
+  function vkShowModal() {
+    vkModalState.lastFocus = document.activeElement;
+    document.getElementById('vk-modal-backdrop').classList.add('open');
+    document.addEventListener('keydown', vkModalKeydown, true);
+  }
+
+  function vkHideModal() {
+    document.getElementById('vk-modal-backdrop').classList.remove('open');
+    document.removeEventListener('keydown', vkModalKeydown, true);
+    if (vkModalState.lastFocus && vkModalState.lastFocus.focus) { vkModalState.lastFocus.focus(); }
+  }
+
+  /** Open the Create Key form. */
+  function vkOpenCreateForm() {
+    vkModalState.mode = 'create';
+    vkModalState.id = null;
+    vkResetForm();
+    vkPopulateExpires('create');
+    vkEnsureConfig(function () { vkPopulateModels([]); });
+    document.getElementById('vk-modal-title').textContent = 'Create Virtual Key';
+    document.getElementById('vk-form-submit').textContent = 'Create Key';
+    vkShowModal();
+    document.getElementById('vk-f-name').focus();
+  }
+
+  /**
+   * Open the Edit Key form pre-populated with a key's current values.
+   * Task 14.3 calls this from its per-row Edit button; keep the signature stable.
+   */
+  function vkOpenEditForm(key) {
+    if (!key || key.id == null) { showToast('Cannot edit key: missing identifier', true); return; }
+    vkModalState.mode = 'edit';
+    vkModalState.id = key.id;
+    vkResetForm();
+    vkPopulateExpires('edit');
+    document.getElementById('vk-modal-title').textContent = 'Edit Virtual Key';
+    document.getElementById('vk-form-submit').textContent = 'Save Changes';
+    vkShowModal();
+    document.getElementById('vk-f-name').focus();
+    // Fetch the full key config for accuracy; fall back to the passed row data.
+    setStatus('Loading key details\u2026');
+    fetch(apiUrl('keys/' + encodeURIComponent(key.id)))
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (full) { vkEnsureConfig(function () { vkFillForm(full); }); setStatus('Loaded key details'); })
+      .catch(function () { vkEnsureConfig(function () { vkFillForm(key); }); });
+  }
+
+  /** Submit handler for both create and edit (Req 12.4, 12.5, 12.12). */
+  function vkSubmit(e) {
+    e.preventDefault();
+    if (!vkValidateForm()) { setStatus('Fix the highlighted fields before submitting'); return; }
+    var mode = vkModalState.mode;
+    var body = vkBuildBody(mode);
+    var url = (mode === 'create') ? apiUrl('keys') : apiUrl('keys/' + encodeURIComponent(vkModalState.id));
+    var method = (mode === 'create') ? 'POST' : 'PATCH';
+    var submitBtn = document.getElementById('vk-form-submit');
+    submitBtn.disabled = true;
+    setStatus(mode === 'create' ? 'Creating virtual key\u2026' : 'Updating virtual key\u2026');
+    fetch(url, { method: method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          var data = null; try { data = t ? JSON.parse(t) : null; } catch (_) { data = null; }
+          return { ok: r.ok, status: r.status, data: data, text: t };
+        });
+      })
+      .then(function (res) {
+        submitBtn.disabled = false;
+        if (!res.ok) { vkHandleError(res); return; }
+        if (mode === 'create') {
+          vkShowCreatedKey(res.data);
+          setStatus('Virtual key created');
+          showToast('Virtual key created');
+        } else {
+          setStatus('Virtual key updated');
+          showToast('Virtual key updated');
+          vkHideModal();
+        }
+        vkReload();
+      })
+      .catch(function (err) {
+        submitBtn.disabled = false;
+        // Preserve the admin's input on failure (Req 12.12).
+        setStatus('Operation failed: ' + err.message);
+        showToast('Operation failed: ' + err.message, true);
+      });
+  }
+
+  // Wire up the create/edit form controls (elements exist at end of body).
+  (function vkFormWire() {
+    var toolbar = document.getElementById('vk-toolbar');
+    if (toolbar) {
+      var createBtn = document.createElement('button');
+      createBtn.type = 'button';
+      createBtn.className = 'btn btn-primary';
+      createBtn.id = 'vk-create-btn';
+      createBtn.textContent = '+ Create Key';
+      createBtn.addEventListener('click', vkOpenCreateForm);
+      toolbar.appendChild(createBtn);
+    }
+
+    var form = document.getElementById('vk-form');
+    if (form) { form.addEventListener('submit', vkSubmit); }
+
+    var cancel = document.getElementById('vk-form-cancel');
+    if (cancel) { cancel.addEventListener('click', vkHideModal); }
+
+    var revealClose = document.getElementById('vk-reveal-close');
+    if (revealClose) { revealClose.addEventListener('click', vkHideModal); }
+
+    var copyBtn = document.getElementById('vk-copy-key');
+    if (copyBtn) { copyBtn.addEventListener('click', vkCopyKey); }
+
+    var bd = document.getElementById('vk-modal-backdrop');
+    if (bd) { bd.addEventListener('click', function (e) { if (e.target === bd) { vkHideModal(); } }); }
+
+    // Clear inline errors as the admin corrects each field.
+    ['vk-f-name', 'vk-f-budget', 'vk-f-token-budget', 'vk-f-rpm', 'vk-f-tpm'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) { el.addEventListener('input', function () { clearError(el); }); }
+    });
+  })();
+
+  /** Load current enforcement mode from config (Req 12.10). */
+  function vkLoadEnforcement() {
+    fetch(apiUrl('config'))
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (cfg) {
+        var mode = (cfg.virtual_keys && cfg.virtual_keys.enforcement) || 'disabled';
+        document.getElementById('vk-enforcement').value = mode;
+      })
+      .catch(function (err) { setStatus('Failed to load enforcement mode: ' + err.message); });
+  }
+
+  /** Persist enforcement mode change: GET config, set field, PUT config (Req 12.10). */
+  function vkSaveEnforcement(mode) {
+    setStatus('Updating enforcement mode\u2026');
+    fetch(apiUrl('config'))
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (cfg) {
+        cfg.virtual_keys = cfg.virtual_keys || {};
+        cfg.virtual_keys.enforcement = mode;
+        return fetch(apiUrl('config'), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+      })
+      .then(function (r) { if (!r.ok) return r.text().then(function (t) { throw new Error(t); }); return r.json().catch(function () { return {}; }); })
+      .then(function () {
+        if (config) { config.virtual_keys = config.virtual_keys || {}; config.virtual_keys.enforcement = mode; }
+        setStatus('Enforcement mode set to ' + mode);
+        showToast('Enforcement mode updated to ' + mode);
+      })
+      .catch(function (err) {
+        setStatus('Failed to update enforcement: ' + err.message);
+        showToast('Failed to update enforcement: ' + err.message, true);
+        vkLoadEnforcement();
+      });
+  }
+
+  /** Called whenever the Virtual Keys section is opened. */
+  function vkOnOpen() {
+    vkLoadEnforcement();
+    vkState.offset = 0;
+    vkLoad();
+  }
+
+  // Wire up controls (elements exist: script runs at end of body).
+  (function vkWire() {
+    var enf = document.getElementById('vk-enforcement');
+    if (enf) { enf.addEventListener('change', function () { vkSaveEnforcement(this.value); }); }
+
+    var search = document.getElementById('vk-search');
+    if (search) { search.addEventListener('input', function () { vkState.search = this.value; vkRender(); }); }
+
+    var prev = document.getElementById('vk-prev');
+    if (prev) { prev.addEventListener('click', function () { if (vkState.offset > 0) { vkState.offset = Math.max(0, vkState.offset - vkState.limit); vkLoad(); } }); }
+
+    var next = document.getElementById('vk-next');
+    if (next) { next.addEventListener('click', function () { if (vkState.offset + vkState.limit < vkState.total) { vkState.offset += vkState.limit; vkLoad(); } }); }
+
+    document.querySelectorAll('#vk-table th.sortable').forEach(function (th) {
+      function doSort() {
+        var key = th.dataset.sort;
+        if (vkState.sortKey === key) { vkState.sortDir *= -1; } else { vkState.sortKey = key; vkState.sortDir = 1; }
+        document.querySelectorAll('#vk-table th.sortable').forEach(function (o) { o.setAttribute('aria-sort', 'none'); });
+        th.setAttribute('aria-sort', vkState.sortDir === 1 ? 'ascending' : 'descending');
+        vkRender();
+      }
+      th.addEventListener('click', doSort);
+      th.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); doSort(); } });
+    });
+  })();
 
   // --- Init: load config on startup ---
   loadConfig();

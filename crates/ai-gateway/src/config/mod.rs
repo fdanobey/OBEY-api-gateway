@@ -75,6 +75,11 @@ pub struct Config {
     /// [`StreamingConfig::default`]. See [`StreamingConfig`].
     #[serde(default)]
     pub streaming: Option<StreamingConfig>,
+    /// Virtual key management (caller authentication and usage governance).
+    /// Absent section applies [`VirtualKeysConfig::default`] (enforcement
+    /// disabled). See [`VirtualKeysConfig`].
+    #[serde(default)]
+    pub virtual_keys: VirtualKeysConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -986,6 +991,57 @@ fn default_keepalive_interval() -> u64 {
 
 fn default_chunk_timeout() -> u64 {
     60
+}
+
+/// Virtual key management configuration.
+///
+/// Controls whether the gateway enforces caller authentication via virtual
+/// keys and where key records are persisted. Defaults to enforcement
+/// `disabled` so the feature is fully opt-in and existing deployments are
+/// unaffected. See the `virtual-key-management` spec.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VirtualKeysConfig {
+    /// Enforcement mode: `disabled` (default), `optional`, or `required`.
+    #[serde(default = "default_enforcement")]
+    pub enforcement: EnforcementMode,
+    /// Path to the SQLite database used for key storage and usage tracking.
+    #[serde(default = "default_keys_db_path")]
+    pub database_path: String,
+}
+
+impl Default for VirtualKeysConfig {
+    fn default() -> Self {
+        Self {
+            enforcement: default_enforcement(),
+            database_path: default_keys_db_path(),
+        }
+    }
+}
+
+/// Virtual key enforcement mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementMode {
+    /// Ignore virtual keys entirely; route using provider keys directly.
+    Disabled,
+    /// Validate and track `vk_`-prefixed keys when present; pass others through.
+    Optional,
+    /// Reject any request that does not present a valid virtual key.
+    Required,
+}
+
+impl Default for EnforcementMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+fn default_enforcement() -> EnforcementMode {
+    EnforcementMode::Disabled
+}
+
+fn default_keys_db_path() -> String {
+    "./keys.db".to_string()
 }
 
 #[cfg(test)]

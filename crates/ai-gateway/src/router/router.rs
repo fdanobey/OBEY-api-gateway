@@ -4115,6 +4115,7 @@ mod tests {
             tray: crate::config::TrayConfig::default(),
             codex_instructions_url: None,
             streaming: None,
+            virtual_keys: Default::default(),
         }
     }
 

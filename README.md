@@ -43,6 +43,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Response caching** — built-in two-tier cache: in-memory exact-match (default-on, no setup) plus optional semantic Qdrant tier; works for both streaming and non-streaming requests, including tool-using clients
 - **OpenAI OAuth login** — browser-based sign-in with your ChatGPT Plus/Pro subscription (PKCE flow, automatic token refresh)
 - **Codex backend translation** — transparently routes OAuth-authenticated requests through the ChatGPT Codex backend, translating Chat Completions ↔ Responses API on the fly
+- **Virtual key management** — issue per-caller API keys (`vk_…`) with independent USD/token budgets, rate limits, model-access restrictions, and expiry; authenticate callers without sharing real provider keys (see [Virtual Key Management](#virtual-key-management))
 - **Encrypted API key storage** — provider keys encrypted at rest with a machine-local master key
 - **Admin panel & dashboard** — embedded web UIs for configuration, metrics, and log viewing
 - **Prometheus metrics** — `/metrics` endpoint for existing monitoring infrastructure
@@ -388,6 +389,74 @@ When a timeout fires, the error response tells the user exactly which timeout wa
 | `ADMIN_PASSWORD` | Admin panel password |
 | `RUST_LOG` | Tracing filter (`info`, `debug`, `ai_gateway=trace`) |
 
+## Virtual Key Management
+
+Instead of every caller sharing your real provider keys, administrators can issue **virtual keys** (`vk_…`) that authenticate individual callers to the gateway. Each key carries its own budgets, rate limits, model-access rules, and expiry, all enforced at the proxy layer before requests reach upstream providers. This enables multi-tenant usage tracking, cost control, and access governance without exposing provider credentials.
+
+Virtual keys are stored encrypted in a dedicated SQLite database (`keys.db`), separate from request logs.
+
+### Enforcement Modes
+
+Enforcement is opt-in and defaults to `disabled`, so existing deployments are unaffected:
+
+```yaml
+virtual_keys:
+  enforcement: disabled       # disabled | optional | required
+  database_path: "./keys.db"  # dedicated key/usage store
+```
+
+| Mode | Behavior |
+|------|----------|
+| `disabled` (default) | Virtual keys are ignored; requests route with provider keys directly |
+| `optional` | Requests with a `vk_` bearer token are validated and tracked; requests without one pass through |
+| `required` | Every proxied request must present a valid virtual key (else `401`) |
+
+The enforcement pipeline runs in order: **authenticate → model access → budget → rate limit → forward**, then usage (spend + tokens) is recorded from the provider response.
+
+### Per-Key Constraints
+
+| Constraint | Description |
+|------------|-------------|
+| `budget_limit_usd` | Cumulative USD spend cap (`0.01`–`999,999,999.99`) → `429` when reached |
+| `token_budget` | Cumulative token cap (input + output) → `429` when reached |
+| `budget_window` | `daily` / `weekly` / `monthly` reset window (omit for a lifetime limit) |
+| `requests_per_minute` | Per-key RPM token-bucket → `429` + `Retry-After` |
+| `tokens_per_minute` | Per-key TPM rolling 60s window → `429` + `Retry-After` |
+| `model_access` | Whitelist of model group names (omit to allow all) → `403` on denial |
+| `expires_in` | `never`, `1_year`, `6_months`, `3_months`, `1_month`, `2_weeks`, `1_week`, `3_days`, `1_day` |
+
+### Admin API
+
+Virtual keys are managed through the admin API (protected by the existing admin auth) or the **Virtual Keys** tab in the admin panel:
+
+```bash
+# Create a key (returns the full vk_ value exactly once)
+curl -X POST http://localhost:8080/admin/keys \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"team-a","budget_limit_usd":50,"budget_window":"monthly","requests_per_minute":60}'
+
+# List / inspect / update / revoke / delete
+curl http://localhost:8080/admin/keys
+curl http://localhost:8080/admin/keys/{id}
+curl -X PATCH  http://localhost:8080/admin/keys/{id} -H 'Content-Type: application/json' -d '{"budget_limit_usd":100}'
+curl -X POST   http://localhost:8080/admin/keys/{id}/revoke
+curl -X DELETE http://localhost:8080/admin/keys/{id}
+
+# Per-key usage aggregate over a time range
+curl "http://localhost:8080/admin/keys/{id}/usage?start=2024-01-01T00:00:00Z&end=2024-01-31T23:59:59Z"
+```
+
+Callers then authenticate with the issued key:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer vk_your_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4-group","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+The admin panel's **Virtual Keys** section provides a searchable/sortable key table (with budget and expiry warnings), create/edit forms, one-time key reveal, revoke/delete confirmations, and a 30-day per-key usage chart.
+
 ## API Endpoints
 
 All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` response header for correlation.
@@ -397,6 +466,13 @@ All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` re
 | `POST` | `/admin/oauth/openai/login` | Initiate OpenAI OAuth login |
 | `GET` | `/admin/oauth/openai/status` | OAuth session status |
 | `POST` | `/admin/oauth/openai/logout` | Clear OAuth tokens |
+| `POST` | `/admin/keys` | Create a virtual key (returns full `vk_` value once) |
+| `GET` | `/admin/keys` | List virtual keys (paginated) |
+| `GET` | `/admin/keys/{id}` | Inspect a virtual key |
+| `PATCH` | `/admin/keys/{id}` | Update virtual key constraints |
+| `DELETE` | `/admin/keys/{id}` | Delete a virtual key + its usage history |
+| `POST` | `/admin/keys/{id}/revoke` | Revoke a virtual key |
+| `GET` | `/admin/keys/{id}/usage` | Per-key usage aggregate for a time range |
 | `GET` | `/health` | Health check |
 | `GET` | `/metrics` | Prometheus metrics |
 | `POST` | `/v1/chat/completions` | Chat completions (streaming + non-streaming) |
@@ -537,6 +613,7 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── logger/               # SQLite request logging
 │           ├── metrics/              # Prometheus metrics
 │           ├── oauth/                # OpenAI OAuth 2.0 login (PKCE flow)
+│           ├── virtual_keys/         # Virtual key management (auth, budgets, rate limits, usage, admin API)
 │           ├── secrets.rs            # API key encryption/decryption
 │           ├── error/                # Error types & HTTP status mapping
 │           ├── models/               # OpenAI-compatible data models
