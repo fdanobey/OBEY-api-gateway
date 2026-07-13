@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../Assets/icon.ico");
@@ -10,7 +8,9 @@ fn main() {
 
 #[cfg(target_os = "windows")]
 fn compile_windows_resources() {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"));
+    let manifest_dir = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
+    );
     let icon_path = manifest_dir.join("../../Assets/icon.ico");
 
     let mut resource = winres::WindowsResource::new();

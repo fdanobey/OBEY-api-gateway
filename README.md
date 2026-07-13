@@ -43,6 +43,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Response caching** — built-in two-tier cache: in-memory exact-match (default-on, no setup) plus optional semantic Qdrant tier; works for both streaming and non-streaming requests, including tool-using clients
 - **OpenAI OAuth login** — browser-based sign-in with your ChatGPT Plus/Pro subscription (PKCE flow, automatic token refresh)
 - **Codex backend translation** — transparently routes OAuth-authenticated requests through the ChatGPT Codex backend, translating Chat Completions ↔ Responses API on the fly
+- **Guardrail pipelines** — configurable pre-call and post-call policy enforcement with PII redaction/re-injection, regex scanning, Presidio NLP, OpenAI Moderation, Lakera, semantic prompt guard, and custom HTTP providers; includes refusal detection with automatic failover (see [Guardrail Pipelines](#guardrail-pipelines))
 - **Virtual key management** — issue per-caller API keys (`vk_…`) with independent USD/token budgets, rate limits, model-access restrictions, and expiry; authenticate callers without sharing real provider keys (see [Virtual Key Management](#virtual-key-management))
 - **Encrypted API key storage** — provider keys encrypted at rest with a machine-local master key
 - **Admin panel & dashboard** — embedded web UIs for configuration, metrics, and log viewing
@@ -457,6 +458,131 @@ curl http://localhost:8080/v1/chat/completions \
 
 The admin panel's **Virtual Keys** section provides a searchable/sortable key table (with budget and expiry warnings), create/edit forms, one-time key reveal, revoke/delete confirmations, and a 30-day per-key usage chart.
 
+## Guardrail Pipelines
+
+Guardrail Pipelines add a configurable policy-enforcement layer that intercepts requests before provider routing (pre-call) and responses before returning to the caller (post-call). Use them for PII/DLP filtering, content moderation, semantic prompt guarding, and sensitive data redaction with transparent re-injection.
+
+Guardrails are opt-in per virtual key, model group, or route and execute through a pluggable provider interface.
+
+### Guardrail Providers
+
+| Type | Description |
+|------|-------------|
+| `regex` | Up to 256 named patterns with allow/deny modes; compiled at load time, per-pattern 10ms budget |
+| `presidio` | Presidio-compatible NLP PII detection via HTTP; configurable entity types and confidence threshold |
+| `openai_moderation` | OpenAI Moderation API integration |
+| `lakera` | Lakera Guard prompt injection detection |
+| `semantic` | Embedding-based similarity matching against allow/deny example collections in Qdrant |
+| `custom_http` | POST content to any HTTP endpoint implementing the documented findings JSON schema |
+
+### Policy Actions
+
+| Action | Pre-Call | Post-Call | Behavior |
+|--------|:--------:|:---------:|----------|
+| `allow` | ✓ | ✓ | Pass through unmodified |
+| `block` | ✓ | ✓ | Reject with HTTP 403 (pre-call stops forwarding; post-call discards response) |
+| `mask` | ✓ | | Replace each character with `*`, preserving byte length |
+| `redact` | ✓ | ✓ | Replace with placeholder tokens (pre-call) or `[REDACTED]` (post-call) |
+| `replace_with_policy_message` | | ✓ | Replace assistant content with a configured message |
+
+### PII Redaction & Re-Injection
+
+When a pre-call stage uses the `redact` action, detected PII values are replaced with deterministic placeholder tokens (`<<PII_EMAIL_1>>`, `<<PII_SSN_2>>`, etc.) before the request reaches the LLM. A system instruction is automatically prepended telling the model to preserve placeholders verbatim. After the LLM responds, placeholders are transparently restored to original values before the response reaches the caller.
+
+- Up to 256 distinct values per request receive re-injection entries
+- Identical values reuse the same placeholder (deduplication)
+- Configurable redaction-notice instruction text and insertion mode (`separate` or `merged`)
+- The Re_Injection_Map is held only in memory for the request duration and discarded immediately after
+
+### Refusal Detection & Failover
+
+The gateway can detect model refusals (via phrase matching or tool-call omission) and optionally fail over to the next provider in the fallback ordering:
+
+- **Phrase matching** — case-insensitive regex patterns against assistant-role content (ships with a default list, overridable per-pipeline)
+- **Tool-omission signal** — fires when tools were provided but the model didn't call any
+- **Bounded failover** — re-dispatches the already-redacted request to the next eligible target (skipping open circuit breakers), attempting each at most once
+- **Toggle** — `failover_on_refusal` per-pipeline or per-binding, disabled by default
+
+### Pipeline Ordering
+
+When multiple pipelines apply (global default + virtual-key + model-group + route), stages are concatenated in a fixed order:
+
+1. Global default pipeline stages
+2. Virtual-key pipeline stages
+3. Model-group pipeline stages
+4. Route pipeline stages
+
+Halting actions (`block`, `replace_with_policy_message`) short-circuit immediately; non-halting actions continue to the next stage.
+
+### Streaming Support
+
+For SSE responses with a post-call pipeline, the gateway buffers the streamed response (up to 10 MB), sends keep-alive comments during buffering, applies guardrail analysis on the assembled content, and re-chunks the result into SSE events matching the original chunk boundaries.
+
+### Configuration Example
+
+```yaml
+guardrails:
+  providers:
+    - name: secret-scanner
+      type: regex
+      failure_policy: fail_close
+      patterns:
+        - { name: openai_key, regex: "sk-[A-Za-z0-9]{20,}", entity: API_KEY, mode: deny }
+
+    - name: pii-detector
+      type: presidio
+      failure_policy: fail_open
+      endpoint: "http://presidio:3000/analyze"
+      entities: [EMAIL_ADDRESS, US_SSN, CREDIT_CARD]
+      confidence_threshold: 0.6
+
+    - name: prompt-guard
+      type: semantic
+      failure_policy: fail_open
+      allow_collection: "guardrail_allow"
+      deny_collection: "guardrail_deny"
+      allow_threshold: 0.90
+      deny_threshold: 0.85
+
+  pipelines:
+    - name: standard
+      failover_on_refusal: true
+      stages:
+        - { name: pii-redact, provider: pii-detector, phase: pre_call, action: redact }
+        - { name: secret-block, provider: secret-scanner, phase: pre_call, action: block }
+        - { name: injection-guard, provider: prompt-guard, phase: pre_call, action: block }
+        - { name: out-redact, provider: secret-scanner, phase: post_call, action: redact }
+
+  global_default_pipeline: standard
+
+  bindings:
+    virtual_keys:
+      vk_team_a: standard
+    model_groups:
+      gpt-4-group: standard
+    routes:
+      "/v1/chat/completions": standard
+```
+
+### Failure Policies
+
+Each provider must declare a `failure_policy`:
+
+- **`fail_open`** — on timeout or error, skip the stage and continue the pipeline
+- **`fail_close`** — on timeout or error, halt the pipeline and return HTTP 503
+
+### Observability
+
+Guardrail execution is fully observable:
+
+- Counter: `obey_api_guardrail_stage_executions_total{pipeline, stage, provider, action}`
+- Histogram: `obey_api_guardrail_stage_latency_ms{pipeline, stage, provider}` (buckets: 5–5000ms)
+- Counter: `obey_api_guardrail_refusal_detected_total{pipeline, signal}`
+- Counter: `obey_api_guardrail_refusal_failover_total{pipeline, outcome}`
+- INFO logs for non-pass actions (never includes triggering content)
+- WARN logs for provider errors
+- Per-request guardrail summary in the request log entry
+
 ## API Endpoints
 
 All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` response header for correlation.
@@ -607,6 +733,7 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── router/               # Provider selection, circuit breaker, rate limiter
 │           ├── providers/            # Provider implementations (8 providers)
 │           ├── context/              # Context window management & truncation
+│           ├── guardrail/            # Guardrail pipelines: PII redaction/re-injection, regex, Presidio, semantic, refusal detection & failover
 │           ├── cache/                # Response caching: in-memory exact-match (tier 1) + optional Qdrant semantic (tier 2)
 │           ├── admin/                # Admin panel routes & embedded UI
 │           ├── dashboard/            # Dashboard routes & WebSocket metrics

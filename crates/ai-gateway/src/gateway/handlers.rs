@@ -9,6 +9,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
+    Extension,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,10 @@ use crate::cache::ExactCache;
 use crate::config::{load_and_validate_config, StreamingConfig};
 use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
 use crate::gateway::apply_runtime_config_update;
+use crate::guardrail::{
+    stream as guardrail_stream, BindingSelector, GuardrailContext, GuardrailEngine,
+    PostCallOutcome, PreCallOutcome, RefusalDecision, StagePhase, ToolContext,
+};
 use crate::logger::LogEntry;
 use crate::metrics::Metrics;
 use crate::models::openai::{Choice, OpenAIRequest, OpenAIResponse};
@@ -125,6 +130,26 @@ fn attach_trace_id_header(response: &mut Response, trace_id: &str) {
 
 use super::AppState;
 
+/// Finalize a guardrail-produced [`GatewayError`] into an HTTP response,
+/// completing the request-metrics guard, writing the request log entry, and
+/// attaching the trace-id header — mirroring the error path in
+/// `chat_completions_non_stream` so guardrail rejections are observed
+/// identically to provider failures.
+fn guardrail_error_response(
+    state: &AppState,
+    request: &OpenAIRequest,
+    request_guard: &mut RequestCompleteGuard,
+    trace_id: &str,
+    error: GatewayError,
+) -> Response {
+    let duration_ms = request_guard.complete();
+    let log_context = RequestLogContext::from_error(request, trace_id.to_string(), duration_ms, &error);
+    log_request(state, request, &log_context);
+    let mut response = error.into_response();
+    attach_trace_id_header(&mut response, trace_id);
+    response
+}
+
 // ---------------------------------------------------------------------------
 // Error → HTTP response mapping
 // ---------------------------------------------------------------------------
@@ -171,6 +196,22 @@ impl IntoResponse for GatewayError {
                     serde_json::json!({ "error": { "message": self.to_string(), "type": "provider_error" } }),
                 )
             },
+            // Guardrail policy block (pre- or post-call): 403 with the
+            // triggering category only, never the raw content (Req 2.2, 3.1).
+            GatewayError::GuardrailPolicyViolation { category } => (
+                StatusCode::FORBIDDEN,
+                serde_json::json!({ "error": { "message": "Request blocked by guardrail policy", "type": "guardrail_policy_violation", "category": category } }),
+            ),
+            // Stage action invalid for its phase (Req 2.7).
+            GatewayError::GuardrailInvalidAction => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({ "error": { "message": "Invalid guardrail stage action", "type": "invalid_request_error" } }),
+            ),
+            // fail_close provider timeout/error (Req 2.9, 9.7).
+            GatewayError::GuardrailUnavailable(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "error": { "message": msg, "type": "guardrail_unavailable" } }),
+            ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 serde_json::json!({ "error": { "message": self.to_string(), "type": "server_error" } }),
@@ -237,25 +278,39 @@ pub async fn health_check(State(state): State<AppState>) -> Response {
 // ---------------------------------------------------------------------------
 
 /// Chat completions handler — streaming and non-streaming.
+///
+/// The optional `Extension<AuthenticatedKey>` is inserted by the virtual-key
+/// enforcement middleware (`virtual_keys::auth`) when key enforcement is active.
+/// Its id is threaded into the guardrail `BindingSelector` so per-virtual-key
+/// guardrail bindings resolve (Req 1.3, 1.7). When enforcement is disabled the
+/// extension is absent and the id is `None`.
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
+    authenticated_key: Option<Extension<AuthenticatedKey>>,
     Json(request): Json<OpenAIRequest>,
 ) -> Response {
     tracing::info!(model = %request.model, stream = request.stream, "Received chat completion request");
     let trace_id = trace_id_from_headers(&headers);
+    let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
     if request.stream {
-        chat_completions_stream(state, request, trace_id).await
+        chat_completions_stream(state, request, trace_id, virtual_key_id).await
     } else {
-        chat_completions_non_stream(state, request, trace_id).await
+        chat_completions_non_stream(state, request, trace_id, virtual_key_id).await
     }
 }
 
-async fn chat_completions_non_stream(state: AppState, request: OpenAIRequest, trace_id: String) -> Response {
+async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest, trace_id: String, virtual_key_id: Option<String>) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
     let mut request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
     tracing::debug!(model = %request.model, "Routing non-stream request");
+
+    // Snapshot the guardrail engine once for the whole request (Req 1.8): a
+    // concurrent hot-reload swaps `AppState.guardrail_engine` wholesale, but this
+    // request keeps its cloned `Arc` snapshot. `None` means guardrails are not
+    // configured and this handler behaves byte-for-byte as before.
+    let guardrail_engine = state.guardrail_engine.read().await.clone();
 
     // Tier-1: exact-match in-memory cache.  Lookup is always safe — eligibility
     // (deterministic temperature, n=1) is enforced internally.  Tool-using
@@ -305,8 +360,237 @@ async fn chat_completions_non_stream(state: AppState, request: OpenAIRequest, tr
         }
     }
 
+    // -----------------------------------------------------------------
+    // Guardrail hooks (opt-in). NOTE: cache hits above are served WITHOUT
+    // guardrail evaluation. This matches the design's "pre-call before
+    // route_request" placement and keeps this task scoped; a cached reply is a
+    // verbatim replay of a response that already passed guardrails when first
+    // produced (post-call runs before caching below), so redact/replace effects
+    // are preserved in the cached payload. A pre-call `block` can still be
+    // bypassed by an exact/semantic cache hit — a known limitation to revisit if
+    // guardrails must gate cached replays.
+    // -----------------------------------------------------------------
+    // A request-scoped context carries the PII Re_Injection_Map from pre-call
+    // redaction into post-call re-injection (Req 9.5); it is dropped when this
+    // function returns (Req 2.6 / 4.6).
+    let mut guardrail_ctx = GuardrailContext::new();
+    // Bindings resolve from the authenticated virtual-key id (when key
+    // enforcement is active), the requested model group, and the route path
+    // (Req 1.3, 1.7).
+    let selector = BindingSelector::new(
+        virtual_key_id.clone(),
+        Some(request.model.clone()),
+        Some("/v1/chat/completions".to_string()),
+    );
+
+    if let Some(engine) = guardrail_engine.as_ref() {
+        match engine
+            .run_pre_call(&mut request, &selector, &mut guardrail_ctx, &trace_id)
+            .await
+        {
+            // Forward the (possibly redacted/masked) request to the router.
+            PreCallOutcome::Proceed => {}
+            // `block` fired → HTTP 403, do NOT route (Req 2.2).
+            PreCallOutcome::Block(block) => {
+                let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label };
+                return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+            }
+            // Action invalid for the pre-call phase → HTTP 400 (Req 2.7).
+            PreCallOutcome::InvalidAction => {
+                return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, GatewayError::GuardrailInvalidAction);
+            }
+            // fail_close scan timeout → HTTP 503 (Req 2.9).
+            PreCallOutcome::Timeout => {
+                let err = GatewayError::GuardrailUnavailable("guardrail scan timeout".to_string());
+                return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+            }
+            // fail_close provider error → HTTP 503 (Req 9.7).
+            PreCallOutcome::ServiceFailure => {
+                let err = GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
+                return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+            }
+        }
+    }
+
     match state.router.route_request(&request).await {
-        Ok(response) => {
+        Ok(mut response) => {
+            // Post-call guardrails run on the freshly routed response BEFORE it
+            // is cached or returned, using the SAME ctx so PII re-injection
+            // works (Req 9.5). Caching the post-guardrail response means later
+            // cache replays already reflect redact/replace/re-injection.
+            if let Some(engine) = guardrail_engine.as_ref() {
+                // Build ToolContext from request/response for refusal detection (Req 12.3).
+                let tool_ctx = ToolContext {
+                    tool_use_allowed: request.extra.get("tool_choice").and_then(|v| v.as_str()).map_or(true, |tc| tc != "none"),
+                    tools_provided: request.extra.get("tools").and_then(|v| v.as_array()).map_or(false, |t| !t.is_empty()),
+                    finish_reason_is_tool_call: response.choices.first().and_then(|c| c.finish_reason.as_deref()).map_or(false, |r| r == "tool_calls"),
+                    has_tool_calls: response.choices.first().map_or(false, |c| {
+                        c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
+                    }),
+                };
+                match engine
+                    .run_post_call(&mut response, &selector, &mut guardrail_ctx, &trace_id, &tool_ctx)
+                    .await
+                {
+                    // Proceed without refusal: re-injection already ran inside
+                    // run_post_call. Replaced also returns as-is (Req 9.4: a
+                    // halting action skips re-injection and is final regardless
+                    // of refusal detection).
+                    (PostCallOutcome::Proceed, RefusalDecision::NotRefusal)
+                    | (PostCallOutcome::Replaced, _) => {}
+                    // Refusal detected with failover enabled (Req 12.5): run the
+                    // bounded re-dispatch loop. Re-injection was skipped inside
+                    // run_post_call so we do it exactly once on the final response.
+                    (PostCallOutcome::Proceed, RefusalDecision::Refusal(_signal)) => {
+                        // Compute the fallback ordering once (Req 12.5, 12.7).
+                        let model_group = match state.router.find_model_group(&request.model).await {
+                            Ok(mg) => mg,
+                            Err(_) => {
+                                // Cannot resolve model group — re-inject on current response and return.
+                                engine.reinject_response(&mut response, &guardrail_ctx);
+                                // fall through to caching/return below
+                                let cacheable = crate::router::router::Router::should_cache_response(&response);
+                                if cacheable {
+                                    let response_json = serde_json::to_string(&response).unwrap_or_default();
+                                    if !response_json.is_empty() {
+                                        state.exact_cache.set(&request, response_json.clone());
+                                    }
+                                    if !skip_semantic {
+                                        if let Some(ref cache) = state.cache {
+                                            if let Err(e) = cache.set(&request, &response_json, 0.0).await {
+                                                tracing::warn!("Failed to cache response: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                let duration_ms = request_guard.complete();
+                                let log_context = RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
+                                log_request(&state, &request, &log_context);
+                                let mut http_response = Json(response).into_response();
+                                attach_trace_id_header(&mut http_response, &trace_id);
+                                return http_response;
+                            }
+                        };
+                        let fallback_order = state.router.select_provider_order(&model_group).await;
+
+                        // Identify the provider that produced the current (refused) response.
+                        let already_tried_provider = response
+                            .extra
+                            .get("gateway_provider")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        let mut tried: Vec<String> = vec![already_tried_provider.clone()];
+                        let mut last_response = response;
+                        // Track whether the final response was a halting action
+                        // (replaced/block) that skips re-injection (Req 9.4).
+                        let mut skip_reinjection = false;
+
+                        // Bounded re-dispatch loop (Req 12.7): attempt each
+                        // target at most once, bounded by ordering length.
+                        for target in &fallback_order {
+                            // Skip already-tried targets (Req 12.7).
+                            let target_key = format!("{}:{}", target.provider, target.model);
+                            if tried.contains(&target.provider) {
+                                continue;
+                            }
+                            // Skip targets whose circuit breaker is open (Req 12.10).
+                            let cb = state.router.get_circuit_breaker(&target_key).await;
+                            if !cb.is_available().await {
+                                tracing::debug!(
+                                    provider = %target.provider,
+                                    model = %target.model,
+                                    "Refusal failover: circuit breaker open, skipping"
+                                );
+                                continue;
+                            }
+
+                            tried.push(target.provider.clone());
+
+                            // Re-dispatch the already-redacted request to this
+                            // single target via route_with_failover (Req 12.5).
+                            let attempt_result = state
+                                .router
+                                .route_with_failover(&request, vec![target.clone()])
+                                .await;
+
+                            match attempt_result {
+                                Ok(mut new_response) => {
+                                    // Re-run post-call + refusal detection on the new response.
+                                    let new_tool_ctx = ToolContext {
+                                        tool_use_allowed: request.extra.get("tool_choice").and_then(|v| v.as_str()).map_or(true, |tc| tc != "none"),
+                                        tools_provided: request.extra.get("tools").and_then(|v| v.as_array()).map_or(false, |t| !t.is_empty()),
+                                        finish_reason_is_tool_call: new_response.choices.first().and_then(|c| c.finish_reason.as_deref()).map_or(false, |r| r == "tool_calls"),
+                                        has_tool_calls: new_response.choices.first().map_or(false, |c| {
+                                            c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
+                                        }),
+                                    };
+                                    let (post_outcome, refusal_decision) = engine
+                                        .run_post_call(&mut new_response, &selector, &mut guardrail_ctx, &trace_id, &new_tool_ctx)
+                                        .await;
+
+                                    match post_outcome {
+                                        // Block/ServiceFailure from post-call on failover target:
+                                        // return the error immediately.
+                                        PostCallOutcome::Block(block) => {
+                                            let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label };
+                                            return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+                                        }
+                                        PostCallOutcome::ServiceFailure => {
+                                            let err = GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
+                                            return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+                                        }
+                                        // Replaced means we got a policy message; treat as non-refusal.
+                                        // Re-injection is skipped for replaced responses (Req 9.4).
+                                        PostCallOutcome::Replaced => {
+                                            last_response = new_response;
+                                            skip_reinjection = true;
+                                            break;
+                                        }
+                                        PostCallOutcome::Proceed => {
+                                            if !refusal_decision.is_refusal() {
+                                                // First non-refusal: use it (Req 12.5).
+                                                // Re-injection runs once below on the final response.
+                                                last_response = new_response;
+                                                break;
+                                            }
+                                            // Still a refusal — record and continue loop.
+                                            last_response = new_response;
+                                        }
+                                    }
+                                }
+                                Err(_e) => {
+                                    // Provider error during failover — continue to next target.
+                                    tracing::debug!(
+                                        provider = %target.provider,
+                                        "Refusal failover: provider error, trying next"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // PII re-injection runs exactly once on the finally
+                        // selected response (Req 9.5, 12.5), unless the response
+                        // was replaced by a policy message (Req 9.4).
+                        if !skip_reinjection {
+                            engine.reinject_response(&mut last_response, &guardrail_ctx);
+                        }
+                        response = last_response;
+                    }
+                    // `block` → discard response, HTTP 403 (Req 3.1).
+                    (PostCallOutcome::Block(block), _) => {
+                        let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label };
+                        return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+                    }
+                    // fail_close provider error/timeout → HTTP 503 (Req 9.7).
+                    (PostCallOutcome::ServiceFailure, _) => {
+                        let err = GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
+                        return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+                    }
+                }
+            }
             // Cache responses that are safe to replay.  Filter applies to
             // both tiers (no tool_calls, complete finish_reason, etc.).
             let cacheable = crate::router::router::Router::should_cache_response(&response);
@@ -341,7 +625,7 @@ async fn chat_completions_non_stream(state: AppState, request: OpenAIRequest, tr
     }
 }
 
-async fn chat_completions_stream(state: AppState, request: OpenAIRequest, trace_id: String) -> Response {
+async fn chat_completions_stream(state: AppState, mut request: OpenAIRequest, trace_id: String, virtual_key_id: Option<String>) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
     tracing::debug!(
@@ -378,6 +662,95 @@ async fn chat_completions_stream(state: AppState, request: OpenAIRequest, trace_
         }
     } else if state.exact_cache.is_eligible(&request) {
         state.metrics.record_cache_miss();
+    }
+
+    // -----------------------------------------------------------------
+    // Guardrail hooks (opt-in) for streaming (Req 10). Mirrors the non-stream
+    // handler: snapshot the engine once (Req 1.8), run pre-call BEFORE routing,
+    // and — when a post-call pipeline is bound — force the buffered path so the
+    // assembled response can be analyzed before any bytes reach the caller.
+    //
+    // Cache hits above are served WITHOUT guardrail evaluation (same documented
+    // limitation as the non-stream path). When the engine is `None`, or no
+    // post-call stage is bound, the existing pass-through/buffered SSE behavior
+    // below is preserved byte-for-byte.
+    // -----------------------------------------------------------------
+    let guardrail_engine = state.guardrail_engine.read().await.clone();
+    if let Some(engine) = guardrail_engine.as_ref() {
+        // Request-scoped context carrying the PII Re_Injection_Map from pre-call
+        // redaction into post-call re-injection (Req 9.5).
+        let mut guardrail_ctx = GuardrailContext::new();
+        // Bindings resolve from the authenticated virtual-key id (when key
+        // enforcement is active), the requested model group, and the route path
+        // (Req 1.3, 1.7), matching the non-stream handler.
+        let selector = BindingSelector::new(
+            virtual_key_id.clone(),
+            Some(request.model.clone()),
+            Some("/v1/chat/completions".to_string()),
+        );
+
+        // Pre-call runs before routing. Nothing has streamed yet, so on a
+        // terminal pre-call outcome we return a plain JSON error response
+        // identical to the non-stream handler.
+        match engine
+            .run_pre_call(&mut request, &selector, &mut guardrail_ctx, &trace_id)
+            .await
+        {
+            PreCallOutcome::Proceed => {}
+            PreCallOutcome::Block(block) => {
+                let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
+                let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label };
+                return guardrail_error_response(&state, &request, &mut guard, &trace_id, err);
+            }
+            PreCallOutcome::InvalidAction => {
+                let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
+                return guardrail_error_response(&state, &request, &mut guard, &trace_id, GatewayError::GuardrailInvalidAction);
+            }
+            PreCallOutcome::Timeout => {
+                let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
+                let err = GatewayError::GuardrailUnavailable("guardrail scan timeout".to_string());
+                return guardrail_error_response(&state, &request, &mut guard, &trace_id, err);
+            }
+            PreCallOutcome::ServiceFailure => {
+                let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
+                let err = GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
+                return guardrail_error_response(&state, &request, &mut guard, &trace_id, err);
+            }
+        }
+
+        // Force the buffered path when either:
+        //   (a) a post-call pipeline is bound (at least one resolved stage runs
+        //       in the post-call phase for this selector), so the assembled
+        //       response can be analyzed before any bytes reach the caller; OR
+        //   (b) pre-call redaction populated the Re_Injection_Map — even with no
+        //       post-call stage, the assembled response must be buffered so PII
+        //       placeholders are re-injected as the final post-call step (Req
+        //       9.5). Without this, a streaming response would leak raw
+        //       `<<PII_..>>` placeholders instead of the restored originals.
+        // `run_post_call` handles the no-post-call-stage case: it runs no stages
+        // and performs re-injection when the context is non-empty.
+        let post_call_bound = engine
+            .resolver()
+            .resolve(&selector)
+            .iter()
+            .any(|s| s.phase == StagePhase::PostCall);
+        let needs_buffering = post_call_bound || !guardrail_ctx.is_empty();
+        if needs_buffering {
+            return stream_buffered_with_post_call(
+                state,
+                request,
+                trace_id,
+                start,
+                streaming_config,
+                engine.clone(),
+                selector,
+                guardrail_ctx,
+            )
+            .await;
+        }
+        // No post-call pipeline and no pending re-injection: fall through to the
+        // existing SSE behavior with the (possibly pre-call-mutated) request.
+        // `guardrail_ctx` is dropped.
     }
 
     // Req 1: resolve the effective streaming settings — done above so all SSE
@@ -809,6 +1182,402 @@ async fn chat_completions_stream(state: AppState, request: OpenAIRequest, trace_
     Sse::new(stream)
         .keep_alive(build_keepalive(&streaming_config))
         .into_response()
+}
+
+/// Streaming handler variant used when a post-call guardrail pipeline is bound
+/// (task 13.3, Req 10). It FORCES the buffered path: rather than relaying
+/// upstream SSE chunks verbatim, it assembles the complete response, runs the
+/// post-call pipeline on it, then re-chunks the result back into SSE.
+///
+/// - Buffers the upstream response under a 10 MB cap, aborting with a gateway
+///   error beyond it (Req 10.1), emitting keep-alive comments during idle gaps
+///   at `keepalive_interval_seconds` (Req 10.2).
+/// - On a premature disconnect (no `finish_reason`), applies the bound post-call
+///   stages' failure policy: `fail_close` discards, `fail_open` forwards the
+///   partial content (Req 10.5).
+/// - Maps post-call outcomes to SSE: pass/replace → re-chunk (Req 10.4) and
+///   forward within 500 ms of analysis (Req 10.6, no artificial delay);
+///   `block` → a terminal policy-violation event + `[DONE]` (Req 10.3);
+///   `ServiceFailure` → a 503-style graceful SSE error termination (Req 9.7).
+///
+/// Pre-call has already run against `request` before this function is called;
+/// `guardrail_ctx` carries the pre-call PII Re_Injection_Map so post-call
+/// re-injection restores originals in the assembled response (Req 9.5).
+#[allow(clippy::too_many_arguments)]
+async fn stream_buffered_with_post_call(
+    state: AppState,
+    request: OpenAIRequest,
+    trace_id: String,
+    start: std::time::Instant,
+    streaming_config: StreamingConfig,
+    engine: Arc<GuardrailEngine>,
+    selector: BindingSelector,
+    mut guardrail_ctx: GuardrailContext,
+) -> Response {
+    let emit_early = streaming_config.emit_early_event;
+    let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let created = chrono::Utc::now().timestamp();
+    let requested_model = request.model.clone();
+    // Keep-alive cadence while buffering (Req 10.2). Clamp to at least 1s so a
+    // configured `0` (axum-default keepalive) does not spin the buffering loop.
+    let keepalive_interval =
+        Duration::from_secs(streaming_config.keepalive_interval_seconds.max(1));
+    // Premature-disconnect failure policy from the bound post-call stages (Req 10.5).
+    let discard_on_disconnect =
+        guardrail_stream::disconnect_discards_partial(&engine.resolver().resolve(&selector));
+
+    let request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
+    let stream_trace_id = trace_id.clone();
+
+    let stream = async_stream::stream! {
+        let mut _guard = request_guard;
+
+        // Early synthetic role event (Req 1.1-1.3) so the client's idle timer
+        // resets while we buffer; re-chunking below reuses its id/created.
+        if emit_early {
+            let early = early_event_chunk(&response_id, created, &requested_model);
+            yield Ok::<_, Infallible>(Event::default().data(early.to_string()));
+        }
+
+        // Force the buffered path: assemble the full upstream response (never
+        // relay pass-through chunks to the caller) so the post-call pipeline
+        // sees the complete content.
+        let mut assembled: Option<OpenAIResponse> = None;
+        let mut disconnected = false;
+
+        match state.router.route_request_streaming(&request).await {
+            Ok(StreamingResponse::Buffered(response)) => {
+                assembled = Some(response);
+            }
+            Ok(StreamingResponse::PassThrough { byte_stream, .. }) => {
+                // Buffer the live SSE body under the 10 MB cap while emitting
+                // keep-alive comments during idle gaps (Req 10.1, 10.2).
+                let mut buf = guardrail_stream::SseBuffer::with_default_cap();
+                let mut bytes = byte_stream.bytes_stream();
+                let mut too_large = false;
+                loop {
+                    match tokio::time::timeout(keepalive_interval, bytes.next()).await {
+                        // Idle gap while buffering: keep the client alive (Req 10.2).
+                        Err(_elapsed) => {
+                            yield Ok(Event::default().comment("keepalive"));
+                        }
+                        // Upstream stream ended.
+                        Ok(None) => break,
+                        Ok(Some(Ok(b))) => {
+                            if buf.push_bytes(&b).is_err() {
+                                too_large = true;
+                                break;
+                            }
+                        }
+                        // Transport error mid-stream → premature disconnect (Req 10.5).
+                        Ok(Some(Err(_e))) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+
+                if too_large {
+                    // Req 10.1: abort with a gateway error when the cap is exceeded.
+                    let msg = format!(
+                        "Buffered streaming response exceeded the {} byte guardrail buffer limit",
+                        guardrail_stream::MAX_STREAM_BUFFER_BYTES
+                    );
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let err = GatewayError::GuardrailUnavailable(msg.clone());
+                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                    log_request(&state, &request, &log_context);
+                    for event in emit_sse_error_event("guardrail_buffer_overflow", &msg, &stream_trace_id) {
+                        yield Ok(event);
+                    }
+                    _guard.complete();
+                    return;
+                }
+
+                match buf.assemble() {
+                    Ok(a) => {
+                        // No finish_reason ⇒ premature disconnect (Req 10.5).
+                        if !a.complete {
+                            disconnected = true;
+                        }
+                        assembled = Some(a.response);
+                    }
+                    // Empty/mid-error buffer: treat as a disconnect (Req 10.5).
+                    Err(_e) => {
+                        disconnected = true;
+                    }
+                }
+            }
+            Err(e) => {
+                // Routing failed before any streaming — graceful SSE error frame.
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
+                log_request(&state, &request, &log_context);
+                let (error_type, message) = classify_stream_error(&e);
+                for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
+                    yield Ok(event);
+                }
+                _guard.complete();
+                return;
+            }
+        }
+
+        // Premature disconnect handling (Req 10.5): fail_close discards, fail_open
+        // forwards the partial content through post-call.
+        if disconnected && (discard_on_disconnect || assembled.is_none()) {
+            let msg = "Upstream stream ended before a complete response; guardrail failure policy is fail-close".to_string();
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let err = GatewayError::GuardrailUnavailable(msg.clone());
+            let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+            log_request(&state, &request, &log_context);
+            for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
+                yield Ok(event);
+            }
+            _guard.complete();
+            return;
+        }
+
+        let mut response = match assembled {
+            Some(r) => r,
+            None => {
+                yield Ok(Event::default().data("[DONE]"));
+                _guard.complete();
+                return;
+            }
+        };
+
+        // Post-call guardrails on the assembled response, using the SAME ctx as
+        // pre-call so PII re-injection works (Req 9.5). No artificial delay is
+        // added, so re-chunked events forward within 500 ms of analysis (Req 10.6).
+        //
+        // Refusal detection runs on the assembled buffered response BEFORE the
+        // failover decision (Req 12.9). On premature stream termination (no
+        // finish_reason), detection runs on the partially assembled content and
+        // the same failover decision applies (Req 12.14).
+        let tool_ctx = ToolContext {
+            tool_use_allowed: request.extra.get("tool_choice").and_then(|v| v.as_str()).map_or(true, |tc| tc != "none"),
+            tools_provided: request.extra.get("tools").and_then(|v| v.as_array()).map_or(false, |t| !t.is_empty()),
+            finish_reason_is_tool_call: response.choices.first().and_then(|c| c.finish_reason.as_deref()).map_or(false, |r| r == "tool_calls"),
+            has_tool_calls: response.choices.first().map_or(false, |c| {
+                c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
+            }),
+        };
+        match engine
+            .run_post_call(&mut response, &selector, &mut guardrail_ctx, &stream_trace_id, &tool_ctx)
+            .await
+        {
+            // Proceed without refusal, or replaced (halting action skips
+            // re-injection, Req 9.4) → re-chunk normally.
+            (PostCallOutcome::Proceed, RefusalDecision::NotRefusal)
+            | (PostCallOutcome::Replaced, _) => {
+                let chunks = if emit_early {
+                    guardrail_stream::rechunk_after_early_event(&response, &response_id, created)
+                } else {
+                    guardrail_stream::rechunk_full(&response)
+                };
+                if crate::router::router::Router::should_cache_response(&response) {
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        state.exact_cache.set(&request, json);
+                    }
+                }
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                log_request(&state, &request, &log_context);
+                for chunk in chunks {
+                    yield Ok(Event::default().data(chunk.to_string()));
+                }
+                yield Ok(Event::default().data("[DONE]"));
+            }
+            // Refusal detected with failover enabled (Req 12.5, 12.9, 12.14):
+            // run the bounded re-dispatch loop, buffering each re-dispatched
+            // target before detection (same pattern as the non-streaming 17.2).
+            (PostCallOutcome::Proceed, RefusalDecision::Refusal(_signal)) => {
+                // Compute the fallback ordering once (Req 12.5, 12.7).
+                let model_group = match state.router.find_model_group(&request.model).await {
+                    Ok(mg) => mg,
+                    Err(_) => {
+                        // Cannot resolve model group — re-inject on current response and return.
+                        engine.reinject_response(&mut response, &guardrail_ctx);
+                        let chunks = if emit_early {
+                            guardrail_stream::rechunk_after_early_event(&response, &response_id, created)
+                        } else {
+                            guardrail_stream::rechunk_full(&response)
+                        };
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                        log_request(&state, &request, &log_context);
+                        for chunk in chunks {
+                            yield Ok(Event::default().data(chunk.to_string()));
+                        }
+                        yield Ok(Event::default().data("[DONE]"));
+                        _guard.complete();
+                        return;
+                    }
+                };
+                let fallback_order = state.router.select_provider_order(&model_group).await;
+
+                // Identify the provider that produced the current (refused) response.
+                let already_tried_provider = response
+                    .extra
+                    .get("gateway_provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let mut tried: Vec<String> = vec![already_tried_provider.clone()];
+                let mut last_response = response;
+                let mut skip_reinjection = false;
+
+                // Bounded re-dispatch loop (Req 12.7): attempt each target at
+                // most once, bounded by ordering length. Re-dispatched targets in
+                // a streaming context are likewise buffered before detection.
+                for target in &fallback_order {
+                    let target_key = format!("{}:{}", target.provider, target.model);
+                    if tried.contains(&target.provider) {
+                        continue;
+                    }
+                    // Skip targets whose circuit breaker is open (Req 12.10).
+                    let cb = state.router.get_circuit_breaker(&target_key).await;
+                    if !cb.is_available().await {
+                        tracing::debug!(
+                            provider = %target.provider,
+                            model = %target.model,
+                            "Streaming refusal failover: circuit breaker open, skipping"
+                        );
+                        continue;
+                    }
+
+                    tried.push(target.provider.clone());
+
+                    // Re-dispatch the already-redacted request to this single
+                    // target (Req 12.5). Buffer the response for detection.
+                    let attempt_result = state
+                        .router
+                        .route_with_failover(&request, vec![target.clone()])
+                        .await;
+
+                    match attempt_result {
+                        Ok(mut new_response) => {
+                            // Re-run post-call + refusal detection on the new response.
+                            let new_tool_ctx = ToolContext {
+                                tool_use_allowed: request.extra.get("tool_choice").and_then(|v| v.as_str()).map_or(true, |tc| tc != "none"),
+                                tools_provided: request.extra.get("tools").and_then(|v| v.as_array()).map_or(false, |t| !t.is_empty()),
+                                finish_reason_is_tool_call: new_response.choices.first().and_then(|c| c.finish_reason.as_deref()).map_or(false, |r| r == "tool_calls"),
+                                has_tool_calls: new_response.choices.first().map_or(false, |c| {
+                                    c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
+                                }),
+                            };
+                            let (post_outcome, refusal_decision) = engine
+                                .run_post_call(&mut new_response, &selector, &mut guardrail_ctx, &stream_trace_id, &new_tool_ctx)
+                                .await;
+
+                            match post_outcome {
+                                PostCallOutcome::Block(block) => {
+                                    // Block from failover target → terminal SSE event (Req 10.3).
+                                    let payload = guardrail_stream::block_frame_payload(&block.entity_label);
+                                    let duration_ms = start.elapsed().as_millis() as u64;
+                                    let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
+                                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                                    log_request(&state, &request, &log_context);
+                                    yield Ok(Event::default().data(payload.to_string()));
+                                    yield Ok(Event::default().data("[DONE]"));
+                                    _guard.complete();
+                                    return;
+                                }
+                                PostCallOutcome::ServiceFailure => {
+                                    let msg = "guardrail service unavailable".to_string();
+                                    let duration_ms = start.elapsed().as_millis() as u64;
+                                    let err = GatewayError::GuardrailUnavailable(msg.clone());
+                                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                                    log_request(&state, &request, &log_context);
+                                    for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
+                                        yield Ok(event);
+                                    }
+                                    _guard.complete();
+                                    return;
+                                }
+                                PostCallOutcome::Replaced => {
+                                    last_response = new_response;
+                                    skip_reinjection = true;
+                                    break;
+                                }
+                                PostCallOutcome::Proceed => {
+                                    if !refusal_decision.is_refusal() {
+                                        // First non-refusal: use it (Req 12.5).
+                                        last_response = new_response;
+                                        break;
+                                    }
+                                    // Still a refusal — record and continue loop.
+                                    last_response = new_response;
+                                }
+                            }
+                        }
+                        Err(_e) => {
+                            tracing::debug!(
+                                provider = %target.provider,
+                                "Streaming refusal failover: provider error, trying next"
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                // PII re-injection runs exactly once on the finally selected
+                // response (Req 9.5, 12.5), unless replaced (Req 9.4).
+                if !skip_reinjection {
+                    engine.reinject_response(&mut last_response, &guardrail_ctx);
+                }
+
+                // Re-chunk the final response into SSE events (Req 10.4).
+                let chunks = if emit_early {
+                    guardrail_stream::rechunk_after_early_event(&last_response, &response_id, created)
+                } else {
+                    guardrail_stream::rechunk_full(&last_response)
+                };
+                if crate::router::router::Router::should_cache_response(&last_response) {
+                    if let Ok(json) = serde_json::to_string(&last_response) {
+                        state.exact_cache.set(&request, json);
+                    }
+                }
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &last_response);
+                log_request(&state, &request, &log_context);
+                for chunk in chunks {
+                    yield Ok(Event::default().data(chunk.to_string()));
+                }
+                yield Ok(Event::default().data("[DONE]"));
+            }
+            // Block → terminal policy-violation event + [DONE] (Req 10.3).
+            (PostCallOutcome::Block(block), _) => {
+                let payload = guardrail_stream::block_frame_payload(&block.entity_label);
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
+                let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                log_request(&state, &request, &log_context);
+                yield Ok(Event::default().data(payload.to_string()));
+                yield Ok(Event::default().data("[DONE]"));
+            }
+            // fail_close provider error/timeout → 503-style SSE termination (Req 9.7).
+            (PostCallOutcome::ServiceFailure, _) => {
+                let msg = "guardrail service unavailable".to_string();
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let err = GatewayError::GuardrailUnavailable(msg.clone());
+                let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                log_request(&state, &request, &log_context);
+                for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
+                    yield Ok(event);
+                }
+            }
+        }
+
+        _guard.complete();
+    };
+
+    let mut sse = Sse::new(stream)
+        .keep_alive(build_keepalive(&streaming_config))
+        .into_response();
+    attach_trace_id_header(&mut sse, &trace_id);
+    sse
 }
 
 /// Build the SSE keep-alive policy from streaming config (Req 2.1-2.5).
@@ -1439,7 +2208,7 @@ fn relay_passthrough_stream(
     }
 }
 
-fn streaming_chunks_from_response(response: &OpenAIResponse) -> Vec<serde_json::Value> {
+pub(crate) fn streaming_chunks_from_response(response: &OpenAIResponse) -> Vec<serde_json::Value> {
     build_streaming_chunks(response, None)
 }
 
@@ -1447,7 +2216,7 @@ fn streaming_chunks_from_response(response: &OpenAIResponse) -> Vec<serde_json::
 /// been emitted (Req 1.5). It suppresses the duplicate role delta and reuses
 /// the early event's pre-generated `id`/`created` for every subsequent chunk so
 /// the whole stream shares a single id (task 2.2).
-fn streaming_chunks_after_early_event(
+pub(crate) fn streaming_chunks_after_early_event(
     response: &OpenAIResponse,
     id: &str,
     created: i64,
@@ -2342,12 +3111,14 @@ mod tests {
 pub async fn completions(
     State(state): State<AppState>,
     headers: HeaderMap,
+    authenticated_key: Option<Extension<AuthenticatedKey>>,
     Json(request): Json<OpenAIRequest>,
 ) -> Response {
     // Reuse chat completions routing; the OpenAI completions format is close enough
     // for provider pass-through. Full translation can be refined later.
     let trace_id = trace_id_from_headers(&headers);
-    chat_completions_non_stream(state, request, trace_id).await
+    let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
+    chat_completions_non_stream(state, request, trace_id, virtual_key_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2831,6 +3602,10 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
             ));
         }
     }
+
+    // Req 11.5: guardrail counter/histogram metrics with the
+    // `obey_api_guardrail_` prefix.
+    state.metrics.write_guardrail_prometheus(&mut out);
 
     (
         StatusCode::OK,

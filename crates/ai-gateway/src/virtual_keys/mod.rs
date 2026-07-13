@@ -37,11 +37,18 @@ use models::{
 };
 
 pub use access::AccessError;
+#[allow(unused_imports)]
 pub use auth::AuthError;
 pub use budget::BudgetError;
-pub use errors::{FieldError, KeyError, ValidationErrors};
-pub use rate_limiter::{PerKeyRateLimiter, RateLimitError, RetryAfterSeconds};
-pub use store::{KeyStore, KeyStoreError, KeyUpdates, StoredVirtualKey};
+#[allow(unused_imports)]
+pub use errors::FieldError;
+pub use errors::{KeyError, ValidationErrors};
+pub use rate_limiter::{PerKeyRateLimiter, RateLimitError};
+#[allow(unused_imports)]
+pub use rate_limiter::RetryAfterSeconds;
+pub use store::{KeyStore, KeyStoreError, StoredVirtualKey};
+#[allow(unused_imports)]
+pub use store::KeyUpdates;
 pub use usage::{compute_cost, UsageTracker};
 
 // --- Key generation / validation constants -----------------------------------
@@ -179,6 +186,7 @@ impl VirtualKeyManager {
     ///
     /// Exposed so callers holding the plaintext key (e.g. revoke/delete paths)
     /// can derive the cache key to pass to [`Self::invalidate_cache`].
+    #[allow(dead_code)]
     pub fn hash_key(raw_key: &str) -> String {
         sha256_hex(raw_key)
     }

@@ -78,6 +78,7 @@ fn test_config() -> Config {
         codex_instructions_url: None,
         streaming: None,
         virtual_keys: Default::default(),
+        guardrails: None,
     }
 }
 
@@ -268,7 +269,7 @@ async fn test_chat_completions_preserves_trace_id_header() {
         .body(Body::from(serde_json::to_string(&body_json).unwrap()))
         .unwrap();
 
-    let resp = build_app(test_config()).await.oneshot(req).await.unwrap();
+    let resp = app.oneshot(req).await.unwrap();
     let header = resp.headers().get("x-trace-id").unwrap().to_str().unwrap();
     assert_eq!(header, "trace-abc-123");
 }
@@ -391,6 +392,67 @@ async fn test_prometheus_metrics_when_enabled() {
     assert!(text.contains("# HELP"), "Expected Prometheus HELP lines");
     assert!(text.contains("# TYPE"), "Expected Prometheus TYPE lines");
     assert!(text.contains("obey_api_requests_total"), "Expected request counter metric");
+}
+
+/// Task 12.4 (Req 11.5): guardrail counter and histogram metrics are exposed on
+/// the Prometheus endpoint with the `obey_api_guardrail_` prefix. We record a
+/// guardrail stage on the server's shared `Metrics` (as the engine does at
+/// runtime), then GET the endpoint through the real router via `oneshot()` and
+/// assert the prefixed metric families render.
+#[tokio::test]
+async fn test_prometheus_exposes_guardrail_metrics_with_prefix() {
+    let mut cfg = test_config();
+    cfg.prometheus = Some(PrometheusConfig {
+        enabled: true,
+        path: "/metrics".to_string(),
+    });
+
+    // Build the server directly (not via `build_app`) so we can record a
+    // guardrail stage on the same `Metrics` instance the endpoint reads.
+    let server = GatewayServer::new(cfg, None).await.unwrap();
+    server
+        .state
+        .metrics
+        .record_guardrail_stage("pii_pipeline", "pii_scan", "regex", "redact", 12.5);
+
+    let app = server.build_router();
+    let req = Request::get("/metrics").body(Body::empty()).unwrap();
+    let (status, body) = send(app, req).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let text = std::str::from_utf8(&body).unwrap();
+
+    // Counter family with the guardrail prefix (Req 11.1, 11.5).
+    assert!(
+        text.contains("# TYPE obey_api_guardrail_stage_executions_total counter"),
+        "expected guardrail counter TYPE line with obey_api_guardrail_ prefix"
+    );
+    assert!(
+        text.contains(
+            "obey_api_guardrail_stage_executions_total{pipeline=\"pii_pipeline\",stage=\"pii_scan\",provider=\"regex\",action=\"redact\"} 1"
+        ),
+        "expected the recorded guardrail counter sample with the obey_api_guardrail_ prefix"
+    );
+
+    // Histogram family with the guardrail prefix (Req 11.2, 11.5).
+    assert!(
+        text.contains("# TYPE obey_api_guardrail_stage_latency_ms histogram"),
+        "expected guardrail latency histogram TYPE line with obey_api_guardrail_ prefix"
+    );
+    assert!(
+        text.contains(
+            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pii_pipeline\",stage=\"pii_scan\",provider=\"regex\"} 1"
+        ),
+        "expected the recorded guardrail latency count with the obey_api_guardrail_ prefix"
+    );
+
+    // Every guardrail metric line must carry the required prefix (Req 11.5).
+    for line in text.lines().filter(|l| l.contains("guardrail")) {
+        assert!(
+            line.contains("obey_api_guardrail_"),
+            "guardrail metric line missing obey_api_guardrail_ prefix: {line}"
+        );
+    }
 }
 
 #[tokio::test]

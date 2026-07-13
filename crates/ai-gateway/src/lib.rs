@@ -6,6 +6,7 @@ pub mod context;
 pub mod dashboard;
 pub mod error;
 pub mod gateway;
+pub mod guardrail;
 pub mod logger;
 pub mod metrics;
 pub mod models;

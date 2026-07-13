@@ -18,6 +18,7 @@ use crate::admin;
 use crate::cache::{ExactCache, SemanticCache};
 use crate::config::Config;
 use crate::error::GatewayError;
+use crate::guardrail::GuardrailEngine;
 use crate::logger::RequestLogger;
 use crate::metrics::Metrics;
 use crate::oauth::{OAuthManager, OAuthTokenStore};
@@ -44,6 +45,16 @@ pub struct AppState {
     /// Always present; enforcement is gated by `config.virtual_keys.enforcement`
     /// (default `disabled`), so an unconfigured deployment is unaffected.
     pub virtual_key_manager: Arc<VirtualKeyManager>,
+    /// Guardrail engine snapshot (Req 1.8, 8.5).
+    ///
+    /// `None` (inner) when no `guardrails` section is configured. Wrapped in an
+    /// `Arc<RwLock<..>>` so hot-reload can swap in a freshly built engine while
+    /// in-flight requests keep the `Arc<GuardrailEngine>` they cloned at request
+    /// start — mirroring how `config: Arc<RwLock<Config>>` is snapshotted.
+    /// Handlers (tasks 13.2/13.3) take a snapshot with
+    /// `state.guardrail_engine.read().await.clone()` and run the whole request
+    /// against that clone.
+    pub guardrail_engine: Arc<RwLock<Option<Arc<GuardrailEngine>>>>,
 }
 
 /// Core HTTP server wrapping Axum with middleware and integrated components.
@@ -154,6 +165,28 @@ impl GatewayServer {
             Arc::new(manager)
         };
 
+        // --- Guardrail engine construction (Req 1.8, 8.5) ---
+        // Built only when a `guardrails` section is present. Provider
+        // instantiation (registry) and pipeline compilation happen here; a
+        // build error (e.g. an invalid regex that slipped past validation)
+        // fails startup, consistent with other component construction.
+        let guardrail_engine = match &config.guardrails {
+            Some(guardrails) => {
+                let http_client = reqwest::Client::new();
+                let engine = crate::guardrail::build_engine(
+                    guardrails,
+                    &http_client,
+                    cache.as_deref(),
+                    Some(metrics.clone()),
+                )
+                .map_err(|e| {
+                    GatewayError::Configuration(format!("Failed to build guardrail engine: {e}"))
+                })?;
+                Some(Arc::new(engine))
+            }
+            None => None,
+        };
+
         let state = AppState {
             config: config_arc,
             config_path: Arc::new(config_path.unwrap_or_else(|| std::path::PathBuf::from("./config.yaml"))),
@@ -167,6 +200,7 @@ impl GatewayServer {
             oauth_usage_tracker,
             codex_models_discovery: Arc::new(crate::codex::models_discovery::ModelsDiscovery::new()),
             virtual_key_manager,
+            guardrail_engine: Arc::new(RwLock::new(guardrail_engine)),
         };
 
         Ok(Self { state })
@@ -393,6 +427,10 @@ impl GatewayServer {
 
     /// Start listening on the configured address.
     /// Returns a future that resolves when the server shuts down.
+    ///
+    /// Only the non-tray `main` startup path calls this; under the `tray`
+    /// feature the tray manager owns the server lifecycle instead.
+    #[cfg_attr(feature = "tray", allow(dead_code))]
     pub async fn start(self) -> Result<(), GatewayError> {
         self.start_with_shutdown(shutdown_signal()).await
     }
@@ -534,9 +572,50 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     state.router.clear_rate_limiters();
     state.router.clear_http_clients();
     state.router.clear_model_capabilities();
+
+    // --- Rebuild the guardrail engine snapshot (Req 1.8) ---
+    // A freshly built `Arc<GuardrailEngine>` is swapped in; in-flight requests
+    // keep the `Arc` they already cloned and finish on the old definitions,
+    // while requests starting after the swap see the new one. The outer
+    // `Option` distinguishes "swap to this value" from "keep the previous
+    // engine": on a build failure we log and retain the existing engine rather
+    // than tearing down enforcement.
+    let rebuilt: Option<Option<Arc<GuardrailEngine>>> = {
+        let cfg = state.config.read().await;
+        match &cfg.guardrails {
+            Some(guardrails) => {
+                let http_client = reqwest::Client::new();
+                match crate::guardrail::build_engine(
+                    guardrails,
+                    &http_client,
+                    state.cache.as_deref(),
+                    Some(state.metrics.clone()),
+                ) {
+                    Ok(engine) => Some(Some(Arc::new(engine))),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "Failed to rebuild guardrail engine on hot-reload; keeping previous engine"
+                        );
+                        None
+                    }
+                }
+            }
+            // No guardrails configured after reload: clear any previous engine.
+            None => Some(None),
+        }
+    };
+
+    if let Some(new_engine) = rebuilt {
+        *state.guardrail_engine.write().await = new_engine;
+    }
 }
 
 /// Wait for SIGTERM / SIGINT (Req 18.1-18.5).
+///
+/// Consumed only by [`GatewayServer::start`] on the non-tray startup path; the
+/// tray feature drives shutdown through the tray manager instead.
+#[cfg_attr(feature = "tray", allow(dead_code))]
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -636,6 +715,7 @@ mod tests {
             codex_instructions_url: None,
             streaming: None,
             virtual_keys: Default::default(),
+            guardrails: None,
         }
     }
 
@@ -889,6 +969,7 @@ mod tests {
                     codex_instructions_url: None,
                     streaming: None,
                     virtual_keys: Default::default(),
+                    guardrails: None,
                 };
 
                 let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -1367,7 +1448,6 @@ mod tests {
             rt.block_on(async {
                 // 1. Create initial config and write to temp file
                 let initial_cfg = minimal_config();
-                let initial_port = initial_cfg.server.port;
                 let initial_provider_name = initial_cfg.providers[0].name.clone();
 
                 let tmp_dir = tempfile::tempdir().unwrap();
@@ -1460,6 +1540,7 @@ mod tests {
                     codex_instructions_url: None,
                     streaming: None,
                     virtual_keys: Default::default(),
+                    guardrails: None,
                 };
 
                 // Write new config to disk

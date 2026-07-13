@@ -40,6 +40,71 @@ pub struct Metrics {
     /// Cache statistics
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    /// Guardrail stage execution counter, keyed by
+    /// (pipeline, stage, provider_type, action). `action` is one of
+    /// `pass`, `block`, `redact`, `mask`, `replace_with_policy_message`, `error`
+    /// (Req 11.1).
+    guardrail_stage_executions: Arc<DashMap<GuardrailStageCounterKey, AtomicU64>>,
+    /// Guardrail stage latency histogram, keyed by
+    /// (pipeline, stage, provider_type), with fixed bucket boundaries
+    /// (Req 11.2).
+    guardrail_stage_latency: Arc<DashMap<GuardrailLatencyKey, GuardrailLatencyHistogram>>,
+    /// Refusal detection counter, keyed by (pipeline, signal) where
+    /// signal ∈ {phrase, tool_omission} (Req 12.11).
+    guardrail_refusal_detected: Arc<DashMap<(String, String), AtomicU64>>,
+    /// Refusal failover outcome counter, keyed by (pipeline, outcome) where
+    /// outcome ∈ {recovered, exhausted} (Req 12.11).
+    guardrail_refusal_failover: Arc<DashMap<(String, String), AtomicU64>>,
+}
+
+/// Label set for the guardrail stage execution counter (Req 11.1).
+type GuardrailStageCounterKey = (String, String, String, String);
+
+/// Label set for the guardrail stage latency histogram (Req 11.2).
+type GuardrailLatencyKey = (String, String, String);
+
+/// Upper bucket boundaries (inclusive, milliseconds) for the guardrail stage
+/// latency histogram (Req 11.2). Observations greater than the last boundary
+/// fall only into the implicit `+Inf` bucket.
+const GUARDRAIL_LATENCY_BUCKETS_MS: [f64; 10] =
+    [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0];
+
+/// Per-label-set latency histogram. Bucket counts are stored non-cumulatively
+/// and rendered cumulatively in Prometheus exposition. The latency sum is kept
+/// in microseconds to preserve sub-millisecond precision without float atomics.
+#[derive(Debug)]
+struct GuardrailLatencyHistogram {
+    /// Non-cumulative per-bucket observation counts, aligned with
+    /// `GUARDRAIL_LATENCY_BUCKETS_MS`.
+    buckets: [AtomicU64; 10],
+    /// Total observation count (equals the `+Inf` bucket in exposition).
+    count: AtomicU64,
+    /// Sum of observed latencies in microseconds.
+    sum_micros: AtomicU64,
+}
+
+impl GuardrailLatencyHistogram {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            count: AtomicU64::new(0),
+            sum_micros: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a single latency observation in milliseconds.
+    fn observe(&self, latency_ms: f64) {
+        let clamped = latency_ms.max(0.0);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_micros
+            .fetch_add((clamped * 1000.0).round() as u64, Ordering::Relaxed);
+        if let Some(idx) = GUARDRAIL_LATENCY_BUCKETS_MS
+            .iter()
+            .position(|&boundary| clamped <= boundary)
+        {
+            self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Per-provider health tracking
@@ -188,6 +253,10 @@ impl Metrics {
             rate_limit_exhaustions_by_provider: Arc::new(DashMap::new()),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            guardrail_stage_executions: Arc::new(DashMap::new()),
+            guardrail_stage_latency: Arc::new(DashMap::new()),
+            guardrail_refusal_detected: Arc::new(DashMap::new()),
+            guardrail_refusal_failover: Arc::new(DashMap::new()),
         }
     }
 
@@ -439,6 +508,189 @@ impl Metrics {
             .entry(provider.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a single guardrail stage execution: bumps the execution counter
+    /// for `(pipeline, stage, provider_type, action)` and observes `latency_ms`
+    /// in the latency histogram for `(pipeline, stage, provider_type)`
+    /// (Req 11.1, 11.2).
+    ///
+    /// `action` must be one of `pass`, `block`, `redact`, `mask`,
+    /// `replace_with_policy_message`, or `error`. Recording is best-effort and
+    /// never fails the calling request (Req 11.7).
+    pub fn record_guardrail_stage(
+        &self,
+        pipeline: &str,
+        stage: &str,
+        provider_type: &str,
+        action: &str,
+        latency_ms: f64,
+    ) {
+        let counter_key = (
+            pipeline.to_string(),
+            stage.to_string(),
+            provider_type.to_string(),
+            action.to_string(),
+        );
+        self.guardrail_stage_executions
+            .entry(counter_key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+
+        let latency_key = (
+            pipeline.to_string(),
+            stage.to_string(),
+            provider_type.to_string(),
+        );
+        self.guardrail_stage_latency
+            .entry(latency_key)
+            .or_insert_with(GuardrailLatencyHistogram::new)
+            .observe(latency_ms);
+    }
+
+    /// Increment the refusal-detected counter for `(pipeline, signal)` where
+    /// `signal` ∈ {phrase, tool_omission} (Req 12.11). Best-effort: never
+    /// fails the request (Req 11.7).
+    pub fn record_guardrail_refusal_detected(&self, pipeline: &str, signal: &str) {
+        let key = (pipeline.to_string(), signal.to_string());
+        self.guardrail_refusal_detected
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the refusal-failover counter for `(pipeline, outcome)` where
+    /// `outcome` ∈ {recovered, exhausted} (Req 12.11). Best-effort: never
+    /// fails the request (Req 11.7).
+    #[allow(dead_code)] // public API; called from GuardrailEngine::record_refusal_failover
+    pub fn record_guardrail_refusal_failover(&self, pipeline: &str, outcome: &str) {
+        let key = (pipeline.to_string(), outcome.to_string());
+        self.guardrail_refusal_failover
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Append guardrail counter and histogram metrics to `out` in Prometheus
+    /// text exposition format, using the `obey_api_guardrail_` name prefix
+    /// (Req 11.5). Emits nothing when no guardrail stages have executed.
+    ///
+    /// Called by the `prometheus_metrics` endpoint handler so guardrail metrics
+    /// are exposed alongside the existing gateway metrics.
+    pub fn write_guardrail_prometheus(&self, out: &mut String) {
+        // Counter: obey_api_guardrail_stage_executions_total (Req 11.1)
+        if !self.guardrail_stage_executions.is_empty() {
+            // Sort for deterministic exposition ordering.
+            let mut rows: Vec<(GuardrailStageCounterKey, u64)> = self
+                .guardrail_stage_executions
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+            out.push_str(
+                "# HELP obey_api_guardrail_stage_executions_total \
+Total guardrail stage executions by pipeline, stage, provider, and action\n",
+            );
+            out.push_str("# TYPE obey_api_guardrail_stage_executions_total counter\n");
+            for ((pipeline, stage, provider, action), value) in &rows {
+                out.push_str(&format!(
+                    "obey_api_guardrail_stage_executions_total{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\",action=\"{}\"}} {}\n",
+                    pipeline, stage, provider, action, value
+                ));
+            }
+        }
+
+        // Histogram: obey_api_guardrail_stage_latency_ms (Req 11.2)
+        if !self.guardrail_stage_latency.is_empty() {
+            let mut keys: Vec<GuardrailLatencyKey> = self
+                .guardrail_stage_latency
+                .iter()
+                .map(|e| e.key().clone())
+                .collect();
+            keys.sort();
+
+            out.push_str(
+                "# HELP obey_api_guardrail_stage_latency_ms \
+Guardrail stage latency in milliseconds by pipeline, stage, and provider\n",
+            );
+            out.push_str("# TYPE obey_api_guardrail_stage_latency_ms histogram\n");
+            for key in &keys {
+                let entry = match self.guardrail_stage_latency.get(key) {
+                    Some(entry) => entry,
+                    None => continue,
+                };
+                let hist = entry.value();
+                let (pipeline, stage, provider) = key;
+
+                let mut cumulative = 0u64;
+                for (idx, boundary) in GUARDRAIL_LATENCY_BUCKETS_MS.iter().enumerate() {
+                    cumulative += hist.buckets[idx].load(Ordering::Relaxed);
+                    out.push_str(&format!(
+                        "obey_api_guardrail_stage_latency_ms_bucket{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\",le=\"{}\"}} {}\n",
+                        pipeline, stage, provider, boundary, cumulative
+                    ));
+                }
+                let total = hist.count.load(Ordering::Relaxed);
+                out.push_str(&format!(
+                    "obey_api_guardrail_stage_latency_ms_bucket{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\",le=\"+Inf\"}} {}\n",
+                    pipeline, stage, provider, total
+                ));
+                let sum_ms = hist.sum_micros.load(Ordering::Relaxed) as f64 / 1000.0;
+                out.push_str(&format!(
+                    "obey_api_guardrail_stage_latency_ms_sum{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\"}} {}\n",
+                    pipeline, stage, provider, sum_ms
+                ));
+                out.push_str(&format!(
+                    "obey_api_guardrail_stage_latency_ms_count{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\"}} {}\n",
+                    pipeline, stage, provider, total
+                ));
+            }
+        }
+
+        // Counter: obey_api_guardrail_refusal_detected_total (Req 12.11)
+        if !self.guardrail_refusal_detected.is_empty() {
+            let mut rows: Vec<((String, String), u64)> = self
+                .guardrail_refusal_detected
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+            out.push_str(
+                "# HELP obey_api_guardrail_refusal_detected_total \
+Total refusal detections by pipeline and signal\n",
+            );
+            out.push_str("# TYPE obey_api_guardrail_refusal_detected_total counter\n");
+            for ((pipeline, signal), value) in &rows {
+                out.push_str(&format!(
+                    "obey_api_guardrail_refusal_detected_total{{pipeline=\"{}\",signal=\"{}\"}} {}\n",
+                    pipeline, signal, value
+                ));
+            }
+        }
+
+        // Counter: obey_api_guardrail_refusal_failover_total (Req 12.11)
+        if !self.guardrail_refusal_failover.is_empty() {
+            let mut rows: Vec<((String, String), u64)> = self
+                .guardrail_refusal_failover
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+            out.push_str(
+                "# HELP obey_api_guardrail_refusal_failover_total \
+Total refusal failover outcomes by pipeline and outcome\n",
+            );
+            out.push_str("# TYPE obey_api_guardrail_refusal_failover_total counter\n");
+            for ((pipeline, outcome), value) in &rows {
+                out.push_str(&format!(
+                    "obey_api_guardrail_refusal_failover_total{{pipeline=\"{}\",outcome=\"{}\"}} {}\n",
+                    pipeline, outcome, value
+                ));
+            }
+        }
     }
 
     /// Record cache hit
@@ -775,6 +1027,89 @@ mod tests {
         assert_eq!(snapshot.cache_hit_rate, Some(2.0 / 3.0));
     }
 
+    #[test]
+    fn test_guardrail_stage_counter_exposition() {
+        let metrics = Metrics::new();
+
+        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "redact", 12.0);
+        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "redact", 8.0);
+        metrics.record_guardrail_stage("standard", "secret-block", "regex", "block", 3.0);
+
+        let mut out = String::new();
+        metrics.write_guardrail_prometheus(&mut out);
+
+        // Counter type + prefixed name (Req 11.1, 11.5)
+        assert!(out.contains("# TYPE obey_api_guardrail_stage_executions_total counter"));
+        // Two executions of the redact stage, one of the block stage.
+        assert!(out.contains(
+            "obey_api_guardrail_stage_executions_total{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",action=\"redact\"} 2"
+        ));
+        assert!(out.contains(
+            "obey_api_guardrail_stage_executions_total{pipeline=\"standard\",stage=\"secret-block\",provider=\"regex\",action=\"block\"} 1"
+        ));
+    }
+
+    #[test]
+    fn test_guardrail_stage_latency_histogram_exposition() {
+        let metrics = Metrics::new();
+
+        // One observation at 8ms (falls in le="10"), one at 300ms (le="500").
+        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "pass", 8.0);
+        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "pass", 300.0);
+
+        let mut out = String::new();
+        metrics.write_guardrail_prometheus(&mut out);
+
+        assert!(out.contains("# TYPE obey_api_guardrail_stage_latency_ms histogram"));
+        // Design bucket boundaries are present.
+        assert!(out.contains(
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",le=\"5\"} 0"
+        ));
+        // Cumulative: 8ms counted at le="10".
+        assert!(out.contains(
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",le=\"10\"} 1"
+        ));
+        // Cumulative: both observations counted by le="500".
+        assert!(out.contains(
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",le=\"500\"} 2"
+        ));
+        assert!(out.contains(
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",le=\"+Inf\"} 2"
+        ));
+        assert!(out.contains(
+            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\"} 2"
+        ));
+        // Sum = 8 + 300 = 308 ms.
+        assert!(out.contains(
+            "obey_api_guardrail_stage_latency_ms_sum{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\"} 308"
+        ));
+    }
+
+    #[test]
+    fn test_guardrail_prometheus_empty_when_no_stages() {
+        let metrics = Metrics::new();
+        let mut out = String::new();
+        metrics.write_guardrail_prometheus(&mut out);
+        assert!(out.is_empty(), "no guardrail stages should emit no metrics");
+    }
+
+    #[test]
+    fn test_guardrail_latency_over_max_bucket_only_in_inf() {
+        let metrics = Metrics::new();
+        // 6000ms exceeds the last boundary (5000) → only in +Inf/count.
+        metrics.record_guardrail_stage("p", "s", "regex", "error", 6000.0);
+
+        let mut out = String::new();
+        metrics.write_guardrail_prometheus(&mut out);
+
+        assert!(out.contains(
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"p\",stage=\"s\",provider=\"regex\",le=\"5000\"} 0"
+        ));
+        assert!(out.contains(
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"p\",stage=\"s\",provider=\"regex\",le=\"+Inf\"} 1"
+        ));
+    }
+
     // Property 33: Cost Calculation
     // **Validates: Requirements 30.1, 30.2**
     use proptest::prelude::*;
@@ -882,5 +1217,55 @@ mod tests {
                 success_rate, health.success_rate
             );
         }
+    }
+
+    #[test]
+    fn test_guardrail_refusal_detected_counter_exposition() {
+        let metrics = Metrics::new();
+
+        metrics.record_guardrail_refusal_detected("safety-pipeline", "phrase");
+        metrics.record_guardrail_refusal_detected("safety-pipeline", "phrase");
+        metrics.record_guardrail_refusal_detected("safety-pipeline", "tool_omission");
+
+        let mut out = String::new();
+        metrics.write_guardrail_prometheus(&mut out);
+
+        assert!(out.contains("# TYPE obey_api_guardrail_refusal_detected_total counter"));
+        assert!(out.contains(
+            "obey_api_guardrail_refusal_detected_total{pipeline=\"safety-pipeline\",signal=\"phrase\"} 2"
+        ));
+        assert!(out.contains(
+            "obey_api_guardrail_refusal_detected_total{pipeline=\"safety-pipeline\",signal=\"tool_omission\"} 1"
+        ));
+    }
+
+    #[test]
+    fn test_guardrail_refusal_failover_counter_exposition() {
+        let metrics = Metrics::new();
+
+        metrics.record_guardrail_refusal_failover("safety-pipeline", "recovered");
+        metrics.record_guardrail_refusal_failover("safety-pipeline", "exhausted");
+        metrics.record_guardrail_refusal_failover("safety-pipeline", "recovered");
+
+        let mut out = String::new();
+        metrics.write_guardrail_prometheus(&mut out);
+
+        assert!(out.contains("# TYPE obey_api_guardrail_refusal_failover_total counter"));
+        assert!(out.contains(
+            "obey_api_guardrail_refusal_failover_total{pipeline=\"safety-pipeline\",outcome=\"exhausted\"} 1"
+        ));
+        assert!(out.contains(
+            "obey_api_guardrail_refusal_failover_total{pipeline=\"safety-pipeline\",outcome=\"recovered\"} 2"
+        ));
+    }
+
+    #[test]
+    fn test_guardrail_refusal_prometheus_empty_when_no_refusals() {
+        let metrics = Metrics::new();
+        let mut out = String::new();
+        metrics.write_guardrail_prometheus(&mut out);
+        // No refusal counters should appear.
+        assert!(!out.contains("refusal_detected"));
+        assert!(!out.contains("refusal_failover"));
     }
 }

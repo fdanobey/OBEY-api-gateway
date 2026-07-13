@@ -207,7 +207,7 @@ fn truncate_sliding_window(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::openai::{Message, OpenAIRequest};
+    use crate::models::openai::Message;
 
     fn create_test_message(role: &str, content: &str) -> Message {
         Message {

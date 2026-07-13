@@ -46,6 +46,7 @@ fn test_config() -> Config {
             codex_base_url_override: None,
             codex_model_override: None,
             instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
         }],
         model_groups: vec![ModelGroup {
             name: "default".to_string(),
@@ -70,6 +71,7 @@ fn test_config() -> Config {
         codex_instructions_url: None,
         streaming: None,
         virtual_keys: Default::default(),
+        guardrails: None,
     }
 }
 

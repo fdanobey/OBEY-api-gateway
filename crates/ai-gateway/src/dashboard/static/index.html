@@ -287,7 +287,20 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
   }
   function fmtCost(v){ return '$'+Number(v||0).toFixed(4); }
   function fmtPct(v){ return (Number(v||0)*100).toFixed(1)+'%'; }
-  function fmtMs(v){ return Number(v||0).toFixed(1)+' ms'; }
+  function fmtMs(v){
+    var milliseconds = Math.max(0, Number(v)||0);
+    if(milliseconds>=60000){
+      var rounded = Math.round(milliseconds);
+      var minutes = Math.floor(rounded/60000);
+      var seconds = Math.floor((rounded%60000)/1000);
+      var remainder = rounded%1000;
+      return String(minutes).padStart(2,'0')+':'+String(seconds).padStart(2,'0')+':'+String(remainder).padStart(3,'0');
+    }
+    if(milliseconds>=1000){
+      return Number((milliseconds/1000).toFixed(2))+' s';
+    }
+    return milliseconds.toFixed(1)+' ms';
+  }
 
   // --- Chart Setup (Req 16.15) ---
   var chartColors = {line:'rgba(59,130,246,.8)',fill:'rgba(59,130,246,.1)',grid:'rgba(71,85,105,.3)',tick:'#94a3b8'};

@@ -2,6 +2,7 @@ use super::*;
 use std::path::{Path, PathBuf};
 use std::env;
 
+use crate::guardrail::GuardrailConfig;
 use crate::secrets;
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../config.example.yaml");
@@ -45,6 +46,60 @@ pub enum ValidationError {
 
     #[error("Codex field '{field}' is only valid on oauth+openai providers (provider: '{provider}')")]
     InvalidCodexField { provider: String, field: String },
+
+    // --- Guardrail pipeline validation (Req 1.1, 1.2, 1.9, 1.10, 6.3, 6.6, 7.6, 5.1) ---
+
+    #[error("Guardrail pipeline name must be non-empty")]
+    GuardrailEmptyPipelineName,
+
+    #[error("Duplicate guardrail pipeline name: '{0}'")]
+    GuardrailDuplicatePipeline(String),
+
+    #[error("Guardrail pipeline '{0}' must contain at least one stage")]
+    GuardrailEmptyPipeline(String),
+
+    #[error("Duplicate guardrail provider name: '{0}'")]
+    GuardrailDuplicateProvider(String),
+
+    #[error("Guardrail pipeline '{pipeline}' stage {stage_index} references undeclared provider '{provider}'")]
+    GuardrailUndeclaredProvider {
+        pipeline: String,
+        stage_index: usize,
+        provider: String,
+    },
+
+    #[error("Guardrail binding target '{target}' references undefined pipeline '{pipeline}'")]
+    GuardrailUndefinedBindingPipeline { target: String, pipeline: String },
+
+    #[error("Guardrail global_default_pipeline references undefined pipeline '{0}'")]
+    GuardrailUndefinedGlobalDefault(String),
+
+    #[error("Guardrail provider '{provider}' (presidio) requires at least one entity type")]
+    GuardrailPresidioNoEntities { provider: String },
+
+    #[error("Guardrail provider '{provider}' field '{field}' must be within {min}..={max}, got: {value}")]
+    GuardrailThresholdOutOfRange {
+        provider: String,
+        field: String,
+        value: f32,
+        min: f32,
+        max: f32,
+    },
+
+    #[error("Guardrail provider '{provider}' (regex) declares {count} patterns, exceeding the maximum of {max}")]
+    GuardrailTooManyPatterns {
+        provider: String,
+        count: usize,
+        max: usize,
+    },
+
+    #[error("Guardrail pipeline '{pipeline_name}' refusal_phrase_list entry {index} is invalid: {reason} (pattern: '{pattern}')")]
+    GuardrailInvalidRefusalPhrase {
+        pipeline_name: String,
+        index: usize,
+        pattern: String,
+        reason: String,
+    },
 }
 
 pub type ValidationResult<T> = Result<T, Vec<ValidationError>>;
@@ -326,10 +381,180 @@ impl Config {
             }
         }
         
+        // Validate guardrail pipelines (Req 1.1, 1.2, 1.9, 1.10, 6.3, 6.6, 7.6, 8.7).
+        // Runs only when the opt-in `guardrails` section is present; an absent
+        // section disables all guardrail processing and skips validation.
+        if let Some(ref guardrails) = self.guardrails {
+            self.validate_guardrails(guardrails, &mut errors);
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    /// Validate the opt-in guardrail configuration section.
+    ///
+    /// Collects every violation into `errors` (matching the accumulate-then-
+    /// report pattern used throughout [`Config::validate`]) so a single load
+    /// surfaces all problems at once.
+    fn validate_guardrails(
+        &self,
+        guardrails: &GuardrailConfig,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        use crate::guardrail::GuardrailProviderType;
+        use std::collections::HashSet;
+
+        /// Maximum regex patterns per regex provider (Req 5.1).
+        const MAX_REGEX_PATTERNS: usize = 256;
+
+        // Collect declared provider names and detect duplicates. Provider-type
+        // specific settings are validated in the same pass.
+        let mut provider_names: HashSet<&str> = HashSet::new();
+        for provider in &guardrails.providers {
+            if !provider_names.insert(provider.name.as_str()) {
+                errors.push(ValidationError::GuardrailDuplicateProvider(
+                    provider.name.clone(),
+                ));
+            }
+
+            // Presidio: entity list must be non-empty (Req 6.3).
+            if provider.provider_type == GuardrailProviderType::Presidio
+                && provider.settings.entities.is_empty()
+            {
+                errors.push(ValidationError::GuardrailPresidioNoEntities {
+                    provider: provider.name.clone(),
+                });
+            }
+
+            // Threshold ranges must be within 0.0..=1.0:
+            //   - presidio confidence_threshold (Req 6.6)
+            //   - semantic allow/deny thresholds (Req 7.6)
+            let thresholds = [
+                ("confidence_threshold", provider.settings.confidence_threshold),
+                ("allow_threshold", provider.settings.allow_threshold),
+                ("deny_threshold", provider.settings.deny_threshold),
+            ];
+            for (field, value) in thresholds {
+                if let Some(v) = value {
+                    if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                        errors.push(ValidationError::GuardrailThresholdOutOfRange {
+                            provider: provider.name.clone(),
+                            field: field.to_string(),
+                            value: v,
+                            min: 0.0,
+                            max: 1.0,
+                        });
+                    }
+                }
+            }
+
+            // Regex provider: pattern count cap (Req 5.1).
+            if provider.provider_type == GuardrailProviderType::Regex
+                && provider.settings.patterns.len() > MAX_REGEX_PATTERNS
+            {
+                errors.push(ValidationError::GuardrailTooManyPatterns {
+                    provider: provider.name.clone(),
+                    count: provider.settings.patterns.len(),
+                    max: MAX_REGEX_PATTERNS,
+                });
+            }
+
+            // Req 8.7: each provider must declare a failure_policy. The field is
+            // a required, non-Option `FailurePolicy`, so its presence (and
+            // validity) is structurally guaranteed at deserialization time;
+            // no additional runtime check is required here.
+        }
+
+        // Collect defined pipeline names, enforcing uniqueness, non-empty names,
+        // and at least one stage per pipeline (Req 1.1). Stage provider
+        // references are validated against the declared provider set (Req 1.2,
+        // 1.9). `PolicyAction` and `StagePhase` are enums, so invalid action or
+        // phase values are rejected at deserialization; validity is structurally
+        // guaranteed here.
+        let mut pipeline_names: HashSet<&str> = HashSet::new();
+        for pipeline in &guardrails.pipelines {
+            if pipeline.name.trim().is_empty() {
+                errors.push(ValidationError::GuardrailEmptyPipelineName);
+            }
+            if !pipeline_names.insert(pipeline.name.as_str()) {
+                errors.push(ValidationError::GuardrailDuplicatePipeline(
+                    pipeline.name.clone(),
+                ));
+            }
+
+            if pipeline.stages.is_empty() {
+                errors.push(ValidationError::GuardrailEmptyPipeline(
+                    pipeline.name.clone(),
+                ));
+            }
+
+            for (stage_index, stage) in pipeline.stages.iter().enumerate() {
+                if !provider_names.contains(stage.provider.as_str()) {
+                    errors.push(ValidationError::GuardrailUndeclaredProvider {
+                        pipeline: pipeline.name.clone(),
+                        stage_index,
+                        provider: stage.provider.clone(),
+                    });
+                }
+            }
+
+            // Req 12.2, 12.13: validate refusal_phrase_list override entries.
+            // Each entry must be non-empty and compilable as a case-insensitive regex.
+            if let Some(ref phrases) = pipeline.refusal_phrase_list {
+                for (index, pattern) in phrases.iter().enumerate() {
+                    if pattern.is_empty() {
+                        errors.push(ValidationError::GuardrailInvalidRefusalPhrase {
+                            pipeline_name: pipeline.name.clone(),
+                            index,
+                            pattern: pattern.clone(),
+                            reason: "empty refusal phrase".to_string(),
+                        });
+                    } else if let Err(e) =
+                        regex::RegexBuilder::new(pattern)
+                            .case_insensitive(true)
+                            .build()
+                    {
+                        errors.push(ValidationError::GuardrailInvalidRefusalPhrase {
+                            pipeline_name: pipeline.name.clone(),
+                            index,
+                            pattern: pattern.clone(),
+                            reason: e.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // global_default_pipeline, if set, must reference a defined pipeline.
+        if let Some(ref default_name) = guardrails.global_default_pipeline {
+            if !pipeline_names.contains(default_name.as_str()) {
+                errors.push(ValidationError::GuardrailUndefinedGlobalDefault(
+                    default_name.clone(),
+                ));
+            }
+        }
+
+        // Every binding (virtual_keys / model_groups / routes) must reference a
+        // defined pipeline; undefined → error identifying binding target and
+        // pipeline name (Req 1.10).
+        let binding_groups: [(&str, &std::collections::HashMap<String, String>); 3] = [
+            ("virtual_keys", &guardrails.bindings.virtual_keys),
+            ("model_groups", &guardrails.bindings.model_groups),
+            ("routes", &guardrails.bindings.routes),
+        ];
+        for (kind, map) in binding_groups {
+            for (target, pipeline_name) in map {
+                if !pipeline_names.contains(pipeline_name.as_str()) {
+                    errors.push(ValidationError::GuardrailUndefinedBindingPipeline {
+                        target: format!("{kind}.{target}"),
+                        pipeline: pipeline_name.clone(),
+                    });
+                }
+            }
         }
     }
 }
@@ -506,6 +731,7 @@ mod property_tests {
             codex_instructions_url: None,
             streaming: None,
             virtual_keys: Default::default(),
+            guardrails: None,
         }
     }
 
@@ -1069,6 +1295,810 @@ model_groups:
             prop_assert_eq!(provider.codex_base_url_override, None);
             prop_assert_eq!(provider.codex_model_override, None);
             prop_assert_eq!(provider.instructions_override, None);
+        }
+    }
+
+    // Feature: guardrail-pipelines, Task 3.1: guardrail configuration validation
+    // **Validates: Requirements 1.1, 1.2, 1.9, 1.10, 6.3, 6.6, 7.6, 8.7**
+
+    use crate::guardrail::{
+        FailurePolicy, GuardrailBindings, GuardrailConfig, GuardrailProviderConfig,
+        GuardrailProviderType, InstructionInsertionMode, PipelineConfig, PolicyAction,
+        ProviderSettings, RegexPatternConfig, RegexRuleMode, StageConfig, StagePhase,
+    };
+
+    fn regex_provider(name: &str) -> GuardrailProviderConfig {
+        GuardrailProviderConfig {
+            name: name.to_string(),
+            provider_type: GuardrailProviderType::Regex,
+            failure_policy: FailurePolicy::FailClose,
+            timeout_seconds: 5,
+            settings: ProviderSettings {
+                patterns: vec![RegexPatternConfig {
+                    name: "key".to_string(),
+                    regex: "sk-[A-Za-z0-9]+".to_string(),
+                    entity: "API_KEY".to_string(),
+                    mode: RegexRuleMode::Deny,
+                }],
+                ..Default::default()
+            },
+        }
+    }
+
+    fn stage(name: &str, provider: &str) -> StageConfig {
+        StageConfig {
+            name: name.to_string(),
+            provider: provider.to_string(),
+            phase: StagePhase::PreCall,
+            action: PolicyAction::Block,
+        }
+    }
+
+    /// A minimal guardrail config: one regex provider, one single-stage pipeline.
+    fn minimal_guardrails() -> GuardrailConfig {
+        GuardrailConfig {
+            providers: vec![regex_provider("scanner")],
+            pipelines: vec![PipelineConfig {
+                name: "standard".to_string(),
+                stages: vec![stage("block-keys", "scanner")],
+                redaction_notice_instruction: None,
+                instruction_insertion_mode: InstructionInsertionMode::default(),
+                failover_on_refusal: false,
+                refusal_phrase_list: None,
+            }],
+            global_default_pipeline: None,
+            bindings: GuardrailBindings::default(),
+        }
+    }
+
+    fn config_with_guardrails(guardrails: GuardrailConfig) -> Config {
+        let mut config = minimal_valid_config();
+        config.guardrails = Some(guardrails);
+        config
+    }
+
+    #[test]
+    fn test_guardrail_valid_config_accepted() {
+        let config = config_with_guardrails(minimal_guardrails());
+        let result = config.validate();
+        assert!(result.is_ok(), "Valid guardrail config should be accepted: {:?}", result);
+    }
+
+    #[test]
+    fn test_guardrail_none_section_accepted() {
+        // Absent guardrails section disables validation entirely.
+        let config = minimal_valid_config();
+        assert!(config.guardrails.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_guardrail_empty_pipeline_rejected() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.pipelines[0].stages.clear();
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::GuardrailEmptyPipeline(name) if name == "standard"
+            )),
+            "Should reject a pipeline with no stages: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guardrail_duplicate_pipeline_rejected() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.pipelines.push(PipelineConfig {
+            name: "standard".to_string(),
+            stages: vec![stage("dup", "scanner")],
+            redaction_notice_instruction: None,
+            instruction_insertion_mode: InstructionInsertionMode::default(),
+            failover_on_refusal: false,
+            refusal_phrase_list: None,
+        });
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::GuardrailDuplicatePipeline(name) if name == "standard"
+            )),
+            "Should reject duplicate pipeline names: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guardrail_undeclared_provider_rejected_with_context() {
+        let mut guardrails = minimal_guardrails();
+        // Stage index 1 references an undeclared provider.
+        guardrails.pipelines[0]
+            .stages
+            .push(stage("second", "missing-provider"));
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::GuardrailUndeclaredProvider { pipeline, stage_index, provider }
+                    if pipeline == "standard" && *stage_index == 1 && provider == "missing-provider"
+            )),
+            "Should identify pipeline, stage index, and provider name: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guardrail_undefined_binding_pipeline_rejected() {
+        let mut guardrails = minimal_guardrails();
+        guardrails
+            .bindings
+            .model_groups
+            .insert("gpt-4o-group".to_string(), "nonexistent".to_string());
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::GuardrailUndefinedBindingPipeline { target, pipeline }
+                    if target == "model_groups.gpt-4o-group" && pipeline == "nonexistent"
+            )),
+            "Should identify binding target and undefined pipeline: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guardrail_binding_to_defined_pipeline_accepted() {
+        let mut guardrails = minimal_guardrails();
+        guardrails
+            .bindings
+            .routes
+            .insert("/v1/chat/completions".to_string(), "standard".to_string());
+        let config = config_with_guardrails(guardrails);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_guardrail_undefined_global_default_rejected() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.global_default_pipeline = Some("ghost".to_string());
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::GuardrailUndefinedGlobalDefault(name) if name == "ghost"
+            )),
+            "Should reject global_default_pipeline referencing an undefined pipeline: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guardrail_defined_global_default_accepted() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.global_default_pipeline = Some("standard".to_string());
+        let config = config_with_guardrails(guardrails);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_guardrail_presidio_empty_entities_rejected() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.providers.push(GuardrailProviderConfig {
+            name: "pii".to_string(),
+            provider_type: GuardrailProviderType::Presidio,
+            failure_policy: FailurePolicy::FailOpen,
+            timeout_seconds: 5,
+            settings: ProviderSettings {
+                endpoint: Some("http://presidio:3000/analyze".to_string()),
+                entities: vec![], // empty → rejected (Req 6.3)
+                ..Default::default()
+            },
+        });
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::GuardrailPresidioNoEntities { provider } if provider == "pii"
+            )),
+            "Should reject presidio provider with empty entity list: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guardrail_confidence_threshold_out_of_range_rejected() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.providers.push(GuardrailProviderConfig {
+            name: "pii".to_string(),
+            provider_type: GuardrailProviderType::Presidio,
+            failure_policy: FailurePolicy::FailOpen,
+            timeout_seconds: 5,
+            settings: ProviderSettings {
+                endpoint: Some("http://presidio:3000/analyze".to_string()),
+                entities: vec!["EMAIL_ADDRESS".to_string()],
+                confidence_threshold: Some(1.5), // out of range (Req 6.6)
+                ..Default::default()
+            },
+        });
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::GuardrailThresholdOutOfRange { provider, field, .. }
+                    if provider == "pii" && field == "confidence_threshold"
+            )),
+            "Should reject confidence_threshold outside 0.0..=1.0: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guardrail_semantic_thresholds_out_of_range_rejected() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.providers.push(GuardrailProviderConfig {
+            name: "semantic".to_string(),
+            provider_type: GuardrailProviderType::Semantic,
+            failure_policy: FailurePolicy::FailOpen,
+            timeout_seconds: 5,
+            settings: ProviderSettings {
+                allow_threshold: Some(-0.1), // out of range (Req 7.6)
+                deny_threshold: Some(2.0),   // out of range (Req 7.6)
+                ..Default::default()
+            },
+        });
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        let out_of_range: Vec<&str> = errors
+            .iter()
+            .filter_map(|e| match e {
+                ValidationError::GuardrailThresholdOutOfRange { field, .. } => Some(field.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            out_of_range.contains(&"allow_threshold") && out_of_range.contains(&"deny_threshold"),
+            "Should reject both semantic thresholds outside 0.0..=1.0: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guardrail_threshold_at_bounds_accepted() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.providers.push(GuardrailProviderConfig {
+            name: "semantic".to_string(),
+            provider_type: GuardrailProviderType::Semantic,
+            failure_policy: FailurePolicy::FailOpen,
+            timeout_seconds: 5,
+            settings: ProviderSettings {
+                allow_threshold: Some(0.0),
+                deny_threshold: Some(1.0),
+                ..Default::default()
+            },
+        });
+        let config = config_with_guardrails(guardrails);
+        assert!(config.validate().is_ok(), "Thresholds at 0.0 and 1.0 bounds should be accepted");
+    }
+
+    #[test]
+    fn test_guardrail_regex_pattern_cap_rejected() {
+        let mut guardrails = minimal_guardrails();
+        let patterns: Vec<RegexPatternConfig> = (0..257)
+            .map(|i| RegexPatternConfig {
+                name: format!("p{i}"),
+                regex: "a".to_string(),
+                entity: "X".to_string(),
+                mode: RegexRuleMode::Deny,
+            })
+            .collect();
+        guardrails.providers[0].settings.patterns = patterns;
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::GuardrailTooManyPatterns { provider, count, max }
+                    if provider == "scanner" && *count == 257 && *max == 256
+            )),
+            "Should reject regex provider exceeding 256 patterns: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guardrail_duplicate_provider_rejected() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.providers.push(regex_provider("scanner"));
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::GuardrailDuplicateProvider(name) if name == "scanner"
+            )),
+            "Should reject duplicate provider names: {:?}",
+            errors
+        );
+    }
+
+    // Feature: guardrail-pipelines, Task 16.3: Refusal_Phrase_List override validation
+    // **Validates: Requirements 12.2, 12.13**
+
+    #[test]
+    fn test_guardrail_refusal_phrase_list_empty_entry_rejected() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.pipelines[0].refusal_phrase_list = Some(vec![
+            "i can't help".to_string(),
+            "".to_string(), // empty → rejected (Req 12.13)
+        ]);
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::GuardrailInvalidRefusalPhrase { pipeline_name, index, reason, .. }
+                    if pipeline_name == "standard" && *index == 1 && reason == "empty refusal phrase"
+            )),
+            "Should reject empty refusal phrase entry: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guardrail_refusal_phrase_list_invalid_regex_rejected() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.pipelines[0].refusal_phrase_list = Some(vec![
+            "i can'?t (help|assist)".to_string(), // valid
+            "(unclosed".to_string(),               // invalid regex → rejected (Req 12.13)
+        ]);
+        let config = config_with_guardrails(guardrails);
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::GuardrailInvalidRefusalPhrase { pipeline_name, index, pattern, .. }
+                    if pipeline_name == "standard" && *index == 1 && pattern == "(unclosed"
+            )),
+            "Should reject uncompilable regex refusal phrase entry: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_guardrail_refusal_phrase_list_valid_entries_accepted() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.pipelines[0].refusal_phrase_list = Some(vec![
+            "i can'?t (help|assist) with".to_string(),
+            "i'?m (sorry|unable)".to_string(),
+            "as an ai".to_string(),
+        ]);
+        let config = config_with_guardrails(guardrails);
+        assert!(
+            config.validate().is_ok(),
+            "Valid refusal phrase list should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_guardrail_refusal_phrase_list_none_accepted() {
+        // When refusal_phrase_list is None, default list is used — no validation needed.
+        let guardrails = minimal_guardrails();
+        assert!(guardrails.pipelines[0].refusal_phrase_list.is_none());
+        let config = config_with_guardrails(guardrails);
+        assert!(config.validate().is_ok());
+    }
+
+    // ---------------------------------------------------------------------
+    // Feature: guardrail-pipelines, Task 3.2 — Property 3: Pipeline
+    // configuration validation.
+    // **Validates: Requirements 1.1, 1.2, 1.9, 1.10**
+    //
+    // For any generated guardrail configuration, validation succeeds *if and
+    // only if* every pipeline name is unique, every pipeline has at least one
+    // stage, every stage references a declared provider, and every binding
+    // references a defined pipeline; otherwise it fails with an error that
+    // identifies the offending pipeline name / stage index / provider name /
+    // binding target.
+    //
+    // Generators are deliberately constrained so the ONLY possible validation
+    // failures are the four Property-3 conditions: the three declared providers
+    // are always unique and valid; pipeline names are always non-empty; there
+    // is no global default; and no thresholds / entities / pattern caps are
+    // exercised. This lets the test independently recompute expected validity
+    // and match it exactly (both directions of the iff). `PolicyAction` and
+    // `StagePhase` are enums, so an invalid action/phase is unrepresentable and
+    // rejected at deserialization — validity is structurally guaranteed and not
+    // separately generated here.
+
+    /// Provider names declared by every generated config.
+    const P3_DECLARED_PROVIDERS: [&str; 3] = ["p0", "p1", "p2"];
+    /// Candidate provider references for stages; the last two are undeclared.
+    const P3_PROVIDER_REFS: [&str; 5] = ["p0", "p1", "p2", "ghostA", "ghostB"];
+    /// Candidate pipeline names (a small pool so duplicates arise naturally).
+    const P3_PIPELINE_NAMES: [&str; 3] = ["pipeA", "pipeB", "pipeC"];
+    /// Candidate binding pipeline references; `undefX` is never a defined name.
+    const P3_BINDING_REFS: [&str; 4] = ["pipeA", "pipeB", "pipeC", "undefX"];
+
+    #[derive(Debug, Clone)]
+    struct P3Stage {
+        provider_ref: String,
+        action: PolicyAction,
+        phase: StagePhase,
+    }
+
+    #[derive(Debug, Clone)]
+    struct P3Pipeline {
+        name: String,
+        stages: Vec<P3Stage>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct P3Binding {
+        kind: usize, // 0 = virtual_keys, 1 = model_groups, 2 = routes
+        target: String,
+        pipeline_ref: String,
+    }
+
+    fn p3_arb_action() -> impl Strategy<Value = PolicyAction> {
+        prop::sample::select(vec![
+            PolicyAction::Allow,
+            PolicyAction::Block,
+            PolicyAction::Mask,
+            PolicyAction::Redact,
+            PolicyAction::ReplaceWithPolicyMessage,
+        ])
+    }
+
+    fn p3_arb_phase() -> impl Strategy<Value = StagePhase> {
+        prop::sample::select(vec![StagePhase::PreCall, StagePhase::PostCall])
+    }
+
+    fn p3_arb_stage() -> impl Strategy<Value = P3Stage> {
+        (0usize..P3_PROVIDER_REFS.len(), p3_arb_action(), p3_arb_phase()).prop_map(
+            |(pidx, action, phase)| P3Stage {
+                provider_ref: P3_PROVIDER_REFS[pidx].to_string(),
+                action,
+                phase,
+            },
+        )
+    }
+
+    fn p3_arb_pipeline() -> impl Strategy<Value = P3Pipeline> {
+        (
+            0usize..P3_PIPELINE_NAMES.len(),
+            prop::collection::vec(p3_arb_stage(), 0..=3),
+        )
+            .prop_map(|(nidx, stages)| P3Pipeline {
+                name: P3_PIPELINE_NAMES[nidx].to_string(),
+                stages,
+            })
+    }
+
+    fn p3_arb_binding() -> impl Strategy<Value = P3Binding> {
+        (0usize..3, 0usize..4, 0usize..P3_BINDING_REFS.len()).prop_map(
+            |(kind, tidx, ridx)| P3Binding {
+                kind,
+                target: format!("t{tidx}"),
+                pipeline_ref: P3_BINDING_REFS[ridx].to_string(),
+            },
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn prop_guardrail_config_validation_iff(
+            gen_pipelines in prop::collection::vec(p3_arb_pipeline(), 1..=4),
+            gen_bindings in prop::collection::vec(p3_arb_binding(), 0..=4),
+        ) {
+            use std::collections::{HashMap, HashSet};
+
+            // --- Build the guardrail config from the generated data. ---
+            let providers: Vec<GuardrailProviderConfig> =
+                P3_DECLARED_PROVIDERS.iter().map(|n| regex_provider(n)).collect();
+
+            let pipeline_configs: Vec<PipelineConfig> = gen_pipelines
+                .iter()
+                .map(|p| PipelineConfig {
+                    name: p.name.clone(),
+                    stages: p
+                        .stages
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| StageConfig {
+                            name: format!("s{i}"),
+                            provider: s.provider_ref.clone(),
+                            phase: s.phase,
+                            action: s.action,
+                        })
+                        .collect(),
+                    redaction_notice_instruction: None,
+                    instruction_insertion_mode: InstructionInsertionMode::default(),
+                    failover_on_refusal: false,
+                    refusal_phrase_list: None,
+                })
+                .collect();
+
+            let mut binding_cfg = GuardrailBindings::default();
+            for b in &gen_bindings {
+                let map = match b.kind {
+                    0 => &mut binding_cfg.virtual_keys,
+                    1 => &mut binding_cfg.model_groups,
+                    _ => &mut binding_cfg.routes,
+                };
+                map.insert(b.target.clone(), b.pipeline_ref.clone());
+            }
+
+            let guardrails = GuardrailConfig {
+                providers,
+                pipelines: pipeline_configs,
+                global_default_pipeline: None,
+                bindings: binding_cfg.clone(),
+            };
+            let config = config_with_guardrails(guardrails);
+
+            // --- Independently recompute expected validity + offending items. ---
+            let declared: HashSet<&str> = P3_DECLARED_PROVIDERS.iter().copied().collect();
+            let defined: HashSet<&str> =
+                gen_pipelines.iter().map(|p| p.name.as_str()).collect();
+
+            // Req 1.1: duplicate pipeline names.
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut dup_names: HashSet<&str> = HashSet::new();
+            for p in &gen_pipelines {
+                if !seen.insert(p.name.as_str()) {
+                    dup_names.insert(p.name.as_str());
+                }
+            }
+
+            // Req 1.1: pipelines must contain at least one stage.
+            let empty_names: HashSet<&str> = gen_pipelines
+                .iter()
+                .filter(|p| p.stages.is_empty())
+                .map(|p| p.name.as_str())
+                .collect();
+
+            // Req 1.2 / 1.9: stages referencing an undeclared provider,
+            // identified by (pipeline name, stage index, provider name).
+            let mut undeclared: Vec<(String, usize, String)> = Vec::new();
+            for p in &gen_pipelines {
+                for (i, s) in p.stages.iter().enumerate() {
+                    if !declared.contains(s.provider_ref.as_str()) {
+                        undeclared.push((p.name.clone(), i, s.provider_ref.clone()));
+                    }
+                }
+            }
+
+            // Req 1.10: bindings referencing an undefined pipeline, identified
+            // by (binding target, pipeline name).
+            let mut undefined_bindings: Vec<(String, String)> = Vec::new();
+            let binding_kinds: [(&str, &HashMap<String, String>); 3] = [
+                ("virtual_keys", &binding_cfg.virtual_keys),
+                ("model_groups", &binding_cfg.model_groups),
+                ("routes", &binding_cfg.routes),
+            ];
+            for (kind, map) in binding_kinds {
+                for (target, pref) in map {
+                    if !defined.contains(pref.as_str()) {
+                        undefined_bindings.push((format!("{kind}.{target}"), pref.clone()));
+                    }
+                }
+            }
+
+            let expected_valid = dup_names.is_empty()
+                && empty_names.is_empty()
+                && undeclared.is_empty()
+                && undefined_bindings.is_empty();
+
+            // --- Property: validation succeeds iff no offending condition. ---
+            let result = config.validate();
+            prop_assert_eq!(
+                result.is_ok(),
+                expected_valid,
+                "validate().is_ok() must equal expected_valid; errors: {:?}",
+                result.as_ref().err()
+            );
+
+            // --- When invalid, each offending item is identified with context. ---
+            if let Err(errors) = result {
+                for name in &dup_names {
+                    prop_assert!(
+                        errors.iter().any(|e| matches!(
+                            e,
+                            ValidationError::GuardrailDuplicatePipeline(n) if n == name
+                        )),
+                        "missing GuardrailDuplicatePipeline for {:?} in {:?}",
+                        name, errors
+                    );
+                }
+                for name in &empty_names {
+                    prop_assert!(
+                        errors.iter().any(|e| matches!(
+                            e,
+                            ValidationError::GuardrailEmptyPipeline(n) if n == name
+                        )),
+                        "missing GuardrailEmptyPipeline for {:?} in {:?}",
+                        name, errors
+                    );
+                }
+                for (pname, sidx, prov) in &undeclared {
+                    prop_assert!(
+                        errors.iter().any(|e| matches!(
+                            e,
+                            ValidationError::GuardrailUndeclaredProvider { pipeline, stage_index, provider }
+                                if pipeline == pname && stage_index == sidx && provider == prov
+                        )),
+                        "missing GuardrailUndeclaredProvider for ({:?}, {}, {:?}) in {:?}",
+                        pname, sidx, prov, errors
+                    );
+                }
+                for (target, pref) in &undefined_bindings {
+                    prop_assert!(
+                        errors.iter().any(|e| matches!(
+                            e,
+                            ValidationError::GuardrailUndefinedBindingPipeline { target: t, pipeline }
+                                if t == target && pipeline == pref
+                        )),
+                        "missing GuardrailUndefinedBindingPipeline for ({:?}, {:?}) in {:?}",
+                        target, pref, errors
+                    );
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Feature: guardrail-pipelines, Task 16.6 — Property 34: Refusal
+    // phrase-list validation rejects malformed entries.
+    // **Validates: Requirements 12.13**
+    //
+    // For any generated refusal_phrase_list, validation rejects the config iff
+    // the list contains an empty entry OR an uncompilable regex entry, and
+    // identifies the offending entry via GuardrailInvalidRefusalPhrase. A valid,
+    // non-empty list of compilable regex/phrase entries passes validation.
+
+    /// Generate a string that is a valid regex when compiled case-insensitively.
+    /// Uses a fixed pool of known-valid patterns to avoid slow filtering.
+    fn arb_valid_regex_phrase() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "i can'?t (help|assist) with".to_string(),
+            "i'?m (sorry|unable)".to_string(),
+            "as an ai".to_string(),
+            "i must decline".to_string(),
+            "i cannot comply".to_string(),
+            "not able to".to_string(),
+            "refuse to".to_string(),
+            "will not help".to_string(),
+            "against my (policy|guidelines)".to_string(),
+            "harmful content".to_string(),
+        ])
+    }
+
+    /// Generate a string that is NOT compilable as a regex.
+    fn arb_invalid_regex() -> impl Strategy<Value = String> {
+        // Unbalanced parens/brackets produce regex compile errors.
+        prop::sample::select(vec![
+            "[invalid".to_string(),
+            "(unclosed".to_string(),
+            "(?P<bad".to_string(),
+            "[z-a]".to_string(),
+            "***".to_string(),
+            "+start".to_string(),
+            "(?:".to_string(),
+        ])
+    }
+
+    /// The three categories an entry can fall into.
+    #[derive(Debug, Clone)]
+    enum PhraseEntry {
+        Valid(String),
+        Empty,
+        InvalidRegex(String),
+    }
+
+    fn arb_phrase_entry() -> impl Strategy<Value = PhraseEntry> {
+        prop_oneof![
+            3 => arb_valid_regex_phrase().prop_map(PhraseEntry::Valid),
+            1 => Just(PhraseEntry::Empty),
+            1 => arb_invalid_regex().prop_map(PhraseEntry::InvalidRegex),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_refusal_phrase_list_validation_rejects_malformed(
+            entries in prop::collection::vec(arb_phrase_entry(), 1..=8),
+        ) {
+            // Build refusal_phrase_list from generated entries.
+            let phrase_list: Vec<String> = entries
+                .iter()
+                .map(|e| match e {
+                    PhraseEntry::Valid(s) => s.clone(),
+                    PhraseEntry::Empty => String::new(),
+                    PhraseEntry::InvalidRegex(s) => s.clone(),
+                })
+                .collect();
+
+            let mut guardrails = minimal_guardrails();
+            guardrails.pipelines[0].refusal_phrase_list = Some(phrase_list.clone());
+            let config = config_with_guardrails(guardrails);
+
+            // Independently compute which entries are malformed.
+            let malformed_indices: Vec<(usize, &str)> = entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| match e {
+                    PhraseEntry::Empty => Some((i, "empty")),
+                    PhraseEntry::InvalidRegex(_) => Some((i, "regex_error")),
+                    PhraseEntry::Valid(_) => None,
+                })
+                .collect();
+
+            let expected_valid = malformed_indices.is_empty();
+            let result = config.validate();
+
+            // Property: validation passes iff no malformed entry exists.
+            prop_assert_eq!(
+                result.is_ok(),
+                expected_valid,
+                "validate().is_ok() = {} but expected_valid = {}; phrase_list: {:?}",
+                result.is_ok(),
+                expected_valid,
+                phrase_list
+            );
+
+            // When invalid, each malformed entry triggers GuardrailInvalidRefusalPhrase.
+            if let Err(ref errors) = result {
+                for (idx, kind) in &malformed_indices {
+                    let found = errors.iter().any(|e| match e {
+                        ValidationError::GuardrailInvalidRefusalPhrase {
+                            pipeline_name,
+                            index,
+                            pattern,
+                            reason,
+                        } => {
+                            pipeline_name == "standard"
+                                && *index == *idx
+                                && pattern == &phrase_list[*idx]
+                                && match *kind {
+                                    "empty" => reason.contains("empty"),
+                                    _ => !reason.is_empty(), // regex error has non-empty reason
+                                }
+                        }
+                        _ => false,
+                    });
+                    prop_assert!(
+                        found,
+                        "missing GuardrailInvalidRefusalPhrase for index {} ({:?}) in {:?}",
+                        idx,
+                        kind,
+                        errors
+                    );
+                }
+            }
         }
     }
 }

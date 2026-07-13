@@ -272,6 +272,7 @@ mod tests {
             codex_instructions_url: None,
             streaming: None,
             virtual_keys: Default::default(),
+            guardrails: None,
         }
     }
 

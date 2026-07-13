@@ -129,6 +129,7 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
             enforcement,
             database_path: db_path,
         },
+        guardrails: None,
     }
 }
 

@@ -47,6 +47,22 @@ pub enum GatewayError {
 
     #[error("Network error: {0}")]
     Network(String),
+
+    /// A guardrail `block` action fired (pre- or post-call). Maps to HTTP 403.
+    /// Carries only the triggering entity/category label, never raw content
+    /// (Req 2.2, 3.1).
+    #[error("Request blocked by guardrail policy: {category}")]
+    GuardrailPolicyViolation { category: String },
+
+    /// A guardrail stage declared an action invalid for its phase. Maps to
+    /// HTTP 400 (Req 2.7).
+    #[error("Invalid guardrail stage action")]
+    GuardrailInvalidAction,
+
+    /// A `fail_close` guardrail provider timed out or errored. Maps to HTTP 503
+    /// (Req 2.9, 9.7).
+    #[error("Guardrail unavailable: {0}")]
+    GuardrailUnavailable(String),
 }
 
 /// Aggregated error containing all provider attempts
@@ -90,6 +106,9 @@ impl GatewayError {
             GatewayError::TtfbTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             GatewayError::TotalTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             GatewayError::CircuitBreakerOpen(_) => StatusCode::SERVICE_UNAVAILABLE,
+            GatewayError::GuardrailPolicyViolation { .. } => StatusCode::FORBIDDEN,
+            GatewayError::GuardrailInvalidAction => StatusCode::BAD_REQUEST,
+            GatewayError::GuardrailUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::Provider { status_code, .. } => {
                 status_code
                     .and_then(|c| StatusCode::from_u16(c).ok())

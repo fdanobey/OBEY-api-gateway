@@ -161,6 +161,7 @@ pub struct UpdateKeyParams {
 
 /// Authenticated key loaded from cache/store, carried through the request
 /// pipeline for enforcement checks.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AuthenticatedKey {
     pub id: String,
@@ -179,6 +180,7 @@ pub struct AuthenticatedKey {
 }
 
 /// Cached key entry stored in the DashMap for fast authentication lookups.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CachedKey {
     pub key: AuthenticatedKey,

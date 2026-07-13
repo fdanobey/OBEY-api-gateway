@@ -16,6 +16,7 @@ mod dashboard;
 mod models;
 mod error;
 mod gateway;
+mod guardrail;
 mod metrics;
 mod oauth;
 mod secrets;
@@ -82,14 +83,17 @@ async fn main() -> anyhow::Result<()> {
     
     tracing::info!("Configuration loaded successfully");
 
+    // Each configuration compiles exactly one of the following blocks as the
+    // function's tail expression, so there is no unreachable trailing
+    // expression under the `tray` feature.
     #[cfg(feature = "tray")]
     {
-        return run_tray_mode(config, config_path).await;
+        run_tray_mode(config, config_path).await
     }
 
     #[cfg(not(feature = "tray"))]
     {
-    // Create and start the gateway server
+        // Create and start the gateway server
         tracing::info!("Server will listen on {}:{}", config.server.host, config.server.port);
         let server = gateway::GatewayServer::new(config, Some(config_path)).await
             .map_err(|e| {
@@ -102,9 +106,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!("Gateway server error: {}", e);
             anyhow::anyhow!("{}", e)
         })?;
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 #[cfg(feature = "tray")]

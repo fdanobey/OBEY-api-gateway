@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use crate::guardrail::GuardrailConfig;
 use crate::secrets;
 
 pub mod validation;
@@ -80,6 +81,11 @@ pub struct Config {
     /// disabled). See [`VirtualKeysConfig`].
     #[serde(default)]
     pub virtual_keys: VirtualKeysConfig,
+    /// Guardrail pipelines (opt-in pre-call/post-call policy enforcement).
+    /// Absent section disables all guardrail processing. See
+    /// [`crate::guardrail::GuardrailConfig`].
+    #[serde(default)]
+    pub guardrails: Option<GuardrailConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

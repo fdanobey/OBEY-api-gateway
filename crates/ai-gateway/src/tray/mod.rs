@@ -1,8 +1,16 @@
+// The tray feature is still being wired up: several helper methods and fields
+// are defined ahead of their call sites. Allow dead_code across the tray
+// submodules so an in-progress `--features tray` build stays warning-clean.
+#[allow(dead_code)]
 mod icon;
+#[allow(dead_code)]
 mod manager;
+#[allow(dead_code)]
 mod menu;
+#[allow(dead_code)]
 mod notification;
 mod single_instance;
+#[allow(dead_code)]
 mod splash;
 
 use std::fs;
@@ -13,7 +21,7 @@ use crate::config::Config;
 
 pub use icon::TrayIconHandle;
 pub use manager::TrayManager;
-pub use menu::{TrayMenu, TrayMenuAction, TrayMenuItem};
+pub use menu::{TrayMenu, TrayMenuAction};
 pub use notification::NotificationManager;
 pub use single_instance::{InstanceError, SingleInstanceGuard};
 pub use splash::SplashScreen;
@@ -183,6 +191,7 @@ pub enum TrayError {
     Configuration(String),
     #[error("tray notification error: {0}")]
     Notification(String),
+    #[allow(dead_code)] // reserved error variant; not yet constructed
     #[error("splash screen error: {0}")]
     Splash(String),
     #[error("single instance error: {0}")]
@@ -243,6 +252,7 @@ mod tests {
                 codex_base_url_override: None,
                 codex_model_override: None,
                 instructions_override: None,
+                max_rate_limit_cooldown_seconds: None,
             }],
             model_groups: vec![ModelGroup {
                 name: "default".to_string(),
@@ -267,6 +277,7 @@ mod tests {
             codex_instructions_url: None,
             streaming: None,
             virtual_keys: Default::default(),
+            guardrails: None,
         }
     }
 
