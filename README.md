@@ -20,6 +20,10 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/fdanobey/OBEY-api-gateway/wiki">📖 Documentation Wiki</a>
+</p>
+
+<p align="center">
   <a href="https://railway.com/deploy?template=https%3A%2F%2Fgithub.com%2Ffdanobey%2FOBEY-api-gateway"><img src="https://railway.com/button.svg" alt="Deploy on Railway" /></a>
 </p>
 
