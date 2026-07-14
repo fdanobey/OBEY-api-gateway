@@ -1188,7 +1188,9 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       // so we don't clobber a manually typed model name.
       if (mdlSel.tagName !== 'SELECT') { return; }
       // Preserve whatever is currently selected/typed so the refresh is non-destructive.
-      var current = mdlSel.value || '';
+      // Use the data-model attribute as authoritative source — it survives async fetch
+      // states where mdlSel.value may be empty (e.g. "Loading…" placeholder).
+      var current = mdlSel.value || row.dataset.model || '';
       fetchModelsForProvider(provSel.value, mdlSel, current);
     });
   }
@@ -1864,6 +1866,11 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         opts += '<option value="'+m+'"'+(m===currentModel?' selected':'')+'>'+label+'</option>';
       });
       selectEl.innerHTML = opts;
+      // Sync the authoritative data-model attribute on the parent row so
+      // refreshModelGroupModels always has a reliable fallback even if a
+      // subsequent fetch briefly sets the select to "Loading…".
+      var row = selectEl.closest('.form-row');
+      if (row && currentModel) { row.dataset.model = currentModel; }
     }
 
     if (!baseUrl) {
@@ -1998,6 +2005,9 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       opts += '<option value="'+m+'"'+(m===currentModel?' selected':'')+'>'+label+'</option>';
     });
     selectEl.innerHTML = opts;
+    // Sync data-model on parent row for race-condition resilience
+    var row = selectEl.closest('.form-row');
+    if (row && currentModel) { row.dataset.model = currentModel; }
   }
 
   function addModelRow(container, data) {
@@ -2006,6 +2016,9 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     if (data) {
       row.querySelector('.mdl-cost-in').value = data.cost_per_million_input_tokens || 0;
       row.querySelector('.mdl-cost-out').value = data.cost_per_million_output_tokens || 0;
+      // Persist the intended model value so it survives async fetch race conditions
+      // (e.g. tab-switch triggering refreshModelGroupModels while a fetch is in-flight).
+      if (data.model) { row.dataset.model = data.model; }
     }
     row.querySelector('.remove-model').addEventListener('click', function() { row.remove(); updatePriorityBadges(container); });
     initDragAndDrop(row, container);
@@ -2015,6 +2028,10 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     if (provSel) {
       var names = getProviderNames();
       provSel.innerHTML = '<option value="">-- select --</option>' + names.map(function(n){return '<option value="'+n+'"'+(data&&n===data.provider?' selected':'')+'>'+n+'</option>';}).join('');
+      // Keep data-model in sync when the user manually picks a different model
+      mdlSel.addEventListener('change', function() {
+        if (this.value) { row.dataset.model = this.value; }
+      });
       // When provider changes, fetch its models
       provSel.addEventListener('change', function() {
         var prov = this.value;
