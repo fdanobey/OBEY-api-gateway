@@ -1007,6 +1007,9 @@ impl Router {
                 instructions,
                 http,
                 self.metrics.clone(),
+                self.oauth_usage_tracker
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(crate::oauth::UsageTracker::new())),
                 provider_cfg.codex_base_url_override.clone(),
                 provider_cfg.codex_model_override.clone(),
                 provider_cfg.instructions_override.clone(),

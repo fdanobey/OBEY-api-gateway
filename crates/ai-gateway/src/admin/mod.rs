@@ -862,6 +862,7 @@ async fn test_connection(
         instructions,
         http,
         state.metrics.clone(),
+        state.oauth_usage_tracker.clone(),
         provider_cfg.codex_base_url_override.clone(),
         provider_cfg.codex_model_override.clone(),
         provider_cfg.instructions_override.clone(),

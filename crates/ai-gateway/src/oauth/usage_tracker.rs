@@ -1,20 +1,10 @@
 #![allow(dead_code)]
 //! Tracks OpenAI rate-limit usage for OAuth (browser-login) providers.
 //!
-//! OpenAI returns `x-ratelimit-*` headers on every response. For ChatGPT Plus
-//! / Pro browser-login accounts, these manifest as two sliding windows:
-//!   1. A short window (typically 3-5 hours) — the "5h" limit.
-//!   2. A weekly window (7 days) — the "weekly" limit.
-//!
-//! However, OpenAI only sends a single set of headers per response (no `*-5h`
-//! or `*-weekly` suffixes). The router captures these on every response, so the
-//! tracker updates the `short` (5h) window on the first response and the
-//! `weekly` window on responses where the upstream indicates a long cooldown
-//! (Weekly quota exhausted).
-//!
-//! To distinguish the two, the caller passes a `WindowKind` hint so the
-//! tracker knows which window the headers belong to. The admin UI displays both
-//! windows side by side.
+//! API-key OpenAI responses expose count-based `x-ratelimit-*` headers, while
+//! the ChatGPT Codex backend used by browser login exposes percentage-based
+//! `x-codex-{primary,secondary}-*` headers. Both formats are normalized into
+//! the same short/weekly snapshot consumed by the admin provider card.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -98,18 +88,11 @@ impl UsageTracker {
         }
     }
 
-    /// Update tracked usage from response headers.
+    /// Update tracked usage from either OpenAI API or ChatGPT Codex response headers.
     ///
-    /// Parses the standard OpenAI `x-ratelimit-*` headers:
-    /// - `x-ratelimit-limit-requests` / `x-ratelimit-limit-tokens`
-    /// - `x-ratelimit-remaining-requests` / `x-ratelimit-remaining-tokens`
-    /// - `x-ratelimit-reset-requests` / `x-ratelimit-reset-tokens`
-    ///
-    /// OpenAI sends a single set of headers per response. The reset duration
-    /// is used to classify the response into the short (~5h) or weekly (~7d)
-    /// window: if the requests reset duration is >= 24h the headers are applied
-    /// to the weekly window, otherwise to the short window. Both windows
-    /// accumulate independently over time so the admin UI can display both.
+    /// API-key responses use count-based `x-ratelimit-*` headers. The Codex
+    /// backend used by OAuth browser login instead reports percentage-based
+    /// primary (short) and secondary (weekly) windows through `x-codex-*`.
     pub async fn update_from_headers(&self, headers: &reqwest::header::HeaderMap) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -117,46 +100,12 @@ impl UsageTracker {
             .unwrap_or(0);
 
         let mut state = self.state.write().await;
+        let mut updated = update_from_codex_headers(&mut state, headers, now);
+        updated |= update_from_standard_headers(&mut state, headers, now);
 
-        // Parse request-window values
-        let req_limit = header_u64(headers, "x-ratelimit-limit-requests");
-        let req_remaining = header_u64(headers, "x-ratelimit-remaining-requests");
-        let req_reset_secs = header_str(headers, "x-ratelimit-reset-requests")
-            .and_then(|s| parse_reset_duration(s));
-
-        // Parse token-window values
-        let tok_limit = header_u64(headers, "x-ratelimit-limit-tokens");
-        let tok_remaining = header_u64(headers, "x-ratelimit-remaining-tokens");
-        let tok_reset_secs = header_str(headers, "x-ratelimit-reset-tokens")
-            .and_then(|s| parse_reset_duration(s));
-
-        // Classify: use the requests reset duration as the primary signal,
-        // falling back to the tokens reset duration.
-        let classification_secs = req_reset_secs.or(tok_reset_secs).unwrap_or(0);
-        let is_weekly = classification_secs >= WEEKLY_THRESHOLD_SECS;
-        let target = if is_weekly { &mut state.weekly } else { &mut state.short };
-
-        if let Some(v) = req_limit {
-            target.requests.limit = Some(v);
+        if updated {
+            state.updated_at = now;
         }
-        if let Some(v) = req_remaining {
-            target.requests.remaining = Some(v);
-        }
-        if let Some(secs) = req_reset_secs {
-            target.requests.resets_at = Some(now + secs);
-        }
-
-        if let Some(v) = tok_limit {
-            target.tokens.limit = Some(v);
-        }
-        if let Some(v) = tok_remaining {
-            target.tokens.remaining = Some(v);
-        }
-        if let Some(secs) = tok_reset_secs {
-            target.tokens.resets_at = Some(now + secs);
-        }
-
-        state.updated_at = now;
     }
 
     /// Get the current usage snapshot.
@@ -181,6 +130,112 @@ impl UsageTracker {
     }
 }
 
+fn update_from_codex_headers(
+    state: &mut UsageSnapshot,
+    headers: &reqwest::header::HeaderMap,
+    now: u64,
+) -> bool {
+    let short = codex_window(headers, "primary", now);
+    let weekly = codex_window(headers, "secondary", now);
+    let updated = short.is_some() || weekly.is_some();
+
+    if let Some(window) = short {
+        state.short.requests = window;
+    }
+    if let Some(window) = weekly {
+        state.weekly.requests = window;
+    }
+
+    updated
+}
+
+fn codex_window(
+    headers: &reqwest::header::HeaderMap,
+    kind: &str,
+    now: u64,
+) -> Option<RateLimitWindow> {
+    let used_percent = header_f64(headers, &format!("x-codex-{kind}-used-percent"));
+    let reset_at = header_u64(headers, &format!("x-codex-{kind}-reset-at"))
+        .map(normalize_epoch_seconds);
+
+    if used_percent.is_none() && reset_at.is_none() {
+        return None;
+    }
+
+    let limit = used_percent.map(|_| 100);
+    let remaining = used_percent.map(|used| {
+        let clamped = used.clamp(0.0, 100.0);
+        (100.0 - clamped).round() as u64
+    });
+
+    Some(RateLimitWindow {
+        limit,
+        remaining,
+        resets_at: reset_at.filter(|reset| *reset > now),
+    })
+}
+
+fn update_from_standard_headers(
+    state: &mut UsageSnapshot,
+    headers: &reqwest::header::HeaderMap,
+    now: u64,
+) -> bool {
+    let req_limit = header_u64(headers, "x-ratelimit-limit-requests");
+    let req_remaining = header_u64(headers, "x-ratelimit-remaining-requests");
+    let req_reset_secs = header_str(headers, "x-ratelimit-reset-requests")
+        .and_then(parse_reset_duration);
+    let tok_limit = header_u64(headers, "x-ratelimit-limit-tokens");
+    let tok_remaining = header_u64(headers, "x-ratelimit-remaining-tokens");
+    let tok_reset_secs = header_str(headers, "x-ratelimit-reset-tokens")
+        .and_then(parse_reset_duration);
+
+    if req_limit.is_none()
+        && req_remaining.is_none()
+        && req_reset_secs.is_none()
+        && tok_limit.is_none()
+        && tok_remaining.is_none()
+        && tok_reset_secs.is_none()
+    {
+        return false;
+    }
+
+    let classification_secs = req_reset_secs.or(tok_reset_secs).unwrap_or(0);
+    let target = if classification_secs >= WEEKLY_THRESHOLD_SECS {
+        &mut state.weekly
+    } else {
+        &mut state.short
+    };
+
+    if let Some(value) = req_limit {
+        target.requests.limit = Some(value);
+    }
+    if let Some(value) = req_remaining {
+        target.requests.remaining = Some(value);
+    }
+    if let Some(seconds) = req_reset_secs {
+        target.requests.resets_at = Some(now + seconds);
+    }
+    if let Some(value) = tok_limit {
+        target.tokens.limit = Some(value);
+    }
+    if let Some(value) = tok_remaining {
+        target.tokens.remaining = Some(value);
+    }
+    if let Some(seconds) = tok_reset_secs {
+        target.tokens.resets_at = Some(now + seconds);
+    }
+
+    true
+}
+
+fn normalize_epoch_seconds(value: u64) -> u64 {
+    if value > 10_000_000_000 {
+        value / 1_000
+    } else {
+        value
+    }
+}
+
 /// Extract a header value as a string slice.
 fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
@@ -188,6 +243,11 @@ fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option
 
 /// Extract a header value as u64.
 fn header_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+    header_str(headers, name)?.trim().parse().ok()
+}
+
+/// Extract a header value as f64.
+fn header_f64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
     header_str(headers, name)?.trim().parse().ok()
 }
 
@@ -345,6 +405,57 @@ mod tests {
         assert!(snap.weekly.requests.resets_at.is_some());
         // Short window should not have been populated
         assert_eq!(snap.short.requests.limit, None);
+    }
+
+    #[tokio::test]
+    async fn test_codex_windows_from_oauth_headers() {
+        let tracker = UsageTracker::new();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", "37.4".parse().unwrap());
+        headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+        headers.insert("x-codex-primary-reset-at", "2000000000".parse().unwrap());
+        headers.insert("x-codex-secondary-used-percent", "82".parse().unwrap());
+        headers.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
+        headers.insert("x-codex-secondary-reset-at", "2000500000".parse().unwrap());
+
+        tracker.update_from_headers(&headers).await;
+        let snap = tracker.snapshot().await;
+
+        assert_eq!(snap.short.requests.limit, Some(100));
+        assert_eq!(snap.short.requests.remaining, Some(63));
+        assert_eq!(snap.short.requests.resets_at, Some(2_000_000_000));
+        assert_eq!(snap.weekly.requests.limit, Some(100));
+        assert_eq!(snap.weekly.requests.remaining, Some(18));
+        assert_eq!(snap.weekly.requests.resets_at, Some(2_000_500_000));
+        assert!(snap.updated_at > 0);
+    }
+
+    #[tokio::test]
+    async fn test_codex_reset_at_milliseconds_are_normalized() {
+        let tracker = UsageTracker::new();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", "10".parse().unwrap());
+        headers.insert(
+            "x-codex-primary-reset-at",
+            "2000000000000".parse().unwrap(),
+        );
+
+        tracker.update_from_headers(&headers).await;
+        let snap = tracker.snapshot().await;
+
+        assert_eq!(snap.short.requests.resets_at, Some(2_000_000_000));
+    }
+
+    #[tokio::test]
+    async fn test_unrelated_headers_do_not_mark_usage_updated() {
+        let tracker = UsageTracker::new();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+
+        tracker.update_from_headers(&headers).await;
+        let snap = tracker.snapshot().await;
+
+        assert_eq!(snap.updated_at, 0);
     }
 
     #[tokio::test]

@@ -40,8 +40,9 @@ pub struct CodexProviderClient {
     base_url: String,
     instructions_override: Option<String>,
     model_override: Option<String>,
-    #[allow(dead_code)] // stored for future use; not yet read
+    #[allow(dead_code)] // used by the direct streaming path
     metrics: Arc<Metrics>,
+    usage_tracker: Arc<crate::oauth::UsageTracker>,
     /// Operator-configured allowlists (from gateway config).
     xhigh_models_allowlist: Vec<String>,
     reasoning_models_allowlist: Vec<String>,
@@ -58,6 +59,7 @@ impl CodexProviderClient {
         instructions: Arc<InstructionsStore>,
         http: reqwest::Client,
         metrics: Arc<Metrics>,
+        usage_tracker: Arc<crate::oauth::UsageTracker>,
         base_url_override: Option<String>,
         model_override: Option<String>,
         instructions_override: Option<String>,
@@ -74,6 +76,7 @@ impl CodexProviderClient {
             instructions_override,
             model_override,
             metrics,
+            usage_tracker,
             xhigh_models_allowlist,
             reasoning_models_allowlist,
         }
@@ -318,6 +321,7 @@ impl CodexProviderClient {
             })?;
 
         let status = resp.status().as_u16();
+        self.usage_tracker.update_from_headers(resp.headers()).await;
         if status == 401 || status == 403 {
             tracing::warn!(provider = %self.provider_name, status, "Codex upstream auth error");
             return Err(GatewayError::Provider {
@@ -431,6 +435,7 @@ impl CodexProviderClient {
             })?;
 
         let status = resp.status().as_u16();
+        self.usage_tracker.update_from_headers(resp.headers()).await;
         if !resp.status().is_success() {
             return Err(GatewayError::Provider {
                 provider: self.provider_name.clone(),
