@@ -21,9 +21,12 @@ jobs:
     runs-on: windows-latest
     env:
       NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-      STATE_DIR: ${{ runner.temp }}\nim-sync-state
-      SUMMARY_FILE: ${{ runner.temp }}\nim-sync-summary.json
     steps:
+      - name: Set paths
+        shell: pwsh
+        run: |
+          "STATE_DIR=${{ runner.temp }}\nim-sync-state" >> $env:GITHUB_ENV
+          "SUMMARY_FILE=${{ runner.temp }}\nim-sync-summary.json" >> $env:GITHUB_ENV
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

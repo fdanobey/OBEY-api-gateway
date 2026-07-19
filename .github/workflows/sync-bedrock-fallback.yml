@@ -18,10 +18,12 @@ permissions:
 jobs:
   sync:
     runs-on: windows-latest
-    env:
-      STATE_DIR: ${{ runner.temp }}\bedrock-sync-state
-      SUMMARY_FILE: ${{ runner.temp }}\bedrock-sync-summary.json
     steps:
+      - name: Set paths
+        shell: pwsh
+        run: |
+          "STATE_DIR=${{ runner.temp }}\bedrock-sync-state" >> $env:GITHUB_ENV
+          "SUMMARY_FILE=${{ runner.temp }}\bedrock-sync-summary.json" >> $env:GITHUB_ENV
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
