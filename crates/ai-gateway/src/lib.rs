@@ -8,6 +8,7 @@ pub mod error;
 pub mod gateway;
 pub mod guardrail;
 pub mod logger;
+pub mod loop_detection;
 pub mod metrics;
 pub mod models;
 pub mod oauth;

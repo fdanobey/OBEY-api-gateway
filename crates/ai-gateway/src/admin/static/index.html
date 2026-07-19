@@ -240,6 +240,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="caching" id="tab-caching" aria-controls="page-caching">Caching</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="context" id="tab-context" aria-controls="page-context">Context</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="streaming" id="tab-streaming" aria-controls="page-streaming">Streaming</button></li>
+    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="loop-detection" id="tab-loop-detection" aria-controls="page-loop-detection">Loop Detection</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="virtual-keys" id="tab-virtual-keys" aria-controls="page-virtual-keys">Virtual Keys</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="guardrails" id="tab-guardrails" aria-controls="page-guardrails">Guardrails</button></li>
   </ul>
@@ -894,6 +895,47 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     </div>
   </section>
 
+  <section class="page" id="page-loop-detection" role="tabpanel" aria-labelledby="tab-loop-detection">
+    <h2>Loop Detection</h2>
+    <p class="hint">Detect repeating agent behavior and progressively warn, slow, redirect, or stop requests.</p>
+    <div class="form-check"><input type="checkbox" id="loop-enabled"><label for="loop-enabled">Enable loop detection</label></div>
+    <fieldset><legend>Session Tracking</legend><div class="form-row">
+      <div class="form-group"><label for="loop-session-timeout">Session timeout (minutes)</label><input type="number" id="loop-session-timeout" min="1" max="1440"><div class="hint">1–1,440 minutes.</div></div>
+      <div class="form-group"><label for="loop-max-sessions">Maximum sessions</label><input type="number" id="loop-max-sessions" min="100" max="1000000"></div>
+      <div class="form-group"><label for="loop-history-depth">History depth</label><input type="number" id="loop-history-depth" min="2" max="50"></div>
+    </div></fieldset>
+    <fieldset><legend>Confidence Thresholds</legend><div class="form-row">
+      <div class="form-group"><label for="loop-threshold-warn">Warn</label><input type="number" id="loop-threshold-warn" min="0" max="1" step="0.01"></div>
+      <div class="form-group"><label for="loop-threshold-throttle">Throttle</label><input type="number" id="loop-threshold-throttle" min="0" max="1" step="0.01"></div>
+      <div class="form-group"><label for="loop-threshold-inject">Inject</label><input type="number" id="loop-threshold-inject" min="0" max="1" step="0.01"></div>
+      <div class="form-group"><label for="loop-threshold-hardstop">Hard stop</label><input type="number" id="loop-threshold-hardstop" min="0" max="1" step="0.01"></div>
+    </div></fieldset>
+    <fieldset><legend>Consecutive Request Counts</legend><div class="form-row">
+      <div class="form-group"><label for="loop-count-warn">Warn</label><input type="number" id="loop-count-warn" min="1" max="100"></div>
+      <div class="form-group"><label for="loop-count-throttle">Throttle</label><input type="number" id="loop-count-throttle" min="1" max="100"></div>
+      <div class="form-group"><label for="loop-count-inject">Inject</label><input type="number" id="loop-count-inject" min="1" max="100"></div>
+      <div class="form-group"><label for="loop-count-hardstop">Hard stop</label><input type="number" id="loop-count-hardstop" min="1" max="100"></div>
+    </div></fieldset>
+    <fieldset><legend>Signal Weights</legend>
+      <div class="form-row"><div class="form-group"><label for="loop-preset">Preset</label><select id="loop-preset"><option value="">Custom</option><option value="balanced">Balanced</option><option value="tool-heavy">Tool-Heavy</option><option value="cost-sensitive">Cost-Sensitive</option></select></div><div class="form-group"><label>Weight sum</label><output id="loop-weight-sum" aria-live="polite">1.000</output><div class="hint">Must equal 1.000 ±0.001.</div></div></div>
+      <div class="form-row" id="loop-weight-fields">
+        <div class="form-group"><label for="loop-weight-content">Content similarity</label><input class="loop-weight" type="number" id="loop-weight-content" min="0" max="1" step="0.01"></div>
+        <div class="form-group"><label for="loop-weight-tool">Tool repetition</label><input class="loop-weight" type="number" id="loop-weight-tool" min="0" max="1" step="0.01"></div>
+        <div class="form-group"><label for="loop-weight-stagnation">Response stagnation</label><input class="loop-weight" type="number" id="loop-weight-stagnation" min="0" max="1" step="0.01"></div>
+        <div class="form-group"><label for="loop-weight-token">Token velocity</label><input class="loop-weight" type="number" id="loop-weight-token" min="0" max="1" step="0.01"></div>
+        <div class="form-group"><label for="loop-weight-error">Error cycling</label><input class="loop-weight" type="number" id="loop-weight-error" min="0" max="1" step="0.01"></div>
+        <div class="form-group"><label for="loop-weight-context">Context growth</label><input class="loop-weight" type="number" id="loop-weight-context" min="0" max="1" step="0.01"></div>
+        <div class="form-group"><label for="loop-weight-cost">Cost velocity</label><input class="loop-weight" type="number" id="loop-weight-cost" min="0" max="1" step="0.01"></div>
+      </div><div class="error" id="loop-validation-error" role="alert"></div>
+    </fieldset>
+    <fieldset><legend>Enforcement</legend><div class="form-row">
+      <div class="form-group"><label for="loop-throttle-delay">Throttle delay (seconds)</label><input type="number" id="loop-throttle-delay" min="1" max="30"></div>
+      <div class="form-group"><label for="loop-injection-strategy">Injection strategy</label><select id="loop-injection-strategy"><option value="system_prompt_append">Append to system prompt</option><option value="context_aware">Context-aware</option></select></div>
+    </div><div class="form-group"><label for="loop-break-template">Custom break instruction</label><textarea id="loop-break-template" maxlength="2000" rows="5" aria-describedby="loop-template-count"></textarea><div class="hint" id="loop-template-count">0 / 2000 characters. Blank uses the built-in instruction.</div></div></fieldset>
+    <div class="error" id="loop-server-error" role="alert"></div>
+    <div class="actions"><button class="btn btn-primary" type="button" id="loop-save">Save Loop Detection</button><button class="btn btn-secondary" type="button" id="loop-reset-defaults">Reset to Defaults</button></div>
+  </section>
+
   <!-- Virtual Keys (Req 12.1, 12.2, 12.8, 12.9, 12.10) -->
   <section class="page" id="page-virtual-keys" role="tabpanel" aria-labelledby="tab-virtual-keys">
     <h2>Virtual Keys</h2>
@@ -1016,6 +1058,20 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
             <select id="vk-f-models" multiple aria-describedby="vk-f-models-hint"></select>
             <div class="hint" id="vk-f-models-hint">Select allowed model groups. Leave empty to allow all.</div>
           </div>
+          <details id="vk-loop-overrides"><summary>Loop Detection Overrides</summary>
+            <div class="hint">Leave disabled to inherit every global setting. Enable to set or clear key-specific overrides.</div>
+            <div class="form-check"><input type="checkbox" id="vk-f-loop-enabled"><label for="vk-f-loop-enabled">Use per-key loop detection overrides</label></div>
+            <div id="vk-loop-fields" hidden>
+              <fieldset><legend>Thresholds and counts</legend><div class="form-row">
+                <div class="form-group"><label for="vk-loop-thresholds">Thresholds (warn, throttle, inject, hard stop)</label><input type="text" id="vk-loop-thresholds" placeholder="0.3, 0.5, 0.7, 0.9"></div>
+                <div class="form-group"><label for="vk-loop-counts">Consecutive counts</label><input type="text" id="vk-loop-counts" placeholder="3, 5, 7, 10"></div>
+              </div></fieldset>
+              <fieldset><legend>Weights</legend><div class="form-group"><label for="vk-loop-weights">Seven weights</label><input type="text" id="vk-loop-weights" placeholder="0.25, 0.20, 0.15, 0.10, 0.15, 0.10, 0.05"><div class="hint">Content, tool, stagnation, token, error, context, cost. Must sum to 1.0.</div></div></fieldset>
+              <div class="form-row"><div class="form-group"><label for="vk-loop-delay">Throttle delay</label><input type="number" id="vk-loop-delay" min="1" max="30" placeholder="Inherit"></div><div class="form-group"><label for="vk-loop-strategy">Injection strategy</label><select id="vk-loop-strategy"><option value="">Inherit</option><option value="system_prompt_append">Append to system prompt</option><option value="context_aware">Context-aware</option></select></div></div>
+              <div class="form-group"><label for="vk-loop-template">Custom break instruction</label><textarea id="vk-loop-template" maxlength="2000" rows="4" placeholder="Inherit global instruction"></textarea></div>
+              <button type="button" class="btn btn-secondary btn-sm" id="vk-loop-clear">Clear overrides</button><div class="error" id="vk-loop-error" role="alert"></div>
+            </div>
+          </details>
           <div class="actions">
             <button type="submit" class="btn btn-primary" id="vk-form-submit">Create Key</button>
             <button type="button" class="btn btn-secondary" id="vk-form-cancel">Cancel</button>
@@ -1174,6 +1230,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     // released provider models (e.g. new Bedrock OpenAI models) appear without
     // a manual refresh.
     if (pageId === 'model-groups') { refreshModelGroupModels(); }
+    if (pageId === 'loop-detection') { populateLoopDetection((config && config.loop_detection) || LOOP_DEFAULTS); }
     if (pageId === 'virtual-keys') { vkOnOpen(); }
     if (pageId === 'guardrails') { loadGuardrailVirtualKeys(); }
   }
@@ -1529,6 +1586,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         'page-caching': validateCachingPage,
         'page-context': validateContextPage,
         'page-streaming': validateStreamingPage,
+        'page-loop-detection': validateLoopDetectionPage,
         'page-guardrails': validateGuardrailsPage
     };
 
@@ -2127,6 +2185,32 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 
   document.getElementById('add-group').addEventListener('click', function() { addGroupCard(null); setStatus('Model group added'); });
 
+  var LOOP_DEFAULTS={enabled:false,session_timeout_minutes:30,max_sessions:10000,history_depth:5,thresholds:{warn_confidence:0.3,throttle_confidence:0.5,inject_confidence:0.7,hardstop_confidence:0.9},consecutive_counts:{warn:3,throttle:5,inject:7,hardstop:10},weights:{content_similarity:0.25,tool_call_repetition:0.20,response_stagnation:0.15,token_velocity:0.10,error_cycling:0.15,context_growth:0.10,cost_velocity:0.05},throttle_delay_seconds:2,injection_strategy:'system_prompt_append',break_instruction_template:null};
+  var LOOP_PRESETS={
+    balanced:{content_similarity:0.25,tool_call_repetition:0.20,response_stagnation:0.15,token_velocity:0.10,error_cycling:0.15,context_growth:0.10,cost_velocity:0.05},
+    'tool-heavy':{content_similarity:0.15,tool_call_repetition:0.35,response_stagnation:0.15,token_velocity:0.08,error_cycling:0.15,context_growth:0.07,cost_velocity:0.05},
+    'cost-sensitive':{content_similarity:0.18,tool_call_repetition:0.15,response_stagnation:0.12,token_velocity:0.15,error_cycling:0.10,context_growth:0.10,cost_velocity:0.20}
+  };
+  var LOOP_WEIGHT_IDS={content_similarity:'loop-weight-content',tool_call_repetition:'loop-weight-tool',response_stagnation:'loop-weight-stagnation',token_velocity:'loop-weight-token',error_cycling:'loop-weight-error',context_growth:'loop-weight-context',cost_velocity:'loop-weight-cost'};
+
+  function populateLoopDetection(value){
+    var loop=value||LOOP_DEFAULTS,thresholds=loop.thresholds||LOOP_DEFAULTS.thresholds,counts=loop.consecutive_counts||LOOP_DEFAULTS.consecutive_counts,weights=loop.weights||LOOP_DEFAULTS.weights;
+    document.getElementById('loop-enabled').checked=!!loop.enabled;
+    document.getElementById('loop-session-timeout').value=loop.session_timeout_minutes||30;document.getElementById('loop-max-sessions').value=loop.max_sessions||10000;document.getElementById('loop-history-depth').value=loop.history_depth||5;
+    document.getElementById('loop-threshold-warn').value=thresholds.warn_confidence;document.getElementById('loop-threshold-throttle').value=thresholds.throttle_confidence;document.getElementById('loop-threshold-inject').value=thresholds.inject_confidence;document.getElementById('loop-threshold-hardstop').value=thresholds.hardstop_confidence;
+    document.getElementById('loop-count-warn').value=counts.warn;document.getElementById('loop-count-throttle').value=counts.throttle;document.getElementById('loop-count-inject').value=counts.inject;document.getElementById('loop-count-hardstop').value=counts.hardstop;
+    Object.keys(LOOP_WEIGHT_IDS).forEach(function(key){document.getElementById(LOOP_WEIGHT_IDS[key]).value=weights[key];});
+    document.getElementById('loop-throttle-delay').value=loop.throttle_delay_seconds||2;document.getElementById('loop-injection-strategy').value=loop.injection_strategy||'system_prompt_append';document.getElementById('loop-break-template').value=loop.break_instruction_template||'';document.getElementById('loop-preset').value='';updateLoopWeightSum();updateLoopTemplateCount();clearLoopErrors();
+  }
+  function collectLoopDetection(){var weights={};Object.keys(LOOP_WEIGHT_IDS).forEach(function(key){weights[key]=parseFloat(document.getElementById(LOOP_WEIGHT_IDS[key]).value);});var template=document.getElementById('loop-break-template').value;return {enabled:document.getElementById('loop-enabled').checked,session_timeout_minutes:parseInt(document.getElementById('loop-session-timeout').value,10),max_sessions:parseInt(document.getElementById('loop-max-sessions').value,10),history_depth:parseInt(document.getElementById('loop-history-depth').value,10),thresholds:{warn_confidence:parseFloat(document.getElementById('loop-threshold-warn').value),throttle_confidence:parseFloat(document.getElementById('loop-threshold-throttle').value),inject_confidence:parseFloat(document.getElementById('loop-threshold-inject').value),hardstop_confidence:parseFloat(document.getElementById('loop-threshold-hardstop').value)},consecutive_counts:{warn:parseInt(document.getElementById('loop-count-warn').value,10),throttle:parseInt(document.getElementById('loop-count-throttle').value,10),inject:parseInt(document.getElementById('loop-count-inject').value,10),hardstop:parseInt(document.getElementById('loop-count-hardstop').value,10)},weights:weights,throttle_delay_seconds:parseInt(document.getElementById('loop-throttle-delay').value,10),injection_strategy:document.getElementById('loop-injection-strategy').value,break_instruction_template:template.trim()?template:null};}
+  function loopWeightSum(){return Object.keys(LOOP_WEIGHT_IDS).reduce(function(sum,key){return sum+(parseFloat(document.getElementById(LOOP_WEIGHT_IDS[key]).value)||0);},0);}
+  function updateLoopWeightSum(){var sum=loopWeightSum(),output=document.getElementById('loop-weight-sum'),valid=Math.abs(sum-1)<=0.001;output.textContent=sum.toFixed(3);output.style.color=valid?'var(--success)':'var(--danger)';output.setAttribute('aria-label','Weight sum '+sum.toFixed(3)+(valid?', valid':', invalid'));}
+  function updateLoopTemplateCount(){var el=document.getElementById('loop-break-template');document.getElementById('loop-template-count').textContent=el.value.length+' / 2000 characters. Blank uses the built-in instruction.';}
+  function clearLoopErrors(){document.getElementById('loop-validation-error').textContent='';document.getElementById('loop-server-error').textContent='';}
+  function validateLoopDetectionPage(){clearLoopErrors();var loop=collectLoopDetection(),errors=[];if(Math.abs(loopWeightSum()-1)>0.001)errors.push('Signal weights must sum to 1.0 ±0.001.');var t=loop.thresholds;if(!(t.warn_confidence<t.throttle_confidence&&t.throttle_confidence<t.inject_confidence&&t.inject_confidence<t.hardstop_confidence))errors.push('Thresholds must be strictly ascending.');var c=loop.consecutive_counts;if(!(c.warn<=c.throttle&&c.throttle<=c.inject&&c.inject<=c.hardstop))errors.push('Consecutive counts must be non-decreasing.');if(loop.throttle_delay_seconds<1||loop.throttle_delay_seconds>30)errors.push('Throttle delay must be between 1 and 30 seconds.');if(document.getElementById('loop-break-template').value.length>2000)errors.push('Break instruction must be 2,000 characters or fewer.');document.getElementById('loop-validation-error').textContent=errors.join(' ');return errors.length===0;}
+  function applyLoopPreset(name){var weights=LOOP_PRESETS[name];if(!weights)return;Object.keys(LOOP_WEIGHT_IDS).forEach(function(key){document.getElementById(LOOP_WEIGHT_IDS[key]).value=weights[key];});updateLoopWeightSum();}
+  function saveLoopDetection(){if(!validateLoopDetectionPage()){setStatus('Validation failed — fix Loop Detection settings');return;}var cfg=config?JSON.parse(JSON.stringify(config)):{};cfg.loop_detection=collectLoopDetection();setStatus('Saving loop detection…');fetch(apiUrl('config'),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)}).then(function(r){return r.text().then(function(text){var data=null;try{data=text?JSON.parse(text):null;}catch(_){}if(!r.ok)throw new Error((data&&data.error&&((data.error.details||[]).join(' ')||data.error.message))||text||('HTTP '+r.status));return data;});}).then(function(){config=cfg;document.getElementById('loop-server-error').textContent='';setStatus('Loop detection saved and applied');showToast('Loop detection saved and applied');}).catch(function(error){document.getElementById('loop-server-error').textContent=error.message;setStatus('Loop detection save failed');showToast('Loop detection save failed',true);});}
+
   // --- Load Config from API ---
   function loadConfig() {
     setStatus('Loading configuration…');
@@ -2149,6 +2233,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     if(cfg.semantic_cache){document.getElementById('cache-enabled').checked=!!cfg.semantic_cache.enabled; document.getElementById('cache-qdrant-url').value=cfg.semantic_cache.qdrant_url||''; document.getElementById('cache-collection').value=cfg.semantic_cache.collection_name||'ai_gateway_cache'; document.getElementById('cache-threshold').value=cfg.semantic_cache.similarity_threshold||0.95; document.getElementById('cache-ttl').value=cfg.semantic_cache.ttl_seconds||3600; document.getElementById('cache-max-entries').value=cfg.semantic_cache.max_cache_size||10000;}
     if(cfg.context){document.getElementById('context-enabled').checked=!!cfg.context.enabled; document.getElementById('context-strategy').value=cfg.context.truncation_strategy||'remove_oldest'; document.getElementById('context-window-size').value=cfg.context.sliding_window_size||10; document.getElementById('context-cache-ttl').value=cfg.context.capabilities_cache_ttl_seconds||3600; document.getElementById('context-max-retries').value=cfg.context.max_truncation_retries||3;}
     var sc=cfg.streaming||{};document.getElementById('stream-early-event').checked=sc.emit_early_event!==false;document.getElementById('stream-keepalive').value=sc.keepalive_interval_seconds!=null?sc.keepalive_interval_seconds:5;document.getElementById('stream-passthrough').checked=sc.passthrough_enabled!==false;document.getElementById('stream-chunk-timeout').value=sc.chunk_timeout_seconds||60;document.getElementById('stream-retry-truncation').checked=sc.retry_on_truncation!==false;
+    populateLoopDetection(cfg.loop_detection||LOOP_DEFAULTS);
     populateProviderSelects();
     if(cfg.semantic_cache&&cfg.semantic_cache.embedding_provider){
       document.getElementById('cache-embed-provider').value=cfg.semantic_cache.embedding_provider;
@@ -2176,6 +2261,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     cfg.semantic_cache={enabled:document.getElementById('cache-enabled').checked,qdrant_url:document.getElementById('cache-qdrant-url').value.trim(),collection_name:document.getElementById('cache-collection').value.trim(),embedding_provider:document.getElementById('cache-embed-provider').value,embedding_model:document.getElementById('cache-embed-model').value.trim(),similarity_threshold:parseFloat(document.getElementById('cache-threshold').value),ttl_seconds:parseInt(document.getElementById('cache-ttl').value,10),max_cache_size:parseInt(document.getElementById('cache-max-entries').value,10)};
     cfg.context={enabled:document.getElementById('context-enabled').checked,truncation_strategy:document.getElementById('context-strategy').value,sliding_window_size:parseInt(document.getElementById('context-window-size').value,10),capabilities_cache_ttl_seconds:parseInt(document.getElementById('context-cache-ttl').value,10),max_truncation_retries:parseInt(document.getElementById('context-max-retries').value,10)};
     cfg.streaming={emit_early_event:document.getElementById('stream-early-event').checked,keepalive_interval_seconds:parseInt(document.getElementById('stream-keepalive').value,10),passthrough_enabled:document.getElementById('stream-passthrough').checked,chunk_timeout_seconds:parseInt(document.getElementById('stream-chunk-timeout').value,10),retry_on_truncation:document.getElementById('stream-retry-truncation').checked};
+    cfg.loop_detection=collectLoopDetection();
     cfg.guardrails=collectGuardrails();
     return cfg;
   }
@@ -2197,6 +2283,12 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       .then(function(){setStatus('Configuration saved');showToast('Configuration saved to file');})
       .catch(function(err){setStatus('Save failed: '+err.message);showToast('Save failed: '+err.message,true);});
   }
+
+  document.getElementById('loop-weight-fields').addEventListener('input',updateLoopWeightSum);
+  document.getElementById('loop-break-template').addEventListener('input',updateLoopTemplateCount);
+  document.getElementById('loop-preset').addEventListener('change',function(){applyLoopPreset(this.value);});
+  document.getElementById('loop-save').addEventListener('click',saveLoopDetection);
+  document.getElementById('loop-reset-defaults').addEventListener('click',function(){if(window.confirm('Reset all Loop Detection settings to defaults?'))populateLoopDetection(LOOP_DEFAULTS);});
 
   // --- Action Buttons ---
   document.addEventListener('click', function(e) {
@@ -3063,7 +3155,14 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       rpm: document.getElementById('vk-f-rpm'),
       tpm: document.getElementById('vk-f-tpm'),
       models: document.getElementById('vk-f-models'),
-      expires: document.getElementById('vk-f-expires')
+      expires: document.getElementById('vk-f-expires'),
+      loopEnabled: document.getElementById('vk-f-loop-enabled'),
+      loopThresholds: document.getElementById('vk-loop-thresholds'),
+      loopCounts: document.getElementById('vk-loop-counts'),
+      loopWeights: document.getElementById('vk-loop-weights'),
+      loopDelay: document.getElementById('vk-loop-delay'),
+      loopStrategy: document.getElementById('vk-loop-strategy'),
+      loopTemplate: document.getElementById('vk-loop-template')
     };
   }
 
@@ -3071,7 +3170,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
   function vkFieldEl(field) {
     var map = { name: 'vk-f-name', budget_limit_usd: 'vk-f-budget', token_budget: 'vk-f-token-budget',
       budget_window: 'vk-f-window', requests_per_minute: 'vk-f-rpm', tokens_per_minute: 'vk-f-tpm',
-      model_access: 'vk-f-models', expires_in: 'vk-f-expires' };
+      model_access: 'vk-f-models', expires_in: 'vk-f-expires', loop_detection: 'vk-f-loop-enabled' };
     return map[field] ? document.getElementById(map[field]) : null;
   }
 
@@ -3133,6 +3232,9 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     document.getElementById('vk-key-reveal').hidden = true;
     document.getElementById('vk-created-key').value = '';
     document.getElementById('vk-form-submit').disabled = false;
+    document.getElementById('vk-f-loop-enabled').checked=false;
+    document.getElementById('vk-loop-fields').hidden=true;
+    vkClearLoopFields();
   }
 
   /** Fill the form fields from a VirtualKeyInfo-shaped object (edit mode). */
@@ -3145,8 +3247,15 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     f.rpm.value = (d.requests_per_minute != null) ? d.requests_per_minute : '';
     f.tpm.value = (d.tokens_per_minute != null) ? d.tokens_per_minute : '';
     vkPopulateModels(d.model_access || []);
+    vkPopulateLoopOverrides(d.loop_detection || null);
     // Expiration stays on "Keep current" unless the admin picks a new value.
   }
+
+  function vkParseNumbers(value, expected){var values=value.split(',').map(function(item){return Number(item.trim());});return values.length===expected&&values.every(Number.isFinite)?values:null;}
+  function vkClearLoopFields(){['vk-loop-thresholds','vk-loop-counts','vk-loop-weights','vk-loop-delay','vk-loop-template'].forEach(function(id){document.getElementById(id).value='';});document.getElementById('vk-loop-strategy').value='';document.getElementById('vk-loop-error').textContent='';}
+  function vkPopulateLoopOverrides(loop){var f=vkFormEls(),enabled=!!loop;f.loopEnabled.checked=enabled;document.getElementById('vk-loop-fields').hidden=!enabled;vkClearLoopFields();if(!loop)return;if(loop.thresholds)f.loopThresholds.value=[loop.thresholds.warn_confidence,loop.thresholds.throttle_confidence,loop.thresholds.inject_confidence,loop.thresholds.hardstop_confidence].join(', ');if(loop.consecutive_counts)f.loopCounts.value=[loop.consecutive_counts.warn,loop.consecutive_counts.throttle,loop.consecutive_counts.inject,loop.consecutive_counts.hardstop].join(', ');if(loop.weights)f.loopWeights.value=[loop.weights.content_similarity,loop.weights.tool_call_repetition,loop.weights.response_stagnation,loop.weights.token_velocity,loop.weights.error_cycling,loop.weights.context_growth,loop.weights.cost_velocity].join(', ');f.loopDelay.value=loop.throttle_delay_seconds!=null?loop.throttle_delay_seconds:'';f.loopStrategy.value=loop.injection_strategy||'';f.loopTemplate.value=loop.break_instruction_template||'';}
+  function vkCollectLoopOverrides(){var f=vkFormEls();if(!f.loopEnabled.checked)return null;var result={},thresholds=vkParseNumbers(f.loopThresholds.value,4),counts=vkParseNumbers(f.loopCounts.value,4),weights=vkParseNumbers(f.loopWeights.value,7);if(thresholds)result.thresholds={warn_confidence:thresholds[0],throttle_confidence:thresholds[1],inject_confidence:thresholds[2],hardstop_confidence:thresholds[3]};if(counts)result.consecutive_counts={warn:counts[0],throttle:counts[1],inject:counts[2],hardstop:counts[3]};if(weights)result.weights={content_similarity:weights[0],tool_call_repetition:weights[1],response_stagnation:weights[2],token_velocity:weights[3],error_cycling:weights[4],context_growth:weights[5],cost_velocity:weights[6]};if(f.loopDelay.value.trim())result.throttle_delay_seconds=parseInt(f.loopDelay.value,10);if(f.loopStrategy.value)result.injection_strategy=f.loopStrategy.value;if(f.loopTemplate.value.trim())result.break_instruction_template=f.loopTemplate.value;return result;}
+  function vkValidateLoopOverrides(){var f=vkFormEls(),error='';if(!f.loopEnabled.checked){document.getElementById('vk-loop-error').textContent='';return true;}var thresholds=f.loopThresholds.value.trim()?vkParseNumbers(f.loopThresholds.value,4):null;if(f.loopThresholds.value.trim()&&(!thresholds||!(thresholds[0]<thresholds[1]&&thresholds[1]<thresholds[2]&&thresholds[2]<thresholds[3])))error='Thresholds must contain four ascending numbers.';var counts=f.loopCounts.value.trim()?vkParseNumbers(f.loopCounts.value,4):null;if(!error&&f.loopCounts.value.trim()&&(!counts||!counts.every(Number.isInteger)||!(counts[0]<=counts[1]&&counts[1]<=counts[2]&&counts[2]<=counts[3])))error='Counts must contain four non-decreasing integers.';var weights=f.loopWeights.value.trim()?vkParseNumbers(f.loopWeights.value,7):null;if(!error&&f.loopWeights.value.trim()&&(!weights||Math.abs(weights.reduce(function(sum,value){return sum+value;},0)-1)>0.001))error='Weights must contain seven numbers summing to 1.0.';if(!error&&f.loopDelay.value.trim()&&(Number(f.loopDelay.value)<1||Number(f.loopDelay.value)>30))error='Throttle delay must be 1–30 seconds.';if(!error&&f.loopTemplate.value.length>2000)error='Custom instruction must be 2,000 characters or fewer.';document.getElementById('vk-loop-error').textContent=error;return !error;}
 
   /** Client-side validation mirroring the API rules (Req 12.11). */
   function vkValidateForm() {
@@ -3182,6 +3291,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       if (!Number.isInteger(tpm) || tpm < 1 || tpm > 10000000) { showError(f.tpm, 'Tokens/minute must be an integer between 1 and 10,000,000'); ok = false; }
     }
 
+    if (!vkValidateLoopOverrides()) { ok = false; }
     return ok;
   }
 
@@ -3208,6 +3318,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       if (tpmRaw !== '') { body.tokens_per_minute = parseInt(tpmRaw, 10); }
       if (models.length) { body.model_access = models; }
       body.expires_in = (expires && expires !== 'never') ? expires : 'never';
+      if (f.loopEnabled.checked) { body.loop_detection = vkCollectLoopOverrides(); }
     } else {
       // Edit: what you see is what you set. Blank clears the limit (null).
       if (nameV !== '') { body.name = nameV; }
@@ -3219,6 +3330,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       body.model_access = models.length ? models : null;
       // Only send expires_in when the admin explicitly picked a new value.
       if (expires && expires !== 'keep') { body.expires_in = expires; }
+      body.loop_detection = f.loopEnabled.checked ? vkCollectLoopOverrides() : null;
     }
     return body;
   }
@@ -3387,6 +3499,8 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 
     var form = document.getElementById('vk-form');
     if (form) { form.addEventListener('submit', vkSubmit); }
+    document.getElementById('vk-f-loop-enabled').addEventListener('change',function(){document.getElementById('vk-loop-fields').hidden=!this.checked;if(!this.checked)document.getElementById('vk-loop-error').textContent='';});
+    document.getElementById('vk-loop-clear').addEventListener('click',function(){vkClearLoopFields();document.getElementById('vk-f-loop-enabled').checked=false;document.getElementById('vk-loop-fields').hidden=true;});
 
     var cancel = document.getElementById('vk-form-cancel');
     if (cancel) { cancel.addEventListener('click', vkHideModal); }

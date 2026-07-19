@@ -81,6 +81,9 @@ pub struct Config {
     /// disabled). See [`VirtualKeysConfig`].
     #[serde(default)]
     pub virtual_keys: VirtualKeysConfig,
+    /// Runtime agent-loop detection settings. Disabled by default.
+    #[serde(default)]
+    pub loop_detection: crate::loop_detection::LoopDetectionConfig,
     /// Guardrail pipelines (opt-in pre-call/post-call policy enforcement).
     /// Absent section disables all guardrail processing. See
     /// [`crate::guardrail::GuardrailConfig`].

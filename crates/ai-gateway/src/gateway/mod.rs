@@ -55,6 +55,8 @@ pub struct AppState {
     /// `state.guardrail_engine.read().await.clone()` and run the whole request
     /// against that clone.
     pub guardrail_engine: Arc<RwLock<Option<Arc<GuardrailEngine>>>>,
+    /// Shared agent-loop detection state and middleware configuration.
+    pub loop_detector: Arc<crate::loop_detection::middleware::LoopDetectorState>,
 }
 
 /// Core HTTP server wrapping Axum with middleware and integrated components.
@@ -187,6 +189,12 @@ impl GatewayServer {
             None => None,
         };
 
+        let loop_detector = Arc::new(crate::loop_detection::middleware::LoopDetectorState::new(
+            config_arc.clone(),
+            config.loop_detection.clone(),
+        ));
+        loop_detector.spawn_eviction(&config.loop_detection);
+
         let state = AppState {
             config: config_arc,
             config_path: Arc::new(config_path.unwrap_or_else(|| std::path::PathBuf::from("./config.yaml"))),
@@ -201,6 +209,7 @@ impl GatewayServer {
             codex_models_discovery: Arc::new(crate::codex::models_discovery::ModelsDiscovery::new()),
             virtual_key_manager,
             guardrail_engine: Arc::new(RwLock::new(guardrail_engine)),
+            loop_detector,
         };
 
         Ok(Self { state })
@@ -296,6 +305,10 @@ impl GatewayServer {
                 "/v1/fine_tuning/jobs/{fine_tuning_id}/events",
                 get(list_fine_tuning_events),
             );
+
+        let api_routes = api_routes.layer(crate::loop_detection::middleware::LoopDetectorLayer::new(
+            self.state.loop_detector.clone(),
+        ));
 
         // --- Virtual key authentication + enforcement (Req 2.1, 2.4, 5.5, 6.4,
         // 11.1-11.5) --- Layer runs BEFORE the routing handlers above. In
@@ -564,10 +577,12 @@ impl GatewayServer {
 }
 
 pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
+    let loop_detection = new_config.loop_detection.clone();
     {
         let mut cfg = state.config.write().await;
         *cfg = new_config;
     }
+    state.loop_detector.apply_config(loop_detection).await;
     state.router.clear_circuit_breakers();
     state.router.clear_rate_limiters();
     state.router.clear_http_clients();
@@ -715,6 +730,7 @@ mod tests {
             codex_instructions_url: None,
             streaming: None,
             virtual_keys: Default::default(),
+            loop_detection: Default::default(),
             guardrails: None,
         }
     }
@@ -969,6 +985,7 @@ mod tests {
                     codex_instructions_url: None,
                     streaming: None,
                     virtual_keys: Default::default(),
+                    loop_detection: Default::default(),
                     guardrails: None,
                 };
 
@@ -1540,6 +1557,7 @@ mod tests {
                     codex_instructions_url: None,
                     streaming: None,
                     virtual_keys: Default::default(),
+                    loop_detection: Default::default(),
                     guardrails: None,
                 };
 

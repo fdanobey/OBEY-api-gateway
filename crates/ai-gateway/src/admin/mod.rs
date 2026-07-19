@@ -48,8 +48,11 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
     let virtual_keys_api =
         crate::virtual_keys::admin::routes(std::sync::Arc::clone(&state.virtual_key_manager));
 
+    let loop_detection_api = crate::loop_detection::admin::routes();
+
     Router::new()
         .nest("/config", config_api)
+        .nest("/loop-detection", loop_detection_api)
         .nest_service("/keys", virtual_keys_api)
         .route("/providers/models", get(proxy_provider_models))
         .route("/test-connection", post(test_connection))
@@ -1366,6 +1369,7 @@ mod tests {
                     codex_instructions_url: None,
                     streaming: None,
                     virtual_keys: Default::default(),
+                    loop_detection: Default::default(),
                     guardrails: None,
                 })
             })
@@ -1423,6 +1427,45 @@ mod tests {
         let data = asset.unwrap();
         let html = std::str::from_utf8(&data.data).unwrap();
         assert!(html.contains("OBEY-API Admin"), "Should contain admin panel title");
+    }
+
+    #[test]
+    fn loop_detection_ui_has_valid_presets_and_put_save_path() {
+        let asset = AdminAssets::get("index.html").expect("index embedded");
+        let html = std::str::from_utf8(&asset.data).unwrap();
+        for id in [
+            "page-loop-detection",
+            "loop-enabled",
+            "loop-session-timeout",
+            "loop-max-sessions",
+            "loop-history-depth",
+            "loop-threshold-warn",
+            "loop-count-warn",
+            "loop-weight-sum",
+            "loop-throttle-delay",
+            "loop-injection-strategy",
+            "loop-break-template",
+        ] {
+            assert!(html.contains(id), "missing loop UI field {id}");
+        }
+        assert!(html.contains("balanced:{content_similarity:0.25"));
+        assert!(html.contains("'tool-heavy':{content_similarity:0.15"));
+        assert!(html.contains("'cost-sensitive':{content_similarity:0.18"));
+        assert!(html.contains("fetch(apiUrl('config'),{method:'PUT'"));
+        assert!(html.contains("cfg.loop_detection=collectLoopDetection()"));
+        assert!(html.contains("Reset all Loop Detection settings to defaults?"));
+    }
+
+    #[test]
+    fn virtual_key_ui_collects_and_clears_loop_overrides() {
+        let asset = AdminAssets::get("index.html").expect("index embedded");
+        let html = std::str::from_utf8(&asset.data).unwrap();
+        for id in ["vk-f-loop-enabled", "vk-loop-thresholds", "vk-loop-counts", "vk-loop-weights", "vk-loop-delay", "vk-loop-strategy", "vk-loop-template", "vk-loop-clear"] {
+            assert!(html.contains(id), "missing VK loop control {id}");
+        }
+        assert!(html.contains("body.loop_detection = vkCollectLoopOverrides()"));
+        assert!(html.contains("body.loop_detection = f.loopEnabled.checked ? vkCollectLoopOverrides() : null"));
+        assert!(html.contains("vkPopulateLoopOverrides(d.loop_detection || null)"));
     }
 
     #[test]
@@ -1640,6 +1683,7 @@ retry:
             codex_instructions_url: None,
             streaming: None,
             virtual_keys: Default::default(),
+            loop_detection: Default::default(),
             guardrails: None,
         }
     }
@@ -1652,6 +1696,32 @@ retry:
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
         format!("Basic {}", encoded)
+    }
+
+    #[tokio::test]
+    async fn loop_detection_admin_requires_auth_when_enabled() {
+        let user_env = "LOOP_ADMIN_TEST_USER";
+        let pass_env = "LOOP_ADMIN_TEST_PASS";
+        std::env::set_var(user_env, "admin");
+        std::env::set_var(pass_env, "secret");
+        let cfg = test_config_with_auth_env(true, user_env, pass_env);
+        let server = crate::gateway::GatewayServer::new(cfg, None).await.unwrap();
+        let app = server.build_router();
+
+        let unauthorized = axum::http::Request::get("/admin/loop-detection/sessions")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), unauthorized).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = axum::http::Request::get("/admin/loop-detection/sessions")
+            .header("Authorization", basic_auth_header("admin", "secret"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, authorized).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        std::env::remove_var(user_env);
+        std::env::remove_var(pass_env);
     }
 
     #[tokio::test]

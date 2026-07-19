@@ -96,6 +96,7 @@ impl VirtualKeyManager {
             requests_per_minute: params.requests_per_minute,
             tokens_per_minute: params.tokens_per_minute,
             model_access_list: params.model_access.clone(),
+            loop_detection: params.loop_detection.clone(),
             expires_at,
             // Req 7.3: never touch usage counters or window start on update.
             window_start: None,
@@ -246,6 +247,7 @@ pub(crate) fn stored_to_info(stored: &StoredVirtualKey) -> VirtualKeyInfo {
         requests_per_minute: stored.requests_per_minute,
         tokens_per_minute: stored.tokens_per_minute,
         model_access: stored.model_access_list.clone(),
+        loop_detection: stored.loop_detection.clone(),
         request_count: stored.request_count,
         created_at: stored.created_at,
         expires_at: stored.expires_at,
@@ -308,6 +310,14 @@ fn validate_update_params(params: &UpdateKeyParams) -> Result<(), KeyError> {
         }
     }
 
+    if let Some(Some(loop_detection)) = &params.loop_detection {
+        if let Err(loop_errors) = loop_detection.merge(&crate::loop_detection::LoopDetectionConfig::default()) {
+            for error in loop_errors {
+                errors.push("loop_detection", error.to_string());
+            }
+        }
+    }
+
     errors.into_result().map_err(KeyError::Validation)
 }
 
@@ -333,6 +343,7 @@ mod tests {
             tokens_per_minute: None,
             model_access: None,
             expires_in: None,
+            loop_detection: None,
         }
     }
 

@@ -4119,6 +4119,7 @@ mod tests {
             codex_instructions_url: None,
             streaming: None,
             virtual_keys: Default::default(),
+            loop_detection: Default::default(),
             guardrails: None,
         }
     }

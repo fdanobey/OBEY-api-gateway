@@ -47,29 +47,48 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
+    let mut subscription = state.loop_detector.events.subscribe();
+    for event in subscription.replay {
+        let message = serde_json::json!({"type": "loop_detection", "data": event});
+        if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+            return;
+        }
+    }
+
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
-        interval.tick().await;
-        let snapshot = build_dashboard_snapshot(&state);
-        let msg = serde_json::json!({"type": "metrics", "data": snapshot});
-        if socket
-            .send(Message::Text(msg.to_string().into()))
-            .await
-            .is_err()
-        {
-            break;
-        }
+        tokio::select! {
+            event = subscription.receiver.recv() => {
+                match event {
+                    Ok(event) => {
+                        let message = serde_json::json!({"type": "loop_detection", "data": event});
+                        if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = interval.tick() => {
+                let snapshot = build_dashboard_snapshot(&state).await;
+                let msg = serde_json::json!({"type": "metrics", "data": snapshot});
+                if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
+                    break;
+                }
 
-        let errors = recent_errors(&state, 25);
-        let errors_msg = serde_json::json!({"type": "errors", "data": errors});
-        if socket.send(Message::Text(errors_msg.to_string().into())).await.is_err() {
-            break;
+                let errors = recent_errors(&state, 25);
+                let errors_msg = serde_json::json!({"type": "errors", "data": errors});
+                if socket.send(Message::Text(errors_msg.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    Json(build_dashboard_snapshot(&state))
+    Json(build_dashboard_snapshot(&state).await)
 }
 
 async fn logs_handler(
@@ -136,11 +155,9 @@ fn serve_embedded(path: &str) -> Response {
     }
 }
 
-fn build_dashboard_snapshot(state: &AppState) -> crate::metrics::MetricsSnapshot {
+async fn build_dashboard_snapshot(state: &AppState) -> crate::metrics::MetricsSnapshot {
     let mut snapshot = state.metrics.snapshot();
-    let cb_states = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(state.router.get_circuit_breaker_states())
-    });
+    let cb_states = state.router.get_circuit_breaker_states().await;
     snapshot.circuit_breaker_states = cb_states.clone();
     snapshot.enrich_circuit_breaker_states(&cb_states);
     snapshot
@@ -272,6 +289,7 @@ mod tests {
             codex_instructions_url: None,
             streaming: None,
             virtual_keys: Default::default(),
+            loop_detection: Default::default(),
             guardrails: None,
         }
     }

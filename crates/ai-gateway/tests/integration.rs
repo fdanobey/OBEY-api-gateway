@@ -78,6 +78,7 @@ fn test_config() -> Config {
         codex_instructions_url: None,
         streaming: None,
         virtual_keys: Default::default(),
+        loop_detection: Default::default(),
         guardrails: None,
     }
 }
@@ -329,7 +330,7 @@ async fn test_custom_admin_and_dashboard_paths_are_honored() {
 
     let app = build_app(cfg).await;
 
-    let req = Request::get("/control-panel/").body(Body::empty()).unwrap();
+    let req = Request::get("/control-panel").body(Body::empty()).unwrap();
     let (admin_status, admin_body) = send(app.clone(), req).await;
     assert_eq!(admin_status, StatusCode::OK);
     let admin_html = std::str::from_utf8(&admin_body).unwrap();

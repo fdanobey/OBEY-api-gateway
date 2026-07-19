@@ -58,6 +58,7 @@ pub struct StoredVirtualKey {
     pub requests_per_minute: Option<u32>,
     pub tokens_per_minute: Option<u64>,
     pub model_access_list: Option<Vec<String>>,
+    pub loop_detection: Option<crate::loop_detection::VkLoopConfig>,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
@@ -80,6 +81,7 @@ pub struct KeyUpdates {
     pub requests_per_minute: Option<Option<u32>>,
     pub tokens_per_minute: Option<Option<u64>>,
     pub model_access_list: Option<Option<Vec<String>>>,
+    pub loop_detection: Option<Option<crate::loop_detection::VkLoopConfig>>,
     pub expires_at: Option<Option<DateTime<Utc>>>,
     pub window_start: Option<Option<DateTime<Utc>>>,
     pub current_spend_usd: Option<f64>,
@@ -99,6 +101,7 @@ impl KeyUpdates {
             && self.requests_per_minute.is_none()
             && self.tokens_per_minute.is_none()
             && self.model_access_list.is_none()
+            && self.loop_detection.is_none()
             && self.expires_at.is_none()
             && self.window_start.is_none()
             && self.current_spend_usd.is_none()
@@ -127,6 +130,7 @@ impl KeyStore {
         // CASCADE deletes require foreign keys to be enabled per-connection.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Self::create_schema(&conn)?;
+        Self::migrate_schema(&conn)?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -152,6 +156,7 @@ impl KeyStore {
                 requests_per_minute INTEGER,
                 tokens_per_minute INTEGER,
                 model_access_list TEXT,
+                loop_detection_json TEXT,
                 expires_at INTEGER,
                 created_at INTEGER NOT NULL,
                 last_used_at INTEGER,
@@ -182,9 +187,26 @@ impl KeyStore {
         Ok(())
     }
 
+    fn migrate_schema(conn: &Connection) -> Result<(), KeyStoreError> {
+        let has_loop_detection = conn
+            .prepare("PRAGMA table_info(virtual_keys)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "loop_detection_json");
+        if !has_loop_detection {
+            conn.execute(
+                "ALTER TABLE virtual_keys ADD COLUMN loop_detection_json TEXT",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Insert a new key row.
     pub fn create_key(&self, key: &StoredVirtualKey) -> Result<(), KeyStoreError> {
         let model_access_json = serialize_model_access(&key.model_access_list)?;
+        let loop_detection_json = serialize_loop_detection(&key.loop_detection)?;
         let conn = self.conn.lock().expect("keys.db mutex poisoned");
 
         conn.execute(
@@ -193,13 +215,13 @@ impl KeyStore {
                 budget_limit_usd, token_budget, budget_window,
                 current_spend_usd, current_tokens_used, window_start_timestamp,
                 requests_per_minute, tokens_per_minute, model_access_list,
-                expires_at, created_at, last_used_at, request_count
+                loop_detection_json, expires_at, created_at, last_used_at, request_count
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9,
                 ?10, ?11, ?12,
                 ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19
+                ?16, ?17, ?18, ?19, ?20
             )",
             params![
                 key.id,
@@ -217,6 +239,7 @@ impl KeyStore {
                 key.requests_per_minute.map(|v| v as i64),
                 key.tokens_per_minute.map(|v| v as i64),
                 model_access_json,
+                loop_detection_json,
                 key.expires_at.map(|t| t.timestamp()),
                 key.created_at.timestamp(),
                 key.last_used_at.map(|t| t.timestamp()),
@@ -297,6 +320,10 @@ impl KeyStore {
         if let Some(model_access) = &updates.model_access_list {
             assignments.push(format!("model_access_list = ?{}", values.len() + 1));
             values.push(Box::new(serialize_model_access(model_access)?));
+        }
+        if let Some(loop_detection) = &updates.loop_detection {
+            assignments.push(format!("loop_detection_json = ?{}", values.len() + 1));
+            values.push(Box::new(serialize_loop_detection(loop_detection)?));
         }
         if let Some(expires_at) = &updates.expires_at {
             assignments.push(format!("expires_at = ?{}", values.len() + 1));
@@ -476,9 +503,9 @@ impl KeyStore {
 /// [`row_to_stored_key`].
 const SELECT_COLUMNS: &str = "id, key_hash, key_prefix, encrypted_key, name, status, \
      budget_limit_usd, token_budget, budget_window, current_spend_usd, \
-     current_tokens_used, window_start_timestamp, requests_per_minute, \
-     tokens_per_minute, model_access_list, expires_at, created_at, \
-     last_used_at, request_count";
+      current_tokens_used, window_start_timestamp, requests_per_minute, \
+      tokens_per_minute, model_access_list, loop_detection_json, expires_at, created_at, \
+      last_used_at, request_count";
 
 /// Map a row (selected via [`SELECT_COLUMNS`]) into a [`StoredVirtualKey`].
 fn row_to_stored_key(row: &Row) -> rusqlite::Result<StoredVirtualKey> {
@@ -502,15 +529,22 @@ fn row_to_stored_key(row: &Row) -> rusqlite::Result<StoredVirtualKey> {
         None => None,
     };
 
+    let loop_detection_json: Option<String> = row.get(15)?;
+    let loop_detection = match loop_detection_json {
+        Some(json) => Some(serde_json::from_str(&json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(15, SqlType::Text, Box::new(error))
+        })?),
+        None => None,
+    };
     let token_budget: Option<i64> = row.get(7)?;
     let requests_per_minute: Option<i64> = row.get(12)?;
     let tokens_per_minute: Option<i64> = row.get(13)?;
     let window_start_ts: Option<i64> = row.get(11)?;
-    let expires_at_ts: Option<i64> = row.get(15)?;
-    let created_at_ts: i64 = row.get(16)?;
-    let last_used_at_ts: Option<i64> = row.get(17)?;
+    let expires_at_ts: Option<i64> = row.get(16)?;
+    let created_at_ts: i64 = row.get(17)?;
+    let last_used_at_ts: Option<i64> = row.get(18)?;
     let current_tokens_used: i64 = row.get(10)?;
-    let request_count: i64 = row.get(18)?;
+    let request_count: i64 = row.get(19)?;
 
     Ok(StoredVirtualKey {
         id: row.get(0)?,
@@ -528,9 +562,10 @@ fn row_to_stored_key(row: &Row) -> rusqlite::Result<StoredVirtualKey> {
         requests_per_minute: requests_per_minute.map(|v| v as u32),
         tokens_per_minute: tokens_per_minute.map(|v| v as u64),
         model_access_list,
-        expires_at: epoch_to_datetime_opt(expires_at_ts, 15)?,
-        created_at: epoch_to_datetime(created_at_ts, 16)?,
-        last_used_at: epoch_to_datetime_opt(last_used_at_ts, 17)?,
+        loop_detection,
+        expires_at: epoch_to_datetime_opt(expires_at_ts, 16)?,
+        created_at: epoch_to_datetime(created_at_ts, 17)?,
+        last_used_at: epoch_to_datetime_opt(last_used_at_ts, 18)?,
         request_count: request_count as u64,
     })
 }
@@ -560,6 +595,15 @@ fn epoch_to_datetime_opt(
 fn serialize_model_access(list: &Option<Vec<String>>) -> Result<Option<String>, KeyStoreError> {
     match list {
         Some(items) => Ok(Some(serde_json::to_string(items)?)),
+        None => Ok(None),
+    }
+}
+
+fn serialize_loop_detection(
+    config: &Option<crate::loop_detection::VkLoopConfig>,
+) -> Result<Option<String>, KeyStoreError> {
+    match config {
+        Some(config) => Ok(Some(serde_json::to_string(config)?)),
         None => Ok(None),
     }
 }
@@ -635,11 +679,55 @@ mod tests {
             requests_per_minute: Some(60),
             tokens_per_minute: Some(10_000),
             model_access_list: Some(vec!["gpt-4".to_string(), "claude".to_string()]),
+            loop_detection: None,
             expires_at: Some(ts(created_at + 86_400)),
             created_at: ts(created_at),
             last_used_at: None,
             request_count: 0,
         }
+    }
+
+    #[test]
+    fn migrates_existing_virtual_keys_table_with_loop_detection_column() {
+        let temp = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(temp.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE virtual_keys (
+                    id TEXT PRIMARY KEY,
+                    key_hash TEXT NOT NULL UNIQUE,
+                    key_prefix TEXT NOT NULL,
+                    encrypted_key TEXT NOT NULL,
+                    name TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    budget_limit_usd REAL,
+                    token_budget INTEGER,
+                    budget_window TEXT,
+                    current_spend_usd REAL NOT NULL DEFAULT 0.0,
+                    current_tokens_used INTEGER NOT NULL DEFAULT 0,
+                    window_start_timestamp INTEGER,
+                    requests_per_minute INTEGER,
+                    tokens_per_minute INTEGER,
+                    model_access_list TEXT,
+                    expires_at INTEGER,
+                    created_at INTEGER NOT NULL,
+                    last_used_at INTEGER,
+                    request_count INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        }
+
+        let store = KeyStore::new(temp.path()).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(virtual_keys)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "loop_detection_json"));
     }
 
     #[test]
@@ -653,6 +741,20 @@ mod tests {
 
         let by_hash = store.get_key_by_hash("hash-id-1").unwrap().unwrap();
         assert_eq!(by_hash, key);
+    }
+
+    #[test]
+    fn loop_detection_override_round_trips() {
+        let (store, _tmp) = temp_store();
+        let mut key = sample_key("id-loop", 1_700_000_050);
+        key.loop_detection = Some(crate::loop_detection::VkLoopConfig {
+            throttle_delay_seconds: Some(9),
+            ..Default::default()
+        });
+        store.create_key(&key).unwrap();
+
+        let loaded = store.get_key_by_id("id-loop").unwrap().unwrap();
+        assert_eq!(loaded.loop_detection, key.loop_detection);
     }
 
     #[test]

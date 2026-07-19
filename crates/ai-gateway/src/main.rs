@@ -11,6 +11,8 @@ mod router;
 mod cache;
 mod codex;
 mod logger;
+#[allow(dead_code, unused_imports)]
+mod loop_detection;
 mod admin;
 mod dashboard;
 mod models;

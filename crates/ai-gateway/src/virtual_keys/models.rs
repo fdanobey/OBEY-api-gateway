@@ -120,6 +120,8 @@ pub struct CreateKeyParams {
     pub model_access: Option<Vec<String>>,
     #[serde(default)]
     pub expires_in: Option<ExpiresIn>,
+    #[serde(default)]
+    pub loop_detection: Option<crate::loop_detection::VkLoopConfig>,
 }
 
 /// Response from key creation (includes the plaintext key exactly once).
@@ -157,6 +159,8 @@ pub struct UpdateKeyParams {
     pub model_access: Option<Option<Vec<String>>>,
     #[serde(default)]
     pub expires_in: Option<ExpiresIn>,
+    #[serde(default)]
+    pub loop_detection: Option<Option<crate::loop_detection::VkLoopConfig>>,
 }
 
 /// Authenticated key loaded from cache/store, carried through the request
@@ -177,6 +181,7 @@ pub struct AuthenticatedKey {
     pub tokens_per_minute: Option<u64>,
     pub model_access: Option<Vec<String>>,
     pub expires_at: Option<DateTime<Utc>>,
+    pub loop_detection: Option<crate::loop_detection::VkLoopConfig>,
 }
 
 /// Cached key entry stored in the DashMap for fast authentication lookups.
@@ -248,6 +253,7 @@ pub struct VirtualKeyInfo {
     pub requests_per_minute: Option<u32>,
     pub tokens_per_minute: Option<u64>,
     pub model_access: Option<Vec<String>>,
+    pub loop_detection: Option<crate::loop_detection::VkLoopConfig>,
     pub request_count: u64,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,

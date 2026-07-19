@@ -157,6 +157,15 @@ impl Config {
             errors.push(ValidationError::InvalidTimeout(self.server.request_timeout_seconds));
         }
         
+        // Validate loop detection before the configuration reaches runtime state.
+        if let Err(loop_errors) = self.loop_detection.validate() {
+            errors.extend(loop_errors.into_iter().map(|error| ValidationError::InvalidValue {
+                field: "loop_detection".to_string(),
+                value: error.to_string(),
+                expected: "a valid loop detection configuration".to_string(),
+            }));
+        }
+
         // Validate at least one provider (21.7)
         if self.providers.is_empty() {
             errors.push(ValidationError::NoProviders);
@@ -731,6 +740,7 @@ mod property_tests {
             codex_instructions_url: None,
             streaming: None,
             virtual_keys: Default::default(),
+            loop_detection: Default::default(),
             guardrails: None,
         }
     }

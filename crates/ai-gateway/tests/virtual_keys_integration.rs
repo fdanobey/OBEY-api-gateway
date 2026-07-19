@@ -129,6 +129,7 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
             enforcement,
             database_path: db_path,
         },
+        loop_detection: Default::default(),
         guardrails: None,
     }
 }
@@ -174,6 +175,7 @@ fn create_defaults() -> CreateKeyParams {
         tokens_per_minute: None,
         model_access: None,
         expires_in: None,
+        loop_detection: None,
     }
 }
 

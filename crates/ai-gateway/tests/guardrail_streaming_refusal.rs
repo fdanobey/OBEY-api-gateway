@@ -129,6 +129,7 @@ fn two_provider_config(
             ..StreamingConfig::default()
         }),
         virtual_keys: Default::default(),
+        loop_detection: Default::default(),
         guardrails: Some(guardrails),
     }
 }

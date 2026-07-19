@@ -107,6 +107,7 @@ mod tests {
             tokens_per_minute: None,
             model_access,
             expires_at: None,
+            loop_detection: None,
         }
     }
 

@@ -173,6 +173,7 @@ fn stored_to_authenticated(stored: &StoredVirtualKey) -> AuthenticatedKey {
         tokens_per_minute: stored.tokens_per_minute,
         model_access: stored.model_access_list.clone(),
         expires_at: stored.expires_at,
+        loop_detection: stored.loop_detection.clone(),
     }
 }
 
@@ -548,6 +549,7 @@ mod tests {
             tokens_per_minute: None,
             model_access: None,
             expires_in: None,
+            loop_detection: None,
         }
     }
 

@@ -79,6 +79,7 @@ fn codex_test_config() -> Config {
         codex_instructions_url: None,
         streaming: None,
         virtual_keys: Default::default(),
+        loop_detection: Default::default(),
         guardrails: None,
     }
 }

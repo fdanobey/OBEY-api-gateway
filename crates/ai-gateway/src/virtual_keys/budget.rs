@@ -185,6 +185,7 @@ mod tests {
             tokens_per_minute: None,
             model_access: None,
             expires_at: None,
+            loop_detection: None,
         }
     }
 

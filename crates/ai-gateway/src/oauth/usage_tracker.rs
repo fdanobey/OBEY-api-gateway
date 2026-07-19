@@ -135,18 +135,33 @@ fn update_from_codex_headers(
     headers: &reqwest::header::HeaderMap,
     now: u64,
 ) -> bool {
-    let short = codex_window(headers, "primary", now);
-    let weekly = codex_window(headers, "secondary", now);
-    let updated = short.is_some() || weekly.is_some();
+    let primary = codex_window(headers, "primary", now);
+    let secondary = codex_window(headers, "secondary", now);
 
-    if let Some(window) = short {
-        state.short.requests = window;
+    let mut updated = false;
+    if let Some(window) = primary {
+        assign_codex_window(state, window, now);
+        updated = true;
     }
-    if let Some(window) = weekly {
-        state.weekly.requests = window;
+    if let Some(window) = secondary {
+        assign_codex_window(state, window, now);
+        updated = true;
     }
 
     updated
+}
+
+fn assign_codex_window(state: &mut UsageSnapshot, window: RateLimitWindow, now: u64) {
+    let is_weekly = window
+        .resets_at
+        .map(|reset| reset.saturating_sub(now) >= WEEKLY_THRESHOLD_SECS)
+        .unwrap_or(false);
+
+    if is_weekly {
+        state.weekly.requests = window;
+    } else {
+        state.short.requests = window;
+    }
 }
 
 fn codex_window(
@@ -408,42 +423,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_codex_windows_from_oauth_headers() {
+    async fn test_codex_primary_header_with_weekly_reset_is_routed_to_weekly() {
         let tracker = UsageTracker::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let mut headers = reqwest::header::HeaderMap::new();
+        // 100% used in the long-term window, reset ~7 days out.
+        headers.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        headers.insert(
+            "x-codex-primary-reset-at",
+            (now + 7 * 86_400).to_string().parse().unwrap(),
+        );
+
+        tracker.update_from_headers(&headers).await;
+        let snap = tracker.snapshot().await;
+
+        // Should be routed to weekly based on reset duration, not short.
+        assert_eq!(snap.weekly.requests.limit, Some(100));
+        assert_eq!(snap.weekly.requests.remaining, Some(0));
+        assert!(snap.weekly.requests.resets_at.is_some());
+        assert_eq!(snap.short.requests.limit, None);
+        assert_eq!(snap.short.requests.remaining, None);
+    }
+
+    #[tokio::test]
+    async fn test_codex_primary_header_with_short_reset_is_routed_to_short() {
+        let tracker = UsageTracker::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut headers = reqwest::header::HeaderMap::new();
+        // Short-term window, reset 3h30m out.
         headers.insert("x-codex-primary-used-percent", "37.4".parse().unwrap());
-        headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
-        headers.insert("x-codex-primary-reset-at", "2000000000".parse().unwrap());
-        headers.insert("x-codex-secondary-used-percent", "82".parse().unwrap());
-        headers.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
-        headers.insert("x-codex-secondary-reset-at", "2000500000".parse().unwrap());
+        headers.insert(
+            "x-codex-primary-reset-at",
+            (now + 12_600).to_string().parse().unwrap(),
+        );
 
         tracker.update_from_headers(&headers).await;
         let snap = tracker.snapshot().await;
 
         assert_eq!(snap.short.requests.limit, Some(100));
         assert_eq!(snap.short.requests.remaining, Some(63));
-        assert_eq!(snap.short.requests.resets_at, Some(2_000_000_000));
+        assert!(snap.short.requests.resets_at.is_some());
+        assert_eq!(snap.weekly.requests.limit, None);
+    }
+
+    #[tokio::test]
+    async fn test_codex_windows_from_oauth_headers() {
+        let tracker = UsageTracker::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", "37.4".parse().unwrap());
+        headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+        headers.insert(
+            "x-codex-primary-reset-at",
+            (now + 18_000).to_string().parse().unwrap(),
+        );
+        headers.insert("x-codex-secondary-used-percent", "82".parse().unwrap());
+        headers.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
+        headers.insert(
+            "x-codex-secondary-reset-at",
+            (now + 7 * 86_400).to_string().parse().unwrap(),
+        );
+
+        tracker.update_from_headers(&headers).await;
+        let snap = tracker.snapshot().await;
+
+        assert_eq!(snap.short.requests.limit, Some(100));
+        assert_eq!(snap.short.requests.remaining, Some(63));
+        assert!(snap.short.requests.resets_at.is_some());
         assert_eq!(snap.weekly.requests.limit, Some(100));
         assert_eq!(snap.weekly.requests.remaining, Some(18));
-        assert_eq!(snap.weekly.requests.resets_at, Some(2_000_500_000));
+        assert!(snap.weekly.requests.resets_at.is_some());
         assert!(snap.updated_at > 0);
     }
 
     #[tokio::test]
     async fn test_codex_reset_at_milliseconds_are_normalized() {
         let tracker = UsageTracker::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-codex-primary-used-percent", "10".parse().unwrap());
         headers.insert(
             "x-codex-primary-reset-at",
-            "2000000000000".parse().unwrap(),
+            ((now + 3_600) * 1_000).to_string().parse().unwrap(),
         );
 
         tracker.update_from_headers(&headers).await;
         let snap = tracker.snapshot().await;
 
-        assert_eq!(snap.short.requests.resets_at, Some(2_000_000_000));
+        let reset_at = snap.short.requests.resets_at.expect("reset should be set");
+        assert!(reset_at > now && reset_at <= now + 3_600);
     }
 
     #[tokio::test]

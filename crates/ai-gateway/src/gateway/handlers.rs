@@ -3606,6 +3606,10 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
     // Req 11.5: guardrail counter/histogram metrics with the
     // `obey_api_guardrail_` prefix.
     state.metrics.write_guardrail_prometheus(&mut out);
+    state
+        .loop_detector
+        .metrics
+        .write_prometheus(&mut out, state.loop_detector.sessions.len());
 
     (
         StatusCode::OK,
