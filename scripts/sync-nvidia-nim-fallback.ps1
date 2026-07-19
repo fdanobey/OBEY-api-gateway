@@ -157,7 +157,11 @@ function Convert-ParameterCount {
 
 function Get-ModelMetadata {
     param([string]$Id)
-    $url = "https://build.nvidia.com/$Id"
+    # NVIDIA build pages replace dots with underscores in the model-name segment
+    # e.g. nvidia/llama-3.1-nemotron-70b-instruct -> nvidia/llama-3_1-nemotron-70b-instruct
+    $parts = $Id -split '/', 2
+    $sluggedName = if ($parts.Count -eq 2) { "$($parts[0])/$($parts[1] -replace '\.', '_')" } else { $Id -replace '\.', '_' }
+    $url = "https://build.nvidia.com/$sluggedName"
     $metadata = [ordered]@{
         id = $Id
         owned_by = ($Id -split '/', 2)[0]
