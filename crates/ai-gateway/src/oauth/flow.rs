@@ -338,8 +338,7 @@ impl OAuthFlow {
             .unwrap_or(callback_port);
 
         // 3. Build the redirect_uri with the REAL port.
-        let redirect_uri =
-            format!("http://localhost:{}/auth/callback", actual_port);
+        let redirect_uri = format!("http://localhost:{}/auth/callback", actual_port);
 
         // 4. Stash secrets + redirect URI for the later token-exchange step.
         self.pkce_verifier = Some(pkce_pair.code_verifier);
@@ -377,12 +376,9 @@ impl OAuthFlow {
         };
 
         // 7. Spawn the callback server using the pre-bound listener.
-        let server_handle: JoinHandle<Result<AuthorizationCode, OAuthError>> =
-            tokio::spawn(super::callback::start_callback_server_with_listener(
-                listener,
-                state,
-                callback_timeout,
-            ));
+        let server_handle: JoinHandle<Result<AuthorizationCode, OAuthError>> = tokio::spawn(
+            super::callback::start_callback_server_with_listener(listener, state, callback_timeout),
+        );
 
         // 8. Advance the state machine.
         self.state = FlowState::AwaitingCallback;

@@ -134,10 +134,7 @@ impl VirtualKeyManager {
     /// (Req 8.1, 8.5).
     ///
     /// _Requirements: 8.1, 8.5_
-    pub async fn list_keys(
-        &self,
-        params: ListKeysParams,
-    ) -> Result<PaginatedKeys, KeyError> {
+    pub async fn list_keys(&self, params: ListKeysParams) -> Result<PaginatedKeys, KeyError> {
         let limit = if params.limit == 0 {
             LIST_DEFAULT_LIMIT
         } else {
@@ -311,7 +308,9 @@ fn validate_update_params(params: &UpdateKeyParams) -> Result<(), KeyError> {
     }
 
     if let Some(Some(loop_detection)) = &params.loop_detection {
-        if let Err(loop_errors) = loop_detection.merge(&crate::loop_detection::LoopDetectionConfig::default()) {
+        if let Err(loop_errors) =
+            loop_detection.merge(&crate::loop_detection::LoopDetectionConfig::default())
+        {
             for error in loop_errors {
                 errors.push("loop_detection", error.to_string());
             }

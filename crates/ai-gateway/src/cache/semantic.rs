@@ -138,9 +138,7 @@ impl SemanticCache {
                         .vectors_config(VectorParamsBuilder::new(vector_dim, Distance::Cosine)),
                 )
                 .await
-                .map_err(|e| {
-                    GatewayError::Cache(format!("Failed to create collection: {}", e))
-                })?;
+                .map_err(|e| GatewayError::Cache(format!("Failed to create collection: {}", e)))?;
 
             info!(
                 collection = %self.collection_name,
@@ -296,14 +294,16 @@ impl SemanticCache {
     ///
     /// Returns the number of entries deleted.
     pub async fn evict_expired(&self) -> Result<usize, GatewayError> {
-        use qdrant_client::qdrant::{Condition, Filter, FieldCondition, Range, DeletePointsBuilder};
+        use qdrant_client::qdrant::{
+            Condition, DeletePointsBuilder, FieldCondition, Filter, Range,
+        };
 
         let cutoff_timestamp = chrono::Utc::now().timestamp() - self.ttl_seconds as i64;
 
         let filter = Filter {
             must: vec![Condition {
-                condition_one_of: Some(
-                    qdrant_client::qdrant::condition::ConditionOneOf::Field(FieldCondition {
+                condition_one_of: Some(qdrant_client::qdrant::condition::ConditionOneOf::Field(
+                    FieldCondition {
                         key: "timestamp".to_string(),
                         r#match: None,
                         range: Some(Range {
@@ -311,8 +311,8 @@ impl SemanticCache {
                             ..Default::default()
                         }),
                         ..Default::default()
-                    }),
-                ),
+                    },
+                )),
             }],
             ..Default::default()
         };
@@ -330,7 +330,9 @@ impl SemanticCache {
     /// Uses LRU (Least Recently Used) strategy based on timestamp.
     /// Returns the number of entries deleted.
     pub async fn evict_lru(&self) -> Result<usize, GatewayError> {
-        use qdrant_client::qdrant::{ScrollPointsBuilder, OrderByBuilder, Direction, CountPointsBuilder, DeletePointsBuilder};
+        use qdrant_client::qdrant::{
+            CountPointsBuilder, DeletePointsBuilder, Direction, OrderByBuilder, ScrollPointsBuilder,
+        };
 
         // 1. Count total points in collection
         let count_result = self
@@ -397,7 +399,10 @@ impl SemanticCache {
             .http_client
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", self.embedding_api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.embedding_api_key),
+            )
             .json(&body)
             .send()
             .await
@@ -504,12 +509,24 @@ mod tests {
 
     #[test]
     fn test_normalize_qdrant_url_rest_to_grpc() {
-        assert_eq!(normalize_qdrant_url("http://localhost:6333"), "http://localhost:6334");
-        assert_eq!(normalize_qdrant_url("http://qdrant:6333"), "http://qdrant:6334");
+        assert_eq!(
+            normalize_qdrant_url("http://localhost:6333"),
+            "http://localhost:6334"
+        );
+        assert_eq!(
+            normalize_qdrant_url("http://qdrant:6333"),
+            "http://qdrant:6334"
+        );
         // Already gRPC port — no change
-        assert_eq!(normalize_qdrant_url("http://localhost:6334"), "http://localhost:6334");
+        assert_eq!(
+            normalize_qdrant_url("http://localhost:6334"),
+            "http://localhost:6334"
+        );
         // Custom port — no change
-        assert_eq!(normalize_qdrant_url("http://localhost:9999"), "http://localhost:9999");
+        assert_eq!(
+            normalize_qdrant_url("http://localhost:9999"),
+            "http://localhost:9999"
+        );
     }
 
     #[test]
@@ -554,7 +571,10 @@ mod tests {
 
         assert_eq!(deserialized.id, entry.id);
         assert_eq!(deserialized.vector, entry.vector);
-        assert_eq!(deserialized.payload.request_hash, entry.payload.request_hash);
+        assert_eq!(
+            deserialized.payload.request_hash,
+            entry.payload.request_hash
+        );
     }
 
     #[test]
@@ -603,8 +623,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_embedding_success() {
-        use wiremock::{MockServer, Mock, ResponseTemplate};
-        use wiremock::matchers::{method, path, header};
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
 
@@ -653,8 +673,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_embedding_http_error() {
-        use wiremock::{MockServer, Mock, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
 
@@ -689,8 +709,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_embedding_empty_response() {
-        use wiremock::{MockServer, Mock, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
 
@@ -761,10 +781,10 @@ mod property_tests {
             // We verify the threshold check logic directly since full integration
             // would require Qdrant running
             let should_hit = similarity_score >= threshold;
-            
+
             // Verify threshold comparison logic
             let actual_hit = similarity_score >= cache.similarity_threshold;
-            
+
             prop_assert_eq!(
                 should_hit,
                 actual_hit,
@@ -845,7 +865,7 @@ mod property_tests {
                     extra: Default::default(),
                 };
 
-                let response = format!(r#"{{"id":"{}","object":"chat.completion","created":1234567890,"model":"{}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}}}"#, 
+                let response = format!(r#"{{"id":"{}","object":"chat.completion","created":1234567890,"model":"{}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}}}"#,
                     response_id, model, response_content);
 
                 // Store in cache

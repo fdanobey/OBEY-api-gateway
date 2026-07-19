@@ -36,9 +36,7 @@ pub const XHIGH_MODEL_PATTERNS: &[&str] = &[
 ///
 /// Membership is substring-based. The order is the insertion order
 /// documented in the spec and is preserved verbatim.
-pub const REASONING_MODEL_PATTERNS: &[&str] = &[
-    "codex", "gpt-5", "gpt-6", "o1", "o3", "o4",
-];
+pub const REASONING_MODEL_PATTERNS: &[&str] = &["codex", "gpt-5", "gpt-6", "o1", "o3", "o4"];
 
 /// Forward the client-supplied model unchanged unless a
 /// `codex_model_override` is configured on the provider.
@@ -61,8 +59,7 @@ pub fn resolve_model<'a>(client_model: &'a str, override_: Option<&'a str>) -> &
 ///
 /// _Requirements: 8.4, 10.9, 10.10._
 pub fn is_xhigh(model: &str, allowlist: &[String]) -> bool {
-    XHIGH_MODEL_PATTERNS.iter().any(|p| model.contains(p))
-        || allowlist.iter().any(|a| a == model)
+    XHIGH_MODEL_PATTERNS.iter().any(|p| model.contains(p)) || allowlist.iter().any(|a| a == model)
 }
 
 /// Returns `true` when `model` should receive a `reasoning` field on the

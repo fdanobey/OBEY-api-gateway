@@ -10,7 +10,11 @@ pub enum GatewayError {
     Configuration(String),
 
     #[error("Provider error: {provider} - {message}")]
-    Provider { provider: String, message: String, status_code: Option<u16> },
+    Provider {
+        provider: String,
+        message: String,
+        status_code: Option<u16>,
+    },
 
     #[error("All providers failed")]
     AllProvidersFailed(AggregatedError),
@@ -109,11 +113,9 @@ impl GatewayError {
             GatewayError::GuardrailPolicyViolation { .. } => StatusCode::FORBIDDEN,
             GatewayError::GuardrailInvalidAction => StatusCode::BAD_REQUEST,
             GatewayError::GuardrailUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-            GatewayError::Provider { status_code, .. } => {
-                status_code
-                    .and_then(|c| StatusCode::from_u16(c).ok())
-                    .unwrap_or(StatusCode::BAD_GATEWAY)
-            }
+            GatewayError::Provider { status_code, .. } => status_code
+                .and_then(|c| StatusCode::from_u16(c).ok())
+                .unwrap_or(StatusCode::BAD_GATEWAY),
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -130,12 +132,7 @@ pub struct ProviderAttempt {
 }
 
 impl ProviderAttempt {
-    pub fn new(
-        provider: String,
-        model: String,
-        error: String,
-        status_code: Option<u16>,
-    ) -> Self {
+    pub fn new(provider: String, model: String, error: String, status_code: Option<u16>) -> Self {
         Self {
             provider,
             model,
@@ -243,7 +240,7 @@ mod tests {
         );
 
         let json = serde_json::to_value(&attempt).expect("Should serialize to JSON");
-        
+
         assert!(json.get("timestamp").is_some());
         let timestamp_str = json["timestamp"].as_str().unwrap();
         assert!(!timestamp_str.is_empty());

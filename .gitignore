@@ -27,6 +27,9 @@ cargo_*.txt
 # Temp test directories
 tmp-*/
 
+# NVIDIA NIM catalog probe cache/state
+/scripts/.cache/
+
 # IDE / editor metadata
 .vscode/
 .idea/

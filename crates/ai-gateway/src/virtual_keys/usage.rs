@@ -152,9 +152,7 @@ mod tests {
             .record(record_at(&key.id, 2_000, 200, 25, 0.0020))
             .unwrap();
 
-        let agg = tracker
-            .query_aggregate(&key.id, ts(0), ts(10_000))
-            .unwrap();
+        let agg = tracker.query_aggregate(&key.id, ts(0), ts(10_000)).unwrap();
         assert!((agg.total_spend_usd - 0.0035).abs() < 1e-9);
         assert_eq!(agg.total_input_tokens, 300);
         assert_eq!(agg.total_output_tokens, 75);
@@ -175,9 +173,15 @@ mod tests {
         let key = mgr.create_key(defaults()).await.unwrap();
         let tracker = UsageTracker::new(std::sync::Arc::clone(&mgr.store));
 
-        tracker.record(record_at(&key.id, 100, 10, 0, 0.01)).unwrap();
-        tracker.record(record_at(&key.id, 200, 20, 0, 0.02)).unwrap();
-        tracker.record(record_at(&key.id, 300, 30, 0, 0.03)).unwrap();
+        tracker
+            .record(record_at(&key.id, 100, 10, 0, 0.01))
+            .unwrap();
+        tracker
+            .record(record_at(&key.id, 200, 20, 0, 0.02))
+            .unwrap();
+        tracker
+            .record(record_at(&key.id, 300, 30, 0, 0.03))
+            .unwrap();
 
         // Range [100, 300] includes all three (both boundaries inclusive).
         let all = tracker.query_aggregate(&key.id, ts(100), ts(300)).unwrap();
@@ -201,7 +205,9 @@ mod tests {
         let key = mgr.create_key(defaults()).await.unwrap();
         let tracker = UsageTracker::new(std::sync::Arc::clone(&mgr.store));
 
-        tracker.record(record_at(&key.id, 5_000, 10, 5, 0.01)).unwrap();
+        tracker
+            .record(record_at(&key.id, 5_000, 10, 5, 0.01))
+            .unwrap();
 
         let agg = tracker.query_aggregate(&key.id, ts(0), ts(1_000)).unwrap();
         assert_eq!(agg.total_spend_usd, 0.0);

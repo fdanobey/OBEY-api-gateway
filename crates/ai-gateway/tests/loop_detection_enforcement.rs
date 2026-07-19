@@ -91,11 +91,26 @@ fn escalation_uses_session_wide_consecutive_streak() {
     config.consecutive_counts.hardstop = 5;
     let mut session = SessionState::new(Some("vk".into()), 5);
 
-    assert_eq!(EnforcementEngine::evaluate(1.0, &mut session, &config).level, EnforcementLevel::None);
-    assert_eq!(EnforcementEngine::evaluate(1.0, &mut session, &config).level, EnforcementLevel::Warn);
-    assert_eq!(EnforcementEngine::evaluate(1.0, &mut session, &config).level, EnforcementLevel::Throttle);
-    assert_eq!(EnforcementEngine::evaluate(1.0, &mut session, &config).level, EnforcementLevel::Inject);
-    assert_eq!(EnforcementEngine::evaluate(1.0, &mut session, &config).level, EnforcementLevel::HardStop);
+    assert_eq!(
+        EnforcementEngine::evaluate(1.0, &mut session, &config).level,
+        EnforcementLevel::None
+    );
+    assert_eq!(
+        EnforcementEngine::evaluate(1.0, &mut session, &config).level,
+        EnforcementLevel::Warn
+    );
+    assert_eq!(
+        EnforcementEngine::evaluate(1.0, &mut session, &config).level,
+        EnforcementLevel::Throttle
+    );
+    assert_eq!(
+        EnforcementEngine::evaluate(1.0, &mut session, &config).level,
+        EnforcementLevel::Inject
+    );
+    assert_eq!(
+        EnforcementEngine::evaluate(1.0, &mut session, &config).level,
+        EnforcementLevel::HardStop
+    );
 }
 
 #[test]

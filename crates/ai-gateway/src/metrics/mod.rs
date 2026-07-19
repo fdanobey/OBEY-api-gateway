@@ -66,8 +66,9 @@ type GuardrailLatencyKey = (String, String, String);
 /// Upper bucket boundaries (inclusive, milliseconds) for the guardrail stage
 /// latency histogram (Req 11.2). Observations greater than the last boundary
 /// fall only into the implicit `+Inf` bucket.
-const GUARDRAIL_LATENCY_BUCKETS_MS: [f64; 10] =
-    [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0];
+const GUARDRAIL_LATENCY_BUCKETS_MS: [f64; 10] = [
+    5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+];
 
 /// Per-label-set latency histogram. Bucket counts are stored non-cumulatively
 /// and rendered cumulatively in Prometheus exposition. The latency sum is kept
@@ -179,12 +180,10 @@ impl MetricsSnapshot {
                 .iter()
                 .filter(|(key, _)| key.starts_with(&ph.provider))
                 .map(|(_, state)| state.as_str())
-                .fold("closed", |worst, s| {
-                    match (worst, s) {
-                        (_, "open") | ("open", _) => "open",
-                        (_, "half_open") | ("half_open", _) => "half_open",
-                        _ => "closed",
-                    }
+                .fold("closed", |worst, s| match (worst, s) {
+                    (_, "open") | ("open", _) => "open",
+                    (_, "half_open") | ("half_open", _) => "half_open",
+                    _ => "closed",
                 });
             ph.circuit_breaker_state = worst_state.to_string();
         }
@@ -265,7 +264,7 @@ impl Metrics {
     pub fn start_request(&self) {
         self.request_count.fetch_add(1, Ordering::Relaxed);
         self.active_requests.fetch_add(1, Ordering::Relaxed);
-        
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -280,7 +279,10 @@ impl Metrics {
         let mut current = self.active_requests.load(Ordering::Relaxed);
         loop {
             if current == 0 {
-                tracing::warn!(duration_ms, "Ignoring request completion because active request count is already zero");
+                tracing::warn!(
+                    duration_ms,
+                    "Ignoring request completion because active request count is already zero"
+                );
                 return;
             }
             match self.active_requests.compare_exchange_weak(
@@ -293,14 +295,17 @@ impl Metrics {
                 Err(actual) => current = actual,
             }
         }
-        self.total_response_time_ms.fetch_add(duration_ms, Ordering::Relaxed);
+        self.total_response_time_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
         self.completed_requests.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record successful provider request
     pub fn record_provider_success(&self, provider: &str, duration_ms: u64) {
-        let health = self.provider_health.entry(provider.to_string()).or_insert_with(|| {
-            ProviderHealth {
+        let health = self
+            .provider_health
+            .entry(provider.to_string())
+            .or_insert_with(|| ProviderHealth {
                 total_requests: AtomicU64::new(0),
                 successful_requests: AtomicU64::new(0),
                 failed_requests: AtomicU64::new(0),
@@ -309,13 +314,14 @@ impl Metrics {
                 last_failure_timestamp: AtomicU64::new(0),
                 last_failure_reason: Mutex::new(None),
                 cooldown_until_timestamp: AtomicU64::new(0),
-            }
-        });
+            });
 
         health.total_requests.fetch_add(1, Ordering::Relaxed);
         health.successful_requests.fetch_add(1, Ordering::Relaxed);
-        health.total_response_time_ms.fetch_add(duration_ms, Ordering::Relaxed);
-        
+        health
+            .total_response_time_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -349,8 +355,10 @@ impl Metrics {
         reason: Option<String>,
         cooldown_until_unix: Option<u64>,
     ) {
-        let health = self.provider_health.entry(provider.to_string()).or_insert_with(|| {
-            ProviderHealth {
+        let health = self
+            .provider_health
+            .entry(provider.to_string())
+            .or_insert_with(|| ProviderHealth {
                 total_requests: AtomicU64::new(0),
                 successful_requests: AtomicU64::new(0),
                 failed_requests: AtomicU64::new(0),
@@ -359,12 +367,11 @@ impl Metrics {
                 last_failure_timestamp: AtomicU64::new(0),
                 last_failure_reason: Mutex::new(None),
                 cooldown_until_timestamp: AtomicU64::new(0),
-            }
-        });
+            });
 
         health.total_requests.fetch_add(1, Ordering::Relaxed);
         health.failed_requests.fetch_add(1, Ordering::Relaxed);
-        
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -377,7 +384,9 @@ impl Metrics {
             }
         }
         if let Some(deadline) = cooldown_until_unix {
-            health.cooldown_until_timestamp.store(deadline, Ordering::Relaxed);
+            health
+                .cooldown_until_timestamp
+                .store(deadline, Ordering::Relaxed);
         }
     }
 
@@ -385,14 +394,11 @@ impl Metrics {
     /// without recording a new failure (the failure was already recorded
     /// in the same code path). Updates the dashboard's "last failure
     /// reason" to reflect the rate-limit pause and stores the deadline.
-    pub fn set_provider_cooldown(
-        &self,
-        provider: &str,
-        reason: String,
-        cooldown_until_unix: u64,
-    ) {
-        let health = self.provider_health.entry(provider.to_string()).or_insert_with(|| {
-            ProviderHealth {
+    pub fn set_provider_cooldown(&self, provider: &str, reason: String, cooldown_until_unix: u64) {
+        let health = self
+            .provider_health
+            .entry(provider.to_string())
+            .or_insert_with(|| ProviderHealth {
                 total_requests: AtomicU64::new(0),
                 successful_requests: AtomicU64::new(0),
                 failed_requests: AtomicU64::new(0),
@@ -401,13 +407,14 @@ impl Metrics {
                 last_failure_timestamp: AtomicU64::new(0),
                 last_failure_reason: Mutex::new(None),
                 cooldown_until_timestamp: AtomicU64::new(0),
-            }
-        });
+            });
 
         if let Ok(mut slot) = health.last_failure_reason.lock() {
             *slot = Some(reason);
         }
-        health.cooldown_until_timestamp.store(cooldown_until_unix, Ordering::Relaxed);
+        health
+            .cooldown_until_timestamp
+            .store(cooldown_until_unix, Ordering::Relaxed);
     }
 
     /// Number of seconds remaining on an upstream-driven cooldown for
@@ -423,7 +430,10 @@ impl Metrics {
     /// showing as "Pausing for ~23h (rate limited)".
     pub fn provider_cooldown_remaining_secs(&self, provider: &str) -> Option<u64> {
         let entry = self.provider_health.get(provider)?;
-        let deadline = entry.value().cooldown_until_timestamp.load(Ordering::Relaxed);
+        let deadline = entry
+            .value()
+            .cooldown_until_timestamp
+            .load(Ordering::Relaxed);
         if deadline == 0 {
             return None;
         }
@@ -443,7 +453,10 @@ impl Metrics {
     /// succeeds, so the dashboard reflects recovery immediately.
     pub fn clear_provider_cooldown(&self, provider: &str) {
         if let Some(entry) = self.provider_health.get(provider) {
-            entry.value().cooldown_until_timestamp.store(0, Ordering::Relaxed);
+            entry
+                .value()
+                .cooldown_until_timestamp
+                .store(0, Ordering::Relaxed);
             if let Ok(mut slot) = entry.value().last_failure_reason.lock() {
                 *slot = None;
             }
@@ -453,8 +466,9 @@ impl Metrics {
     /// Add cost to cumulative total and per-provider tracking
     pub fn add_cost(&self, provider: &str, cost: f64) {
         let cost_cents = (cost * 100.0) as u64;
-        self.cumulative_cost_cents.fetch_add(cost_cents, Ordering::Relaxed);
-        
+        self.cumulative_cost_cents
+            .fetch_add(cost_cents, Ordering::Relaxed);
+
         self.cost_by_provider_cents
             .entry(provider.to_string())
             .or_insert_with(|| AtomicU64::new(0))
@@ -720,11 +734,11 @@ Total refusal failover outcomes by pipeline and outcome\n",
             .map(|entry| {
                 let provider = entry.key().clone();
                 let health = entry.value();
-                
+
                 let total = health.total_requests.load(Ordering::Relaxed);
                 let successful = health.successful_requests.load(Ordering::Relaxed);
                 let failed = health.failed_requests.load(Ordering::Relaxed);
-                
+
                 let success_rate = if total > 0 {
                     successful as f64 / total as f64
                 } else {
@@ -774,8 +788,16 @@ Total refusal failover outcomes by pipeline and outcome\n",
                     failed_requests: failed,
                     success_rate,
                     avg_response_time_ms,
-                    last_success_timestamp: if last_success > 0 { Some(last_success) } else { None },
-                    last_failure_timestamp: if last_failure > 0 { Some(last_failure) } else { None },
+                    last_success_timestamp: if last_success > 0 {
+                        Some(last_success)
+                    } else {
+                        None
+                    },
+                    last_failure_timestamp: if last_failure > 0 {
+                        Some(last_failure)
+                    } else {
+                        None
+                    },
                     status,
                     circuit_breaker_state: "closed".to_string(),
                     last_failure_reason,
@@ -809,7 +831,12 @@ Total refusal failover outcomes by pipeline and outcome\n",
         let budget_limit_by_provider: Vec<(String, f64)> = self
             .budget_limit_by_provider_cents
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed) as f64 / 100.0))
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().load(Ordering::Relaxed) as f64 / 100.0,
+                )
+            })
             .collect();
 
         let budget_exhaustions_by_provider: Vec<(String, u64)> = self
@@ -888,7 +915,7 @@ mod tests {
     fn test_metrics_initialization() {
         let metrics = Metrics::new();
         let snapshot = metrics.snapshot();
-        
+
         assert_eq!(snapshot.request_count, 0);
         assert_eq!(snapshot.active_requests, 0);
         assert_eq!(snapshot.cumulative_cost, 0.0);
@@ -898,11 +925,11 @@ mod tests {
     #[test]
     fn test_request_tracking() {
         let metrics = Metrics::new();
-        
+
         metrics.start_request();
         assert_eq!(metrics.snapshot().request_count, 1);
         assert_eq!(metrics.snapshot().active_requests, 1);
-        
+
         metrics.complete_request(100);
         assert_eq!(metrics.snapshot().active_requests, 0);
         assert_eq!(metrics.snapshot().avg_response_time_ms, 100.0);
@@ -927,14 +954,18 @@ mod tests {
     #[test]
     fn test_provider_health_tracking() {
         let metrics = Metrics::new();
-        
+
         metrics.record_provider_success("provider1", 50);
         metrics.record_provider_success("provider1", 150);
         metrics.record_provider_failure("provider1");
-        
+
         let snapshot = metrics.snapshot();
-        let health = snapshot.provider_health.iter().find(|h| h.provider == "provider1").unwrap();
-        
+        let health = snapshot
+            .provider_health
+            .iter()
+            .find(|h| h.provider == "provider1")
+            .unwrap();
+
         assert_eq!(health.total_requests, 3);
         assert_eq!(health.successful_requests, 2);
         assert_eq!(health.failed_requests, 1);
@@ -946,15 +977,17 @@ mod tests {
     #[test]
     fn test_cost_tracking() {
         let metrics = Metrics::new();
-        
+
         metrics.add_cost("provider1", 0.05);
         metrics.add_cost("provider2", 0.10);
         metrics.add_cost("provider1", 0.03);
-        
+
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.cumulative_cost, 0.18);
-        
-        let provider1_cost = snapshot.cost_by_provider.iter()
+
+        let provider1_cost = snapshot
+            .cost_by_provider
+            .iter()
             .find(|(p, _)| p == "provider1")
             .map(|(_, c)| *c)
             .unwrap();
@@ -969,11 +1002,15 @@ mod tests {
         metrics.record_provider_retry("provider1", 800);
 
         let snapshot = metrics.snapshot();
-        let retry_count = snapshot.retry_count_by_provider.iter()
+        let retry_count = snapshot
+            .retry_count_by_provider
+            .iter()
             .find(|(p, _)| p == "provider1")
             .map(|(_, c)| *c)
             .unwrap();
-        let retry_delay = snapshot.retry_delay_ms_by_provider.iter()
+        let retry_delay = snapshot
+            .retry_delay_ms_by_provider
+            .iter()
             .find(|(p, _)| p == "provider1")
             .map(|(_, c)| *c)
             .unwrap();
@@ -992,19 +1029,27 @@ mod tests {
         metrics.record_provider_rate_limit_exhausted("provider1");
 
         let snapshot = metrics.snapshot();
-        let budget_limit = snapshot.budget_limit_by_provider.iter()
+        let budget_limit = snapshot
+            .budget_limit_by_provider
+            .iter()
             .find(|(p, _)| p == "provider1")
             .map(|(_, c)| *c)
             .unwrap();
-        let budget_exhaustions = snapshot.budget_exhaustions_by_provider.iter()
+        let budget_exhaustions = snapshot
+            .budget_exhaustions_by_provider
+            .iter()
             .find(|(p, _)| p == "provider1")
             .map(|(_, c)| *c)
             .unwrap();
-        let unknown_cost = snapshot.unknown_cost_by_provider.iter()
+        let unknown_cost = snapshot
+            .unknown_cost_by_provider
+            .iter()
             .find(|(p, _)| p == "provider1")
             .map(|(_, c)| *c)
             .unwrap();
-        let rate_limit_exhaustions = snapshot.rate_limit_exhaustions_by_provider.iter()
+        let rate_limit_exhaustions = snapshot
+            .rate_limit_exhaustions_by_provider
+            .iter()
             .find(|(p, _)| p == "provider1")
             .map(|(_, c)| *c)
             .unwrap();
@@ -1018,11 +1063,11 @@ mod tests {
     #[test]
     fn test_cache_hit_rate() {
         let metrics = Metrics::new();
-        
+
         metrics.record_cache_hit();
         metrics.record_cache_hit();
         metrics.record_cache_miss();
-        
+
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.cache_hit_rate, Some(2.0 / 3.0));
     }
@@ -1151,7 +1196,7 @@ mod tests {
                     .find(|(p, _)| p == provider)
                     .map(|(_, c)| *c)
                     .unwrap_or(0.0);
-                
+
                 assert!((actual_cost - expected_cost).abs() < f64::EPSILON,
                     "Provider {} cost {} should equal sum of its costs {}",
                     provider, actual_cost, expected_cost);
@@ -1187,7 +1232,7 @@ mod tests {
                 .expect("Provider should exist in snapshot");
 
             let total = successes + failures;
-            
+
             // Skip if no requests (undefined success rate)
             if total == 0 {
                 return Ok(());

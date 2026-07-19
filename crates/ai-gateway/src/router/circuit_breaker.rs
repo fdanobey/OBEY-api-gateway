@@ -54,7 +54,7 @@ impl CircuitBreaker {
     }
 
     /// Check if the circuit breaker allows requests
-    /// 
+    ///
     /// Uses a write lock to atomically check and transition state, avoiding
     /// race conditions between checking elapsed time and updating state.
     pub async fn is_available(&self) -> bool {
@@ -92,14 +92,16 @@ impl CircuitBreaker {
 
         if failures >= self.failure_threshold as usize {
             let backoff_index = self.current_backoff_index.load(Ordering::SeqCst);
-            let retry_after = self.backoff_sequence[backoff_index.min(self.backoff_sequence.len() - 1)];
+            let retry_after =
+                self.backoff_sequence[backoff_index.min(self.backoff_sequence.len() - 1)];
 
             let mut state = self.state.write().await;
             match *state {
                 CircuitState::HalfOpen => {
                     // Failed in half-open, increase backoff
                     let next_index = (backoff_index + 1).min(self.backoff_sequence.len() - 1);
-                    self.current_backoff_index.store(next_index, Ordering::SeqCst);
+                    self.current_backoff_index
+                        .store(next_index, Ordering::SeqCst);
                     let new_retry_after = self.backoff_sequence[next_index];
                     *state = CircuitState::Open {
                         opened_at: Instant::now(),
@@ -175,9 +177,9 @@ mod tests {
 
         cb.record_failure().await;
         assert!(!cb.is_available().await);
-        
+
         sleep(Duration::from_millis(5100)).await;
-        
+
         // is_available transitions to half-open
         assert!(cb.is_available().await);
         assert_eq!(cb.get_state().await, CircuitState::HalfOpen);
@@ -251,7 +253,7 @@ mod tests {
                 sleep(retry_after + Duration::from_millis(5)).await;
                 assert!(cb.is_available().await);
             }
-            
+
             // After 5th failure, should be capped at 50ms
             if i >= 4 {
                 match cb.get_state().await {
@@ -336,9 +338,9 @@ mod property_tests {
         })]
 
         /// **Validates: Requirements 9.2-9.6**
-        /// 
+        ///
         /// Property 4: Circuit Breaker State Transitions
-        /// 
+        ///
         /// For any circuit breaker, the state transitions shall follow:
         /// - Closed → (after failure) → Open
         /// - Open → (after backoff) → HalfOpen
@@ -353,7 +355,7 @@ mod property_tests {
                 let backoff_durations: Vec<Duration> = backoff_ms.iter()
                     .map(|&ms| Duration::from_millis(ms))
                     .collect();
-                
+
                 let cb = CircuitBreaker::with_backoff_sequence(
                     failure_threshold,
                     backoff_durations.clone(),
@@ -367,7 +369,7 @@ mod property_tests {
                 for _ in 0..failure_threshold {
                     cb.record_failure().await;
                 }
-                
+
                 assert!(!cb.is_available().await);
                 match cb.get_state().await {
                     CircuitState::Open { retry_after, .. } => {
@@ -393,9 +395,9 @@ mod property_tests {
                 tokio::time::sleep(backoff_durations[0] + Duration::from_millis(5)).await;
                 assert!(cb.is_available().await);
                 assert_eq!(cb.get_state().await, CircuitState::HalfOpen);
-                
+
                 cb.record_failure().await;
-                
+
                 assert!(!cb.is_available().await);
                 match cb.get_state().await {
                     CircuitState::Open { retry_after, .. } => {
@@ -410,10 +412,10 @@ mod property_tests {
         }
 
         /// **Validates: Requirements 9.7, 9.8**
-        /// 
+        ///
         /// Property 5: Circuit Breaker Backoff Sequence
-        /// 
-        /// For any sequence of circuit breaker failures, the backoff times shall follow 
+        ///
+        /// For any sequence of circuit breaker failures, the backoff times shall follow
         /// the sequence [5s, 10s, 20s, 40s, 300s] with 300s as the maximum.
         #[test]
         fn prop_circuit_breaker_backoff_sequence(
@@ -429,7 +431,7 @@ mod property_tests {
                     Duration::from_millis(40),   // 40s -> 40ms
                     Duration::from_millis(300),  // 300s -> 300ms
                 ];
-                
+
                 let cb = CircuitBreaker::with_backoff_sequence(
                     failure_threshold,
                     test_sequence.clone(),
@@ -444,13 +446,13 @@ mod property_tests {
                     for _ in 0..failure_threshold {
                         cb.record_failure().await;
                     }
-                    
+
                     // Verify the circuit is open with correct backoff
                     assert!(!cb.is_available().await);
                     match cb.get_state().await {
                         CircuitState::Open { retry_after, .. } => {
                             assert_eq!(
-                                retry_after, 
+                                retry_after,
                                 test_sequence[i],
                                 "Failure iteration {}: expected backoff {:?}, got {:?}",
                                 i, test_sequence[i], retry_after
@@ -470,11 +472,11 @@ mod property_tests {
                 for _ in 0..failure_threshold {
                     cb.record_failure().await;
                 }
-                
+
                 match cb.get_state().await {
                     CircuitState::Open { retry_after, .. } => {
                         assert_eq!(
-                            retry_after, 
+                            retry_after,
                             *test_sequence.last().unwrap(),
                             "Backoff should be capped at maximum value"
                         );
@@ -485,10 +487,10 @@ mod property_tests {
         }
 
         /// **Validates: Requirements 9.9**
-        /// 
+        ///
         /// Property 6: Circuit Breaker Reset
-        /// 
-        /// For any circuit breaker in Open state, a successful request shall reset 
+        ///
+        /// For any circuit breaker in Open state, a successful request shall reset
         /// the backoff time to 5 seconds and transition to Closed state.
         #[test]
         fn prop_circuit_breaker_reset(
@@ -500,7 +502,7 @@ mod property_tests {
                 let backoff_durations: Vec<Duration> = backoff_ms.iter()
                     .map(|&ms| Duration::from_millis(ms))
                     .collect();
-                
+
                 let cb = CircuitBreaker::with_backoff_sequence(
                     failure_threshold,
                     backoff_durations.clone(),
@@ -513,7 +515,7 @@ mod property_tests {
                     for _ in 0..failure_threshold {
                         cb.record_failure().await;
                     }
-                    
+
                     // Verify circuit is open with expected backoff
                     assert!(!cb.is_available().await);
                     match cb.get_state().await {
@@ -531,7 +533,7 @@ mod property_tests {
 
                 // Now record a successful request - this should reset everything
                 cb.record_success().await;
-                
+
                 // Verify circuit is closed
                 assert_eq!(cb.get_state().await, CircuitState::Closed);
                 assert!(cb.is_available().await);
@@ -540,13 +542,13 @@ mod property_tests {
                 for _ in 0..failure_threshold {
                     cb.record_failure().await;
                 }
-                
+
                 // Verify circuit is open with FIRST backoff value (reset)
                 assert!(!cb.is_available().await);
                 match cb.get_state().await {
                     CircuitState::Open { retry_after, .. } => {
                         assert_eq!(
-                            retry_after, 
+                            retry_after,
                             backoff_durations[0],
                             "After success, backoff should reset to first value {:?}, got {:?}",
                             backoff_durations[0], retry_after

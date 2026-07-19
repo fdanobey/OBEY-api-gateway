@@ -40,7 +40,9 @@ fn invalid_weight_override_is_rejected() {
         }),
         ..Default::default()
     };
-    assert!(override_config.merge(&LoopDetectionConfig::default()).is_err());
+    assert!(override_config
+        .merge(&LoopDetectionConfig::default())
+        .is_err());
 }
 
 #[test]
@@ -55,6 +57,12 @@ fn full_override_replaces_only_supported_fields() {
     let merged = override_config.merge(&global).unwrap();
     assert_eq!(merged.throttle_delay_seconds, 10);
     assert_eq!(merged.injection_strategy, InjectionStrategy::ContextAware);
-    assert_eq!(merged.break_instruction_template.as_deref(), Some("escape now"));
-    assert_eq!(merged.session_timeout_minutes, global.session_timeout_minutes);
+    assert_eq!(
+        merged.break_instruction_template.as_deref(),
+        Some("escape now")
+    );
+    assert_eq!(
+        merged.session_timeout_minutes,
+        global.session_timeout_minutes
+    );
 }

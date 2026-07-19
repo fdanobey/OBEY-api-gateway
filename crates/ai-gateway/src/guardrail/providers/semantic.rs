@@ -214,7 +214,10 @@ impl SemanticProvider {
             .http_client
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", self.embedding_api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.embedding_api_key),
+            )
             .json(&body)
             .send()
             .await
@@ -269,9 +272,7 @@ impl SemanticProvider {
     ) -> Result<CollectionMatch, GuardrailProviderError> {
         let search = self
             .qdrant_client
-            .search_points(
-                SearchPointsBuilder::new(collection, embedding, 1).with_payload(true),
-            )
+            .search_points(SearchPointsBuilder::new(collection, embedding, 1).with_payload(true))
             .await
             .map_err(|e| {
                 GuardrailProviderError::Unreachable(format!(

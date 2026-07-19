@@ -65,14 +65,13 @@ pub async fn start_mock_openai(behavior: MockBehavior) -> MockServer {
     let server = MockServer::start().await;
 
     let response = match behavior {
-        MockBehavior::Success => ResponseTemplate::new(200)
-            .set_body_json(mock_chat_completion_response()),
+        MockBehavior::Success => {
+            ResponseTemplate::new(200).set_body_json(mock_chat_completion_response())
+        }
 
-        MockBehavior::Error(status) => ResponseTemplate::new(status)
-            .set_body_json(mock_error_response(
-                status,
-                &format!("Mock error with status {}", status),
-            )),
+        MockBehavior::Error(status) => ResponseTemplate::new(status).set_body_json(
+            mock_error_response(status, &format!("Mock error with status {}", status)),
+        ),
 
         MockBehavior::RateLimit => ResponseTemplate::new(429)
             .set_body_json(mock_error_response(429, "Rate limit exceeded"))
@@ -116,7 +115,10 @@ mod tests {
 
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["choices"][0]["message"]["content"], "Hello from mock provider!");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "Hello from mock provider!"
+        );
     }
 
     #[tokio::test]

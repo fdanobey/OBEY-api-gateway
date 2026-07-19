@@ -11,9 +11,9 @@
 //! - `lakera`      — LakeraProvider (task 7).
 //! - `semantic`    — SemanticProvider (task 8).
 
-pub mod regex;
-pub mod presidio;
 pub mod custom_http;
-pub mod moderation;
 pub mod lakera;
+pub mod moderation;
+pub mod presidio;
+pub mod regex;
 pub mod semantic;

@@ -42,7 +42,21 @@ providers:
     base_url: "http://localhost:11434"
     timeout_seconds: 120
 
-  # Bedrock supports two authentication modes:
+  # NVIDIA's hosted NIM API uses a maintained built-in model fallback when
+  # live /v1/models discovery is unavailable. Optional manual_models entries
+  # are additive overrides and do not replace the built-in catalog.
+  # - name: "nvidia-nim"
+  #   type: "nvidia_nim"
+  #   base_url: "https://integrate.api.nvidia.com/v1"
+  #   api_key_env: "NVIDIA_API_KEY"
+  #   timeout_seconds: 60
+
+  # Bedrock supports two authentication modes and maintains a separate fallback
+  # catalog for each endpoint family. API key mode dispatches Mantle Chat,
+  # Responses (GPT-5.6/5.5/5.4), or Messages (Claude) by model; SDK mode uses
+  # verified Bedrock Runtime IDs through Converse. The matching catalog is
+  # catalog is merged only when live discovery is unavailable or incomplete.
+  # Optional manual_models entries remain additive overrides.
   # 1) API key auth via the Bedrock Mantle OpenAI-compatible endpoint
   # 2) AWS SDK auth via env vars, shared credentials file, or IAM role
   # - name: "bedrock-api-key"
@@ -55,6 +69,16 @@ providers:
   # - name: "bedrock-sdk"
   #   type: "bedrock"
   #   region: "us-east-1"              # Uses AWS SDK credentials from env / file / IAM
+  #   timeout_seconds: 60
+
+  # NVIDIA hosted NIM. The provider ships a maintained built-in fallback list
+  # used only when live /v1/models is unavailable or empty. manual_models is
+  # optional; any values configured in the Admin UI or config are merged first
+  # as explicit overrides (no prefilled list is required here).
+  # - name: "nvidia-nim"
+  #   type: "nvidia_nim"
+  #   base_url: "https://integrate.api.nvidia.com/v1"
+  #   api_key_env: "NVIDIA_API_KEY"
   #   timeout_seconds: 60
 
 # Model groups — equivalent models for failover routing

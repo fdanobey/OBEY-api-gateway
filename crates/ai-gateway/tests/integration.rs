@@ -93,7 +93,9 @@ async fn build_app(config: Config) -> axum::Router {
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     (status, body.to_vec())
 }
 
@@ -175,7 +177,9 @@ async fn test_admin_config_validate() {
 #[tokio::test]
 async fn test_admin_config_export() {
     let app = build_app(test_config()).await;
-    let req = Request::get("/admin/config/export").body(Body::empty()).unwrap();
+    let req = Request::get("/admin/config/export")
+        .body(Body::empty())
+        .unwrap();
     let (status, body) = send(app, req).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -225,7 +229,6 @@ retry:
     assert_eq!(json["config"]["retry"]["max_retries_per_provider"], 2);
 }
 
-
 // ---------------------------------------------------------------------------
 // 5. Chat completions with no reachable provider
 // ---------------------------------------------------------------------------
@@ -252,7 +255,10 @@ async fn test_chat_completions_no_provider() {
         status
     );
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["error"].is_object(), "Response should contain error object");
+    assert!(
+        json["error"].is_object(),
+        "Response should contain error object"
+    );
 }
 
 #[tokio::test]
@@ -291,7 +297,10 @@ async fn test_models_endpoint() {
     let data = json["data"].as_array().unwrap();
     // Should contain our configured model
     let model_ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
-    assert!(model_ids.contains(&"gpt-4"), "Expected gpt-4 in models list");
+    assert!(
+        model_ids.contains(&"gpt-4"),
+        "Expected gpt-4 in models list"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +343,10 @@ async fn test_custom_admin_and_dashboard_paths_are_honored() {
     let (admin_status, admin_body) = send(app.clone(), req).await;
     assert_eq!(admin_status, StatusCode::OK);
     let admin_html = std::str::from_utf8(&admin_body).unwrap();
-    assert!(admin_html.contains("/ops"), "Admin UI should link to configured dashboard path");
+    assert!(
+        admin_html.contains("/ops"),
+        "Admin UI should link to configured dashboard path"
+    );
 
     let req = Request::get("/ops/").body(Body::empty()).unwrap();
     let dash_redirect = app.clone().oneshot(req).await.unwrap();
@@ -361,10 +373,18 @@ async fn test_disabled_admin_and_dashboard_routes_are_not_mounted() {
 
     let app = build_app(cfg).await;
 
-    let (admin_status, _) = send(app.clone(), Request::get("/admin/").body(Body::empty()).unwrap()).await;
+    let (admin_status, _) = send(
+        app.clone(),
+        Request::get("/admin/").body(Body::empty()).unwrap(),
+    )
+    .await;
     assert_eq!(admin_status, StatusCode::NOT_FOUND);
 
-    let (dash_status, _) = send(app.clone(), Request::get("/dashboard/").body(Body::empty()).unwrap()).await;
+    let (dash_status, _) = send(
+        app.clone(),
+        Request::get("/dashboard/").body(Body::empty()).unwrap(),
+    )
+    .await;
     assert_eq!(dash_status, StatusCode::NOT_FOUND);
 
     let (health_status, _) = send(app, Request::get("/health").body(Body::empty()).unwrap()).await;
@@ -392,7 +412,10 @@ async fn test_prometheus_metrics_when_enabled() {
     // Prometheus text format markers
     assert!(text.contains("# HELP"), "Expected Prometheus HELP lines");
     assert!(text.contains("# TYPE"), "Expected Prometheus TYPE lines");
-    assert!(text.contains("obey_api_requests_total"), "Expected request counter metric");
+    assert!(
+        text.contains("obey_api_requests_total"),
+        "Expected request counter metric"
+    );
 }
 
 /// Task 12.4 (Req 11.5): guardrail counter and histogram metrics are exposed on
@@ -411,10 +434,13 @@ async fn test_prometheus_exposes_guardrail_metrics_with_prefix() {
     // Build the server directly (not via `build_app`) so we can record a
     // guardrail stage on the same `Metrics` instance the endpoint reads.
     let server = GatewayServer::new(cfg, None).await.unwrap();
-    server
-        .state
-        .metrics
-        .record_guardrail_stage("pii_pipeline", "pii_scan", "regex", "redact", 12.5);
+    server.state.metrics.record_guardrail_stage(
+        "pii_pipeline",
+        "pii_scan",
+        "regex",
+        "redact",
+        12.5,
+    );
 
     let app = server.build_router();
     let req = Request::get("/metrics").body(Body::empty()).unwrap();
@@ -464,7 +490,9 @@ async fn test_admin_config_validate_accepts_reliability_fields() {
     validatable.retry.jitter_enabled = true;
     validatable.retry.jitter_ratio = 0.25;
     validatable.providers[0].connection_pool.max_idle_per_host = 12;
-    validatable.providers[0].connection_pool.idle_timeout_seconds = 120;
+    validatable.providers[0]
+        .connection_pool
+        .idle_timeout_seconds = 120;
     validatable.providers[0].budget = Some(ProviderBudgetConfig {
         limit_usd: 25.0,
         reset_policy: BudgetResetPolicy::Manual,
@@ -591,7 +619,11 @@ async fn post_stream(app: axum::Router) -> Vec<serde_json::Value> {
         .body(streaming_request_body())
         .unwrap();
     let (status, body) = send(app, req).await;
-    assert_eq!(status, StatusCode::OK, "streaming request should return 200");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "streaming request should return 200"
+    );
     parse_sse_chunks(&body)
 }
 
@@ -604,7 +636,10 @@ async fn test_streaming_emits_early_event_by_default() {
     let app = build_app(streaming_test_config(&mock.uri(), true)).await;
 
     let chunks = post_stream(app).await;
-    assert!(!chunks.is_empty(), "expected at least the early event chunk");
+    assert!(
+        !chunks.is_empty(),
+        "expected at least the early event chunk"
+    );
 
     // First chunk is the synthetic early event: role delta, no content, null finish.
     let early = &chunks[0];
@@ -615,12 +650,22 @@ async fn test_streaming_emits_early_event_by_default() {
     assert!(early["choices"][0]["finish_reason"].is_null());
 
     let early_id = early["id"].as_str().unwrap();
-    assert!(early_id.starts_with("chatcmpl-"), "early id should be a chatcmpl id");
-    assert_ne!(early_id, MOCK_PROVIDER_ID, "early event must use a fresh id, not the provider's");
+    assert!(
+        early_id.starts_with("chatcmpl-"),
+        "early id should be a chatcmpl id"
+    );
+    assert_ne!(
+        early_id, MOCK_PROVIDER_ID,
+        "early event must use a fresh id, not the provider's"
+    );
 
     // Subsequent chunks share the early event id (Req 1.5 consistent stream id).
     for chunk in &chunks {
-        assert_eq!(chunk["id"].as_str().unwrap(), early_id, "all chunks share the early event id");
+        assert_eq!(
+            chunk["id"].as_str().unwrap(),
+            early_id,
+            "all chunks share the early event id"
+        );
     }
 }
 
@@ -659,7 +704,10 @@ async fn test_streaming_cache_hit_skips_early_event() {
 
     // First request: cache miss → early event present with a fresh id.
     let first_chunks = post_stream(app.clone()).await;
-    assert_ne!(first_chunks[0]["id"], MOCK_PROVIDER_ID, "first (miss) emits a fresh early-event id");
+    assert_ne!(
+        first_chunks[0]["id"], MOCK_PROVIDER_ID,
+        "first (miss) emits a fresh early-event id"
+    );
 
     // Second identical request: cache hit → no early event, provider id reused.
     let cached_chunks = post_stream(app).await;
@@ -670,7 +718,10 @@ async fn test_streaming_cache_hit_skips_early_event() {
     assert_eq!(first["choices"][0]["delta"]["role"], "assistant");
     assert!(first["choices"][0]["delta"].get("content").is_some());
     for chunk in &cached_chunks {
-        assert_eq!(chunk["id"], MOCK_PROVIDER_ID, "cache replay keeps the provider id (no early event)");
+        assert_eq!(
+            chunk["id"], MOCK_PROVIDER_ID,
+            "cache replay keeps the provider id (no early event)"
+        );
     }
 }
 
@@ -800,10 +851,17 @@ async fn test_streaming_ttfb_timeout_emits_error_event_then_done() {
 
     // The early event was already emitted, so the response is a 200 SSE stream
     // rather than an HTTP error status.
-    assert_eq!(status, StatusCode::OK, "early event forces a 200 SSE stream");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "early event forces a 200 SSE stream"
+    );
 
     let data_lines = raw_sse_data_lines(&body);
-    assert!(data_lines.len() >= 2, "expected at least an error frame and [DONE]");
+    assert!(
+        data_lines.len() >= 2,
+        "expected at least an error frame and [DONE]"
+    );
 
     // The stream terminates with the [DONE] sentinel (Req 5.4).
     assert_eq!(
@@ -814,10 +872,13 @@ async fn test_streaming_ttfb_timeout_emits_error_event_then_done() {
 
     // The data line immediately before [DONE] is the graceful error frame.
     let error_line = &data_lines[data_lines.len() - 2];
-    let error_json: serde_json::Value = serde_json::from_str(error_line)
-        .expect("error frame before [DONE] must be valid JSON");
+    let error_json: serde_json::Value =
+        serde_json::from_str(error_line).expect("error frame before [DONE] must be valid JSON");
     let error_obj = &error_json["error"];
-    assert!(error_obj.is_object(), "error frame must carry an `error` object");
+    assert!(
+        error_obj.is_object(),
+        "error frame must carry an `error` object"
+    );
 
     // Error frame shape (Req 5.1) and trace_id correlation (Req 5.5).
     assert!(
@@ -839,7 +900,9 @@ async fn test_streaming_ttfb_timeout_emits_error_event_then_done() {
         "TTFB timeout must map to the exact ttfb_timeout_error type (Req 5.1)"
     );
     assert!(
-        error_obj["trace_id"].as_str().is_some_and(|t| !t.is_empty()),
+        error_obj["trace_id"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
         "error frame must include a trace_id for correlation (Req 5.5)"
     );
 
@@ -943,7 +1006,10 @@ async fn test_streaming_passthrough_forwards_provider_chunks_and_terminates() {
     // The first data line is the synthetic early event (role delta, fresh id),
     // proving the client was in SSE mode before any provider chunk arrived.
     assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
-    assert_ne!(chunks[0]["id"], MOCK_PROVIDER_ID, "early event uses a fresh id");
+    assert_ne!(
+        chunks[0]["id"], MOCK_PROVIDER_ID,
+        "early event uses a fresh id"
+    );
 
     // The forwarded content chunks carry the provider's own id (verbatim relay).
     assert!(
@@ -987,7 +1053,10 @@ async fn test_streaming_passthrough_done_terminates_cleanly() {
             continue;
         }
         let json: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert!(json.get("error").is_none(), "clean stream must contain no error frame");
+        assert!(
+            json.get("error").is_none(),
+            "clean stream must contain no error frame"
+        );
     }
 }
 
@@ -1009,7 +1078,11 @@ async fn test_streaming_passthrough_midstream_error_forwarded_then_done() {
         .body(streaming_request_body())
         .unwrap();
     let (status, raw) = send(app, req).await;
-    assert_eq!(status, StatusCode::OK, "early event forces a 200 SSE stream");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "early event forces a 200 SSE stream"
+    );
 
     let data_lines = raw_sse_data_lines(&raw);
     assert_eq!(
@@ -1023,7 +1096,10 @@ async fn test_streaming_passthrough_midstream_error_forwarded_then_done() {
     let error_json: serde_json::Value =
         serde_json::from_str(error_line).expect("error frame must be valid JSON");
     let error_obj = &error_json["error"];
-    assert!(error_obj.is_object(), "error frame carries an `error` object");
+    assert!(
+        error_obj.is_object(),
+        "error frame carries an `error` object"
+    );
     assert_eq!(
         error_obj["message"].as_str(),
         Some("boom"),
@@ -1038,7 +1114,11 @@ async fn test_streaming_passthrough_midstream_error_forwarded_then_done() {
     // The partial content forwarded before the error is still delivered.
     let content: String = parse_sse_chunks(&raw)
         .iter()
-        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str().map(String::from))
+        .filter_map(|c| {
+            c["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(String::from)
+        })
         .collect();
     assert_eq!(content, "partial answer", "pre-error content is forwarded");
 }
@@ -1171,7 +1251,10 @@ async fn test_streaming_failover_before_content_is_transparent() {
         .iter()
         .filter(|c| c["choices"][0]["delta"]["role"] == "assistant")
         .count();
-    assert_eq!(role_events, 1, "exactly one role event across a transparent failover (Req 4.4)");
+    assert_eq!(
+        role_events, 1,
+        "exactly one role event across a transparent failover (Req 4.4)"
+    );
 
     // No error frame leaked to the client — the primary's failure was invisible.
     for chunk in &chunks {
@@ -1215,15 +1298,26 @@ async fn test_streaming_failover_after_content_emits_error_no_failover() {
         .body(streaming_request_body())
         .unwrap();
     let (status, raw) = send(app, req).await;
-    assert_eq!(status, StatusCode::OK, "early event forces a 200 SSE stream");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "early event forces a 200 SSE stream"
+    );
 
     // Only the primary's partial content reaches the client — the backup is
     // never used (no transparent mid-content failover).
     let content: String = parse_sse_chunks(&raw)
         .iter()
-        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str().map(String::from))
+        .filter_map(|c| {
+            c["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(String::from)
+        })
         .collect();
-    assert_eq!(content, "partial answer", "only primary's pre-error content; backup not used (Req 4.2)");
+    assert_eq!(
+        content, "partial answer",
+        "only primary's pre-error content; backup not used (Req 4.2)"
+    );
 
     let data_lines = raw_sse_data_lines(&raw);
     // The stream terminates with [DONE] preceded by a graceful error frame.
@@ -1231,7 +1325,10 @@ async fn test_streaming_failover_after_content_emits_error_no_failover() {
     let error_line = &data_lines[data_lines.len() - 2];
     let error_json: serde_json::Value =
         serde_json::from_str(error_line).expect("error frame before [DONE] must be valid JSON");
-    assert!(error_json["error"].is_object(), "post-content failure emits an error frame (Req 4.2)");
+    assert!(
+        error_json["error"].is_object(),
+        "post-content failure emits an error frame (Req 4.2)"
+    );
 }
 
 /// Req 4.3: when EVERY provider fails before content, the gateway exhausts the
@@ -1251,14 +1348,25 @@ async fn test_streaming_failover_all_providers_fail_aggregated_error() {
         .body(streaming_request_body())
         .unwrap();
     let (status, raw) = send(app, req).await;
-    assert_eq!(status, StatusCode::OK, "early event forces a 200 SSE stream");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "early event forces a 200 SSE stream"
+    );
 
     // No provider content was forwarded (only the early event).
     let content: String = parse_sse_chunks(&raw)
         .iter()
-        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str().map(String::from))
+        .filter_map(|c| {
+            c["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(String::from)
+        })
         .collect();
-    assert!(content.is_empty(), "no content when all providers fail pre-content");
+    assert!(
+        content.is_empty(),
+        "no content when all providers fail pre-content"
+    );
 
     let data_lines = raw_sse_data_lines(&raw);
     assert_eq!(
@@ -1271,7 +1379,10 @@ async fn test_streaming_failover_all_providers_fail_aggregated_error() {
     let error_line = &data_lines[data_lines.len() - 2];
     let error_json: serde_json::Value =
         serde_json::from_str(error_line).expect("aggregated error frame must be valid JSON");
-    assert!(error_json["error"].is_object(), "aggregated error frame carries an `error` object");
+    assert!(
+        error_json["error"].is_object(),
+        "aggregated error frame carries an `error` object"
+    );
     assert_eq!(
         error_json["error"]["type"].as_str(),
         Some("stream_error"),
@@ -1282,7 +1393,10 @@ async fn test_streaming_failover_all_providers_fail_aggregated_error() {
 /// Extract a single `obey_api_provider_failures_total{provider="..."}` counter
 /// value from a Prometheus exposition body. Returns 0 if the series is absent.
 fn provider_failures_metric(metrics_body: &str, provider: &str) -> u64 {
-    let needle = format!("obey_api_provider_failures_total{{provider=\"{}\"}} ", provider);
+    let needle = format!(
+        "obey_api_provider_failures_total{{provider=\"{}\"}} ",
+        provider
+    );
     metrics_body
         .lines()
         .find_map(|line| line.strip_prefix(needle.as_str()))
@@ -1426,7 +1540,10 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
 
 /// Send a non-streaming chat completion with an explicit `max_tokens` and
 /// return the parsed JSON response body.
-async fn post_chat_nonstream(app: axum::Router, max_tokens: u64) -> (StatusCode, serde_json::Value) {
+async fn post_chat_nonstream(
+    app: axum::Router,
+    max_tokens: u64,
+) -> (StatusCode, serde_json::Value) {
     let body_json = serde_json::json!({
         "model": "gpt-4",
         "messages": [{"role": "user", "content": "hello"}],
@@ -1457,7 +1574,11 @@ async fn test_truncation_low_token_count_triggers_failover() {
     let app = build_app(truncation_config(&primary.uri(), &backup.uri(), true)).await;
     let (status, json) = post_chat_nonstream(app, 1000).await;
 
-    assert_eq!(status, StatusCode::OK, "failover should yield a successful response");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "failover should yield a successful response"
+    );
     assert_eq!(
         json["choices"][0]["message"]["content"], "BACKUP_COMPLETE",
         "client must receive the backup's complete response after failover (Req 6.1)"
@@ -1509,7 +1630,11 @@ async fn test_truncation_all_providers_truncate_returns_longest() {
     let app = build_app(truncation_config(&primary.uri(), &backup.uri(), true)).await;
     let (status, json) = post_chat_nonstream(app, 1000).await;
 
-    assert_eq!(status, StatusCode::OK, "all-truncated must return the longest partial, not an error (Req 6.2)");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "all-truncated must return the longest partial, not an error (Req 6.2)"
+    );
     assert_eq!(
         json["choices"][0]["message"]["content"], "BACKUP_LONGER",
         "the longest partial (highest completion_tokens) is returned (Req 6.2)"

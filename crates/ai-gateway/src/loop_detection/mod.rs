@@ -1,12 +1,12 @@
 pub mod admin;
 pub mod config;
 pub mod enforcement;
-pub mod eviction;
 pub mod events;
+pub mod eviction;
 pub mod fingerprint;
 pub mod injection;
-pub mod middleware;
 pub mod metrics;
+pub mod middleware;
 pub mod scorer;
 pub mod session;
 pub mod signals;

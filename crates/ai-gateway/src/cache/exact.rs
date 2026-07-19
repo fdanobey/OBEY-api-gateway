@@ -168,11 +168,7 @@ pub fn is_cache_eligible(request: &OpenAIRequest, temperature_threshold: f32) ->
     if temperature > temperature_threshold {
         return false;
     }
-    let n = request
-        .extra
-        .get("n")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1);
+    let n = request.extra.get("n").and_then(|v| v.as_u64()).unwrap_or(1);
     if n != 1 {
         return false;
     }
@@ -185,7 +181,10 @@ pub fn is_cache_eligible(request: &OpenAIRequest, temperature_threshold: f32) ->
 /// produce identical strings.
 fn canonicalize_request(request: &OpenAIRequest, temperature_threshold: f32) -> String {
     let mut root = serde_json::Map::new();
-    root.insert("model".to_string(), serde_json::Value::String(request.model.clone()));
+    root.insert(
+        "model".to_string(),
+        serde_json::Value::String(request.model.clone()),
+    );
     root.insert(
         "messages".to_string(),
         serde_json::to_value(&request.messages).unwrap_or(serde_json::Value::Null),

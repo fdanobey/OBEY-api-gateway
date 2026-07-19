@@ -186,7 +186,8 @@ async fn chat_request(
     bearer: Option<&str>,
     model: &str,
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
-    let mut builder = Request::post("/v1/chat/completions").header("content-type", "application/json");
+    let mut builder =
+        Request::post("/v1/chat/completions").header("content-type", "application/json");
     if let Some(token) = bearer {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
@@ -201,7 +202,9 @@ async fn chat_request(
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     (status, headers, bytes.to_vec())
 }
 
@@ -241,8 +244,7 @@ async fn required_valid_key_authenticates_routes_and_records_usage() {
     let ts = TestServer::new(EnforcementMode::Required).await;
     let created = ts.manager().create_key(create_defaults()).await.unwrap();
 
-    let (status, _headers, body) =
-        chat_request(ts.router(), Some(&created.key), TEST_MODEL).await;
+    let (status, _headers, body) = chat_request(ts.router(), Some(&created.key), TEST_MODEL).await;
 
     assert!(
         status.is_success(),
@@ -292,8 +294,7 @@ async fn disabled_with_key_is_ignored_and_not_tracked() {
     let ts = TestServer::new(EnforcementMode::Disabled).await;
     let created = ts.manager().create_key(create_defaults()).await.unwrap();
 
-    let (status, _headers, body) =
-        chat_request(ts.router(), Some(&created.key), TEST_MODEL).await;
+    let (status, _headers, body) = chat_request(ts.router(), Some(&created.key), TEST_MODEL).await;
     assert!(
         status.is_success(),
         "expected 2xx under disabled with key ignored, got {status}: {}",
@@ -302,8 +303,15 @@ async fn disabled_with_key_is_ignored_and_not_tracked() {
 
     // Give any (erroneous) spawned recording a chance to run, then assert none.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let agg = ts.manager().query_usage(&created.id, full_window()).await.unwrap();
-    assert_eq!(agg.total_requests, 0, "disabled mode must not track vk_ usage");
+    let agg = ts
+        .manager()
+        .query_usage(&created.id, full_window())
+        .await
+        .unwrap();
+    assert_eq!(
+        agg.total_requests, 0,
+        "disabled mode must not track vk_ usage"
+    );
     assert_eq!(agg.total_input_tokens, 0);
     assert_eq!(agg.total_output_tokens, 0);
 }
@@ -319,8 +327,7 @@ async fn optional_with_valid_key_is_validated_and_tracked() {
     let ts = TestServer::new(EnforcementMode::Optional).await;
     let created = ts.manager().create_key(create_defaults()).await.unwrap();
 
-    let (status, _headers, body) =
-        chat_request(ts.router(), Some(&created.key), TEST_MODEL).await;
+    let (status, _headers, body) = chat_request(ts.router(), Some(&created.key), TEST_MODEL).await;
     assert!(
         status.is_success(),
         "expected 2xx for a valid key under optional, got {status}: {}",
@@ -328,7 +335,10 @@ async fn optional_with_valid_key_is_validated_and_tracked() {
     );
 
     let count = wait_for_request_count(ts.manager(), &created.id, 1).await;
-    assert!(count >= 1, "optional mode must track usage for presented keys");
+    assert!(
+        count >= 1,
+        "optional mode must track usage for presented keys"
+    );
 }
 
 /// Req 11.4, 2.4: under `optional`, a request without a key passes through
@@ -431,8 +441,7 @@ async fn budget_exhaustion_blocks_subsequent_requests_429() {
     ts.manager()
         .invalidate_cache(&VirtualKeyManager::hash_key(&created.key));
 
-    let (status, _headers, _body) =
-        chat_request(ts.router(), Some(&created.key), TEST_MODEL).await;
+    let (status, _headers, _body) = chat_request(ts.router(), Some(&created.key), TEST_MODEL).await;
 
     assert_eq!(
         status,
@@ -475,8 +484,15 @@ async fn rate_limit_returns_429_with_retry_after() {
         .get(axum::http::header::RETRY_AFTER)
         .expect("Retry-After header must be present on rate-limit rejection");
     // Value is an integer number of seconds.
-    let secs: u64 = retry_after.to_str().unwrap().parse().expect("Retry-After is integer seconds");
-    assert!(secs >= 1, "Retry-After should be at least 1 second, got {secs}");
+    let secs: u64 = retry_after
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("Retry-After is integer seconds");
+    assert!(
+        secs >= 1,
+        "Retry-After should be at least 1 second, got {secs}"
+    );
 }
 
 // ---------------------------------------------------------------------------

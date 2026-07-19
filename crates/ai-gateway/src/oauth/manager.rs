@@ -171,7 +171,10 @@ impl OAuthManager {
             *state = OAuthSessionState::Refreshing;
         }
 
-        match self.attempt_refresh_with_backoff(&tokens.refresh_token).await {
+        match self
+            .attempt_refresh_with_backoff(&tokens.refresh_token)
+            .await
+        {
             Ok(response) => {
                 let new_access_token = response.access_token.clone();
                 self.apply_refreshed_tokens(&tokens, response).await?;
@@ -218,7 +221,12 @@ impl OAuthManager {
         let callback_timeout = Duration::from_secs(120);
 
         let (outcome, server_handle) = flow
-            .initiate(&redirect_uri_placeholder, scope, callback_port, callback_timeout)
+            .initiate(
+                &redirect_uri_placeholder,
+                scope,
+                callback_port,
+                callback_timeout,
+            )
             .await?;
 
         // Capture what we need from the flow before releasing the lock.
@@ -254,28 +262,17 @@ impl OAuthManager {
             };
 
             // Exchange the authorization code for tokens.
-            match exchange_code(
-                &http_client,
-                &auth_code.0,
-                &code_verifier,
-                &redirect_uri,
-            )
-            .await
-            {
+            match exchange_code(&http_client, &auth_code.0, &code_verifier, &redirect_uri).await {
                 Ok(token_response) => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
                     let expires_at = now.saturating_add(token_response.expires_in);
-                    let scopes = token_response
-                        .scope
-                        .unwrap_or_else(|| scope.to_string());
+                    let scopes = token_response.scope.unwrap_or_else(|| scope.to_string());
                     let tokens = StoredTokens {
                         access_token: token_response.access_token,
-                        refresh_token: token_response
-                            .refresh_token
-                            .unwrap_or_default(),
+                        refresh_token: token_response.refresh_token.unwrap_or_default(),
                         expires_at,
                         scopes: scopes.clone(),
                     };
@@ -284,10 +281,7 @@ impl OAuthManager {
                         return;
                     }
                     let mut state = session_state.write().await;
-                    *state = OAuthSessionState::Authenticated {
-                        expires_at,
-                        scopes,
-                    };
+                    *state = OAuthSessionState::Authenticated { expires_at, scopes };
                     tracing::info!("OAuth login completed successfully");
                 }
                 Err(e) => {
@@ -333,15 +327,21 @@ impl OAuthManager {
             (verifier, redirect, state)
         };
 
-        let code_verifier = code_verifier.ok_or_else(|| OAuthError::InvalidTokenResponse(
-            "no login in progress — call initiate_login first".to_string(),
-        ))?;
-        let redirect_uri = redirect_uri.ok_or_else(|| OAuthError::InvalidTokenResponse(
-            "no redirect URI captured — call initiate_login first".to_string(),
-        ))?;
+        let code_verifier = code_verifier.ok_or_else(|| {
+            OAuthError::InvalidTokenResponse(
+                "no login in progress — call initiate_login first".to_string(),
+            )
+        })?;
+        let redirect_uri = redirect_uri.ok_or_else(|| {
+            OAuthError::InvalidTokenResponse(
+                "no redirect URI captured — call initiate_login first".to_string(),
+            )
+        })?;
 
         // Validate state when both sides have one (CSRF protection).
-        if let (Some(expected), Some(supplied)) = (expected_state.as_deref(), supplied_state.as_deref()) {
+        if let (Some(expected), Some(supplied)) =
+            (expected_state.as_deref(), supplied_state.as_deref())
+        {
             if expected != supplied {
                 tracing::warn!("CSRF state mismatch on manual OAuth code entry");
                 return Err(OAuthError::StateMismatch);
@@ -349,13 +349,8 @@ impl OAuthManager {
         }
 
         let scope = "openid profile email offline_access";
-        let token_response = exchange_code(
-            &self.http_client,
-            &code,
-            &code_verifier,
-            &redirect_uri,
-        )
-        .await?;
+        let token_response =
+            exchange_code(&self.http_client, &code, &code_verifier, &redirect_uri).await?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -445,7 +440,10 @@ impl OAuthManager {
                 *state = OAuthSessionState::Refreshing;
             }
 
-            match self.attempt_refresh_with_backoff(&tokens.refresh_token).await {
+            match self
+                .attempt_refresh_with_backoff(&tokens.refresh_token)
+                .await
+            {
                 Ok(response) => {
                     if let Err(e) = self.apply_refreshed_tokens(&tokens, response).await {
                         tracing::warn!(
@@ -665,9 +663,8 @@ mod tests {
 
     #[test]
     fn parse_full_redirect_url() {
-        let (code, state) = parse_code_and_state(
-            "http://localhost:1455/auth/callback?code=abc123&state=xyz789",
-        );
+        let (code, state) =
+            parse_code_and_state("http://localhost:1455/auth/callback?code=abc123&state=xyz789");
         assert_eq!(code, "abc123");
         assert_eq!(state.as_deref(), Some("xyz789"));
     }
@@ -688,9 +685,7 @@ mod tests {
 
     #[test]
     fn parse_url_with_only_code() {
-        let (code, state) = parse_code_and_state(
-            "http://localhost:1455/auth/callback?code=abc123",
-        );
+        let (code, state) = parse_code_and_state("http://localhost:1455/auth/callback?code=abc123");
         assert_eq!(code, "abc123");
         assert_eq!(state, None);
     }

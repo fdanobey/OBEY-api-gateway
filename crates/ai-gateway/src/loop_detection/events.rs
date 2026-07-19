@@ -50,7 +50,10 @@ impl LoopEventBus {
 
     pub fn publish(&self, event: LoopDetectionEvent) {
         if self.sender.receiver_count() == 0 {
-            let mut replay = self.replay.lock().expect("loop event replay mutex poisoned");
+            let mut replay = self
+                .replay
+                .lock()
+                .expect("loop event replay mutex poisoned");
             if replay.len() == REPLAY_CAPACITY {
                 replay.pop_front();
             }
@@ -61,7 +64,10 @@ impl LoopEventBus {
 
     pub fn subscribe(&self) -> LoopEventSubscription {
         let replay = {
-            let mut replay = self.replay.lock().expect("loop event replay mutex poisoned");
+            let mut replay = self
+                .replay
+                .lock()
+                .expect("loop event replay mutex poisoned");
             replay.drain(..).collect()
         };
         LoopEventSubscription {
@@ -71,7 +77,10 @@ impl LoopEventBus {
     }
 
     pub fn buffered_len(&self) -> usize {
-        self.replay.lock().expect("loop event replay mutex poisoned").len()
+        self.replay
+            .lock()
+            .expect("loop event replay mutex poisoned")
+            .len()
     }
 }
 

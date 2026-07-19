@@ -128,10 +128,7 @@ impl ModelsDiscovery {
             let model_id: String = segment
                 .chars()
                 .take_while(|c| {
-                    !matches!(
-                        c,
-                        '"' | '\'' | ')' | ']' | '>' | '<' | ' ' | '\n' | '\t'
-                    )
+                    !matches!(c, '"' | '\'' | ')' | ']' | '>' | '<' | ' ' | '\n' | '\t')
                 })
                 .collect();
 

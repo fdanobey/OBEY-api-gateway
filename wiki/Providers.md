@@ -121,6 +121,17 @@ providers:
     timeout_seconds: 60
 ```
 
+### Model Discovery Fallbacks
+
+Bedrock uses two maintained fallback catalogs so model IDs always match the provider's active endpoint:
+
+- **API key / Mantle:** only models verified for the OpenAI Chat Completions API on `bedrock-mantle`, using Mantle IDs such as `openai.gpt-oss-120b`.
+- **AWS SDK / Runtime:** only models verified for Converse or Invoke on `bedrock-runtime`, using runtime IDs such as `openai.gpt-oss-120b-1:0` and `anthropic.claude-opus-4-8`.
+
+Live `/models` or `ListFoundationModels` results are merged first; the matching fallback fills missing IDs. API-key mode dispatches by model family: current GPT-5.6/5.5/5.4 models use the Mantle Responses API, Claude models use the Anthropic Messages API, and open-weight models use Chat Completions. SDK mode uses Bedrock Converse for a unified request schema across runtime models. Legacy models are excluded. `manual_models` remains optional and additive; configured entries override/deduplicate built-ins.
+
+Maintainers synchronize both catalogs with `scripts/sync-bedrock-fallback.ps1`. The weekly docs-first workflow verifies AWS endpoint compatibility, API compatibility, lifecycle status, and exact Programmatic Access IDs before opening an update PR. Removal requires two consecutive confirmations; region-specific live listing differences never remove a documented active model.
+
 ### Bedrock-Specific Options
 
 | Field | Default | Description |
@@ -173,6 +184,10 @@ providers:
     api_key_env: "NVIDIA_API_KEY"
     timeout_seconds: 60
 ```
+
+The hosted NVIDIA catalog is volatile, so the gateway ships a small maintained fallback list for model discovery. It activates only when NVIDIA's live `/v1/models` request fails or returns an empty list. `manual_models` remains optional; configured values are merged first and therefore override/deduplicate the built-in entries.
+
+Maintainers synchronize the fallback with [`scripts/sync-nvidia-nim-fallback.ps1`](../scripts/sync-nvidia-nim-fallback.ps1). The weekly GitHub Actions workflow requires the repository secret `NVIDIA_API_KEY`; it confirms retired/unreachable entries in two consecutive probes before opening a replacement PR. The scope is the hosted catalog at `https://integrate.api.nvidia.com/v1`, not the self-host NIM Support Matrix.
 
 ---
 

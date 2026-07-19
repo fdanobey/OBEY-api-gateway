@@ -1,14 +1,20 @@
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{RwLock, mpsc::{UnboundedReceiver, unbounded_channel}};
+use tokio::sync::{
+    mpsc::{unbounded_channel, UnboundedReceiver},
+    RwLock,
+};
 
 use crate::config::Config;
 
-use super::{NotificationManager, ServerStatus, SingleInstanceGuard, SplashScreen, TrayAssets, TrayError, TrayIconHandle, TrayMenu, TrayMenuAction};
+use super::{
+    NotificationManager, ServerStatus, SingleInstanceGuard, SplashScreen, TrayAssets, TrayError,
+    TrayIconHandle, TrayMenu, TrayMenuAction,
+};
 
 pub struct TrayManager {
     config: Arc<RwLock<Config>>,
@@ -220,7 +226,9 @@ async fn wait_for_http_ready(url: &str) {
 
     for attempt in 1..=20 {
         match client.get(url).send().await {
-            Ok(response) if response.status().is_success() || response.status().is_redirection() => {
+            Ok(response)
+                if response.status().is_success() || response.status().is_redirection() =>
+            {
                 tracing::info!(attempt, status = %response.status(), url = %url, "Dashboard URL responded successfully before browser launch");
                 return;
             }

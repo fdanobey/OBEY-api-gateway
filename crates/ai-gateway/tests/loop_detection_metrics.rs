@@ -10,9 +10,13 @@ fn exact_loop_metric_names_are_exposed() {
     metrics.write_prometheus(&mut output, 3);
 
     assert!(output.contains("# TYPE obey_loop_confidence_score histogram"));
-    assert!(output.contains("obey_loop_confidence_score_bucket{virtual_key=\"id:vk-id\",le=\"0.8\"} 1"));
+    assert!(
+        output.contains("obey_loop_confidence_score_bucket{virtual_key=\"id:vk-id\",le=\"0.8\"} 1")
+    );
     assert!(output.contains("# TYPE obey_loop_enforcement_total counter"));
-    assert!(output.contains("obey_loop_enforcement_total{level=\"warn\",virtual_key=\"id:vk-id\"} 1"));
+    assert!(
+        output.contains("obey_loop_enforcement_total{level=\"warn\",virtual_key=\"id:vk-id\"} 1")
+    );
     assert!(output.contains("obey_loop_sessions_active 3"));
     assert!(output.contains("obey_loop_sessions_evicted_total 1"));
     assert_eq!(metrics.evicted_total(), 1);

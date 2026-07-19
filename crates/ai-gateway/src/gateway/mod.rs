@@ -66,7 +66,10 @@ pub struct GatewayServer {
 
 impl GatewayServer {
     /// Build a new GatewayServer from a validated Config.
-    pub async fn new(config: Config, config_path: Option<std::path::PathBuf>) -> Result<Self, GatewayError> {
+    pub async fn new(
+        config: Config,
+        config_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, GatewayError> {
         let logger = RequestLogger::new(config.logging.clone())
             .map_err(|e| GatewayError::Database(e.to_string()))?;
 
@@ -103,7 +106,9 @@ impl GatewayServer {
         // --- OAuth manager construction (Req 4.3, 5.1) ---
         let oauth_manager = match crate::secrets::master_key_path() {
             Ok(key_path) => {
-                let storage_dir = key_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let storage_dir = key_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
                 let token_path = OAuthTokenStore::default_path(storage_dir);
                 let store = OAuthTokenStore::new(token_path);
                 let http_client = reqwest::Client::new();
@@ -128,12 +133,12 @@ impl GatewayServer {
             }
         };
 
-
         // --- Codex InstructionsStore construction (Req 7.1, 7.2, 7.8) ---
         // Only constructed when at least one Codex-capable provider exists.
-        let has_codex_provider = config.providers.iter().any(|p| {
-            p.auth_method.as_deref() == Some("oauth") && p.provider_type == "openai"
-        });
+        let has_codex_provider = config
+            .providers
+            .iter()
+            .any(|p| p.auth_method.as_deref() == Some("oauth") && p.provider_type == "openai");
         if has_codex_provider {
             match crate::codex::InstructionsStore::new(&config).await {
                 Ok(store) => {
@@ -197,7 +202,9 @@ impl GatewayServer {
 
         let state = AppState {
             config: config_arc,
-            config_path: Arc::new(config_path.unwrap_or_else(|| std::path::PathBuf::from("./config.yaml"))),
+            config_path: Arc::new(
+                config_path.unwrap_or_else(|| std::path::PathBuf::from("./config.yaml")),
+            ),
             router: Arc::new(router),
             logger: Arc::new(logger),
             cache,
@@ -248,7 +255,10 @@ impl GatewayServer {
             // Models (Req 2.6, 2.12)
             .route("/v1/models", get(list_models))
             // Assistants (Req 2.7)
-            .route("/v1/assistants", post(create_assistant).get(list_assistants))
+            .route(
+                "/v1/assistants",
+                post(create_assistant).get(list_assistants),
+            )
             .route(
                 "/v1/assistants/{assistant_id}",
                 get(get_assistant)
@@ -259,9 +269,7 @@ impl GatewayServer {
             .route("/v1/threads", post(create_thread))
             .route(
                 "/v1/threads/{thread_id}",
-                get(get_thread)
-                    .post(modify_thread)
-                    .delete(delete_thread),
+                get(get_thread).post(modify_thread).delete(delete_thread),
             )
             // Messages on threads
             .route(
@@ -273,20 +281,14 @@ impl GatewayServer {
                 "/v1/threads/{thread_id}/runs",
                 post(create_run).get(list_runs),
             )
-            .route(
-                "/v1/threads/{thread_id}/runs/{run_id}",
-                get(get_run),
-            )
+            .route("/v1/threads/{thread_id}/runs/{run_id}", get(get_run))
             .route(
                 "/v1/threads/{thread_id}/runs/{run_id}/cancel",
                 post(cancel_run),
             )
             // Files (Req 2.10)
             .route("/v1/files", post(upload_file).get(list_files))
-            .route(
-                "/v1/files/{file_id}",
-                get(get_file).delete(delete_file),
-            )
+            .route("/v1/files/{file_id}", get(get_file).delete(delete_file))
             .route("/v1/files/{file_id}/content", get(get_file_content))
             // Fine-tuning (Req 2.11)
             .route(
@@ -306,9 +308,10 @@ impl GatewayServer {
                 get(list_fine_tuning_events),
             );
 
-        let api_routes = api_routes.layer(crate::loop_detection::middleware::LoopDetectorLayer::new(
-            self.state.loop_detector.clone(),
-        ));
+        let api_routes =
+            api_routes.layer(crate::loop_detection::middleware::LoopDetectorLayer::new(
+                self.state.loop_detector.clone(),
+            ));
 
         // --- Virtual key authentication + enforcement (Req 2.1, 2.4, 5.5, 6.4,
         // 11.1-11.5) --- Layer runs BEFORE the routing handlers above. In
@@ -368,7 +371,10 @@ impl GatewayServer {
                 );
             }
             tracing::info!(path = %dashboard_path, "Mounting dashboard routes");
-            router = router.nest(&dashboard_path, crate::dashboard::dashboard_routes(self.state.clone()));
+            router = router.nest(
+                &dashboard_path,
+                crate::dashboard::dashboard_routes(self.state.clone()),
+            );
         } else {
             tracing::warn!("Dashboard routes are disabled by configuration");
         }
@@ -425,15 +431,14 @@ impl GatewayServer {
         }
 
         // Req 36.5: validate cert/key are parseable
-        let rustls_config =
-            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls_cfg.cert_path, &tls_cfg.key_path)
-                .await
-                .map_err(|e| {
-                    GatewayError::Configuration(format!(
-                        "Invalid TLS certificate or key: {}",
-                        e
-                    ))
-                })?;
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            &tls_cfg.cert_path,
+            &tls_cfg.key_path,
+        )
+        .await
+        .map_err(|e| {
+            GatewayError::Configuration(format!("Invalid TLS certificate or key: {}", e))
+        })?;
 
         Ok(Some(rustls_config))
     }
@@ -480,9 +485,9 @@ impl GatewayServer {
 
         if let Some(rustls_config) = rustls_config {
             // Req 36.1: HTTPS only when TLS enabled
-            let addr_parsed: std::net::SocketAddr = addr
-                .parse()
-                .map_err(|e| GatewayError::Configuration(format!("Invalid address {}: {}", addr, e)))?;
+            let addr_parsed: std::net::SocketAddr = addr.parse().map_err(|e| {
+                GatewayError::Configuration(format!("Invalid address {}: {}", addr, e))
+            })?;
 
             tracing::info!("OBEY-API listening on {} (HTTPS)", addr);
 
@@ -502,11 +507,9 @@ impl GatewayServer {
                 .map_err(|e| GatewayError::Http(format!("Server error: {}", e)))?;
         } else {
             // Req 36.6: plain HTTP when TLS disabled
-            let listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .map_err(|e| {
-                    GatewayError::Configuration(format!("Failed to bind {}: {}", addr, e))
-                })?;
+            let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+                GatewayError::Configuration(format!("Failed to bind {}: {}", addr, e))
+            })?;
 
             tracing::info!("OBEY-API listening on {} (HTTP)", addr);
 
@@ -549,7 +552,9 @@ impl GatewayServer {
             .iter()
             .filter_map(|o| {
                 if o == "*" {
-                    tracing::warn!("CORS wildcard origin configured — review security implications");
+                    tracing::warn!(
+                        "CORS wildcard origin configured — review security implications"
+                    );
                 }
                 o.parse().ok()
             })
@@ -816,6 +821,40 @@ mod tests {
         assert_eq!(json["status"], "shutting_down");
     }
 
+    #[tokio::test]
+    async fn test_models_endpoint_surfaces_nvidia_nim_fallback_without_manual_models() {
+        let mut config = minimal_config();
+        config.providers[0].provider_type = "nvidia_nim".to_string();
+        config.providers[0].manual_models.clear();
+        config.model_groups.clear();
+
+        let server = GatewayServer::new(config, None).await.unwrap();
+        let app = server.build_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids: std::collections::HashSet<&str> = parsed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains("openai/gpt-oss-120b"));
+        assert!(ids.contains("meta/llama-3.1-70b-instruct"));
+        assert!(ids.contains("nvidia/nemotron-3-nano"));
+    }
+
     fn config_with_size_limit(max_mb: u64) -> Config {
         let mut cfg = minimal_config();
         cfg.server.max_request_size_mb = max_mb;
@@ -837,8 +876,8 @@ mod tests {
             format!("{}", body.len())
         }
 
-        let api_routes = axum::Router::new()
-            .route("/v1/chat/completions", axum::routing::post(echo_handler));
+        let api_routes =
+            axum::Router::new().route("/v1/chat/completions", axum::routing::post(echo_handler));
 
         Router::new()
             .merge(api_routes)
@@ -1662,10 +1701,19 @@ mod tests {
         server.state.metrics.record_provider_success("openai", 100);
         server.state.metrics.record_provider_failure("bedrock");
         server.state.metrics.record_provider_retry("openai", 1200);
-        server.state.metrics.set_provider_budget_limit("openai", 5.0);
-        server.state.metrics.record_provider_budget_exhausted("openai");
+        server
+            .state
+            .metrics
+            .set_provider_budget_limit("openai", 5.0);
+        server
+            .state
+            .metrics
+            .record_provider_budget_exhausted("openai");
         server.state.metrics.record_provider_unknown_cost("openai");
-        server.state.metrics.record_provider_rate_limit_exhausted("bedrock");
+        server
+            .state
+            .metrics
+            .record_provider_rate_limit_exhausted("bedrock");
         server.state.metrics.record_cache_hit();
         server.state.metrics.record_cache_miss();
         server.state.metrics.add_cost("openai", 0.05);
@@ -1681,10 +1729,20 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-        assert!(ct.contains("text/plain"), "Content-Type should be text/plain");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("text/plain"),
+            "Content-Type should be text/plain"
+        );
 
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
 
         // Verify key metric lines are present
@@ -1698,7 +1756,9 @@ mod tests {
         assert!(text.contains("obey_api_provider_budget_limit_dollars{provider=\"openai\"} 5"));
         assert!(text.contains("obey_api_provider_budget_exhaustions_total{provider=\"openai\"} 1"));
         assert!(text.contains("obey_api_provider_unknown_cost_total{provider=\"openai\"} 1"));
-        assert!(text.contains("obey_api_provider_rate_limit_exhaustions_total{provider=\"bedrock\"} 1"));
+        assert!(
+            text.contains("obey_api_provider_rate_limit_exhaustions_total{provider=\"bedrock\"} 1")
+        );
         assert!(text.contains("obey_api_cache_hit_rate"));
         assert!(text.contains("obey_api_cost_by_provider_dollars{provider=\"openai\"} 0.05"));
     }

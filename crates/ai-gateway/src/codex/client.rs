@@ -95,13 +95,12 @@ impl ProviderClient for CodexProviderClient {
         let result = self.chat_completion_with_retry(&request).await?;
         let latency_ms = start.elapsed().as_millis() as u64;
 
-        let openai_response: OpenAIResponse = serde_json::from_value(result).map_err(|e| {
-            GatewayError::Provider {
+        let openai_response: OpenAIResponse =
+            serde_json::from_value(result).map_err(|e| GatewayError::Provider {
                 provider: self.provider_name.clone(),
                 message: format!("response deserialization failed: {e}"),
                 status_code: None,
-            }
-        })?;
+            })?;
 
         Ok(ProviderResponse {
             response: openai_response,
@@ -137,7 +136,10 @@ impl ProviderClient for CodexProviderClient {
         // Codex backend has no /v1/models; return static hint list.
         let mut models: Vec<Model> = Vec::new();
 
-        for pattern in XHIGH_MODEL_PATTERNS.iter().chain(REASONING_MODEL_PATTERNS.iter()) {
+        for pattern in XHIGH_MODEL_PATTERNS
+            .iter()
+            .chain(REASONING_MODEL_PATTERNS.iter())
+        {
             models.push(Model {
                 id: pattern.to_string(),
                 object: "model".to_string(),
@@ -145,6 +147,7 @@ impl ProviderClient for CodexProviderClient {
                 created: None,
                 context_window: None,
                 max_completion_tokens: None,
+                supports_vision: true,
             });
         }
 
@@ -158,6 +161,7 @@ impl ProviderClient for CodexProviderClient {
                     created: None,
                     context_window: None,
                     max_completion_tokens: None,
+                    supports_vision: true,
                 });
             }
         }
@@ -170,6 +174,7 @@ impl ProviderClient for CodexProviderClient {
                     created: None,
                     context_window: None,
                     max_completion_tokens: None,
+                    supports_vision: true,
                 });
             }
         }
@@ -244,28 +249,30 @@ impl CodexProviderClient {
             }) => {
                 // 401 → force refresh before consuming retry budget (Req 10.4).
                 tracing::info!(provider = %self.provider_name, "Upstream 401; forcing OAuth refresh");
-                let new_token = self.oauth.force_refresh().await.map_err(|e| {
-                    GatewayError::Provider {
-                        provider: self.provider_name.clone(),
-                        message: format!("OAuth refresh after 401 failed: {e}"),
-                        status_code: Some(401),
-                    }
-                })?;
-                let new_account_id =
-                    extract_chatgpt_account_id(&new_token).map_err(|e| {
-                        GatewayError::Provider {
+                let new_token =
+                    self.oauth
+                        .force_refresh()
+                        .await
+                        .map_err(|e| GatewayError::Provider {
                             provider: self.provider_name.clone(),
-                            message: format!("JWT extraction failed after refresh: {e}"),
+                            message: format!("OAuth refresh after 401 failed: {e}"),
                             status_code: Some(401),
-                        }
+                        })?;
+                let new_account_id =
+                    extract_chatgpt_account_id(&new_token).map_err(|e| GatewayError::Provider {
+                        provider: self.provider_name.clone(),
+                        message: format!("JWT extraction failed after refresh: {e}"),
+                        status_code: Some(401),
                     })?;
                 // Retry once with fresh token.
                 self.dispatch_once(&new_token, &new_account_id, &body).await
             }
-            Err(e @ GatewayError::Provider {
-                status_code: Some(403),
-                ..
-            }) => {
+            Err(
+                e @ GatewayError::Provider {
+                    status_code: Some(403),
+                    ..
+                },
+            ) => {
                 // 403 → surface immediately, no refresh (Req 10.5).
                 tracing::warn!(provider = %self.provider_name, "Upstream 403; not retrying");
                 Err(e)
@@ -278,10 +285,16 @@ impl CodexProviderClient {
     async fn build_translated_body(&self, req: &OpenAIRequest) -> Result<Value, GatewayError> {
         let resolved_model = resolve_model(&req.model, self.model_override.as_deref());
         let reasoning_effort_str = req.extra.get("reasoning_effort").and_then(|v| v.as_str());
-        let mapped_effort =
-            map_effort(reasoning_effort_str, resolved_model, &self.xhigh_models_allowlist);
+        let mapped_effort = map_effort(
+            reasoning_effort_str,
+            resolved_model,
+            &self.xhigh_models_allowlist,
+        );
         let emit_reasoning = is_reasoning(resolved_model, &self.reasoning_models_allowlist);
-        let instructions = self.instructions.get(self.instructions_override.as_deref()).await;
+        let instructions = self
+            .instructions
+            .get(self.instructions_override.as_deref())
+            .await;
 
         let translator = ChatToResponsesTranslator {
             resolved_model,
@@ -374,7 +387,9 @@ impl CodexProviderClient {
             );
             return Err(GatewayError::Provider {
                 provider: self.provider_name.clone(),
-                message: format!("Upstream returned 2xx but no parseable SSE events. Body preview: {truncated}"),
+                message: format!(
+                    "Upstream returned 2xx but no parseable SSE events. Body preview: {truncated}"
+                ),
                 status_code: Some(502),
             });
         }
@@ -406,21 +421,22 @@ impl CodexProviderClient {
         &self,
         req: &OpenAIRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = ResponsesEvent> + Send>>, GatewayError> {
-        let access_token = self.oauth.get_access_token().await.ok_or_else(|| {
-            GatewayError::Provider {
-                provider: self.provider_name.clone(),
-                message: "OAuth session not authenticated".to_string(),
-                status_code: Some(401),
-            }
-        })?;
+        let access_token =
+            self.oauth
+                .get_access_token()
+                .await
+                .ok_or_else(|| GatewayError::Provider {
+                    provider: self.provider_name.clone(),
+                    message: "OAuth session not authenticated".to_string(),
+                    status_code: Some(401),
+                })?;
 
-        let account_id = extract_chatgpt_account_id(&access_token).map_err(|e| {
-            GatewayError::Provider {
+        let account_id =
+            extract_chatgpt_account_id(&access_token).map_err(|e| GatewayError::Provider {
                 provider: self.provider_name.clone(),
                 message: format!("JWT extraction failed: {e}"),
                 status_code: Some(401),
-            }
-        })?;
+            })?;
 
         let body = self.build_translated_body(req).await?;
 

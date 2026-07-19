@@ -1,30 +1,33 @@
-#![cfg_attr(all(target_os = "windows", feature = "tray"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", feature = "tray"),
+    windows_subsystem = "windows"
+)]
 
 use clap::Parser;
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod config;
-mod context;
-mod providers;
-mod router;
+mod admin;
 mod cache;
 mod codex;
-mod logger;
-#[allow(dead_code, unused_imports)]
-mod loop_detection;
-mod admin;
+mod config;
+mod context;
 mod dashboard;
-mod models;
 mod error;
 mod gateway;
 mod guardrail;
+mod logger;
+#[allow(dead_code, unused_imports)]
+mod loop_detection;
 mod metrics;
+mod models;
 mod oauth;
+mod providers;
+mod router;
 mod secrets;
-mod virtual_keys;
 #[cfg(feature = "tray")]
 mod tray;
+mod virtual_keys;
 
 #[derive(Parser, Debug)]
 #[command(name = "ai-gateway")]
@@ -60,20 +63,18 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    
+
     // Parse CLI arguments
     let cli = Cli::parse();
-    
+
     // Resolve config path
     let config_path = config::resolve_config_path(cli.config);
     tracing::info!("Loading configuration from: {}", config_path.display());
 
-    if config::bootstrap_config_if_missing(&config_path)
-        .map_err(|error| anyhow::anyhow!(error))?
-    {
+    if config::bootstrap_config_if_missing(&config_path).map_err(|error| anyhow::anyhow!(error))? {
         tracing::info!("Created default configuration at {}", config_path.display());
     }
-    
+
     // Load and validate configuration
     let config = match config::load_and_validate_config(&config_path) {
         Ok(cfg) => cfg,
@@ -82,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
-    
+
     tracing::info!("Configuration loaded successfully");
 
     // Each configuration compiles exactly one of the following blocks as the
@@ -96,8 +97,13 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(feature = "tray"))]
     {
         // Create and start the gateway server
-        tracing::info!("Server will listen on {}:{}", config.server.host, config.server.port);
-        let server = gateway::GatewayServer::new(config, Some(config_path)).await
+        tracing::info!(
+            "Server will listen on {}:{}",
+            config.server.host,
+            config.server.port
+        );
+        let server = gateway::GatewayServer::new(config, Some(config_path))
+            .await
             .map_err(|e| {
                 tracing::error!("Failed to initialize gateway: {}", e);
                 anyhow::anyhow!("{}", e)
@@ -125,7 +131,11 @@ async fn run_tray_mode(config: config::Config, config_path: PathBuf) -> anyhow::
     let config = tray::prepare_startup_config(config, &config_path)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
-    tracing::info!("Server will listen on {}:{}", config.server.host, config.server.port);
+    tracing::info!(
+        "Server will listen on {}:{}",
+        config.server.host,
+        config.server.port
+    );
 
     let mut tray_manager = tray::TrayManager::new(config.clone()).await?;
     tray_manager.attach_instance_guard(instance_guard);
@@ -173,14 +183,18 @@ async fn run_tray_mode(config: config::Config, config_path: PathBuf) -> anyhow::
 
         match &result {
             Ok(()) => tracing::info!("Tray-mode gateway server task exited cleanly"),
-            Err(error) => tracing::error!(%error, "Tray-mode gateway server task exited with an error"),
+            Err(error) => {
+                tracing::error!(%error, "Tray-mode gateway server task exited with an error")
+            }
         }
 
         result
     });
 
     tray_manager.set_server_running(true).await;
-    tracing::info!("Tray manager marked the server as running while the HTTP server task is still starting");
+    tracing::info!(
+        "Tray manager marked the server as running while the HTTP server task is still starting"
+    );
 
     if tray_manager.is_first_launch().await {
         tray_manager.show_first_launch_experience().await?;
@@ -193,8 +207,7 @@ async fn run_tray_mode(config: config::Config, config_path: PathBuf) -> anyhow::
 
         let mut persisted = config.clone();
         persisted.first_launch_completed = true;
-        config::save_config(&config_path, &persisted)
-            .map_err(|error| anyhow::anyhow!(error))?;
+        config::save_config(&config_path, &persisted).map_err(|error| anyhow::anyhow!(error))?;
         tray_manager.mark_first_launch_complete().await;
     }
 

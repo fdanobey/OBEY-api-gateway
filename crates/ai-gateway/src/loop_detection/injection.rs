@@ -53,7 +53,11 @@ fn select_instruction(
 }
 
 fn append_system_instruction(request: &mut OpenAIRequest, instruction: &str) {
-    if let Some(system) = request.messages.iter_mut().find(|message| message.role == "system") {
+    if let Some(system) = request
+        .messages
+        .iter_mut()
+        .find(|message| message.role == "system")
+    {
         match &mut system.content {
             Value::String(content) => {
                 if !content.is_empty() {

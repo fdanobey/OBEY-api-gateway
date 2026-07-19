@@ -46,11 +46,7 @@ impl TruncationResult {
     }
 
     /// Create a result indicating truncation was performed
-    pub fn truncated(
-        messages_removed: usize,
-        original_tokens: u32,
-        final_tokens: u32,
-    ) -> Self {
+    pub fn truncated(messages_removed: usize, original_tokens: u32, final_tokens: u32) -> Self {
         Self {
             truncated: true,
             messages_removed,
@@ -143,10 +139,7 @@ fn truncate_remove_oldest(
 /// When the window boundary falls inside a tool-use group (assistant with
 /// tool_calls + following tool messages), the entire group is included so
 /// the conversation stays well-formed.
-fn truncate_sliding_window(
-    messages: &mut Vec<Message>,
-    window_size: usize,
-) -> usize {
+fn truncate_sliding_window(messages: &mut Vec<Message>, window_size: usize) -> usize {
     if messages.len() <= window_size {
         return 0;
     }
@@ -221,9 +214,7 @@ mod tests {
         // Rough estimate: 4 characters per token
         messages
             .iter()
-            .map(|m| {
-                m.content_as_text().len() as u32 / 4
-            })
+            .map(|m| m.content_as_text().len() as u32 / 4)
             .sum()
     }
 

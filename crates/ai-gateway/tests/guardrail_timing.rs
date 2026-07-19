@@ -237,7 +237,13 @@ async fn stream_assemble_analyze_and_rechunk_completes_well_under_500ms() {
         has_tool_calls: false,
     };
     let (outcome, _refusal) = engine
-        .run_post_call(&mut response, &selector, &mut ctx, "trace-stream", &tool_ctx)
+        .run_post_call(
+            &mut response,
+            &selector,
+            &mut ctx,
+            "trace-stream",
+            &tool_ctx,
+        )
         .await;
     // ... immediately followed by re-chunking the assembled response into SSE.
     let chunks = stream::rechunk_full(&response);

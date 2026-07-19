@@ -75,7 +75,10 @@ fn creates_system_message_when_absent() {
         None,
     );
     assert_eq!(request.messages[0].role, "system");
-    assert_eq!(request.messages[0].content, json!(DEFAULT_BREAK_INSTRUCTION));
+    assert_eq!(
+        request.messages[0].content,
+        json!(DEFAULT_BREAK_INSTRUCTION)
+    );
 }
 
 #[test]
@@ -117,7 +120,10 @@ fn context_aware_variants_and_custom_template_are_selected() {
         &config,
         None,
     );
-    assert_eq!(error_request.messages[0].content, json!(ERROR_CYCLING_INSTRUCTION));
+    assert_eq!(
+        error_request.messages[0].content,
+        json!(ERROR_CYCLING_INSTRUCTION)
+    );
 
     config.break_instruction_template = Some("custom escape".into());
     let mut custom_request = request(vec![]);

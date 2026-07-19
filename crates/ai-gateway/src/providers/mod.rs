@@ -1,19 +1,19 @@
 #[allow(dead_code)]
-pub mod openai_compatible;
-#[allow(dead_code)]
 pub mod bedrock;
 #[allow(dead_code)]
-pub mod ollama;
-#[allow(dead_code)]
 pub mod groq;
-#[allow(dead_code)]
-pub mod together;
-#[allow(dead_code)]
-pub mod vllm;
 #[allow(dead_code)]
 pub mod lmstudio;
 #[allow(dead_code)]
 pub mod nvidia_nim;
+#[allow(dead_code)]
+pub mod ollama;
+#[allow(dead_code)]
+pub mod openai_compatible;
+#[allow(dead_code)]
+pub mod together;
+#[allow(dead_code)]
+pub mod vllm;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -100,6 +100,10 @@ pub struct Model {
     /// Populated from provider's /models endpoint when available
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
+    /// Whether this model supports image/vision inputs.
+    /// Populated from provider's /models endpoint when available; defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_vision: bool,
 }
 
 /// Provider response wrapper

@@ -109,37 +109,44 @@ async fn handle_callback(
 ) -> impl IntoResponse {
     // Decide the outcome (status, html body, channel payload) without
     // borrowing secrets into logs. Note: we never log `code` or `state`.
-    let (status, body, result): (StatusCode, &'static str, Result<AuthorizationCode, OAuthError>) =
-        if let Some(error_code) = query.error {
-            // 4.4: provider returned an error on the redirect.
-            tracing::warn!(
-                error = %error_code,
-                description = ?query.error_description,
-                "OAuth authorization error from provider"
-            );
-            (
-                StatusCode::OK,
-                FAILURE_HTML,
-                Err(OAuthError::AuthorizationError {
-                    error: error_code,
-                    description: query.error_description,
-                }),
-            )
-        } else if query.state.as_deref() != Some(state.expected_state.as_str()) {
-            // 4.3: CSRF state mismatch — HTTP 400 + warn log.
-            tracing::warn!("CSRF state mismatch on OAuth callback");
-            (StatusCode::BAD_REQUEST, FAILURE_HTML, Err(OAuthError::StateMismatch))
-        } else if let Some(code) = query.code {
-            // 4.5: success path.
-            (StatusCode::OK, SUCCESS_HTML, Ok(AuthorizationCode(code)))
-        } else {
-            // Valid state but no code and no error — malformed provider response.
-            (
-                StatusCode::BAD_REQUEST,
-                FAILURE_HTML,
-                Err(OAuthError::MissingAuthorizationCode),
-            )
-        };
+    let (status, body, result): (
+        StatusCode,
+        &'static str,
+        Result<AuthorizationCode, OAuthError>,
+    ) = if let Some(error_code) = query.error {
+        // 4.4: provider returned an error on the redirect.
+        tracing::warn!(
+            error = %error_code,
+            description = ?query.error_description,
+            "OAuth authorization error from provider"
+        );
+        (
+            StatusCode::OK,
+            FAILURE_HTML,
+            Err(OAuthError::AuthorizationError {
+                error: error_code,
+                description: query.error_description,
+            }),
+        )
+    } else if query.state.as_deref() != Some(state.expected_state.as_str()) {
+        // 4.3: CSRF state mismatch — HTTP 400 + warn log.
+        tracing::warn!("CSRF state mismatch on OAuth callback");
+        (
+            StatusCode::BAD_REQUEST,
+            FAILURE_HTML,
+            Err(OAuthError::StateMismatch),
+        )
+    } else if let Some(code) = query.code {
+        // 4.5: success path.
+        (StatusCode::OK, SUCCESS_HTML, Ok(AuthorizationCode(code)))
+    } else {
+        // Valid state but no code and no error — malformed provider response.
+        (
+            StatusCode::BAD_REQUEST,
+            FAILURE_HTML,
+            Err(OAuthError::MissingAuthorizationCode),
+        )
+    };
 
     // Deliver the outcome exactly once; subsequent callbacks (if any) find the
     // sender already consumed and silently render the failure page instead.
@@ -434,7 +441,8 @@ mod tests {
         assert_eq!(
             bound_addr.ip(),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
-            "callback server must bind to 127.0.0.1, not {}", bound_addr.ip()
+            "callback server must bind to 127.0.0.1, not {}",
+            bound_addr.ip()
         );
 
         let server = tokio::spawn(start_callback_server_with_listener(
@@ -452,10 +460,8 @@ mod tests {
             // Attempt a TCP connection via the LAN IP. Since the server only
             // listens on 127.0.0.1, this should be refused.
             let target = std::net::SocketAddr::new(IpAddr::V4(lan_ip), port);
-            let connect_result = StdTcpStream::connect_timeout(
-                &target,
-                std::time::Duration::from_secs(2),
-            );
+            let connect_result =
+                StdTcpStream::connect_timeout(&target, std::time::Duration::from_secs(2));
             assert!(
                 connect_result.is_err(),
                 "connection to non-loopback {target} should be refused, but succeeded"

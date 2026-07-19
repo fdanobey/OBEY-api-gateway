@@ -257,39 +257,50 @@ fn dispatch_to_event(v: serde_json::Value) -> Result<ResponsesEvent, CodexError>
             let model = resp
                 .get("model")
                 .and_then(|x| x.as_str())
-                .ok_or_else(|| {
-                    CodexError::Sse("response.created missing `response.model`".into())
-                })?
+                .ok_or_else(|| CodexError::Sse("response.created missing `response.model`".into()))?
                 .to_owned();
-            Ok(ResponsesEvent::Created { id, model, sequence_number })
+            Ok(ResponsesEvent::Created {
+                id,
+                model,
+                sequence_number,
+            })
         }
         "response.output_text.delta" => {
             let item_id = str_field(&v, "item_id", "output_text.delta")?;
             let delta = str_field(&v, "delta", "output_text.delta")?;
-            Ok(ResponsesEvent::OutputTextDelta { item_id, delta, sequence_number })
+            Ok(ResponsesEvent::OutputTextDelta {
+                item_id,
+                delta,
+                sequence_number,
+            })
         }
         "response.output_text.done" => {
             let item_id = str_field(&v, "item_id", "output_text.done")?;
             let text = str_field(&v, "text", "output_text.done")?;
-            Ok(ResponsesEvent::OutputTextDone { item_id, text, sequence_number })
+            Ok(ResponsesEvent::OutputTextDone {
+                item_id,
+                text,
+                sequence_number,
+            })
         }
         "response.output_item.added" => {
-            let item = v.get("item").ok_or_else(|| {
-                CodexError::Sse("output_item.added missing `item` object".into())
-            })?;
+            let item = v
+                .get("item")
+                .ok_or_else(|| CodexError::Sse("output_item.added missing `item` object".into()))?;
             let kind = item
                 .get("type")
                 .and_then(|x| x.as_str())
-                .ok_or_else(|| {
-                    CodexError::Sse("output_item.added missing `item.type`".into())
-                })?
+                .ok_or_else(|| CodexError::Sse("output_item.added missing `item.type`".into()))?
                 .to_owned();
             let item_id = item
                 .get("id")
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .to_owned();
-            let call_id = item.get("call_id").and_then(|x| x.as_str()).map(str::to_owned);
+            let call_id = item
+                .get("call_id")
+                .and_then(|x| x.as_str())
+                .map(str::to_owned);
             let name = item.get("name").and_then(|x| x.as_str()).map(str::to_owned);
             Ok(ResponsesEvent::OutputItemAdded {
                 item_id,
@@ -315,15 +326,24 @@ fn dispatch_to_event(v: serde_json::Value) -> Result<ResponsesEvent, CodexError>
             let response: CompletedPayload = serde_json::from_value(resp_v).map_err(|e| {
                 CodexError::Sse(format!("response.completed payload decode failed: {}", e))
             })?;
-            Ok(ResponsesEvent::Completed { response, sequence_number })
+            Ok(ResponsesEvent::Completed {
+                response,
+                sequence_number,
+            })
         }
         "response.failed" => {
             let error = decode_error_payload(&v, "response.failed")?;
-            Ok(ResponsesEvent::Failed { error, sequence_number })
+            Ok(ResponsesEvent::Failed {
+                error,
+                sequence_number,
+            })
         }
         "error" => {
             let error = decode_error_payload(&v, "error")?;
-            Ok(ResponsesEvent::Error { error, sequence_number })
+            Ok(ResponsesEvent::Error {
+                error,
+                sequence_number,
+            })
         }
         _ => Ok(ResponsesEvent::Other {
             kind: event_type,
@@ -376,7 +396,11 @@ mod tests {
         let out = p.feed(frame);
         assert_eq!(out.len(), 1, "expected exactly one event");
         match out.into_iter().next().unwrap() {
-            Ok(ResponsesEvent::Created { id, model, sequence_number }) => {
+            Ok(ResponsesEvent::Created {
+                id,
+                model,
+                sequence_number,
+            }) => {
                 assert_eq!(id, "resp_abc");
                 assert_eq!(model, "gpt-5");
                 assert_eq!(sequence_number, 0);
@@ -399,7 +423,11 @@ mod tests {
         let frame = b"data: {\"type\":\"response.output_text.delta\",\
                       \"sequence_number\":3,\"item_id\":\"item_1\",\"delta\":\"Hel\"}\n\n";
         match feed_one(frame).expect("decode ok") {
-            ResponsesEvent::OutputTextDelta { item_id, delta, sequence_number } => {
+            ResponsesEvent::OutputTextDelta {
+                item_id,
+                delta,
+                sequence_number,
+            } => {
                 assert_eq!(item_id, "item_1");
                 assert_eq!(delta, "Hel");
                 assert_eq!(sequence_number, 3);
@@ -414,7 +442,11 @@ mod tests {
         let frame = b"data: {\"type\":\"response.output_text.done\",\
                       \"sequence_number\":7,\"item_id\":\"item_1\",\"text\":\"Hello world\"}\n\n";
         match feed_one(frame).expect("decode ok") {
-            ResponsesEvent::OutputTextDone { item_id, text, sequence_number } => {
+            ResponsesEvent::OutputTextDone {
+                item_id,
+                text,
+                sequence_number,
+            } => {
                 assert_eq!(item_id, "item_1");
                 assert_eq!(text, "Hello world");
                 assert_eq!(sequence_number, 7);
@@ -484,7 +516,10 @@ mod tests {
                       \"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15},\
                       \"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n";
         match feed_one(frame).expect("decode ok") {
-            ResponsesEvent::Completed { response, sequence_number } => {
+            ResponsesEvent::Completed {
+                response,
+                sequence_number,
+            } => {
                 assert_eq!(sequence_number, 99);
                 assert_eq!(response.id, "resp_done");
                 assert_eq!(response.model, "gpt-5.5");
@@ -529,7 +564,10 @@ mod tests {
                       \"error\":{\"message\":\"upstream blew up\",\
                       \"code\":\"server_error\",\"type\":\"api_error\"}}\n\n";
         match feed_one(frame).expect("decode ok") {
-            ResponsesEvent::Failed { error, sequence_number } => {
+            ResponsesEvent::Failed {
+                error,
+                sequence_number,
+            } => {
                 assert_eq!(sequence_number, 42);
                 assert_eq!(error.message.as_deref(), Some("upstream blew up"));
                 assert_eq!(error.code.as_deref(), Some("server_error"));
@@ -546,7 +584,10 @@ mod tests {
                       \"error\":{\"message\":\"bad token\",\"code\":\"invalid_request_error\",\
                       \"type\":\"invalid_request_error\"}}\n\n";
         match feed_one(frame).expect("decode ok") {
-            ResponsesEvent::Error { error, sequence_number } => {
+            ResponsesEvent::Error {
+                error,
+                sequence_number,
+            } => {
                 assert_eq!(sequence_number, 2);
                 assert_eq!(error.message.as_deref(), Some("bad token"));
                 assert_eq!(error.code.as_deref(), Some("invalid_request_error"));
@@ -562,7 +603,10 @@ mod tests {
         let frame = b"data: {\"type\":\"response.web_search_call.in_progress\",\
                       \"sequence_number\":17}\n\n";
         match feed_one(frame).expect("decode ok") {
-            ResponsesEvent::Other { kind, sequence_number } => {
+            ResponsesEvent::Other {
+                kind,
+                sequence_number,
+            } => {
                 assert_eq!(kind, "response.web_search_call.in_progress");
                 assert_eq!(sequence_number, 17);
             }
@@ -586,7 +630,11 @@ mod tests {
         let out2 = p.feed(part2);
         assert_eq!(out2.len(), 1);
         match out2.into_iter().next().unwrap().expect("decode ok") {
-            ResponsesEvent::OutputTextDelta { item_id, delta, sequence_number } => {
+            ResponsesEvent::OutputTextDelta {
+                item_id,
+                delta,
+                sequence_number,
+            } => {
                 assert_eq!(item_id, "item_2");
                 assert_eq!(delta, "lo ");
                 assert_eq!(sequence_number, 4);
@@ -609,7 +657,11 @@ mod tests {
         let out2 = p.feed(b"\n");
         assert_eq!(out2.len(), 1);
         match out2.into_iter().next().unwrap().expect("decode ok") {
-            ResponsesEvent::OutputTextDelta { item_id, delta, sequence_number } => {
+            ResponsesEvent::OutputTextDelta {
+                item_id,
+                delta,
+                sequence_number,
+            } => {
                 assert_eq!(item_id, "it_3");
                 assert_eq!(delta, "x");
                 assert_eq!(sequence_number, 5);
@@ -629,7 +681,11 @@ mod tests {
         let frame = b"data: {\"type\":\"response.output_text.delta\",\"sequence_number\":6,\n\
                       data: \"item_id\":\"x\",\"delta\":\"y\"}\n\n";
         match feed_one(frame).expect("decode ok") {
-            ResponsesEvent::OutputTextDelta { item_id, delta, sequence_number } => {
+            ResponsesEvent::OutputTextDelta {
+                item_id,
+                delta,
+                sequence_number,
+            } => {
                 assert_eq!(item_id, "x");
                 assert_eq!(delta, "y");
                 assert_eq!(sequence_number, 6);
@@ -654,12 +710,19 @@ mod tests {
             other => panic!("expected first record to be Sse error, got {:?}", other),
         }
         match &out[1] {
-            Ok(ResponsesEvent::OutputTextDelta { item_id, delta, sequence_number }) => {
+            Ok(ResponsesEvent::OutputTextDelta {
+                item_id,
+                delta,
+                sequence_number,
+            }) => {
                 assert_eq!(item_id, "after");
                 assert_eq!(delta, "ok");
                 assert_eq!(*sequence_number, 8);
             }
-            other => panic!("expected second record to be OutputTextDelta, got {:?}", other),
+            other => panic!(
+                "expected second record to be OutputTextDelta, got {:?}",
+                other
+            ),
         }
     }
 
@@ -678,7 +741,11 @@ mod tests {
         );
         assert_eq!(out2.len(), 1);
         match out2.into_iter().next().unwrap().expect("decode ok") {
-            ResponsesEvent::OutputTextDelta { item_id, delta, sequence_number } => {
+            ResponsesEvent::OutputTextDelta {
+                item_id,
+                delta,
+                sequence_number,
+            } => {
                 assert_eq!(item_id, "id");
                 assert_eq!(delta, "d");
                 assert_eq!(sequence_number, 1);
@@ -698,7 +765,11 @@ mod tests {
                       data: {\"type\":\"response.output_text.delta\",\
                       \"sequence_number\":12,\"item_id\":\"only\",\"delta\":\"z\"}\n\n";
         match feed_one(frame).expect("decode ok") {
-            ResponsesEvent::OutputTextDelta { item_id, delta, sequence_number } => {
+            ResponsesEvent::OutputTextDelta {
+                item_id,
+                delta,
+                sequence_number,
+            } => {
                 assert_eq!(item_id, "only");
                 assert_eq!(delta, "z");
                 assert_eq!(sequence_number, 12);

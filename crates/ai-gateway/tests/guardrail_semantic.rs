@@ -226,8 +226,8 @@ async fn semantic_live_qdrant_query_path() {
     let embed_base_url = std::env::var("GUARDRAIL_TEST_EMBED_BASE_URL")
         .expect("GUARDRAIL_TEST_EMBED_BASE_URL must be set for the live semantic test");
     let embed_api_key = std::env::var("GUARDRAIL_TEST_EMBED_API_KEY").unwrap_or_default();
-    let embed_model = std::env::var("GUARDRAIL_TEST_EMBED_MODEL")
-        .unwrap_or_else(|_| EMBED_MODEL.to_string());
+    let embed_model =
+        std::env::var("GUARDRAIL_TEST_EMBED_MODEL").unwrap_or_else(|_| EMBED_MODEL.to_string());
     let allow_collection = std::env::var("GUARDRAIL_TEST_ALLOW_COLLECTION")
         .unwrap_or_else(|_| "guardrail_allow".to_string());
     let deny_collection = std::env::var("GUARDRAIL_TEST_DENY_COLLECTION")

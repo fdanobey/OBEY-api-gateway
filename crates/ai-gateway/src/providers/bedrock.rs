@@ -2,8 +2,11 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_bedrock::Client as BedrockControlClient;
 use aws_sdk_bedrockruntime::{
-    operation::invoke_model::InvokeModelOutput,
-    primitives::Blob,
+    operation::{converse::ConverseOutput as SdkConverseOutput, invoke_model::InvokeModelOutput},
+    types::{
+        ContentBlock, ConversationRole, InferenceConfiguration, Message as BedrockMessage,
+        SystemContentBlock,
+    },
     Client as BedrockClient,
 };
 use futures::stream::{Stream, StreamExt};
@@ -16,6 +19,24 @@ use std::time::Instant;
 use crate::error::GatewayError;
 use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
 use crate::providers::{Model, ProviderClient, ProviderResponse, SSEEvent};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MantleApi {
+    Chat,
+    Responses,
+    Messages,
+}
+
+fn mantle_api_for_model(model_id: &str) -> MantleApi {
+    let id = model_id.to_ascii_lowercase();
+    if id.starts_with("openai.gpt-5.6") || id == "openai.gpt-5.5" || id == "openai.gpt-5.4" {
+        MantleApi::Responses
+    } else if id.starts_with("anthropic.claude") {
+        MantleApi::Messages
+    } else {
+        MantleApi::Chat
+    }
+}
 
 /// Default pool idle timeout in seconds
 const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
@@ -36,6 +57,335 @@ pub const BEDROCK_REGIONS: &[&str] = &[
     "ca-central-1",
     "us-gov-west-1",
 ];
+
+/// A fallback catalog entry for Bedrock model discovery.
+/// One struct backs both the Mantle Chat and runtime fallback lists; the
+/// generated block per catalog is delimited so `scripts/sync-bedrock-fallback.ps1`
+/// can rewrite it without touching surrounding code.
+pub struct BedrockFallbackModel {
+    pub id: &'static str,
+    pub owned_by: &'static str,
+    pub supports_vision: bool,
+    pub context_window: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
+    pub source_url: &'static str,
+}
+
+// BEGIN BEDROCK MANTLE CHAT FALLBACK MODELS
+// Source: AWS Bedrock model cards (Programmatic Access) + API compatibility table.
+// Only Chat Completions-capable bedrock-mantle models with verified IDs.
+// Responses-only (GPT-5.5/5.4/GPT-5.6) and Messages-only (Claude) models are
+// intentionally excluded pending dedicated adapters.
+pub const BEDROCK_MANTLE_CHAT_FALLBACK: &[BedrockFallbackModel] = &[
+    BedrockFallbackModel {
+        id: "openai.gpt-oss-120b",
+        owned_by: "openai",
+        supports_vision: false,
+        context_window: Some(128_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-oss-120b.html",
+    },
+    BedrockFallbackModel {
+        id: "openai.gpt-oss-20b",
+        owned_by: "openai",
+        supports_vision: false,
+        context_window: Some(128_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-oss-20b.html",
+    },
+    BedrockFallbackModel {
+        id: "deepseek.v3.2",
+        owned_by: "deepseek",
+        supports_vision: false,
+        context_window: Some(164_000),
+        max_completion_tokens: Some(8_192),
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-deepseek-deepseek-v3-2.html",
+    },
+    BedrockFallbackModel {
+        id: "deepseek.v3.1",
+        owned_by: "deepseek",
+        supports_vision: false,
+        context_window: Some(128_000),
+        max_completion_tokens: Some(8_192),
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-deepseek-deepseek-v3-1.html",
+    },
+    BedrockFallbackModel {
+        id: "mistral.mistral-large-3-675b-instruct",
+        owned_by: "mistral",
+        supports_vision: false,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-mistral-ai-mistral-large-3.html",
+    },
+    BedrockFallbackModel {
+        id: "qwen.qwen3-32b",
+        owned_by: "qwen",
+        supports_vision: false,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-qwen-qwen3-32b.html",
+    },
+    BedrockFallbackModel {
+        id: "qwen.qwen3-235b-a22b-2507",
+        owned_by: "qwen",
+        supports_vision: false,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+    BedrockFallbackModel {
+        id: "qwen.qwen3-coder-480b-a35b-instruct",
+        owned_by: "qwen",
+        supports_vision: false,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+];
+// END BEDROCK MANTLE CHAT FALLBACK MODELS
+
+// BEGIN BEDROCK MANTLE RESPONSES FALLBACK MODELS
+pub const BEDROCK_MANTLE_RESPONSES_FALLBACK: &[BedrockFallbackModel] = &[
+    BedrockFallbackModel {
+        id: "openai.gpt-5.6-sol",
+        owned_by: "openai",
+        supports_vision: true,
+        context_window: Some(272_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-56-sol.html",
+    },
+    BedrockFallbackModel {
+        id: "openai.gpt-5.6-terra",
+        owned_by: "openai",
+        supports_vision: true,
+        context_window: Some(272_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-56-terra.html",
+    },
+    BedrockFallbackModel {
+        id: "openai.gpt-5.6-luna",
+        owned_by: "openai",
+        supports_vision: true,
+        context_window: Some(272_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-56-luna.html",
+    },
+    BedrockFallbackModel {
+        id: "openai.gpt-5.5",
+        owned_by: "openai",
+        supports_vision: true,
+        context_window: Some(272_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-55.html",
+    },
+    BedrockFallbackModel {
+        id: "openai.gpt-5.4",
+        owned_by: "openai",
+        supports_vision: true,
+        context_window: Some(272_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-54.html",
+    },
+];
+// END BEDROCK MANTLE RESPONSES FALLBACK MODELS
+
+// BEGIN BEDROCK MANTLE MESSAGES FALLBACK MODELS
+pub const BEDROCK_MANTLE_MESSAGES_FALLBACK: &[BedrockFallbackModel] = &[
+    BedrockFallbackModel {
+        id: "anthropic.claude-sonnet-5",
+        owned_by: "anthropic",
+        supports_vision: true,
+        context_window: Some(1_000_000),
+        max_completion_tokens: Some(131_072),
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5.html",
+    },
+    BedrockFallbackModel {
+        id: "anthropic.claude-fable-5",
+        owned_by: "anthropic",
+        supports_vision: true,
+        context_window: Some(1_000_000),
+        max_completion_tokens: Some(131_072),
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-fable-5.html",
+    },
+    BedrockFallbackModel {
+        id: "anthropic.claude-opus-4-8",
+        owned_by: "anthropic",
+        supports_vision: true,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-8.html",
+    },
+    BedrockFallbackModel {
+        id: "anthropic.claude-opus-4-7",
+        owned_by: "anthropic",
+        supports_vision: true,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+];
+// END BEDROCK MANTLE MESSAGES FALLBACK MODELS
+
+// BEGIN BEDROCK RUNTIME FALLBACK MODELS
+// Source: AWS Bedrock model cards (Programmatic Access) + ListFoundationModels.
+// Only Converse/Invoke-capable runtime models. Legacy models (Nova Premier,
+// meta.llama3-1-405b, AI21 Jamba, Cohere Command R/R+) are excluded.
+// SDK chat currently routes through InvokeModel with legacy translators; once
+// Converse migration lands, this catalog's IDs all become truthfully invocable.
+pub const BEDROCK_RUNTIME_FALLBACK: &[BedrockFallbackModel] = &[
+    BedrockFallbackModel {
+        id: "anthropic.claude-sonnet-5",
+        owned_by: "anthropic",
+        supports_vision: true,
+        context_window: Some(1_000_000),
+        max_completion_tokens: Some(131_072),
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5.html",
+    },
+    BedrockFallbackModel {
+        id: "anthropic.claude-opus-4-8",
+        owned_by: "anthropic",
+        supports_vision: true,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-8.html",
+    },
+    BedrockFallbackModel {
+        id: "anthropic.claude-opus-4-7",
+        owned_by: "anthropic",
+        supports_vision: true,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+    BedrockFallbackModel {
+        id: "anthropic.claude-haiku-4-5-20251001-v1:0",
+        owned_by: "anthropic",
+        supports_vision: true,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+    BedrockFallbackModel {
+        id: "amazon.nova-2-lite-v1:0",
+        owned_by: "amazon",
+        supports_vision: true,
+        context_window: Some(1_000_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+    BedrockFallbackModel {
+        id: "amazon.nova-pro-v1:0",
+        owned_by: "amazon",
+        supports_vision: true,
+        context_window: None,
+        max_completion_tokens: Some(25_000),
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+    BedrockFallbackModel {
+        id: "amazon.nova-lite-v1:0",
+        owned_by: "amazon",
+        supports_vision: true,
+        context_window: Some(300_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+    BedrockFallbackModel {
+        id: "amazon.nova-micro-v1:0",
+        owned_by: "amazon",
+        supports_vision: false,
+        context_window: Some(128_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+    BedrockFallbackModel {
+        id: "openai.gpt-oss-120b-1:0",
+        owned_by: "openai",
+        supports_vision: false,
+        context_window: Some(128_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-oss-120b.html",
+    },
+    BedrockFallbackModel {
+        id: "openai.gpt-oss-20b-1:0",
+        owned_by: "openai",
+        supports_vision: false,
+        context_window: Some(128_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-oss-20b.html",
+    },
+    BedrockFallbackModel {
+        id: "deepseek.v3.2",
+        owned_by: "deepseek",
+        supports_vision: false,
+        context_window: Some(164_000),
+        max_completion_tokens: Some(8_192),
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-deepseek-deepseek-v3-2.html",
+    },
+    BedrockFallbackModel {
+        id: "deepseek.v3.1",
+        owned_by: "deepseek",
+        supports_vision: false,
+        context_window: Some(128_000),
+        max_completion_tokens: Some(8_192),
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-deepseek-deepseek-v3-1.html",
+    },
+    BedrockFallbackModel {
+        id: "meta.llama3-1-70b-instruct-v1:0",
+        owned_by: "meta",
+        supports_vision: false,
+        context_window: Some(128_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+    BedrockFallbackModel {
+        id: "meta.llama3-1-8b-instruct-v1:0",
+        owned_by: "meta",
+        supports_vision: false,
+        context_window: Some(128_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+    BedrockFallbackModel {
+        id: "meta.llama3-3-70b-instruct-v1:0",
+        owned_by: "meta",
+        supports_vision: false,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
+    },
+    BedrockFallbackModel {
+        id: "mistral.mistral-large-3-675b-instruct",
+        owned_by: "mistral",
+        supports_vision: false,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-mistral-ai-mistral-large-3.html",
+    },
+    BedrockFallbackModel {
+        id: "qwen.qwen3-32b-v1:0",
+        owned_by: "qwen",
+        supports_vision: false,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-qwen-qwen3-32b.html",
+    },
+];
+// END BEDROCK RUNTIME FALLBACK MODELS
+
+fn fallback_entries_to_models(entries: &[BedrockFallbackModel]) -> Vec<Model> {
+    entries
+        .iter()
+        .map(|entry| Model {
+            id: entry.id.to_string(),
+            object: "model".to_string(),
+            owned_by: entry.owned_by.to_string(),
+            created: None,
+            context_window: entry.context_window,
+            max_completion_tokens: entry.max_completion_tokens,
+            supports_vision: entry.supports_vision,
+        })
+        .collect()
+}
 
 /// Derive the region group code from an AWS region string.
 /// Maps region prefixes to group codes used for global inference profile model ID prefixing.
@@ -105,7 +455,17 @@ pub fn model_supports_reasoning(model_id: &str) -> bool {
         return true;
     }
 
-    // Claude 4+ family (future-proofing)
+    // Current Claude naming uses the family before the major version (for
+    // example claude-sonnet-5 and claude-opus-4-8).
+    if id.contains("claude-sonnet-5")
+        || id.contains("claude-opus-4")
+        || id.contains("claude-fable-5")
+        || id.contains("claude-haiku-4-5")
+    {
+        return true;
+    }
+
+    // Claude 4+ legacy naming (future-proofing)
     if id.contains("claude-4") || id.contains("claude-5") {
         return true;
     }
@@ -177,7 +537,7 @@ impl BedrockProvider {
     }
 
     /// Create a new Bedrock provider client with full configuration options.
-    /// 
+    ///
     /// If `api_key` is provided, uses HTTP-based authentication to the Bedrock Mantle endpoint.
     /// Otherwise, falls back to AWS SDK authentication using the credential chain.
     ///
@@ -203,10 +563,14 @@ impl BedrockProvider {
 
             let http_client = Client::builder()
                 .pool_max_idle_per_host(pool_size)
-                .pool_idle_timeout(std::time::Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS))
+                .pool_idle_timeout(std::time::Duration::from_secs(
+                    DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+                ))
                 .timeout(timeout)
                 .build()
-                .map_err(|e| GatewayError::Configuration(format!("Failed to create HTTP client: {}", e)))?;
+                .map_err(|e| {
+                    GatewayError::Configuration(format!("Failed to create HTTP client: {}", e))
+                })?;
 
             let base_url = build_mantle_base_url(&region);
 
@@ -225,7 +589,10 @@ impl BedrockProvider {
 
             let client = BedrockClient::new(&config);
             let control_client = BedrockControlClient::new(&config);
-            BedrockAuthMode::AwsSdk { client, control_client }
+            BedrockAuthMode::AwsSdk {
+                client,
+                control_client,
+            }
         };
 
         Ok(Self {
@@ -255,34 +622,49 @@ impl BedrockProvider {
     fn translate_model_id(&self, openai_model: &str) -> String {
         // Support common model name patterns
         match openai_model {
-            // Claude models
+            // Current Claude families
+            m if m.contains("claude-sonnet-5") => "anthropic.claude-sonnet-5".to_string(),
+            m if m.contains("claude-opus-4-8") => "anthropic.claude-opus-4-8".to_string(),
+            m if m.contains("claude-opus-4-7") => "anthropic.claude-opus-4-7".to_string(),
+            m if m.contains("claude-haiku-4-5") => {
+                "anthropic.claude-haiku-4-5-20251001-v1:0".to_string()
+            }
+            // Claude 3 models
             m if m.contains("claude-3-opus") => "anthropic.claude-3-opus-20240229-v1:0".to_string(),
-            m if m.contains("claude-3-sonnet") => "anthropic.claude-3-sonnet-20240229-v1:0".to_string(),
-            m if m.contains("claude-3-haiku") => "anthropic.claude-3-haiku-20240307-v1:0".to_string(),
+            m if m.contains("claude-3-sonnet") => {
+                "anthropic.claude-3-sonnet-20240229-v1:0".to_string()
+            }
+            m if m.contains("claude-3-haiku") => {
+                "anthropic.claude-3-haiku-20240307-v1:0".to_string()
+            }
             m if m.contains("claude-2.1") => "anthropic.claude-v2:1".to_string(),
             m if m.contains("claude-2") => "anthropic.claude-v2".to_string(),
             m if m.contains("claude-instant") => "anthropic.claude-instant-v1".to_string(),
-            
+
             // Titan models
             m if m.contains("titan-text-express") => "amazon.titan-text-express-v1".to_string(),
             m if m.contains("titan-text-lite") => "amazon.titan-text-lite-v1".to_string(),
             m if m.contains("titan-embed") => "amazon.titan-embed-text-v1".to_string(),
-            
+
             // Jurassic models
             m if m.contains("jurassic-2-ultra") => "ai21.j2-ultra-v1".to_string(),
             m if m.contains("jurassic-2-mid") => "ai21.j2-mid-v1".to_string(),
-            
+
             // Command models (Cohere)
             m if m.contains("command-text") => "cohere.command-text-v14".to_string(),
             m if m.contains("command-light") => "cohere.command-light-text-v14".to_string(),
-            
+
             // If already in ARN format, use as-is
             _ => openai_model.to_string(),
         }
     }
 
     /// Translate OpenAI request to Bedrock format
-    fn translate_request(&self, request: &OpenAIRequest, model_id: &str) -> Result<String, GatewayError> {
+    fn translate_request(
+        &self,
+        request: &OpenAIRequest,
+        model_id: &str,
+    ) -> Result<String, GatewayError> {
         // Determine model family from model_id
         if model_id.starts_with("anthropic.claude") {
             self.translate_claude_request(request)
@@ -298,6 +680,121 @@ impl BedrockProvider {
                 model_id
             )))
         }
+    }
+
+    /// Convert OpenAI messages into the Bedrock Converse message and system
+    /// shapes. Converse supports a common schema across current Bedrock models,
+    /// avoiding the legacy per-provider InvokeModel translators.
+    fn build_converse_input(
+        &self,
+        request: &OpenAIRequest,
+    ) -> Result<
+        (
+            Vec<BedrockMessage>,
+            Vec<SystemContentBlock>,
+            InferenceConfiguration,
+        ),
+        GatewayError,
+    > {
+        let mut messages = Vec::new();
+        let mut system = Vec::new();
+
+        for message in &request.messages {
+            if message.role == "system" {
+                system.push(SystemContentBlock::Text(message.content_as_text()));
+                continue;
+            }
+
+            let role = match message.role.as_str() {
+                "assistant" => ConversationRole::Assistant,
+                "user" => ConversationRole::User,
+                other => {
+                    return Err(GatewayError::Configuration(format!(
+                        "Unsupported Converse message role: {}",
+                        other
+                    )))
+                }
+            };
+            let built = BedrockMessage::builder()
+                .role(role)
+                .content(ContentBlock::Text(message.content_as_text()))
+                .build()
+                .map_err(|error| {
+                    GatewayError::Configuration(format!(
+                        "Failed to build Bedrock Converse message: {}",
+                        error
+                    ))
+                })?;
+            messages.push(built);
+        }
+
+        if messages.is_empty() {
+            return Err(GatewayError::Configuration(
+                "Bedrock Converse requires at least one user or assistant message".to_string(),
+            ));
+        }
+
+        let max_tokens = request.max_tokens.unwrap_or(2048).min(i32::MAX as u32) as i32;
+        let inference = InferenceConfiguration::builder()
+            .max_tokens(max_tokens)
+            .set_temperature(request.temperature)
+            .build();
+
+        Ok((messages, system, inference))
+    }
+
+    fn translate_converse_output(
+        &self,
+        output: SdkConverseOutput,
+        original_model: &str,
+    ) -> Result<OpenAIResponse, GatewayError> {
+        let message = output
+            .output()
+            .and_then(|value| value.as_message().ok())
+            .ok_or_else(|| GatewayError::Provider {
+                provider: self.name.clone(),
+                message: "Bedrock Converse response did not contain a message".to_string(),
+                status_code: None,
+            })?;
+
+        let content = message
+            .content()
+            .iter()
+            .filter_map(|block| block.as_text().ok())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("");
+        let usage = output.usage();
+        let finish_reason = match output.stop_reason().as_str() {
+            "max_tokens" => "length",
+            "end_turn" | "stop_sequence" => "stop",
+            "tool_use" => "tool_calls",
+            other => other,
+        };
+
+        Ok(OpenAIResponse {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            object: "chat.completion".to_string(),
+            created: chrono::Utc::now().timestamp(),
+            model: original_model.to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String(content),
+                    extra: Default::default(),
+                },
+                finish_reason: Some(finish_reason.to_string()),
+                extra: Default::default(),
+            }],
+            usage: Usage {
+                prompt_tokens: usage.map_or(0, |value| value.input_tokens().max(0) as u32),
+                completion_tokens: usage.map_or(0, |value| value.output_tokens().max(0) as u32),
+                total_tokens: usage.map_or(0, |value| value.total_tokens().max(0) as u32),
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        })
     }
 
     /// Translate OpenAI request to Claude format
@@ -318,7 +815,9 @@ impl BedrockProvider {
             match msg.role.as_str() {
                 "system" => prompt.push_str(&format!("\n\nSystem: {}", msg.content_as_text())),
                 "user" => prompt.push_str(&format!("\n\nHuman: {}", msg.content_as_text())),
-                "assistant" => prompt.push_str(&format!("\n\nAssistant: {}", msg.content_as_text())),
+                "assistant" => {
+                    prompt.push_str(&format!("\n\nAssistant: {}", msg.content_as_text()))
+                }
                 _ => {}
             }
         }
@@ -331,8 +830,7 @@ impl BedrockProvider {
             stop_sequences: None,
         };
 
-        serde_json::to_string(&claude_req)
-            .map_err(|e| GatewayError::Serialization(e))
+        serde_json::to_string(&claude_req).map_err(|e| GatewayError::Serialization(e))
     }
 
     /// Translate OpenAI request to Titan format
@@ -369,8 +867,7 @@ impl BedrockProvider {
             },
         };
 
-        serde_json::to_string(&titan_req)
-            .map_err(|e| GatewayError::Serialization(e))
+        serde_json::to_string(&titan_req).map_err(|e| GatewayError::Serialization(e))
     }
 
     /// Translate OpenAI request to Jurassic format
@@ -397,8 +894,7 @@ impl BedrockProvider {
             temperature: request.temperature,
         };
 
-        serde_json::to_string(&jurassic_req)
-            .map_err(|e| GatewayError::Serialization(e))
+        serde_json::to_string(&jurassic_req).map_err(|e| GatewayError::Serialization(e))
     }
 
     /// Translate OpenAI request to Command format
@@ -425,8 +921,7 @@ impl BedrockProvider {
             temperature: request.temperature,
         };
 
-        serde_json::to_string(&command_req)
-            .map_err(|e| GatewayError::Serialization(e))
+        serde_json::to_string(&command_req).map_err(|e| GatewayError::Serialization(e))
     }
 
     /// Translate Bedrock response to OpenAI format
@@ -456,18 +951,22 @@ impl BedrockProvider {
     }
 
     /// Translate Claude response to OpenAI format
-    fn translate_claude_response(&self, response_text: &str, model: &str) -> Result<OpenAIResponse, GatewayError> {
+    fn translate_claude_response(
+        &self,
+        response_text: &str,
+        model: &str,
+    ) -> Result<OpenAIResponse, GatewayError> {
         #[derive(Deserialize)]
         struct ClaudeResponse {
             completion: String,
             stop_reason: Option<String>,
         }
 
-        let claude_resp: ClaudeResponse = serde_json::from_str(response_text)
-            .map_err(|e| GatewayError::Provider {
+        let claude_resp: ClaudeResponse =
+            serde_json::from_str(response_text).map_err(|e| GatewayError::Provider {
                 provider: self.name.clone(),
                 message: format!("Failed to parse Claude response: {}", e),
-            status_code: None,
+                status_code: None,
             })?;
 
         Ok(OpenAIResponse {
@@ -496,7 +995,11 @@ impl BedrockProvider {
     }
 
     /// Translate Titan response to OpenAI format
-    fn translate_titan_response(&self, response_text: &str, model: &str) -> Result<OpenAIResponse, GatewayError> {
+    fn translate_titan_response(
+        &self,
+        response_text: &str,
+        model: &str,
+    ) -> Result<OpenAIResponse, GatewayError> {
         #[derive(Deserialize)]
         struct TitanResponse {
             results: Vec<TitanResult>,
@@ -508,11 +1011,11 @@ impl BedrockProvider {
             output_text: String,
         }
 
-        let titan_resp: TitanResponse = serde_json::from_str(response_text)
-            .map_err(|e| GatewayError::Provider {
+        let titan_resp: TitanResponse =
+            serde_json::from_str(response_text).map_err(|e| GatewayError::Provider {
                 provider: self.name.clone(),
                 message: format!("Failed to parse Titan response: {}", e),
-            status_code: None,
+                status_code: None,
             })?;
 
         let content = titan_resp
@@ -547,7 +1050,11 @@ impl BedrockProvider {
     }
 
     /// Translate Jurassic response to OpenAI format
-    fn translate_jurassic_response(&self, response_text: &str, model: &str) -> Result<OpenAIResponse, GatewayError> {
+    fn translate_jurassic_response(
+        &self,
+        response_text: &str,
+        model: &str,
+    ) -> Result<OpenAIResponse, GatewayError> {
         #[derive(Deserialize)]
         struct JurassicResponse {
             completions: Vec<JurassicCompletion>,
@@ -563,11 +1070,11 @@ impl BedrockProvider {
             text: String,
         }
 
-        let jurassic_resp: JurassicResponse = serde_json::from_str(response_text)
-            .map_err(|e| GatewayError::Provider {
+        let jurassic_resp: JurassicResponse =
+            serde_json::from_str(response_text).map_err(|e| GatewayError::Provider {
                 provider: self.name.clone(),
                 message: format!("Failed to parse Jurassic response: {}", e),
-            status_code: None,
+                status_code: None,
             })?;
 
         let content = jurassic_resp
@@ -602,7 +1109,11 @@ impl BedrockProvider {
     }
 
     /// Translate Command response to OpenAI format
-    fn translate_command_response(&self, response_text: &str, model: &str) -> Result<OpenAIResponse, GatewayError> {
+    fn translate_command_response(
+        &self,
+        response_text: &str,
+        model: &str,
+    ) -> Result<OpenAIResponse, GatewayError> {
         #[derive(Deserialize)]
         struct CommandResponse {
             generations: Vec<CommandGeneration>,
@@ -613,11 +1124,11 @@ impl BedrockProvider {
             text: String,
         }
 
-        let command_resp: CommandResponse = serde_json::from_str(response_text)
-            .map_err(|e| GatewayError::Provider {
+        let command_resp: CommandResponse =
+            serde_json::from_str(response_text).map_err(|e| GatewayError::Provider {
                 provider: self.name.clone(),
                 message: format!("Failed to parse Command response: {}", e),
-            status_code: None,
+                status_code: None,
             })?;
 
         let content = command_resp
@@ -651,40 +1162,30 @@ impl BedrockProvider {
         })
     }
 
-    /// Static backup catalog used when the live Mantle `/models` listing is
-    /// unavailable (AWS SDK mode, network failure, or empty response).
-    ///
-    /// Kept current with the models OBEY commonly routes to so the dashboard
-    /// and `/v1/models` aggregation stay useful offline.
-    fn backup_models() -> Vec<Model> {
-        const BACKUP: &[(&str, &str)] = &[
-            // OpenAI models hosted on Bedrock (Mantle endpoint)
-            ("openai.gpt-5.5", "openai"),
-            ("openai.gpt-5.4", "openai"),
-            ("openai.gpt-oss-120b-1:0", "openai"),
-            ("openai.gpt-oss-20b-1:0", "openai"),
-            // Anthropic Claude
-            ("anthropic.claude-3-5-sonnet-20241022-v2:0", "anthropic"),
-            ("anthropic.claude-3-opus-20240229-v1:0", "anthropic"),
-            ("anthropic.claude-3-sonnet-20240229-v1:0", "anthropic"),
-            ("anthropic.claude-3-haiku-20240307-v1:0", "anthropic"),
-            // Amazon
-            ("amazon.nova-pro-v1:0", "amazon"),
-            ("amazon.nova-lite-v1:0", "amazon"),
-            ("amazon.titan-text-express-v1", "amazon"),
-        ];
+    /// Static fallback catalog used when the live Mantle `/v1/models` listing
+    /// is unavailable or empty in API key mode. Contains only models confirmed
+    /// OpenAI Chat Completions-compatible on the bedrock-mantle endpoint by AWS
+    /// model cards. Mantle Responses-only (GPT-5.5/5.4/GPT-5.6) and Anthropic
+    /// Messages-only (Claude) families are intentionally excluded until dedicated
+    /// adapters are wired (see sync-bedrock-fallback verifier).
+    pub fn mantle_chat_fallback_models() -> Vec<Model> {
+        fallback_entries_to_models(BEDROCK_MANTLE_CHAT_FALLBACK)
+    }
 
-        BACKUP
-            .iter()
-            .map(|(id, owner)| Model {
-                id: (*id).to_string(),
-                object: "model".to_string(),
-                owned_by: (*owner).to_string(),
-                created: None,
-                context_window: None,
-                max_completion_tokens: None,
-            })
-            .collect()
+    pub fn mantle_responses_fallback_models() -> Vec<Model> {
+        fallback_entries_to_models(BEDROCK_MANTLE_RESPONSES_FALLBACK)
+    }
+
+    pub fn mantle_messages_fallback_models() -> Vec<Model> {
+        fallback_entries_to_models(BEDROCK_MANTLE_MESSAGES_FALLBACK)
+    }
+
+    /// Static fallback catalog used when `ListFoundationModels` is unavailable
+    /// in AWS SDK mode. Contains only runtime IDs verified on AWS model cards
+    /// as Converse/Invoke-capable. Legacy models and `meta.llama3-1-405b` are
+    /// excluded. Will route through Converse once the SDK chat migration lands.
+    pub fn runtime_fallback_models() -> Vec<Model> {
+        fallback_entries_to_models(BEDROCK_RUNTIME_FALLBACK)
     }
 
     /// Query the OpenAI-compatible `/models` endpoint on the Bedrock Mantle
@@ -714,9 +1215,7 @@ impl BedrockProvider {
         // 2) OpenAI-specific Mantle path: /openai/v1/models (GPT-5.5, GPT-5.4)
         // The base_url is typically https://bedrock-mantle.{region}.api.aws/v1
         // We need https://bedrock-mantle.{region}.api.aws/openai/v1/models
-        let openai_base = base_url
-            .trim_end_matches('/')
-            .trim_end_matches("/v1");
+        let openai_base = base_url.trim_end_matches('/').trim_end_matches("/v1");
         let openai_url = format!("{}/openai/v1/models", openai_base);
         if let Ok(models) = self
             .fetch_models_from_url(http_client, api_key, &openai_url, custom_headers)
@@ -784,10 +1283,9 @@ impl BedrockProvider {
             });
         }
 
-        let parsed: ModelsResponse = response
-            .json()
-            .await
-            .map_err(|e| GatewayError::Network(format!("Failed to parse models response: {}", e)))?;
+        let parsed: ModelsResponse = response.json().await.map_err(|e| {
+            GatewayError::Network(format!("Failed to parse models response: {}", e))
+        })?;
 
         Ok(parsed.data)
     }
@@ -832,16 +1330,20 @@ impl BedrockProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            
+
             // Handle authentication failures specifically
             if status.as_u16() == 401 || status.as_u16() == 403 {
                 return Err(GatewayError::Provider {
                     provider: self.name.clone(),
-                    message: format!("Bedrock API key authentication failed: HTTP {}: {}", status.as_u16(), error_text),
+                    message: format!(
+                        "Bedrock API key authentication failed: HTTP {}: {}",
+                        status.as_u16(),
+                        error_text
+                    ),
                     status_code: Some(status.as_u16()),
                 });
             }
-            
+
             return Err(GatewayError::Provider {
                 provider: self.name.clone(),
                 message: format!("HTTP {}: {}", status.as_u16(), error_text),
@@ -862,6 +1364,224 @@ impl BedrockProvider {
         })
     }
 
+    async fn chat_completion_responses_api(
+        &self,
+        request: OpenAIRequest,
+        http_client: &Client,
+        api_key: &str,
+        base_url: &str,
+        custom_headers: &HashMap<String, String>,
+    ) -> Result<ProviderResponse, GatewayError> {
+        let start = Instant::now();
+        let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+        let url = format!("{}/openai/v1/responses", root);
+        let input = request
+            .messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "role": message.role,
+                    "content": message.content_as_text()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut body = serde_json::json!({
+            "model": request.model,
+            "input": input,
+            "max_output_tokens": request.max_tokens.unwrap_or(2048),
+            "stream": false
+        });
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+        let value = self
+            .post_mantle_json(http_client, api_key, &url, custom_headers, &body)
+            .await?;
+        let content = value
+            .get("output_text")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                value
+                    .get("output")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|item| item.get("content").and_then(|value| value.as_array()))
+                    .flatten()
+                    .find_map(|item| {
+                        item.get("text")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    })
+            })
+            .unwrap_or_default();
+        let usage = value.get("usage");
+        Ok(ProviderResponse {
+            response: self.openai_response_from_text(
+                &request.model,
+                content,
+                usage
+                    .and_then(|value| value.get("input_tokens"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0) as u32,
+                usage
+                    .and_then(|value| value.get("output_tokens"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0) as u32,
+                "stop",
+            ),
+            provider_name: self.name.clone(),
+            latency_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    async fn chat_completion_messages_api(
+        &self,
+        request: OpenAIRequest,
+        http_client: &Client,
+        api_key: &str,
+        base_url: &str,
+        custom_headers: &HashMap<String, String>,
+    ) -> Result<ProviderResponse, GatewayError> {
+        let start = Instant::now();
+        let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+        let url = format!("{}/v1/messages", root);
+        let system = request
+            .messages
+            .iter()
+            .filter(|message| message.role == "system")
+            .map(|message| message.content_as_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let messages = request
+            .messages
+            .iter()
+            .filter(|message| message.role != "system")
+            .map(|message| {
+                serde_json::json!({
+                    "role": message.role,
+                    "content": message.content_as_text()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut body = serde_json::json!({
+            "model": request.model,
+            "messages": messages,
+            "max_tokens": request.max_tokens.unwrap_or(2048),
+            "stream": false
+        });
+        if !system.is_empty() {
+            body["system"] = serde_json::json!(system);
+        }
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+        let value = self
+            .post_mantle_json(http_client, api_key, &url, custom_headers, &body)
+            .await?;
+        let content = value
+            .get("content")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("text").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        let usage = value.get("usage");
+        let stop_reason = value
+            .get("stop_reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or("end_turn");
+        Ok(ProviderResponse {
+            response: self.openai_response_from_text(
+                &request.model,
+                content,
+                usage
+                    .and_then(|value| value.get("input_tokens"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0) as u32,
+                usage
+                    .and_then(|value| value.get("output_tokens"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0) as u32,
+                if stop_reason == "max_tokens" {
+                    "length"
+                } else {
+                    "stop"
+                },
+            ),
+            provider_name: self.name.clone(),
+            latency_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    async fn post_mantle_json(
+        &self,
+        http_client: &Client,
+        api_key: &str,
+        url: &str,
+        custom_headers: &HashMap<String, String>,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, GatewayError> {
+        let mut request = http_client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(body);
+        for (key, value) in custom_headers {
+            request = request.header(key.as_str(), resolve_header_value(value));
+        }
+        let response = request.send().await.map_err(|error| {
+            GatewayError::Network(format!("Request to {} failed: {}", url, error))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GatewayError::Provider {
+                provider: self.name.clone(),
+                message: format!("HTTP {}: {}", status.as_u16(), text),
+                status_code: Some(status.as_u16()),
+            });
+        }
+        response.json().await.map_err(|error| {
+            GatewayError::Network(format!("Failed to parse response from {}: {}", url, error))
+        })
+    }
+
+    fn openai_response_from_text(
+        &self,
+        model: &str,
+        content: String,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        finish_reason: &str,
+    ) -> OpenAIResponse {
+        OpenAIResponse {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            object: "chat.completion".to_string(),
+            created: chrono::Utc::now().timestamp(),
+            model: model.to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String(content),
+                    extra: Default::default(),
+                },
+                finish_reason: Some(finish_reason.to_string()),
+                extra: Default::default(),
+            }],
+            usage: Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens.saturating_add(completion_tokens),
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        }
+    }
+
     /// Perform streaming chat completion using API key authentication via HTTP.
     /// Sends request to the Bedrock Mantle endpoint which is OpenAI-compatible.
     /// Returns a stream of SSE events.
@@ -872,7 +1592,8 @@ impl BedrockProvider {
         api_key: &str,
         base_url: &str,
         custom_headers: &HashMap<String, String>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError>
+    {
         let url = format!("{}/chat/completions", base_url);
 
         // Build request with Bearer token and custom headers
@@ -901,16 +1622,20 @@ impl BedrockProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            
+
             // Handle authentication failures specifically
             if status.as_u16() == 401 || status.as_u16() == 403 {
                 return Err(GatewayError::Provider {
                     provider: self.name.clone(),
-                    message: format!("Bedrock API key authentication failed: HTTP {}: {}", status.as_u16(), error_text),
+                    message: format!(
+                        "Bedrock API key authentication failed: HTTP {}: {}",
+                        status.as_u16(),
+                        error_text
+                    ),
                     status_code: Some(status.as_u16()),
                 });
             }
-            
+
             return Err(GatewayError::Provider {
                 provider: self.name.clone(),
                 message: format!("HTTP {}: {}", status.as_u16(), error_text),
@@ -961,30 +1686,71 @@ impl ProviderClient for BedrockProvider {
         request: OpenAIRequest,
     ) -> Result<ProviderResponse, GatewayError> {
         match &self.auth_mode {
-            BedrockAuthMode::ApiKey { http_client, api_key, base_url, custom_headers } => {
-                // API key mode: use HTTP to Bedrock Mantle endpoint (OpenAI-compatible)
-                self.chat_completion_api_key(request, http_client, api_key, base_url, custom_headers).await
-            }
+            BedrockAuthMode::ApiKey {
+                http_client,
+                api_key,
+                base_url,
+                custom_headers,
+            } => match mantle_api_for_model(&request.model) {
+                MantleApi::Chat => {
+                    self.chat_completion_api_key(
+                        request,
+                        http_client,
+                        api_key,
+                        base_url,
+                        custom_headers,
+                    )
+                    .await
+                }
+                MantleApi::Responses => {
+                    self.chat_completion_responses_api(
+                        request,
+                        http_client,
+                        api_key,
+                        base_url,
+                        custom_headers,
+                    )
+                    .await
+                }
+                MantleApi::Messages => {
+                    self.chat_completion_messages_api(
+                        request,
+                        http_client,
+                        api_key,
+                        base_url,
+                        custom_headers,
+                    )
+                    .await
+                }
+            },
             BedrockAuthMode::AwsSdk { client, .. } => {
-                // AWS SDK mode: use traditional Bedrock API with request translation
+                // AWS SDK mode: Converse provides one request/response schema
+                // across current Bedrock model families. Always set max_tokens
+                // explicitly to avoid reserving each model's maximum quota.
                 let start = Instant::now();
                 let model_id = self.translate_model_id(&request.model);
-                let body = self.translate_request(&request, &model_id)?;
+                let (messages, system, inference_config) = self.build_converse_input(&request)?;
 
                 let output = client
-                    .invoke_model()
+                    .converse()
                     .model_id(&model_id)
-                    .body(Blob::new(body.as_bytes()))
+                    .set_messages(Some(messages))
+                    .set_system(if system.is_empty() {
+                        None
+                    } else {
+                        Some(system)
+                    })
+                    .inference_config(inference_config)
                     .send()
                     .await
-                    .map_err(|e| GatewayError::Provider {
+                    .map_err(|error| GatewayError::Provider {
                         provider: self.name.clone(),
-                        message: format!("Bedrock InvokeModel failed: {}", e),
+                        message: format!("Bedrock Converse failed: {}", error),
                         status_code: None,
                     })?;
 
                 let latency_ms = start.elapsed().as_millis() as u64;
-                let response = self.translate_response(output, &model_id, &request.model)?;
+                let response = self.translate_converse_output(output, &request.model)?;
 
                 Ok(ProviderResponse {
                     response,
@@ -998,61 +1764,99 @@ impl ProviderClient for BedrockProvider {
     async fn chat_completion_stream(
         &self,
         request: OpenAIRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError>
+    {
         match &self.auth_mode {
-            BedrockAuthMode::ApiKey { http_client, api_key, base_url, custom_headers } => {
-                // API key mode: use HTTP to Bedrock Mantle endpoint (OpenAI-compatible)
-                // Ensure stream is set to true for streaming requests
-                let mut stream_request = request;
-                stream_request.stream = true;
-                self.chat_completion_stream_api_key(stream_request, http_client, api_key, base_url, custom_headers).await
+            BedrockAuthMode::ApiKey {
+                http_client,
+                api_key,
+                base_url,
+                custom_headers,
+            } => {
+                if mantle_api_for_model(&request.model) == MantleApi::Chat {
+                    let mut stream_request = request;
+                    stream_request.stream = true;
+                    self.chat_completion_stream_api_key(
+                        stream_request,
+                        http_client,
+                        api_key,
+                        base_url,
+                        custom_headers,
+                    )
+                    .await
+                } else {
+                    // Responses and Messages require translation into the
+                    // gateway's OpenAI response schema, so buffer the upstream
+                    // response and emit one translated event for replay.
+                    let provider_response = match mantle_api_for_model(&request.model) {
+                        MantleApi::Responses => {
+                            self.chat_completion_responses_api(
+                                request,
+                                http_client,
+                                api_key,
+                                base_url,
+                                custom_headers,
+                            )
+                            .await?
+                        }
+                        MantleApi::Messages => {
+                            self.chat_completion_messages_api(
+                                request,
+                                http_client,
+                                api_key,
+                                base_url,
+                                custom_headers,
+                            )
+                            .await?
+                        }
+                        MantleApi::Chat => unreachable!(),
+                    };
+                    let payload = serde_json::to_string(&provider_response.response)
+                        .map_err(GatewayError::Serialization)?;
+                    Ok(Box::pin(futures::stream::once(async move {
+                        Ok(SSEEvent::new(payload))
+                    })))
+                }
             }
             BedrockAuthMode::AwsSdk { client, .. } => {
-                // AWS SDK mode: use traditional Bedrock API with request translation
+                // Bedrock-translated providers use the gateway's buffer-and-
+                // replay path. Perform a non-streaming Converse request here and
+                // expose one OpenAI-shaped SSE event; the handler re-chunks the
+                // complete response for clients.
                 let model_id = self.translate_model_id(&request.model);
-                let body = self.translate_request(&request, &model_id)?;
-
-                let mut output = client
-                    .invoke_model_with_response_stream()
+                let (messages, system, inference_config) = self.build_converse_input(&request)?;
+                let output = client
+                    .converse()
                     .model_id(&model_id)
-                    .body(Blob::new(body.as_bytes()))
+                    .set_messages(Some(messages))
+                    .set_system(if system.is_empty() {
+                        None
+                    } else {
+                        Some(system)
+                    })
+                    .inference_config(inference_config)
                     .send()
                     .await
-                    .map_err(|e| GatewayError::Provider {
+                    .map_err(|error| GatewayError::Provider {
                         provider: self.name.clone(),
-                        message: format!("Bedrock InvokeModelWithResponseStream failed: {}", e),
+                        message: format!("Bedrock Converse failed: {}", error),
                         status_code: None,
                     })?;
-
+                let response = self.translate_converse_output(output, &request.model)?;
                 let provider_name = self.name.clone();
-                let original_model = request.model.clone();
-
-                let stream = async_stream::stream! {
-                    while let Some(event) = output.body.recv().await.transpose() {
-                        match event {
-                            Ok(chunk) => {
-                                if let Ok(payload) = chunk.as_chunk() {
-                                    if let Some(bytes) = payload.bytes() {
-                                        let text = String::from_utf8_lossy(bytes.as_ref());
-                                        
-                                        if let Ok(sse_event) = parse_bedrock_chunk(&text, &original_model) {
-                                            yield Ok(sse_event);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                yield Err(GatewayError::Provider {
-                                    provider: provider_name.clone(),
-                                    message: format!("Stream error: {}", e),
-                                    status_code: None,
-                                });
-                                break;
-                            }
-                        }
+                let payload =
+                    serde_json::to_string(&response).map_err(GatewayError::Serialization)?;
+                let stream = futures::stream::once(async move {
+                    if payload.is_empty() {
+                        Err(GatewayError::Provider {
+                            provider: provider_name,
+                            message: "Bedrock Converse returned an empty response".to_string(),
+                            status_code: None,
+                        })
+                    } else {
+                        Ok(SSEEvent::new(payload))
                     }
-                };
-
+                });
                 Ok(Box::pin(stream))
             }
         }
@@ -1073,7 +1877,9 @@ impl ProviderClient for BedrockProvider {
                     .list_models_api_key(http_client, api_key, base_url, custom_headers)
                     .await
                 {
-                    Ok(models) => { live_models = models; }
+                    Ok(models) => {
+                        live_models = models;
+                    }
                     Err(e) => {
                         tracing::warn!(
                             provider = %self.name,
@@ -1085,11 +1891,7 @@ impl ProviderClient for BedrockProvider {
             }
             // SDK mode: use the ListFoundationModels control-plane API.
             BedrockAuthMode::AwsSdk { control_client, .. } => {
-                match control_client
-                    .list_foundation_models()
-                    .send()
-                    .await
-                {
+                match control_client.list_foundation_models().send().await {
                     Ok(output) => {
                         let summaries = output.model_summaries();
                         live_models = summaries
@@ -1097,6 +1899,10 @@ impl ProviderClient for BedrockProvider {
                             .map(|s| {
                                 let id = s.model_id().to_string();
                                 let owner = s.provider_name().unwrap_or("unknown").to_string();
+                                let has_vision = id.contains("claude-3")
+                                    || id.contains("nova-pro")
+                                    || id.contains("nova-lite")
+                                    || id.contains("gpt-oss");
                                 Model {
                                     id,
                                     object: "model".to_string(),
@@ -1104,6 +1910,7 @@ impl ProviderClient for BedrockProvider {
                                     created: None,
                                     context_window: None,
                                     max_completion_tokens: None,
+                                    supports_vision: has_vision,
                                 }
                             })
                             .collect();
@@ -1119,13 +1926,23 @@ impl ProviderClient for BedrockProvider {
             }
         }
 
-        // Always merge the backup catalog so models like openai.gpt-5.5 / openai.gpt-5.4
-        // are guaranteed to appear even if the live listing doesn't include them
-        // (they live on a separate /openai/v1 Mantle path that ListFoundationModels
-        // and the standard /v1/models may not cover).
+        // Merge the compatibility-correct fallback catalog for the active auth
+        // mode so the gateway stays useful when the live listing is incomplete
+        // or unavailable. API key mode merges the Mantle Chat catalog (only
+        // Chat Completions-capable IDs); AWS SDK mode merges the runtime
+        // catalog (Converse/Invoke-capable IDs). Existing live IDs win.
         let existing_ids: std::collections::HashSet<String> =
             live_models.iter().map(|m| m.id.clone()).collect();
-        for backup in Self::backup_models() {
+        let fallback: Vec<Model> = match &self.auth_mode {
+            BedrockAuthMode::ApiKey { .. } => {
+                let mut models = Self::mantle_chat_fallback_models();
+                models.extend(Self::mantle_responses_fallback_models());
+                models.extend(Self::mantle_messages_fallback_models());
+                models
+            }
+            BedrockAuthMode::AwsSdk { .. } => Self::runtime_fallback_models(),
+        };
+        for backup in fallback {
             if !existing_ids.contains(&backup.id) {
                 live_models.push(backup);
             }
@@ -1140,6 +1957,7 @@ impl ProviderClient for BedrockProvider {
 }
 
 /// Parse Bedrock streaming chunk to SSE event
+#[allow(dead_code)]
 fn parse_bedrock_chunk(text: &str, model: &str) -> Result<SSEEvent, GatewayError> {
     // Convert Bedrock chunk to OpenAI SSE format
     #[derive(Serialize)]
@@ -1177,8 +1995,7 @@ fn parse_bedrock_chunk(text: &str, model: &str) -> Result<SSEEvent, GatewayError
         }],
     };
 
-    let json = serde_json::to_string(&chunk)
-        .map_err(|e| GatewayError::Serialization(e))?;
+    let json = serde_json::to_string(&chunk).map_err(|e| GatewayError::Serialization(e))?;
 
     Ok(SSEEvent::new(json))
 }
@@ -1186,30 +2003,33 @@ fn parse_bedrock_chunk(text: &str, model: &str) -> Result<SSEEvent, GatewayError
 /// Parse SSE chunk from API key mode (OpenAI-compatible format).
 /// Returns None for empty lines or [DONE] terminator.
 /// Returns Some(SSEEvent) for valid data lines.
-fn parse_sse_chunk_api_key(text: &str, _provider_name: &str) -> Result<Option<SSEEvent>, GatewayError> {
+fn parse_sse_chunk_api_key(
+    text: &str,
+    _provider_name: &str,
+) -> Result<Option<SSEEvent>, GatewayError> {
     // SSE format: "data: {...}\n\n" or "data: [DONE]\n\n"
     for line in text.lines() {
         let line = line.trim();
-        
+
         // Skip empty lines
         if line.is_empty() {
             continue;
         }
-        
+
         // Handle data lines
         if let Some(data) = line.strip_prefix("data: ") {
             let data = data.trim();
-            
+
             // Handle [DONE] terminator
             if data == "[DONE]" {
                 return Ok(None);
             }
-            
+
             // Return the JSON data as-is (already in OpenAI format)
             return Ok(Some(SSEEvent::new(data.to_string())));
         }
     }
-    
+
     // No valid data found in this chunk
     Ok(None)
 }
@@ -1233,26 +2053,33 @@ mod tests {
         let client = BedrockClient::from_conf(
             aws_sdk_bedrockruntime::Config::builder()
                 .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
-                .build()
+                .build(),
         );
         let control_client = BedrockControlClient::from_conf(
             aws_sdk_bedrock::Config::builder()
                 .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
-                .build()
+                .build(),
         );
         BedrockProvider {
             name: name.to_string(),
             region: region.to_string(),
-            auth_mode: BedrockAuthMode::AwsSdk { client, control_client },
+            auth_mode: BedrockAuthMode::AwsSdk {
+                client,
+                control_client,
+            },
         }
     }
 
     /// Helper function to create a test BedrockProvider with API key auth mode
-    fn create_test_provider_with_api_key(name: &str, region: &str, api_key: &str) -> BedrockProvider {
+    fn create_test_provider_with_api_key(
+        name: &str,
+        region: &str,
+        api_key: &str,
+    ) -> BedrockProvider {
         let http_client = Client::builder()
             .build()
             .expect("Failed to create HTTP client");
-        
+
         BedrockProvider {
             name: name.to_string(),
             region: region.to_string(),
@@ -1331,19 +2158,23 @@ mod tests {
             Some(50),
             Some(60),
             HashMap::new(),
-        ).await.expect("Failed to create provider");
+        )
+        .await
+        .expect("Failed to create provider");
 
         // Verify API key mode is selected
         assert!(provider.is_api_key_mode());
         assert!(provider.get_sdk_client().is_none());
-        
+
         // Verify provider name and region are set correctly
         assert_eq!(provider.name, "test-bedrock");
         assert_eq!(provider.region, "us-east-1");
-        
+
         // Verify base_url is constructed correctly
         match &provider.auth_mode {
-            BedrockAuthMode::ApiKey { base_url, api_key, .. } => {
+            BedrockAuthMode::ApiKey {
+                base_url, api_key, ..
+            } => {
                 assert_eq!(base_url, "https://bedrock-mantle.us-east-1.api.aws/v1");
                 assert_eq!(api_key, "test-api-key-12345");
             }
@@ -1360,12 +2191,14 @@ mod tests {
             None,
             None,
             HashMap::new(),
-        ).await.expect("Failed to create provider");
+        )
+        .await
+        .expect("Failed to create provider");
 
         // Verify SDK mode is selected
         assert!(!provider.is_api_key_mode());
         assert!(provider.get_sdk_client().is_some());
-        
+
         // Verify provider name and region are set correctly
         assert_eq!(provider.name, "test-bedrock");
         assert_eq!(provider.region, "us-west-2");
@@ -1374,10 +2207,9 @@ mod tests {
     #[tokio::test]
     async fn test_new_backward_compatible() {
         // Test the backward-compatible new() constructor
-        let provider = BedrockProvider::new(
-            "test-bedrock".to_string(),
-            "eu-west-1".to_string(),
-        ).await.expect("Failed to create provider");
+        let provider = BedrockProvider::new("test-bedrock".to_string(), "eu-west-1".to_string())
+            .await
+            .expect("Failed to create provider");
 
         // Should use SDK mode by default
         assert!(!provider.is_api_key_mode());
@@ -1390,10 +2222,10 @@ mod tests {
     fn test_resolve_header_value_env_var() {
         // Set a test environment variable
         std::env::set_var("TEST_BEDROCK_HEADER", "resolved-value");
-        
+
         let result = resolve_header_value("${TEST_BEDROCK_HEADER}");
         assert_eq!(result, "resolved-value");
-        
+
         // Clean up
         std::env::remove_var("TEST_BEDROCK_HEADER");
     }
@@ -1408,7 +2240,7 @@ mod tests {
     fn test_resolve_header_value_unset_env_var() {
         // Ensure the env var doesn't exist
         std::env::remove_var("NONEXISTENT_VAR_12345");
-        
+
         let result = resolve_header_value("${NONEXISTENT_VAR_12345}");
         // Should return the original value when env var is not set
         assert_eq!(result, "${NONEXISTENT_VAR_12345}");
@@ -1449,27 +2281,41 @@ mod tests {
     #[test]
     fn test_model_supports_reasoning_sonnet_v2() {
         // Claude 3.5 Sonnet v2 should support reasoning
-        assert!(model_supports_reasoning("anthropic.claude-3-5-sonnet-20241022-v2:0"));
-        assert!(model_supports_reasoning("us.anthropic.claude-3-5-sonnet-20241022-v2:0"));
+        assert!(model_supports_reasoning(
+            "anthropic.claude-3-5-sonnet-20241022-v2:0"
+        ));
+        assert!(model_supports_reasoning(
+            "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        ));
     }
 
     #[test]
     fn test_model_supports_reasoning_sonnet_v1_no() {
         // Claude 3.5 Sonnet v1 should NOT support reasoning
-        assert!(!model_supports_reasoning("anthropic.claude-3-5-sonnet-20240620-v1:0"));
+        assert!(!model_supports_reasoning(
+            "anthropic.claude-3-5-sonnet-20240620-v1:0"
+        ));
     }
 
     #[test]
     fn test_model_supports_reasoning_opus() {
         // Claude 3 Opus supports reasoning
-        assert!(model_supports_reasoning("anthropic.claude-3-opus-20240229-v1:0"));
-        assert!(model_supports_reasoning("us.anthropic.claude-3-opus-20240229-v1:0"));
+        assert!(model_supports_reasoning(
+            "anthropic.claude-3-opus-20240229-v1:0"
+        ));
+        assert!(model_supports_reasoning(
+            "us.anthropic.claude-3-opus-20240229-v1:0"
+        ));
     }
 
     #[test]
     fn test_model_supports_reasoning_non_reasoning_models() {
-        assert!(!model_supports_reasoning("anthropic.claude-3-sonnet-20240229-v1:0"));
-        assert!(!model_supports_reasoning("anthropic.claude-3-haiku-20240307-v1:0"));
+        assert!(!model_supports_reasoning(
+            "anthropic.claude-3-sonnet-20240229-v1:0"
+        ));
+        assert!(!model_supports_reasoning(
+            "anthropic.claude-3-haiku-20240307-v1:0"
+        ));
         assert!(!model_supports_reasoning("amazon.titan-text-express-v1"));
         assert!(!model_supports_reasoning("cohere.command-r-plus-v1:0"));
         assert!(!model_supports_reasoning("meta.llama3-1-70b-instruct-v1:0"));
@@ -1509,7 +2355,7 @@ mod tests {
     fn test_parse_sse_chunk_api_key_valid_data() {
         let chunk = "data: {\"id\":\"test\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n";
         let result = parse_sse_chunk_api_key(chunk, "test-provider");
-        
+
         assert!(result.is_ok());
         let event = result.unwrap();
         assert!(event.is_some());
@@ -1519,7 +2365,7 @@ mod tests {
     fn test_parse_sse_chunk_api_key_done() {
         let chunk = "data: [DONE]\n\n";
         let result = parse_sse_chunk_api_key(chunk, "test-provider");
-        
+
         assert!(result.is_ok());
         let event = result.unwrap();
         assert!(event.is_none()); // [DONE] should return None
@@ -1529,13 +2375,17 @@ mod tests {
     fn test_parse_sse_chunk_api_key_empty() {
         let chunk = "\n\n";
         let result = parse_sse_chunk_api_key(chunk, "test-provider");
-        
+
         assert!(result.is_ok());
         let event = result.unwrap();
         assert!(event.is_none()); // Empty chunk should return None
     }
 
-    fn create_api_key_mode_provider_for_base_url(name: &str, base_url: String, api_key: &str) -> BedrockProvider {
+    fn create_api_key_mode_provider_for_base_url(
+        name: &str,
+        base_url: String,
+        api_key: &str,
+    ) -> BedrockProvider {
         let http_client = Client::builder()
             .build()
             .expect("Failed to create HTTP client");
@@ -1599,12 +2449,17 @@ mod tests {
             "test-api-key",
         );
 
-        let result = provider.chat_completion(create_test_chat_request(false)).await;
+        let result = provider
+            .chat_completion(create_test_chat_request(false))
+            .await;
         assert!(result.is_ok(), "API key mode request should succeed");
 
         let response = result.unwrap();
         assert_eq!(response.provider_name, "bedrock-test");
-        assert_eq!(response.response.choices[0].message.content_as_text(), "hi from bedrock");
+        assert_eq!(
+            response.response.choices[0].message.content_as_text(),
+            "hi from bedrock"
+        );
     }
 
     #[tokio::test]
@@ -1622,17 +2477,20 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let provider = create_api_key_mode_provider_for_base_url(
-            "bedrock-test",
-            mock_server.uri(),
-            "bad-key",
-        );
+        let provider =
+            create_api_key_mode_provider_for_base_url("bedrock-test", mock_server.uri(), "bad-key");
 
-        let result = provider.chat_completion(create_test_chat_request(false)).await;
+        let result = provider
+            .chat_completion(create_test_chat_request(false))
+            .await;
         assert!(result.is_err(), "401 response should return an error");
 
         match result {
-            Err(GatewayError::Provider { provider, status_code, message }) => {
+            Err(GatewayError::Provider {
+                provider,
+                status_code,
+                message,
+            }) => {
                 assert_eq!(provider, "bedrock-test");
                 assert_eq!(status_code, Some(401));
                 assert!(message.contains("authentication failed"));
@@ -1670,20 +2528,23 @@ mod tests {
             "test-api-key",
         );
 
-        let models = provider.list_models().await.expect("list_models should succeed");
+        let models = provider
+            .list_models()
+            .await
+            .expect("list_models should succeed");
         let ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
         assert!(ids.contains(&"openai.gpt-5.5".to_string()));
         assert!(ids.contains(&"openai.gpt-5.4".to_string()));
     }
 
     #[tokio::test]
-    async fn test_list_models_falls_back_to_backup_on_failure() {
+    async fn test_list_models_falls_back_to_mantle_chat_catalog_on_failure() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
 
-        // Simulate the live listing being unavailable.
+        // Simulate the live Mantle /models listing being unavailable.
         Mock::given(method("GET"))
             .and(path("/models"))
             .respond_with(ResponseTemplate::new(500).set_body_string("error"))
@@ -1696,23 +2557,157 @@ mod tests {
             "test-api-key",
         );
 
-        let models = provider.list_models().await.expect("list_models should fall back");
+        let models = provider
+            .list_models()
+            .await
+            .expect("list_models should fall back");
         let ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
-        // Backup catalog must still surface the new OpenAI models.
+        // Mantle Chat fallback must surface verified Chat Completions-capable models.
+        assert!(ids.contains(&"openai.gpt-oss-120b".to_string()));
+        assert!(ids.contains(&"openai.gpt-oss-20b".to_string()));
+        assert!(ids.contains(&"deepseek.v3.2".to_string()));
+        // Responses-only IDs are included because the provider now dispatches
+        // them through the dedicated Mantle Responses adapter.
         assert!(ids.contains(&"openai.gpt-5.5".to_string()));
         assert!(ids.contains(&"openai.gpt-5.4".to_string()));
+        assert!(ids.contains(&"anthropic.claude-sonnet-5".to_string()));
     }
 
     #[test]
-    fn test_backup_models_includes_new_openai_models() {
-        let ids: Vec<String> = BedrockProvider::backup_models()
+    fn test_mantle_chat_fallback_includes_only_chat_compatible_models() {
+        let ids: Vec<String> = BedrockProvider::mantle_chat_fallback_models()
             .into_iter()
             .map(|m| m.id)
             .collect();
-        assert!(ids.contains(&"openai.gpt-5.5".to_string()));
-        assert!(ids.contains(&"openai.gpt-5.4".to_string()));
+        // Verified Mantle Chat IDs.
+        assert!(ids.contains(&"openai.gpt-oss-120b".to_string()));
+        assert!(ids.contains(&"openai.gpt-oss-20b".to_string()));
+        assert!(ids.contains(&"deepseek.v3.2".to_string()));
+        assert!(ids.contains(&"mistral.mistral-large-3-675b-instruct".to_string()));
+        assert!(ids.contains(&"qwen.qwen3-32b".to_string()));
+        // Runtime-only IDs must not appear in the Mantle Chat catalog.
+        assert!(!ids.contains(&"openai.gpt-oss-120b-1:0".to_string()));
+        assert!(!ids.contains(&"openai.gpt-oss-20b-1:0".to_string()));
+        // Responses-only OpenAI models are intentionally absent.
+        assert!(!ids.contains(&"openai.gpt-5.5".to_string()));
+        assert!(!ids.contains(&"openai.gpt-5.4".to_string()));
+        // Responses and Messages catalogs become visible only because their
+        // dedicated adapters dispatch those IDs to compatible Mantle APIs.
+        let responses: Vec<String> = BedrockProvider::mantle_responses_fallback_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        let messages: Vec<String> = BedrockProvider::mantle_messages_fallback_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert!(responses.contains(&"openai.gpt-5.6-sol".to_string()));
+        assert!(responses.contains(&"openai.gpt-5.5".to_string()));
+        assert!(messages.contains(&"anthropic.claude-sonnet-5".to_string()));
+    }
+
+    #[test]
+    fn test_runtime_fallback_uses_converse_ids() {
+        let ids: Vec<String> = BedrockProvider::runtime_fallback_models()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        // Verified runtime (Converse/Invoke) IDs.
         assert!(ids.contains(&"openai.gpt-oss-120b-1:0".to_string()));
         assert!(ids.contains(&"openai.gpt-oss-20b-1:0".to_string()));
+        assert!(ids.contains(&"anthropic.claude-sonnet-5".to_string()));
+        assert!(ids.contains(&"anthropic.claude-opus-4-8".to_string()));
+        assert!(ids.contains(&"amazon.nova-2-lite-v1:0".to_string()));
+        assert!(ids.contains(&"amazon.nova-pro-v1:0".to_string()));
+        // Mantle-only IDs do not belong in the runtime catalog.
+        assert!(!ids.contains(&"openai.gpt-oss-120b".to_string()));
+        // Some providers use the same verified ID on both endpoints.
+        assert!(ids.contains(&"deepseek.v3.2".to_string()));
+        // Responses-only OpenAI models are absent.
+        assert!(!ids.contains(&"openai.gpt-5.5".to_string()));
+        assert!(!ids.contains(&"openai.gpt-5.4".to_string()));
+        // Legacy models are excluded.
+        assert!(!ids.contains(&"amazon.nova-premier-v1:0".to_string()));
+        assert!(!ids.contains(&"meta.llama3-1-405b-instruct-v1:0".to_string()));
+    }
+
+    #[test]
+    fn test_mantle_api_dispatch() {
+        assert_eq!(mantle_api_for_model("openai.gpt-oss-120b"), MantleApi::Chat);
+        assert_eq!(
+            mantle_api_for_model("openai.gpt-5.6-sol"),
+            MantleApi::Responses
+        );
+        assert_eq!(mantle_api_for_model("openai.gpt-5.5"), MantleApi::Responses);
+        assert_eq!(
+            mantle_api_for_model("anthropic.claude-sonnet-5"),
+            MantleApi::Messages
+        );
+    }
+
+    #[tokio::test]
+    async fn test_responses_api_translation() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .and(header("Authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_test",
+                "output_text": "response adapter works",
+                "usage": {"input_tokens": 3, "output_tokens": 4}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = create_api_key_mode_provider_for_base_url(
+            "bedrock-test",
+            format!("{}/v1", server.uri()),
+            "test-api-key",
+        );
+        let mut request = create_test_chat_request(false);
+        request.model = "openai.gpt-5.6-sol".to_string();
+        let response = provider.chat_completion(request).await.unwrap().response;
+        assert_eq!(
+            response.choices[0].message.content_as_text(),
+            "response adapter works"
+        );
+        assert_eq!(response.usage.total_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn test_messages_api_translation() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("Authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_test",
+                "content": [{"type": "text", "text": "messages adapter works"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 6}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = create_api_key_mode_provider_for_base_url(
+            "bedrock-test",
+            format!("{}/v1", server.uri()),
+            "test-api-key",
+        );
+        let mut request = create_test_chat_request(false);
+        request.model = "anthropic.claude-sonnet-5".to_string();
+        let response = provider.chat_completion(request).await.unwrap().response;
+        assert_eq!(
+            response.choices[0].message.content_as_text(),
+            "messages adapter works"
+        );
+        assert_eq!(response.usage.total_tokens, 11);
     }
 
     #[tokio::test]
@@ -1751,7 +2746,11 @@ mod tests {
             .expect("stream should be created");
 
         let events: Vec<Result<SSEEvent, GatewayError>> = stream.collect().await;
-        assert_eq!(events.len(), 2, "[DONE] terminator should not produce an event");
+        assert_eq!(
+            events.len(),
+            2,
+            "[DONE] terminator should not produce an event"
+        );
 
         let first = events[0].as_ref().expect("first SSE event should be ok");
         let second = events[1].as_ref().expect("second SSE event should be ok");
@@ -1763,56 +2762,69 @@ mod tests {
 #[cfg(test)]
 mod property_tests {
     use super::*;
-    use proptest::prelude::*;
     use crate::models::openai::Message;
+    use proptest::prelude::*;
 
     /// Helper function to create a test BedrockProvider with AWS SDK auth mode
     fn create_test_provider(name: &str, region: &str) -> BedrockProvider {
         let client = BedrockClient::from_conf(
             aws_sdk_bedrockruntime::Config::builder()
                 .behavior_version(aws_sdk_bedrockruntime::config::BehaviorVersion::latest())
-                .build()
+                .build(),
         );
         let control_client = BedrockControlClient::from_conf(
             aws_sdk_bedrock::Config::builder()
                 .behavior_version(aws_sdk_bedrock::config::BehaviorVersion::latest())
-                .build()
+                .build(),
         );
         BedrockProvider {
             name: name.to_string(),
             region: region.to_string(),
-            auth_mode: BedrockAuthMode::AwsSdk { client, control_client },
+            auth_mode: BedrockAuthMode::AwsSdk {
+                client,
+                control_client,
+            },
         }
     }
 
     fn arb_openai_request() -> impl Strategy<Value = OpenAIRequest> {
         (
             prop::sample::select(vec![
-                "claude-3-opus", "claude-3-sonnet", "claude-2",
-                "titan-text-express", "titan-text-lite",
-                "jurassic-2-ultra", "jurassic-2-mid",
-                "command-text", "command-light"
+                "claude-3-opus",
+                "claude-3-sonnet",
+                "claude-2",
+                "titan-text-express",
+                "titan-text-lite",
+                "jurassic-2-ultra",
+                "jurassic-2-mid",
+                "command-text",
+                "command-light",
             ]),
             prop::collection::vec(
-                (prop::sample::select(vec!["system", "user", "assistant"]), "[a-zA-Z0-9 ]{10,50}"),
-                1..5
+                (
+                    prop::sample::select(vec!["system", "user", "assistant"]),
+                    "[a-zA-Z0-9 ]{10,50}",
+                ),
+                1..5,
             ),
             prop::option::of(0.0f32..2.0f32),
             prop::option::of(100u32..2048u32),
-        ).prop_map(|(model, messages, temperature, max_tokens)| {
-            OpenAIRequest {
+        )
+            .prop_map(|(model, messages, temperature, max_tokens)| OpenAIRequest {
                 model: model.to_string(),
-                messages: messages.into_iter().map(|(role, content)| Message { 
-                    role: role.to_string(), 
-                    content: serde_json::Value::String(content),
-                    extra: Default::default(),
-                }).collect(),
+                messages: messages
+                    .into_iter()
+                    .map(|(role, content)| Message {
+                        role: role.to_string(),
+                        content: serde_json::Value::String(content),
+                        extra: Default::default(),
+                    })
+                    .collect(),
                 stream: false,
                 temperature,
                 max_tokens,
                 extra: Default::default(),
-            }
-        })
+            })
     }
 
     // Feature: ai-gateway, Property 17: Bedrock Translation Round-Trip
@@ -1823,14 +2835,14 @@ mod property_tests {
             let provider = create_test_provider("test-bedrock", "us-east-1");
 
             let model_id = provider.translate_model_id(&request.model);
-            
+
             // Step 1: Translate OpenAI request to Bedrock format
             let bedrock_request = provider.translate_request(&request, &model_id);
             prop_assert!(bedrock_request.is_ok(), "Request translation must succeed for valid OpenAI request");
-            
+
             let bedrock_json = bedrock_request.unwrap();
             prop_assert!(!bedrock_json.is_empty(), "Bedrock request must not be empty");
-            
+
             // Step 2: Create mock Bedrock response based on model family
             let mock_response = if model_id.starts_with("anthropic.claude") {
                 r#"{"completion":"test response","stop_reason":"stop"}"#
@@ -1843,26 +2855,26 @@ mod property_tests {
             } else {
                 panic!("Unsupported model family");
             };
-            
+
             // Step 3: Translate Bedrock response back to OpenAI format
             let openai_response = provider.translate_claude_response(mock_response, &request.model)
                 .or_else(|_| provider.translate_titan_response(mock_response, &request.model))
                 .or_else(|_| provider.translate_jurassic_response(mock_response, &request.model))
                 .or_else(|_| provider.translate_command_response(mock_response, &request.model));
-            
+
             prop_assert!(openai_response.is_ok(), "Response translation must succeed");
-            
+
             let response = openai_response.unwrap();
-            
+
             // Verify OpenAI response structure
             prop_assert_eq!(response.object, "chat.completion");
             prop_assert_eq!(response.model, request.model);
             prop_assert_eq!(response.choices.len(), 1);
             prop_assert_eq!(response.choices[0].index, 0);
             prop_assert_eq!(&response.choices[0].message.role, "assistant");
-            prop_assert!(response.choices[0].message.content != serde_json::Value::Null, 
+            prop_assert!(response.choices[0].message.content != serde_json::Value::Null,
                 "Response content must not be null");
-            
+
             // Verify semantic content preserved (response contains expected text)
             prop_assert_eq!(response.choices[0].message.content.clone(), serde_json::Value::String("test response".to_string()));
         }
@@ -1870,8 +2882,7 @@ mod property_tests {
 
     /// Strategy: alphanumeric + hyphens, 1..30 chars (mimics valid AWS region strings)
     fn arb_region_string() -> impl Strategy<Value = String> {
-        proptest::string::string_regex("[a-zA-Z0-9][a-zA-Z0-9-]{0,29}")
-            .expect("valid regex")
+        proptest::string::string_regex("[a-zA-Z0-9][a-zA-Z0-9-]{0,29}").expect("valid regex")
     }
 
     // Feature: bedrock-ui-integration, Property 1: Mantle URL generation is deterministic and well-formed
@@ -1903,8 +2914,7 @@ mod property_tests {
 
     /// Strategy: generate a model ID string (alphanumeric + dots + colons + hyphens)
     fn arb_model_id() -> impl Strategy<Value = String> {
-        proptest::string::string_regex("[a-zA-Z][a-zA-Z0-9._:-]{0,59}")
-            .expect("valid regex")
+        proptest::string::string_regex("[a-zA-Z][a-zA-Z0-9._:-]{0,59}").expect("valid regex")
     }
 
     /// Strategy: pick one of the supported Bedrock regions
@@ -1991,6 +3001,14 @@ mod property_tests {
             "anthropic.claude-4-sonnet-20250514-v1:0".to_string(),
             "us.anthropic.claude-4-opus-20250601-v1:0".to_string(),
             "anthropic.claude-5-sonnet-20260101-v1:0".to_string(),
+            // Current Anthropic Claude verified IDs (AWS model cards, 2026-07)
+            "anthropic.claude-sonnet-5".to_string(),
+            "us.anthropic.claude-sonnet-5".to_string(),
+            "anthropic.claude-opus-4-8".to_string(),
+            "us.anthropic.claude-opus-4-8".to_string(),
+            "anthropic.claude-opus-4-7".to_string(),
+            "us.anthropic.claude-opus-4-7".to_string(),
+            "anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
         ])
     }
 

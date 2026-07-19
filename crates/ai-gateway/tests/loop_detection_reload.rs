@@ -11,10 +11,11 @@ fn minimal_config() -> Config {
 #[tokio::test]
 async fn successful_reload_swaps_detector_snapshot_and_clears_sessions() {
     let server = GatewayServer::new(minimal_config(), None).await.unwrap();
-    server.state.loop_detector.sessions.insert(
-        "active".into(),
-        SessionState::new(Some("vk-id".into()), 5),
-    );
+    server
+        .state
+        .loop_detector
+        .sessions
+        .insert("active".into(), SessionState::new(Some("vk-id".into()), 5));
     let mut updated = minimal_config();
     updated.loop_detection.enabled = true;
     updated.loop_detection.throttle_delay_seconds = 7;

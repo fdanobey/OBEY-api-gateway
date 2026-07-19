@@ -5,7 +5,10 @@ use ai_gateway::{
         LoopDetectionConfig,
     },
 };
-use axum::{body::{to_bytes, Body}, http::{Request, Response, StatusCode}};
+use axum::{
+    body::{to_bytes, Body},
+    http::{Request, Response, StatusCode},
+};
 use std::{convert::Infallible, sync::Arc};
 use tokio::sync::RwLock;
 use tower::{service_fn, Layer, ServiceExt};
@@ -22,7 +25,8 @@ fn chat_request(session: &str) -> Request<Body> {
         "model":"gpt-4",
         "messages":[{"role":"user","content":"repeat repeat repeat"}],
         "stream":false
-    }).to_string();
+    })
+    .to_string();
     Request::post("/v1/chat/completions")
         .header("content-type", "application/json")
         .header("content-length", body.len().to_string())
@@ -39,9 +43,12 @@ async fn disabled_fast_path_does_not_create_session() {
         Arc::new(RwLock::new(config)),
         detector_config,
     ));
-    let service = LoopDetectorLayer::new(state.clone()).layer(service_fn(|request: Request<Body>| async move {
-        Ok::<_, Infallible>(Response::new(request.into_body()))
-    }));
+    let service =
+        LoopDetectorLayer::new(state.clone()).layer(service_fn(
+            |request: Request<Body>| async move {
+                Ok::<_, Infallible>(Response::new(request.into_body()))
+            },
+        ));
     let response = service.oneshot(chat_request("disabled")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(state.sessions.is_empty());
@@ -57,15 +64,21 @@ async fn non_json_and_unrelated_routes_pass_through() {
         Arc::new(RwLock::new(config)),
         detector_config,
     ));
-    let service = LoopDetectorLayer::new(state.clone()).layer(service_fn(|request: Request<Body>| async move {
-        Ok::<_, Infallible>(Response::new(request.into_body()))
-    }));
+    let service =
+        LoopDetectorLayer::new(state.clone()).layer(service_fn(
+            |request: Request<Body>| async move {
+                Ok::<_, Infallible>(Response::new(request.into_body()))
+            },
+        ));
     let request = Request::post("/v1/embeddings")
         .header("content-type", "application/json")
         .body(Body::from("not-json"))
         .unwrap();
     let response = service.oneshot(request).await.unwrap();
-    assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), "not-json");
+    assert_eq!(
+        to_bytes(response.into_body(), 1024).await.unwrap(),
+        "not-json"
+    );
     assert!(state.sessions.is_empty());
 }
 
@@ -82,9 +95,16 @@ async fn repeated_requests_reach_warn_and_add_header() {
         Arc::new(RwLock::new(config)),
         detector_config,
     ));
-    let service = LoopDetectorLayer::new(state.clone()).layer(service_fn(|_request: Request<Body>| async move {
-        Ok::<_, Infallible>(Response::builder().header("content-type", "application/json").body(Body::from("{}" )).unwrap())
-    }));
+    let service = LoopDetectorLayer::new(state.clone()).layer(service_fn(
+        |_request: Request<Body>| async move {
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+        },
+    ));
     for _ in 0..2 {
         service.clone().oneshot(chat_request("warn")).await.unwrap();
     }

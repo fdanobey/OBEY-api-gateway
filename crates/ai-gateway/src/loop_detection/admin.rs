@@ -18,7 +18,9 @@ pub struct SessionQuery {
     offset: usize,
 }
 
-fn default_limit() -> usize { 50 }
+fn default_limit() -> usize {
+    50
+}
 
 #[derive(Debug, Serialize)]
 struct SessionSummary {
@@ -52,7 +54,11 @@ async fn list_sessions(
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
     let limit = query.limit.clamp(1, 200);
-    let sessions = sessions.into_iter().skip(query.offset).take(limit).collect::<Vec<_>>();
+    let sessions = sessions
+        .into_iter()
+        .skip(query.offset)
+        .take(limit)
+        .collect::<Vec<_>>();
     Json(json!({"sessions": sessions, "total": total, "limit": limit, "offset": query.offset}))
 }
 
@@ -61,7 +67,11 @@ async fn session_detail(
     Path(id): Path<String>,
 ) -> Response {
     let Some(session) = state.loop_detector.sessions.get(&id) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error":{"message":"Session not found","type":"not_found"}}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":{"message":"Session not found","type":"not_found"}})),
+        )
+            .into_response();
     };
     Json(json!({
         "session_id": id,
@@ -105,7 +115,11 @@ async fn reset_session(
     Path(id): Path<String>,
 ) -> Response {
     let Some(mut session) = state.loop_detector.sessions.get_mut(&id) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error":{"message":"Session not found","type":"not_found"}}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":{"message":"Session not found","type":"not_found"}})),
+        )
+            .into_response();
     };
     reset_session_state(&mut session);
     Json(json!({
@@ -130,8 +144,12 @@ async fn stats(State(state): State<crate::gateway::AppState>) -> Json<serde_json
     let mut total_confidence = 0.0f64;
     let mut top = Vec::new();
     for entry in state.loop_detector.sessions.iter() {
-        *enforcement_counts.entry(level_label(entry.enforcement_level)).or_default() += 1;
-        *signal_distribution.entry(entry.dominant_signal).or_default() += 1;
+        *enforcement_counts
+            .entry(level_label(entry.enforcement_level))
+            .or_default() += 1;
+        *signal_distribution
+            .entry(entry.dominant_signal)
+            .or_default() += 1;
         total_confidence += f64::from(entry.smoothed_confidence);
         top.push(summary(entry.key().clone(), entry.value()));
     }

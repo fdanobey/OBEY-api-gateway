@@ -1,0 +1,106 @@
+name: Sync AWS Bedrock fallback
+
+on:
+  schedule:
+    - cron: "17 6 * * 2"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report catalog drift without updating a pull request
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: windows-latest
+    env:
+      STATE_DIR: ${{ runner.temp }}\bedrock-sync-state
+      SUMMARY_FILE: ${{ runner.temp }}\bedrock-sync-summary.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore consecutive-run state
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STATE_DIR }}
+          key: bedrock-fallback-state-${{ github.run_id }}
+          restore-keys: |
+            bedrock-fallback-state-
+
+      - name: Verify docs-first fallback catalog
+        id: sync
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Path $env:STATE_DIR -Force | Out-Null
+          $dryRun = '${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}' -eq 'true'
+          $output = & ./scripts/sync-bedrock-fallback.ps1 `
+            -StatePath "$env:STATE_DIR\state.json" `
+            -DryRun:$dryRun 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { "$_" }
+          $summary = ($output | Select-Object -Last 1)
+          Set-Content -Path $env:SUMMARY_FILE -Value $summary -Encoding utf8NoBOM
+          "exit_code=$exitCode" >> $env:GITHUB_OUTPUT
+          "dry_run=$($dryRun.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Publish catalog summary
+        if: always()
+        shell: pwsh
+        run: |
+          "## AWS Bedrock fallback sync" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          '```json' >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path $env:SUMMARY_FILE) { Get-Content $env:SUMMARY_FILE >> $env:GITHUB_STEP_SUMMARY }
+          '```' >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Create or update fallback pull request
+        if: steps.sync.outputs.exit_code == '1' && steps.sync.outputs.dry_run != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $branch = 'chore/bedrock-fallback-sync'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C $branch
+          git add -- crates/ai-gateway/src/providers/bedrock.rs crates/ai-gateway/src/admin/static/index.html scripts/fixtures/bedrock/catalog.json
+          git commit -m 'chore(bedrock): sync built-in fallback models'
+          git push --force-with-lease origin $branch
+          $bodyPath = "$env:RUNNER_TEMP\bedrock-sync-pr.md"
+          @(
+            'Automated docs-first update of the AWS Bedrock fallback catalogs.',
+            '',
+            'The verifier keeps Mantle Chat, Responses, Messages, and Runtime/Converse IDs separate. Removals require two confirmations; region-specific live differences never evict documented active models.',
+            '',
+            '```json',
+            (Get-Content $env:SUMMARY_FILE -Raw),
+            '```'
+          ) | Set-Content -Path $bodyPath -Encoding utf8NoBOM
+          $existing = gh pr list --head $branch --state open --json number --jq '.[0].number'
+          if ($existing) {
+            gh pr edit $existing --title 'chore(bedrock): sync built-in fallback models' --body-file $bodyPath
+          } else {
+            $baseBranch = '${{ github.event.repository.default_branch }}'
+            gh pr create --base $baseBranch --head $branch --title 'chore(bedrock): sync built-in fallback models' --body-file $bodyPath
+          }
+
+      - name: Warn on advisory AWS check unavailable
+        if: steps.sync.outputs.exit_code == '2'
+        shell: pwsh
+        run: Write-Output "::warning::AWS live listing was unavailable. Documentation remains authoritative; see the workflow summary."
+
+      - name: Fail on hard verifier error
+        if: steps.sync.outputs.exit_code != '0' && steps.sync.outputs.exit_code != '1' && steps.sync.outputs.exit_code != '2'
+        shell: pwsh
+        run: |
+          Write-Output "::error::Bedrock fallback verification stopped with exit code ${{ steps.sync.outputs.exit_code }}."
+          exit 1

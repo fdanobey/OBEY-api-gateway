@@ -93,35 +93,41 @@ impl<'a> ChatToResponsesTranslator<'a> {
         env.insert("input".to_string(), Value::Array(input));
         env.insert("store".to_string(), json!(false));
         env.insert("stream".to_string(), json!(true));
-        env.insert("include".to_string(), json!(["reasoning.encrypted_content"]));
+        env.insert(
+            "include".to_string(),
+            json!(["reasoning.encrypted_content"]),
+        );
 
         // tools — transform from Chat Completions format to Responses API format.
         // Chat Completions: {"type":"function","function":{"name":"x","description":"...","parameters":{...}}}
         // Responses API:    {"type":"function","name":"x","description":"...","parameters":{...}}
         if let Some(tools) = req.extra.get("tools").and_then(|v| v.as_array()) {
-            let transformed: Vec<Value> = tools.iter().map(|tool| {
-                if let Some(func) = tool.get("function") {
-                    // Flatten: pull name, description, parameters up from function object
-                    let mut t = serde_json::Map::new();
-                    t.insert("type".to_string(), json!("function"));
-                    if let Some(name) = func.get("name") {
-                        t.insert("name".to_string(), name.clone());
+            let transformed: Vec<Value> = tools
+                .iter()
+                .map(|tool| {
+                    if let Some(func) = tool.get("function") {
+                        // Flatten: pull name, description, parameters up from function object
+                        let mut t = serde_json::Map::new();
+                        t.insert("type".to_string(), json!("function"));
+                        if let Some(name) = func.get("name") {
+                            t.insert("name".to_string(), name.clone());
+                        }
+                        if let Some(desc) = func.get("description") {
+                            t.insert("description".to_string(), desc.clone());
+                        }
+                        if let Some(params) = func.get("parameters") {
+                            t.insert("parameters".to_string(), params.clone());
+                        }
+                        if let Some(strict) = func.get("strict") {
+                            t.insert("strict".to_string(), strict.clone());
+                        }
+                        Value::Object(t)
+                    } else {
+                        // Non-function tool types (web_search, etc.) — forward as-is
+                        tool.clone()
                     }
-                    if let Some(desc) = func.get("description") {
-                        t.insert("description".to_string(), desc.clone());
-                    }
-                    if let Some(params) = func.get("parameters") {
-                        t.insert("parameters".to_string(), params.clone());
-                    }
-                    if let Some(strict) = func.get("strict") {
-                        t.insert("strict".to_string(), strict.clone());
-                    }
-                    Value::Object(t)
-                } else {
-                    // Non-function tool types (web_search, etc.) — forward as-is
-                    tool.clone()
-                }
-            }).collect();
+                })
+                .collect();
             env.insert("tools".to_string(), Value::Array(transformed));
         }
         // tool_choice — forward unchanged (Req 2.7)
@@ -260,12 +266,11 @@ fn convert_messages(messages: &[Message]) -> Result<Vec<Value>, CodexError> {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let args =
-                                match c.get("function").and_then(|f| f.get("arguments")) {
-                                    Some(Value::String(s)) => s.clone(),
-                                    Some(other) => other.to_string(),
-                                    None => String::new(),
-                                };
+                            let args = match c.get("function").and_then(|f| f.get("arguments")) {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(other) => other.to_string(),
+                                None => String::new(),
+                            };
                             if !call_id.is_empty() {
                                 call_ids.insert(call_id.clone());
                             }
@@ -421,7 +426,11 @@ mod tests {
         ]);
         let out = translator().translate(&req).unwrap();
         let input = out["input"].as_array().unwrap();
-        assert_eq!(input.len(), 2, "system message should be skipped: {input:#?}");
+        assert_eq!(
+            input.len(),
+            2,
+            "system message should be skipped: {input:#?}"
+        );
         assert_eq!(
             input[0],
             json!({"type":"message","role":"user",
@@ -434,7 +443,9 @@ mod tests {
         );
         // No item should carry role=="system".
         assert!(
-            !input.iter().any(|i| i.get("role").and_then(|r| r.as_str()) == Some("system")),
+            !input
+                .iter()
+                .any(|i| i.get("role").and_then(|r| r.as_str()) == Some("system")),
             "no system message should be in the output input array"
         );
     }
@@ -484,7 +495,8 @@ mod tests {
     #[test]
     fn tool_role_orphan_call_id_falls_back_to_user_message() {
         let mut t = msg("tool", json!("orphan-output"));
-        t.extra.insert("tool_call_id".into(), json!("does-not-exist"));
+        t.extra
+            .insert("tool_call_id".into(), json!("does-not-exist"));
         let req = req_with(vec![t]);
         let out = translator().translate(&req).unwrap();
         let input = out["input"].as_array().unwrap();
@@ -522,7 +534,9 @@ mod tests {
         );
         let req = req_with(vec![m]);
         match translator().translate(&req) {
-            Err(CodexError::UnsupportedFeature { feature: "input_audio" }) => {}
+            Err(CodexError::UnsupportedFeature {
+                feature: "input_audio",
+            }) => {}
             other => panic!("expected UnsupportedFeature(input_audio), got {other:?}"),
         }
     }
@@ -530,9 +544,12 @@ mod tests {
     #[test]
     fn audio_output_extra_field_returns_unsupported_feature() {
         let mut req = req_with(vec![msg("user", json!("hi"))]);
-        req.extra.insert("audio".into(), json!({"voice":"alloy","format":"mp3"}));
+        req.extra
+            .insert("audio".into(), json!({"voice":"alloy","format":"mp3"}));
         match translator().translate(&req) {
-            Err(CodexError::UnsupportedFeature { feature: "audio_output" }) => {}
+            Err(CodexError::UnsupportedFeature {
+                feature: "audio_output",
+            }) => {}
             other => panic!("expected UnsupportedFeature(audio_output), got {other:?}"),
         }
     }
@@ -540,9 +557,12 @@ mod tests {
     #[test]
     fn audio_output_modalities_audio_returns_unsupported_feature() {
         let mut req = req_with(vec![msg("user", json!("hi"))]);
-        req.extra.insert("modalities".into(), json!(["text", "audio"]));
+        req.extra
+            .insert("modalities".into(), json!(["text", "audio"]));
         match translator().translate(&req) {
-            Err(CodexError::UnsupportedFeature { feature: "audio_output" }) => {}
+            Err(CodexError::UnsupportedFeature {
+                feature: "audio_output",
+            }) => {}
             other => panic!("expected UnsupportedFeature(audio_output), got {other:?}"),
         }
     }
@@ -550,7 +570,8 @@ mod tests {
     #[test]
     fn response_format_text_is_omitted() {
         let mut req = req_with(vec![msg("user", json!("hi"))]);
-        req.extra.insert("response_format".into(), json!({"type":"text"}));
+        req.extra
+            .insert("response_format".into(), json!({"type":"text"}));
         let out = translator().translate(&req).unwrap();
         assert!(out.get("text").is_none(), "text should be absent: {out:#}");
     }
@@ -558,7 +579,8 @@ mod tests {
     #[test]
     fn response_format_json_object_translates() {
         let mut req = req_with(vec![msg("user", json!("hi"))]);
-        req.extra.insert("response_format".into(), json!({"type":"json_object"}));
+        req.extra
+            .insert("response_format".into(), json!({"type":"json_object"}));
         let out = translator().translate(&req).unwrap();
         assert_eq!(out["text"]["format"], json!({"type":"json_object"}));
     }
@@ -700,7 +722,10 @@ mod tests {
         assert_eq!(out_tools[1], json!({"type":"web_search"}));
 
         // [2] unknown-future: forwarded unchanged.
-        assert_eq!(out_tools[2], json!({"type":"unknown-future","payload":{"q":1}}));
+        assert_eq!(
+            out_tools[2],
+            json!({"type":"unknown-future","payload":{"q":1}})
+        );
     }
 
     #[test]
@@ -849,7 +874,10 @@ mod property_tests {
     /// item-count formula is exact.
     fn shape_strategy() -> impl Strategy<Value = Shape> {
         prop_oneof![
-            (prop_oneof![Just("system"), Just("developer")], "[a-zA-Z]{1,32}")
+            (
+                prop_oneof![Just("system"), Just("developer")],
+                "[a-zA-Z]{1,32}"
+            )
                 .prop_map(|(role, text)| Shape::SystemOrDev { role, text }),
             "[a-zA-Z]{1,32}".prop_map(|text| Shape::UserStr { text }),
             proptest::collection::vec(user_part(), 0..=3)
@@ -1100,20 +1128,18 @@ mod property_tests {
             });
         let body_strategy = prop::option::of("[a-zA-Z0-9 _-]{0,64}".prop_map(String::from));
 
-        (type_strategy, function_payload, body_strategy).prop_map(
-            |(t, function, body)| {
-                let mut obj = Map::new();
-                obj.insert("type".into(), Value::String(t.to_string()));
-                // Only `function` tools carry a nested `function` object.
-                if t == "function" {
-                    obj.insert("function".into(), function);
-                }
-                if let Some(b) = body {
-                    obj.insert("body".into(), Value::String(b));
-                }
-                Value::Object(obj)
-            },
-        )
+        (type_strategy, function_payload, body_strategy).prop_map(|(t, function, body)| {
+            let mut obj = Map::new();
+            obj.insert("type".into(), Value::String(t.to_string()));
+            // Only `function` tools carry a nested `function` object.
+            if t == "function" {
+                obj.insert("function".into(), function);
+            }
+            if let Some(b) = body {
+                obj.insert("body".into(), Value::String(b));
+            }
+            Value::Object(obj)
+        })
     }
 
     proptest! {

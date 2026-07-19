@@ -236,9 +236,7 @@ impl OAuthTokenStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::{
-        decrypt_provider_secret_with_key, encrypt_provider_secret_with_key,
-    };
+    use crate::secrets::{decrypt_provider_secret_with_key, encrypt_provider_secret_with_key};
     use proptest::prelude::*;
 
     // Feature: openai-oauth-login, Property 4: Token Store Round-Trip

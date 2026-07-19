@@ -43,9 +43,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::models::{
-    CreateKeyParams, ListKeysParams, UpdateKeyParams, UsageQueryParams,
-};
+use super::models::{CreateKeyParams, ListKeysParams, UpdateKeyParams, UsageQueryParams};
 use super::{KeyError, VirtualKeyManager};
 
 /// Shared handler state: the virtual key manager behind an `Arc`.
@@ -68,10 +66,7 @@ type ManagerState = State<Arc<VirtualKeyManager>>;
 pub fn routes(manager: Arc<VirtualKeyManager>) -> Router {
     Router::new()
         .route("/", post(create_key).get(list_keys))
-        .route(
-            "/{id}",
-            get(get_key).patch(update_key).delete(delete_key),
-        )
+        .route("/{id}", get(get_key).patch(update_key).delete(delete_key))
         .route("/{id}/revoke", post(revoke_key))
         .route("/{id}/usage", get(query_usage))
         .with_state(manager)
@@ -333,11 +328,8 @@ mod tests {
     #[tokio::test]
     async fn patch_updates_and_reflects_change() {
         let (mgr, _tmp) = manager();
-        let (id, _key) = create_key(
-            &mgr,
-            json!({ "name": "before", "budget_limit_usd": 100.0 }),
-        )
-        .await;
+        let (id, _key) =
+            create_key(&mgr, json!({ "name": "before", "budget_limit_usd": 100.0 })).await;
 
         let (status, body) = send(
             app(&mgr),

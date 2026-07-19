@@ -22,6 +22,9 @@ pub struct ModelCapabilities {
     pub context_window: u32,
     /// Maximum output tokens
     pub max_completion_tokens: Option<u32>,
+    /// Whether this model supports image/vision inputs.
+    /// Defaults to false when capabilities are unknown.
+    pub supports_vision: bool,
     /// When this capability was discovered
     pub discovered_at: Instant,
 }
@@ -29,11 +32,17 @@ pub struct ModelCapabilities {
 #[allow(dead_code)]
 impl ModelCapabilities {
     /// Create new model capabilities
-    pub fn new(model_id: String, context_window: u32, max_completion_tokens: Option<u32>) -> Self {
+    pub fn new(
+        model_id: String,
+        context_window: u32,
+        max_completion_tokens: Option<u32>,
+        supports_vision: bool,
+    ) -> Self {
         Self {
             model_id,
             context_window,
             max_completion_tokens,
+            supports_vision,
             discovered_at: Instant::now(),
         }
     }
@@ -41,7 +50,12 @@ impl ModelCapabilities {
     /// Create from provider Model struct
     pub fn from_model(model: &Model) -> Option<Self> {
         model.context_window.map(|cw| {
-            Self::new(model.id.clone(), cw, model.max_completion_tokens)
+            Self::new(
+                model.id.clone(),
+                cw,
+                model.max_completion_tokens,
+                model.supports_vision,
+            )
         })
     }
 
@@ -156,11 +170,7 @@ impl ContextManager {
     }
 
     /// Check if a request fits within context limits
-    pub fn fits_within_limits(
-        &self,
-        request: &OpenAIRequest,
-        context_window: u32,
-    ) -> bool {
+    pub fn fits_within_limits(&self, request: &OpenAIRequest, context_window: u32) -> bool {
         let estimated = Self::estimate_request_tokens(request);
         // Leave some buffer for output tokens
         let effective_limit = (context_window as f64 * 0.75) as u32;
@@ -346,7 +356,7 @@ mod tests {
     fn test_token_estimation() {
         let messages = vec![
             create_test_message("system", "You are a helpful assistant"), // ~7 tokens
-            create_test_message("user", "Hello, how are you?"), // ~6 tokens
+            create_test_message("user", "Hello, how are you?"),           // ~6 tokens
         ];
 
         let estimate = ContextManager::estimate_tokens(&messages);
@@ -358,7 +368,7 @@ mod tests {
     fn test_capability_caching() {
         let manager = ContextManager::new();
 
-        let caps = ModelCapabilities::new("gpt-4".to_string(), 128000, Some(4096));
+        let caps = ModelCapabilities::new("gpt-4".to_string(), 128000, Some(4096), true);
         manager.store_capabilities(caps);
 
         let retrieved = manager.get_capabilities("gpt-4");
@@ -370,26 +380,12 @@ mod tests {
     fn test_context_length_error_detection() {
         let manager = ContextManager::new();
 
-        assert!(manager.is_context_length_error(
-            400,
-            "This model's maximum context length is 4096 tokens"
-        ));
-        assert!(manager.is_context_length_error(
-            400,
-            "context_length_exceeded"
-        ));
-        assert!(manager.is_context_length_error(
-            413,
-            "Input is too long"
-        ));
-        assert!(!manager.is_context_length_error(
-            400,
-            "Invalid API key"
-        ));
-        assert!(!manager.is_context_length_error(
-            500,
-            "Internal server error"
-        ));
+        assert!(manager
+            .is_context_length_error(400, "This model's maximum context length is 4096 tokens"));
+        assert!(manager.is_context_length_error(400, "context_length_exceeded"));
+        assert!(manager.is_context_length_error(413, "Input is too long"));
+        assert!(!manager.is_context_length_error(400, "Invalid API key"));
+        assert!(!manager.is_context_length_error(500, "Internal server error"));
     }
 
     #[test]
@@ -399,6 +395,7 @@ mod tests {
             "test-model".to_string(),
             100, // Small context for testing
             None,
+            false,
         ));
 
         let mut request = OpenAIRequest {

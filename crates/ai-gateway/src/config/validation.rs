@@ -1,6 +1,6 @@
 use super::*;
-use std::path::{Path, PathBuf};
 use std::env;
+use std::path::{Path, PathBuf};
 
 use crate::guardrail::GuardrailConfig;
 use crate::secrets;
@@ -12,43 +12,44 @@ const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../config.example.yaml");
 pub enum ValidationError {
     #[error("Missing required field: {0}")]
     MissingField(String),
-    
+
     #[error("Invalid value for field '{field}': {value}. Expected: {expected}")]
     InvalidValue {
         field: String,
         value: String,
         expected: String,
     },
-    
+
     #[error("Port number must be in range 1-65535, got: {0}")]
     InvalidPort(u16),
-    
+
     #[error("Timeout value must be positive, got: {0}")]
     InvalidTimeout(u64),
-    
+
     #[error("At least one provider must be configured")]
     NoProviders,
-    
+
     #[error("Model group '{0}' must contain at least one model")]
     EmptyModelGroup(String),
-    
+
     #[error("Model in group '{group}' is missing provider field")]
     MissingProviderField { group: String },
-    
+
     #[error("Model in group '{group}' is missing model identifier field")]
     MissingModelField { group: String },
-    
+
     #[error("Environment variable '{0}' is not set")]
     MissingEnvVar(String),
 
     #[error("Bedrock provider '{0}' requires a region to be configured")]
     MissingBedrockRegion(String),
 
-    #[error("Codex field '{field}' is only valid on oauth+openai providers (provider: '{provider}')")]
+    #[error(
+        "Codex field '{field}' is only valid on oauth+openai providers (provider: '{provider}')"
+    )]
     InvalidCodexField { provider: String, field: String },
 
     // --- Guardrail pipeline validation (Req 1.1, 1.2, 1.9, 1.10, 6.3, 6.6, 7.6, 5.1) ---
-
     #[error("Guardrail pipeline name must be non-empty")]
     GuardrailEmptyPipelineName,
 
@@ -114,18 +115,18 @@ pub fn resolve_config_path(cli_path: Option<PathBuf>) -> PathBuf {
     if let Some(path) = cli_path {
         return path;
     }
-    
+
     // Priority 2: CONFIG_PATH env var
     if let Ok(path) = env::var("CONFIG_PATH") {
         return PathBuf::from(path);
     }
-    
+
     // Priority 3: ./config.yaml
     let local_path = PathBuf::from("./config.yaml");
     if local_path.exists() {
         return local_path;
     }
-    
+
     // Priority 4: %APPDATA%/ai-gateway/config.yaml (Windows)
     #[cfg(target_os = "windows")]
     {
@@ -138,7 +139,7 @@ pub fn resolve_config_path(cli_path: Option<PathBuf>) -> PathBuf {
             }
         }
     }
-    
+
     // Default fallback
     local_path
 }
@@ -146,31 +147,37 @@ pub fn resolve_config_path(cli_path: Option<PathBuf>) -> PathBuf {
 impl Config {
     pub fn validate(&self) -> ValidationResult<()> {
         let mut errors = Vec::new();
-        
+
         // Validate port range (21.9)
         if self.server.port == 0 {
             errors.push(ValidationError::InvalidPort(self.server.port));
         }
-        
+
         // Validate timeout values (21.10)
         if self.server.request_timeout_seconds == 0 {
-            errors.push(ValidationError::InvalidTimeout(self.server.request_timeout_seconds));
+            errors.push(ValidationError::InvalidTimeout(
+                self.server.request_timeout_seconds,
+            ));
         }
-        
+
         // Validate loop detection before the configuration reaches runtime state.
         if let Err(loop_errors) = self.loop_detection.validate() {
-            errors.extend(loop_errors.into_iter().map(|error| ValidationError::InvalidValue {
-                field: "loop_detection".to_string(),
-                value: error.to_string(),
-                expected: "a valid loop detection configuration".to_string(),
-            }));
+            errors.extend(
+                loop_errors
+                    .into_iter()
+                    .map(|error| ValidationError::InvalidValue {
+                        field: "loop_detection".to_string(),
+                        value: error.to_string(),
+                        expected: "a valid loop detection configuration".to_string(),
+                    }),
+            );
         }
 
         // Validate at least one provider (21.7)
         if self.providers.is_empty() {
             errors.push(ValidationError::NoProviders);
         }
-        
+
         // Validate provider timeouts and env vars
         for provider in &self.providers {
             if provider.timeout_seconds == 0 {
@@ -191,7 +198,10 @@ impl Config {
 
             if provider.connection_pool.max_idle_per_host == 0 {
                 errors.push(ValidationError::InvalidValue {
-                    field: format!("providers.{}.connection_pool.max_idle_per_host", provider.name),
+                    field: format!(
+                        "providers.{}.connection_pool.max_idle_per_host",
+                        provider.name
+                    ),
                     value: provider.connection_pool.max_idle_per_host.to_string(),
                     expected: "a positive integer".to_string(),
                 });
@@ -199,7 +209,10 @@ impl Config {
 
             if provider.connection_pool.idle_timeout_seconds == 0 {
                 errors.push(ValidationError::InvalidValue {
-                    field: format!("providers.{}.connection_pool.idle_timeout_seconds", provider.name),
+                    field: format!(
+                        "providers.{}.connection_pool.idle_timeout_seconds",
+                        provider.name
+                    ),
                     value: provider.connection_pool.idle_timeout_seconds.to_string(),
                     expected: "a positive integer".to_string(),
                 });
@@ -214,7 +227,7 @@ impl Config {
                     });
                 }
             }
-            
+
             // Warn about missing API key env vars but don't block startup (configurable via UI)
             if let Some(ref env_var) = provider.api_key_env {
                 if !env_var.is_empty()
@@ -232,7 +245,7 @@ impl Config {
                     provider.name
                 );
             }
-            
+
             if let Some(ref env_var) = provider.api_secret_env {
                 if !env_var.is_empty() && env::var(env_var).is_err() {
                     tracing::warn!("Environment variable '{}' for provider '{}' is not set — provider will be unavailable until configured", env_var, provider.name);
@@ -240,11 +253,14 @@ impl Config {
             }
 
             // OAuth auth_method is only supported for OpenAI providers (6.1, 6.5)
-            if provider.auth_method.as_deref() == Some("oauth") && provider.provider_type != "openai" {
+            if provider.auth_method.as_deref() == Some("oauth")
+                && provider.provider_type != "openai"
+            {
                 errors.push(ValidationError::InvalidValue {
                     field: format!("providers.{}.auth_method", provider.name),
                     value: "oauth".to_string(),
-                    expected: "auth_method 'oauth' is only supported for provider_type 'openai'".to_string(),
+                    expected: "auth_method 'oauth' is only supported for provider_type 'openai'"
+                        .to_string(),
                 });
             }
 
@@ -306,7 +322,9 @@ impl Config {
                     );
                 }
 
-                if provider.custom_vpc_endpoint && provider.base_url.as_deref().unwrap_or("").is_empty() {
+                if provider.custom_vpc_endpoint
+                    && provider.base_url.as_deref().unwrap_or("").is_empty()
+                {
                     errors.push(ValidationError::InvalidValue {
                         field: format!("providers.{}.base_url", provider.name),
                         value: "empty".to_string(),
@@ -354,7 +372,7 @@ impl Config {
                 });
             }
         }
-        
+
         // Validate admin auth env vars (21.5)
         if self.admin.auth.enabled {
             if let Some(ref env_var) = self.admin.auth.username_env {
@@ -368,13 +386,13 @@ impl Config {
                 }
             }
         }
-        
+
         // Validate model groups (21.8)
         for group in &self.model_groups {
             if group.models.is_empty() {
                 errors.push(ValidationError::EmptyModelGroup(group.name.clone()));
             }
-            
+
             // Validate each model has provider and model fields (4.3)
             for model in &group.models {
                 if model.provider.is_empty() {
@@ -389,7 +407,7 @@ impl Config {
                 }
             }
         }
-        
+
         // Validate guardrail pipelines (Req 1.1, 1.2, 1.9, 1.10, 6.3, 6.6, 7.6, 8.7).
         // Runs only when the opt-in `guardrails` section is present; an absent
         // section disables all guardrail processing and skips validation.
@@ -409,11 +427,7 @@ impl Config {
     /// Collects every violation into `errors` (matching the accumulate-then-
     /// report pattern used throughout [`Config::validate`]) so a single load
     /// surfaces all problems at once.
-    fn validate_guardrails(
-        &self,
-        guardrails: &GuardrailConfig,
-        errors: &mut Vec<ValidationError>,
-    ) {
+    fn validate_guardrails(&self, guardrails: &GuardrailConfig, errors: &mut Vec<ValidationError>) {
         use crate::guardrail::GuardrailProviderType;
         use std::collections::HashSet;
 
@@ -443,7 +457,10 @@ impl Config {
             //   - presidio confidence_threshold (Req 6.6)
             //   - semantic allow/deny thresholds (Req 7.6)
             let thresholds = [
-                ("confidence_threshold", provider.settings.confidence_threshold),
+                (
+                    "confidence_threshold",
+                    provider.settings.confidence_threshold,
+                ),
                 ("allow_threshold", provider.settings.allow_threshold),
                 ("deny_threshold", provider.settings.deny_threshold),
             ];
@@ -522,10 +539,9 @@ impl Config {
                             pattern: pattern.clone(),
                             reason: "empty refusal phrase".to_string(),
                         });
-                    } else if let Err(e) =
-                        regex::RegexBuilder::new(pattern)
-                            .case_insensitive(true)
-                            .build()
+                    } else if let Err(e) = regex::RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
                     {
                         errors.push(ValidationError::GuardrailInvalidRefusalPhrase {
                             pipeline_name: pipeline.name.clone(),
@@ -576,14 +592,14 @@ pub fn load_and_validate_config(path: &Path) -> Result<Config, String> {
             path.display()
         ));
     }
-    
+
     // Read file
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read configuration file: {}", e))?;
-    
+
     // Parse YAML (21.2)
-    let mut config: Config = serde_yaml::from_str(&contents)
-        .map_err(|e| format!("Invalid YAML syntax: {}", e))?;
+    let mut config: Config =
+        serde_yaml::from_str(&contents).map_err(|e| format!("Invalid YAML syntax: {}", e))?;
 
     for provider in &mut config.providers {
         // Handle api_key
@@ -622,16 +638,16 @@ pub fn load_and_validate_config(path: &Path) -> Result<Config, String> {
             }
         }
     }
-    
+
     // Validate configuration (21.3, 21.4, 41.2, 41.4)
-    config.validate()
-        .map_err(|errors| {
-            let error_messages: Vec<String> = errors.iter()
-                .map(|e| e.to_string())
-                .collect();
-            format!("Configuration validation failed:\n  - {}", error_messages.join("\n  - "))
-        })?;
-    
+    config.validate().map_err(|errors| {
+        let error_messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+        format!(
+            "Configuration validation failed:\n  - {}",
+            error_messages.join("\n  - ")
+        )
+    })?;
+
     Ok(config)
 }
 
@@ -664,15 +680,14 @@ pub fn save_config(path: &Path, config: &Config) -> Result<(), String> {
         }
     }
 
-    std::fs::write(path, yaml)
-        .map_err(|e| format!("Failed to write configuration file: {}", e))
+    std::fs::write(path, yaml).map_err(|e| format!("Failed to write configuration file: {}", e))
 }
 
 #[cfg(test)]
 mod property_tests {
     use super::*;
     use proptest::prelude::*;
-    
+
     // Helper to create minimal valid config
     fn minimal_valid_config() -> Config {
         Config {
@@ -690,7 +705,7 @@ mod property_tests {
                 name: "test-provider".to_string(),
                 provider_type: "openai".to_string(),
                 base_url: Some("https://api.openai.com/v1".to_string()),
-                api_key_env: None,  // No env var required for test
+                api_key_env: None, // No env var required for test
                 api_key_encrypted: None,
                 api_secret_env: None,
                 api_secret_encrypted: None,
@@ -802,7 +817,7 @@ model_groups:
         assert!(reloaded.first_launch_completed);
         assert_eq!(reloaded.tray, config.tray);
     }
-    
+
     // Feature: ai-gateway, Property 11: API Key Storage
     // **Validates: Requirements 12.8, 19.2**
     proptest! {
@@ -811,24 +826,24 @@ model_groups:
             api_key in "[A-Z_][A-Z0-9_]{0,50}",
             api_secret in "[A-Z_][A-Z0-9_]{0,50}",
         ) {
-            // Property: For any configuration file, API keys shall be stored only as 
+            // Property: For any configuration file, API keys shall be stored only as
             // environment variable names, never as literal values.
-            
+
             let mut config = minimal_valid_config();
-            
+
             // Set API key and secret as environment variable names
             config.providers[0].api_key_env = Some(api_key.clone());
             config.providers[0].api_secret_env = Some(api_secret.clone());
-            
+
             // Serialize to YAML (simulating config file storage)
             let yaml = serde_yaml::to_string(&config).unwrap();
-            
+
             // Verify that the YAML contains the env var names
-            prop_assert!(yaml.contains(&api_key), 
+            prop_assert!(yaml.contains(&api_key),
                 "Config should contain env var name: {}", api_key);
-            prop_assert!(yaml.contains(&api_secret), 
+            prop_assert!(yaml.contains(&api_secret),
                 "Config should contain env var name: {}", api_secret);
-            
+
             // Verify that the YAML does NOT contain literal API key patterns
             // Common API key patterns: sk-..., Bearer ..., etc.
             let literal_key_patterns = [
@@ -837,68 +852,68 @@ model_groups:
                 "[a-f0-9]{32,}",  // Hex keys
                 "AKIA[A-Z0-9]{16}",  // AWS access key
             ];
-            
+
             for pattern in &literal_key_patterns {
                 let re = regex::Regex::new(pattern).unwrap();
-                prop_assert!(!re.is_match(&yaml), 
+                prop_assert!(!re.is_match(&yaml),
                     "Config should not contain literal API key matching pattern: {}", pattern);
             }
         }
-        
+
         #[test]
         fn prop_admin_auth_stored_as_env_var_names(
             username_env in "[A-Z_][A-Z0-9_]{0,50}",
             password_env in "[A-Z_][A-Z0-9_]{0,50}",
         ) {
             // Property: Admin credentials should also be stored as env var names
-            
+
             let mut config = minimal_valid_config();
             config.admin.auth.enabled = true;
             config.admin.auth.username_env = Some(username_env.clone());
             config.admin.auth.password_env = Some(password_env.clone());
-            
+
             // Serialize to YAML
             let yaml = serde_yaml::to_string(&config).unwrap();
-            
+
             // Verify env var names are present
-            prop_assert!(yaml.contains(&username_env), 
+            prop_assert!(yaml.contains(&username_env),
                 "Config should contain username env var: {}", username_env);
-            prop_assert!(yaml.contains(&password_env), 
+            prop_assert!(yaml.contains(&password_env),
                 "Config should contain password env var: {}", password_env);
-            
+
             // Verify no literal passwords (common patterns)
             let password_patterns = [
                 r#"password:\s*"[^"]{8,}""#,  // Quoted password
                 r#"password:\s*[a-zA-Z0-9]{8,}"#,  // Unquoted password
             ];
-            
+
             for pattern in &password_patterns {
                 let re = regex::Regex::new(pattern).unwrap();
-                prop_assert!(!re.is_match(&yaml), 
+                prop_assert!(!re.is_match(&yaml),
                     "Config should not contain literal password matching pattern: {}", pattern);
             }
         }
-        
+
         #[test]
         fn prop_custom_headers_may_contain_env_refs(
             header_value in "[A-Z_][A-Z0-9_]{0,50}",
         ) {
             // Property: Custom headers can reference env vars but should not contain literal secrets
-            
+
             let mut config = minimal_valid_config();
             config.providers[0].custom_headers.insert(
-                "X-API-Key".to_string(), 
+                "X-API-Key".to_string(),
                 format!("${{{}}}", header_value)  // ${ENV_VAR} format
             );
-            
+
             let yaml = serde_yaml::to_string(&config).unwrap();
-            
+
             // Should contain the env var reference
-            prop_assert!(yaml.contains(&header_value), 
+            prop_assert!(yaml.contains(&header_value),
                 "Config should contain env var reference: {}", header_value);
         }
     }
-    
+
     // Feature: ai-gateway, Property 9: Configuration Validation Rejection
     // **Validates: Requirements 12.6, 12.7, 21.1-21.4, 41.2, 41.4, 41.5**
     proptest! {
@@ -907,59 +922,59 @@ model_groups:
             if port == 0 {
                 let mut config = minimal_valid_config();
                 config.server.port = port;
-                
+
                 let result = config.validate();
                 prop_assert!(result.is_err(), "Port 0 should be rejected");
             }
         }
-        
+
         #[test]
         fn prop_zero_timeout_rejected(timeout in prop::num::u64::ANY) {
             if timeout == 0 {
                 let mut config = minimal_valid_config();
                 config.server.request_timeout_seconds = timeout;
-                
+
                 let result = config.validate();
                 prop_assert!(result.is_err(), "Zero timeout should be rejected");
             }
         }
-        
+
         #[test]
         fn prop_no_providers_rejected(_dummy in prop::num::u8::ANY) {
             let mut config = minimal_valid_config();
             config.providers.clear();
-            
+
             let result = config.validate();
             prop_assert!(result.is_err(), "Config with no providers should be rejected");
         }
-        
+
         #[test]
         fn prop_empty_model_group_rejected(_dummy in prop::num::u8::ANY) {
             let mut config = minimal_valid_config();
             config.model_groups[0].models.clear();
-            
+
             let result = config.validate();
             prop_assert!(result.is_err(), "Model group with no models should be rejected");
         }
-        
+
         #[test]
         fn prop_missing_provider_field_rejected(_dummy in prop::num::u8::ANY) {
             let mut config = minimal_valid_config();
             config.model_groups[0].models[0].provider = String::new();
-            
+
             let result = config.validate();
             prop_assert!(result.is_err(), "Model with empty provider should be rejected");
         }
-        
+
         #[test]
         fn prop_missing_model_field_rejected(_dummy in prop::num::u8::ANY) {
             let mut config = minimal_valid_config();
             config.model_groups[0].models[0].model = String::new();
-            
+
             let result = config.validate();
             prop_assert!(result.is_err(), "Model with empty model identifier should be rejected");
         }
-        
+
         #[test]
         fn prop_valid_config_accepted(
             port in 1u16..=65535u16,
@@ -968,7 +983,7 @@ model_groups:
             let mut config = minimal_valid_config();
             config.server.port = port;
             config.server.request_timeout_seconds = timeout;
-            
+
             let result = config.validate();
             prop_assert!(result.is_ok(), "Valid config should be accepted: {:?}", result);
         }
@@ -985,7 +1000,10 @@ model_groups:
         config.providers[0].auth_method = Some("oauth".to_string());
 
         let result = config.validate();
-        assert!(result.is_err(), "auth_method 'oauth' on non-openai provider should be rejected");
+        assert!(
+            result.is_err(),
+            "auth_method 'oauth' on non-openai provider should be rejected"
+        );
         let errors = result.unwrap_err();
         assert!(
             errors.iter().any(|e| match e {
@@ -1009,7 +1027,10 @@ model_groups:
         });
 
         let result = config.validate();
-        assert!(result.is_err(), "keepalive_interval_seconds > 60 should be rejected");
+        assert!(
+            result.is_err(),
+            "keepalive_interval_seconds > 60 should be rejected"
+        );
         let errors = result.unwrap_err();
         assert!(
             errors.iter().any(|e| matches!(
@@ -1030,7 +1051,11 @@ model_groups:
         });
 
         let result = config.validate();
-        assert!(result.is_ok(), "keepalive_interval_seconds == 60 should be accepted: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "keepalive_interval_seconds == 60 should be accepted: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1043,7 +1068,11 @@ model_groups:
         });
 
         let result = config.validate();
-        assert!(result.is_ok(), "keepalive_interval_seconds == 0 should be accepted: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "keepalive_interval_seconds == 0 should be accepted: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1055,7 +1084,10 @@ model_groups:
         });
 
         let result = config.validate();
-        assert!(result.is_err(), "chunk_timeout_seconds < 5 should be rejected");
+        assert!(
+            result.is_err(),
+            "chunk_timeout_seconds < 5 should be rejected"
+        );
         let errors = result.unwrap_err();
         assert!(
             errors.iter().any(|e| matches!(
@@ -1076,7 +1108,11 @@ model_groups:
         });
 
         let result = config.validate();
-        assert!(result.is_ok(), "chunk_timeout_seconds == 5 should be accepted: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "chunk_timeout_seconds == 5 should be accepted: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1085,7 +1121,11 @@ model_groups:
         config.streaming = Some(StreamingConfig::default());
 
         let result = config.validate();
-        assert!(result.is_ok(), "Default StreamingConfig should be accepted: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Default StreamingConfig should be accepted: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1095,7 +1135,11 @@ model_groups:
         config.providers[0].auth_method = Some("oauth".to_string());
 
         let result = config.validate();
-        assert!(result.is_ok(), "auth_method 'oauth' on openai provider should be accepted: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "auth_method 'oauth' on openai provider should be accepted: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1105,7 +1149,11 @@ model_groups:
         config.providers[0].auth_method = None;
 
         let result = config.validate();
-        assert!(result.is_ok(), "No auth_method should be accepted for any provider: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "No auth_method should be accepted for any provider: {:?}",
+            result
+        );
     }
 
     // Feature: bedrock-ui-integration, Bedrock validation rules
@@ -1118,10 +1166,15 @@ model_groups:
         config.providers[0].region = None;
 
         let result = config.validate();
-        assert!(result.is_err(), "Bedrock provider without region should be rejected");
+        assert!(
+            result.is_err(),
+            "Bedrock provider without region should be rejected"
+        );
         let errors = result.unwrap_err();
         assert!(
-            errors.iter().any(|e| matches!(e, ValidationError::MissingBedrockRegion(_))),
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MissingBedrockRegion(_))),
             "Should contain MissingBedrockRegion error"
         );
     }
@@ -1133,7 +1186,11 @@ model_groups:
         config.providers[0].region = Some("us-east-1".to_string());
 
         let result = config.validate();
-        assert!(result.is_ok(), "Bedrock provider with region should be accepted: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Bedrock provider with region should be accepted: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1143,7 +1200,11 @@ model_groups:
         config.providers[0].region = None;
 
         let result = config.validate();
-        assert!(result.is_ok(), "Non-bedrock provider without region should be accepted: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Non-bedrock provider without region should be accepted: {:?}",
+            result
+        );
     }
 
     // Feature: bedrock-ui-integration, Property 4: Provider config Bedrock fields round-trip through serialization
@@ -1371,7 +1432,11 @@ model_groups:
     fn test_guardrail_valid_config_accepted() {
         let config = config_with_guardrails(minimal_guardrails());
         let result = config.validate();
-        assert!(result.is_ok(), "Valid guardrail config should be accepted: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Valid guardrail config should be accepted: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1603,7 +1668,10 @@ model_groups:
             },
         });
         let config = config_with_guardrails(guardrails);
-        assert!(config.validate().is_ok(), "Thresholds at 0.0 and 1.0 bounds should be accepted");
+        assert!(
+            config.validate().is_ok(),
+            "Thresholds at 0.0 and 1.0 bounds should be accepted"
+        );
     }
 
     #[test]
@@ -1678,7 +1746,7 @@ model_groups:
         let mut guardrails = minimal_guardrails();
         guardrails.pipelines[0].refusal_phrase_list = Some(vec![
             "i can'?t (help|assist)".to_string(), // valid
-            "(unclosed".to_string(),               // invalid regex → rejected (Req 12.13)
+            "(unclosed".to_string(),              // invalid regex → rejected (Req 12.13)
         ]);
         let config = config_with_guardrails(guardrails);
 
@@ -1784,13 +1852,16 @@ model_groups:
     }
 
     fn p3_arb_stage() -> impl Strategy<Value = P3Stage> {
-        (0usize..P3_PROVIDER_REFS.len(), p3_arb_action(), p3_arb_phase()).prop_map(
-            |(pidx, action, phase)| P3Stage {
+        (
+            0usize..P3_PROVIDER_REFS.len(),
+            p3_arb_action(),
+            p3_arb_phase(),
+        )
+            .prop_map(|(pidx, action, phase)| P3Stage {
                 provider_ref: P3_PROVIDER_REFS[pidx].to_string(),
                 action,
                 phase,
-            },
-        )
+            })
     }
 
     fn p3_arb_pipeline() -> impl Strategy<Value = P3Pipeline> {
@@ -1805,13 +1876,13 @@ model_groups:
     }
 
     fn p3_arb_binding() -> impl Strategy<Value = P3Binding> {
-        (0usize..3, 0usize..4, 0usize..P3_BINDING_REFS.len()).prop_map(
-            |(kind, tidx, ridx)| P3Binding {
+        (0usize..3, 0usize..4, 0usize..P3_BINDING_REFS.len()).prop_map(|(kind, tidx, ridx)| {
+            P3Binding {
                 kind,
                 target: format!("t{tidx}"),
                 pipeline_ref: P3_BINDING_REFS[ridx].to_string(),
-            },
-        )
+            }
+        })
     }
 
     proptest! {

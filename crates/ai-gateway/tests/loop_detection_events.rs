@@ -38,7 +38,13 @@ fn disconnected_replay_is_bounded_to_newest_hundred() {
     assert_eq!(bus.buffered_len(), 100);
     let subscription = bus.subscribe();
     assert_eq!(subscription.replay.len(), 100);
-    assert_eq!(subscription.replay.first().unwrap().session_id, "session-50");
-    assert_eq!(subscription.replay.last().unwrap().session_id, "session-149");
+    assert_eq!(
+        subscription.replay.first().unwrap().session_id,
+        "session-50"
+    );
+    assert_eq!(
+        subscription.replay.last().unwrap().session_id,
+        "session-149"
+    );
     assert_eq!(bus.buffered_len(), 0);
 }

@@ -27,10 +27,7 @@ pub enum AccessError {
     /// The requested `model` is not present in the key's access list.
     /// `allowed` carries the key's permitted scope for the response body.
     #[error("Model {model} not permitted for this key")]
-    ModelDenied {
-        model: String,
-        allowed: Vec<String>,
-    },
+    ModelDenied { model: String, allowed: Vec<String> },
 }
 
 impl VirtualKeyManager {
@@ -121,10 +118,7 @@ mod tests {
     #[test]
     fn model_in_list_permitted() {
         let (mgr, _tmp) = manager();
-        let key = key_with_access(Some(vec![
-            "gpt-4".to_string(),
-            "claude-3-opus".to_string(),
-        ]));
+        let key = key_with_access(Some(vec!["gpt-4".to_string(), "claude-3-opus".to_string()]));
         assert!(mgr.check_model_access(&key, "gpt-4").is_ok());
         assert!(mgr.check_model_access(&key, "claude-3-opus").is_ok());
     }

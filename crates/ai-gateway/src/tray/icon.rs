@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tray_item::{IconSource, TrayItem};
 
 #[cfg(target_os = "windows")]
-use winapi::um::winuser::{IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadImageW};
+use winapi::um::winuser::{LoadImageW, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE};
 
 use super::{TrayError, TrayMenuAction};
 

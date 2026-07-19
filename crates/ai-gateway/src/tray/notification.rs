@@ -35,7 +35,11 @@ impl NotificationManager {
 
     pub fn notify_already_running() -> Result<(), TrayError> {
         #[cfg(target_os = "windows")]
-        show_windows_toast("OBEY API Gateway", "Application is already running", "Use the tray icon to interact with it")?;
+        show_windows_toast(
+            "OBEY API Gateway",
+            "Application is already running",
+            "Use the tray icon to interact with it",
+        )?;
 
         tracing::info!("Tray notification: application is already running");
         Ok(())

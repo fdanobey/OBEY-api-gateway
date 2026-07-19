@@ -233,8 +233,16 @@ fn serve_index_html(state: &AppState) -> Response {
             // Inject <base> so relative asset URLs (logo, favicon) resolve under the admin path
             let admin_base = format!("{}/", config.admin.path.trim_end_matches('/'));
             html = html.replace("<head>", &format!("<head><base href=\"{}\">", admin_base));
-            html = html.replace("href=\"/dashboard\" id=\"dashboard-link\"", &format!("href=\"{}\" id=\"dashboard-link\"", dashboard_href));
-            (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+            html = html.replace(
+                "href=\"/dashboard\" id=\"dashboard-link\"",
+                &format!("href=\"{}\" id=\"dashboard-link\"", dashboard_href),
+            );
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                html,
+            )
+                .into_response()
         }
         None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
@@ -299,7 +307,9 @@ fn redact_config_for_response(config: &Config) -> serde_json::Value {
 
                 obj.insert(
                     "api_key_env".to_string(),
-                    resolved_key_value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+                    resolved_key_value
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
                 );
                 obj.remove("api_key_encrypted");
                 obj.insert(
@@ -318,9 +328,9 @@ fn redact_config_for_response(config: &Config) -> serde_json::Value {
                 } else if let Some(value) = provider.api_secret_env.as_deref() {
                     if secrets::is_env_var_reference(value) {
                         // This is an env var name - resolve it
-                        std::env::var(value).ok().or_else(|| {
-                            provider.resolved_api_secret.clone()
-                        })
+                        std::env::var(value)
+                            .ok()
+                            .or_else(|| provider.resolved_api_secret.clone())
                     } else if secrets::looks_like_plaintext_secret(value) {
                         // Already a plaintext secret - return as-is
                         Some(value.to_string())
@@ -334,7 +344,9 @@ fn redact_config_for_response(config: &Config) -> serde_json::Value {
 
                 obj.insert(
                     "api_secret_env".to_string(),
-                    resolved_secret_value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+                    resolved_secret_value
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
                 );
                 obj.remove("api_secret_encrypted");
                 obj.insert(
@@ -392,7 +404,9 @@ fn hydrate_provider_runtime_secrets(config: &mut Config) {
         if let Some(encrypted) = provider.api_key_encrypted.as_deref() {
             match secrets::decrypt_provider_secret(encrypted) {
                 Ok(value) => provider.resolved_api_key = Some(value),
-                Err(error) => tracing::warn!(provider = %provider.name, error = %error, "Failed to decrypt provider api_key in admin flow"),
+                Err(error) => {
+                    tracing::warn!(provider = %provider.name, error = %error, "Failed to decrypt provider api_key in admin flow")
+                }
             }
         } else if let Some(value) = provider.api_key_env.as_deref() {
             if secrets::looks_like_plaintext_secret(value) {
@@ -406,7 +420,9 @@ fn hydrate_provider_runtime_secrets(config: &mut Config) {
         if let Some(encrypted) = provider.api_secret_encrypted.as_deref() {
             match secrets::decrypt_provider_secret(encrypted) {
                 Ok(value) => provider.resolved_api_secret = Some(value),
-                Err(error) => tracing::warn!(provider = %provider.name, error = %error, "Failed to decrypt provider api_secret in admin flow"),
+                Err(error) => {
+                    tracing::warn!(provider = %provider.name, error = %error, "Failed to decrypt provider api_secret in admin flow")
+                }
             }
         } else if let Some(value) = provider.api_secret_env.as_deref() {
             if secrets::looks_like_plaintext_secret(value) {
@@ -421,16 +437,27 @@ fn normalize_config_for_storage(
     existing_config: Option<&Config>,
 ) -> Result<Config, String> {
     for provider in &mut config.providers {
-        let existing_provider = existing_config
-            .and_then(|cfg| cfg.providers.iter().find(|candidate| candidate.name == provider.name));
+        let existing_provider = existing_config.and_then(|cfg| {
+            cfg.providers
+                .iter()
+                .find(|candidate| candidate.name == provider.name)
+        });
 
         // Handle api_key_env encryption
-        let key_input = provider.api_key_env.as_deref().map(str::trim).filter(|value| !value.is_empty());
+        let key_input = provider
+            .api_key_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
 
         if let Some(value) = key_input {
             if secrets::looks_like_plaintext_secret(value) {
-                let encrypted = secrets::encrypt_provider_secret(value)
-                    .map_err(|error| format!("Failed to encrypt API key for provider '{}': {}", provider.name, error))?;
+                let encrypted = secrets::encrypt_provider_secret(value).map_err(|error| {
+                    format!(
+                        "Failed to encrypt API key for provider '{}': {}",
+                        provider.name, error
+                    )
+                })?;
                 provider.api_key_encrypted = Some(encrypted);
                 provider.resolved_api_key = Some(value.to_string());
                 provider.api_key_env = None;
@@ -450,7 +477,11 @@ fn normalize_config_for_storage(
                     .and_then(|encrypted| secrets::decrypt_provider_secret(encrypted).ok());
             }
 
-            if provider.api_key_env.as_deref().is_some_and(|value| value.trim().is_empty()) {
+            if provider
+                .api_key_env
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
                 provider.api_key_env = None;
             }
         } else if let Some(existing) = existing_provider {
@@ -462,12 +493,20 @@ fn normalize_config_for_storage(
         }
 
         // Handle api_secret_env encryption
-        let secret_input = provider.api_secret_env.as_deref().map(str::trim).filter(|value| !value.is_empty());
+        let secret_input = provider
+            .api_secret_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
 
         if let Some(value) = secret_input {
             if secrets::looks_like_plaintext_secret(value) {
-                let encrypted = secrets::encrypt_provider_secret(value)
-                    .map_err(|error| format!("Failed to encrypt API secret for provider '{}': {}", provider.name, error))?;
+                let encrypted = secrets::encrypt_provider_secret(value).map_err(|error| {
+                    format!(
+                        "Failed to encrypt API secret for provider '{}': {}",
+                        provider.name, error
+                    )
+                })?;
                 provider.api_secret_encrypted = Some(encrypted);
                 provider.resolved_api_secret = Some(value.to_string());
                 provider.api_secret_env = None;
@@ -487,7 +526,11 @@ fn normalize_config_for_storage(
                     .and_then(|encrypted| secrets::decrypt_provider_secret(encrypted).ok());
             }
 
-            if provider.api_secret_env.as_deref().is_some_and(|value| value.trim().is_empty()) {
+            if provider
+                .api_secret_env
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
                 provider.api_secret_env = None;
             }
         } else if let Some(existing) = existing_provider {
@@ -516,10 +559,7 @@ async fn get_config(State(state): State<AppState>) -> Response {
 ///
 /// Accepts a full Config JSON body. On success the new config is written to
 /// the YAML file and swapped into the live state.
-async fn update_config(
-    State(state): State<AppState>,
-    Json(new_config): Json<Config>,
-) -> Response {
+async fn update_config(State(state): State<AppState>, Json(new_config): Json<Config>) -> Response {
     let current_config = state.config.read().await.clone();
 
     let normalized_config = match normalize_config_for_storage(new_config, Some(&current_config)) {
@@ -572,7 +612,10 @@ async fn update_config(
     // Apply to live state
     apply_runtime_config_update(&state, normalized_config).await;
 
-    tracing::info!("Configuration updated and saved to {}", config_path.display());
+    tracing::info!(
+        "Configuration updated and saved to {}",
+        config_path.display()
+    );
 
     (
         StatusCode::OK,
@@ -809,7 +852,9 @@ async fn test_connection(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"status": "unauthenticated", "message": "OpenAI OAuth login required"})),
+                Json(
+                    json!({"status": "unauthenticated", "message": "OpenAI OAuth login required"}),
+                ),
             )
                 .into_response();
         }
@@ -821,7 +866,9 @@ async fn test_connection(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"status": "unauthenticated", "message": "OpenAI OAuth login required"})),
+                Json(
+                    json!({"status": "unauthenticated", "message": "OpenAI OAuth login required"}),
+                ),
             )
                 .into_response();
         }
@@ -888,38 +935,36 @@ async fn test_connection(
             )
                 .into_response()
         }
-        Err(crate::error::GatewayError::Provider { status_code: Some(code), .. })
-            if code == 401 || code == 403 =>
-        {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
-                    "status": "auth_error",
-                    "upstream_status": code,
-                })),
-            )
-                .into_response()
-        }
-        Err(crate::error::GatewayError::Provider { status_code: Some(code), .. }) => {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
-                    "status": "upstream_error",
-                    "upstream_status": code,
-                })),
-            )
-                .into_response()
-        }
-        Err(_) => {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
-                    "status": "upstream_error",
-                    "upstream_status": 502,
-                })),
-            )
-                .into_response()
-        }
+        Err(crate::error::GatewayError::Provider {
+            status_code: Some(code),
+            ..
+        }) if code == 401 || code == 403 => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "status": "auth_error",
+                "upstream_status": code,
+            })),
+        )
+            .into_response(),
+        Err(crate::error::GatewayError::Provider {
+            status_code: Some(code),
+            ..
+        }) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "status": "upstream_error",
+                "upstream_status": code,
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "status": "upstream_error",
+                "upstream_status": 502,
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1079,9 +1124,7 @@ async fn oauth_status(State(state): State<AppState>) -> Response {
     let session = manager.session_state().await;
 
     let (state_str, expires_at, scopes) = match &session {
-        crate::oauth::flow::OAuthSessionState::Unauthenticated => {
-            ("unauthenticated", None, None)
-        }
+        crate::oauth::flow::OAuthSessionState::Unauthenticated => ("unauthenticated", None, None),
         crate::oauth::flow::OAuthSessionState::Authenticated { expires_at, scopes } => {
             ("authenticated", Some(*expires_at), Some(scopes.clone()))
         }
@@ -1118,11 +1161,7 @@ async fn oauth_logout(State(state): State<AppState>) -> Response {
         Some(m) => m.clone(),
         None => {
             // No OAuth configured — already effectively logged out.
-            return (
-                StatusCode::OK,
-                Json(json!({ "status": "logged_out" })),
-            )
-                .into_response();
+            return (StatusCode::OK, Json(json!({ "status": "logged_out" }))).into_response();
         }
     };
 
@@ -1154,6 +1193,10 @@ struct ProxyModelsParams {
     /// the resolved (decrypted) key from the live config for this provider.
     #[serde(default)]
     provider_name: Option<String>,
+    /// Optional provider type. NVIDIA NIM uses its built-in fallback when live
+    /// discovery fails or returns an empty catalog.
+    #[serde(default)]
+    provider_type: Option<String>,
 }
 
 /// Proxy endpoint that fetches `/v1/models` from an upstream provider server-side,
@@ -1222,7 +1265,37 @@ async fn proxy_provider_models(
             let status = resp.status().as_u16();
             match resp.text().await {
                 Ok(body) => {
-                    // Forward the upstream status and body as-is
+                    if params.provider_type.as_deref() == Some("nvidia_nim") {
+                        let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+                        let has_models = parsed
+                            .as_ref()
+                            .and_then(|value| value.get("data"))
+                            .and_then(|value| value.as_array())
+                            .is_some_and(|models| !models.is_empty());
+                        if status < 400 && has_models {
+                            return (
+                                StatusCode::OK,
+                                [(header::CONTENT_TYPE, "application/json")],
+                                body,
+                            )
+                                .into_response();
+                        }
+
+                        tracing::warn!(
+                            upstream_status = status,
+                            "NVIDIA NIM admin model discovery failed or returned no models; using built-in fallback catalog"
+                        );
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "object": "list",
+                                "data": crate::providers::nvidia_nim::fallback_models(),
+                                "fallback": true
+                            })),
+                        )
+                            .into_response();
+                    }
+
                     let axum_status =
                         StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
                     (
@@ -1232,16 +1305,48 @@ async fn proxy_provider_models(
                     )
                         .into_response()
                 }
-                Err(e) => (
+                Err(error) if params.provider_type.as_deref() == Some("nvidia_nim") => {
+                    tracing::warn!(
+                        error = %error,
+                        "Failed to read NVIDIA NIM model response; using built-in fallback catalog"
+                    );
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "object": "list",
+                            "data": crate::providers::nvidia_nim::fallback_models(),
+                            "fallback": true
+                        })),
+                    )
+                        .into_response()
+                }
+                Err(error) => (
                     StatusCode::BAD_GATEWAY,
-                    Json(json!({ "error": format!("Failed to read upstream response: {}", e) })),
+                    Json(
+                        json!({ "error": format!("Failed to read upstream response: {}", error) }),
+                    ),
                 )
                     .into_response(),
             }
         }
-        Err(e) => (
+        Err(error) if params.provider_type.as_deref() == Some("nvidia_nim") => {
+            tracing::warn!(
+                error = %error,
+                "Failed to reach NVIDIA NIM model endpoint; using built-in fallback catalog"
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "object": "list",
+                    "data": crate::providers::nvidia_nim::fallback_models(),
+                    "fallback": true
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
             StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": format!("Failed to reach provider: {}", e) })),
+            Json(json!({ "error": format!("Failed to reach provider: {}", error) })),
         )
             .into_response(),
     }
@@ -1260,22 +1365,32 @@ mod tests {
 
     fn arb_server_config() -> impl Strategy<Value = ServerConfig> {
         (
-            prop::sample::select(vec!["0.0.0.0".to_string(), "127.0.0.1".to_string(), "localhost".to_string()]),
+            prop::sample::select(vec![
+                "0.0.0.0".to_string(),
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+            ]),
             1u16..=65535u16,
             1u64..=300u64,
             1u64..=100u64,
-        ).prop_map(|(host, port, timeout, max_size)| ServerConfig {
-            host,
-            port,
-            request_timeout_seconds: timeout,
-            max_request_size_mb: max_size,
-        })
+        )
+            .prop_map(|(host, port, timeout, max_size)| ServerConfig {
+                host,
+                port,
+                request_timeout_seconds: timeout,
+                max_request_size_mb: max_size,
+            })
     }
 
     fn arb_provider() -> impl Strategy<Value = Provider> {
         (
             "[a-z][a-z0-9_]{1,10}",
-            prop::sample::select(vec!["openai".to_string(), "ollama".to_string(), "bedrock".to_string(), "groq".to_string()]),
+            prop::sample::select(vec![
+                "openai".to_string(),
+                "ollama".to_string(),
+                "bedrock".to_string(),
+                "groq".to_string(),
+            ]),
             prop::option::of(Just("https://api.example.com/v1".to_string())),
             prop::option::of("[A-Z_][A-Z0-9_]{2,10}"),
             prop::option::of("[A-Z_][A-Z0-9_]{2,10}"),
@@ -1283,37 +1398,50 @@ mod tests {
             1u64..=120u64,
             1u32..=500u32,
             0u32..=1000u32,
-        ).prop_map(|(name, ptype, base_url, api_key_env, api_secret_env, region, timeout, max_conn, rate_limit)| Provider {
-            name,
-            provider_type: ptype,
-            base_url,
-            api_key_env,
-            api_key_encrypted: None,
-            api_secret_env,
-            api_secret_encrypted: None,
-            auth_method: None,
-            resolved_api_key: None,
-            resolved_api_secret: None,
-            region,
-            timeout_seconds: timeout,
-            ttfb_timeout_seconds: None,
-            total_timeout_seconds: None,
-            max_connections: max_conn,
-            rate_limit_per_minute: rate_limit,
-            custom_headers: HashMap::new(),
-            connection_pool: ProviderConnectionPoolConfig::default(),
-            budget: None,
-            manual_models: vec![],
-            global_inference_profile: false,
-            cross_region_inference: false,
-            custom_vpc_endpoint: false,
-            prompt_caching: false,
-            reasoning: true,
-            codex_base_url_override: None,
-            codex_model_override: None,
-            instructions_override: None,
-            max_rate_limit_cooldown_seconds: None,
-        })
+        )
+            .prop_map(
+                |(
+                    name,
+                    ptype,
+                    base_url,
+                    api_key_env,
+                    api_secret_env,
+                    region,
+                    timeout,
+                    max_conn,
+                    rate_limit,
+                )| Provider {
+                    name,
+                    provider_type: ptype,
+                    base_url,
+                    api_key_env,
+                    api_key_encrypted: None,
+                    api_secret_env,
+                    api_secret_encrypted: None,
+                    auth_method: None,
+                    resolved_api_key: None,
+                    resolved_api_secret: None,
+                    region,
+                    timeout_seconds: timeout,
+                    ttfb_timeout_seconds: None,
+                    total_timeout_seconds: None,
+                    max_connections: max_conn,
+                    rate_limit_per_minute: rate_limit,
+                    custom_headers: HashMap::new(),
+                    connection_pool: ProviderConnectionPoolConfig::default(),
+                    budget: None,
+                    manual_models: vec![],
+                    global_inference_profile: false,
+                    cross_region_inference: false,
+                    custom_vpc_endpoint: false,
+                    prompt_caching: false,
+                    reasoning: true,
+                    codex_base_url_override: None,
+                    codex_model_override: None,
+                    instructions_override: None,
+                    max_rate_limit_cooldown_seconds: None,
+                },
+            )
     }
 
     fn arb_provider_model(provider_name: String) -> impl Strategy<Value = ProviderModel> {
@@ -1322,13 +1450,14 @@ mod tests {
             0.0f64..100.0f64,
             0.0f64..100.0f64,
             1u32..=1000u32,
-        ).prop_map(move |(model, cost_in, cost_out, priority)| ProviderModel {
-            provider: provider_name.clone(),
-            model,
-            cost_per_million_input_tokens: cost_in,
-            cost_per_million_output_tokens: cost_out,
-            priority,
-        })
+        )
+            .prop_map(move |(model, cost_in, cost_out, priority)| ProviderModel {
+                provider: provider_name.clone(),
+                model,
+                cost_per_million_input_tokens: cost_in,
+                cost_per_million_output_tokens: cost_out,
+                priority,
+            })
     }
 
     fn arb_model_group(provider_name: String) -> impl Strategy<Value = ModelGroup> {
@@ -1336,11 +1465,12 @@ mod tests {
             "[a-z][a-z0-9-]{2,10}",
             prop::bool::ANY,
             prop::collection::vec(arb_provider_model(provider_name), 1..=3),
-        ).prop_map(|(name, vf, models)| ModelGroup {
-            name,
-            version_fallback_enabled: vf,
-            models,
-        })
+        )
+            .prop_map(|(name, vf, models)| ModelGroup {
+                name,
+                version_fallback_enabled: vf,
+                models,
+            })
     }
 
     fn arb_config() -> impl Strategy<Value = Config> {
@@ -1414,7 +1544,10 @@ mod tests {
     fn test_mime_from_path() {
         assert_eq!(mime_from_path("index.html"), "text/html; charset=utf-8");
         assert_eq!(mime_from_path("style.css"), "text/css; charset=utf-8");
-        assert_eq!(mime_from_path("app.js"), "application/javascript; charset=utf-8");
+        assert_eq!(
+            mime_from_path("app.js"),
+            "application/javascript; charset=utf-8"
+        );
         assert_eq!(mime_from_path("data.json"), "application/json");
         assert_eq!(mime_from_path("unknown.xyz"), "application/octet-stream");
     }
@@ -1426,7 +1559,10 @@ mod tests {
         assert!(asset.is_some(), "index.html should be embedded");
         let data = asset.unwrap();
         let html = std::str::from_utf8(&data.data).unwrap();
-        assert!(html.contains("OBEY-API Admin"), "Should contain admin panel title");
+        assert!(
+            html.contains("OBEY-API Admin"),
+            "Should contain admin panel title"
+        );
     }
 
     #[test]
@@ -1460,11 +1596,22 @@ mod tests {
     fn virtual_key_ui_collects_and_clears_loop_overrides() {
         let asset = AdminAssets::get("index.html").expect("index embedded");
         let html = std::str::from_utf8(&asset.data).unwrap();
-        for id in ["vk-f-loop-enabled", "vk-loop-thresholds", "vk-loop-counts", "vk-loop-weights", "vk-loop-delay", "vk-loop-strategy", "vk-loop-template", "vk-loop-clear"] {
+        for id in [
+            "vk-f-loop-enabled",
+            "vk-loop-thresholds",
+            "vk-loop-counts",
+            "vk-loop-weights",
+            "vk-loop-delay",
+            "vk-loop-strategy",
+            "vk-loop-template",
+            "vk-loop-clear",
+        ] {
             assert!(html.contains(id), "missing VK loop control {id}");
         }
         assert!(html.contains("body.loop_detection = vkCollectLoopOverrides()"));
-        assert!(html.contains("body.loop_detection = f.loopEnabled.checked ? vkCollectLoopOverrides() : null"));
+        assert!(html.contains(
+            "body.loop_detection = f.loopEnabled.checked ? vkCollectLoopOverrides() : null"
+        ));
         assert!(html.contains("vkPopulateLoopOverrides(d.loop_detection || null)"));
     }
 
@@ -1483,7 +1630,9 @@ mod tests {
     #[tokio::test]
     async fn test_admin_index_links_to_canonical_dashboard_path() {
         let config = test_config_with_auth(false);
-        let server = crate::gateway::GatewayServer::new(config, None).await.unwrap();
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
         let resp = serve_index_html(&server.state);
         assert_eq!(resp.status(), StatusCode::OK);
 
@@ -1540,7 +1689,10 @@ retry:
 
     #[test]
     fn test_redact_config_for_response_hides_encrypted_provider_key() {
-        let mut config = arb_config().new_tree(&mut proptest::test_runner::TestRunner::default()).unwrap().current();
+        let mut config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
         config.providers[0].api_key_env = None;
         config.providers[0].api_key_encrypted = Some("enc-v1:test:test".to_string());
         config.providers[0].resolved_api_key = Some("sk-secret-value".to_string());
@@ -1554,7 +1706,10 @@ retry:
 
     #[test]
     fn test_normalize_config_for_storage_encrypts_plaintext_key() {
-        let mut config = arb_config().new_tree(&mut proptest::test_runner::TestRunner::default()).unwrap().current();
+        let mut config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
         config.providers[0].name = "plain-provider".to_string();
         config.providers[0].api_key_env = Some("sk-test-secret-12345678901234567890".to_string());
         config.providers[0].api_key_encrypted = None;
@@ -1562,13 +1717,22 @@ retry:
 
         let normalized = normalize_config_for_storage(config, None).unwrap();
         assert!(normalized.providers[0].api_key_env.is_none());
-        assert!(normalized.providers[0].api_key_encrypted.as_deref().is_some_and(secrets::is_encrypted_secret));
-        assert_eq!(normalized.providers[0].resolved_api_key.as_deref(), Some("sk-test-secret-12345678901234567890"));
+        assert!(normalized.providers[0]
+            .api_key_encrypted
+            .as_deref()
+            .is_some_and(secrets::is_encrypted_secret));
+        assert_eq!(
+            normalized.providers[0].resolved_api_key.as_deref(),
+            Some("sk-test-secret-12345678901234567890")
+        );
     }
 
     #[test]
     fn test_normalize_config_for_storage_preserves_existing_encrypted_key_when_blank() {
-        let mut existing = arb_config().new_tree(&mut proptest::test_runner::TestRunner::default()).unwrap().current();
+        let mut existing = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
         existing.providers[0].name = "persisted-provider".to_string();
         existing.providers[0].api_key_encrypted = Some("enc-v1:nonce:data".to_string());
         existing.providers[0].resolved_api_key = Some("sk-existing-secret".to_string());
@@ -1580,8 +1744,14 @@ retry:
         incoming.providers[0].api_key_env = None;
 
         let normalized = normalize_config_for_storage(incoming, Some(&existing)).unwrap();
-        assert_eq!(normalized.providers[0].api_key_encrypted.as_deref(), Some("enc-v1:nonce:data"));
-        assert_eq!(normalized.providers[0].resolved_api_key.as_deref(), Some("sk-existing-secret"));
+        assert_eq!(
+            normalized.providers[0].api_key_encrypted.as_deref(),
+            Some("enc-v1:nonce:data")
+        );
+        assert_eq!(
+            normalized.providers[0].resolved_api_key.as_deref(),
+            Some("sk-existing-secret")
+        );
     }
 
     // --- Admin authentication tests (Req 35.1-35.7) ---
@@ -1604,7 +1774,11 @@ retry:
         let resp = unauthorized_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
-            resp.headers().get("www-authenticate").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("www-authenticate")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "Basic realm=\"OBEY-API Admin\""
         );
     }
@@ -1694,7 +1868,8 @@ retry:
 
     fn basic_auth_header(user: &str, pass: &str) -> String {
         use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
         format!("Basic {}", encoded)
     }
 
@@ -1711,7 +1886,9 @@ retry:
         let unauthorized = axum::http::Request::get("/admin/loop-detection/sessions")
             .body(axum::body::Body::empty())
             .unwrap();
-        let response = tower::ServiceExt::oneshot(app.clone(), unauthorized).await.unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), unauthorized)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let authorized = axum::http::Request::get("/admin/loop-detection/sessions")
@@ -2104,9 +2281,18 @@ retry:
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // Must have all three fields
-        assert!(json.get("state").is_some(), "response must have 'state' field");
-        assert!(json.get("expires_at").is_some(), "response must have 'expires_at' field");
-        assert!(json.get("scopes").is_some(), "response must have 'scopes' field");
+        assert!(
+            json.get("state").is_some(),
+            "response must have 'state' field"
+        );
+        assert!(
+            json.get("expires_at").is_some(),
+            "response must have 'expires_at' field"
+        );
+        assert!(
+            json.get("scopes").is_some(),
+            "response must have 'scopes' field"
+        );
 
         // Fresh server with no prior login → unauthenticated
         assert_eq!(json["state"], "unauthenticated");

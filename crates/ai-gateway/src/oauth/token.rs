@@ -328,10 +328,7 @@ mod tests {
         }"#;
 
         let result = serde_json::from_str::<TokenResponse>(json);
-        assert!(
-            result.is_err(),
-            "expires_in as a string must fail to parse"
-        );
+        assert!(result.is_err(), "expires_in as a string must fail to parse");
     }
 
     #[test]

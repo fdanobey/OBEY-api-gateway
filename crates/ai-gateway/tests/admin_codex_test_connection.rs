@@ -155,7 +155,10 @@ async fn test_connection_non_codex_provider() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "error");
-    assert!(json["message"].as_str().unwrap().contains("not a Codex provider"));
+    assert!(json["message"]
+        .as_str()
+        .unwrap()
+        .contains("not a Codex provider"));
 }
 
 // ---------------------------------------------------------------------------

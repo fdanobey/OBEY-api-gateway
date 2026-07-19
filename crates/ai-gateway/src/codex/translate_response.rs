@@ -124,9 +124,7 @@ where
                 });
             }
 
-            ResponsesEvent::FunctionCallArgumentsDelta {
-                item_id, delta, ..
-            } => {
+            ResponsesEvent::FunctionCallArgumentsDelta { item_id, delta, .. } => {
                 // Match by item_id — the tool call whose id matches,
                 // or fall back to the last one pushed (streaming order).
                 let idx = acc
@@ -524,28 +522,26 @@ fn format_chunk(
         body.insert("usage".into(), u);
     }
 
-    let json_str = serde_json::to_string(&serde_json::Value::Object(body))
-        .unwrap_or_else(|_| "{}".to_owned());
+    let json_str =
+        serde_json::to_string(&serde_json::Value::Object(body)).unwrap_or_else(|_| "{}".to_owned());
     format!("data: {json_str}\n\n")
 }
-
 
 #[cfg(test)]
 mod property_tests {
     use super::*;
-    use futures::stream;
-    use futures::StreamExt;
-    use proptest::prelude::*;
     use crate::codex::sse::{
         CompletedPayload, OutputItem, OutputItemContent, ResponsesEvent, Usage,
     };
+    use futures::stream;
+    use futures::StreamExt;
+    use proptest::prelude::*;
 
     // ─── Strategies ──────────────────────────────────────────────────────────
 
     /// ASCII printable string up to 32 chars for text deltas.
     fn ascii_delta() -> impl Strategy<Value = String> {
-        proptest::string::string_regex("[a-zA-Z0-9 ]{1,32}")
-            .unwrap()
+        proptest::string::string_regex("[a-zA-Z0-9 ]{1,32}").unwrap()
     }
 
     /// Item ID from a bounded pool of 1..=4.
@@ -563,10 +559,8 @@ mod property_tests {
         // Generate between 1 and 10 text deltas and 0..3 tool call groups
         let text_deltas = proptest::collection::vec(ascii_delta(), 1..=10);
         let tool_call_count = 0u8..=3;
-        let tool_arg_deltas = proptest::collection::vec(
-            proptest::collection::vec(ascii_delta(), 1..=3),
-            0..=3,
-        );
+        let tool_arg_deltas =
+            proptest::collection::vec(proptest::collection::vec(ascii_delta(), 1..=3), 0..=3);
 
         (text_deltas, tool_call_count, tool_arg_deltas).prop_flat_map(
             |(deltas, tc_count, arg_groups)| {
@@ -576,7 +570,8 @@ mod property_tests {
                 let arg_groups_clone = arg_groups.clone();
 
                 // We need item_ids for tool calls
-                let tool_ids = proptest::collection::vec(item_id_pool(), tc_count..=tc_count.max(1));
+                let tool_ids =
+                    proptest::collection::vec(item_id_pool(), tc_count..=tc_count.max(1));
 
                 tool_ids.prop_map(move |tool_ids| {
                     let mut events: Vec<ResponsesEvent> = Vec::new();

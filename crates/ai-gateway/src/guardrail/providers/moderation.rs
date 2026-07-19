@@ -238,8 +238,7 @@ mod tests {
 
     #[test]
     fn provider_type_is_openai_moderation() {
-        let provider =
-            OpenAiModerationProvider::new(Client::new(), None, None, "sk-test", None);
+        let provider = OpenAiModerationProvider::new(Client::new(), None, None, "sk-test", None);
         assert_eq!(provider.provider_type(), "openai_moderation");
         assert_eq!(provider.endpoint, DEFAULT_ENDPOINT);
         assert_eq!(provider.model, DEFAULT_MODEL);

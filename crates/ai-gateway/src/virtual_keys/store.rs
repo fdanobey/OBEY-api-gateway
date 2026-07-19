@@ -582,10 +582,7 @@ fn epoch_to_datetime(secs: i64, col: usize) -> rusqlite::Result<DateTime<Utc>> {
     })
 }
 
-fn epoch_to_datetime_opt(
-    secs: Option<i64>,
-    col: usize,
-) -> rusqlite::Result<Option<DateTime<Utc>>> {
+fn epoch_to_datetime_opt(secs: Option<i64>, col: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
     match secs {
         Some(s) => Ok(Some(epoch_to_datetime(s, col)?)),
         None => Ok(None),
@@ -848,7 +845,9 @@ mod tests {
     #[test]
     fn update_usage_counters_accumulates() {
         let (store, _tmp) = temp_store();
-        store.create_key(&sample_key("id-usage", 1_700_000_400)).unwrap();
+        store
+            .create_key(&sample_key("id-usage", 1_700_000_400))
+            .unwrap();
 
         store.update_usage_counters("id-usage", 1.5, 100).unwrap();
         store.update_usage_counters("id-usage", 2.25, 50).unwrap();
@@ -863,7 +862,9 @@ mod tests {
     #[test]
     fn reset_window_counters_zeroes_spend_and_tokens() {
         let (store, _tmp) = temp_store();
-        store.create_key(&sample_key("id-reset", 1_700_000_500)).unwrap();
+        store
+            .create_key(&sample_key("id-reset", 1_700_000_500))
+            .unwrap();
         store.update_usage_counters("id-reset", 10.0, 500).unwrap();
 
         store.reset_window_counters("id-reset").unwrap();
@@ -879,7 +880,9 @@ mod tests {
     #[test]
     fn delete_cascades_usage_rows() {
         let (store, _tmp) = temp_store();
-        store.create_key(&sample_key("id-cascade", 1_700_000_600)).unwrap();
+        store
+            .create_key(&sample_key("id-cascade", 1_700_000_600))
+            .unwrap();
         {
             let conn = store.conn.lock().unwrap();
             conn.execute(

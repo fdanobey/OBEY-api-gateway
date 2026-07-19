@@ -3,10 +3,10 @@ use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
 
+use super::openai_compatible::OpenAICompatibleProvider;
 use crate::error::GatewayError;
 use crate::models::openai::OpenAIRequest;
 use crate::providers::{Model, ProviderClient, ProviderResponse, SSEEvent};
-use super::openai_compatible::OpenAICompatibleProvider;
 
 /// Ollama provider client
 /// Uses OpenAI-compatible API format
@@ -17,7 +17,13 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     /// Create a new Ollama provider client
     /// Ollama typically runs at http://localhost:11434 and doesn't require an API key
-    pub fn new(name: String, base_url: String, max_connections: Option<u32>, timeout_seconds: Option<u64>, custom_headers: HashMap<String, String>) -> Result<Self, GatewayError> {
+    pub fn new(
+        name: String,
+        base_url: String,
+        max_connections: Option<u32>,
+        timeout_seconds: Option<u64>,
+        custom_headers: HashMap<String, String>,
+    ) -> Result<Self, GatewayError> {
         let inner = OpenAICompatibleProvider::new(
             name,
             format!("{}/v1", base_url.trim_end_matches('/')),
@@ -43,7 +49,8 @@ impl ProviderClient for OllamaProvider {
     async fn chat_completion_stream(
         &self,
         request: OpenAIRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError>
+    {
         self.inner.chat_completion_stream(request).await
     }
 

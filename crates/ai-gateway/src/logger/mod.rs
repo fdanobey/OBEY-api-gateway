@@ -12,10 +12,10 @@ use crate::config::LoggingConfig;
 pub enum LoggerError {
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
-    
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -64,23 +64,23 @@ impl RequestLogger {
     /// Create a new RequestLogger with the given configuration
     pub fn new(config: LoggingConfig) -> Result<Self> {
         let db_path = Path::new(&config.database_path);
-        
+
         // Create parent directory if it doesn't exist
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
+
         let conn = Connection::open(db_path)?;
-        
+
         // Create schema
         Self::create_schema(&conn)?;
-        
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             config,
         })
     }
-    
+
     /// Create database schema with indexes
     fn create_schema(conn: &Connection) -> Result<()> {
         conn.execute(
@@ -102,58 +102,54 @@ impl RequestLogger {
             )",
             [],
         )?;
-        
+
         // Create indexes for common query patterns
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp)",
             [],
         )?;
-        
+
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model)",
             [],
         )?;
-        
+
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_requests_provider ON requests(provider)",
             [],
         )?;
-        
+
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_requests_status_code ON requests(status_code)",
             [],
         )?;
-        
+
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_requests_trace_id ON requests(trace_id)",
             [],
         )?;
-        
+
         Ok(())
     }
-    
+
     /// Log a request entry
     pub fn log(&self, entry: LogEntry) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        
+
         // Process request body if logging is enabled
         let request_body = if self.config.request_body_logging {
-            entry.request_body.map(|body| {
-                self.process_body(&body)
-            })
+            entry.request_body.map(|body| self.process_body(&body))
         } else {
             None
         };
-        
+
         // Process response body if logging is enabled
         let response_body = if self.config.response_body_logging {
-            entry.response_body.map(|body| {
-                self.process_body(&body)
-            })
+            entry.response_body.map(|body| self.process_body(&body))
         } else {
             None
         };
-        
+
         conn.execute(
             "INSERT INTO requests (
                 trace_id, timestamp, method, path, model, provider,
@@ -176,46 +172,61 @@ impl RequestLogger {
                 entry.responded_model,
             ],
         )?;
-        
+
         Ok(())
     }
-    
+
     /// Process body for logging: apply size limits, field exclusion, and API key redaction
     fn process_body(&self, body: &str) -> String {
         // First, redact API keys
         let redacted = self.redact_api_keys(body);
-        
+
         // Then, exclude fields if configured
         let excluded = self.exclude_fields(&redacted);
-        
+
         // Finally, apply size limit
         self.apply_size_limit(&excluded)
     }
-    
+
     /// Redact API keys and authorization tokens from text
     fn redact_api_keys(&self, text: &str) -> String {
         let patterns = [
             // OpenAI keys: sk-... with 20+ chars (covers sk-proj-..., sk-svcacct-..., etc.)
-            (regex::Regex::new(r"sk-[a-zA-Z0-9_\-]{20,}").unwrap(), "[REDACTED]"),
-            (regex::Regex::new(r"Bearer\s+[a-zA-Z0-9\-_.]+").unwrap(), "Bearer [REDACTED]"),
-            (regex::Regex::new(r#"(?i)(api[_-]?key|authorization)["']?\s*[:=]\s*["']?[a-zA-Z0-9\-_.]+"#).unwrap(), "$1: [REDACTED]"),
+            (
+                regex::Regex::new(r"sk-[a-zA-Z0-9_\-]{20,}").unwrap(),
+                "[REDACTED]",
+            ),
+            (
+                regex::Regex::new(r"Bearer\s+[a-zA-Z0-9\-_.]+").unwrap(),
+                "Bearer [REDACTED]",
+            ),
+            (
+                regex::Regex::new(
+                    r#"(?i)(api[_-]?key|authorization)["']?\s*[:=]\s*["']?[a-zA-Z0-9\-_.]+"#,
+                )
+                .unwrap(),
+                "$1: [REDACTED]",
+            ),
             // AWS access keys: AKIA...
-            (regex::Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(), "[REDACTED]"),
+            (
+                regex::Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
+                "[REDACTED]",
+            ),
         ];
-        
+
         let mut result = text.to_string();
         for (re, replacement) in &patterns {
             result = re.replace_all(&result, *replacement).to_string();
         }
         result
     }
-    
+
     /// Exclude configured fields from JSON body
     fn exclude_fields(&self, body: &str) -> String {
         if self.config.excluded_fields.is_empty() {
             return body.to_string();
         }
-        
+
         // Try to parse as JSON
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) {
             // Recursively redact excluded fields
@@ -225,14 +236,19 @@ impl RequestLogger {
             body.to_string()
         }
     }
-    
+
     /// Recursively redact excluded fields in JSON
     fn redact_json_fields(&self, value: &mut serde_json::Value) {
         match value {
             serde_json::Value::Object(map) => {
                 for (key, val) in map.iter_mut() {
                     // Check if this field should be excluded
-                    if self.config.excluded_fields.iter().any(|f| f.eq_ignore_ascii_case(key)) {
+                    if self
+                        .config
+                        .excluded_fields
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(key))
+                    {
                         *val = serde_json::Value::String("[REDACTED]".to_string());
                     } else {
                         // Recursively process nested objects/arrays
@@ -248,88 +264,90 @@ impl RequestLogger {
             _ => {}
         }
     }
-    
+
     /// Apply size limit to body, truncating if necessary
     fn apply_size_limit(&self, body: &str) -> String {
         if body.len() <= self.config.max_body_size_bytes {
             body.to_string()
         } else {
             let truncated = &body[..self.config.max_body_size_bytes];
-            format!("{}... [TRUNCATED: body exceeds {} bytes]", 
-                truncated, 
-                self.config.max_body_size_bytes)
+            format!(
+                "{}... [TRUNCATED: body exceeds {} bytes]",
+                truncated, self.config.max_body_size_bytes
+            )
         }
     }
-    
+
     /// Query log entries with optional filtering
     pub fn query(&self, filter: LogFilter) -> Result<Vec<LogEntry>> {
         let conn = self.conn.lock().unwrap();
-        
+
         let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model FROM requests WHERE 1=1");
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        
+
         if let Some(ref trace_id) = filter.trace_id {
             query.push_str(" AND trace_id = ?");
             params.push(Box::new(trace_id.clone()));
         }
-        
+
         if let Some(start_time) = filter.start_time {
             query.push_str(" AND timestamp >= ?");
             params.push(Box::new(start_time.timestamp()));
         }
-        
+
         if let Some(end_time) = filter.end_time {
             query.push_str(" AND timestamp <= ?");
             params.push(Box::new(end_time.timestamp()));
         }
-        
+
         if let Some(ref model) = filter.model {
             query.push_str(" AND model = ?");
             params.push(Box::new(model.clone()));
         }
-        
+
         if let Some(ref provider) = filter.provider {
             query.push_str(" AND provider = ?");
             params.push(Box::new(provider.clone()));
         }
-        
+
         if let Some(status_code) = filter.status_code {
             query.push_str(" AND status_code = ?");
             params.push(Box::new(status_code));
         }
-        
+
         query.push_str(" ORDER BY timestamp DESC");
-        
+
         if let Some(limit) = filter.limit {
             query.push_str(" LIMIT ?");
             params.push(Box::new(limit as i64));
         }
-        
+
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        
+
         let mut stmt = conn.prepare(&query)?;
-        let entries = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok(LogEntry {
-                trace_id: row.get(0)?,
-                timestamp: DateTime::from_timestamp(row.get(1)?, 0).unwrap(),
-                method: row.get(2)?,
-                path: row.get(3)?,
-                model: row.get(4)?,
-                provider: row.get(5)?,
-                status_code: row.get(6)?,
-                duration_ms: row.get(7)?,
-                cost: row.get(8)?,
-                request_body: row.get(9)?,
-                response_body: row.get(10)?,
-                requested_model: row.get(11)?,
-                responded_model: row.get(12)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-        
+        let entries = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(LogEntry {
+                    trace_id: row.get(0)?,
+                    timestamp: DateTime::from_timestamp(row.get(1)?, 0).unwrap(),
+                    method: row.get(2)?,
+                    path: row.get(3)?,
+                    model: row.get(4)?,
+                    provider: row.get(5)?,
+                    status_code: row.get(6)?,
+                    duration_ms: row.get(7)?,
+                    cost: row.get(8)?,
+                    request_body: row.get(9)?,
+                    response_body: row.get(10)?,
+                    requested_model: row.get(11)?,
+                    responded_model: row.get(12)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
         Ok(entries)
     }
-    
+
     /// Flush pending writes and checkpoint the WAL (Req 18.3).
     /// Called during graceful shutdown to ensure all data is persisted.
     pub fn flush(&self) {
@@ -346,16 +364,16 @@ impl RequestLogger {
             // Retention disabled
             return Ok(0);
         }
-        
+
         let conn = self.conn.lock().unwrap();
-        let cutoff_timestamp = Utc::now()
-            .timestamp() - (self.config.retention_days as i64 * 24 * 60 * 60);
-        
+        let cutoff_timestamp =
+            Utc::now().timestamp() - (self.config.retention_days as i64 * 24 * 60 * 60);
+
         let deleted = conn.execute(
             "DELETE FROM requests WHERE timestamp < ?1",
             params![cutoff_timestamp],
         )?;
-        
+
         Ok(deleted)
     }
 }
@@ -364,7 +382,7 @@ impl RequestLogger {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
-    
+
     fn create_test_logger() -> (RequestLogger, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
         let config = LoggingConfig {
@@ -377,15 +395,15 @@ mod tests {
             retention_days: 30,
             cleanup_schedule_hours: 24,
         };
-        
+
         let logger = RequestLogger::new(config).unwrap();
         (logger, temp_file)
     }
-    
+
     #[test]
     fn test_log_and_query() {
         let (logger, _temp) = create_test_logger();
-        
+
         let entry = LogEntry {
             trace_id: "test-123".to_string(),
             timestamp: Utc::now(),
@@ -401,70 +419,74 @@ mod tests {
             requested_model: None,
             responded_model: None,
         };
-        
+
         logger.log(entry.clone()).unwrap();
-        
-        let results = logger.query(LogFilter {
-            trace_id: Some("test-123".to_string()),
-            ..Default::default()
-        }).unwrap();
-        
+
+        let results = logger
+            .query(LogFilter {
+                trace_id: Some("test-123".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].trace_id, "test-123");
         assert_eq!(results[0].model, "gpt-4");
     }
-    
+
     #[test]
     fn test_api_key_redaction() {
         let (logger, _temp) = create_test_logger();
-        
+
         // Standard 48-char key
-        let body = r#"{"api_key":"sk-1234567890abcdefghijklmnopqrstuvwxyz1234567890ab","message":"test"}"#;
+        let body =
+            r#"{"api_key":"sk-1234567890abcdefghijklmnopqrstuvwxyz1234567890ab","message":"test"}"#;
         let redacted = logger.redact_api_keys(body);
         assert!(!redacted.contains("sk-1234567890"));
         assert!(redacted.contains("[REDACTED]"));
-        
+
         // Longer project-scoped key (sk-proj-...)
-        let body2 = r#"{"key":"sk-proj-abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrstuvwxyz"}"#;
+        let body2 =
+            r#"{"key":"sk-proj-abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrstuvwxyz"}"#;
         let redacted2 = logger.redact_api_keys(body2);
         assert!(!redacted2.contains("sk-proj-"));
         assert!(redacted2.contains("[REDACTED]"));
-        
+
         // AWS access key
         let body3 = r#"{"aws_key":"AKIAIOSFODNN7EXAMPLE"}"#;
         let redacted3 = logger.redact_api_keys(body3);
         assert!(!redacted3.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(redacted3.contains("[REDACTED]"));
     }
-    
+
     #[test]
     fn test_field_exclusion() {
         let (logger, _temp) = create_test_logger();
-        
+
         let body = r#"{"api_key":"secret","password":"pass123","message":"test"}"#;
         let excluded = logger.exclude_fields(body);
-        
+
         let json: serde_json::Value = serde_json::from_str(&excluded).unwrap();
         assert_eq!(json["api_key"], "[REDACTED]");
         assert_eq!(json["password"], "[REDACTED]");
         assert_eq!(json["message"], "test");
     }
-    
+
     #[test]
     fn test_size_limit() {
         let (logger, _temp) = create_test_logger();
-        
+
         let large_body = "x".repeat(2000);
         let limited = logger.apply_size_limit(&large_body);
-        
+
         assert!(limited.len() < 2000);
         assert!(limited.contains("[TRUNCATED"));
     }
-    
+
     #[test]
     fn test_cleanup_old_logs() {
         let (logger, _temp) = create_test_logger();
-        
+
         // Insert an old entry
         let old_entry = LogEntry {
             trace_id: "old-123".to_string(),
@@ -481,9 +503,9 @@ mod tests {
             requested_model: None,
             responded_model: None,
         };
-        
+
         logger.log(old_entry).unwrap();
-        
+
         // Insert a recent entry
         let recent_entry = LogEntry {
             trace_id: "recent-123".to_string(),
@@ -500,13 +522,13 @@ mod tests {
             requested_model: None,
             responded_model: None,
         };
-        
+
         logger.log(recent_entry).unwrap();
-        
+
         // Cleanup should remove the old entry
         let deleted = logger.cleanup_old_logs().unwrap();
         assert_eq!(deleted, 1);
-        
+
         // Verify only recent entry remains
         let results = logger.query(LogFilter::default()).unwrap();
         assert_eq!(results.len(), 1);
@@ -514,13 +536,12 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod property_tests {
     use super::*;
     use proptest::prelude::*;
     use tempfile::NamedTempFile;
-    
+
     fn arb_log_entry() -> impl Strategy<Value = LogEntry> {
         (
             "[a-z0-9-]{8,36}",
@@ -528,7 +549,11 @@ mod property_tests {
                 DateTime::from_timestamp(ts.abs() % 2_000_000_000, 0).unwrap_or_else(|| Utc::now())
             }),
             prop::sample::select(vec!["GET", "POST", "PUT", "DELETE"]),
-            prop::sample::select(vec!["/v1/chat/completions", "/v1/completions", "/v1/embeddings"]),
+            prop::sample::select(vec![
+                "/v1/chat/completions",
+                "/v1/completions",
+                "/v1/embeddings",
+            ]),
             "[a-z0-9-]{3,20}",
             "[a-z0-9-]{3,20}",
             100u16..600u16,
@@ -536,25 +561,40 @@ mod property_tests {
             0.0f64..10.0f64,
             prop::option::of(prop::string::string_regex("[a-zA-Z0-9 {}\":,]{0,500}").unwrap()),
             prop::option::of(prop::string::string_regex("[a-zA-Z0-9 {}\":,]{0,500}").unwrap()),
-        ).prop_map(|(trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body)| {
-            LogEntry {
-                trace_id,
-                timestamp,
-                method: method.to_string(),
-                path: path.to_string(),
-                model,
-                provider,
-                status_code,
-                duration_ms,
-                cost,
-                request_body,
-                response_body,
-                requested_model: None,
-                responded_model: None,
-            }
-        })
+        )
+            .prop_map(
+                |(
+                    trace_id,
+                    timestamp,
+                    method,
+                    path,
+                    model,
+                    provider,
+                    status_code,
+                    duration_ms,
+                    cost,
+                    request_body,
+                    response_body,
+                )| {
+                    LogEntry {
+                        trace_id,
+                        timestamp,
+                        method: method.to_string(),
+                        path: path.to_string(),
+                        model,
+                        provider,
+                        status_code,
+                        duration_ms,
+                        cost,
+                        request_body,
+                        response_body,
+                        requested_model: None,
+                        responded_model: None,
+                    }
+                },
+            )
     }
-    
+
     fn create_test_logger_with_config(config: LoggingConfig) -> (RequestLogger, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
         let mut config = config;
@@ -562,7 +602,7 @@ mod property_tests {
         let logger = RequestLogger::new(config).unwrap();
         (logger, temp_file)
     }
-    
+
     // Property 12: Request Logging Completeness
     // Validates: Requirements 14.1, 14.2, 33.2, 33.5
     proptest! {
@@ -570,21 +610,21 @@ mod property_tests {
         fn prop_request_logging_completeness(entry in arb_log_entry()) {
             let config = LoggingConfig::default();
             let (logger, _temp) = create_test_logger_with_config(config);
-            
+
             // Log the entry
             logger.log(entry.clone()).unwrap();
-            
+
             // Query by trace_id
             let results = logger.query(LogFilter {
                 trace_id: Some(entry.trace_id.clone()),
                 ..Default::default()
             }).unwrap();
-            
+
             // Should find exactly one entry
             prop_assert_eq!(results.len(), 1);
-            
+
             let logged = &results[0];
-            
+
             // Verify all required fields are present
             prop_assert_eq!(&logged.trace_id, &entry.trace_id);
             prop_assert_eq!(&logged.method, &entry.method);
@@ -596,7 +636,7 @@ mod property_tests {
             prop_assert!((logged.cost - entry.cost).abs() < 0.001);
         }
     }
-    
+
     // Property 14: Log Retention Cleanup
     // Validates: Requirements 14.6, 38.2
     proptest! {
@@ -615,7 +655,7 @@ mod property_tests {
                 ..Default::default()
             };
             let (logger, _temp) = create_test_logger_with_config(config);
-            
+
             // Create entry with specific age
             let timestamp = Utc::now() - chrono::Duration::days(days_old);
             let entry = LogEntry {
@@ -633,17 +673,17 @@ mod property_tests {
                 requested_model: None,
                 responded_model: None,
             };
-            
+
             logger.log(entry.clone()).unwrap();
-            
+
             // Run cleanup
             let deleted = logger.cleanup_old_logs().unwrap();
-            
+
             // Verify cleanup behavior
             if days_old > retention_days as i64 {
                 // Entry should be deleted
                 prop_assert_eq!(deleted, 1);
-                
+
                 let results = logger.query(LogFilter {
                     trace_id: Some(entry.trace_id.clone()),
                     ..Default::default()
@@ -652,7 +692,7 @@ mod property_tests {
             } else {
                 // Entry should remain
                 prop_assert_eq!(deleted, 0);
-                
+
                 let results = logger.query(LogFilter {
                     trace_id: Some(entry.trace_id.clone()),
                     ..Default::default()
@@ -661,7 +701,7 @@ mod property_tests {
             }
         }
     }
-    
+
     // Property 31: Body Logging Size Limit
     // Validates: Requirements 27.4
     proptest! {
@@ -676,10 +716,10 @@ mod property_tests {
                 ..Default::default()
             };
             let (logger, _temp) = create_test_logger_with_config(config);
-            
+
             // Create body of specific size
             let body = "x".repeat(body_size);
-            
+
             let entry = LogEntry {
                 trace_id: "test-size".to_string(),
                 timestamp: Utc::now(),
@@ -695,16 +735,16 @@ mod property_tests {
                 requested_model: None,
                 responded_model: None,
             };
-            
+
             logger.log(entry).unwrap();
-            
+
             let results = logger.query(LogFilter {
                 trace_id: Some("test-size".to_string()),
                 ..Default::default()
             }).unwrap();
-            
+
             prop_assert_eq!(results.len(), 1);
-            
+
             if let Some(logged_body) = &results[0].request_body {
                 if body_size > max_size {
                     // Body should be truncated
@@ -717,7 +757,7 @@ mod property_tests {
             }
         }
     }
-    
+
     // Property 32: Body Logging Field Exclusion
     // Validates: Requirements 27.6
     proptest! {
@@ -732,13 +772,13 @@ mod property_tests {
                 ..Default::default()
             };
             let (logger, _temp) = create_test_logger_with_config(config);
-            
+
             // Create JSON body with excluded fields
             let body = format!(
                 r#"{{"api_key":"{}","password":"secret","message":"{}"}}"#,
                 secret_value, public_value
             );
-            
+
             let entry = LogEntry {
                 trace_id: "test-exclusion".to_string(),
                 timestamp: Utc::now(),
@@ -754,27 +794,27 @@ mod property_tests {
                 requested_model: None,
                 responded_model: None,
             };
-            
+
             logger.log(entry).unwrap();
-            
+
             let results = logger.query(LogFilter {
                 trace_id: Some("test-exclusion".to_string()),
                 ..Default::default()
             }).unwrap();
-            
+
             prop_assert_eq!(results.len(), 1);
-            
+
             if let Some(logged_body) = &results[0].request_body {
                 // Excluded fields should be redacted
                 prop_assert!(!logged_body.contains(&secret_value));
                 prop_assert!(logged_body.contains("[REDACTED]"));
-                
+
                 // Public fields should remain
                 prop_assert!(logged_body.contains(&public_value));
             }
         }
     }
-    
+
     // Property 10: API Key Redaction
     // Validates: Requirements 19.3, 19.4, 19.9, 19.10
     proptest! {
@@ -787,7 +827,7 @@ mod property_tests {
                 ..Default::default()
             };
             let (logger, _temp) = create_test_logger_with_config(config);
-            
+
             // Create body with API key patterns
             let api_key = "sk-1234567890abcdefghijklmnopqrstuvwxyz1234567890ab";
             let bearer_token = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
@@ -795,7 +835,7 @@ mod property_tests {
                 r#"{{"api_key":"{}","authorization":"{}","message":"{}"}}"#,
                 api_key, bearer_token, message
             );
-            
+
             let entry = LogEntry {
                 trace_id: "test-redaction".to_string(),
                 timestamp: Utc::now(),
@@ -811,28 +851,28 @@ mod property_tests {
                 requested_model: None,
                 responded_model: None,
             };
-            
+
             logger.log(entry).unwrap();
-            
+
             let results = logger.query(LogFilter {
                 trace_id: Some("test-redaction".to_string()),
                 ..Default::default()
             }).unwrap();
-            
+
             prop_assert_eq!(results.len(), 1);
-            
+
             if let Some(logged_body) = &results[0].request_body {
                 // API keys should be redacted
                 prop_assert!(!logged_body.contains(api_key));
                 prop_assert!(!logged_body.contains(bearer_token));
                 prop_assert!(logged_body.contains("[REDACTED]"));
-                
+
                 // Message should remain
                 prop_assert!(logged_body.contains(&message));
             }
         }
     }
-    
+
     // Property 22: Version Fallback Logging
     // **Validates: Requirements 5.9**
     //

@@ -16,10 +16,15 @@ fn compile_windows_resources() {
     let mut resource = winres::WindowsResource::new();
     resource.set_icon(icon_path.to_string_lossy().as_ref());
     resource.set("ProductName", env!("CARGO_PKG_NAME"));
-    resource.set("FileDescription", "OBEY API Gateway with optional system tray support");
+    resource.set(
+        "FileDescription",
+        "OBEY API Gateway with optional system tray support",
+    );
     resource.set("OriginalFilename", "ai-gateway.exe");
     resource.set("ProductVersion", env!("CARGO_PKG_VERSION"));
     resource.set("FileVersion", env!("CARGO_PKG_VERSION"));
 
-    resource.compile().expect("failed to compile Windows resources");
+    resource
+        .compile()
+        .expect("failed to compile Windows resources");
 }

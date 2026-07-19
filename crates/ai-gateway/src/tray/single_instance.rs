@@ -6,13 +6,13 @@ use std::os::windows::ffi::OsStrExt;
 #[cfg(target_os = "windows")]
 use winapi::shared::minwindef::FALSE;
 #[cfg(target_os = "windows")]
+use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+#[cfg(target_os = "windows")]
 use winapi::um::errhandlingapi::GetLastError;
 #[cfg(target_os = "windows")]
 use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
 #[cfg(target_os = "windows")]
 use winapi::um::synchapi::CreateMutexW;
-#[cfg(target_os = "windows")]
-use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
 #[cfg(target_os = "windows")]
 use winapi::um::winnt::HANDLE;
 

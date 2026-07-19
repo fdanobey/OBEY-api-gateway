@@ -68,7 +68,13 @@ fn capacity_evicts_least_recently_active() {
     new.last_active = now;
     insert_bounded(&sessions, "old".into(), old, 2, None);
     insert_bounded(&sessions, "new".into(), new, 2, None);
-    let evicted = insert_bounded(&sessions, "latest".into(), SessionState::new(None, 5), 2, None);
+    let evicted = insert_bounded(
+        &sessions,
+        "latest".into(),
+        SessionState::new(None, 5),
+        2,
+        None,
+    );
     assert_eq!(evicted.as_deref(), Some("old"));
     assert!(!sessions.contains_key("old"));
 }

@@ -231,8 +231,16 @@ mod tests {
         // Start on Wednesday 2024-03-13; week's Monday is 2024-03-11, so the
         // reset boundary is the following Monday 2024-03-18 00:00 UTC.
         let start = dt(2024, 3, 13, 8, 0);
-        assert!(!window_expired(&BudgetWindow::Weekly, start, dt(2024, 3, 17, 23, 0)));
-        assert!(window_expired(&BudgetWindow::Weekly, start, dt(2024, 3, 18, 0, 0)));
+        assert!(!window_expired(
+            &BudgetWindow::Weekly,
+            start,
+            dt(2024, 3, 17, 23, 0)
+        ));
+        assert!(window_expired(
+            &BudgetWindow::Weekly,
+            start,
+            dt(2024, 3, 18, 0, 0)
+        ));
     }
 
     // --- window_expired: monthly -----------------------------------------------
@@ -337,7 +345,14 @@ mod tests {
         // effective spend is zeroed, so the request is allowed (Req 3.3).
         let start = dt(2024, 3, 10, 12, 0);
         let now = dt(2024, 3, 11, 0, 1);
-        let key = key_with(Some(10.0), Some(100), Some(BudgetWindow::Daily), 50.0, 500, Some(start));
+        let key = key_with(
+            Some(10.0),
+            Some(100),
+            Some(BudgetWindow::Daily),
+            50.0,
+            500,
+            Some(start),
+        );
         assert!(mgr.check_budget_at(&key, now).is_ok());
     }
 
@@ -347,7 +362,14 @@ mod tests {
         // Same-day window (not expired) with spend over limit -> rejected.
         let start = dt(2024, 3, 10, 1, 0);
         let now = dt(2024, 3, 10, 12, 0);
-        let key = key_with(Some(10.0), None, Some(BudgetWindow::Daily), 50.0, 0, Some(start));
+        let key = key_with(
+            Some(10.0),
+            None,
+            Some(BudgetWindow::Daily),
+            50.0,
+            0,
+            Some(start),
+        );
         assert_eq!(
             mgr.check_budget_at(&key, now),
             Err(BudgetError::BudgetExhausted)

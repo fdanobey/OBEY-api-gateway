@@ -35,7 +35,7 @@ pub fn map_effort(
     xhigh_allowlist: &[String],
 ) -> &'static str {
     match req_effort {
-        None => "medium", // Req 9.6
+        None => "medium",                        // Req 9.6
         Some("minimal") | Some("none") => "low", // Req 9.1 / 9.2
         Some("low") => "low",
         Some("medium") => "medium",
@@ -126,13 +126,13 @@ mod tests {
         // {low, medium, high, xhigh}, and specifically "medium" for the
         // unknown arm per the design document's mapping table.
         for bad in [
-            "",         // empty string
-            "Low",      // wrong case
-            "LOW",      // wrong case
-            "HIGHEST",  // not in the vocabulary
-            "xhigh ",   // trailing whitespace
-            " xhigh",   // leading whitespace
-            "x-high",   // hyphen variant
+            "",        // empty string
+            "Low",     // wrong case
+            "LOW",     // wrong case
+            "HIGHEST", // not in the vocabulary
+            "xhigh ",  // trailing whitespace
+            " xhigh",  // leading whitespace
+            "x-high",  // hyphen variant
             "very-high",
             "ultra",
         ] {

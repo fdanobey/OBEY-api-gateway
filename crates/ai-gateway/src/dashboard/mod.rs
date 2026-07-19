@@ -40,17 +40,18 @@ pub fn dashboard_routes(state: AppState) -> Router<AppState> {
         .route("/{*path}", get(static_handler))
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
     let mut subscription = state.loop_detector.events.subscribe();
     for event in subscription.replay {
         let message = serde_json::json!({"type": "loop_detection", "data": event});
-        if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+        if socket
+            .send(Message::Text(message.to_string().into()))
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -149,7 +150,12 @@ fn serve_embedded(path: &str) -> Response {
     match DashboardAssets::get(path) {
         Some(content) => {
             let mime = mime_from_path(path);
-            (StatusCode::OK, [(header::CONTENT_TYPE, mime)], content.data.to_vec()).into_response()
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime)],
+                content.data.to_vec(),
+            )
+                .into_response()
         }
         None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
@@ -164,7 +170,10 @@ async fn build_dashboard_snapshot(state: &AppState) -> crate::metrics::MetricsSn
 }
 
 fn recent_errors(state: &AppState, limit: usize) -> Vec<crate::logger::LogEntry> {
-    match state.logger.query(LogFilter { limit: Some(limit * 4), ..Default::default() }) {
+    match state.logger.query(LogFilter {
+        limit: Some(limit * 4),
+        ..Default::default()
+    }) {
         Ok(entries) => entries
             .into_iter()
             .filter(|entry| entry.status_code >= 400)
@@ -184,7 +193,10 @@ fn serve_index_html(state: &AppState) -> Response {
             let config = state.config.try_read().expect("config lock poisoned");
             // Inject <base> so relative asset URLs (logo, favicon) resolve under the dashboard path
             let dashboard_base = format!("{}/", config.dashboard.path.trim_end_matches('/'));
-            html = html.replace("<head>", &format!("<head><base href=\"{}\">", dashboard_base));
+            html = html.replace(
+                "<head>",
+                &format!("<head><base href=\"{}\">", dashboard_base),
+            );
             let bootstrap = format!(
                 "<script>window.__dashboardBasePath={:?};window.__adminBasePath={:?};window.__dashboardPollIntervalMs={};</script>",
                 config.dashboard.path,
@@ -192,7 +204,12 @@ fn serve_index_html(state: &AppState) -> Response {
                 config.dashboard.metrics_update_interval_seconds.saturating_mul(1000)
             );
             html = html.replace("</head>", &(bootstrap + "</head>"));
-            (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                html,
+            )
+                .into_response()
         }
         None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
@@ -215,13 +232,17 @@ fn mime_from_path(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AdminConfig, CircuitBreakerConfig, Config, ContextConfig, CorsConfig, DashboardConfig, ExactCacheConfig, LoggingConfig, ModelGroup, Provider, ProviderModel, RetryConfig, ServerConfig, TrayConfig};
-    use crate::logger::LogEntry;
+    use crate::config::{
+        AdminConfig, CircuitBreakerConfig, Config, ContextConfig, CorsConfig, DashboardConfig,
+        ExactCacheConfig, LoggingConfig, ModelGroup, Provider, ProviderModel, RetryConfig,
+        ServerConfig, TrayConfig,
+    };
     use crate::gateway::GatewayServer;
-    use chrono::{Datelike, Timelike};
-    use tower::ServiceExt;
+    use crate::logger::LogEntry;
     use axum::body::Body;
     use axum::http::Request;
+    use chrono::{Datelike, Timelike};
+    use tower::ServiceExt;
 
     fn test_config() -> Config {
         Config {
@@ -318,7 +339,10 @@ mod tests {
     #[test]
     fn test_dashboard_mime_types() {
         assert_eq!(mime_from_path("index.html"), "text/html; charset=utf-8");
-        assert_eq!(mime_from_path("app.js"), "application/javascript; charset=utf-8");
+        assert_eq!(
+            mime_from_path("app.js"),
+            "application/javascript; charset=utf-8"
+        );
         assert_eq!(mime_from_path("style.css"), "text/css; charset=utf-8");
         assert_eq!(mime_from_path("unknown.xyz"), "application/octet-stream");
     }
@@ -371,44 +395,72 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_dashboard_metrics_enriches_circuit_breaker_state() {
         let server = GatewayServer::new(test_config(), None).await.unwrap();
-        let cb = server.state.router.get_circuit_breaker("test-provider:gpt-4").await;
+        let cb = server
+            .state
+            .router
+            .get_circuit_breaker("test-provider:gpt-4")
+            .await;
         cb.record_failure().await;
         cb.record_failure().await;
         cb.record_failure().await;
 
         let app = server.build_router();
-        let response = app.oneshot(Request::get("/dashboard/metrics").body(Body::empty()).unwrap()).await.unwrap();
+        let response = app
+            .oneshot(
+                Request::get("/dashboard/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["circuit_breaker_states"].as_array().is_some_and(|arr| !arr.is_empty()));
+        assert!(json["circuit_breaker_states"]
+            .as_array()
+            .is_some_and(|arr| !arr.is_empty()));
     }
 
     #[tokio::test]
     async fn test_dashboard_errors_endpoint_returns_failed_logs() {
         let server = GatewayServer::new(test_config(), None).await.unwrap();
-        server.state.logger.log(LogEntry {
-            trace_id: "trace-1".to_string(),
-            timestamp: chrono::Utc::now(),
-            method: "POST".to_string(),
-            path: "/v1/chat/completions".to_string(),
-            model: "gpt-4".to_string(),
-            provider: "test-provider".to_string(),
-            status_code: 502,
-            duration_ms: 120,
-            cost: 0.0,
-            request_body: None,
-            response_body: None,
-            requested_model: Some("gpt-4".to_string()),
-            responded_model: None,
-        }).unwrap();
+        server
+            .state
+            .logger
+            .log(LogEntry {
+                trace_id: "trace-1".to_string(),
+                timestamp: chrono::Utc::now(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                model: "gpt-4".to_string(),
+                provider: "test-provider".to_string(),
+                status_code: 502,
+                duration_ms: 120,
+                cost: 0.0,
+                request_body: None,
+                response_body: None,
+                requested_model: Some("gpt-4".to_string()),
+                responded_model: None,
+            })
+            .unwrap();
 
         let app = server.build_router();
-        let response = app.oneshot(Request::get("/dashboard/errors").body(Body::empty()).unwrap()).await.unwrap();
+        let response = app
+            .oneshot(
+                Request::get("/dashboard/errors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.as_array().is_some_and(|arr| !arr.is_empty()));
         assert_eq!(json[0]["status_code"], 502);

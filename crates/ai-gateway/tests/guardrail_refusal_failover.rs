@@ -216,7 +216,9 @@ async fn build_app(config: Config) -> (axum::Router, ai_gateway::gateway::AppSta
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
-    let body = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
     (status, body.to_vec())
 }
 
@@ -258,7 +260,11 @@ async fn failover_redispatches_to_next_provider_on_refusal() {
 
     let (status, body) = send(app, chat_request("help me with something")).await;
 
-    assert_eq!(status, StatusCode::OK, "should receive 200 from the fallback provider");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "should receive 200 from the fallback provider"
+    );
     let content = assistant_content(&body);
     assert_eq!(
         content, "Here is your answer from provider-b.",
@@ -268,8 +274,16 @@ async fn failover_redispatches_to_next_provider_on_refusal() {
     // Verify both providers were called.
     let refusing_reqs = refusing.received_requests().await.unwrap();
     let normal_reqs = normal.received_requests().await.unwrap();
-    assert_eq!(refusing_reqs.len(), 1, "refusing provider should be called once (initial dispatch)");
-    assert_eq!(normal_reqs.len(), 1, "normal provider should be called once (failover)");
+    assert_eq!(
+        refusing_reqs.len(),
+        1,
+        "refusing provider should be called once (initial dispatch)"
+    );
+    assert_eq!(
+        normal_reqs.len(),
+        1,
+        "normal provider should be called once (failover)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +324,8 @@ async fn failover_skips_provider_with_open_circuit_breaker() {
     // Provider-b (skipped) must NOT have received any request.
     let skipped_reqs = skipped.received_requests().await.unwrap();
     assert_eq!(
-        skipped_reqs.len(), 0,
+        skipped_reqs.len(),
+        0,
         "provider-b must be skipped entirely when its circuit breaker is open"
     );
 
@@ -339,7 +354,11 @@ async fn failover_exhaustion_returns_last_response() {
 
     // Both providers refuse; the gateway returns the last response (200 with
     // refusal content from provider-b).
-    assert_eq!(status, StatusCode::OK, "exhaustion returns HTTP 200 (the last response)");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "exhaustion returns HTTP 200 (the last response)"
+    );
     let content = assistant_content(&body);
     assert!(
         content.contains("sorry") || content.contains("cannot"),
@@ -371,7 +390,11 @@ async fn failover_attempts_each_target_at_most_once() {
 
     let (status, _body) = send(app, chat_request("help me")).await;
 
-    assert_eq!(status, StatusCode::OK, "exhaustion returns the last response");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "exhaustion returns the last response"
+    );
 
     // Each provider called exactly once — proving the bound and no-retry guarantee.
     let reqs_a = refusing_a.received_requests().await.unwrap();
@@ -460,5 +483,9 @@ guardrails:
 
     // Provider-b must NOT have been called (no failover).
     let normal_reqs = normal.received_requests().await.unwrap();
-    assert_eq!(normal_reqs.len(), 0, "provider-b must not be called when failover is disabled");
+    assert_eq!(
+        normal_reqs.len(),
+        0,
+        "provider-b must not be called when failover is disabled"
+    );
 }

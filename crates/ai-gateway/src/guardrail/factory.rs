@@ -13,9 +13,7 @@ use std::sync::Arc;
 use reqwest::Client;
 
 use crate::cache::SemanticCache;
-use crate::guardrail::config::{
-    GuardrailConfig, GuardrailProviderConfig, GuardrailProviderType,
-};
+use crate::guardrail::config::{GuardrailConfig, GuardrailProviderConfig, GuardrailProviderType};
 use crate::guardrail::pipeline::PipelineResolverError;
 use crate::guardrail::provider::{GuardrailProvider, ProviderRegistry};
 use crate::guardrail::providers::custom_http::CustomHttpProvider;
@@ -41,7 +39,10 @@ pub enum RegistryBuildError {
         source: RegexCompileError,
     },
     /// A required setting for a provider type was absent.
-    MissingSetting { provider: String, field: &'static str },
+    MissingSetting {
+        provider: String,
+        field: &'static str,
+    },
     /// A `semantic` provider was declared but no semantic cache is configured,
     /// so its embedding provider/model and Qdrant instance cannot be reused
     /// (Req 7.1, 7.5).
@@ -67,7 +68,9 @@ impl std::fmt::Display for RegistryBuildError {
                 "guardrail provider '{provider}' requires a configured semantic cache \
                  (embedding provider + Qdrant), but none is available"
             ),
-            RegistryBuildError::Resolver(e) => write!(f, "guardrail pipeline resolution failed: {e}"),
+            RegistryBuildError::Resolver(e) => {
+                write!(f, "guardrail pipeline resolution failed: {e}")
+            }
         }
     }
 }
@@ -138,10 +141,13 @@ fn build_provider(
             Arc::new(regex)
         }
         GuardrailProviderType::Presidio => {
-            let endpoint = settings.endpoint.clone().ok_or(RegistryBuildError::MissingSetting {
-                provider: cfg.name.clone(),
-                field: "endpoint",
-            })?;
+            let endpoint = settings
+                .endpoint
+                .clone()
+                .ok_or(RegistryBuildError::MissingSetting {
+                    provider: cfg.name.clone(),
+                    field: "endpoint",
+                })?;
             Arc::new(PresidioProvider::new(
                 http_client.clone(),
                 endpoint,
@@ -315,7 +321,10 @@ mod tests {
         assert_eq!(registry.len(), 5);
         assert_eq!(registry.get("scanner").unwrap().provider_type(), "regex");
         assert_eq!(registry.get("pii").unwrap().provider_type(), "presidio");
-        assert_eq!(registry.get("custom").unwrap().provider_type(), "custom_http");
+        assert_eq!(
+            registry.get("custom").unwrap().provider_type(),
+            "custom_http"
+        );
         assert_eq!(
             registry.get("mod").unwrap().provider_type(),
             "openai_moderation"
@@ -379,7 +388,10 @@ mod tests {
         let err = build_registry(&config, &client, None).expect_err("missing endpoint fails");
         assert!(matches!(
             err,
-            RegistryBuildError::MissingSetting { field: "endpoint", .. }
+            RegistryBuildError::MissingSetting {
+                field: "endpoint",
+                ..
+            }
         ));
     }
 

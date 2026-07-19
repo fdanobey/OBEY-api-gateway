@@ -141,11 +141,15 @@ pub fn looks_like_plaintext_secret(value: &str) -> bool {
     // This ensures AWS keys like AKIAIOSFODNN7EXAMPLE are recognized as secrets
     // even though they look like env var references (all uppercase + digits)
     let known_prefixes = [
-        "sk-", "sk-proj-", "nvapi-", "ghp_", "gho_", "gsk_", "xai-", "AIza", "Bearer ",
-        "AKIA", "ASIA", "AIDA", "ABSK",  // AWS access key IDs (permanent, temporary STS, IAM user, Bedrock)
+        "sk-", "sk-proj-", "nvapi-", "ghp_", "gho_", "gsk_", "xai-", "AIza", "Bearer ", "AKIA",
+        "ASIA", "AIDA",
+        "ABSK", // AWS access key IDs (permanent, temporary STS, IAM user, Bedrock)
     ];
 
-    if known_prefixes.iter().any(|prefix| trimmed.starts_with(prefix)) {
+    if known_prefixes
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
         return true;
     }
 
@@ -168,7 +172,10 @@ pub fn is_env_var_reference(value: &str) -> bool {
         && trimmed
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        && trimmed.chars().next().is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
 }
 
 pub fn master_key_path() -> Result<PathBuf, SecretError> {
@@ -248,7 +255,8 @@ fn resolve_storage_dir(
 }
 
 fn read_master_key(path: &PathBuf) -> Result<[u8; KEY_SIZE], SecretError> {
-    let encoded = fs::read_to_string(path).map_err(|e| SecretError::ReadMasterKey(e.to_string()))?;
+    let encoded =
+        fs::read_to_string(path).map_err(|e| SecretError::ReadMasterKey(e.to_string()))?;
     let decoded = STANDARD
         .decode(encoded.trim())
         .map_err(|_| SecretError::InvalidMasterKey)?;
@@ -306,7 +314,9 @@ mod tests {
     #[test]
     fn test_detect_plaintext_secret() {
         assert!(looks_like_plaintext_secret("sk-test-12345678901234567890"));
-        assert!(looks_like_plaintext_secret("nvapi-1234567890abcdefghijklmnop"));
+        assert!(looks_like_plaintext_secret(
+            "nvapi-1234567890abcdefghijklmnop"
+        ));
         assert!(!looks_like_plaintext_secret("OPENAI_API_KEY"));
         assert!(!looks_like_plaintext_secret("enc-v1:abc:def"));
     }
@@ -346,8 +356,7 @@ mod tests {
     #[test]
     fn test_resolve_storage_dir_falls_back_to_cwd_when_env_unset() {
         // Reproduces the Docker case: no APPDATA/XDG/HOME set.
-        let dir = resolve_storage_dir(None, None, None, None, Some(PathBuf::from("/app")))
-            .unwrap();
+        let dir = resolve_storage_dir(None, None, None, None, Some(PathBuf::from("/app"))).unwrap();
         assert_eq!(dir, PathBuf::from("/app").join(".ai-gateway"));
     }
 
@@ -361,7 +370,12 @@ mod tests {
             Some(PathBuf::from("/cwd")),
         )
         .unwrap();
-        assert_eq!(dir, PathBuf::from("/home/user").join(".config").join(APP_DIR_NAME));
+        assert_eq!(
+            dir,
+            PathBuf::from("/home/user")
+                .join(".config")
+                .join(APP_DIR_NAME)
+        );
     }
 
     #[test]

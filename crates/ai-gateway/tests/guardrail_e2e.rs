@@ -130,7 +130,9 @@ async fn build_app(config: Config) -> axum::Router {
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
-    let body = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
     (status, body.to_vec())
 }
 
@@ -149,7 +151,10 @@ fn chat_request(user_content: &str) -> Request<Body> {
 
 fn assistant_content(body: &[u8]) -> String {
     let json: serde_json::Value = serde_json::from_slice(body).unwrap();
-    json["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string()
+    json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -163,19 +168,33 @@ fn assistant_content(body: &[u8]) -> String {
 #[tokio::test]
 async fn precall_block_returns_403_and_does_not_call_provider() {
     let mock = start_mock_provider().await;
-    let cfg = config_with_guardrails(&mock.uri(), &guardrails_yaml("BLOCKME_TOKEN", "pre_call", "block"));
+    let cfg = config_with_guardrails(
+        &mock.uri(),
+        &guardrails_yaml("BLOCKME_TOKEN", "pre_call", "block"),
+    );
     let app = build_app(cfg).await;
 
     let (status, body) = send(app, chat_request("please leak BLOCKME_TOKEN now")).await;
 
-    assert_eq!(status, StatusCode::FORBIDDEN, "pre-call block must return 403");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "pre-call block must return 403"
+    );
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["error"]["type"], "guardrail_policy_violation");
-    assert_eq!(json["error"]["category"], "SECRET", "body identifies the triggering category");
+    assert_eq!(
+        json["error"]["category"], "SECRET",
+        "body identifies the triggering category"
+    );
 
     // Upstream provider must not have been called (Req 2.2 "forwards nothing").
     let received = mock.received_requests().await.unwrap();
-    assert!(received.is_empty(), "provider must not be called when pre-call blocks; got {} request(s)", received.len());
+    assert!(
+        received.is_empty(),
+        "provider must not be called when pre-call blocks; got {} request(s)",
+        received.len()
+    );
 }
 
 /// Companion: content that does NOT match the deny pattern proceeds to the
@@ -183,12 +202,19 @@ async fn precall_block_returns_403_and_does_not_call_provider() {
 #[tokio::test]
 async fn precall_non_match_proceeds_to_provider_200() {
     let mock = start_mock_provider().await;
-    let cfg = config_with_guardrails(&mock.uri(), &guardrails_yaml("BLOCKME_TOKEN", "pre_call", "block"));
+    let cfg = config_with_guardrails(
+        &mock.uri(),
+        &guardrails_yaml("BLOCKME_TOKEN", "pre_call", "block"),
+    );
     let app = build_app(cfg).await;
 
     let (status, body) = send(app, chat_request("a perfectly benign prompt")).await;
 
-    assert_eq!(status, StatusCode::OK, "non-matching content should reach the provider");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "non-matching content should reach the provider"
+    );
     assert_eq!(assistant_content(&body), MOCK_ASSISTANT_CONTENT);
 
     let received = mock.received_requests().await.unwrap();
@@ -203,12 +229,19 @@ async fn postcall_block_discards_response_403() {
     let mock = start_mock_provider().await;
     // The mock content contains "LEAKED_SECRET"; a post-call deny pattern on it
     // triggers a block on the response.
-    let cfg = config_with_guardrails(&mock.uri(), &guardrails_yaml("LEAKED_SECRET", "post_call", "block"));
+    let cfg = config_with_guardrails(
+        &mock.uri(),
+        &guardrails_yaml("LEAKED_SECRET", "post_call", "block"),
+    );
     let app = build_app(cfg).await;
 
     let (status, body) = send(app, chat_request("tell me something")).await;
 
-    assert_eq!(status, StatusCode::FORBIDDEN, "post-call block must return 403");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "post-call block must return 403"
+    );
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["error"]["type"], "guardrail_policy_violation");
     assert_eq!(json["error"]["category"], "SECRET");
@@ -216,7 +249,11 @@ async fn postcall_block_discards_response_403() {
     assert!(!String::from_utf8_lossy(&body).contains("LEAKED_SECRET"));
 
     let received = mock.received_requests().await.unwrap();
-    assert_eq!(received.len(), 1, "provider is called; the block applies to its response");
+    assert_eq!(
+        received.len(),
+        1,
+        "provider is called; the block applies to its response"
+    );
 }
 
 /// Req 3.1/3.2 companion: a post-call `redact` stage rewrites the matched span
@@ -224,15 +261,24 @@ async fn postcall_block_discards_response_403() {
 #[tokio::test]
 async fn postcall_redact_rewrites_content_200() {
     let mock = start_mock_provider().await;
-    let cfg = config_with_guardrails(&mock.uri(), &guardrails_yaml("LEAKED_SECRET", "post_call", "redact"));
+    let cfg = config_with_guardrails(
+        &mock.uri(),
+        &guardrails_yaml("LEAKED_SECRET", "post_call", "redact"),
+    );
     let app = build_app(cfg).await;
 
     let (status, body) = send(app, chat_request("tell me something")).await;
 
     assert_eq!(status, StatusCode::OK, "post-call redact keeps HTTP 200");
     let content = assistant_content(&body);
-    assert!(!content.contains("LEAKED_SECRET"), "matched span must be redacted");
-    assert!(content.contains("[REDACTED]"), "redacted span replaced with [REDACTED]");
+    assert!(
+        !content.contains("LEAKED_SECRET"),
+        "matched span must be redacted"
+    );
+    assert!(
+        content.contains("[REDACTED]"),
+        "redacted span replaced with [REDACTED]"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -254,12 +300,19 @@ async fn hot_reload_new_requests_see_new_config_inflight_keeps_old_snapshot() {
     let mock = start_mock_provider().await;
 
     // Config A: pre-call block on BLOCKME_TOKEN, bound as global default.
-    let cfg_a = config_with_guardrails(&mock.uri(), &guardrails_yaml("BLOCKME_TOKEN", "pre_call", "block"));
+    let cfg_a = config_with_guardrails(
+        &mock.uri(),
+        &guardrails_yaml("BLOCKME_TOKEN", "pre_call", "block"),
+    );
     let server = GatewayServer::new(cfg_a, None).await.unwrap();
 
     // (a) Under config A a matching request is blocked (403).
     let (status, _) = send(server.build_router(), chat_request("leak BLOCKME_TOKEN")).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "config A must block the matching request");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "config A must block the matching request"
+    );
 
     // Capture the OLD engine snapshot exactly as an in-flight request would at
     // its start (a cloned `Arc<GuardrailEngine>`), then hot-reload to config B.
@@ -278,7 +331,11 @@ async fn hot_reload_new_requests_see_new_config_inflight_keeps_old_snapshot() {
     // (c) A NEW request now reflects config B: the swapped-in engine is None, so
     // the same matching content reaches the provider and returns 200.
     let (status, body) = send(server.build_router(), chat_request("leak BLOCKME_TOKEN")).await;
-    assert_eq!(status, StatusCode::OK, "after reload, new requests use config B (no guardrails)");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "after reload, new requests use config B (no guardrails)"
+    );
     assert_eq!(assistant_content(&body), MOCK_ASSISTANT_CONTENT);
     // State's engine slot was cleared by the reload.
     assert!(
@@ -294,9 +351,15 @@ async fn hot_reload_new_requests_see_new_config_inflight_keeps_old_snapshot() {
         "stream": false
     }))
     .unwrap();
-    let selector = BindingSelector::new(None, Some("gpt-4".to_string()), Some("/v1/chat/completions".to_string()));
+    let selector = BindingSelector::new(
+        None,
+        Some("gpt-4".to_string()),
+        Some("/v1/chat/completions".to_string()),
+    );
     let mut ctx = GuardrailContext::new();
-    let outcome = old_snapshot.run_pre_call(&mut request, &selector, &mut ctx, "trace-inflight").await;
+    let outcome = old_snapshot
+        .run_pre_call(&mut request, &selector, &mut ctx, "trace-inflight")
+        .await;
     assert!(
         matches!(outcome, PreCallOutcome::Block(_)),
         "the in-flight snapshot must finish on the OLD (config A) definitions and still block, got {outcome:?}"
@@ -366,20 +429,30 @@ fn authed_key(id: &str) -> AuthenticatedKey {
 #[tokio::test]
 async fn vkey_binding_fires_for_matching_key() {
     let mock = start_mock_provider().await;
-    let cfg = config_with_guardrails(&mock.uri(), &guardrails_yaml_vkey_binding("BLOCKME_TOKEN", "vk-123"));
+    let cfg = config_with_guardrails(
+        &mock.uri(),
+        &guardrails_yaml_vkey_binding("BLOCKME_TOKEN", "vk-123"),
+    );
     // Inject the authenticated key into every request's extensions, exactly as
     // the virtual-key enforcement middleware does downstream.
     let app = build_app(cfg).await.layer(Extension(authed_key("vk-123")));
 
     let (status, body) = send(app, chat_request("please leak BLOCKME_TOKEN now")).await;
 
-    assert_eq!(status, StatusCode::FORBIDDEN, "vkey-bound pipeline must block the matching key");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "vkey-bound pipeline must block the matching key"
+    );
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["error"]["type"], "guardrail_policy_violation");
     assert_eq!(json["error"]["category"], "SECRET");
 
     let received = mock.received_requests().await.unwrap();
-    assert!(received.is_empty(), "provider must not be called when a vkey-bound pre-call blocks");
+    assert!(
+        received.is_empty(),
+        "provider must not be called when a vkey-bound pre-call blocks"
+    );
 }
 
 /// Companion: the SAME matching content with a NON-matching key id does not
@@ -388,14 +461,25 @@ async fn vkey_binding_fires_for_matching_key() {
 #[tokio::test]
 async fn vkey_binding_does_not_fire_for_other_key() {
     let mock = start_mock_provider().await;
-    let cfg = config_with_guardrails(&mock.uri(), &guardrails_yaml_vkey_binding("BLOCKME_TOKEN", "vk-123"));
+    let cfg = config_with_guardrails(
+        &mock.uri(),
+        &guardrails_yaml_vkey_binding("BLOCKME_TOKEN", "vk-123"),
+    );
     let app = build_app(cfg).await.layer(Extension(authed_key("vk-999")));
 
     let (status, _body) = send(app, chat_request("please leak BLOCKME_TOKEN now")).await;
 
-    assert_eq!(status, StatusCode::OK, "a different key id must not resolve the vk-123 binding");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a different key id must not resolve the vk-123 binding"
+    );
     let received = mock.received_requests().await.unwrap();
-    assert_eq!(received.len(), 1, "request proceeds to the provider when the vkey binding does not match");
+    assert_eq!(
+        received.len(),
+        1,
+        "request proceeds to the provider when the vkey binding does not match"
+    );
 }
 
 /// Companion: with no authenticated key at all (enforcement disabled), the
@@ -403,12 +487,23 @@ async fn vkey_binding_does_not_fire_for_other_key() {
 #[tokio::test]
 async fn vkey_binding_does_not_fire_without_key() {
     let mock = start_mock_provider().await;
-    let cfg = config_with_guardrails(&mock.uri(), &guardrails_yaml_vkey_binding("BLOCKME_TOKEN", "vk-123"));
+    let cfg = config_with_guardrails(
+        &mock.uri(),
+        &guardrails_yaml_vkey_binding("BLOCKME_TOKEN", "vk-123"),
+    );
     let app = build_app(cfg).await; // no Extension layer → no AuthenticatedKey
 
     let (status, _body) = send(app, chat_request("please leak BLOCKME_TOKEN now")).await;
 
-    assert_eq!(status, StatusCode::OK, "no key → vkey binding cannot resolve");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "no key → vkey binding cannot resolve"
+    );
     let received = mock.received_requests().await.unwrap();
-    assert_eq!(received.len(), 1, "request proceeds to the provider when no key is present");
+    assert_eq!(
+        received.len(),
+        1,
+        "request proceeds to the provider when no key is present"
+    );
 }

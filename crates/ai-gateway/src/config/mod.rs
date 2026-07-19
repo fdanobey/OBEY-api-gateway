@@ -6,7 +6,9 @@ use crate::guardrail::GuardrailConfig;
 use crate::secrets;
 
 pub mod validation;
-pub use validation::{bootstrap_config_if_missing, load_and_validate_config, resolve_config_path, save_config};
+pub use validation::{
+    bootstrap_config_if_missing, load_and_validate_config, resolve_config_path, save_config,
+};
 
 /// Pre-compiled regex for environment variable substitution
 /// Compiled once at startup using LazyLock for thread-safe lazy initialization
@@ -21,14 +23,14 @@ static ENV_VAR_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
 #[allow(dead_code)]
 fn resolve_env_var_in_string(value: &str) -> String {
     let mut result = value.to_string();
-    
+
     for cap in ENV_VAR_REGEX.captures_iter(value) {
         let env_var = &cap[1];
         if let Ok(env_value) = std::env::var(env_var) {
             result = result.replace(&format!("${{{}}}", env_var), &env_value);
         }
     }
-    
+
     result
 }
 
@@ -1142,7 +1144,7 @@ mod runtime_resolution_tests {
     #[test]
     fn test_provider_resolve_api_key() {
         env::set_var("TEST_API_KEY", "sk-test123");
-        
+
         let provider = Provider {
             name: "test".to_string(),
             provider_type: "openai".to_string(),
@@ -1174,9 +1176,9 @@ mod runtime_resolution_tests {
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
         };
-        
+
         assert_eq!(provider.resolve_api_key(), Some("sk-test123".to_string()));
-        
+
         env::remove_var("TEST_API_KEY");
     }
 
@@ -1213,18 +1215,18 @@ mod runtime_resolution_tests {
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
         };
-        
+
         assert_eq!(provider.resolve_api_key(), None);
     }
 
     #[test]
     fn test_provider_resolve_custom_headers() {
         env::set_var("CUSTOM_TOKEN", "token123");
-        
+
         let mut headers = HashMap::new();
         headers.insert("X-API-Key".to_string(), "${CUSTOM_TOKEN}".to_string());
         headers.insert("X-Static".to_string(), "static-value".to_string());
-        
+
         let provider = Provider {
             name: "test".to_string(),
             provider_type: "openai".to_string(),
@@ -1256,11 +1258,11 @@ mod runtime_resolution_tests {
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
         };
-        
+
         let resolved = provider.resolve_custom_headers();
         assert_eq!(resolved.get("X-API-Key"), Some(&"token123".to_string()));
         assert_eq!(resolved.get("X-Static"), Some(&"static-value".to_string()));
-        
+
         env::remove_var("CUSTOM_TOKEN");
     }
 
@@ -1298,7 +1300,10 @@ mod runtime_resolution_tests {
             max_rate_limit_cooldown_seconds: None,
         };
 
-        assert_eq!(provider.resolve_api_key(), Some("decrypted-key".to_string()));
+        assert_eq!(
+            provider.resolve_api_key(),
+            Some("decrypted-key".to_string())
+        );
     }
 
     #[test]
@@ -1343,16 +1348,16 @@ mod runtime_resolution_tests {
     fn test_admin_auth_resolve_credentials() {
         env::set_var("ADMIN_USER", "admin");
         env::set_var("ADMIN_PASS", "secret");
-        
+
         let auth = AdminAuthConfig {
             enabled: true,
             username_env: Some("ADMIN_USER".to_string()),
             password_env: Some("ADMIN_PASS".to_string()),
         };
-        
+
         assert_eq!(auth.resolve_username(), Some("admin".to_string()));
         assert_eq!(auth.resolve_password(), Some("secret".to_string()));
-        
+
         env::remove_var("ADMIN_USER");
         env::remove_var("ADMIN_PASS");
     }

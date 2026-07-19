@@ -65,8 +65,9 @@ placeholder tokens, so that the downstream layer can restore the original values
 /// (letters, digits, underscore) and `{N}` is a decimal sequence number. Used
 /// during re-injection to distinguish complete placeholders from corrupted
 /// fragments (Req 4.7).
-static PLACEHOLDER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<<PII_[A-Za-z0-9_]+_[0-9]+>>").expect("placeholder regex is valid"));
+static PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<<PII_[A-Za-z0-9_]+_[0-9]+>>").expect("placeholder regex is valid")
+});
 
 /// Marker that begins every placeholder; a `<<PII_` occurrence that is not part
 /// of a complete placeholder match is treated as a corrupted fragment.
@@ -512,14 +513,11 @@ mod tests {
         let mut ctx = GuardrailContext::new();
         let content = "email a@x.com and ssn 111-22-3333 here";
         let findings = vec![
-            finding("EMAIL", 6, 13),   // "a@x.com"
-            finding("SSN", 22, 33),    // "111-22-3333"
+            finding("EMAIL", 6, 13), // "a@x.com"
+            finding("SSN", 22, 33),  // "111-22-3333"
         ];
         let redacted = ctx.redact(content, &findings);
-        assert_eq!(
-            redacted,
-            "email <<PII_EMAIL_1>> and ssn <<PII_SSN_1>> here"
-        );
+        assert_eq!(redacted, "email <<PII_EMAIL_1>> and ssn <<PII_SSN_1>> here");
         assert_eq!(ctx.len(), 2);
     }
 
@@ -599,7 +597,7 @@ mod tests {
     fn reinject_leaves_corrupted_fragment_unchanged() {
         let mut ctx = GuardrailContext::new();
         ctx.placeholder_for("EMAIL", "a@x.com"); // <<PII_EMAIL_1>>
-        // A corrupted/partial fragment must be left as-is.
+                                                 // A corrupted/partial fragment must be left as-is.
         let response = "here is <<PII_EMAIL_ and a stray <<PII_EMAIL_1>>";
         let restored = ctx.reinject(response);
         assert_eq!(restored, "here is <<PII_EMAIL_ and a stray a@x.com");
@@ -1352,12 +1350,7 @@ mod redaction_notice_tests {
         let mut ctx = GuardrailContext::new();
         ctx.placeholder_for("EMAIL", "a@x.com");
         let mut messages = vec![system_msg("You are helpful."), user_msg("hi")];
-        inject_redaction_notice(
-            &mut messages,
-            &ctx,
-            None,
-            InstructionInsertionMode::Merged,
-        );
+        inject_redaction_notice(&mut messages, &ctx, None, InstructionInsertionMode::Merged);
         // No new message added; content prepended to existing system message.
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
@@ -1372,12 +1365,7 @@ mod redaction_notice_tests {
         let mut ctx = GuardrailContext::new();
         ctx.placeholder_for("EMAIL", "a@x.com");
         let mut messages = vec![user_msg("hi")];
-        inject_redaction_notice(
-            &mut messages,
-            &ctx,
-            None,
-            InstructionInsertionMode::Merged,
-        );
+        inject_redaction_notice(&mut messages, &ctx, None, InstructionInsertionMode::Merged);
         // Falls back: inserts a new system message at position 0.
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
@@ -1426,12 +1414,7 @@ mod redaction_notice_tests {
         let mut ctx = GuardrailContext::new();
         ctx.placeholder_for("KEY", "secret123");
         let mut messages: Vec<Message> = vec![];
-        inject_redaction_notice(
-            &mut messages,
-            &ctx,
-            None,
-            InstructionInsertionMode::Merged,
-        );
+        inject_redaction_notice(&mut messages, &ctx, None, InstructionInsertionMode::Merged);
         // Falls back to separate: one new system message inserted.
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "system");

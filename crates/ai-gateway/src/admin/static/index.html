@@ -426,7 +426,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         <div class="form-group" style="margin-top:.5rem">
           <label>Manual Models (one per line, always included in model lists)</label>
           <textarea class="prov-manual-models" rows="2" placeholder="model-name-1&#10;model-name-2" style="font-size:.8rem;font-family:monospace"></textarea>
-          <div class="hint">Use when provider doesn't expose /v1/models (e.g. NVIDIA NIM cloud)</div>
+          <div class="hint">Optional override. Bedrock ships separate maintained fallbacks for Mantle Chat (API key) and Runtime/Converse (AWS SDK); NVIDIA NIM also has a maintained fallback.</div>
         </div>
         <div class="bedrock-fields">
           <div class="bedrock-title">AWS Bedrock Settings</div>
@@ -1160,55 +1160,63 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 (function() {
   var config = null;
 
-  // --- Bedrock Built-in Model Catalog (fallback when /v1/models is unreachable) ---
-  var BEDROCK_BUILTIN_MODELS = [
-    // OpenAI (hosted on Bedrock via the Mantle endpoint)
+  // BEGIN BEDROCK MANTLE CHAT FALLBACK MODELS
+  // Chat Completions-compatible IDs for API-key providers on bedrock-mantle.
+  // Responses-only GPT-5.x and Messages-only Claude models are excluded until
+  // their dedicated adapters are available.
+  var BEDROCK_MANTLE_CHAT_MODELS = [
+    'openai.gpt-oss-120b',
+    'openai.gpt-oss-20b',
+    'deepseek.v3.2',
+    'deepseek.v3.1',
+    'mistral.mistral-large-3-675b-instruct',
+    'qwen.qwen3-32b',
+    'qwen.qwen3-235b-a22b-2507',
+    'qwen.qwen3-coder-480b-a35b-instruct'
+  ];
+  // END BEDROCK MANTLE CHAT FALLBACK MODELS
+
+  // BEGIN BEDROCK MANTLE RESPONSES FALLBACK MODELS
+  var BEDROCK_MANTLE_RESPONSES_MODELS = [
+    'openai.gpt-5.6-sol',
+    'openai.gpt-5.6-terra',
+    'openai.gpt-5.6-luna',
     'openai.gpt-5.5',
-    'openai.gpt-5.4',
-    'openai.gpt-oss-120b-1:0',
-    'openai.gpt-oss-20b-1:0',
-    // Anthropic Claude 4.x family
+    'openai.gpt-5.4'
+  ];
+  // END BEDROCK MANTLE RESPONSES FALLBACK MODELS
+
+  // BEGIN BEDROCK MANTLE MESSAGES FALLBACK MODELS
+  var BEDROCK_MANTLE_MESSAGES_MODELS = [
+    'anthropic.claude-sonnet-5',
+    'anthropic.claude-fable-5',
+    'anthropic.claude-opus-4-8',
+    'anthropic.claude-opus-4-7'
+  ];
+  // END BEDROCK MANTLE MESSAGES FALLBACK MODELS
+
+  // BEGIN BEDROCK RUNTIME FALLBACK MODELS
+  // Converse/Invoke-compatible IDs for AWS SDK providers.
+  var BEDROCK_RUNTIME_MODELS = [
+    'anthropic.claude-sonnet-5',
+    'anthropic.claude-opus-4-8',
     'anthropic.claude-opus-4-7',
-    'anthropic.claude-sonnet-4-6',
-    'anthropic.claude-opus-4-6',
-    'anthropic.claude-sonnet-4-5-v2:0',
-    'anthropic.claude-opus-4-5-v1:0',
     'anthropic.claude-haiku-4-5-20251001-v1:0',
-    'anthropic.claude-sonnet-4-v1:0',
-    'anthropic.claude-opus-4-v1:0',
-    // Anthropic Claude 3.x family
-    'anthropic.claude-3-5-sonnet-20241022-v2:0',
-    'anthropic.claude-3-5-haiku-20241022-v1:0',
-    'anthropic.claude-3-opus-20240229-v1:0',
-    'anthropic.claude-3-sonnet-20240229-v1:0',
-    'anthropic.claude-3-haiku-20240307-v1:0',
-    // Amazon Nova
-    'amazon.nova-premier-v1:0',
+    'amazon.nova-2-lite-v1:0',
     'amazon.nova-pro-v1:0',
     'amazon.nova-lite-v1:0',
     'amazon.nova-micro-v1:0',
-    'amazon.titan-text-express-v1',
-    'amazon.titan-text-lite-v1',
-    // Meta Llama
-    'meta.llama4-maverick-17b-instruct-v1:0',
-    'meta.llama4-scout-17b-instruct-v1:0',
-    'meta.llama3-3-70b-instruct-v1:0',
-    'meta.llama3-1-405b-instruct-v1:0',
+    'openai.gpt-oss-120b-1:0',
+    'openai.gpt-oss-20b-1:0',
+    'deepseek.v3.2',
+    'deepseek.v3.1',
     'meta.llama3-1-70b-instruct-v1:0',
     'meta.llama3-1-8b-instruct-v1:0',
-    // DeepSeek
-    'deepseek.deepseek-r1-v1:0',
-    'deepseek.deepseek-v3-2-v1:0',
-    // Mistral
-    'mistral.mistral-large-2407-v1:0',
-    'mistral.mistral-large-3-v1:0',
-    'mistral.mistral-small-2402-v1:0',
-    // Cohere
-    'cohere.command-r-plus-v1:0',
-    'cohere.command-r-v1:0',
-    // Qwen
+    'meta.llama3-3-70b-instruct-v1:0',
+    'mistral.mistral-large-3-675b-instruct',
     'qwen.qwen3-32b-v1:0'
   ];
+  // END BEDROCK RUNTIME FALLBACK MODELS
 
   // Compute the admin API base path so fetch URLs work regardless of trailing slash.
   // e.g. /admin or /admin/ both yield "/admin/"
@@ -1815,7 +1823,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         var region = regionSelect.value || 'us-east-1';
         var apiKey = card.querySelector('.prov-key-env').value.trim();
         var mantleBase = 'https://bedrock-mantle.' + region + '.api.aws/v1';
-        var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(mantleBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(name);
+        var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(mantleBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(name) + '&provider_type=bedrock';
         fetch(proxyUrl, {
           method: 'GET',
           signal: AbortSignal.timeout(10000)
@@ -1839,7 +1847,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       } else {
         // Non-bedrock: proxy through backend to avoid CORS with 10s timeout
         var provApiKey = card.querySelector('.prov-key-env').value.trim();
-        var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(url) + '&api_key=' + encodeURIComponent(provApiKey || '') + '&provider_name=' + encodeURIComponent(name);
+        var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(url) + '&api_key=' + encodeURIComponent(provApiKey || '') + '&provider_name=' + encodeURIComponent(name) + '&provider_type=' + encodeURIComponent(typeSelect.value || '');
         fetch(proxyUrl, { method: 'GET', signal: AbortSignal.timeout(10000) })
           .then(function(resp) {
             if (resp.ok) { resultEl.textContent = '✓ Reachable'; resultEl.style.color = 'var(--success)'; setStatus('Connection test passed for ' + name); }
@@ -1892,6 +1900,14 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     return card ? card.querySelector('.prov-type').value : '';
   }
 
+  function getBedrockFallbackModels(providerName) {
+    // Bedrock API-key providers use Mantle Chat IDs. Empty api_key_env means
+    // AWS SDK credential-chain mode, which requires runtime model IDs.
+    return getProviderApiKey(providerName)
+      ? BEDROCK_MANTLE_CHAT_MODELS.concat(BEDROCK_MANTLE_RESPONSES_MODELS, BEDROCK_MANTLE_MESSAGES_MODELS)
+      : BEDROCK_RUNTIME_MODELS.slice();
+  }
+
   function getManualModelsForProvider(providerName) {
     var mm = [];
     document.querySelectorAll('#providers-list .item-card').forEach(function(c) {
@@ -1933,7 +1949,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 
     if (!baseUrl) {
       // For bedrock with no base URL, use built-in catalog
-      if (provType === 'bedrock') { populateSelect(BEDROCK_BUILTIN_MODELS.slice()); return; }
+      if (provType === 'bedrock') { populateSelect(getBedrockFallbackModels(providerName)); return; }
       if (manualModels.length) { populateSelect([]); return; }
       selectEl.innerHTML = '<option value="">-- no base URL --</option>';
       return;
@@ -1945,16 +1961,16 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     // For Bedrock, query both the standard /v1 and the OpenAI-specific /openai/v1 paths
     if (provType === 'bedrock') {
       var openaiBase = baseUrl.replace(/\/v1\/?$/, '/openai/v1');
-      var proxyUrl1 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName);
-      var proxyUrl2 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(openaiBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName);
+      var proxyUrl1 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=bedrock';
+      var proxyUrl2 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(openaiBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=bedrock';
       Promise.all([
         fetch(proxyUrl1, { signal: AbortSignal.timeout(12000) }).then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};}),
         fetch(proxyUrl2, { signal: AbortSignal.timeout(12000) }).then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};})
       ]).then(function(results) {
         var seen = {};
         var models = [];
-        // Always include the built-in catalog so new models always appear
-        BEDROCK_BUILTIN_MODELS.forEach(function(id) { if (!seen[id]) { seen[id] = true; models.push(id); } });
+        // Include only the catalog compatible with this provider's auth mode.
+        getBedrockFallbackModels(providerName).forEach(function(id) { if (!seen[id]) { seen[id] = true; models.push(id); } });
         // Merge any live-discovered models on top
         results.forEach(function(data) {
           (data.data || []).forEach(function(m) {
@@ -1964,12 +1980,12 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         });
         populateSelect(models);
       }).catch(function() {
-        populateSelect(BEDROCK_BUILTIN_MODELS.slice());
+        populateSelect(getBedrockFallbackModels(providerName));
       });
       return;
     }
 
-    var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName);
+    var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=' + encodeURIComponent(provType || '');
     fetch(proxyUrl, { signal: AbortSignal.timeout(12000) })
       .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function(data) {
@@ -2010,8 +2026,8 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     selectEl.innerHTML = '<option value="">Loading…</option>';
 
     // Query both Mantle paths: /v1/models (open-weight) and /openai/v1/models (GPT-5.5, GPT-5.4)
-    var proxyUrl1 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(mantleBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName || '');
-    var proxyUrl2 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(openaiBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName || '');
+    var proxyUrl1 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(mantleBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName || '') + '&provider_type=bedrock';
+    var proxyUrl2 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(openaiBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName || '') + '&provider_type=bedrock';
 
     var fetches = [
       fetch(proxyUrl1, { signal: AbortSignal.timeout(12000) }).then(function(r) { return r.ok ? r.json() : { data: [] }; }).catch(function() { return { data: [] }; }),
@@ -2022,7 +2038,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       var seen = {};
       var models = [];
       // Always include the built-in catalog so new models are guaranteed visible
-      BEDROCK_BUILTIN_MODELS.forEach(function(id) { if (!seen[id]) { seen[id] = true; models.push(id); } });
+      getBedrockFallbackModels(providerName).forEach(function(id) { if (!seen[id]) { seen[id] = true; models.push(id); } });
       // Merge in live-discovered models
       results.forEach(function(data) {
         (data.data || []).forEach(function(m) {
@@ -2033,7 +2049,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       populateBedrockModelSelect(models, globalInference, region, selectEl, currentModel, manualModels);
     }).catch(function() {
       // Fall back to built-in catalog
-      populateBedrockModelSelect(BEDROCK_BUILTIN_MODELS.slice(), globalInference, region, selectEl, currentModel, manualModels);
+      populateBedrockModelSelect(getBedrockFallbackModels(providerName), globalInference, region, selectEl, currentModel, manualModels);
     });
   }
 

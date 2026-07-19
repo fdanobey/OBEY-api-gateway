@@ -34,15 +34,19 @@ impl Message {
     pub fn content_as_text(&self) -> String {
         match &self.content {
             serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Array(parts) => {
-                parts.iter().filter_map(|p| {
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .filter_map(|p| {
                     if p.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        p.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
                     } else {
                         None
                     }
-                }).collect::<Vec<_>>().join("")
-            }
+                })
+                .collect::<Vec<_>>()
+                .join(""),
             serde_json::Value::Null => String::new(),
             other => other.to_string(),
         }

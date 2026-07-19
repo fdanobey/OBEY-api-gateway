@@ -46,7 +46,10 @@ pub struct LoopDetectorState {
 }
 
 impl LoopDetectorState {
-    pub fn new(config: Arc<RwLock<Config>>, detector_config: crate::loop_detection::LoopDetectionConfig) -> Self {
+    pub fn new(
+        config: Arc<RwLock<Config>>,
+        detector_config: crate::loop_detection::LoopDetectionConfig,
+    ) -> Self {
         let enabled = detector_config.enabled;
         Self {
             sessions: Arc::new(DashMap::new()),
@@ -168,7 +171,9 @@ where
             let mut openai_request = match serde_json::from_slice::<OpenAIRequest>(&bytes) {
                 Ok(request) => request,
                 Err(_) => {
-                    return inner.call(Request::from_parts(parts, Body::from(bytes))).await;
+                    return inner
+                        .call(Request::from_parts(parts, Body::from(bytes)))
+                        .await;
                 }
             };
 
@@ -203,14 +208,12 @@ where
             }
 
             let decision = {
-                let mut session = state.sessions.get_mut(&session_id).expect("session inserted");
-                let signals = SignalComputer::compute(
-                    &session,
-                    &record,
-                    None,
-                    &effective_config,
-                    None,
-                );
+                let mut session = state
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("session inserted");
+                let signals =
+                    SignalComputer::compute(&session, &record, None, &effective_config, None);
                 let score = ConfidenceScorer::score(
                     &signals,
                     &effective_config.weights,
@@ -220,15 +223,11 @@ where
                 );
                 session.dominant_signal = score.dominant_signal;
                 session.record_signals(signals);
-                state.metrics.record_confidence(
-                    session.vk_id.as_deref(),
-                    score.confidence,
-                );
-                let decision = EnforcementEngine::evaluate(
-                    score.confidence,
-                    &mut session,
-                    &effective_config,
-                );
+                state
+                    .metrics
+                    .record_confidence(session.vk_id.as_deref(), score.confidence);
+                let decision =
+                    EnforcementEngine::evaluate(score.confidence, &mut session, &effective_config);
                 InjectionEngine::inject(
                     &mut openai_request,
                     &decision,
@@ -370,7 +369,9 @@ fn request_record(request: &OpenAIRequest) -> RequestRecord {
     let new_information_tokens = estimate_new_information_tokens(request);
     RequestRecord {
         content_simhash: simhash::compute_messages(&messages),
-        tool_call_fingerprint: ToolCallFingerprint::from_json(&serde_json::Value::Array(tool_calls.clone())),
+        tool_call_fingerprint: ToolCallFingerprint::from_json(&serde_json::Value::Array(
+            tool_calls.clone(),
+        )),
         context_token_count: content_tokens,
         new_information_tokens,
         token_count: content_tokens,
@@ -378,7 +379,10 @@ fn request_record(request: &OpenAIRequest) -> RequestRecord {
         has_tool_calls: !tool_calls.is_empty(),
         tool_names: tool_calls
             .iter()
-            .filter_map(|call| call.pointer("/function/name").and_then(serde_json::Value::as_str))
+            .filter_map(|call| {
+                call.pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+            })
             .map(str::to_string)
             .collect(),
         timestamp: Instant::now(),
@@ -393,9 +397,16 @@ fn estimate_new_information_tokens(request: &OpenAIRequest) -> u32 {
     for token in message.content_as_text().split_whitespace() {
         unique.insert(token.to_ascii_lowercase());
     }
-    if let Some(tool_calls) = message.extra.get("tool_calls").and_then(serde_json::Value::as_array) {
+    if let Some(tool_calls) = message
+        .extra
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+    {
         for call in tool_calls {
-            if let Some(arguments) = call.pointer("/function/arguments").and_then(serde_json::Value::as_str) {
+            if let Some(arguments) = call
+                .pointer("/function/arguments")
+                .and_then(serde_json::Value::as_str)
+            {
                 unique.extend(arguments.split_whitespace().map(str::to_ascii_lowercase));
             }
         }

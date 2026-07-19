@@ -430,20 +430,19 @@ mod tests {
     /// Strategy: pick a random case transformation of a string.
     fn randomize_case(s: &str) -> impl Strategy<Value = String> {
         let owned = s.to_string();
-        any::<Vec<bool>>()
-            .prop_map(move |bools| {
-                owned
-                    .chars()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        if bools.get(i).copied().unwrap_or(false) {
-                            c.to_uppercase().to_string()
-                        } else {
-                            c.to_lowercase().to_string()
-                        }
-                    })
-                    .collect::<String>()
-            })
+        any::<Vec<bool>>().prop_map(move |bools| {
+            owned
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if bools.get(i).copied().unwrap_or(false) {
+                        c.to_uppercase().to_string()
+                    } else {
+                        c.to_lowercase().to_string()
+                    }
+                })
+                .collect::<String>()
+        })
     }
 
     /// Strategy: generate a concrete string that matches one of the TEST_PHRASES

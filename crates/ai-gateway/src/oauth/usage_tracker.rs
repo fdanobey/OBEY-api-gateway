@@ -6,10 +6,10 @@
 //! `x-codex-{primary,secondary}-*` headers. Both formats are normalized into
 //! the same short/weekly snapshot consumed by the admin provider card.
 
+use serde::Serialize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use serde::Serialize;
 
 /// A single rate-limit window (e.g., "requests per 5h" or "tokens per week").
 #[derive(Debug, Clone, Serialize, Default)]
@@ -170,8 +170,8 @@ fn codex_window(
     now: u64,
 ) -> Option<RateLimitWindow> {
     let used_percent = header_f64(headers, &format!("x-codex-{kind}-used-percent"));
-    let reset_at = header_u64(headers, &format!("x-codex-{kind}-reset-at"))
-        .map(normalize_epoch_seconds);
+    let reset_at =
+        header_u64(headers, &format!("x-codex-{kind}-reset-at")).map(normalize_epoch_seconds);
 
     if used_percent.is_none() && reset_at.is_none() {
         return None;
@@ -197,12 +197,12 @@ fn update_from_standard_headers(
 ) -> bool {
     let req_limit = header_u64(headers, "x-ratelimit-limit-requests");
     let req_remaining = header_u64(headers, "x-ratelimit-remaining-requests");
-    let req_reset_secs = header_str(headers, "x-ratelimit-reset-requests")
-        .and_then(parse_reset_duration);
+    let req_reset_secs =
+        header_str(headers, "x-ratelimit-reset-requests").and_then(parse_reset_duration);
     let tok_limit = header_u64(headers, "x-ratelimit-limit-tokens");
     let tok_remaining = header_u64(headers, "x-ratelimit-remaining-tokens");
-    let tok_reset_secs = header_str(headers, "x-ratelimit-reset-tokens")
-        .and_then(parse_reset_duration);
+    let tok_reset_secs =
+        header_str(headers, "x-ratelimit-reset-tokens").and_then(parse_reset_duration);
 
     if req_limit.is_none()
         && req_remaining.is_none()
@@ -323,7 +323,11 @@ fn parse_reset_duration(s: &str) -> Option<u64> {
         }
     }
 
-    if total_secs > 0 { Some(total_secs) } else { Some(1) }
+    if total_secs > 0 {
+        Some(total_secs)
+    } else {
+        Some(1)
+    }
 }
 
 #[cfg(test)]

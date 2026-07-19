@@ -233,7 +233,10 @@ mod tests {
     #[test]
     fn filter_ignores_entities_not_in_configured_list() {
         // PERSON is detected but not configured → ignored (Req 6.2).
-        let entities = vec![entity("PERSON", 0, 4, 0.99), entity("EMAIL_ADDRESS", 5, 10, 0.8)];
+        let entities = vec![
+            entity("PERSON", 0, 4, 0.99),
+            entity("EMAIL_ADDRESS", 5, 10, 0.8),
+        ];
         let findings = filter_entities(entities, &configured(&["EMAIL_ADDRESS"]), 0.5);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].entity_label, "EMAIL_ADDRESS");
@@ -253,11 +256,20 @@ mod tests {
 
     #[test]
     fn clamp_timeout_defaults_and_bounds() {
-        assert_eq!(clamp_timeout(None), Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert_eq!(
+            clamp_timeout(None),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
         // Below minimum clamps up to 1 s.
-        assert_eq!(clamp_timeout(Some(0)), Duration::from_secs(MIN_TIMEOUT_SECS));
+        assert_eq!(
+            clamp_timeout(Some(0)),
+            Duration::from_secs(MIN_TIMEOUT_SECS)
+        );
         // Above maximum clamps down to 30 s.
-        assert_eq!(clamp_timeout(Some(120)), Duration::from_secs(MAX_TIMEOUT_SECS));
+        assert_eq!(
+            clamp_timeout(Some(120)),
+            Duration::from_secs(MAX_TIMEOUT_SECS)
+        );
         // In-range value is preserved.
         assert_eq!(clamp_timeout(Some(10)), Duration::from_secs(10));
     }

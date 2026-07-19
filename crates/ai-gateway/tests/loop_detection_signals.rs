@@ -88,9 +88,21 @@ fn prior_responses_drive_stagnation_and_error_retry_signals() {
     session.request_count = 3;
     session.request_hashes.extend([123, 123, 123]);
     session.response_descriptors.extend([
-        ResponseDescriptor { token_count: 100, block_type_hash: 9, is_error: true },
-        ResponseDescriptor { token_count: 101, block_type_hash: 9, is_error: true },
-        ResponseDescriptor { token_count: 99, block_type_hash: 9, is_error: true },
+        ResponseDescriptor {
+            token_count: 100,
+            block_type_hash: 9,
+            is_error: true,
+        },
+        ResponseDescriptor {
+            token_count: 101,
+            block_type_hash: 9,
+            is_error: true,
+        },
+        ResponseDescriptor {
+            token_count: 99,
+            block_type_hash: 9,
+            is_error: true,
+        },
     ]);
     session.error_retry_cycles = 2;
 

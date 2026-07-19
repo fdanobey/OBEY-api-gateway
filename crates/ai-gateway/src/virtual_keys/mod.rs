@@ -43,12 +43,12 @@ pub use budget::BudgetError;
 #[allow(unused_imports)]
 pub use errors::FieldError;
 pub use errors::{KeyError, ValidationErrors};
-pub use rate_limiter::{PerKeyRateLimiter, RateLimitError};
 #[allow(unused_imports)]
 pub use rate_limiter::RetryAfterSeconds;
-pub use store::{KeyStore, KeyStoreError, StoredVirtualKey};
+pub use rate_limiter::{PerKeyRateLimiter, RateLimitError};
 #[allow(unused_imports)]
 pub use store::KeyUpdates;
+pub use store::{KeyStore, KeyStoreError, StoredVirtualKey};
 pub use usage::{compute_cost, UsageTracker};
 
 // --- Key generation / validation constants -----------------------------------
@@ -111,10 +111,7 @@ impl VirtualKeyManager {
     /// encrypted copy of the value, and returns the plaintext key exactly once.
     ///
     /// _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9_
-    pub async fn create_key(
-        &self,
-        params: CreateKeyParams,
-    ) -> Result<CreateKeyResponse, KeyError> {
+    pub async fn create_key(&self, params: CreateKeyParams) -> Result<CreateKeyResponse, KeyError> {
         validate_create_params(&params)?;
 
         // 1-4. Generate `vk_<43 base64url chars>` from 32 secure random bytes.
@@ -364,7 +361,9 @@ fn validate_create_params(params: &CreateKeyParams) -> Result<(), KeyError> {
     }
 
     if let Some(loop_detection) = &params.loop_detection {
-        if let Err(loop_errors) = loop_detection.merge(&crate::loop_detection::LoopDetectionConfig::default()) {
+        if let Err(loop_errors) =
+            loop_detection.merge(&crate::loop_detection::LoopDetectionConfig::default())
+        {
             for error in loop_errors {
                 errors.push("loop_detection", error.to_string());
             }
@@ -471,12 +470,12 @@ mod tests {
     async fn create_key_validation_failure_reports_fields() {
         let (mgr, _tmp) = temp_manager();
         let params = CreateKeyParams {
-            name: Some(String::new()),          // too short
-            budget_limit_usd: Some(0.0),        // below 0.01
-            token_budget: Some(0),              // below 1
-            requests_per_minute: Some(0),       // below 1
+            name: Some(String::new()),           // too short
+            budget_limit_usd: Some(0.0),         // below 0.01
+            token_budget: Some(0),               // below 1
+            requests_per_minute: Some(0),        // below 1
             tokens_per_minute: Some(20_000_000), // above 10_000_000
-            model_access: Some(vec![]),         // empty list
+            model_access: Some(vec![]),          // empty list
             ..defaults()
         };
 

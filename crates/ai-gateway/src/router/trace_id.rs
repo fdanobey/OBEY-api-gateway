@@ -1,9 +1,9 @@
 use uuid::Uuid;
 
 /// Generate a unique trace ID for a request
-/// 
+///
 /// Uses X-Request-Id header if provided by client, otherwise generates UUID v4
-/// 
+///
 /// Requirements: 33.1, 33.7
 pub fn generate_trace_id(request_id_header: Option<&str>) -> String {
     match request_id_header {

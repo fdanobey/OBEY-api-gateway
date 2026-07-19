@@ -1,0 +1,102 @@
+# Required repository secret: NVIDIA_API_KEY.
+name: Sync NVIDIA NIM fallback
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report proposed changes without updating a pull request
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: windows-latest
+    env:
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      STATE_DIR: ${{ runner.temp }}\nim-sync-state
+      SUMMARY_FILE: ${{ runner.temp }}\nim-sync-summary.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore consecutive-run state
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STATE_DIR }}
+          key: nim-fallback-state-${{ github.run_id }}
+          restore-keys: |
+            nim-fallback-state-
+
+      - name: Probe hosted catalog
+        id: sync
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Path $env:STATE_DIR -Force | Out-Null
+          $dryRun = '${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}' -eq 'true'
+          $output = & ./scripts/sync-nvidia-nim-fallback.ps1 `
+            -StatePath "$env:STATE_DIR\state.json" `
+            -DryRun:$dryRun 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { "$_" }
+          $summary = ($output | Select-Object -Last 1)
+          Set-Content -Path $env:SUMMARY_FILE -Value $summary -Encoding utf8NoBOM
+          "exit_code=$exitCode" >> $env:GITHUB_OUTPUT
+          "dry_run=$($dryRun.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Publish catalog summary
+        if: always()
+        shell: pwsh
+        run: |
+          "## NVIDIA NIM fallback sync" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          '```json' >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path $env:SUMMARY_FILE) { Get-Content $env:SUMMARY_FILE >> $env:GITHUB_STEP_SUMMARY }
+          '```' >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Create or update fallback pull request
+        if: steps.sync.outputs.exit_code == '1' && steps.sync.outputs.dry_run != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $branch = 'chore/nvidia-nim-fallback-sync'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C $branch
+          git add -- crates/ai-gateway/src/providers/nvidia_nim.rs
+          git commit -m 'chore(nvidia-nim): sync built-in fallback models'
+          git push --force-with-lease origin $branch
+          $bodyPath = "$env:RUNNER_TEMP\nim-sync-pr.md"
+          @(
+            'Automated update of the curated NVIDIA NIM hosted-model fallback.',
+            '',
+            'The sync job only replaces entries after two consecutive actionable absence checks. HTTP 429 counts as available; transient failures do not evict models.',
+            '',
+            '```json',
+            (Get-Content $env:SUMMARY_FILE -Raw),
+            '```'
+          ) | Set-Content -Path $bodyPath -Encoding utf8NoBOM
+          $existing = gh pr list --head $branch --state open --json number --jq '.[0].number'
+          if ($existing) {
+            gh pr edit $existing --title 'chore(nvidia-nim): sync built-in fallback models' --body-file $bodyPath
+          } else {
+            $baseBranch = '${{ github.event.repository.default_branch }}'
+            gh pr create --base $baseBranch --head $branch --title 'chore(nvidia-nim): sync built-in fallback models' --body-file $bodyPath
+          }
+
+      - name: Warn on hard sync error
+        if: steps.sync.outputs.exit_code != '0' && steps.sync.outputs.exit_code != '1'
+        shell: pwsh
+        run: |
+          Write-Output "::warning::NVIDIA NIM sync stopped with exit code ${{ steps.sync.outputs.exit_code }}. No pull request was opened; see the workflow summary."

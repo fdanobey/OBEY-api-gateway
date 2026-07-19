@@ -3,10 +3,10 @@ use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
 
+use super::openai_compatible::OpenAICompatibleProvider;
 use crate::error::GatewayError;
 use crate::models::openai::OpenAIRequest;
 use crate::providers::{Model, ProviderClient, ProviderResponse, SSEEvent};
-use super::openai_compatible::OpenAICompatibleProvider;
 
 /// Groq provider client
 /// Uses OpenAI-compatible API format
@@ -17,7 +17,13 @@ pub struct GroqProvider {
 impl GroqProvider {
     /// Create a new Groq provider client
     /// Groq API endpoint: https://api.groq.com/openai/v1
-    pub fn new(name: String, api_key: String, max_connections: Option<u32>, timeout_seconds: Option<u64>, custom_headers: HashMap<String, String>) -> Result<Self, GatewayError> {
+    pub fn new(
+        name: String,
+        api_key: String,
+        max_connections: Option<u32>,
+        timeout_seconds: Option<u64>,
+        custom_headers: HashMap<String, String>,
+    ) -> Result<Self, GatewayError> {
         let inner = OpenAICompatibleProvider::new(
             name,
             "https://api.groq.com/openai/v1".to_string(),
@@ -39,7 +45,14 @@ impl GroqProvider {
         timeout_seconds: Option<u64>,
         custom_headers: HashMap<String, String>,
     ) -> Result<Self, GatewayError> {
-        let inner = OpenAICompatibleProvider::new(name, base_url, api_key, max_connections, timeout_seconds, custom_headers)?;
+        let inner = OpenAICompatibleProvider::new(
+            name,
+            base_url,
+            api_key,
+            max_connections,
+            timeout_seconds,
+            custom_headers,
+        )?;
         Ok(Self { inner })
     }
 }
@@ -56,7 +69,8 @@ impl ProviderClient for GroqProvider {
     async fn chat_completion_stream(
         &self,
         request: OpenAIRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError>
+    {
         self.inner.chat_completion_stream(request).await
     }
 

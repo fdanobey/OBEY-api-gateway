@@ -60,10 +60,14 @@ impl OpenAICompatibleProvider {
 
         let http_client = Client::builder()
             .pool_max_idle_per_host(pool_size)
-            .pool_idle_timeout(std::time::Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS))
+            .pool_idle_timeout(std::time::Duration::from_secs(
+                DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+            ))
             .timeout(timeout)
             .build()
-            .map_err(|e| GatewayError::Configuration(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| {
+                GatewayError::Configuration(format!("Failed to create HTTP client: {}", e))
+            })?;
 
         Ok(Self {
             name,
@@ -135,7 +139,8 @@ impl ProviderClient for OpenAICompatibleProvider {
     async fn chat_completion_stream(
         &self,
         request: OpenAIRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError>
+    {
         let url = format!("{}/chat/completions", self.base_url);
 
         let response = self
@@ -203,10 +208,9 @@ impl ProviderClient for OpenAICompatibleProvider {
             });
         }
 
-        let models_response: ModelsResponse = response
-            .json()
-            .await
-            .map_err(|e| GatewayError::Network(format!("Failed to parse models response: {}", e)))?;
+        let models_response: ModelsResponse = response.json().await.map_err(|e| {
+            GatewayError::Network(format!("Failed to parse models response: {}", e))
+        })?;
 
         Ok(models_response.data)
     }
@@ -221,7 +225,7 @@ fn parse_sse_chunk(text: &str, _provider_name: &str) -> Result<Option<SSEEvent>,
     for line in text.lines() {
         if line.starts_with("data: ") {
             let data = &line[6..];
-            
+
             // Check for stream end marker
             if data.trim() == "[DONE]" {
                 return Ok(None);
@@ -230,7 +234,7 @@ fn parse_sse_chunk(text: &str, _provider_name: &str) -> Result<Option<SSEEvent>,
             return Ok(Some(SSEEvent::new(data.to_string())));
         }
     }
-    
+
     Ok(None)
 }
 
@@ -248,7 +252,10 @@ mod tests {
     #[test]
     fn test_resolve_header_value_env_var() {
         std::env::set_var("TEST_HEADER_VAL", "resolved-secret");
-        assert_eq!(resolve_header_value("${TEST_HEADER_VAL}"), "resolved-secret");
+        assert_eq!(
+            resolve_header_value("${TEST_HEADER_VAL}"),
+            "resolved-secret"
+        );
         std::env::remove_var("TEST_HEADER_VAL");
     }
 
@@ -260,14 +267,17 @@ mod tests {
     #[test]
     fn test_resolve_header_value_missing_env() {
         // Missing env var falls back to the raw string
-        assert_eq!(resolve_header_value("${NONEXISTENT_HDR_VAR_XYZ}"), "${NONEXISTENT_HDR_VAR_XYZ}");
+        assert_eq!(
+            resolve_header_value("${NONEXISTENT_HDR_VAR_XYZ}"),
+            "${NONEXISTENT_HDR_VAR_XYZ}"
+        );
     }
 
     // **Validates: Requirements 39.1-39.5**
     #[tokio::test]
     async fn test_custom_headers_included_in_request() {
-        use wiremock::{MockServer, Mock, ResponseTemplate};
-        use wiremock::matchers::{method, path, header};
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
 
@@ -296,11 +306,16 @@ mod tests {
             None,
             None,
             headers,
-        ).unwrap();
+        )
+        .unwrap();
 
         let request = OpenAIRequest {
             model: "test-model".to_string(),
-            messages: vec![Message { role: "user".to_string(), content: serde_json::Value::String("hello".to_string()), extra: Default::default() }],
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("hello".to_string()),
+                extra: Default::default(),
+            }],
             stream: false,
             temperature: None,
             max_tokens: None,
@@ -331,18 +346,21 @@ mod tests {
     fn test_parse_sse_chunk_with_data() {
         let chunk = "data: {\"id\":\"test\",\"object\":\"chat.completion.chunk\"}";
         let result = parse_sse_chunk(chunk, "test-provider");
-        
+
         assert!(result.is_ok());
         let event = result.unwrap();
         assert!(event.is_some());
-        assert_eq!(event.unwrap().data, "{\"id\":\"test\",\"object\":\"chat.completion.chunk\"}");
+        assert_eq!(
+            event.unwrap().data,
+            "{\"id\":\"test\",\"object\":\"chat.completion.chunk\"}"
+        );
     }
 
     #[test]
     fn test_parse_sse_chunk_with_done() {
         let chunk = "data: [DONE]";
         let result = parse_sse_chunk(chunk, "test-provider");
-        
+
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -351,7 +369,7 @@ mod tests {
     fn test_parse_sse_chunk_empty() {
         let chunk = "";
         let result = parse_sse_chunk(chunk, "test-provider");
-        
+
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -360,7 +378,7 @@ mod tests {
     fn test_parse_sse_chunk_no_data_prefix() {
         let chunk = "event: message\nid: 123";
         let result = parse_sse_chunk(chunk, "test-provider");
-        
+
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -368,12 +386,12 @@ mod tests {
     // **Validates: Requirements 8.4**
     #[tokio::test]
     async fn test_connection_timeout_handling() {
-        use wiremock::{MockServer, Mock, ResponseTemplate};
-        use wiremock::matchers::{method, path};
         use std::time::Duration as StdDuration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
-        
+
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_delay(StdDuration::from_secs(10)))
@@ -407,12 +425,15 @@ mod tests {
         };
 
         let result = provider.chat_completion(request).await;
-        
+
         assert!(result.is_err(), "Request should timeout");
-        
+
         if let Err(GatewayError::Network(msg)) = result {
-            assert!(msg.contains("Request failed"), 
-                "Error should indicate network failure: {}", msg);
+            assert!(
+                msg.contains("Request failed"),
+                "Error should indicate network failure: {}",
+                msg
+            );
         } else {
             panic!("Expected Network error, got: {:?}", result);
         }
@@ -421,11 +442,11 @@ mod tests {
     // **Validates: Requirements 8.5**
     #[tokio::test]
     async fn test_malformed_json_handling() {
-        use wiremock::{MockServer, Mock, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
-        
+
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string("{invalid json"))
@@ -439,7 +460,8 @@ mod tests {
             None,
             None,
             HashMap::new(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let request = OpenAIRequest {
             model: "test-model".to_string(),
@@ -455,25 +477,31 @@ mod tests {
         };
 
         let result = provider.chat_completion(request).await;
-        
+
         assert!(result.is_err(), "Malformed JSON should cause error");
-        
+
         if let Err(GatewayError::Network(msg)) = result {
-            assert!(msg.contains("Failed to parse response") || msg.contains("parse"), 
-                "Error should indicate JSON parsing failure: {}", msg);
+            assert!(
+                msg.contains("Failed to parse response") || msg.contains("parse"),
+                "Error should indicate JSON parsing failure: {}",
+                msg
+            );
         } else {
-            panic!("Expected Network error for malformed JSON, got: {:?}", result);
+            panic!(
+                "Expected Network error for malformed JSON, got: {:?}",
+                result
+            );
         }
     }
 
     // **Validates: Requirements 8.6**
     #[tokio::test]
     async fn test_empty_response_handling() {
-        use wiremock::{MockServer, Mock, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
-        
+
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(""))
@@ -487,7 +515,8 @@ mod tests {
             None,
             None,
             HashMap::new(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let request = OpenAIRequest {
             model: "test-model".to_string(),
@@ -503,14 +532,20 @@ mod tests {
         };
 
         let result = provider.chat_completion(request).await;
-        
+
         assert!(result.is_err(), "Empty response should cause error");
-        
+
         if let Err(GatewayError::Network(msg)) = result {
-            assert!(msg.contains("Failed to parse response") || msg.contains("EOF"), 
-                "Error should indicate empty/invalid response: {}", msg);
+            assert!(
+                msg.contains("Failed to parse response") || msg.contains("EOF"),
+                "Error should indicate empty/invalid response: {}",
+                msg
+            );
         } else {
-            panic!("Expected Network error for empty response, got: {:?}", result);
+            panic!(
+                "Expected Network error for empty response, got: {:?}",
+                result
+            );
         }
     }
 }
@@ -518,29 +553,34 @@ mod tests {
 #[cfg(test)]
 mod property_tests {
     use super::*;
-    use proptest::prelude::*;
     use crate::models::openai::Message;
+    use proptest::prelude::*;
 
     fn arb_openai_request() -> impl Strategy<Value = OpenAIRequest> {
         (
             "[a-z]{3,20}",
-            prop::collection::vec(
-                ("[a-z]{4,10}", "[a-zA-Z0-9 ]{1,100}"),
-                1..5
-            ),
+            prop::collection::vec(("[a-z]{4,10}", "[a-zA-Z0-9 ]{1,100}"), 1..5),
             any::<bool>(),
             prop::option::of(0.0f32..2.0f32),
             prop::option::of(1u32..4096u32),
-        ).prop_map(|(model, messages, stream, temperature, max_tokens)| {
-            OpenAIRequest {
-                model,
-                messages: messages.into_iter().map(|(role, content)| Message { role, content: serde_json::Value::String(content), extra: Default::default() }).collect(),
-                stream,
-                temperature,
-                max_tokens,
-                extra: Default::default(),
-            }
-        })
+        )
+            .prop_map(
+                |(model, messages, stream, temperature, max_tokens)| OpenAIRequest {
+                    model,
+                    messages: messages
+                        .into_iter()
+                        .map(|(role, content)| Message {
+                            role,
+                            content: serde_json::Value::String(content),
+                            extra: Default::default(),
+                        })
+                        .collect(),
+                    stream,
+                    temperature,
+                    max_tokens,
+                    extra: Default::default(),
+                },
+            )
     }
 
     // Feature: ai-gateway, Property 16: OpenAI-Compatible Passthrough
@@ -549,16 +589,16 @@ mod property_tests {
         #[test]
         fn prop_openai_compatible_passthrough_no_translation(request in arb_openai_request()) {
             let original_json = serde_json::to_value(&request).unwrap();
-            
+
             // Serialize and deserialize to simulate forwarding
             let serialized = serde_json::to_string(&request).unwrap();
             let deserialized: OpenAIRequest = serde_json::from_str(&serialized).unwrap();
             let forwarded_json = serde_json::to_value(&deserialized).unwrap();
-            
+
             // Verify no translation occurred - JSON should be identical
-            prop_assert_eq!(original_json, forwarded_json, 
+            prop_assert_eq!(original_json, forwarded_json,
                 "OpenAI-compatible provider must forward requests without translation");
-            
+
             // Verify all fields preserved
             prop_assert_eq!(request.model, deserialized.model);
             prop_assert_eq!(request.messages.len(), deserialized.messages.len());

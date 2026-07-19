@@ -156,11 +156,12 @@ impl InstructionsStore {
         fetched_at: u64,
     ) -> anyhow::Result<()> {
         if let Some(parent) = self.disk_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| {
-                    format!("create codex instructions cache dir at {}", parent.display())
-                })?;
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!(
+                    "create codex instructions cache dir at {}",
+                    parent.display()
+                )
+            })?;
         }
 
         atomic_write_with_owner_only(&self.disk_path, body.as_bytes()).await?;
@@ -185,11 +186,12 @@ impl InstructionsStore {
     /// (Req 7.3).
     pub(crate) async fn touch_etag(&self, fetched_at: u64) -> anyhow::Result<()> {
         if let Some(parent) = self.etag_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| {
-                    format!("create codex instructions cache dir at {}", parent.display())
-                })?;
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!(
+                    "create codex instructions cache dir at {}",
+                    parent.display()
+                )
+            })?;
         }
 
         let etag = self.cache.read().await.etag.clone();
@@ -349,10 +351,7 @@ impl InstructionsStore {
 /// I/O error other than `NotFound` is logged at `warn!` (path only, no
 /// body bytes) and treated as a missing-cache fallthrough so the caller
 /// reseeds with the bundled prompt.
-pub(crate) async fn load_disk_cache(
-    disk_path: &Path,
-    etag_path: &Path,
-) -> Option<CachedPrompt> {
+pub(crate) async fn load_disk_cache(disk_path: &Path, etag_path: &Path) -> Option<CachedPrompt> {
     let body = match tokio::fs::read_to_string(disk_path).await {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -429,9 +428,12 @@ async fn atomic_write_with_owner_only(path: &Path, bytes: &[u8]) -> anyhow::Resu
         PathBuf::from(p)
     };
 
-    tokio::fs::write(&tmp_path, bytes)
-        .await
-        .with_context(|| format!("write codex instructions tmp file at {}", tmp_path.display()))?;
+    tokio::fs::write(&tmp_path, bytes).await.with_context(|| {
+        format!(
+            "write codex instructions tmp file at {}",
+            tmp_path.display()
+        )
+    })?;
 
     tokio::fs::rename(&tmp_path, path).await.with_context(|| {
         format!(
@@ -551,7 +553,9 @@ mod tests {
         assert!(load_disk_cache(&disk_path, &etag_path).await.is_none());
 
         // Both present but etag malformed -> still fall back.
-        tokio::fs::write(&etag_path, b"only-one-line").await.unwrap();
+        tokio::fs::write(&etag_path, b"only-one-line")
+            .await
+            .unwrap();
         assert!(load_disk_cache(&disk_path, &etag_path).await.is_none());
     }
 
@@ -572,12 +576,7 @@ mod tests {
             .unwrap();
 
         for p in [&disk_path, &etag_path] {
-            let mode = tokio::fs::metadata(p)
-                .await
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
+            let mode = tokio::fs::metadata(p).await.unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{} must be mode 0600", p.display());
         }
     }
@@ -800,10 +799,8 @@ mod tests {
         store.maybe_refresh().await;
 
         assert_eq!(store.get(None).await, "startup body");
-        let (etag, _ts) = parse_etag_file(
-            &tokio::fs::read_to_string(&etag_path).await.unwrap(),
-        )
-        .unwrap();
+        let (etag, _ts) =
+            parse_etag_file(&tokio::fs::read_to_string(&etag_path).await.unwrap()).unwrap();
         assert_eq!(etag.as_deref(), Some("W/\"v3\""));
     }
 }

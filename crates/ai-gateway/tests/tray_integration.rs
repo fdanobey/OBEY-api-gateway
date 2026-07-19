@@ -2,8 +2,14 @@
 
 use std::time::Duration;
 
-use ai_gateway::config::{AdminConfig, Config, ContextConfig, CorsConfig, DashboardConfig, ExactCacheConfig, LoggingConfig, ModelGroup, Provider, ProviderConnectionPoolConfig, ProviderModel, RetryConfig, ServerConfig, TrayConfig};
-use ai_gateway::tray::{SingleInstanceGuard, SplashScreen, TrayAssets, TrayManager, TrayMenuAction};
+use ai_gateway::config::{
+    AdminConfig, Config, ContextConfig, CorsConfig, DashboardConfig, ExactCacheConfig,
+    LoggingConfig, ModelGroup, Provider, ProviderConnectionPoolConfig, ProviderModel, RetryConfig,
+    ServerConfig, TrayConfig,
+};
+use ai_gateway::tray::{
+    SingleInstanceGuard, SplashScreen, TrayAssets, TrayManager, TrayMenuAction,
+};
 
 fn test_config() -> Config {
     Config {
@@ -77,12 +83,9 @@ fn test_config() -> Config {
 
 #[tokio::test]
 async fn test_tray_manager_first_launch_flow() {
-    let mut manager = TrayManager::with_assets(
-        test_config(),
-        TrayAssets::default(),
-    )
-    .await
-    .unwrap();
+    let mut manager = TrayManager::with_assets(test_config(), TrayAssets::default())
+        .await
+        .unwrap();
 
     assert!(manager.is_first_launch().await);
     manager.show_first_launch_experience().await.unwrap();
@@ -112,7 +115,10 @@ async fn test_tray_menu_quit_requests_shutdown() {
     let manager = TrayManager::new(test_config()).await.unwrap();
     assert!(!manager.shutdown_requested());
 
-    manager.handle_menu_action(TrayMenuAction::Quit).await.unwrap();
+    manager
+        .handle_menu_action(TrayMenuAction::Quit)
+        .await
+        .unwrap();
     assert!(manager.shutdown_requested());
 }
 

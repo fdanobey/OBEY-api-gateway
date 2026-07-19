@@ -5,12 +5,12 @@ use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usag
 use crate::providers::bedrock::{apply_global_inference_prefix, model_supports_reasoning};
 use dashmap::DashMap;
 use std::collections::HashSet;
+use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::Duration;
-use std::error::Error as StdError;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{warn, debug, info};
+use tracing::{debug, info, warn};
 
 use super::{CircuitBreaker, LatencyTracker, RateLimiter};
 
@@ -94,7 +94,11 @@ impl Router {
 
     /// Create a new Router with explicit context configuration
     #[allow(dead_code)]
-    pub fn with_context_config(config: Arc<RwLock<Config>>, context_config: ContextConfig, metrics: Arc<crate::metrics::Metrics>) -> Self {
+    pub fn with_context_config(
+        config: Arc<RwLock<Config>>,
+        context_config: ContextConfig,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Self {
         Self {
             config,
             circuit_breakers: Arc::new(DashMap::new()),
@@ -141,11 +145,11 @@ impl Router {
     }
 
     /// Find the model group containing the requested model
-    /// 
+    ///
     /// Returns the model group if found, or an error if the model is not configured
     pub async fn find_model_group(&self, model: &str) -> Result<ModelGroup, GatewayError> {
         let config = self.config.read().await;
-        
+
         for group in &config.model_groups {
             // Match by group name first (allows clients to use group names directly)
             if group.name == model {
@@ -157,7 +161,7 @@ impl Router {
                 }
             }
         }
-        
+
         Err(GatewayError::InvalidRequest(format!(
             "Model '{}' not found in any model group",
             model
@@ -219,7 +223,7 @@ impl Router {
             }
         }
         let mut candidates = filtered;
-        
+
         // Stage 3: Sort by priority, cost, and latency
         candidates.sort_by(|a, b| {
             // First: sort by priority (ascending)
@@ -228,35 +232,39 @@ impl Router {
                     // Second: sort by total cost (ascending)
                     let cost_a = a.total_cost();
                     let cost_b = b.total_cost();
-                    
+
                     // Check if costs are within 10% of each other
                     let cost_diff = (cost_a - cost_b).abs();
                     let cost_threshold = cost_a.min(cost_b) * 0.1;
-                    
+
                     if cost_diff <= cost_threshold {
                         // Costs are similar, sort by latency
                         let latency_a = self.latency_tracker.get_latency(&a.provider);
                         let latency_b = self.latency_tracker.get_latency(&b.provider);
-                        latency_a.partial_cmp(&latency_b).unwrap_or(std::cmp::Ordering::Equal)
+                        latency_a
+                            .partial_cmp(&latency_b)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     } else {
                         // Costs are different, sort by cost
-                        cost_a.partial_cmp(&cost_b).unwrap_or(std::cmp::Ordering::Equal)
+                        cost_a
+                            .partial_cmp(&cost_b)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     }
                 }
                 other => other,
             }
         });
-        
+
         // Stage 4: Version fallback sorting (if enabled)
         if model_group.version_fallback_enabled {
             candidates = self.sort_by_version_fallback(candidates);
         }
-        
+
         candidates
     }
 
     /// Sort models by version date (descending - newer versions first)
-    /// 
+    ///
     /// Extracts version dates from model names in format "model-name-YYYY-MM-DD"
     /// Models without version dates are treated as oldest versions
     #[inline]
@@ -264,22 +272,22 @@ impl Router {
         models.sort_by(|a, b| {
             let version_a = Self::extract_version_date(&a.model);
             let version_b = Self::extract_version_date(&b.model);
-            
+
             // Sort descending (newer versions first)
             version_b.cmp(&version_a)
         });
-        
+
         models
     }
 
     /// Extract version date from model name
-    /// 
+    ///
     /// Returns a tuple (year, month, day) or (0, 0, 0) if no version found
     #[inline]
     fn extract_version_date(model_name: &str) -> (u32, u32, u32) {
         // Look for pattern YYYY-MM-DD at the end of the model name
         let parts: Vec<&str> = model_name.split('-').collect();
-        
+
         if parts.len() >= 3 {
             let len = parts.len();
             if let (Ok(year), Ok(month), Ok(day)) = (
@@ -288,12 +296,18 @@ impl Router {
                 parts[len - 1].parse::<u32>(),
             ) {
                 // Basic validation
-                if year >= 2020 && year <= 2100 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+                if year >= 2020
+                    && year <= 2100
+                    && month >= 1
+                    && month <= 12
+                    && day >= 1
+                    && day <= 31
+                {
                     return (year, month, day);
                 }
             }
         }
-        
+
         (0, 0, 0) // No version found
     }
 
@@ -302,22 +316,23 @@ impl Router {
         if let Some(cb) = self.circuit_breakers.get(provider) {
             return cb.value().clone();
         }
-        
+
         let config = self.config.read().await;
-        
+
         let backoff_sequence: Vec<std::time::Duration> = config
             .circuit_breaker
             .backoff_sequence_seconds
             .iter()
             .map(|&s| std::time::Duration::from_secs(s))
             .collect();
-        
+
         let cb = Arc::new(CircuitBreaker::with_backoff_sequence(
             config.circuit_breaker.failure_threshold,
             backoff_sequence,
         ));
-        
-        self.circuit_breakers.insert(provider.to_string(), cb.clone());
+
+        self.circuit_breakers
+            .insert(provider.to_string(), cb.clone());
         cb
     }
 
@@ -336,7 +351,12 @@ impl Router {
     /// [`Metrics::record_provider_failure_with_reason`], keeping the streaming
     /// failure path consistent with the non-streaming failover path. Pass
     /// `None` to leave the previous dashboard reason untouched.
-    pub async fn record_streaming_failure(&self, provider: &str, model: &str, reason: Option<String>) {
+    pub async fn record_streaming_failure(
+        &self,
+        provider: &str,
+        model: &str,
+        reason: Option<String>,
+    ) {
         let cb_key = format!("{}:{}", provider, model);
         let cb = self.get_circuit_breaker(&cb_key).await;
         cb.record_failure().await;
@@ -344,21 +364,65 @@ impl Router {
             .record_provider_failure_with_reason(provider, reason, None);
     }
 
+    /// Detect and strip image content parts from messages when the target
+    /// model does not support vision inputs.
+    ///
+    /// OpenAI-style messages can carry `content` as an array of parts
+    /// including `{ "type": "image_url", "image_url": { ... } }`. Many
+    /// providers respond with HTTP 400 if such parts reach a non-vision
+    /// model. This method removes those parts and logs that fact.
+    fn strip_image_content_if_unsupported(
+        request: &mut OpenAIRequest,
+        supports_vision: bool,
+        provider_name: &str,
+        model: &str,
+    ) -> usize {
+        if supports_vision {
+            return 0;
+        }
+
+        let mut stripped_total: usize = 0;
+        for (idx, msg) in request.messages.iter_mut().enumerate() {
+            if let serde_json::Value::Array(parts) = &mut msg.content {
+                let before = parts.len();
+                parts.retain(|part| {
+                    if part.get("type").and_then(|v| v.as_str()) == Some("image_url") {
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let removed = before.saturating_sub(parts.len());
+                if removed > 0 && !parts.is_empty() {
+                    warn!(
+                        provider = provider_name,
+                        model = %model,
+                        message_index = idx,
+                        images_removed = removed,
+                        "Stripped image_url content parts from message for non-vision model"
+                    );
+                }
+                stripped_total += removed;
+            }
+        }
+        stripped_total
+    }
+
     /// Get or create rate limiter for a provider
     pub async fn get_rate_limiter(&self, provider: &str) -> Arc<RateLimiter> {
         if let Some(rl) = self.rate_limiters.get(provider) {
             return rl.value().clone();
         }
-        
+
         let config = self.config.read().await;
-        
+
         let rate_limit = config
             .providers
             .iter()
             .find(|p| p.name == provider)
             .map(|p| p.rate_limit_per_minute)
             .unwrap_or(0);
-        
+
         let rl = Arc::new(RateLimiter::new(rate_limit));
         self.rate_limiters.insert(provider.to_string(), rl.clone());
         rl
@@ -514,15 +578,20 @@ impl Router {
     ) -> String {
         // Try to extract the provider's own error message, if any. Most
         // OpenAI-compatible envelopes look like {"error":{"message": "..."}}.
-        let provider_msg: Option<String> = serde_json::from_str::<serde_json::Value>(body_or_message)
-            .ok()
-            .and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
-            });
+        let provider_msg: Option<String> =
+            serde_json::from_str::<serde_json::Value>(body_or_message)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            v.get("message")
+                                .and_then(|m| m.as_str())
+                                .map(|s| s.to_string())
+                        })
+                });
 
         let snippet = provider_msg
             .as_deref()
@@ -534,7 +603,9 @@ impl Router {
                 "Rate limited by provider — pausing until the limit resets".to_string()
             }
             Some(401) => "Authentication failed — check the provider's API key".to_string(),
-            Some(403) => "Provider refused the request (forbidden) — check account permissions".to_string(),
+            Some(403) => {
+                "Provider refused the request (forbidden) — check account permissions".to_string()
+            }
             Some(402) => "Billing issue at the provider (payment required)".to_string(),
             Some(404) => "Provider could not find the requested model or endpoint".to_string(),
             Some(408) => "Provider took too long to respond (request timeout)".to_string(),
@@ -629,9 +700,8 @@ impl Router {
     ) -> Duration {
         let config = self.config.read().await;
         let global_cap_secs = config.retry.max_rate_limit_cooldown_seconds;
-        let default_cooldown = Duration::from_secs(
-            config.retry.default_rate_limit_cooldown_seconds,
-        );
+        let default_cooldown =
+            Duration::from_secs(config.retry.default_rate_limit_cooldown_seconds);
         let provider_cap_secs = config
             .providers
             .iter()
@@ -698,7 +768,10 @@ impl Router {
         }
 
         // Standard Retry-After: seconds or HTTP-date.
-        if let Some(v) = headers.get(reqwest::header::RETRY_AFTER).and_then(|h| h.to_str().ok()) {
+        if let Some(v) = headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|h| h.to_str().ok())
+        {
             let trimmed = v.trim();
             if let Ok(secs) = trimmed.parse::<u64>() {
                 return Some(Duration::from_secs(secs));
@@ -891,16 +964,28 @@ impl Router {
         const HOUR: u64 = 60 * 60;
         const DAY: u64 = 24 * HOUR;
 
-        if lower.contains("per month") || lower.contains("monthly limit") || lower.contains("monthly quota") {
+        if lower.contains("per month")
+            || lower.contains("monthly limit")
+            || lower.contains("monthly quota")
+        {
             return Some(Duration::from_secs(30 * DAY));
         }
-        if lower.contains("per week") || lower.contains("weekly limit") || lower.contains("weekly quota") {
+        if lower.contains("per week")
+            || lower.contains("weekly limit")
+            || lower.contains("weekly quota")
+        {
             return Some(Duration::from_secs(7 * DAY));
         }
-        if lower.contains("per day") || lower.contains("daily limit") || lower.contains("daily quota") {
+        if lower.contains("per day")
+            || lower.contains("daily limit")
+            || lower.contains("daily quota")
+        {
             return Some(Duration::from_secs(DAY));
         }
-        if lower.contains("per hour") || lower.contains("hourly limit") || lower.contains("hourly quota") {
+        if lower.contains("per hour")
+            || lower.contains("hourly limit")
+            || lower.contains("hourly quota")
+        {
             return Some(Duration::from_secs(HOUR));
         }
         None
@@ -908,17 +993,14 @@ impl Router {
 
     /// Check and potentially truncate context before routing
     /// Returns the request to use (possibly modified) and whether truncation occurred
-    pub fn check_and_truncate_context(
-        &self,
-        request: &OpenAIRequest,
-    ) -> (OpenAIRequest, bool) {
+    pub fn check_and_truncate_context(&self, request: &OpenAIRequest) -> (OpenAIRequest, bool) {
         let config = self.config.try_read().expect("config lock");
-        
+
         // Skip if context management is disabled
         if !config.context.enabled {
             return (request.clone(), false);
         }
-        
+
         // Try to get model capabilities
         let context_window = match self.context_manager.get_capabilities(&request.model) {
             Some(caps) => caps.context_window,
@@ -927,16 +1009,21 @@ impl Router {
                 return (request.clone(), false);
             }
         };
-        
+
         // Check if request fits within limits
-        if self.context_manager.fits_within_limits(request, context_window) {
+        if self
+            .context_manager
+            .fits_within_limits(request, context_window)
+        {
             return (request.clone(), false);
         }
-        
+
         // Request exceeds limits, truncate it
         let mut truncated_request = request.clone();
-        let result = self.context_manager.truncate_request(&mut truncated_request, context_window);
-        
+        let result = self
+            .context_manager
+            .truncate_request(&mut truncated_request, context_window);
+
         if result.truncated {
             info!(
                 model = %request.model,
@@ -947,15 +1034,15 @@ impl Router {
                 context_window
             );
         }
-        
+
         (truncated_request, result.truncated)
     }
 
     /// Attempt request with retry logic and exponential backoff
-    /// 
+    ///
     /// Implements retry with backoff sequence [1s, 2s, 4s]
     /// Skips retry on 4xx errors except 429 (rate limit) and 408 (timeout)
-    /// 
+    ///
     /// Requirements: 10.1-10.5
     pub async fn attempt_with_retry(
         &self,
@@ -966,13 +1053,19 @@ impl Router {
         let config = self.config.read().await;
         let max_retries = config.retry.max_retries_per_provider;
         let backoff_sequence = config.retry.backoff_sequence_seconds.clone();
-        
+
         // Find provider config
-        let provider_cfg = config.providers.iter().find(|p| p.name == provider_name)
-            .ok_or_else(|| GatewayError::Configuration(
-                format!("Provider '{}' not found in config", provider_name)
-            ))?;
-        
+        let provider_cfg = config
+            .providers
+            .iter()
+            .find(|p| p.name == provider_name)
+            .ok_or_else(|| {
+                GatewayError::Configuration(format!(
+                    "Provider '{}' not found in config",
+                    provider_name
+                ))
+            })?;
+
         // ─── Codex dispatch (Req 10.1, 10.2) ────────────────────────────────
         let is_codex = provider_cfg.auth_method.as_deref() == Some("oauth")
             && provider_cfg.provider_type == "openai";
@@ -999,7 +1092,8 @@ impl Router {
                     });
                 }
             };
-            let http = self.get_or_create_http_client(provider_name, &provider_cfg.connection_pool)?;
+            let http =
+                self.get_or_create_http_client(provider_name, &provider_cfg.connection_pool)?;
 
             let codex_client = crate::codex::client::CodexProviderClient::new(
                 provider_name.to_string(),
@@ -1061,10 +1155,13 @@ impl Router {
                 status_code: Some(401),
             });
         }
-        
+
         // Build base URL — strip trailing slash, append /v1 if not present
         // For Bedrock with API key, use the Bedrock Mantle endpoint (unless custom VPC endpoint)
-        let mut base_url = if provider_cfg.provider_type == "bedrock" && !api_key.is_empty() && !provider_cfg.custom_vpc_endpoint {
+        let mut base_url = if provider_cfg.provider_type == "bedrock"
+            && !api_key.is_empty()
+            && !provider_cfg.custom_vpc_endpoint
+        {
             // Bedrock API key mode: use Bedrock Mantle endpoint (OpenAI-compatible)
             let region = provider_cfg.region.as_deref().unwrap_or("us-east-1");
             format!("https://bedrock-mantle.{}.api.aws/v1", region)
@@ -1076,13 +1173,13 @@ impl Router {
             base_url.push_str("/v1");
         }
         let url = format!("{}/chat/completions", base_url);
-        
+
         let ttfb_timeout_secs = provider_cfg.effective_ttfb_timeout(&provider_model.model);
         let total_timeout_secs = provider_cfg.effective_total_timeout(&provider_model.model);
         let ttfb_timeout = Duration::from_secs(ttfb_timeout_secs);
         let total_timeout = Duration::from_secs(total_timeout_secs);
         tracing::info!(provider = provider_name, %url, model = %provider_model.model, ttfb_timeout_secs, total_timeout_secs, "Calling provider");
-        
+
         let pool_config = provider_cfg.connection_pool.clone();
         let mut custom_headers = provider_cfg.custom_headers.clone();
         let provider_type = provider_cfg.provider_type.clone();
@@ -1093,12 +1190,12 @@ impl Router {
         let is_oauth_provider = provider_cfg.auth_method.as_deref() == Some("oauth");
         let jitter_enabled = config.retry.jitter_enabled;
         let jitter_ratio = config.retry.jitter_ratio;
-        
+
         // Drop config lock before making HTTP calls
         drop(config);
-        
+
         let http_client = self.get_or_create_http_client(provider_name, &pool_config)?;
-        
+
         // Build the outgoing request body — override model to the actual provider model name
         // Always request non-streaming from provider; gateway handles client streaming separately
         let mut outgoing = request.clone();
@@ -1121,16 +1218,22 @@ impl Router {
 
         // Inject prompt caching header for Bedrock providers
         if provider_type == "bedrock" && prompt_caching {
-            custom_headers.insert("x-amzn-bedrock-prompt-caching".to_string(), "OPTIMIZED".to_string());
+            custom_headers.insert(
+                "x-amzn-bedrock-prompt-caching".to_string(),
+                "OPTIMIZED".to_string(),
+            );
         }
 
         // Inject reasoning/extended thinking parameter for Bedrock providers
         if provider_type == "bedrock" && reasoning {
             if model_supports_reasoning(&outgoing.model) {
-                outgoing.extra.insert("thinking".to_string(), serde_json::json!({
-                    "type": "enabled",
-                    "budget_tokens": 4096
-                }));
+                outgoing.extra.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({
+                        "type": "enabled",
+                        "budget_tokens": 4096
+                    }),
+                );
             }
         }
 
@@ -1151,6 +1254,29 @@ impl Router {
         //   "assistant.tool_calls must be an array when provided"
         Self::normalize_message_tool_calls(&mut outgoing.messages);
 
+        // Strip image content parts when the target model is known not to
+        // support vision inputs. This prevents avoidable HTTP 400 rejections
+        // from providers whose non-vision models receive image_url parts.
+        let supports_vision = self
+            .context_manager
+            .get_capabilities(&provider_model.model)
+            .map(|caps| caps.supports_vision)
+            .unwrap_or(false);
+        let images_stripped = Self::strip_image_content_if_unsupported(
+            &mut outgoing,
+            supports_vision,
+            provider_name,
+            &provider_model.model,
+        );
+        if images_stripped > 0 {
+            info!(
+                provider = provider_name,
+                model = %provider_model.model,
+                images_stripped,
+                "Removed image content from request for non-vision model"
+            );
+        }
+
         // Reverse-translate tool_calls history for models that use XML-style tool use.
         //
         // When the gateway previously translated XML tool use → native tool_calls,
@@ -1169,7 +1295,9 @@ impl Router {
         let has_tools = outgoing.extra.contains_key("tools");
         let has_tool_choice = outgoing.extra.contains_key("tool_choice");
         if has_tools || has_tool_choice {
-            let tool_count = outgoing.extra.get("tools")
+            let tool_count = outgoing
+                .extra
+                .get("tools")
                 .and_then(|v| v.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0);
@@ -1199,9 +1327,9 @@ impl Router {
         if has_tools {
             outgoing.messages.push(Self::tool_calling_system_hint());
         }
-        
+
         let mut last_error = None;
-        
+
         for attempt in 0..=max_retries {
             if attempt > 0 {
                 // Defense-in-depth: never burn backoff time on a
@@ -1229,31 +1357,36 @@ impl Router {
                     .get((attempt - 1) as usize)
                     .copied()
                     .unwrap_or(4);
-                let retry_delay = Self::calculate_retry_delay(
-                    backoff_secs,
-                    jitter_enabled,
-                    jitter_ratio,
-                );
-                self.metrics.record_provider_retry(provider_name, retry_delay.as_millis() as u64);
+                let retry_delay =
+                    Self::calculate_retry_delay(backoff_secs, jitter_enabled, jitter_ratio);
+                self.metrics
+                    .record_provider_retry(provider_name, retry_delay.as_millis() as u64);
                 tokio::time::sleep(retry_delay).await;
-                debug!(provider = provider_name, attempt, delay_ms = retry_delay.as_millis() as u64, "Retrying request");
+                debug!(
+                    provider = provider_name,
+                    attempt,
+                    delay_ms = retry_delay.as_millis() as u64,
+                    "Retrying request"
+                );
             }
-            
-            let mut req_builder = http_client.post(&url)
+
+            let mut req_builder = http_client
+                .post(&url)
                 .header("Content-Type", "application/json");
-            
+
             if let Some(ref bearer) = oauth_bearer {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", bearer));
             } else if !api_key.is_empty() {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
             }
-            
+
             for (k, v) in &custom_headers {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
-            
+
             let request_start = std::time::Instant::now();
-            let result = tokio::time::timeout(ttfb_timeout, req_builder.json(&outgoing).send()).await;
+            let result =
+                tokio::time::timeout(ttfb_timeout, req_builder.json(&outgoing).send()).await;
 
             let send_result = match result {
                 Ok(inner) => inner,
@@ -1286,7 +1419,7 @@ impl Router {
                             });
                         }
                     }
-                    
+
                     // Read body with remaining total timeout budget
                     let elapsed = request_start.elapsed();
                     let remaining_total = total_timeout.saturating_sub(elapsed);
@@ -1318,8 +1451,13 @@ impl Router {
                             continue;
                         }
                     };
-                    tracing::info!(provider = provider_name, status = status_code, body_len = body_text.len(), "Provider responded");
-                    
+                    tracing::info!(
+                        provider = provider_name,
+                        status = status_code,
+                        body_len = body_text.len(),
+                        "Provider responded"
+                    );
+
                     if status.is_success() {
                         // Detect error-in-200: some providers (e.g. Nano-GPT) return
                         // HTTP 200 with an error payload like {"error":{...}}.
@@ -1342,11 +1480,10 @@ impl Router {
                                             &body_text,
                                         )
                                         .await;
-                                    let rate_limiter = self
-                                        .get_rate_limiter(provider_name)
-                                        .await;
+                                    let rate_limiter = self.get_rate_limiter(provider_name).await;
                                     rate_limiter.apply_cooldown(cooldown).await;
-                                    self.metrics.record_provider_rate_limit_exhausted(provider_name);
+                                    self.metrics
+                                        .record_provider_rate_limit_exhausted(provider_name);
                                     let now_secs = SystemTime::now()
                                         .duration_since(UNIX_EPOCH)
                                         .map(|d| d.as_secs())
@@ -1391,7 +1528,9 @@ impl Router {
                         }
 
                         // Try parsing as a normal JSON response first
-                        if let Ok(openai_response) = serde_json::from_str::<OpenAIResponse>(&body_text) {
+                        if let Ok(openai_response) =
+                            serde_json::from_str::<OpenAIResponse>(&body_text)
+                        {
                             // Diagnostic: detect whether the model used native tool_calls
                             // or fell back to XML-style tool use in plain text content.
                             if let Some(choice) = openai_response.choices.first() {
@@ -1424,11 +1563,14 @@ impl Router {
                             }
                             return Ok(openai_response);
                         }
-                        
+
                         // Provider may have ignored stream:false and returned SSE chunks.
                         // Parse the SSE stream and reconstruct a single OpenAIResponse.
                         if body_text.starts_with("data: ") {
-                            tracing::debug!(provider = provider_name, "Provider returned SSE despite stream:false, reassembling");
+                            tracing::debug!(
+                                provider = provider_name,
+                                "Provider returned SSE despite stream:false, reassembling"
+                            );
                             match Self::reassemble_sse_response(&body_text) {
                                 Ok(response) => return Ok(response),
                                 Err(e) => {
@@ -1441,7 +1583,7 @@ impl Router {
                                 }
                             }
                         }
-                        
+
                         // Neither JSON nor SSE — log and fail
                         tracing::error!(provider = provider_name, body = %body_text.chars().take(500).collect::<String>(), "Failed to parse provider response");
                         return Err(GatewayError::Provider {
@@ -1450,13 +1592,14 @@ impl Router {
                             status_code: Some(status_code),
                         });
                     }
-                    
+
                     // Context-length failure: attempt in-process truncation + retry.
                     if self.is_context_length_error(status_code, &body_text) {
-                        match self
-                            .context_manager
-                            .handle_context_error(&mut outgoing, context_retry_attempt, Some(&body_text))
-                        {
+                        match self.context_manager.handle_context_error(
+                            &mut outgoing,
+                            context_retry_attempt,
+                            Some(&body_text),
+                        ) {
                             Ok(result) => {
                                 context_retry_attempt += 1;
                                 info!(
@@ -1490,7 +1633,7 @@ impl Router {
                         message: format!("HTTP {}: {}", status_code, body_text),
                         status_code: Some(status_code),
                     };
-                    
+
                     // Req 6.4 (openai-oauth-login): when an OAuth provider
                     // returns HTTP 401, force an immediate token refresh
                     // *before* the circuit breaker's retry path consumes the
@@ -1544,7 +1687,8 @@ impl Router {
                                 .await;
                             let rate_limiter = self.get_rate_limiter(provider_name).await;
                             rate_limiter.apply_cooldown(cooldown).await;
-                            self.metrics.record_provider_rate_limit_exhausted(provider_name);
+                            self.metrics
+                                .record_provider_rate_limit_exhausted(provider_name);
                             let now_secs = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .map(|d| d.as_secs())
@@ -1572,11 +1716,20 @@ impl Router {
                         return Err(err);
                     }
                     if status_code == 503 {
-                        warn!(provider = provider_name, status = status_code, "Service unavailable, failing over immediately");
+                        warn!(
+                            provider = provider_name,
+                            status = status_code,
+                            "Service unavailable, failing over immediately"
+                        );
                         return Err(err);
                     }
-                    
-                    warn!(provider = provider_name, status = status_code, attempt, "Retryable error");
+
+                    warn!(
+                        provider = provider_name,
+                        status = status_code,
+                        attempt,
+                        "Retryable error"
+                    );
                     last_error = Some(err);
                 }
                 Err(e) => {
@@ -1605,7 +1758,7 @@ impl Router {
                 }
             }
         }
-        
+
         Err(last_error.unwrap_or_else(|| GatewayError::Provider {
             provider: provider_name.to_string(),
             message: "All retry attempts exhausted (context truncation retries may have consumed all attempts)".to_string(),
@@ -1645,7 +1798,8 @@ impl Router {
         // Some providers concatenate SSE chunks without newlines between them
         // e.g. "data: {...}data: {...}" instead of "data: {...}\ndata: {...}"
         // Split on "data: " boundaries to handle both cases.
-        let chunks_iter: Vec<&str> = body.split("data: ")
+        let chunks_iter: Vec<&str> = body
+            .split("data: ")
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
@@ -1671,13 +1825,16 @@ impl Router {
             // or finish_reason of "error". These indicate the provider failed
             // partway through generation.
             if let Some(error_obj) = chunk.get("error") {
-                let error_msg = error_obj.get("message")
+                let error_msg = error_obj
+                    .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown mid-stream error");
-                let error_status = error_obj.get("status")
+                let error_status = error_obj
+                    .get("status")
                     .and_then(|v| v.as_u64())
                     .map(|s| s as u16);
-                let error_code = error_obj.get("code")
+                let error_code = error_obj
+                    .get("code")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 tracing::warn!(
@@ -1693,11 +1850,15 @@ impl Router {
             if let Some(choices) = chunk.get("choices").and_then(|v| v.as_array()) {
                 if let Some(choice) = choices.first() {
                     if choice.get("finish_reason").and_then(|v| v.as_str()) == Some("error") {
-                        let delta_text = choice.get("delta")
+                        let delta_text = choice
+                            .get("delta")
                             .and_then(|d| d.get("content"))
                             .and_then(|c| c.as_str())
                             .unwrap_or("Provider returned error finish_reason");
-                        tracing::warn!(detail = delta_text, "Provider stream ended with finish_reason=error");
+                        tracing::warn!(
+                            detail = delta_text,
+                            "Provider stream ended with finish_reason=error"
+                        );
                         return Err(format!("Stream error: {}", delta_text));
                     }
                 }
@@ -1737,9 +1898,8 @@ impl Router {
                         // Accumulate streamed tool_calls by index
                         if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                             for tc_delta in tc_arr {
-                                let idx = tc_delta.get("index")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
+                                let idx =
+                                    tc_delta.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                                 let entry = tool_calls_map.entry(idx).or_insert_with(|| {
                                     serde_json::json!({
                                         "id": "",
@@ -1759,15 +1919,17 @@ impl Router {
                                 if let Some(func) = tc_delta.get("function") {
                                     if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
                                         if !name.is_empty() {
-                                            entry["function"]["name"] = serde_json::Value::String(name.to_string());
+                                            entry["function"]["name"] =
+                                                serde_json::Value::String(name.to_string());
                                         }
                                     }
-                                    if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
-                                        let existing = entry["function"]["arguments"]
-                                            .as_str()
-                                            .unwrap_or("");
+                                    if let Some(args) =
+                                        func.get("arguments").and_then(|v| v.as_str())
+                                    {
+                                        let existing =
+                                            entry["function"]["arguments"].as_str().unwrap_or("");
                                         entry["function"]["arguments"] = serde_json::Value::String(
-                                            format!("{}{}", existing, args)
+                                            format!("{}{}", existing, args),
                                         );
                                     }
                                 }
@@ -1815,7 +1977,10 @@ impl Router {
         let mut msg_extra = serde_json::Map::new();
         if !tool_calls_map.is_empty() {
             let tool_calls_vec: Vec<serde_json::Value> = tool_calls_map.into_values().collect();
-            msg_extra.insert("tool_calls".to_string(), serde_json::Value::Array(tool_calls_vec));
+            msg_extra.insert(
+                "tool_calls".to_string(),
+                serde_json::Value::Array(tool_calls_vec),
+            );
         }
         if !reasoning_content.is_empty() {
             msg_extra.insert(
@@ -1825,7 +1990,11 @@ impl Router {
         }
 
         Ok(OpenAIResponse {
-            id: if response_id.is_empty() { format!("chatcmpl-reassembled-{}", chunk_count) } else { response_id },
+            id: if response_id.is_empty() {
+                format!("chatcmpl-reassembled-{}", chunk_count)
+            } else {
+                response_id
+            },
             object: "chat.completion".to_string(),
             created,
             model,
@@ -1850,10 +2019,10 @@ impl Router {
     }
 
     /// Route request with failover orchestration
-    /// 
+    ///
     /// Iterates through providers in order, attempts each with retry logic,
     /// collects all attempts, returns aggregated error if all fail
-    /// 
+    ///
     /// Requirements: 8.1-8.10
     pub async fn route_with_failover(
         &self,
@@ -1884,20 +2053,28 @@ impl Router {
             .unwrap_or_default()
             .retry_on_truncation;
         drop(config);
-        
+
         for provider_model in providers {
             let start = std::time::Instant::now();
 
-            if let Some(budget_limit_usd) = provider_budgets.get(&provider_model.provider).copied() {
-                self.metrics.set_provider_budget_limit(&provider_model.provider, budget_limit_usd);
-                let current_cost_usd = self.metrics.current_provider_cost_usd(&provider_model.provider);
+            if let Some(budget_limit_usd) = provider_budgets.get(&provider_model.provider).copied()
+            {
+                self.metrics
+                    .set_provider_budget_limit(&provider_model.provider, budget_limit_usd);
+                let current_cost_usd = self
+                    .metrics
+                    .current_provider_cost_usd(&provider_model.provider);
                 if current_cost_usd >= budget_limit_usd {
                     warn!(provider = %provider_model.provider, spent_usd = current_cost_usd, budget_limit_usd, "Provider budget exhausted, skipping provider");
-                    self.metrics.record_provider_budget_exhausted(&provider_model.provider);
+                    self.metrics
+                        .record_provider_budget_exhausted(&provider_model.provider);
                     attempts.push(ProviderAttempt::new(
                         provider_model.provider.clone(),
                         provider_model.model.clone(),
-                        format!("Provider budget exhausted at ${:.2} / ${:.2}", current_cost_usd, budget_limit_usd),
+                        format!(
+                            "Provider budget exhausted at ${:.2} / ${:.2}",
+                            current_cost_usd, budget_limit_usd
+                        ),
                         Some(402),
                     ));
                     continue;
@@ -1953,7 +2130,8 @@ impl Router {
             let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
             if !rate_limiter.consume().await {
                 warn!(provider = %provider_model.provider, "Rate limit exhausted, skipping provider");
-                self.metrics.record_provider_rate_limit_exhausted(&provider_model.provider);
+                self.metrics
+                    .record_provider_rate_limit_exhausted(&provider_model.provider);
                 attempts.push(ProviderAttempt::new(
                     provider_model.provider.clone(),
                     provider_model.model.clone(),
@@ -1962,8 +2140,11 @@ impl Router {
                 ));
                 continue;
             }
-            
-            match self.attempt_with_retry(&provider_model.provider, request, &provider_model).await {
+
+            match self
+                .attempt_with_retry(&provider_model.provider, request, &provider_model)
+                .await
+            {
                 Ok(response) => {
                     // Validate that the response actually contains usable content.
                     // Some overwhelmed providers return 200 with empty choices or
@@ -1987,7 +2168,8 @@ impl Router {
                         attempts.push(ProviderAttempt::new(
                             provider_model.provider.clone(),
                             provider_model.model.clone(),
-                            "Provider returned empty response with no assistant content".to_string(),
+                            "Provider returned empty response with no assistant content"
+                                .to_string(),
                             Some(200),
                         ));
                         continue;
@@ -2014,8 +2196,7 @@ impl Router {
                             // completion_tokens reached (within 50 of) max_tokens,
                             // the response legitimately hit the requested limit.
                             Some(max_tokens) => {
-                                response.usage.completion_tokens
-                                    < max_tokens.saturating_sub(50)
+                                response.usage.completion_tokens < max_tokens.saturating_sub(50)
                             }
                             None => false,
                         };
@@ -2056,9 +2237,11 @@ impl Router {
                         // can be returned directly without reprocessing.
                         let mut candidate = response;
                         let input_cost = candidate.usage.prompt_tokens as f64
-                            * provider_model.cost_per_million_input_tokens / 1_000_000.0;
+                            * provider_model.cost_per_million_input_tokens
+                            / 1_000_000.0;
                         let output_cost = candidate.usage.completion_tokens as f64
-                            * provider_model.cost_per_million_output_tokens / 1_000_000.0;
+                            * provider_model.cost_per_million_output_tokens
+                            / 1_000_000.0;
                         let candidate_cost = input_cost + output_cost;
                         candidate.extra.insert(
                             "gateway_provider".to_string(),
@@ -2079,9 +2262,11 @@ impl Router {
                     // Record success
                     let duration = start.elapsed();
                     let duration_ms = duration.as_millis() as u64;
-                    self.latency_tracker.update_latency(&provider_model.provider, duration);
-                    self.metrics.record_provider_success(&provider_model.provider, duration_ms);
-                    
+                    self.latency_tracker
+                        .update_latency(&provider_model.provider, duration);
+                    self.metrics
+                        .record_provider_success(&provider_model.provider, duration_ms);
+
                     cb.record_success().await;
 
                     // Provider recovered — clear any upstream-driven cooldown
@@ -2106,16 +2291,19 @@ impl Router {
                         || response.usage.completion_tokens > 0;
                     let total_cost = if usage_known {
                         let input_cost = response.usage.prompt_tokens as f64
-                            * provider_model.cost_per_million_input_tokens / 1_000_000.0;
+                            * provider_model.cost_per_million_input_tokens
+                            / 1_000_000.0;
                         let output_cost = response.usage.completion_tokens as f64
-                            * provider_model.cost_per_million_output_tokens / 1_000_000.0;
+                            * provider_model.cost_per_million_output_tokens
+                            / 1_000_000.0;
                         let total_cost = input_cost + output_cost;
                         if total_cost > 0.0 {
                             self.metrics.add_cost(&provider_model.provider, total_cost);
                         }
                         total_cost
                     } else {
-                        self.metrics.record_provider_unknown_cost(&provider_model.provider);
+                        self.metrics
+                            .record_provider_unknown_cost(&provider_model.provider);
                         0.0
                     };
 
@@ -2143,11 +2331,10 @@ impl Router {
                         "gateway_responded_model".to_string(),
                         serde_json::Value::String(provider_model.model.clone()),
                     );
-                    response.extra.insert(
-                        "gateway_cost".to_string(),
-                        serde_json::json!(total_cost),
-                    );
-                    
+                    response
+                        .extra
+                        .insert("gateway_cost".to_string(), serde_json::json!(total_cost));
+
                     return Ok(response);
                 }
                 Err(e) => {
@@ -2170,10 +2357,7 @@ impl Router {
                     let friendly = if attempt_status == Some(429) {
                         None
                     } else {
-                        Some(Self::friendly_failure_reason(
-                            attempt_status,
-                            &raw_message,
-                        ))
+                        Some(Self::friendly_failure_reason(attempt_status, &raw_message))
                     };
                     self.metrics.record_provider_failure_with_reason(
                         &provider_model.provider,
@@ -2191,7 +2375,7 @@ impl Router {
                 }
             }
         }
-        
+
         // All providers failed.
         // Req 6.2: when every provider truncated with finish_reason=length we
         // return the longest partial (highest completion_tokens) rather than an
@@ -2216,7 +2400,9 @@ impl Router {
             return Ok(longest);
         }
 
-        Err(GatewayError::AllProvidersFailed(AggregatedError::new(attempts)))
+        Err(GatewayError::AllProvidersFailed(AggregatedError::new(
+            attempts,
+        )))
     }
 
     /// Check whether a provider response contains usable assistant content.
@@ -2243,9 +2429,13 @@ impl Router {
                 }
                 for tc in arr {
                     // Each tool call must have id, type, and function.name
-                    let has_id = tc.get("id").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+                    let has_id = tc
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty());
                     let has_type = tc.get("type").and_then(|v| v.as_str()).is_some();
-                    let has_fn_name = tc.get("function")
+                    let has_fn_name = tc
+                        .get("function")
                         .and_then(|f| f.get("name"))
                         .and_then(|n| n.as_str())
                         .is_some_and(|s| !s.is_empty());
@@ -2282,16 +2472,35 @@ impl Router {
     const KNOWN_TOOL_NAMES: &'static [&'static str] = &[
         // Sorted longest-first so Pattern 4 matches "edit_file" before "edit",
         // "read_file" before "read", etc.  Prevents prefix collisions.
-        "ask_followup_question", "access_mcp_resource", "attempt_completion",
-        "read_command_output", "run_slash_command", "fetch_instructions",
-        "update_todo_list", "execute_command", "codebase_search",
-        "generate_image", "search_replace", "write_to_file",
-        "search_files", "apply_patch", "switch_mode", "use_mcp_tool",
-        "apply_diff", "edit_file", "list_files", "read_file",
-        "new_task", "skill", "edit",
+        "ask_followup_question",
+        "access_mcp_resource",
+        "attempt_completion",
+        "read_command_output",
+        "run_slash_command",
+        "fetch_instructions",
+        "update_todo_list",
+        "execute_command",
+        "codebase_search",
+        "generate_image",
+        "search_replace",
+        "write_to_file",
+        "search_files",
+        "apply_patch",
+        "switch_mode",
+        "use_mcp_tool",
+        "apply_diff",
+        "edit_file",
+        "list_files",
+        "read_file",
+        "new_task",
+        "skill",
+        "edit",
         // Additional Roo Code / Cline / Kilo Code tools
-        "replace_in_file", "insert_code_block", "browser_action",
-        "list_code_definition_names", "inspect_site",
+        "replace_in_file",
+        "insert_code_block",
+        "browser_action",
+        "list_code_definition_names",
+        "inspect_site",
     ];
 
     /// Clients like Roo Code / Kilo Code expect native OpenAI `tool_calls` in
@@ -2314,7 +2523,10 @@ impl Router {
         let content_text = choice.message.content_as_text();
         // Some providers (e.g. Nano-GPT with thinking models) put tool calls
         // in a `reasoning` field instead of `content`. Check both.
-        let reasoning_text = choice.message.extra.get("reasoning")
+        let reasoning_text = choice
+            .message
+            .extra
+            .get("reasoning")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let combined_text = if content_text.is_empty() && !reasoning_text.is_empty() {
@@ -2501,7 +2713,13 @@ impl Router {
         open_tag_prefix: &str,
         close_tag: &str,
     ) {
-        Self::extract_xml_tool_calls_pattern_inner(text, tool_calls, open_tag_prefix, close_tag, true)
+        Self::extract_xml_tool_calls_pattern_inner(
+            text,
+            tool_calls,
+            open_tag_prefix,
+            close_tag,
+            true,
+        )
     }
 
     /// Inner extraction with control over greedy vs non-greedy close-tag matching.
@@ -2558,14 +2776,20 @@ impl Router {
             let Some(open_end) = full_tag.find('>') else {
                 // Malformed — remove this occurrence and continue looking
                 text.replace_range(start..close_end, "");
-                if dangling { break; }
+                if dangling {
+                    break;
+                }
                 continue;
             };
 
             let opening_tag = &full_tag[..=open_end];
             // When dangling (no close tag), body runs to end of full_tag.
             // Otherwise body ends where the close tag starts (relative to full_tag start).
-            let body_end = if dangling { full_tag.len() } else { close_start_rel };
+            let body_end = if dangling {
+                full_tag.len()
+            } else {
+                close_start_rel
+            };
             let body = &full_tag[open_end + 1..body_end];
 
             // Try to extract tool name from the opening tag attribute: name="..."
@@ -2597,7 +2821,7 @@ impl Router {
                     // Models often emit JSON with literal newlines, tabs, or other
                     // control characters inside string values. Escape them and retry.
                     let sanitized = body_trimmed
-                        .replace("\\\n", "\\n")   // already-escaped but with literal newline
+                        .replace("\\\n", "\\n") // already-escaped but with literal newline
                         .replace('\n', "\\n")
                         .replace('\r', "\\r")
                         .replace('\t', "\\t")
@@ -2619,27 +2843,39 @@ impl Router {
                         );
                         (tag_n.clone(), repaired.to_string())
                     } else {
-                    // ── Attempt 2: naive key extraction (last resort) ──
-                    // Strip outer braces and try to find "key":"value" pattern
-                    let inner = body_trimmed.trim_start_matches('{').trim_end_matches('}').trim();
-                    let mut recovered = serde_json::Map::new();
-                    // Find first "key": pattern
-                    if let Some(colon_pos) = inner.find(':') {
-                        let key = inner[..colon_pos].trim().trim_matches('"');
-                        let val = inner[colon_pos + 1..].trim();
-                        // Strip surrounding quotes if present
-                        let val_clean = if val.starts_with('"') {
-                            val.trim_start_matches('"').trim_end_matches('"')
-                        } else {
-                            val
-                        };
-                        recovered.insert(key.to_string(), serde_json::Value::String(val_clean.to_string()));
-                    }
-                    if recovered.is_empty() {
-                        // Total fallback: use the whole body as a "result" or "input" param
-                        recovered.insert("result".to_string(), serde_json::Value::String(body_trimmed.to_string()));
-                    }
-                    (tag_n.clone(), serde_json::Value::Object(recovered).to_string())
+                        // ── Attempt 2: naive key extraction (last resort) ──
+                        // Strip outer braces and try to find "key":"value" pattern
+                        let inner = body_trimmed
+                            .trim_start_matches('{')
+                            .trim_end_matches('}')
+                            .trim();
+                        let mut recovered = serde_json::Map::new();
+                        // Find first "key": pattern
+                        if let Some(colon_pos) = inner.find(':') {
+                            let key = inner[..colon_pos].trim().trim_matches('"');
+                            let val = inner[colon_pos + 1..].trim();
+                            // Strip surrounding quotes if present
+                            let val_clean = if val.starts_with('"') {
+                                val.trim_start_matches('"').trim_end_matches('"')
+                            } else {
+                                val
+                            };
+                            recovered.insert(
+                                key.to_string(),
+                                serde_json::Value::String(val_clean.to_string()),
+                            );
+                        }
+                        if recovered.is_empty() {
+                            // Total fallback: use the whole body as a "result" or "input" param
+                            recovered.insert(
+                                "result".to_string(),
+                                serde_json::Value::String(body_trimmed.to_string()),
+                            );
+                        }
+                        (
+                            tag_n.clone(),
+                            serde_json::Value::Object(recovered).to_string(),
+                        )
                     }
                 } else {
                     // Body is plain text, not JSON. Wrap it as the primary parameter.
@@ -2650,16 +2886,21 @@ impl Router {
                         _ => "input",
                     };
                     let mut map = serde_json::Map::new();
-                    map.insert(param_name.to_string(), serde_json::Value::String(body_trimmed.to_string()));
+                    map.insert(
+                        param_name.to_string(),
+                        serde_json::Value::String(body_trimmed.to_string()),
+                    );
                     (tag_n.clone(), serde_json::Value::Object(map).to_string())
                 }
             } else if let Some(ref obj) = parsed {
                 // Pattern: <tool_call>{"name":"X","arguments":{...}}</tool_call>
-                let name = obj.get("name")
+                let name = obj
+                    .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let args = obj.get("arguments")
+                let args = obj
+                    .get("arguments")
                     .map(|v| {
                         if v.is_string() {
                             v.as_str().unwrap_or("{}").to_string()
@@ -2691,7 +2932,9 @@ impl Router {
                     "Skipping malformed XML tool call (unparseable body, no name attribute)"
                 );
                 text.replace_range(start..close_end, "");
-                if dangling { break; }
+                if dangling {
+                    break;
+                }
                 continue;
             };
 
@@ -2713,7 +2956,9 @@ impl Router {
 
             // Remove the XML tag from the text
             text.replace_range(start..close_end, "");
-            if dangling { break; }
+            if dangling {
+                break;
+            }
         }
     }
 
@@ -2768,7 +3013,10 @@ impl Router {
                             .filter_map(|f| f.get("path").and_then(|p| p.as_str()))
                             .collect();
                         if !paths.is_empty() {
-                            obj.insert("path".to_string(), serde_json::Value::String(paths.join("\n")));
+                            obj.insert(
+                                "path".to_string(),
+                                serde_json::Value::String(paths.join("\n")),
+                            );
                             changed = true;
                         }
                     }
@@ -2936,10 +3184,7 @@ impl Router {
     /// Parse Anthropic-style `<tool_calls><invoke name="X"><parameter name="Y">V</parameter>...</invoke></tool_calls>`
     /// into native tool_calls. Handles one or more `<invoke>` blocks inside a `<tool_calls>` wrapper,
     /// as well as bare `<invoke>` blocks without the wrapper.
-    fn extract_invoke_style_tool_calls(
-        text: &mut String,
-        tool_calls: &mut Vec<serde_json::Value>,
-    ) {
+    fn extract_invoke_style_tool_calls(text: &mut String, tool_calls: &mut Vec<serde_json::Value>) {
         // Try wrapped form first: <tool_calls>...</tool_calls>
         while let Some(wrapper_start) = text.find("<tool_calls>") {
             let after_open = wrapper_start + "<tool_calls>".len();
@@ -2973,7 +3218,9 @@ impl Router {
 
         // Also handle bare <invoke> blocks without wrapper
         while text.contains("<invoke ") {
-            let Some(start) = text.find("<invoke ") else { break };
+            let Some(start) = text.find("<invoke ") else {
+                break;
+            };
             if let Some(close_rel) = text[start..].find("</invoke>") {
                 let block_end = start + close_rel + "</invoke>".len();
                 let block = text[start..block_end].to_string();
@@ -3000,7 +3247,9 @@ impl Router {
                 .unwrap_or_else(|| "unknown".to_string());
 
             // Find end of opening tag
-            let Some(open_end) = remaining.find('>') else { break };
+            let Some(open_end) = remaining.find('>') else {
+                break;
+            };
             let after_open = open_end + 1;
 
             // Find </invoke> or end of string
@@ -3016,7 +3265,9 @@ impl Router {
                 param_remaining = &param_remaining[p_start..];
                 let param_name = Self::extract_xml_attribute(param_remaining, "name")
                     .unwrap_or_else(|| "unknown".to_string());
-                let Some(p_open_end) = param_remaining.find('>') else { break };
+                let Some(p_open_end) = param_remaining.find('>') else {
+                    break;
+                };
                 let p_after = p_open_end + 1;
                 let p_close = param_remaining[p_after..]
                     .find("</parameter>")
@@ -3062,12 +3313,20 @@ impl Router {
             Err(_) => return,
         };
         for obj in arr {
-            let name = obj.get("name")
+            let name = obj
+                .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string();
-            let arguments = obj.get("arguments")
-                .map(|v| if v.is_string() { v.as_str().unwrap_or("{}").to_string() } else { v.to_string() })
+            let arguments = obj
+                .get("arguments")
+                .map(|v| {
+                    if v.is_string() {
+                        v.as_str().unwrap_or("{}").to_string()
+                    } else {
+                        v.to_string()
+                    }
+                })
                 .unwrap_or_else(|| {
                     let mut m = obj.as_object().cloned().unwrap_or_default();
                     m.remove("name");
@@ -3092,13 +3351,19 @@ impl Router {
         for name in tool_names {
             let pattern = format!("<{}<arg_key>", name);
             loop {
-                let Some(start) = text.find(&pattern) else { break };
+                let Some(start) = text.find(&pattern) else {
+                    break;
+                };
                 // Find the end — could be </tool_call> or end of text
                 let search_from = start + pattern.len();
-                let block_end = text[search_from..].find("</tool_call>")
+                let block_end = text[search_from..]
+                    .find("</tool_call>")
                     .map(|p| search_from + p + "</tool_call>".len())
-                    .or_else(|| text[search_from..].find(&format!("</{}>", name))
-                        .map(|p| search_from + p + format!("</{}>", name).len()))
+                    .or_else(|| {
+                        text[search_from..]
+                            .find(&format!("</{}>", name))
+                            .map(|p| search_from + p + format!("</{}>", name).len())
+                    })
                     .unwrap_or(text.len());
 
                 let block = text[start..block_end].to_string();
@@ -3108,7 +3373,9 @@ impl Router {
                 let mut remaining = block.as_str();
                 while let Some(key_start) = remaining.find("<arg_key>") {
                     let key_content_start = key_start + "<arg_key>".len();
-                    let Some(key_end) = remaining[key_content_start..].find("</arg_key>") else { break };
+                    let Some(key_end) = remaining[key_content_start..].find("</arg_key>") else {
+                        break;
+                    };
                     let key = &remaining[key_content_start..key_content_start + key_end];
 
                     let after_key = key_content_start + key_end + "</arg_key>".len();
@@ -3116,7 +3383,8 @@ impl Router {
 
                     if let Some(val_start) = remaining.find("<arg_value>") {
                         let val_content_start = val_start + "<arg_value>".len();
-                        let val_end = remaining[val_content_start..].find("</arg_value>")
+                        let val_end = remaining[val_content_start..]
+                            .find("</arg_value>")
                             .unwrap_or(remaining.len() - val_content_start);
                         let value = &remaining[val_content_start..val_content_start + val_end];
 
@@ -3163,10 +3431,7 @@ impl Router {
     /// ```
     ///
     /// Also handles variants with `functions_` prefix (e.g. `functions_list_files_6`).
-    fn extract_kimi_token_tool_calls(
-        text: &mut String,
-        tool_calls: &mut Vec<serde_json::Value>,
-    ) {
+    fn extract_kimi_token_tool_calls(text: &mut String, tool_calls: &mut Vec<serde_json::Value>) {
         const SECTION_BEGIN: &str = "<|tool_calls_section_begin|>";
         const SECTION_END: &str = "<|tool_calls_section_end|>";
         const CALL_BEGIN: &str = "<|tool_call_begin|>";
@@ -3174,7 +3439,8 @@ impl Router {
         const ARG_BEGIN: &str = "<|tool_call_argument_begin|>";
 
         while let Some(sec_start) = text.find(SECTION_BEGIN) {
-            let sec_end_pos = text[sec_start..].find(SECTION_END)
+            let sec_end_pos = text[sec_start..]
+                .find(SECTION_END)
                 .map(|p| sec_start + p + SECTION_END.len())
                 .unwrap_or(text.len());
 
@@ -3184,7 +3450,8 @@ impl Router {
             let mut remaining = section.as_str();
             while let Some(call_start) = remaining.find(CALL_BEGIN) {
                 let after_call_begin = call_start + CALL_BEGIN.len();
-                let call_end = remaining[after_call_begin..].find(CALL_END)
+                let call_end = remaining[after_call_begin..]
+                    .find(CALL_END)
                     .map(|p| after_call_begin + p)
                     .unwrap_or(remaining.len());
 
@@ -3204,7 +3471,10 @@ impl Router {
                     let args_json = if serde_json::from_str::<serde_json::Value>(args_str).is_ok() {
                         args_str.to_string()
                     } else {
-                        format!("{{\"input\":{}}}", serde_json::Value::String(args_str.to_string()))
+                        format!(
+                            "{{\"input\":{}}}",
+                            serde_json::Value::String(args_str.to_string())
+                        )
                     };
 
                     let call_id = format!("call_xlat_{}", tool_calls.len());
@@ -3231,7 +3501,8 @@ impl Router {
         // Handle bare <|tool_call_begin|>...<|tool_call_end|> without section wrapper
         while let Some(call_start) = text.find(CALL_BEGIN) {
             let after_begin = call_start + CALL_BEGIN.len();
-            let call_end = text[after_begin..].find(CALL_END)
+            let call_end = text[after_begin..]
+                .find(CALL_END)
                 .map(|p| after_begin + p)
                 .unwrap_or(text.len());
             let block_end = if call_end + CALL_END.len() <= text.len() {
@@ -3248,7 +3519,10 @@ impl Router {
                 let args_json = if serde_json::from_str::<serde_json::Value>(args_str).is_ok() {
                     args_str.to_string()
                 } else {
-                    format!("{{\"input\":{}}}", serde_json::Value::String(args_str.to_string()))
+                    format!(
+                        "{{\"input\":{}}}",
+                        serde_json::Value::String(args_str.to_string())
+                    )
                 };
                 let call_id = format!("call_xlat_{}", tool_calls.len());
                 tool_calls.push(serde_json::json!({
@@ -3315,7 +3589,9 @@ impl Router {
     /// Strip Kimi-style special tokens from all text content in a response.
     /// Operates on the first choice's message content.
     fn sanitize_kimi_tokens_in_response(response: &mut OpenAIResponse) {
-        let Some(choice) = response.choices.first_mut() else { return };
+        let Some(choice) = response.choices.first_mut() else {
+            return;
+        };
         let content_text = choice.message.content_as_text();
         if content_text.contains("<|tool_call") || content_text.contains("<|tool_sep|>") {
             let mut cleaned = content_text.clone();
@@ -3348,7 +3624,9 @@ impl Router {
                 continue;
             }
 
-            let is_xlat = msg.extra.get("tool_calls")
+            let is_xlat = msg
+                .extra
+                .get("tool_calls")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter().any(|tc| {
@@ -3365,7 +3643,9 @@ impl Router {
             }
 
             // Convert tool_calls back to XML content
-            let tool_calls = messages[i].extra.get("tool_calls")
+            let tool_calls = messages[i]
+                .extra
+                .get("tool_calls")
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
@@ -3378,11 +3658,13 @@ impl Router {
             };
 
             for tc in &tool_calls {
-                let fn_name = tc.get("function")
+                let fn_name = tc
+                    .get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
                     .unwrap_or("unknown");
-                let fn_args = tc.get("function")
+                let fn_args = tc
+                    .get("function")
                     .and_then(|f| f.get("arguments"))
                     .and_then(|a| a.as_str())
                     .unwrap_or("{}");
@@ -3402,7 +3684,9 @@ impl Router {
             // Convert following tool result messages to user messages with the output
             while i < messages.len() && messages[i].role == "tool" {
                 let tool_content = messages[i].content_as_text();
-                let tool_name = messages[i].extra.get("tool_call_id")
+                let tool_name = messages[i]
+                    .extra
+                    .get("tool_call_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("tool")
                     .to_string();
@@ -3464,7 +3748,9 @@ impl Router {
                     "stop",
                 ];
                 let before = outgoing.extra.len();
-                outgoing.extra.retain(|k, _| NIM_ALLOWED.contains(&k.as_str()));
+                outgoing
+                    .extra
+                    .retain(|k, _| NIM_ALLOWED.contains(&k.as_str()));
                 before - outgoing.extra.len()
             }
             // Other provider types pass through unmodified
@@ -3504,10 +3790,8 @@ impl Router {
                 serde_json::Value::Array(arr) => {
                     // Already correct shape — put it back.
                     if !arr.is_empty() {
-                        msg.extra.insert(
-                            "tool_calls".to_string(),
-                            serde_json::Value::Array(arr),
-                        );
+                        msg.extra
+                            .insert("tool_calls".to_string(), serde_json::Value::Array(arr));
                     }
                     // Empty array → drop it to avoid confusing providers.
                 }
@@ -3540,7 +3824,8 @@ impl Router {
                                 .filter_map(|(k, v)| k.parse::<usize>().ok().map(|idx| (idx, v)))
                                 .collect();
                             entries.sort_by_key(|(idx, _)| *idx);
-                            let arr: Vec<serde_json::Value> = entries.into_iter().map(|(_, v)| v).collect();
+                            let arr: Vec<serde_json::Value> =
+                                entries.into_iter().map(|(_, v)| v).collect();
                             if !arr.is_empty() {
                                 warn!(
                                     role = %msg.role,
@@ -3624,7 +3909,7 @@ impl Router {
             Some("function_call") => false,
             Some("length") => false,
             Some("content_filter") => false,
-            None => true, // some providers omit finish_reason on success
+            None => true,     // some providers omit finish_reason on success
             Some(_) => false, // unknown finish_reason — don't cache
         }
     }
@@ -3697,9 +3982,9 @@ impl Router {
     }
 
     /// Route non-streaming request
-    /// 
+    ///
     /// Integrates provider selection, retry, failover, and cost calculation
-    /// 
+    ///
     /// Requirements: 2.1, 30.1, 30.2
     pub async fn route_request(
         &self,
@@ -3714,20 +3999,22 @@ impl Router {
         // Find model group
         let model_group = self.find_model_group(&prepared_request.model).await?;
         debug!(group = %model_group.name, "Found model group");
-        
+
         // Select provider order
         let providers = self.select_provider_order(&model_group).await;
         debug!(count = providers.len(), "Selected providers");
-        
+
         if providers.is_empty() {
             return Err(GatewayError::InvalidRequest(
-                "No available providers for model".to_string()
+                "No available providers for model".to_string(),
             ));
         }
-        
+
         // Route with failover
-        let response = self.route_with_failover(&prepared_request, providers).await?;
-        
+        let response = self
+            .route_with_failover(&prepared_request, providers)
+            .await?;
+
         Ok(response)
     }
 
@@ -3960,15 +4247,13 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
 
         // Base URL normalization — strip trailing '/', ensure '/v1'; Bedrock
         // Mantle special-case kept for parity (Bedrock never reaches here).
-        let mut base_url = if provider_type == "bedrock"
-            && !api_key.is_empty()
-            && !custom_vpc_endpoint
-        {
-            let region = provider_region.as_deref().unwrap_or("us-east-1");
-            format!("https://bedrock-mantle.{}.api.aws/v1", region)
-        } else {
-            configured_base_url.unwrap_or_default()
-        };
+        let mut base_url =
+            if provider_type == "bedrock" && !api_key.is_empty() && !custom_vpc_endpoint {
+                let region = provider_region.as_deref().unwrap_or("us-east-1");
+                format!("https://bedrock-mantle.{}.api.aws/v1", region)
+            } else {
+                configured_base_url.unwrap_or_default()
+            };
         base_url = base_url.trim_end_matches('/').to_string();
         if !base_url.ends_with("/v1") {
             base_url.push_str("/v1");
@@ -4062,12 +4347,19 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             .pool_max_idle_per_host(pool_config.max_idle_per_host as usize)
             .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
             .build()
-            .map_err(|e| GatewayError::Configuration(format!("Failed to build HTTP client: {}", e)))?;
-        self.http_clients.insert(provider_name.to_string(), http_client.clone());
+            .map_err(|e| {
+                GatewayError::Configuration(format!("Failed to build HTTP client: {}", e))
+            })?;
+        self.http_clients
+            .insert(provider_name.to_string(), http_client.clone());
         Ok(http_client)
     }
 
-    fn calculate_retry_delay(base_delay_secs: u64, jitter_enabled: bool, jitter_ratio: f64) -> Duration {
+    fn calculate_retry_delay(
+        base_delay_secs: u64,
+        jitter_enabled: bool,
+        jitter_ratio: f64,
+    ) -> Duration {
         if !jitter_enabled || jitter_ratio <= 0.0 {
             return Duration::from_secs(base_delay_secs);
         }
@@ -4141,7 +4433,7 @@ mod tests {
 
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
         let result = router.find_model_group("gpt-4").await;
-        
+
         assert!(result.is_ok());
         assert_eq!(result.unwrap().name, "gpt-4-group");
     }
@@ -4151,7 +4443,7 @@ mod tests {
         let config = create_test_config();
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
         let result = router.find_model_group("unknown-model").await;
-        
+
         assert!(result.is_err());
     }
 
@@ -4182,7 +4474,7 @@ mod tests {
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
         let model_group = router.find_model_group("model-1").await.unwrap();
         let order = router.select_provider_order(&model_group).await;
-        
+
         assert_eq!(order.len(), 2);
         assert_eq!(order[0].provider, "provider-high-priority");
         assert_eq!(order[1].provider, "provider-low-priority");
@@ -4215,7 +4507,7 @@ mod tests {
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
         let model_group = router.find_model_group("model-1").await.unwrap();
         let order = router.select_provider_order(&model_group).await;
-        
+
         assert_eq!(order.len(), 2);
         assert_eq!(order[0].provider, "cheap-provider");
         assert_eq!(order[1].provider, "expensive-provider");
@@ -4246,14 +4538,18 @@ mod tests {
         }];
 
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
-        
+
         // Set latencies
-        router.latency_tracker.update_latency("slow-provider", std::time::Duration::from_millis(500));
-        router.latency_tracker.update_latency("fast-provider", std::time::Duration::from_millis(100));
-        
+        router
+            .latency_tracker
+            .update_latency("slow-provider", std::time::Duration::from_millis(500));
+        router
+            .latency_tracker
+            .update_latency("fast-provider", std::time::Duration::from_millis(100));
+
         let model_group = router.find_model_group("model-1").await.unwrap();
         let order = router.select_provider_order(&model_group).await;
-        
+
         assert_eq!(order.len(), 2);
         // Costs are within 10%, so should sort by latency
         assert_eq!(order[0].provider, "fast-provider");
@@ -4262,8 +4558,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_extract_version_date() {
-        assert_eq!(Router::extract_version_date("gpt-4-turbo-2024-04-09"), (2024, 4, 9));
-        assert_eq!(Router::extract_version_date("claude-3-opus-2024-02-29"), (2024, 2, 29));
+        assert_eq!(
+            Router::extract_version_date("gpt-4-turbo-2024-04-09"),
+            (2024, 4, 9)
+        );
+        assert_eq!(
+            Router::extract_version_date("claude-3-opus-2024-02-29"),
+            (2024, 2, 29)
+        );
         assert_eq!(Router::extract_version_date("gpt-4"), (0, 0, 0));
         assert_eq!(Router::extract_version_date("model-name"), (0, 0, 0));
     }
@@ -4300,9 +4602,12 @@ mod tests {
         }];
 
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
-        let model_group = router.find_model_group("gpt-4-turbo-2024-01-25").await.unwrap();
+        let model_group = router
+            .find_model_group("gpt-4-turbo-2024-01-25")
+            .await
+            .unwrap();
         let order = router.select_provider_order(&model_group).await;
-        
+
         assert_eq!(order.len(), 3);
         // Should be sorted by version date descending (newest first)
         assert_eq!(order[0].model, "gpt-4-turbo-2024-04-09");
@@ -4314,8 +4619,12 @@ mod tests {
     fn test_http_client_reused_per_provider() {
         let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
         let pool_config = crate::config::ProviderConnectionPoolConfig::default();
-        let _client1 = router.get_or_create_http_client("provider-a", &pool_config).unwrap();
-        let _client2 = router.get_or_create_http_client("provider-a", &pool_config).unwrap();
+        let _client1 = router
+            .get_or_create_http_client("provider-a", &pool_config)
+            .unwrap();
+        let _client2 = router
+            .get_or_create_http_client("provider-a", &pool_config)
+            .unwrap();
         assert_eq!(router.http_clients.len(), 1);
     }
 
@@ -4330,7 +4639,10 @@ mod tests {
 
         let response = Router::reassemble_sse_response(body).expect("response should reassemble");
 
-        assert_eq!(response.choices[0].message.content, serde_json::json!("answer"));
+        assert_eq!(
+            response.choices[0].message.content,
+            serde_json::json!("answer")
+        );
         assert_eq!(
             response.choices[0].message.extra.get("reasoning_content"),
             Some(&serde_json::json!("thinking"))
@@ -4413,18 +4725,79 @@ mod tests {
         assert!(matches!(result, Err(GatewayError::AllProvidersFailed(_))));
 
         let snapshot = router_metrics.snapshot();
-        let exhausted = snapshot.budget_exhaustions_by_provider.iter()
+        let exhausted = snapshot
+            .budget_exhaustions_by_provider
+            .iter()
             .find(|(provider, _)| provider == "budgeted-provider")
             .map(|(_, count)| *count)
             .unwrap_or(0);
         assert_eq!(exhausted, 1);
     }
+
+    #[test]
+    fn test_strip_image_content_if_unsupported_removes_image_parts() {
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "https://x.example/p.png"}},
+                ]),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        let parts = request.messages[0].content.as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], serde_json::json!("text"));
+    }
+
+    #[test]
+    fn test_strip_image_content_if_unsupported_keeps_images_for_vision_model() {
+        let mut request = OpenAIRequest {
+            model: "vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "https://x.example/p.png"}},
+                ]),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            true,
+            "test-provider",
+            "vision",
+        );
+        assert_eq!(removed, 0);
+        let parts = request.messages[0].content.as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+    }
 }
 
 #[cfg(test)]
 mod property_tests {
-    use super::*;
     use super::tests::{create_test_config, test_metrics};
+    use super::*;
     use proptest::prelude::*;
 
     // Generator for ProviderModel
@@ -4436,12 +4809,14 @@ mod property_tests {
             0.0..100.0f64,
             1u32..1000,
         )
-            .prop_map(|(provider, model, input_cost, output_cost, priority)| ProviderModel {
-                provider,
-                model,
-                cost_per_million_input_tokens: input_cost,
-                cost_per_million_output_tokens: output_cost,
-                priority,
+            .prop_map(|(provider, model, input_cost, output_cost, priority)| {
+                ProviderModel {
+                    provider,
+                    model,
+                    cost_per_million_input_tokens: input_cost,
+                    cost_per_million_output_tokens: output_cost,
+                    priority,
+                }
             })
     }
 
@@ -4467,7 +4842,7 @@ mod property_tests {
 
         /// **Property 1: Model Group Membership Preservation**
         /// **Validates: Requirements 4.2, 4.5**
-        /// 
+        ///
         /// For any model group and any provider selection from that group,
         /// all selected providers must be members of that model group.
         #[test]
@@ -4476,14 +4851,14 @@ mod property_tests {
             rt.block_on(async {
                 let mut config = create_test_config();
                 config.model_groups = vec![model_group.clone()];
-                
+
                 let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
                 let selected = router.select_provider_order(&model_group).await;
-                
+
                 // All selected providers must be in the original model group
-                let original_providers: std::collections::HashSet<_> = 
+                let original_providers: std::collections::HashSet<_> =
                     model_group.models.iter().map(|m| &m.provider).collect();
-                
+
                 for selected_model in &selected {
                     prop_assert!(
                         original_providers.contains(&selected_model.provider),
@@ -4491,14 +4866,14 @@ mod property_tests {
                         selected_model.provider
                     );
                 }
-                
+
                 Ok(())
             })?;
         }
 
         /// **Property 2: Provider Selection Ordering**
         /// **Validates: Requirements 6.2, 6.3, 7.2, 28.2-28.4, 5.2**
-        /// 
+        ///
         /// For any model group with multiple providers, the router shall order providers by:
         /// (1) priority ascending, (2) cost ascending within same priority,
         /// (3) latency ascending within similar costs (±10%),
@@ -4509,10 +4884,10 @@ mod property_tests {
             rt.block_on(async {
                 let mut config = create_test_config();
                 config.model_groups = vec![model_group.clone()];
-                
+
                 let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
                 let selected = router.select_provider_order(&model_group).await;
-                
+
                 // Check priority ordering (ascending)
                 for window in selected.windows(2) {
                     let (a, b) = (&window[0], &window[1]);
@@ -4521,14 +4896,14 @@ mod property_tests {
                         "Priority ordering violated: {} > {}",
                         a.priority, b.priority
                     );
-                    
+
                     // Within same priority, check cost ordering
                     if a.priority == b.priority {
                         let cost_a = a.total_cost();
                         let cost_b = b.total_cost();
                         let cost_diff = (cost_a - cost_b).abs();
                         let cost_threshold = cost_a.min(cost_b) * 0.1;
-                        
+
                         // If costs differ by more than 10%, lower cost should come first
                         if cost_diff > cost_threshold {
                             prop_assert!(
@@ -4539,14 +4914,14 @@ mod property_tests {
                         }
                     }
                 }
-                
+
                 Ok(())
             })?;
         }
 
         /// **Property 18: Model Group Lookup**
         /// **Validates: Requirements 4.4**
-        /// 
+        ///
         /// For any model name that exists in the configuration,
         /// the router shall identify exactly one model group containing that model.
         #[test]
@@ -4556,19 +4931,19 @@ mod property_tests {
                 let mut config = create_test_config();
                 let group_name = model_group.name.clone();
                 config.model_groups = vec![model_group.clone()];
-                
+
                 let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
-                
+
                 // Test lookup for each model in the group
                 for provider_model in &model_group.models {
                     let result = router.find_model_group(&provider_model.model).await;
-                    
+
                     prop_assert!(
                         result.is_ok(),
                         "Failed to find model group for model '{}'",
                         provider_model.model
                     );
-                    
+
                     let found_group = result.unwrap();
                     prop_assert_eq!(
                         &found_group.name,
@@ -4576,7 +4951,7 @@ mod property_tests {
                         "Found wrong model group"
                     );
                 }
-                
+
                 Ok(())
             })?;
         }
@@ -4584,7 +4959,7 @@ mod property_tests {
 
     /// **Property 19: Model Group Validation**
     /// **Validates: Requirements 4.3**
-    /// 
+    ///
     /// For any model group configuration, validation shall fail if any model
     /// is missing a provider field or model identifier field.
     #[test]
@@ -4601,14 +4976,14 @@ mod property_tests {
                 priority: 100,
             }],
         };
-        
+
         let mut config = create_test_config();
         config.model_groups = vec![invalid_group];
-        
+
         // Validation should catch this during config validation
         // (This is tested in config validation tests, but we verify the structure here)
         assert!(config.model_groups[0].models[0].provider.is_empty());
-        
+
         // Test with empty model
         let invalid_group2 = ModelGroup {
             name: "test-group".to_string(),
@@ -4621,10 +4996,10 @@ mod property_tests {
                 priority: 100,
             }],
         };
-        
+
         let mut config2 = create_test_config();
         config2.model_groups = vec![invalid_group2];
-        
+
         assert!(config2.model_groups[0].models[0].model.is_empty());
     }
 
@@ -4640,16 +5015,28 @@ mod property_tests {
 
     #[test]
     fn test_is_rate_limited_non_rate_limit_4xx() {
-        assert!(!Router::is_rate_limited(400, r#"{"error":{"message":"bad request"}}"#));
-        assert!(!Router::is_rate_limited(401, r#"{"error":{"message":"unauthorized"}}"#));
-        assert!(!Router::is_rate_limited(404, r#"{"error":{"message":"not found"}}"#));
+        assert!(!Router::is_rate_limited(
+            400,
+            r#"{"error":{"message":"bad request"}}"#
+        ));
+        assert!(!Router::is_rate_limited(
+            401,
+            r#"{"error":{"message":"unauthorized"}}"#
+        ));
+        assert!(!Router::is_rate_limited(
+            404,
+            r#"{"error":{"message":"not found"}}"#
+        ));
     }
 
     #[test]
     fn test_is_rate_limited_5xx_ignored() {
         // 5xx aren't rate-limit signals even if message mentions limits.
         assert!(!Router::is_rate_limited(503, "service unavailable"));
-        assert!(!Router::is_rate_limited(500, r#"{"error":{"message":"internal"}}"#));
+        assert!(!Router::is_rate_limited(
+            500,
+            r#"{"error":{"message":"internal"}}"#
+        ));
     }
 
     #[test]
@@ -4678,13 +5065,15 @@ mod property_tests {
 
     #[test]
     fn test_is_rate_limited_200_normal_response_not_flagged() {
-        let body = r#"{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
+        let body =
+            r#"{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
         assert!(!Router::is_rate_limited(200, body));
     }
 
     #[test]
     fn test_is_rate_limited_200_unrelated_error_not_flagged() {
-        let body = r#"{"error":{"message":"context length exceeded","type":"invalid_request_error"}}"#;
+        let body =
+            r#"{"error":{"message":"context length exceeded","type":"invalid_request_error"}}"#;
         assert!(!Router::is_rate_limited(200, body));
     }
 
@@ -5070,7 +5459,9 @@ mod property_tests {
         // Simulate a 429 with a long Retry-After landing on `primary`.
         // Both stores get written, just like the real 429 handler does.
         let limiter = router.get_rate_limiter("primary").await;
-        limiter.apply_cooldown(Duration::from_secs(60 * 60 * 23)).await;
+        limiter
+            .apply_cooldown(Duration::from_secs(60 * 60 * 23))
+            .await;
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -5089,7 +5480,11 @@ mod property_tests {
         // candidate list. Without the metrics check, primary would be
         // reinstated here (None => true), and a request would be issued.
         let order = router.select_provider_order(&group).await;
-        assert_eq!(order.len(), 1, "primary must still be filtered after reload");
+        assert_eq!(
+            order.len(),
+            1,
+            "primary must still be filtered after reload"
+        );
         assert_eq!(order[0].provider, "backup");
 
         // Sanity: clearing the metrics cooldown restores eligibility.

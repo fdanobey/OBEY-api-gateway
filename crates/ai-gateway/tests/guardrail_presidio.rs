@@ -62,10 +62,7 @@ async fn request_payload_contains_text_and_configured_entities() {
     assert!(findings.is_empty(), "empty upstream response → no findings");
 
     // Inspect the request wiremock actually received (Req 6.1).
-    let requests = server
-        .received_requests()
-        .await
-        .expect("recording enabled");
+    let requests = server.received_requests().await.expect("recording enabled");
     assert_eq!(requests.len(), 1, "exactly one analyze request sent");
 
     let body: Value = serde_json::from_slice(&requests[0].body).expect("payload is JSON");
@@ -104,7 +101,11 @@ async fn successful_response_maps_entities_to_findings() {
         .await
         .expect("analyze succeeds");
 
-    assert_eq!(findings.len(), 2, "only configured, at/above-threshold hits");
+    assert_eq!(
+        findings.len(),
+        2,
+        "only configured, at/above-threshold hits"
+    );
     assert_eq!(findings[0].entity_label, "EMAIL_ADDRESS");
     assert_eq!((findings[0].start, findings[0].end), (14, 30));
     assert_eq!(findings[0].score, Some(0.99));

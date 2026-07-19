@@ -37,7 +37,9 @@ use crate::gateway::AppState;
 
 use super::models::{AuthenticatedKey, CachedKey, KeyStatus, UsageRecord};
 use super::store::StoredVirtualKey;
-use super::{compute_cost, sha256_hex, AccessError, BudgetError, RateLimitError, VirtualKeyManager};
+use super::{
+    compute_cost, sha256_hex, AccessError, BudgetError, RateLimitError, VirtualKeyManager,
+};
 
 /// Authentication failure for a presented virtual key.
 ///
@@ -308,11 +310,7 @@ async fn enforce_authenticated(
         };
         let model = serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
-            .and_then(|v| {
-                v.get("model")
-                    .and_then(|m| m.as_str())
-                    .map(str::to_string)
-            });
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
 
         // Req 6.4: model access is checked BEFORE budget / rate limit so denied
         // requests consume no budget or rate-limit capacity.
@@ -364,7 +362,11 @@ fn budget_exhausted_response(err: &BudgetError) -> Response {
         BudgetError::BudgetExhausted => "USD budget limit reached",
         BudgetError::TokenBudgetExhausted => "Token budget limit reached",
     };
-    (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": message }))).into_response()
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({ "error": message })),
+    )
+        .into_response()
 }
 
 /// Map a [`RateLimitError`] to HTTP 429 + `Retry-After` (design HTTP Error
@@ -572,7 +574,10 @@ mod tests {
         assert_eq!(authed.status, KeyStatus::Active);
         assert_eq!(authed.budget_limit_usd, Some(10.0));
         assert_eq!(authed.token_budget, Some(1_000));
-        assert_eq!(authed.model_access.as_deref(), Some(&["gpt-4".to_string()][..]));
+        assert_eq!(
+            authed.model_access.as_deref(),
+            Some(&["gpt-4".to_string()][..])
+        );
     }
 
     /// An unknown key hash fails with `InvalidKey` (→ 401).

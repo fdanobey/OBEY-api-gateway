@@ -356,7 +356,10 @@ async fn post_call_block_emits_terminal_frame_then_done() {
     assert_eq!(status, StatusCode::OK);
 
     let text = std::str::from_utf8(&body).unwrap();
-    assert!(text.contains("[DONE]"), "block stream must still close with [DONE]");
+    assert!(
+        text.contains("[DONE]"),
+        "block stream must still close with [DONE]"
+    );
     assert!(
         !text.contains("TOPSECRET42"),
         "blocked content must never reach the caller"
@@ -404,7 +407,10 @@ async fn premature_disconnect_fail_close_discards_partial_content() {
     assert_eq!(status, StatusCode::OK);
 
     let text = std::str::from_utf8(&body).unwrap();
-    assert!(text.contains("[DONE]"), "stream must still close with [DONE]");
+    assert!(
+        text.contains("[DONE]"),
+        "stream must still close with [DONE]"
+    );
 
     let err_frame = sse_data_chunks(&body)
         .into_iter()

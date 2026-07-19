@@ -49,33 +49,68 @@ struct RequestLogContext {
 }
 
 impl RequestLogContext {
-    fn from_response(request: &OpenAIRequest, trace_id: String, duration_ms: u64, response: &crate::models::openai::OpenAIResponse) -> Self {
+    fn from_response(
+        request: &OpenAIRequest,
+        trace_id: String,
+        duration_ms: u64,
+        response: &crate::models::openai::OpenAIResponse,
+    ) -> Self {
         Self {
             trace_id,
             status_code: StatusCode::OK.as_u16(),
             duration_ms,
-            provider: response.extra.get("gateway_provider").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            provider: response
+                .extra
+                .get("gateway_provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
             requested_model: request.model.clone(),
-            responded_model: response.extra.get("gateway_responded_model").and_then(|v| v.as_str()).map(|s| s.to_string()).or_else(|| if response.model.is_empty() { None } else { Some(response.model.clone()) }),
-            cost: response.extra.get("gateway_cost").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            responded_model: response
+                .extra
+                .get("gateway_responded_model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    if response.model.is_empty() {
+                        None
+                    } else {
+                        Some(response.model.clone())
+                    }
+                }),
+            cost: response
+                .extra
+                .get("gateway_cost")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
             error_message: None,
         }
     }
 
-    fn from_error(request: &OpenAIRequest, trace_id: String, duration_ms: u64, error: &GatewayError) -> Self {
+    fn from_error(
+        request: &OpenAIRequest,
+        trace_id: String,
+        duration_ms: u64,
+        error: &GatewayError,
+    ) -> Self {
         let provider = match error {
             GatewayError::Provider { provider, .. } => provider.clone(),
-            GatewayError::AllProvidersFailed(agg) => agg.attempts.first().map(|attempt| attempt.provider.clone()).unwrap_or_default(),
+            GatewayError::AllProvidersFailed(agg) => agg
+                .attempts
+                .first()
+                .map(|attempt| attempt.provider.clone())
+                .unwrap_or_default(),
             _ => String::new(),
         };
         let error_message = match error {
             GatewayError::Provider { message, .. } => Some(message.clone()),
-            GatewayError::AllProvidersFailed(agg) => {
-                Some(agg.attempts.iter()
+            GatewayError::AllProvidersFailed(agg) => Some(
+                agg.attempts
+                    .iter()
                     .map(|a| format!("[{}] {}", a.provider, a.error))
                     .collect::<Vec<_>>()
-                    .join("; "))
-            }
+                    .join("; "),
+            ),
             other => Some(other.to_string()),
         };
         Self {
@@ -98,7 +133,10 @@ fn log_request(state: &super::AppState, request: &OpenAIRequest, context: &Reque
         timestamp: chrono::Utc::now(),
         method: "POST".to_string(),
         path: "/v1/chat/completions".to_string(),
-        model: context.responded_model.clone().unwrap_or_else(|| context.requested_model.clone()),
+        model: context
+            .responded_model
+            .clone()
+            .unwrap_or_else(|| context.requested_model.clone()),
         provider: context.provider.clone(),
         status_code: context.status_code,
         duration_ms: context.duration_ms,
@@ -143,7 +181,8 @@ fn guardrail_error_response(
     error: GatewayError,
 ) -> Response {
     let duration_ms = request_guard.complete();
-    let log_context = RequestLogContext::from_error(request, trace_id.to_string(), duration_ms, &error);
+    let log_context =
+        RequestLogContext::from_error(request, trace_id.to_string(), duration_ms, &error);
     log_request(state, request, &log_context);
     let mut response = error.into_response();
     attach_trace_id_header(&mut response, trace_id);
@@ -187,7 +226,11 @@ impl IntoResponse for GatewayError {
                 StatusCode::GATEWAY_TIMEOUT,
                 serde_json::json!({ "error": { "message": format!("Request exceeded {}s total round-trip timeout. The response may be too large or the model too slow — consider increasing total_timeout_seconds.", secs), "type": "total_timeout_error" } }),
             ),
-            GatewayError::Provider { provider: _, message: _, status_code } => {
+            GatewayError::Provider {
+                provider: _,
+                message: _,
+                status_code,
+            } => {
                 let sc = status_code
                     .and_then(|c| StatusCode::from_u16(c).ok())
                     .unwrap_or(StatusCode::BAD_GATEWAY);
@@ -195,7 +238,7 @@ impl IntoResponse for GatewayError {
                     sc,
                     serde_json::json!({ "error": { "message": self.to_string(), "type": "provider_error" } }),
                 )
-            },
+            }
             // Guardrail policy block (pre- or post-call): 403 with the
             // triggering category only, never the raw content (Req 2.2, 3.1).
             GatewayError::GuardrailPolicyViolation { category } => (
@@ -234,7 +277,11 @@ struct RequestCompleteGuard {
 
 impl RequestCompleteGuard {
     fn new(metrics: Arc<Metrics>, start: std::time::Instant) -> Self {
-        Self { metrics, start, completed: false }
+        Self {
+            metrics,
+            start,
+            completed: false,
+        }
     }
 
     /// Mark the request as completed normally (prevents the Drop impl from
@@ -254,7 +301,10 @@ impl Drop for RequestCompleteGuard {
         if !self.completed {
             self.completed = true;
             let duration_ms = self.start.elapsed().as_millis() as u64;
-            tracing::debug!(duration_ms, "Stream dropped before completion, completing request metrics via guard");
+            tracing::debug!(
+                duration_ms,
+                "Stream dropped before completion, completing request metrics via guard"
+            );
             self.metrics.complete_request(duration_ms);
         }
     }
@@ -267,7 +317,11 @@ impl Drop for RequestCompleteGuard {
 /// Health check endpoint — returns 200 when operational, 503 when shutting down.
 pub async fn health_check(State(state): State<AppState>) -> Response {
     if state.shutting_down.load(Ordering::Relaxed) {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "status": "shutting_down" }))).into_response()
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "shutting_down" })),
+        )
+            .into_response()
     } else {
         (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
     }
@@ -300,7 +354,12 @@ pub async fn chat_completions(
     }
 }
 
-async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest, trace_id: String, virtual_key_id: Option<String>) -> Response {
+async fn chat_completions_non_stream(
+    state: AppState,
+    mut request: OpenAIRequest,
+    trace_id: String,
+    virtual_key_id: Option<String>,
+) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
     let mut request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
@@ -317,7 +376,9 @@ async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest
     // requests ARE looked up here; only writes are gated below by
     // `should_cache_response`.
     if let Some(cached_json) = state.exact_cache.get(&request) {
-        if let Ok(resp) = serde_json::from_str::<crate::models::openai::OpenAIResponse>(&cached_json) {
+        if let Ok(resp) =
+            serde_json::from_str::<crate::models::openai::OpenAIResponse>(&cached_json)
+        {
             state.metrics.record_cache_hit();
             request_guard.complete();
             let mut http = Json(resp).into_response();
@@ -331,13 +392,16 @@ async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest
     // Tier-2: semantic cache (paraphrase match).  Skipped for tool-using
     // requests — semantic similarity across different tool surfaces is too
     // risky for code agents.
-    let skip_semantic = request.extra.contains_key("tools") || request.extra.contains_key("tool_choice");
+    let skip_semantic =
+        request.extra.contains_key("tools") || request.extra.contains_key("tool_choice");
     if !skip_semantic {
         if let Some(ref cache) = state.cache {
             match cache.get(&request).await {
                 Ok(Some(cached_response)) => {
                     state.metrics.record_cache_hit();
-                    match serde_json::from_str::<crate::models::openai::OpenAIResponse>(&cached_response) {
+                    match serde_json::from_str::<crate::models::openai::OpenAIResponse>(
+                        &cached_response,
+                    ) {
                         Ok(resp) => {
                             request_guard.complete();
                             let mut response = Json(resp).into_response();
@@ -345,7 +409,9 @@ async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest
                             return response;
                         }
                         Err(_) => {
-                            tracing::warn!("Failed to parse cached response, falling through to provider");
+                            tracing::warn!(
+                                "Failed to parse cached response, falling through to provider"
+                            );
                         }
                     }
                 }
@@ -392,22 +458,49 @@ async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest
             PreCallOutcome::Proceed => {}
             // `block` fired → HTTP 403, do NOT route (Req 2.2).
             PreCallOutcome::Block(block) => {
-                let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label };
-                return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+                let err = GatewayError::GuardrailPolicyViolation {
+                    category: block.entity_label,
+                };
+                return guardrail_error_response(
+                    &state,
+                    &request,
+                    &mut request_guard,
+                    &trace_id,
+                    err,
+                );
             }
             // Action invalid for the pre-call phase → HTTP 400 (Req 2.7).
             PreCallOutcome::InvalidAction => {
-                return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, GatewayError::GuardrailInvalidAction);
+                return guardrail_error_response(
+                    &state,
+                    &request,
+                    &mut request_guard,
+                    &trace_id,
+                    GatewayError::GuardrailInvalidAction,
+                );
             }
             // fail_close scan timeout → HTTP 503 (Req 2.9).
             PreCallOutcome::Timeout => {
                 let err = GatewayError::GuardrailUnavailable("guardrail scan timeout".to_string());
-                return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+                return guardrail_error_response(
+                    &state,
+                    &request,
+                    &mut request_guard,
+                    &trace_id,
+                    err,
+                );
             }
             // fail_close provider error → HTTP 503 (Req 9.7).
             PreCallOutcome::ServiceFailure => {
-                let err = GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
-                return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+                let err =
+                    GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
+                return guardrail_error_response(
+                    &state,
+                    &request,
+                    &mut request_guard,
+                    &trace_id,
+                    err,
+                );
             }
         }
     }
@@ -421,15 +514,37 @@ async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest
             if let Some(engine) = guardrail_engine.as_ref() {
                 // Build ToolContext from request/response for refusal detection (Req 12.3).
                 let tool_ctx = ToolContext {
-                    tool_use_allowed: request.extra.get("tool_choice").and_then(|v| v.as_str()).map_or(true, |tc| tc != "none"),
-                    tools_provided: request.extra.get("tools").and_then(|v| v.as_array()).map_or(false, |t| !t.is_empty()),
-                    finish_reason_is_tool_call: response.choices.first().and_then(|c| c.finish_reason.as_deref()).map_or(false, |r| r == "tool_calls"),
+                    tool_use_allowed: request
+                        .extra
+                        .get("tool_choice")
+                        .and_then(|v| v.as_str())
+                        .map_or(true, |tc| tc != "none"),
+                    tools_provided: request
+                        .extra
+                        .get("tools")
+                        .and_then(|v| v.as_array())
+                        .map_or(false, |t| !t.is_empty()),
+                    finish_reason_is_tool_call: response
+                        .choices
+                        .first()
+                        .and_then(|c| c.finish_reason.as_deref())
+                        .map_or(false, |r| r == "tool_calls"),
                     has_tool_calls: response.choices.first().map_or(false, |c| {
-                        c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
+                        c.message
+                            .extra
+                            .get("tool_calls")
+                            .and_then(|v| v.as_array())
+                            .map_or(false, |a| !a.is_empty())
                     }),
                 };
                 match engine
-                    .run_post_call(&mut response, &selector, &mut guardrail_ctx, &trace_id, &tool_ctx)
+                    .run_post_call(
+                        &mut response,
+                        &selector,
+                        &mut guardrail_ctx,
+                        &trace_id,
+                        &tool_ctx,
+                    )
                     .await
                 {
                     // Proceed without refusal: re-injection already ran inside
@@ -443,28 +558,38 @@ async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest
                     // run_post_call so we do it exactly once on the final response.
                     (PostCallOutcome::Proceed, RefusalDecision::Refusal(_signal)) => {
                         // Compute the fallback ordering once (Req 12.5, 12.7).
-                        let model_group = match state.router.find_model_group(&request.model).await {
+                        let model_group = match state.router.find_model_group(&request.model).await
+                        {
                             Ok(mg) => mg,
                             Err(_) => {
                                 // Cannot resolve model group — re-inject on current response and return.
                                 engine.reinject_response(&mut response, &guardrail_ctx);
                                 // fall through to caching/return below
-                                let cacheable = crate::router::router::Router::should_cache_response(&response);
+                                let cacheable =
+                                    crate::router::router::Router::should_cache_response(&response);
                                 if cacheable {
-                                    let response_json = serde_json::to_string(&response).unwrap_or_default();
+                                    let response_json =
+                                        serde_json::to_string(&response).unwrap_or_default();
                                     if !response_json.is_empty() {
                                         state.exact_cache.set(&request, response_json.clone());
                                     }
                                     if !skip_semantic {
                                         if let Some(ref cache) = state.cache {
-                                            if let Err(e) = cache.set(&request, &response_json, 0.0).await {
+                                            if let Err(e) =
+                                                cache.set(&request, &response_json, 0.0).await
+                                            {
                                                 tracing::warn!("Failed to cache response: {}", e);
                                             }
                                         }
                                     }
                                 }
                                 let duration_ms = request_guard.complete();
-                                let log_context = RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
+                                let log_context = RequestLogContext::from_response(
+                                    &request,
+                                    trace_id.clone(),
+                                    duration_ms,
+                                    &response,
+                                );
                                 log_request(&state, &request, &log_context);
                                 let mut http_response = Json(response).into_response();
                                 attach_trace_id_header(&mut http_response, &trace_id);
@@ -519,27 +644,68 @@ async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest
                                 Ok(mut new_response) => {
                                     // Re-run post-call + refusal detection on the new response.
                                     let new_tool_ctx = ToolContext {
-                                        tool_use_allowed: request.extra.get("tool_choice").and_then(|v| v.as_str()).map_or(true, |tc| tc != "none"),
-                                        tools_provided: request.extra.get("tools").and_then(|v| v.as_array()).map_or(false, |t| !t.is_empty()),
-                                        finish_reason_is_tool_call: new_response.choices.first().and_then(|c| c.finish_reason.as_deref()).map_or(false, |r| r == "tool_calls"),
-                                        has_tool_calls: new_response.choices.first().map_or(false, |c| {
-                                            c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
-                                        }),
+                                        tool_use_allowed: request
+                                            .extra
+                                            .get("tool_choice")
+                                            .and_then(|v| v.as_str())
+                                            .map_or(true, |tc| tc != "none"),
+                                        tools_provided: request
+                                            .extra
+                                            .get("tools")
+                                            .and_then(|v| v.as_array())
+                                            .map_or(false, |t| !t.is_empty()),
+                                        finish_reason_is_tool_call: new_response
+                                            .choices
+                                            .first()
+                                            .and_then(|c| c.finish_reason.as_deref())
+                                            .map_or(false, |r| r == "tool_calls"),
+                                        has_tool_calls: new_response.choices.first().map_or(
+                                            false,
+                                            |c| {
+                                                c.message
+                                                    .extra
+                                                    .get("tool_calls")
+                                                    .and_then(|v| v.as_array())
+                                                    .map_or(false, |a| !a.is_empty())
+                                            },
+                                        ),
                                     };
                                     let (post_outcome, refusal_decision) = engine
-                                        .run_post_call(&mut new_response, &selector, &mut guardrail_ctx, &trace_id, &new_tool_ctx)
+                                        .run_post_call(
+                                            &mut new_response,
+                                            &selector,
+                                            &mut guardrail_ctx,
+                                            &trace_id,
+                                            &new_tool_ctx,
+                                        )
                                         .await;
 
                                     match post_outcome {
                                         // Block/ServiceFailure from post-call on failover target:
                                         // return the error immediately.
                                         PostCallOutcome::Block(block) => {
-                                            let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label };
-                                            return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+                                            let err = GatewayError::GuardrailPolicyViolation {
+                                                category: block.entity_label,
+                                            };
+                                            return guardrail_error_response(
+                                                &state,
+                                                &request,
+                                                &mut request_guard,
+                                                &trace_id,
+                                                err,
+                                            );
                                         }
                                         PostCallOutcome::ServiceFailure => {
-                                            let err = GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
-                                            return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+                                            let err = GatewayError::GuardrailUnavailable(
+                                                "guardrail service unavailable".to_string(),
+                                            );
+                                            return guardrail_error_response(
+                                                &state,
+                                                &request,
+                                                &mut request_guard,
+                                                &trace_id,
+                                                err,
+                                            );
                                         }
                                         // Replaced means we got a policy message; treat as non-refusal.
                                         // Re-injection is skipped for replaced responses (Req 9.4).
@@ -581,13 +747,29 @@ async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest
                     }
                     // `block` → discard response, HTTP 403 (Req 3.1).
                     (PostCallOutcome::Block(block), _) => {
-                        let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label };
-                        return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+                        let err = GatewayError::GuardrailPolicyViolation {
+                            category: block.entity_label,
+                        };
+                        return guardrail_error_response(
+                            &state,
+                            &request,
+                            &mut request_guard,
+                            &trace_id,
+                            err,
+                        );
                     }
                     // fail_close provider error/timeout → HTTP 503 (Req 9.7).
                     (PostCallOutcome::ServiceFailure, _) => {
-                        let err = GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
-                        return guardrail_error_response(&state, &request, &mut request_guard, &trace_id, err);
+                        let err = GatewayError::GuardrailUnavailable(
+                            "guardrail service unavailable".to_string(),
+                        );
+                        return guardrail_error_response(
+                            &state,
+                            &request,
+                            &mut request_guard,
+                            &trace_id,
+                            err,
+                        );
                     }
                 }
             }
@@ -608,7 +790,12 @@ async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest
                 }
             }
             let duration_ms = request_guard.complete();
-            let log_context = RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
+            let log_context = RequestLogContext::from_response(
+                &request,
+                trace_id.clone(),
+                duration_ms,
+                &response,
+            );
             log_request(&state, &request, &log_context);
             let mut http_response = Json(response).into_response();
             attach_trace_id_header(&mut http_response, &trace_id);
@@ -616,7 +803,8 @@ async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest
         }
         Err(e) => {
             let duration_ms = request_guard.complete();
-            let log_context = RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
+            let log_context =
+                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
             log_request(&state, &request, &log_context);
             let mut response = e.into_response();
             attach_trace_id_header(&mut response, &trace_id);
@@ -625,7 +813,12 @@ async fn chat_completions_non_stream(state: AppState, mut request: OpenAIRequest
     }
 }
 
-async fn chat_completions_stream(state: AppState, mut request: OpenAIRequest, trace_id: String, virtual_key_id: Option<String>) -> Response {
+async fn chat_completions_stream(
+    state: AppState,
+    mut request: OpenAIRequest,
+    trace_id: String,
+    virtual_key_id: Option<String>,
+) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
     tracing::debug!(
@@ -638,7 +831,13 @@ async fn chat_completions_stream(state: AppState, mut request: OpenAIRequest, tr
     // up front so every SSE path below (cache replay, early event, and the
     // buffer-and-replay fallback) can apply the configured keep-alive interval.
     // An absent `streaming` section falls back to defaults.
-    let streaming_config = state.config.read().await.streaming.clone().unwrap_or_default();
+    let streaming_config = state
+        .config
+        .read()
+        .await
+        .streaming
+        .clone()
+        .unwrap_or_default();
 
     // Tier-1 cache lookup for streaming requests.  The cached payload is a
     // full non-streaming `OpenAIResponse` JSON; we re-emit it as SSE chunks
@@ -647,7 +846,9 @@ async fn chat_completions_stream(state: AppState, mut request: OpenAIRequest, tr
     if let Some(cached_json) = state.exact_cache.get(&request) {
         if let Ok(cached_resp) = serde_json::from_str::<OpenAIResponse>(&cached_json) {
             state.metrics.record_cache_hit();
-            state.metrics.complete_request(start.elapsed().as_millis() as u64);
+            state
+                .metrics
+                .complete_request(start.elapsed().as_millis() as u64);
             let stream_trace_id = trace_id.clone();
             let stream = async_stream::stream! {
                 tracing::debug!(trace_id = %stream_trace_id, "Streaming cached response from exact cache");
@@ -656,7 +857,9 @@ async fn chat_completions_stream(state: AppState, mut request: OpenAIRequest, tr
                 }
                 yield Ok(Event::default().data("[DONE]"));
             };
-            let mut sse = Sse::new(stream).keep_alive(build_keepalive(&streaming_config)).into_response();
+            let mut sse = Sse::new(stream)
+                .keep_alive(build_keepalive(&streaming_config))
+                .into_response();
             attach_trace_id_header(&mut sse, &trace_id);
             return sse;
         }
@@ -699,12 +902,20 @@ async fn chat_completions_stream(state: AppState, mut request: OpenAIRequest, tr
             PreCallOutcome::Proceed => {}
             PreCallOutcome::Block(block) => {
                 let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
-                let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label };
+                let err = GatewayError::GuardrailPolicyViolation {
+                    category: block.entity_label,
+                };
                 return guardrail_error_response(&state, &request, &mut guard, &trace_id, err);
             }
             PreCallOutcome::InvalidAction => {
                 let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
-                return guardrail_error_response(&state, &request, &mut guard, &trace_id, GatewayError::GuardrailInvalidAction);
+                return guardrail_error_response(
+                    &state,
+                    &request,
+                    &mut guard,
+                    &trace_id,
+                    GatewayError::GuardrailInvalidAction,
+                );
             }
             PreCallOutcome::Timeout => {
                 let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
@@ -713,7 +924,8 @@ async fn chat_completions_stream(state: AppState, mut request: OpenAIRequest, tr
             }
             PreCallOutcome::ServiceFailure => {
                 let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
-                let err = GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
+                let err =
+                    GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
                 return guardrail_error_response(&state, &request, &mut guard, &trace_id, err);
             }
         }
@@ -1077,7 +1289,9 @@ async fn chat_completions_stream(state: AppState, mut request: OpenAIRequest, tr
             _guard.complete();
         };
 
-        let mut sse = Sse::new(stream).keep_alive(build_keepalive(&streaming_config)).into_response();
+        let mut sse = Sse::new(stream)
+            .keep_alive(build_keepalive(&streaming_config))
+            .into_response();
         attach_trace_id_header(&mut sse, &trace_id);
         return sse;
     }
@@ -1100,7 +1314,8 @@ async fn chat_completions_stream(state: AppState, mut request: OpenAIRequest, tr
         Ok(resp) => resp,
         Err(e) => {
             let duration_ms = request_guard.complete();
-            let log_context = RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
+            let log_context =
+                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
             log_request(&state, &request, &log_context);
             let mut response = e.into_response();
             attach_trace_id_header(&mut response, &trace_id);
@@ -1120,7 +1335,8 @@ async fn chat_completions_stream(state: AppState, mut request: OpenAIRequest, tr
 
     // Log the successful routed request before streaming begins
     let duration_ms = start.elapsed().as_millis() as u64;
-    let log_context = RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
+    let log_context =
+        RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
     log_request(&state, &request, &log_context);
 
     // Success — convert the complete response into SSE chunk format for the client.
@@ -1590,7 +1806,9 @@ fn build_keepalive(streaming_config: &StreamingConfig) -> KeepAlive {
         KeepAlive::default()
     } else {
         KeepAlive::new()
-            .interval(Duration::from_secs(streaming_config.keepalive_interval_seconds))
+            .interval(Duration::from_secs(
+                streaming_config.keepalive_interval_seconds,
+            ))
             .text("keepalive")
     }
 }
@@ -1710,7 +1928,10 @@ fn classify_stream_error(e: &GatewayError) -> (&'static str, String) {
 /// Otherwise the error is wrapped as a synthetic attempt, preserving any
 /// provider status code. The result is always an `AllProvidersFailed` error so
 /// `classify_stream_error` can recover timeout kinds from the merged attempts.
-fn merge_streaming_attempts(mut attempts: Vec<ProviderAttempt>, error: GatewayError) -> GatewayError {
+fn merge_streaming_attempts(
+    mut attempts: Vec<ProviderAttempt>,
+    error: GatewayError,
+) -> GatewayError {
     match error {
         GatewayError::AllProvidersFailed(agg) => {
             attempts.extend(agg.attempts);
@@ -2254,12 +2475,10 @@ fn build_streaming_chunks(
     let choice = response.choices.first();
 
     let content = choice
-        .map(|c| {
-            match &c.message.content {
-                serde_json::Value::String(s) => serde_json::Value::String(s.clone()),
-                serde_json::Value::Null => serde_json::Value::Null,
-                other => other.clone(),
-            }
+        .map(|c| match &c.message.content {
+            serde_json::Value::String(s) => serde_json::Value::String(s.clone()),
+            serde_json::Value::Null => serde_json::Value::Null,
+            other => other.clone(),
         })
         .unwrap_or(serde_json::Value::Null);
 
@@ -2276,8 +2495,12 @@ fn build_streaming_chunks(
         let tcs = tool_calls.as_ref().unwrap();
         let first_tc = &tcs[0];
         let tc_id = first_tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let tc_type = first_tc.get("type").and_then(|v| v.as_str()).unwrap_or("function");
-        let fn_name = first_tc.get("function")
+        let tc_type = first_tc
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("function");
+        let fn_name = first_tc
+            .get("function")
             .and_then(|f| f.get("name"))
             .and_then(|n| n.as_str())
             .unwrap_or("");
@@ -2306,7 +2529,8 @@ fn build_streaming_chunks(
             chunks.push(build_chunk_payload(response, delta, None));
         }
 
-        let fn_args = first_tc.get("function")
+        let fn_args = first_tc
+            .get("function")
             .and_then(|f| f.get("arguments"))
             .and_then(|a| a.as_str())
             .unwrap_or("{}");
@@ -2323,12 +2547,17 @@ fn build_streaming_chunks(
 
         for (i, tc) in tcs.iter().enumerate().skip(1) {
             let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let tc_type = tc.get("type").and_then(|v| v.as_str()).unwrap_or("function");
-            let fn_name = tc.get("function")
+            let tc_type = tc
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("function");
+            let fn_name = tc
+                .get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            let fn_args = tc.get("function")
+            let fn_args = tc
+                .get("function")
                 .and_then(|f| f.get("arguments"))
                 .and_then(|a| a.as_str())
                 .unwrap_or("{}");
@@ -2445,9 +2674,8 @@ fn reasoning_delta(choice: Option<&Choice>) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_keepalive, classify_relay_line, classify_stream_error, chunk_carries_content,
-        early_event_chunk,
-        emit_sse_error_event, relay_passthrough_stream, sse_error_payload,
+        build_keepalive, chunk_carries_content, classify_relay_line, classify_stream_error,
+        early_event_chunk, emit_sse_error_event, relay_passthrough_stream, sse_error_payload,
         streaming_chunks_after_early_event, streaming_chunks_from_response, RelayLineAction,
         RelayOutcome,
     };
@@ -2493,14 +2721,20 @@ mod tests {
         let chunks = streaming_chunks_from_response(&response);
 
         assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
-        assert_eq!(chunks[1]["choices"][0]["delta"]["reasoning"], "thinking step");
+        assert_eq!(
+            chunks[1]["choices"][0]["delta"]["reasoning"],
+            "thinking step"
+        );
         assert_eq!(chunks[2]["choices"][0]["delta"]["content"], "final answer");
     }
 
     #[test]
     fn streaming_chunks_preserve_reasoning_content_field_name() {
         let mut extra = serde_json::Map::new();
-        extra.insert("reasoning_content".to_string(), serde_json::json!("hidden chain"));
+        extra.insert(
+            "reasoning_content".to_string(),
+            serde_json::json!("hidden chain"),
+        );
 
         let response = base_response(Message {
             role: "assistant".to_string(),
@@ -2510,8 +2744,14 @@ mod tests {
 
         let chunks = streaming_chunks_from_response(&response);
 
-        assert_eq!(chunks[1]["choices"][0]["delta"]["reasoning_content"], "hidden chain");
-        assert_eq!(chunks[2]["choices"][0]["delta"]["content"], "visible answer");
+        assert_eq!(
+            chunks[1]["choices"][0]["delta"]["reasoning_content"],
+            "hidden chain"
+        );
+        assert_eq!(
+            chunks[2]["choices"][0]["delta"]["content"],
+            "visible answer"
+        );
     }
 
     // -- Early synthetic SSE event (task 2.3) --------------------------------
@@ -2609,7 +2849,10 @@ mod tests {
             "tr-ttfb-1",
         );
         assert_eq!(payload["error"]["type"], "ttfb_timeout_error");
-        assert_eq!(payload["error"]["message"], "Provider did not respond within 30s");
+        assert_eq!(
+            payload["error"]["message"],
+            "Provider did not respond within 30s"
+        );
         assert_eq!(payload["error"]["trace_id"], "tr-ttfb-1");
     }
 
@@ -2623,7 +2866,10 @@ mod tests {
             "tr-total-1",
         );
         assert_eq!(payload["error"]["type"], "total_timeout_error");
-        assert_eq!(payload["error"]["message"], "Response exceeded 120s total timeout");
+        assert_eq!(
+            payload["error"]["message"],
+            "Response exceeded 120s total timeout"
+        );
         assert_eq!(payload["error"]["trace_id"], "tr-total-1");
     }
 
@@ -2634,18 +2880,15 @@ mod tests {
     fn sse_error_payload_includes_trace_id() {
         let payload = sse_error_payload("chunk_timeout_error", "stalled", "tr-corr-99");
         assert_eq!(payload["error"]["trace_id"], "tr-corr-99");
-        assert!(payload["error"]["trace_id"].as_str().is_some_and(|s: &str| !s.is_empty()));
+        assert!(payload["error"]["trace_id"]
+            .as_str()
+            .is_some_and(|s: &str| !s.is_empty()));
     }
 
     // -- Stream error classification (task 4.2) ------------------------------
 
     fn attempt_with_error(error: String) -> ProviderAttempt {
-        ProviderAttempt::new(
-            "openai".to_string(),
-            "gpt-4".to_string(),
-            error,
-            Some(504),
-        )
+        ProviderAttempt::new("openai".to_string(), "gpt-4".to_string(), error, Some(504))
     }
 
     /// Req 5.1: `router.route_request()` wraps a single-provider TTFB timeout in
@@ -2730,7 +2973,10 @@ mod tests {
     /// Req 3.3: malformed (non-JSON) chunks are skipped.
     #[test]
     fn classify_relay_line_skips_malformed_json() {
-        assert_eq!(classify_relay_line("{not json"), RelayLineAction::SkipMalformed);
+        assert_eq!(
+            classify_relay_line("{not json"),
+            RelayLineAction::SkipMalformed
+        );
     }
 
     /// Valid JSON without `choices`/`error` is skipped quietly (accumulation is task 5.4).
@@ -2769,9 +3015,7 @@ mod tests {
     /// Build a synthetic streaming `reqwest::Response` from raw SSE bytes so the
     /// relay loop can be driven without a live server.
     fn fake_streaming_response(body: &'static str) -> reqwest::Response {
-        let stream = futures::stream::once(async move {
-            Ok::<_, std::io::Error>(body.as_bytes())
-        });
+        let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(body.as_bytes()) });
         let http_response = axum::http::Response::new(reqwest::Body::wrap_stream(stream));
         reqwest::Response::from(http_response)
     }
@@ -2879,10 +3123,15 @@ mod tests {
         );
         let _events: Vec<_> = stream.collect().await;
 
-        let cached = exact_cache.get(&request).expect("response should be cached");
+        let cached = exact_cache
+            .get(&request)
+            .expect("response should be cached");
         let resp: OpenAIResponse =
             serde_json::from_str(&cached).expect("cached payload is valid JSON");
-        assert_eq!(resp.choices[0].message.content, serde_json::json!("Hello world"));
+        assert_eq!(
+            resp.choices[0].message.content,
+            serde_json::json!("Hello world")
+        );
         assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
     }
 
@@ -2937,7 +3186,9 @@ mod tests {
     ) -> String {
         use axum::response::{IntoResponse, Sse};
         let resp = Sse::new(stream).into_response();
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         String::from_utf8(body.to_vec()).unwrap()
     }
 
@@ -2971,13 +3222,19 @@ mod tests {
 
         let text = relay_to_sse_text(stream).await;
         // The first chunk was forwarded before the stall.
-        assert!(text.contains("\"content\":\"a\""), "first chunk forwarded before timeout");
+        assert!(
+            text.contains("\"content\":\"a\""),
+            "first chunk forwarded before timeout"
+        );
         // The inter-chunk timeout surfaces as the precise type (Req 3.12, 5.3).
         assert!(
             text.contains("\"type\":\"chunk_timeout_error\""),
             "stall must produce a chunk_timeout_error frame, got: {text}"
         );
-        assert!(text.trim_end().ends_with("data: [DONE]"), "error frame followed by [DONE]");
+        assert!(
+            text.trim_end().ends_with("data: [DONE]"),
+            "error frame followed by [DONE]"
+        );
     }
 
     /// Req 3.11: the total streaming budget caps the whole duration. With a 1s
@@ -3007,12 +3264,18 @@ mod tests {
         );
 
         let text = relay_to_sse_text(stream).await;
-        assert!(text.contains("\"content\":\"a\""), "first chunk forwarded before timeout");
+        assert!(
+            text.contains("\"content\":\"a\""),
+            "first chunk forwarded before timeout"
+        );
         assert!(
             text.contains("\"type\":\"total_timeout_error\""),
             "exceeding the total budget must produce a total_timeout_error frame, got: {text}"
         );
-        assert!(text.trim_end().ends_with("data: [DONE]"), "error frame followed by [DONE]");
+        assert!(
+            text.trim_end().ends_with("data: [DONE]"),
+            "error frame followed by [DONE]"
+        );
     }
 
     /// Task 6.1 / Req 4.1: a `data:` payload carrying real content/tool_call/
@@ -3021,13 +3284,19 @@ mod tests {
     #[test]
     fn chunk_carries_content_distinguishes_role_only_from_content() {
         let role_only = r#"{"choices":[{"index":0,"delta":{"role":"assistant"}}]}"#;
-        assert!(!chunk_carries_content(role_only), "role-only delta is not content");
+        assert!(
+            !chunk_carries_content(role_only),
+            "role-only delta is not content"
+        );
 
         let content = r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#;
         assert!(chunk_carries_content(content), "content delta counts");
 
         let empty_content = r#"{"choices":[{"index":0,"delta":{"content":""}}]}"#;
-        assert!(!chunk_carries_content(empty_content), "empty content does not count");
+        assert!(
+            !chunk_carries_content(empty_content),
+            "empty content does not count"
+        );
 
         let tool = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"f"}}]}}]}"#;
         assert!(chunk_carries_content(tool), "tool_calls delta counts");
@@ -3035,7 +3304,10 @@ mod tests {
         let reasoning = r#"{"choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}"#;
         assert!(chunk_carries_content(reasoning), "reasoning_content counts");
 
-        assert!(!chunk_carries_content("not json"), "malformed is not content");
+        assert!(
+            !chunk_carries_content("not json"),
+            "malformed is not content"
+        );
     }
 
     /// Build a streaming `reqwest::Response` whose body errors immediately,
@@ -3043,7 +3315,10 @@ mod tests {
     /// path.
     fn erroring_streaming_response() -> reqwest::Response {
         let stream = futures::stream::once(async move {
-            Err::<&[u8], _>(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"))
+            Err::<&[u8], _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            ))
         });
         let http_response = axum::http::Response::new(reqwest::Body::wrap_stream(stream));
         reqwest::Response::from(http_response)
@@ -3070,7 +3345,10 @@ mod tests {
             None,
         );
         let events: Vec<_> = stream.collect().await;
-        assert!(events.is_empty(), "pre-content failure must emit no SSE events");
+        assert!(
+            events.is_empty(),
+            "pre-content failure must emit no SSE events"
+        );
         let guard = outcome.lock().await;
         match &*guard {
             RelayOutcome::FailedBeforeContent(_) => {}
@@ -3241,6 +3519,7 @@ pub async fn list_models(
                 created: None,
                 context_window: None,
                 max_completion_tokens: None,
+                supports_vision: false,
             });
         }
     }
@@ -3256,12 +3535,15 @@ pub async fn list_models(
                     created: None,
                     context_window: None,
                     max_completion_tokens: None,
+                    supports_vision: false,
                 });
             }
         }
     }
 
-    // Include manually specified models from provider configs
+    // Include manually specified models from provider configs first, then add
+    // the NVIDIA NIM built-in fallback. The existing dedup preserves manual
+    // entries as explicit overrides.
     for provider in &config.providers {
         for model_id in &provider.manual_models {
             if seen_ids.insert(model_id.clone()) {
@@ -3272,7 +3554,17 @@ pub async fn list_models(
                     created: None,
                     context_window: None,
                     max_completion_tokens: None,
+                    supports_vision: false,
                 });
+            }
+        }
+
+        if provider.provider_type == "nvidia_nim" {
+            for mut model in crate::providers::nvidia_nim::fallback_models() {
+                model.owned_by = provider.name.clone();
+                if seen_ids.insert(model.id.clone()) {
+                    all_models.push(model);
+                }
             }
         }
     }
@@ -3527,7 +3819,9 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
 
     // Cost by provider
     if !snap.cost_by_provider.is_empty() {
-        out.push_str("# HELP obey_api_cost_by_provider_dollars Cumulative cost by provider in dollars\n");
+        out.push_str(
+            "# HELP obey_api_cost_by_provider_dollars Cumulative cost by provider in dollars\n",
+        );
         out.push_str("# TYPE obey_api_cost_by_provider_dollars gauge\n");
         for (provider, cost) in &snap.cost_by_provider {
             out.push_str(&format!(
@@ -3613,7 +3907,10 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
 
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         out,
     )
         .into_response()
@@ -3657,7 +3954,10 @@ pub async fn reload_config(State(state): State<AppState>) -> Response {
     // Req 26.6: models list cache is implicitly cleared because list_models
     // reads from the config on every call.
 
-    tracing::info!("Configuration reloaded successfully from {}", config_path.display());
+    tracing::info!(
+        "Configuration reloaded successfully from {}",
+        config_path.display()
+    );
 
     (
         StatusCode::OK,

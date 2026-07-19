@@ -230,7 +230,7 @@ The admin UI shows whether a provider key is missing, environment-backed, encryp
 | `*` | `/v1/files/**` | Files API passthrough |
 | `*` | `/v1/fine_tuning/**` | Fine-tuning API passthrough |
 
-All `/v1/*` endpoints are OpenAI-compatible.
+All `/v1/*` endpoints are OpenAI-compatible. Model discovery normally reflects configured groups and provider entries. NVIDIA NIM additionally ships a small maintained fallback catalog that is used only when its hosted `/v1/models` endpoint fails or returns no models; explicit `manual_models` values are merged first as overrides.
 
 The chat completions endpoint echoes request correlation through the `x-trace-id` response header. If the client provides `x-request-id` or `x-trace-id`, that value is reused; otherwise the gateway generates one.
 

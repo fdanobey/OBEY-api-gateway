@@ -139,7 +139,9 @@ mod tests {
     fn error_source_chain_exposes_oauth_cause() {
         use std::error::Error;
         let err: CodexError = OAuthError::StateMismatch.into();
-        let source = err.source().expect("source should be the wrapped OAuthError");
+        let source = err
+            .source()
+            .expect("source should be the wrapped OAuthError");
         assert!(source.to_string().contains("CSRF state mismatch"));
     }
 }

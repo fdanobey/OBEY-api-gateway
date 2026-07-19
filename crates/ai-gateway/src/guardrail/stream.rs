@@ -429,7 +429,10 @@ mod tests {
         struct NoopProvider;
         #[async_trait::async_trait]
         impl GuardrailProvider for NoopProvider {
-            async fn analyze(&self, _content: &str) -> Result<Vec<Finding>, GuardrailProviderError> {
+            async fn analyze(
+                &self,
+                _content: &str,
+            ) -> Result<Vec<Finding>, GuardrailProviderError> {
                 Ok(Vec::new())
             }
             fn provider_type(&self) -> &'static str {

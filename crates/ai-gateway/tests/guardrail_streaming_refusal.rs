@@ -73,11 +73,7 @@ fn provider_named(name: &str, base_url: &str) -> Provider {
 /// (priority 200) in a single `gpt-4` model group. The guardrails config
 /// enables refusal-failover so that detected refusals trigger re-dispatch to
 /// the backup.
-fn two_provider_config(
-    primary_uri: &str,
-    backup_uri: &str,
-    guardrails: GuardrailConfig,
-) -> Config {
+fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: GuardrailConfig) -> Config {
     Config {
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
@@ -466,5 +462,9 @@ async fn refusal_detected_but_failover_disabled_returns_refusal_to_caller() {
     );
 
     let backup_calls = backup.received_requests().await.unwrap();
-    assert_eq!(backup_calls.len(), 0, "backup NOT called when failover disabled");
+    assert_eq!(
+        backup_calls.len(),
+        0,
+        "backup NOT called when failover disabled"
+    );
 }

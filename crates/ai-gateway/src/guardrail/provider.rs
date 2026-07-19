@@ -242,7 +242,10 @@ mod tests {
     #[test]
     fn registry_insert_replaces_existing() {
         let mut registry = ProviderRegistry::new();
-        registry.insert("p", Arc::new(StubProvider("regex")) as Arc<dyn GuardrailProvider>);
+        registry.insert(
+            "p",
+            Arc::new(StubProvider("regex")) as Arc<dyn GuardrailProvider>,
+        );
         let previous = registry.insert(
             "p",
             Arc::new(StubProvider("presidio")) as Arc<dyn GuardrailProvider>,

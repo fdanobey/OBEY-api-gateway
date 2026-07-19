@@ -38,18 +38,30 @@ impl ServerStatus {
     pub fn new(config: &Config) -> Self {
         Self {
             is_running: false,
-            address: format!("{}:{}", client_host_for_bind_host(&config.server.host), config.server.port),
+            address: format!(
+                "{}:{}",
+                client_host_for_bind_host(&config.server.host),
+                config.server.port
+            ),
             admin_path: config.admin.path.clone(),
             dashboard_path: config.dashboard.path.clone(),
         }
     }
 
     pub fn dashboard_url(&self) -> String {
-        format!("http://{}{}", self.address, normalized_route_prefix(&self.dashboard_path))
+        format!(
+            "http://{}{}",
+            self.address,
+            normalized_route_prefix(&self.dashboard_path)
+        )
     }
 
     pub fn admin_url(&self) -> String {
-        format!("http://{}{}", self.address, normalized_route_prefix(&self.admin_path))
+        format!(
+            "http://{}{}",
+            self.address,
+            normalized_route_prefix(&self.admin_path)
+        )
     }
 }
 
@@ -85,7 +97,8 @@ fn select_available_port(host: &str, preferred_port: u16) -> Result<u16, TrayErr
         return Ok(preferred_port);
     }
 
-    let higher_ports = ((preferred_port as u32 + 1).max(1024)..=u16::MAX as u32).map(|port| port as u16);
+    let higher_ports =
+        ((preferred_port as u32 + 1).max(1024)..=u16::MAX as u32).map(|port| port as u16);
     let lower_ports = (1024..preferred_port.max(1024)).map(|port| port as u16);
 
     for candidate in higher_ports.chain(lower_ports) {
@@ -159,7 +172,12 @@ fn resolve_or_extract_asset(file_name: &str, contents: &[u8]) -> Result<PathBuf,
 
     #[cfg(target_os = "windows")]
     if let Ok(appdata) = std::env::var("APPDATA") {
-        candidates.push(PathBuf::from(appdata).join("ai-gateway").join("Assets").join(file_name));
+        candidates.push(
+            PathBuf::from(appdata)
+                .join("ai-gateway")
+                .join("Assets")
+                .join(file_name),
+        );
     }
 
     for candidate in &candidates {
@@ -207,8 +225,8 @@ mod tests {
     use super::*;
     use crate::config::{
         AdminConfig, CircuitBreakerConfig, ContextConfig, CorsConfig, DashboardConfig,
-        ExactCacheConfig, LoggingConfig, ModelGroup, Provider, ProviderConnectionPoolConfig, ProviderModel,
-        RetryConfig, ServerConfig, TrayConfig,
+        ExactCacheConfig, LoggingConfig, ModelGroup, Provider, ProviderConnectionPoolConfig,
+        ProviderModel, RetryConfig, ServerConfig, TrayConfig,
     };
 
     fn test_config(host: &str, port: u16) -> Config {

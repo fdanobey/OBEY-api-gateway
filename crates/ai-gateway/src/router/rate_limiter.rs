@@ -41,7 +41,7 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     /// Create a new rate limiter with specified requests per minute
-    /// 
+    ///
     /// # Arguments
     /// * `requests_per_minute` - Maximum requests allowed per minute (0 = unlimited)
     pub fn new(requests_per_minute: u32) -> Self {
@@ -163,12 +163,12 @@ impl RateLimiter {
     fn refill_tokens_internal(&self, state: &mut RateLimiterState) {
         let now = Instant::now();
         let elapsed = now.duration_since(state.last_refill);
-        
+
         // Calculate tokens to add based on elapsed time
         // tokens_per_second = requests_per_minute / 60
         let tokens_per_second = self.requests_per_minute as f64 / 60.0;
         let tokens_to_add = elapsed.as_secs_f64() * tokens_per_second;
-        
+
         if tokens_to_add > 0.0 {
             state.tokens = (state.tokens + tokens_to_add).min(self.capacity as f64);
             state.last_refill = now;
@@ -258,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn test_unlimited_rate_limit() {
         let limiter = RateLimiter::new(0);
-        
+
         // Should always allow requests
         for _ in 0..100 {
             assert!(limiter.check_available().await);
@@ -269,12 +269,12 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limit_enforcement() {
         let limiter = RateLimiter::new(60); // 60 requests per minute
-        
+
         // Should allow up to capacity
         for _ in 0..60 {
             assert!(limiter.consume().await);
         }
-        
+
         // Should reject when exhausted
         assert!(!limiter.check_available().await);
         assert!(!limiter.consume().await);
@@ -283,20 +283,20 @@ mod tests {
     #[tokio::test]
     async fn test_token_refill() {
         let limiter = RateLimiter::new(60); // 60 requests per minute = 1 per second
-        
+
         // Consume all tokens
         for _ in 0..60 {
             assert!(limiter.consume().await);
         }
-        
+
         assert!(!limiter.check_available().await);
-        
+
         // Wait for 1 second to refill 1 token
         sleep(Duration::from_millis(1100)).await;
-        
+
         assert!(limiter.check_available().await);
         assert!(limiter.consume().await);
-        
+
         // Should be exhausted again
         assert!(!limiter.check_available().await);
     }
@@ -304,20 +304,20 @@ mod tests {
     #[tokio::test]
     async fn test_check_available_does_not_consume() {
         let limiter = RateLimiter::new(60);
-        
+
         // Consume all but one token
         for _ in 0..59 {
             assert!(limiter.consume().await);
         }
-        
+
         // Check multiple times without consuming
         assert!(limiter.check_available().await);
         assert!(limiter.check_available().await);
         assert!(limiter.check_available().await);
-        
+
         // Should still have 1 token available
         assert!(limiter.consume().await);
-        
+
         // Now should be exhausted
         assert!(!limiter.check_available().await);
     }
@@ -325,33 +325,37 @@ mod tests {
     #[tokio::test]
     async fn test_token_refill_caps_at_capacity() {
         let limiter = RateLimiter::new(10);
-        
+
         // Consume 5 tokens
         for _ in 0..5 {
             assert!(limiter.consume().await);
         }
-        
+
         // Wait long enough to refill more than capacity
         sleep(Duration::from_secs(2)).await;
-        
+
         // Should have capacity tokens, not more
         let tokens = limiter.get_tokens().await;
-        assert!(tokens <= 10.0, "Tokens should be capped at capacity: {}", tokens);
+        assert!(
+            tokens <= 10.0,
+            "Tokens should be capped at capacity: {}",
+            tokens
+        );
     }
 
     #[tokio::test]
     async fn test_fractional_token_accumulation() {
         let limiter = RateLimiter::new(60); // 1 token per second
-        
+
         // Consume all tokens
         for _ in 0..60 {
             assert!(limiter.consume().await);
         }
-        
+
         // Wait for 0.5 seconds (should accumulate 0.5 tokens)
         sleep(Duration::from_millis(500)).await;
         assert!(!limiter.check_available().await); // Not enough for 1 request
-        
+
         // Wait another 0.6 seconds (total 1.1 tokens)
         sleep(Duration::from_millis(600)).await;
         assert!(limiter.check_available().await); // Now have >= 1 token
@@ -395,10 +399,10 @@ mod tests {
 
                     // Wait 1 second and try more requests
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    
+
                     let expected_refill = (rate_limit as f64 / 60.0).ceil() as u32;
                     let mut second_batch = 0u32;
-                    
+
                     for _ in 0..expected_refill + 5 {
                         if limiter.consume().await {
                             second_batch += 1;
@@ -409,8 +413,8 @@ mod tests {
                     let total = successful_requests + second_batch;
                     let elapsed = start.elapsed().as_secs_f64();
                     let max_allowed = (rate_limit as f64 * elapsed / 60.0).ceil() as u32 + rate_limit;
-                    
-                    prop_assert!(total <= max_allowed, 
+
+                    prop_assert!(total <= max_allowed,
                         "Rate limit violated: {} requests in {:.2}s (limit: {} req/min, max_allowed: {})",
                         total, elapsed, rate_limit, max_allowed);
 

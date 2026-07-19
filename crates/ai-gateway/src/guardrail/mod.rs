@@ -37,6 +37,8 @@ pub use config::{
     PolicyAction, ProviderSettings, RegexPatternConfig, RegexRuleMode, StageConfig, StagePhase,
 };
 #[allow(unused_imports)]
+pub use factory::{build_engine, build_registry, RegistryBuildError};
+#[allow(unused_imports)]
 pub use pii::{
     inject_redaction_notice, mask, GuardrailContext, PlaceholderResult,
     DEFAULT_REDACTION_NOTICE_INSTRUCTION, MAX_REINJECTION_ENTRIES,
@@ -51,8 +53,6 @@ pub use provider::{
     analyze_with_policy, Finding, GuardrailProvider, GuardrailProviderError, ProviderRegistry,
     StageDisposition,
 };
-#[allow(unused_imports)]
-pub use factory::{build_engine, build_registry, RegistryBuildError};
 // The streaming (SSE) buffering support consumed by the streaming handler
 // (task 13.3) is reachable via the `stream` submodule path
 // (`crate::guardrail::stream::{SseBuffer, block_frame_payload, ...}`); the
@@ -380,12 +380,8 @@ impl GuardrailEngine {
             }
 
             // Derive the single action label for this stage execution (Req 11.1).
-            let action_label = derive_action_label(
-                stage.action,
-                stage_block.is_some(),
-                errored,
-                modified,
-            );
+            let action_label =
+                derive_action_label(stage.action, stage_block.is_some(), errored, modified);
             let latency_ms = duration_ms(stage_start.elapsed());
             self.record_stage_metric(stage, action_label, latency_ms);
             self.log_stage_action(stage, action_label, entity_for_log.as_deref(), trace_id);
@@ -605,7 +601,9 @@ impl GuardrailEngine {
                 .collect::<Vec<&str>>()
                 .join(" ");
 
-            let raw_decision = self.refusal_detector.detect(&assistant_content, tool_context);
+            let raw_decision = self
+                .refusal_detector
+                .detect(&assistant_content, tool_context);
 
             if failover_enabled {
                 if raw_decision.is_refusal() {
@@ -667,7 +665,10 @@ impl GuardrailEngine {
             duration_ms(pipeline_start.elapsed()),
         );
 
-        (terminal.unwrap_or(PostCallOutcome::Proceed), refusal_decision)
+        (
+            terminal.unwrap_or(PostCallOutcome::Proceed),
+            refusal_decision,
+        )
     }
 
     /// Apply PII re-injection on a response using the given context (Req 9.5).
@@ -675,11 +676,7 @@ impl GuardrailEngine {
     /// This is the public entry point for the handler's refusal-failover loop
     /// (task 17.2): after the loop settles on a final response, the handler
     /// calls this exactly once so re-injection runs on the chosen response.
-    pub fn reinject_response(
-        &self,
-        response: &mut OpenAIResponse,
-        ctx: &GuardrailContext,
-    ) {
+    pub fn reinject_response(&self, response: &mut OpenAIResponse, ctx: &GuardrailContext) {
         if ctx.is_empty() {
             return;
         }
@@ -1232,7 +1229,13 @@ mod engine_tests {
         // The LLM echoes the placeholder; post-call re-injection restores it.
         let mut resp = assistant_response("here you go: <<PII_EMAIL_1>>");
         let post = engine
-            .run_post_call(&mut resp, &BindingSelector::default(), &mut ctx, "t", &no_tool_ctx())
+            .run_post_call(
+                &mut resp,
+                &BindingSelector::default(),
+                &mut ctx,
+                "t",
+                &no_tool_ctx(),
+            )
             .await;
         assert_eq!(post.0, PostCallOutcome::Proceed);
         assert_eq!(assistant_text(&resp), "here you go: john@x.com");
@@ -1300,7 +1303,13 @@ mod engine_tests {
         let mut resp = assistant_response("this is bad text with bad words");
         let mut ctx = GuardrailContext::new();
         let post = engine
-            .run_post_call(&mut resp, &BindingSelector::default(), &mut ctx, "t", &no_tool_ctx())
+            .run_post_call(
+                &mut resp,
+                &BindingSelector::default(),
+                &mut ctx,
+                "t",
+                &no_tool_ctx(),
+            )
             .await;
 
         assert_eq!(post.0, PostCallOutcome::Proceed);
@@ -1324,7 +1333,13 @@ mod engine_tests {
         let mut resp = assistant_response("prohibited output");
         let mut ctx = GuardrailContext::new();
         let post = engine
-            .run_post_call(&mut resp, &BindingSelector::default(), &mut ctx, "t", &no_tool_ctx())
+            .run_post_call(
+                &mut resp,
+                &BindingSelector::default(),
+                &mut ctx,
+                "t",
+                &no_tool_ctx(),
+            )
             .await;
 
         assert_eq!(post.0, PostCallOutcome::Replaced);
@@ -1341,7 +1356,13 @@ mod engine_tests {
         let mut resp = assistant_response("leaked secret");
         let mut ctx = GuardrailContext::new();
         let post = engine
-            .run_post_call(&mut resp, &BindingSelector::default(), &mut ctx, "t", &no_tool_ctx())
+            .run_post_call(
+                &mut resp,
+                &BindingSelector::default(),
+                &mut ctx,
+                "t",
+                &no_tool_ctx(),
+            )
             .await;
 
         match post {
@@ -2222,7 +2243,13 @@ mod engine_tests {
         let mut resp = assistant_response("content");
         let mut ctx = GuardrailContext::new();
         let outcome = engine
-            .run_post_call(&mut resp, &BindingSelector::default(), &mut ctx, "t", &no_tool_ctx())
+            .run_post_call(
+                &mut resp,
+                &BindingSelector::default(),
+                &mut ctx,
+                "t",
+                &no_tool_ctx(),
+            )
             .await;
         assert_eq!(outcome.0, PostCallOutcome::ServiceFailure);
     }
@@ -2258,7 +2285,13 @@ mod engine_tests {
         let before = serde_json::to_string(&resp).unwrap();
         let mut ctx = GuardrailContext::new();
         let outcome = engine
-            .run_post_call(&mut resp, &BindingSelector::default(), &mut ctx, "t", &no_tool_ctx())
+            .run_post_call(
+                &mut resp,
+                &BindingSelector::default(),
+                &mut ctx,
+                "t",
+                &no_tool_ctx(),
+            )
             .await;
         let after = serde_json::to_string(&resp).unwrap();
         assert_eq!(outcome.0, PostCallOutcome::Proceed);
@@ -2285,7 +2318,13 @@ mod engine_tests {
         let before = serde_json::to_string(&resp).unwrap();
         let mut ctx = GuardrailContext::new();
         let outcome = engine
-            .run_post_call(&mut resp, &BindingSelector::default(), &mut ctx, "t", &no_tool_ctx())
+            .run_post_call(
+                &mut resp,
+                &BindingSelector::default(),
+                &mut ctx,
+                "t",
+                &no_tool_ctx(),
+            )
             .await;
         let after = serde_json::to_string(&resp).unwrap();
         assert_eq!(outcome.0, PostCallOutcome::Proceed);
@@ -2453,7 +2492,13 @@ mod engine_tests {
         let mut resp = assistant_response("this is bad");
         let mut ctx = GuardrailContext::new();
         let outcome = engine
-            .run_post_call(&mut resp, &BindingSelector::default(), &mut ctx, "t", &no_tool_ctx())
+            .run_post_call(
+                &mut resp,
+                &BindingSelector::default(),
+                &mut ctx,
+                "t",
+                &no_tool_ctx(),
+            )
             .await;
         assert_eq!(outcome.0, PostCallOutcome::Proceed);
         assert_eq!(assistant_text(&resp), "this is [REDACTED]");
@@ -2536,7 +2581,13 @@ mod engine_tests {
         let mut resp = assistant_response("disallowed content");
         let mut ctx = GuardrailContext::new();
         let outcome = engine
-            .run_post_call(&mut resp, &BindingSelector::default(), &mut ctx, "t", &no_tool_ctx())
+            .run_post_call(
+                &mut resp,
+                &BindingSelector::default(),
+                &mut ctx,
+                "t",
+                &no_tool_ctx(),
+            )
             .await;
         assert_eq!(outcome.0, PostCallOutcome::Replaced);
 
@@ -2564,7 +2615,13 @@ mod engine_tests {
         let mut resp = assistant_response("leaked data");
         let mut ctx = GuardrailContext::new();
         let outcome = engine
-            .run_post_call(&mut resp, &BindingSelector::default(), &mut ctx, "t", &no_tool_ctx())
+            .run_post_call(
+                &mut resp,
+                &BindingSelector::default(),
+                &mut ctx,
+                "t",
+                &no_tool_ctx(),
+            )
             .await;
         assert!(matches!(outcome.0, PostCallOutcome::Block(_)));
 

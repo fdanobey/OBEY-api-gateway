@@ -34,10 +34,14 @@ const SECONDS_PER_MINUTE: f64 = 60.0;
 pub enum RateLimitError {
     /// The per-minute request budget (token bucket) is exhausted.
     #[error("Requests per minute exceeded")]
-    RpmExceeded { retry_after_seconds: RetryAfterSeconds },
+    RpmExceeded {
+        retry_after_seconds: RetryAfterSeconds,
+    },
     /// The rolling 60-second token consumption meets or exceeds the limit.
     #[error("Tokens per minute exceeded")]
-    TpmExceeded { retry_after_seconds: RetryAfterSeconds },
+    TpmExceeded {
+        retry_after_seconds: RetryAfterSeconds,
+    },
 }
 
 /// Token bucket for `requests_per_minute`.
@@ -157,7 +161,11 @@ impl TpmWindow {
         let wait = self
             .entries
             .back()
-            .map(|&(ts, _)| (ts + TPM_WINDOW).saturating_duration_since(now).as_secs_f64())
+            .map(|&(ts, _)| {
+                (ts + TPM_WINDOW)
+                    .saturating_duration_since(now)
+                    .as_secs_f64()
+            })
             .unwrap_or(0.0);
         Err(ceil_secs(wait).max(1))
     }
