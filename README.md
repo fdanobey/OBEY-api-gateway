@@ -48,6 +48,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **OpenAI OAuth login** — browser-based sign-in with your ChatGPT Plus/Pro subscription (PKCE flow, automatic token refresh)
 - **Codex backend translation** — transparently routes OAuth-authenticated requests through the ChatGPT Codex backend, translating Chat Completions ↔ Responses API on the fly
 - **Guardrail pipelines** — configurable pre-call and post-call policy enforcement with PII redaction/re-injection, regex scanning, Presidio NLP, OpenAI Moderation, Lakera, semantic prompt guard, and custom HTTP providers; includes refusal detection with automatic failover (see [Guardrail Pipelines](#guardrail-pipelines))
+- **Agent loop detection** — multi-signal confidence scorer detects repetitive agent behavior (tool-call repetition, content similarity, error cycling, response stagnation, token/cost velocity, context growth) and escalates through Warn → Throttle → Inject → Hard-Stop enforcement levels; per-virtual-key overrides, session admin API, and Prometheus histograms (see [Agent Loop Detection](#agent-loop-detection))
 - **Virtual key management** — issue per-caller API keys (`vk_…`) with independent USD/token budgets, rate limits, model-access restrictions, and expiry; authenticate callers without sharing real provider keys (see [Virtual Key Management](#virtual-key-management))
 - **Encrypted API key storage** — provider keys encrypted at rest with a machine-local master key
 - **Admin panel & dashboard** — embedded web UIs for configuration, metrics, and log viewing
@@ -587,6 +588,147 @@ Guardrail execution is fully observable:
 - WARN logs for provider errors
 - Per-request guardrail summary in the request log entry
 
+## Agent Loop Detection
+
+AI coding agents and automation pipelines can get stuck in repetitive loops — retrying the same tool call, cycling through identical errors, or regenerating near-identical content without progress. The loop detection system monitors request patterns per-session and applies graduated enforcement to break these loops before they burn tokens and cost.
+
+Loop detection is **opt-in** (disabled by default) and operates as Tower middleware on `/v1/chat/completions`.
+
+### How It Works
+
+Each caller session is tracked independently (resolved by virtual key ID, `x-session-id` header, or IP). On every request, seven signals are computed from the session's recent history and combined into a weighted confidence score (EMA-smoothed). When confidence exceeds thresholds for consecutive requests, the enforcement level escalates.
+
+### Detection Signals
+
+| Signal | What it measures |
+|--------|-----------------|
+| `content_similarity` | SimHash similarity between the current request and recent requests |
+| `tool_call_repetition` | Consecutive identical tool-call fingerprints |
+| `response_stagnation` | Responses with matching structure and token count |
+| `token_velocity` | Tokens consumed per minute exceeding threshold |
+| `error_cycling` | Repeated requests after provider errors with high content similarity |
+| `context_growth` | Context token growth disproportionate to new information |
+| `cost_velocity` | USD spend rate per minute exceeding threshold |
+
+Weights must sum to 1.0 and are fully configurable.
+
+### Enforcement Levels
+
+| Level | Confidence | Consecutive | Behavior |
+|-------|-----------|-------------|----------|
+| **None** | — | — | Normal operation |
+| **Warn** | ≥ 0.30 | 3 | `x-loop-warning` response header with confidence and dominant signal |
+| **Throttle** | ≥ 0.50 | 5 | Artificial delay (default 2s) before forwarding |
+| **Inject** | ≥ 0.70 | 7 | System prompt instruction appended telling the model to change strategy |
+| **Hard-Stop** | ≥ 0.90 | 10 | Request rejected with HTTP 429 and `Retry-After: 60` |
+
+Enforcement de-escalates automatically after 5 consecutive low-confidence requests.
+
+### Injection Strategies
+
+When the `inject` level is reached, the gateway appends a break instruction to the system prompt:
+
+| Strategy | Behavior |
+|----------|----------|
+| `system_prompt_append` (default) | Appends a generic "loop detected — change approach" instruction |
+| `context_aware` | Tailors the instruction based on the dominant signal (e.g., names the repeated tool, or tells the model to stop retrying a failing operation) |
+
+A custom `break_instruction_template` (up to 2000 chars) can be configured globally or per virtual key.
+
+### Configuration
+
+```yaml
+loop_detection:
+  enabled: true
+  session_timeout_minutes: 30       # Session expires after inactivity
+  max_sessions: 10000               # LRU eviction above this
+  history_depth: 5                  # Requests retained per session
+
+  thresholds:
+    warn_confidence: 0.30
+    throttle_confidence: 0.50
+    inject_confidence: 0.70
+    hardstop_confidence: 0.90
+
+  consecutive_counts:
+    warn: 3
+    throttle: 5
+    inject: 7
+    hardstop: 10
+
+  weights:
+    content_similarity: 0.25
+    tool_call_repetition: 0.20
+    response_stagnation: 0.15
+    token_velocity: 0.10
+    error_cycling: 0.15
+    context_growth: 0.10
+    cost_velocity: 0.05
+
+  throttle_delay_seconds: 2
+  injection_strategy: system_prompt_append   # or context_aware
+  ema_alpha: 0.3                             # EMA smoothing factor
+  eviction_interval_seconds: 60
+  token_velocity_threshold: 10000.0          # tokens/min before signal fires
+  cost_velocity_threshold: 0.5               # USD/min before signal fires
+  # break_instruction_template: "Custom instruction text..."
+```
+
+### Per-Virtual-Key Overrides
+
+Virtual keys can carry their own loop detection settings that merge with (and override) the global config:
+
+```yaml
+# In virtual key creation/update via admin API
+{
+  "name": "aggressive-agent",
+  "loop_detection": {
+    "thresholds": { "warn_confidence": 0.20, "throttle_confidence": 0.40, "inject_confidence": 0.60, "hardstop_confidence": 0.80 },
+    "consecutive_counts": { "warn": 2, "throttle": 3, "inject": 5, "hardstop": 7 },
+    "injection_strategy": "context_aware",
+    "break_instruction_template": "You are stuck in a loop. Stop and ask the user for guidance."
+  }
+}
+```
+
+### Admin API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/admin/loop-detection/sessions` | List active sessions (paginated, `?limit=50&offset=0`) |
+| `GET` | `/admin/loop-detection/sessions/{id}` | Full session detail with signal history and escalation timeline |
+| `POST` | `/admin/loop-detection/sessions/{id}/reset` | Reset a session's enforcement state |
+| `GET` | `/admin/loop-detection/stats` | Aggregate stats: enforcement counts, signal distribution, top sessions, memory estimate |
+
+### Observability
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `obey_loop_confidence_score` | histogram | Per-virtual-key confidence distribution (buckets: 0.1–1.0) |
+| `obey_loop_enforcement_total` | counter | Enforcement transitions by level and virtual key |
+| `obey_loop_sessions_active` | gauge | Current active session count |
+| `obey_loop_sessions_evicted_total` | counter | Total sessions evicted by LRU |
+
+All enforcement actions are logged at INFO level with session ID, virtual key, confidence, dominant signal, and all signal values. Hard-stops log at ERROR with full session state for forensic analysis.
+
+### Hard-Stop Response
+
+When a session reaches the hard-stop level, the gateway returns:
+
+```json
+{
+  "error": {
+    "reason": "loop_detected",
+    "session_id": "...",
+    "confidence": 0.95,
+    "dominant_signal": "tool_call_repetition",
+    "enforcement_level": "hard_stop"
+  }
+}
+```
+
+HTTP status: `429 Too Many Requests` with `Retry-After: 60`.
+
 ## API Endpoints
 
 All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` response header for correlation.
@@ -603,6 +745,10 @@ All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` re
 | `DELETE` | `/admin/keys/{id}` | Delete a virtual key + its usage history |
 | `POST` | `/admin/keys/{id}/revoke` | Revoke a virtual key |
 | `GET` | `/admin/keys/{id}/usage` | Per-key usage aggregate for a time range |
+| `GET` | `/admin/loop-detection/sessions` | List active loop detection sessions |
+| `GET` | `/admin/loop-detection/sessions/{id}` | Session detail with signal history |
+| `POST` | `/admin/loop-detection/sessions/{id}/reset` | Reset session enforcement state |
+| `GET` | `/admin/loop-detection/stats` | Aggregate loop detection stats |
 | `GET` | `/health` | Health check |
 | `GET` | `/metrics` | Prometheus metrics |
 | `POST` | `/v1/chat/completions` | Chat completions (streaming + non-streaming) |
@@ -738,6 +884,7 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── providers/            # Provider implementations (8 providers)
 │           ├── context/              # Context window management & truncation
 │           ├── guardrail/            # Guardrail pipelines: PII redaction/re-injection, regex, Presidio, semantic, refusal detection & failover
+│           ├── loop_detection/      # Agent loop detection: multi-signal scoring, graduated enforcement, session management, admin API
 │           ├── cache/                # Response caching: in-memory exact-match (tier 1) + optional Qdrant semantic (tier 2)
 │           ├── admin/                # Admin panel routes & embedded UI
 │           ├── dashboard/            # Dashboard routes & WebSocket metrics
@@ -842,4 +989,6 @@ This project is licensed under the [MIT License](LICENSE).
 | Context-length errors loop | Truncation disabled or max retries hit | Enable `context.enabled: true` and increase `max_truncation_retries` |
 | Dashboard shows no data | WebSocket blocked by proxy | Ensure your reverse proxy passes `Upgrade: websocket` headers |
 | Cache Hit Rate stuck on `N/A` | Zero eligible requests observed yet | `N/A` means the cache has never been consulted. Send two identical requests with `temperature ≤ 0.15` and `n: 1`. Tool-using requests are eligible too. |
+| Agent gets 429 with `loop_detected` | Loop detection hard-stop triggered | The agent is stuck in a repetitive loop. Reset the session via `POST /admin/loop-detection/sessions/{id}/reset`, or adjust thresholds/consecutive counts. Check the `dominant_signal` field for the root cause. |
+| `x-loop-warning` header appearing | Loop confidence is elevated | Not blocking yet — the agent is showing repetitive patterns. Monitor the dominant signal. If false-positive, raise thresholds or lower the relevant signal weight. |
 | Timeout on large prompts | `total_timeout_seconds` too low for model | Increase the provider's `total_timeout_seconds`. For thinking models (o1, o3, DeepSeek-R1), also check `ttfb_timeout_seconds` — these models need longer to start responding |
