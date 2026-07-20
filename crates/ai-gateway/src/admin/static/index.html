@@ -224,6 +224,20 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 .guardrail-flow-step.post{border-color:var(--success);color:var(--success)}
 .guardrail-flow-arrow{color:var(--text-muted);font-size:.75rem}
 @media(max-width:700px){.guardrail-presets{grid-template-columns:1fr}.guardrail-stage,.guardrail-pattern,.guardrail-binding-row{grid-template-columns:1fr}}
+
+/* Token compression */
+.compression-note{padding:.75rem 1rem;margin-bottom:1rem;border:1px solid rgba(13,110,253,.25);border-radius:var(--radius);background:rgba(13,110,253,.05);font-size:.82rem;color:var(--text)}
+.compression-note strong{display:block;margin-bottom:.2rem}
+.compression-rule-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.25rem 1rem}
+.compression-editor{margin-top:.75rem}
+.compression-row{display:grid;gap:.6rem;align-items:end;padding:.75rem;margin-bottom:.5rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)}
+.compression-pre-row{grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,.8fr) auto}
+.compression-pipeline-row{grid-template-columns:minmax(0,.7fr) minmax(0,1.3fr) auto}
+.compression-row .form-group{margin:0}
+.compression-override{margin-top:1rem;background:var(--bg)}
+.compression-override-fields{padding-top:.5rem}
+.compression-override-fields[hidden]{display:none}
+@media(max-width:700px){.compression-rule-grid,.compression-pre-row,.compression-pipeline-row{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -238,6 +252,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="circuit-breaker" id="tab-circuit-breaker" aria-controls="page-circuit-breaker">Circuit Breaker</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="logging" id="tab-logging" aria-controls="page-logging">Logging</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="caching" id="tab-caching" aria-controls="page-caching">Caching</button></li>
+    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="compression" id="tab-compression-config" aria-controls="page-compression">Compression</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="context" id="tab-context" aria-controls="page-context">Context</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="streaming" id="tab-streaming" aria-controls="page-streaming">Streaming</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="loop-detection" id="tab-loop-detection" aria-controls="page-loop-detection">Loop Detection</button></li>
@@ -533,6 +548,24 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
           </div>
           <div class="oauth-fields-msg prov-oauth-msg" style="display:none"></div>
         </div>
+        <details class="compression-override" id="prov-compression-override">
+          <summary>Token Compression Override</summary>
+          <div class="hint">Optional provider settings. Unset fields inherit the global compression configuration.</div>
+          <div class="form-check" style="margin-top:.65rem">
+            <input type="checkbox" class="prov-compression-use">
+            <label>Use provider compression override</label>
+          </div>
+          <div class="compression-override-fields prov-compression-fields" hidden>
+            <div class="form-row">
+              <div class="form-group"><label>Enabled</label><select class="prov-compression-enabled"><option value="">Inherit</option><option value="true">On</option><option value="false">Off</option></select></div>
+              <div class="form-group"><label>Level</label><select class="prov-compression-level"><option value="">Inherit</option><option value="none">None</option><option value="lite">Lite</option><option value="standard">Standard</option><option value="aggressive">Aggressive</option><option value="ultra">Ultra</option><option value="rtk">RTK</option><option value="stacked">Stacked</option></select></div>
+            </div>
+            <div class="form-row">
+              <div class="form-group"><label>Automatic threshold (tokens)</label><input type="number" class="prov-compression-threshold" min="0" placeholder="Inherit"><div class="hint">Blank inherits; 0 applies to every enabled request.</div><div class="error" role="alert"></div></div>
+              <div class="form-group"><label>Caveman output</label><select class="prov-compression-caveman"><option value="">Inherit</option><option value="true">On</option><option value="false">Off</option></select></div>
+            </div>
+          </div>
+        </details>
         <div style="margin-top:.5rem">
           <button class="btn btn-secondary btn-sm test-connection">Test Connection</button>
           <span class="test-result" style="font-size:.8rem;margin-left:.5rem"></span>
@@ -568,6 +601,21 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
             </div>
           </div>
         </div>
+        <details class="compression-override" id="grp-compression-override">
+          <summary>Token Compression Override</summary>
+          <div class="hint">Optional group settings take precedence over provider and global settings.</div>
+          <div class="form-check" style="margin-top:.65rem">
+            <input type="checkbox" class="grp-compression-use">
+            <label>Use model-group compression override</label>
+          </div>
+          <div class="compression-override-fields grp-compression-fields" hidden>
+            <div class="form-row">
+              <div class="form-group"><label>Level</label><select class="grp-compression-level"><option value="">Inherit</option><option value="none">None</option><option value="lite">Lite</option><option value="standard">Standard</option><option value="aggressive">Aggressive</option><option value="ultra">Ultra</option><option value="rtk">RTK</option><option value="stacked">Stacked</option></select></div>
+              <div class="form-group"><label>Automatic threshold (tokens)</label><input type="number" class="grp-compression-threshold" min="0" placeholder="Inherit"><div class="hint">Blank inherits; 0 applies to every enabled request.</div><div class="error" role="alert"></div></div>
+            </div>
+            <div class="form-group"><label>Caveman output</label><select class="grp-compression-caveman"><option value="">Inherit</option><option value="true">On</option><option value="false">Off</option></select></div>
+          </div>
+        </details>
         <div class="models-container">
           <strong style="font-size:.8rem;display:block;margin-bottom:.5rem">Models</strong>
         </div>
@@ -807,6 +855,73 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       <button class="btn btn-primary" data-action="save">Save</button>
       <button class="btn btn-secondary" data-action="reset">Reset</button>
     </div>
+  </section>
+
+  <!-- Token Compression -->
+  <section class="page" id="page-compression" role="tabpanel" aria-labelledby="tab-compression-config">
+    <h2>Token Compression</h2>
+    <div class="error" id="compression-validation-summary" role="alert"></div>
+    <div class="compression-note"><strong>Compression is disabled by default.</strong> Enable it only after selecting and testing a suitable level. Perplexity/ONNX mode additionally requires an external ONNX model file and a compatible runtime in the gateway environment.</div>
+    <fieldset><legend>Global Behavior</legend>
+      <div class="form-check"><input type="checkbox" id="compression-enabled"><label for="compression-enabled">Enable token compression globally</label></div>
+      <div class="form-row">
+        <div class="form-group"><label for="compression-default-level">Default level</label><select id="compression-default-level"><option value="none">None</option><option value="lite">Lite</option><option value="standard">Standard</option><option value="aggressive">Aggressive</option><option value="ultra">Ultra</option><option value="rtk">RTK</option><option value="stacked">Stacked</option></select></div>
+        <div class="form-group"><label for="compression-threshold">Automatic threshold (tokens)</label><input type="number" id="compression-threshold" min="0" value="0"><div class="hint">0 means compression is explicit for every enabled request; a positive value enables automatic compression at that token count.</div><div class="error" role="alert"></div></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label for="compression-language">Language</label><input type="text" id="compression-language" value="en" autocomplete="off"><div class="error" role="alert"></div></div>
+        <div class="form-group"><label for="compression-language-packs-dir">Language packs directory</label><input type="text" id="compression-language-packs-dir" value="./language_packs" autocomplete="off"><div class="error" role="alert"></div></div>
+      </div>
+      <div class="form-check"><input type="checkbox" id="compression-caveman"><label for="compression-caveman">Use terse “caveman” output</label></div>
+      <div class="form-check"><input type="checkbox" id="compression-tool-definitions"><label for="compression-tool-definitions">Compress tool definitions</label></div>
+    </fieldset>
+    <fieldset><legend>Time Budgets (milliseconds)</legend>
+      <div class="hint" style="margin-bottom:.75rem">Each enabled engine must have a positive processing budget.</div>
+      <div class="form-row">
+        <div class="form-group"><label for="compression-budget-lite">Lite</label><input type="number" id="compression-budget-lite" min="1" value="500"><div class="error" role="alert"></div></div>
+        <div class="form-group"><label for="compression-budget-standard">Standard</label><input type="number" id="compression-budget-standard" min="1" value="500"><div class="error" role="alert"></div></div>
+        <div class="form-group"><label for="compression-budget-aggressive">Aggressive</label><input type="number" id="compression-budget-aggressive" min="1" value="2000"><div class="error" role="alert"></div></div>
+        <div class="form-group"><label for="compression-budget-ultra">Ultra</label><input type="number" id="compression-budget-ultra" min="1" value="2000"><div class="error" role="alert"></div></div>
+        <div class="form-group"><label for="compression-budget-rtk">RTK</label><input type="number" id="compression-budget-rtk" min="1" value="2000"><div class="error" role="alert"></div></div>
+        <div class="form-group"><label for="compression-budget-stacked">Stacked</label><input type="number" id="compression-budget-stacked" min="1" value="2000"><div class="error" role="alert"></div></div>
+      </div>
+    </fieldset>
+    <fieldset><legend>Protection Rules</legend>
+      <div class="hint" style="margin-bottom:.75rem">Selected structures remain protected while messages are compressed.</div>
+      <div class="compression-rule-grid">
+        <div class="form-check"><input type="checkbox" id="compression-rule-code-blocks" data-compression-rule="code_blocks"><label for="compression-rule-code-blocks">Code blocks</label></div>
+        <div class="form-check"><input type="checkbox" id="compression-rule-urls" data-compression-rule="urls"><label for="compression-rule-urls">URLs</label></div>
+        <div class="form-check"><input type="checkbox" id="compression-rule-file-paths" data-compression-rule="file_paths"><label for="compression-rule-file-paths">File paths</label></div>
+        <div class="form-check"><input type="checkbox" id="compression-rule-json" data-compression-rule="json_structures"><label for="compression-rule-json">JSON structures</label></div>
+        <div class="form-check"><input type="checkbox" id="compression-rule-identifiers" data-compression-rule="identifiers"><label for="compression-rule-identifiers">Identifiers</label></div>
+        <div class="form-check"><input type="checkbox" id="compression-rule-math" data-compression-rule="math_expressions"><label for="compression-rule-math">Math expressions</label></div>
+        <div class="form-check"><input type="checkbox" id="compression-rule-tool-definitions" data-compression-rule="tool_definitions"><label for="compression-rule-tool-definitions">Tool definitions</label></div>
+        <div class="form-check"><input type="checkbox" id="compression-rule-tool-output" data-compression-rule="structured_tool_output"><label for="compression-rule-tool-output">Structured tool output</label></div>
+      </div>
+    </fieldset>
+    <fieldset><legend>RTK</legend>
+      <div class="form-group"><label for="compression-rtk-grouping">Grouping strategy</label><select id="compression-rtk-grouping"><option value="aggressive">Aggressive</option><option value="balanced">Balanced</option><option value="conservative">Conservative</option></select></div>
+    </fieldset>
+    <fieldset><legend>Perplexity / ONNX</legend>
+      <div class="form-check"><input type="checkbox" id="compression-perplexity-enabled"><label for="compression-perplexity-enabled">Enable perplexity engine</label></div>
+      <div class="hint" style="margin-top:-.4rem;margin-bottom:.8rem">Actual ONNX compression requires an external model at the configured path and an available ONNX runtime; the admin panel does not install either dependency.</div>
+      <div class="form-row">
+        <div class="form-group"><label for="compression-redundancy-threshold">Redundancy threshold</label><input type="number" id="compression-redundancy-threshold" min="0" max="1" step="0.01" value="0.5"><div class="hint">0.0–1.0 inclusive.</div><div class="error" role="alert"></div></div>
+        <div class="form-group"><label for="compression-ratio-target">Compression ratio target</label><input type="number" id="compression-ratio-target" min="1" max="20" step="1" value="5"><div class="hint">1–20 inclusive.</div><div class="error" role="alert"></div></div>
+      </div>
+      <div class="form-group"><label for="compression-model-path">ONNX model path</label><input type="text" id="compression-model-path" value="./models/perplexity_scorer.onnx" autocomplete="off"><div class="error" role="alert"></div></div>
+    </fieldset>
+    <fieldset><legend>Precompressed Contexts</legend>
+      <div class="hint">Map source contexts to precompressed artifacts. Content hash is optional.</div>
+      <div class="compression-editor" id="compression-precompressed-list"></div>
+      <button type="button" class="btn btn-secondary btn-sm" id="compression-add-precompressed">+ Add Context</button>
+    </fieldset>
+    <fieldset><legend>Custom Pipelines</legend>
+      <div class="hint">Enter ordered, comma-separated engines: lite, standard, aggressive, ultra, rtk, perplexity, tool_def, language_pack. Existing rows remain editable even when imported from older configurations.</div>
+      <div class="compression-editor" id="compression-pipelines-list"></div>
+      <button type="button" class="btn btn-secondary btn-sm" id="compression-add-pipeline">+ Add Pipeline</button>
+    </fieldset>
+    <div class="actions"><button class="btn btn-primary" data-action="save">Save</button><button class="btn btn-secondary" data-action="reset">Reset</button></div>
   </section>
 
   <!-- Context (Req 13.10) -->
@@ -1437,6 +1552,73 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     return ok;
   }
 
+  function parseOverrideBool(value) {
+    return value === '' ? null : value === 'true';
+  }
+
+  function populateCompressionOverride(card, data, prefix) {
+    var enabled = !!data;
+    var use = card.querySelector('.' + prefix + '-compression-use');
+    use.checked = enabled;
+    card.querySelector('.' + prefix + '-compression-fields').hidden = !enabled;
+    if (prefix === 'prov') card.querySelector('.prov-compression-enabled').value = data && data.enabled != null ? String(data.enabled) : '';
+    card.querySelector('.' + prefix + '-compression-level').value = data && data.level != null ? data.level : '';
+    card.querySelector('.' + prefix + '-compression-threshold').value = data && data.auto_threshold_tokens != null ? data.auto_threshold_tokens : '';
+    card.querySelector('.' + prefix + '-compression-caveman').value = data && data.caveman_output != null ? String(data.caveman_output) : '';
+  }
+
+  var compressionControlId = 0;
+
+  function setupCompressionOverrideIds(card, prefix) {
+    compressionControlId += 1;
+    var suffix = prefix + '-' + compressionControlId;
+    var details = card.querySelector('.compression-override');
+    details.id = prefix === 'prov' ? 'prov-compression-override-' + compressionControlId : 'grp-compression-override-' + compressionControlId;
+    details.dataset.stableId = prefix === 'prov' ? 'prov-compression-override' : 'grp-compression-override';
+    details.querySelectorAll('input,select').forEach(function(control) {
+      var label = control.parentElement.querySelector('label');
+      control.id = control.className.split(' ')[0] + '-' + suffix;
+      if (label) label.htmlFor = control.id;
+    });
+  }
+
+  function wireCompressionOverride(card, prefix) {
+    var use = card.querySelector('.' + prefix + '-compression-use');
+    var fields = card.querySelector('.' + prefix + '-compression-fields');
+    use.addEventListener('change', function() { fields.hidden = !use.checked; });
+  }
+
+  function collectCompressionOverride(card, prefix) {
+    if (!card.querySelector('.' + prefix + '-compression-use').checked) return null;
+    var value = {};
+    if (prefix === 'prov') {
+      var enabled = parseOverrideBool(card.querySelector('.prov-compression-enabled').value);
+      if (enabled !== null) value.enabled = enabled;
+    }
+    var level = card.querySelector('.' + prefix + '-compression-level').value;
+    var threshold = card.querySelector('.' + prefix + '-compression-threshold').value.trim();
+    if (level) value.level = level;
+    if (threshold !== '') value.auto_threshold_tokens = parseInt(threshold, 10);
+    var caveman = parseOverrideBool(card.querySelector('.' + prefix + '-compression-caveman').value);
+    if (caveman !== null) value.caveman_output = caveman;
+    return value;
+  }
+
+  function validateCompressionInteger(input, label, allowZero) {
+    var value = Number(input.value);
+    var minimum = allowZero ? 0 : 1;
+    if (!Number.isInteger(value) || value < minimum) { showError(input, label + (allowZero ? ' must be a non-negative integer' : ' must be a positive integer')); return false; }
+    clearError(input); return true;
+  }
+
+  function validateCompressionOverride(card, prefix) {
+    if (!card.querySelector('.' + prefix + '-compression-use').checked) return true;
+    var threshold = card.querySelector('.' + prefix + '-compression-threshold');
+    if (threshold.value.trim() && !validateCompressionInteger(threshold, 'Compression threshold', true)) return false;
+    clearError(threshold);
+    return true;
+  }
+
   function validateProvidersPage() {
     var ok = true;
     var cards = document.querySelectorAll('#providers-list .item-card');
@@ -1463,6 +1645,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       if (!validatePositiveInt(poolMaxIdleIn, 'Pool max idle')) ok = false;
       if (!validatePositiveInt(poolIdleTimeoutIn, 'Pool idle timeout')) ok = false;
       if (budgetLimitIn.value.trim() && !validatePositiveNum(budgetLimitIn, 'Budget limit')) ok = false;
+      if (!validateCompressionOverride(card, 'prov')) ok = false;
 
       // --- Bedrock-specific validation (Req 9.1, 9.2, 9.3, 9.4) ---
       var isBedrock = typeIn.value === 'bedrock';
@@ -1505,6 +1688,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     cards.forEach(function(card) {
       var nameIn = card.querySelector('.grp-name');
       if (!validateRequired(nameIn, 'Group name')) ok = false;
+      if (!validateCompressionOverride(card, 'grp')) ok = false;
       var modelRows = card.querySelectorAll('.models-container .form-row');
       if (modelRows.length === 0) {
         showError(nameIn, 'Group must have at least one model');
@@ -1564,6 +1748,51 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     return ok;
   }
 
+  function validateCompressionPage() {
+    var ok = true;
+    var summary = document.getElementById('compression-validation-summary');
+    summary.textContent = '';
+    summary.classList.remove('visible');
+    if (!validateCompressionInteger(document.getElementById('compression-threshold'), 'Automatic threshold', true)) ok = false;
+    ['lite','standard','aggressive','ultra','rtk','stacked'].forEach(function(level) {
+      if (!validateCompressionInteger(document.getElementById('compression-budget-' + level), level + ' budget', false)) ok = false;
+    });
+    var redundancy = document.getElementById('compression-redundancy-threshold');
+    if (!validateThreshold(redundancy)) ok = false;
+    var ratio = document.getElementById('compression-ratio-target');
+    var ratioValue = Number(ratio.value);
+    if (!Number.isInteger(ratioValue) || ratioValue < 1 || ratioValue > 20) { showError(ratio, 'Compression ratio must be between 1 and 20'); ok = false; } else { clearError(ratio); }
+    if (document.getElementById('compression-enabled').checked) {
+      if (!validateRequired(document.getElementById('compression-language'), 'Language')) ok = false;
+      if (!validateRequired(document.getElementById('compression-language-packs-dir'), 'Language packs directory')) ok = false;
+    } else {
+      clearError(document.getElementById('compression-language'));
+      clearError(document.getElementById('compression-language-packs-dir'));
+    }
+    if (document.getElementById('compression-perplexity-enabled').checked) {
+      if (!validateRequired(document.getElementById('compression-model-path'), 'ONNX model path')) ok = false;
+    } else { clearError(document.getElementById('compression-model-path')); }
+    document.querySelectorAll('#compression-precompressed-list .compression-pre-row').forEach(function(row) {
+      if (!validateRequired(row.querySelector('.compression-pre-source'), 'Source path')) ok = false;
+      if (!validateRequired(row.querySelector('.compression-pre-output'), 'Compressed path')) ok = false;
+    });
+    document.querySelectorAll('#compression-pipelines-list .compression-pipeline-row').forEach(function(row) {
+      var name = row.querySelector('.compression-pipeline-name');
+      var engines = row.querySelector('.compression-pipeline-engines');
+      if (!validateRequired(name, 'Pipeline name')) ok = false;
+      var duplicate = false;
+      document.querySelectorAll('#compression-pipelines-list .compression-pipeline-name').forEach(function(other) { if (other !== name && other.value.trim() === name.value.trim() && name.value.trim()) duplicate = true; });
+      if (duplicate) { showError(name, 'Pipeline names must be unique'); ok = false; }
+      var values = engines.value.split(',').map(function(value) { return value.trim(); }).filter(Boolean);
+      var invalid = values.filter(function(value) { return COMPRESSION_ENGINES.indexOf(value) === -1; });
+      if (!values.length) { showError(engines, 'Pipeline must contain at least one engine'); ok = false; }
+      else if (invalid.length) { showError(engines, 'Unknown engine: ' + invalid.join(', ')); ok = false; }
+      else { clearError(engines); }
+    });
+    if (!ok) { summary.textContent = 'Fix the highlighted token-compression settings before saving.'; summary.classList.add('visible'); }
+    return ok;
+  }
+
   function validateContextPage() {
     var ok = true;
     if (!validatePositiveInt(document.getElementById('context-window-size'), 'Sliding window size')) ok = false;
@@ -1592,6 +1821,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         'page-circuit-breaker': validateCircuitBreakerPage,
         'page-logging': validateLoggingPage,
         'page-caching': validateCachingPage,
+        'page-compression': validateCompressionPage,
         'page-context': validateContextPage,
         'page-streaming': validateStreamingPage,
         'page-loop-detection': validateLoopDetectionPage,
@@ -1698,6 +1928,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     var keyInput = card.querySelector('.prov-key-env');
     card.dataset.apiKeyStatus = (data && data.api_key_status) || 'missing';
     card.dataset.apiKeyConfigured = (data && data.api_key_configured) ? 'true' : 'false';
+    setupCompressionOverrideIds(card, 'prov');
     if (data) {
       nameInput.value = data.name || ''; titleEl.textContent = data.name || 'New Provider';
       var uiType = (data.type === 'openai' && data.auth_method === 'oauth') ? 'openai_oauth' : (data.type || 'openai');
@@ -1715,6 +1946,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       card.querySelector('.prov-budget-limit').value = (data.budget && data.budget.limit_usd != null) ? data.budget.limit_usd : '';
       card.querySelector('.prov-budget-reset').value = (data.budget && data.budget.reset_policy) || 'manual';
       card.querySelector('.prov-manual-models').value = (data.manual_models || []).join('\n');
+      populateCompressionOverride(card, data.compression, 'prov');
       // Restore Bedrock-specific checkbox values (Req 8.2, 8.4)
       if (data.type === 'bedrock') {
         card.querySelector('.prov-global-inference').checked = !!data.global_inference_profile;
@@ -1724,6 +1956,8 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         card.querySelector('.prov-reasoning').checked = data.reasoning !== false;
       }
     }
+    if (!data) populateCompressionOverride(card, null, 'prov');
+    wireCompressionOverride(card, 'prov');
     nameInput.addEventListener('input', function() { titleEl.textContent = this.value || 'New Provider'; populateProviderSelects(); });
     keyInput.addEventListener('input', function() { renderProviderKeyStatus(card); });
     card.querySelector('.remove-provider').addEventListener('click', function() { card.remove(); populateProviderSelects(); });
@@ -2183,7 +2417,10 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     var card = clone.querySelector('.item-card');
     var nameInput = card.querySelector('.grp-name');
     var titleEl = card.querySelector('.group-title');
+    setupCompressionOverrideIds(card, 'grp');
     if (data) { nameInput.value = data.name || ''; titleEl.textContent = data.name || 'New Group'; card.querySelector('.grp-version-fallback').checked = !!data.version_fallback_enabled; }
+    populateCompressionOverride(card, data && data.compression, 'grp');
+    wireCompressionOverride(card, 'grp');
     nameInput.addEventListener('input', function() { titleEl.textContent = this.value || 'New Group'; });
     card.querySelector('.remove-group').addEventListener('click', function() { card.remove(); });
     var modelsContainer = card.querySelector('.models-container');
@@ -2200,6 +2437,99 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
   }
 
   document.getElementById('add-group').addEventListener('click', function() { addGroupCard(null); setStatus('Model group added'); });
+
+  var COMPRESSION_ENGINES = ['lite','standard','aggressive','ultra','rtk','perplexity','tool_def','language_pack'];
+  var COMPRESSION_RULES = ['code_blocks','urls','file_paths','json_structures','identifiers','math_expressions','tool_definitions','structured_tool_output'];
+  var COMPRESSION_DEFAULTS = {
+    enabled:false,default_level:'lite',auto_threshold_tokens:0,caveman_output:false,compress_tool_definitions:false,language:'en',language_packs_dir:'./language_packs',
+    time_budget_ms:{lite:500,standard:500,aggressive:2000,ultra:2000,rtk:2000,stacked:2000},protection_rules:COMPRESSION_RULES.slice(),precompressed_contexts:[],
+    rtk:{grouping_strategy:'balanced'},perplexity:{enabled:false,redundancy_threshold:0.5,compression_ratio_target:5,model_path:'./models/perplexity_scorer.onnx'},custom_pipelines:{}
+  };
+
+  var compressionRowId = 0;
+
+  function compressionField(className, labelText, value, placeholder) {
+    compressionRowId += 1;
+    var group = document.createElement('div'); group.className = 'form-group';
+    var label = document.createElement('label'); label.textContent = labelText;
+    var input = document.createElement('input'); input.type = 'text'; input.className = className; input.id = className + '-' + compressionRowId; input.value = value == null ? '' : String(value); if (placeholder) input.placeholder = placeholder;
+    label.htmlFor = input.id;
+    var error = document.createElement('div'); error.className = 'error'; error.setAttribute('role', 'alert');
+    group.appendChild(label); group.appendChild(input); group.appendChild(error);
+    return group;
+  }
+
+  function compressionRemoveButton(row, label) {
+    var button = document.createElement('button'); button.type = 'button'; button.className = 'btn btn-danger btn-sm'; button.textContent = 'Remove'; button.setAttribute('aria-label', label); button.addEventListener('click', function() { row.remove(); }); return button;
+  }
+
+  function addPrecompressedRow(data) {
+    var row = document.createElement('div'); row.className = 'compression-row compression-pre-row';
+    row.appendChild(compressionField('compression-pre-source', 'Source path', data && data.source_path, './prompts/system.md'));
+    row.appendChild(compressionField('compression-pre-output', 'Compressed path', data && data.compressed_path, './prompts/system.min.md'));
+    row.appendChild(compressionField('compression-pre-hash', 'Content hash (optional)', data && data.content_hash, 'sha256:...'));
+    row.appendChild(compressionRemoveButton(row, 'Remove precompressed context'));
+    document.getElementById('compression-precompressed-list').appendChild(row);
+  }
+
+  function addCompressionPipelineRow(name, data) {
+    var row = document.createElement('div'); row.className = 'compression-row compression-pipeline-row';
+    var nameField = compressionField('compression-pipeline-name', 'Pipeline name', name, 'my_pipeline');
+    var engines = data && Array.isArray(data.engines) ? data.engines : [];
+    row.appendChild(nameField);
+    row.appendChild(compressionField('compression-pipeline-engines', 'Ordered engines', engines.join(', '), 'lite, tool_def'));
+    row.appendChild(compressionRemoveButton(row, 'Remove custom pipeline'));
+    document.getElementById('compression-pipelines-list').appendChild(row);
+  }
+
+  function populateCompression(value) {
+    var compression = value || COMPRESSION_DEFAULTS;
+    document.getElementById('compression-enabled').checked = !!compression.enabled;
+    document.getElementById('compression-default-level').value = compression.default_level || 'lite';
+    document.getElementById('compression-threshold').value = compression.auto_threshold_tokens != null ? compression.auto_threshold_tokens : 0;
+    document.getElementById('compression-caveman').checked = !!compression.caveman_output;
+    document.getElementById('compression-tool-definitions').checked = !!compression.compress_tool_definitions;
+    document.getElementById('compression-language').value = compression.language != null ? compression.language : 'en';
+    document.getElementById('compression-language-packs-dir').value = compression.language_packs_dir != null ? compression.language_packs_dir : './language_packs';
+    var budgets = compression.time_budget_ms || COMPRESSION_DEFAULTS.time_budget_ms;
+    ['lite','standard','aggressive','ultra','rtk','stacked'].forEach(function(level) { document.getElementById('compression-budget-' + level).value = budgets[level] != null ? budgets[level] : COMPRESSION_DEFAULTS.time_budget_ms[level]; });
+    var selectedRules = Array.isArray(compression.protection_rules) ? compression.protection_rules : COMPRESSION_RULES;
+    document.querySelectorAll('[data-compression-rule]').forEach(function(input) { input.checked = selectedRules.indexOf(input.dataset.compressionRule) !== -1; });
+    document.getElementById('compression-rtk-grouping').value = (compression.rtk && compression.rtk.grouping_strategy) || 'balanced';
+    var perplexity = compression.perplexity || COMPRESSION_DEFAULTS.perplexity;
+    document.getElementById('compression-perplexity-enabled').checked = !!perplexity.enabled;
+    document.getElementById('compression-redundancy-threshold').value = perplexity.redundancy_threshold != null ? perplexity.redundancy_threshold : 0.5;
+    document.getElementById('compression-ratio-target').value = perplexity.compression_ratio_target != null ? perplexity.compression_ratio_target : 5;
+    document.getElementById('compression-model-path').value = perplexity.model_path != null ? perplexity.model_path : './models/perplexity_scorer.onnx';
+    var preList = document.getElementById('compression-precompressed-list'); preList.textContent = '';
+    (compression.precompressed_contexts || []).forEach(addPrecompressedRow);
+    var pipelineList = document.getElementById('compression-pipelines-list'); pipelineList.textContent = '';
+    var pipelines = compression.custom_pipelines || {};
+    Object.keys(pipelines).sort().forEach(function(name) { addCompressionPipelineRow(name, pipelines[name]); });
+  }
+
+  function collectCompression() {
+    var budgets = {};
+    ['lite','standard','aggressive','ultra','rtk','stacked'].forEach(function(level) { budgets[level] = parseInt(document.getElementById('compression-budget-' + level).value, 10); });
+    var contexts = [];
+    document.querySelectorAll('#compression-precompressed-list .compression-pre-row').forEach(function(row) {
+      var hash = row.querySelector('.compression-pre-hash').value.trim();
+      contexts.push({source_path:row.querySelector('.compression-pre-source').value.trim(),compressed_path:row.querySelector('.compression-pre-output').value.trim(),content_hash:hash || null});
+    });
+    var pipelines = {};
+    document.querySelectorAll('#compression-pipelines-list .compression-pipeline-row').forEach(function(row) {
+      pipelines[row.querySelector('.compression-pipeline-name').value.trim()] = {engines:row.querySelector('.compression-pipeline-engines').value.split(',').map(function(value) { return value.trim(); }).filter(Boolean)};
+    });
+    return {
+      enabled:document.getElementById('compression-enabled').checked,default_level:document.getElementById('compression-default-level').value,auto_threshold_tokens:parseInt(document.getElementById('compression-threshold').value,10),
+      caveman_output:document.getElementById('compression-caveman').checked,compress_tool_definitions:document.getElementById('compression-tool-definitions').checked,language:document.getElementById('compression-language').value.trim(),language_packs_dir:document.getElementById('compression-language-packs-dir').value.trim(),
+      time_budget_ms:budgets,protection_rules:Array.from(document.querySelectorAll('[data-compression-rule]:checked')).map(function(input) { return input.dataset.compressionRule; }),precompressed_contexts:contexts,
+      rtk:{grouping_strategy:document.getElementById('compression-rtk-grouping').value},perplexity:{enabled:document.getElementById('compression-perplexity-enabled').checked,redundancy_threshold:parseFloat(document.getElementById('compression-redundancy-threshold').value),compression_ratio_target:parseInt(document.getElementById('compression-ratio-target').value,10),model_path:document.getElementById('compression-model-path').value.trim()},custom_pipelines:pipelines
+    };
+  }
+
+  document.getElementById('compression-add-precompressed').addEventListener('click', function() { addPrecompressedRow(null); });
+  document.getElementById('compression-add-pipeline').addEventListener('click', function() { addCompressionPipelineRow('', null); });
 
   var LOOP_DEFAULTS={enabled:false,session_timeout_minutes:30,max_sessions:10000,history_depth:5,thresholds:{warn_confidence:0.3,throttle_confidence:0.5,inject_confidence:0.7,hardstop_confidence:0.9},consecutive_counts:{warn:3,throttle:5,inject:7,hardstop:10},weights:{content_similarity:0.25,tool_call_repetition:0.20,response_stagnation:0.15,token_velocity:0.10,error_cycling:0.15,context_growth:0.10,cost_velocity:0.05},throttle_delay_seconds:2,injection_strategy:'system_prompt_append',break_instruction_template:null};
   var LOOP_PRESETS={
@@ -2248,6 +2578,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     if(cfg.logging){document.getElementById('log-request-body').checked=!!cfg.logging.request_body_logging; document.getElementById('log-response-body').checked=!!cfg.logging.response_body_logging; document.getElementById('log-max-body').value=cfg.logging.max_body_size_bytes||10240; document.getElementById('log-db-path').value=cfg.logging.database_path||'logs.db'; document.getElementById('log-excluded-fields').value=(cfg.logging.excluded_fields||[]).join(', '); document.getElementById('log-retention').value=cfg.logging.retention_days||30; document.getElementById('log-cleanup').value=cfg.logging.cleanup_schedule_hours||24;}
     if(cfg.semantic_cache){document.getElementById('cache-enabled').checked=!!cfg.semantic_cache.enabled; document.getElementById('cache-qdrant-url').value=cfg.semantic_cache.qdrant_url||''; document.getElementById('cache-collection').value=cfg.semantic_cache.collection_name||'ai_gateway_cache'; document.getElementById('cache-threshold').value=cfg.semantic_cache.similarity_threshold||0.95; document.getElementById('cache-ttl').value=cfg.semantic_cache.ttl_seconds||3600; document.getElementById('cache-max-entries').value=cfg.semantic_cache.max_cache_size||10000;}
     if(cfg.context){document.getElementById('context-enabled').checked=!!cfg.context.enabled; document.getElementById('context-strategy').value=cfg.context.truncation_strategy||'remove_oldest'; document.getElementById('context-window-size').value=cfg.context.sliding_window_size||10; document.getElementById('context-cache-ttl').value=cfg.context.capabilities_cache_ttl_seconds||3600; document.getElementById('context-max-retries').value=cfg.context.max_truncation_retries||3;}
+    populateCompression(cfg.compression || COMPRESSION_DEFAULTS);
     var sc=cfg.streaming||{};document.getElementById('stream-early-event').checked=sc.emit_early_event!==false;document.getElementById('stream-keepalive').value=sc.keepalive_interval_seconds!=null?sc.keepalive_interval_seconds:5;document.getElementById('stream-passthrough').checked=sc.passthrough_enabled!==false;document.getElementById('stream-chunk-timeout').value=sc.chunk_timeout_seconds||60;document.getElementById('stream-retry-truncation').checked=sc.retry_on_truncation!==false;
     populateLoopDetection(cfg.loop_detection||LOOP_DEFAULTS);
     populateProviderSelects();
@@ -2259,13 +2590,21 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
   }
 
   // --- Collect Config from UI ---
+  function findOriginalByName(items, name, index) {
+    var found = null;
+    (items || []).some(function(item) { if (item && item.name === name) { found = item; return true; } return false; });
+    return found || ((items || [])[index]) || null;
+  }
+
   function collectConfig() {
     var cfg = config ? JSON.parse(JSON.stringify(config)) : {};
     cfg.server = { host:document.getElementById('srv-host').value.trim(), port:parseInt(document.getElementById('srv-port').value,10), request_timeout_seconds:parseInt(document.getElementById('srv-timeout').value,10), max_request_size_mb:parseInt(document.getElementById('srv-max-body').value,10) };
     cfg.tls=document.getElementById('tls-enabled').checked?{enabled:true,cert_path:document.getElementById('tls-cert').value.trim(),key_path:document.getElementById('tls-key').value.trim()}:null;
     cfg.admin=cfg.admin||{}; cfg.admin.enabled=cfg.admin.enabled!==false; cfg.admin.path=document.getElementById('admin-path').value.trim(); cfg.admin.auth={enabled:document.getElementById('admin-auth-enabled').checked,username_env:document.getElementById('admin-user-env').value.trim()||null,password_env:document.getElementById('admin-pass-env').value.trim()||null};
-    cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var p={name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}};var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};}var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}cfg.providers.push(p);});
-    cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card){var g={name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,models:[]};card.querySelectorAll('.models-container .form-row').forEach(function(row){g.models.push({provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});});cfg.model_groups.push(g);});
+    var originalProviders = (config && config.providers) || [];
+    cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
+    var originalGroups = (config && config.model_groups) || [];
+    cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container .form-row').forEach(function(row){g.models.push({provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});});cfg.model_groups.push(g);});
     var retryMax=parseInt(document.getElementById('retry-max').value,10);
     var retryBackoff=parseFloat(document.getElementById('retry-backoff').value);
     var retryMultiplier=parseFloat(document.getElementById('retry-multiplier').value);
@@ -2276,6 +2615,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     cfg.logging={request_body_logging:document.getElementById('log-request-body').checked,response_body_logging:document.getElementById('log-response-body').checked,max_body_size_bytes:parseInt(document.getElementById('log-max-body').value,10),database_path:document.getElementById('log-db-path').value.trim(),excluded_fields:document.getElementById('log-excluded-fields').value.split(',').map(function(s){return s.trim();}).filter(Boolean),retention_days:parseInt(document.getElementById('log-retention').value,10),cleanup_schedule_hours:parseInt(document.getElementById('log-cleanup').value,10)};
     cfg.semantic_cache={enabled:document.getElementById('cache-enabled').checked,qdrant_url:document.getElementById('cache-qdrant-url').value.trim(),collection_name:document.getElementById('cache-collection').value.trim(),embedding_provider:document.getElementById('cache-embed-provider').value,embedding_model:document.getElementById('cache-embed-model').value.trim(),similarity_threshold:parseFloat(document.getElementById('cache-threshold').value),ttl_seconds:parseInt(document.getElementById('cache-ttl').value,10),max_cache_size:parseInt(document.getElementById('cache-max-entries').value,10)};
     cfg.context={enabled:document.getElementById('context-enabled').checked,truncation_strategy:document.getElementById('context-strategy').value,sliding_window_size:parseInt(document.getElementById('context-window-size').value,10),capabilities_cache_ttl_seconds:parseInt(document.getElementById('context-cache-ttl').value,10),max_truncation_retries:parseInt(document.getElementById('context-max-retries').value,10)};
+    cfg.compression=collectCompression();
     cfg.streaming={emit_early_event:document.getElementById('stream-early-event').checked,keepalive_interval_seconds:parseInt(document.getElementById('stream-keepalive').value,10),passthrough_enabled:document.getElementById('stream-passthrough').checked,chunk_timeout_seconds:parseInt(document.getElementById('stream-chunk-timeout').value,10),retry_on_truncation:document.getElementById('stream-retry-truncation').checked};
     cfg.loop_detection=collectLoopDetection();
     cfg.guardrails=collectGuardrails();

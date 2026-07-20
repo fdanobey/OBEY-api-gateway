@@ -1580,6 +1580,40 @@ mod tests {
     }
 
     #[test]
+    fn token_compression_admin_ui_round_trips_global_and_overrides() {
+        let asset = AdminAssets::get("index.html").expect("index embedded");
+        let html = std::str::from_utf8(&asset.data).unwrap();
+
+        for marker in [
+            "tab-compression-config",
+            "page-compression",
+            "compression-enabled",
+            "compression-default-level",
+            "compression-threshold",
+            "compression-budget-stacked",
+            "compression-rule-code-blocks",
+            "compression-perplexity-enabled",
+            "compression-precompressed-list",
+            "compression-pipelines-list",
+            "prov-compression-override",
+            "grp-compression-override",
+        ] {
+            assert!(
+                html.contains(marker),
+                "missing compression UI marker {marker}"
+            );
+        }
+
+        assert!(html.contains("function populateCompression(value)"));
+        assert!(html.contains("function collectCompression()"));
+        assert!(html.contains("function collectCompressionOverride(card, prefix)"));
+        assert!(html.contains("'page-compression': validateCompressionPage"));
+        assert!(html.contains("cfg.compression=collectCompression()"));
+        assert!(html.contains("collectCompressionOverride(card,'prov')"));
+        assert!(html.contains("collectCompressionOverride(card,'grp')"));
+    }
+
+    #[test]
     fn loop_detection_ui_has_valid_presets_and_put_save_path() {
         let asset = AdminAssets::get("index.html").expect("index embedded");
         let html = std::str::from_utf8(&asset.data).unwrap();
