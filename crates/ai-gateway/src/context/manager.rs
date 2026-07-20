@@ -3,6 +3,7 @@
 //! Provides token estimation, model capabilities caching, and automatic
 //! context truncation when requests exceed model limits.
 
+use crate::compression::token_counter::TokenCounter;
 use crate::config::ContextConfig;
 use crate::models::openai::{Message, OpenAIRequest};
 use crate::providers::Model;
@@ -160,20 +161,20 @@ impl ContextManager {
 
     /// Estimate token count for a full request
     pub fn estimate_request_tokens(request: &OpenAIRequest) -> u32 {
-        let mut total = Self::estimate_tokens(&request.messages);
-        // Account for tools definitions in the request (can be thousands of tokens)
-        if let Some(tools) = request.extra.get("tools") {
-            let tools_str = tools.to_string();
-            total += (tools_str.len() as u32 + 3) / 4;
-        }
-        total
+        TokenCounter::new().count_request(request)
+    }
+
+    fn input_token_budget(request: &OpenAIRequest, context_window: u32) -> u32 {
+        let safety_margin = (context_window / 20).max(1_024);
+        context_window
+            .saturating_sub(request.max_tokens.unwrap_or(0))
+            .saturating_sub(safety_margin)
     }
 
     /// Check if a request fits within context limits
     pub fn fits_within_limits(&self, request: &OpenAIRequest, context_window: u32) -> bool {
         let estimated = Self::estimate_request_tokens(request);
-        // Leave some buffer for output tokens
-        let effective_limit = (context_window as f64 * 0.75) as u32;
+        let effective_limit = Self::input_token_budget(request, context_window);
         estimated <= effective_limit
     }
 
@@ -191,12 +192,14 @@ impl ContextManager {
             "remove_oldest" | _ => TruncationStrategy::RemoveOldest,
         };
 
-        // Leave some buffer for output tokens
-        let effective_limit = (context_window as f64 * 0.75) as u32;
+        let effective_limit = Self::input_token_budget(request, context_window);
+        let non_message_tokens = Self::estimate_request_tokens(request)
+            .saturating_sub(Self::estimate_tokens(&request.messages));
+        let message_limit = effective_limit.saturating_sub(non_message_tokens);
 
         apply_truncation_strategy(
             &mut request.messages,
-            effective_limit,
+            message_limit,
             strategy,
             Self::estimate_tokens,
         )
@@ -387,6 +390,61 @@ mod tests {
         assert!(manager.is_context_length_error(413, "Input is too long"));
         assert!(!manager.is_context_length_error(400, "Invalid API key"));
         assert!(!manager.is_context_length_error(500, "Internal server error"));
+    }
+
+    #[test]
+    fn test_request_estimate_counts_all_extras_and_output_reservation() {
+        let manager = ContextManager::new();
+        let mut request = OpenAIRequest {
+            model: "zai.glm-5".to_string(),
+            messages: vec![create_test_message("user", &"x".repeat(2_000))],
+            stream: false,
+            temperature: None,
+            max_tokens: Some(2_000),
+            extra: Default::default(),
+        };
+        request.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{"type":"function","function":{"name":"large","description":"d".repeat(4_000),"parameters":{"type":"object"}}}]),
+        );
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), serde_json::json!("high"));
+
+        let with_extras = ContextManager::estimate_request_tokens(&request);
+        request.extra.clear();
+        let without_extras = ContextManager::estimate_request_tokens(&request);
+        assert!(with_extras > without_extras);
+        assert!(!manager.fits_within_limits(&request, 2_500));
+    }
+
+    #[test]
+    fn test_truncate_request_accounts_for_tools_and_max_tokens() {
+        let manager = ContextManager::new();
+        let mut request = OpenAIRequest {
+            model: "zai.glm-5".to_string(),
+            messages: vec![
+                create_test_message("system", "system"),
+                create_test_message("user", &"x".repeat(8_000)),
+                create_test_message("assistant", &"y".repeat(8_000)),
+                create_test_message("user", &"z".repeat(8_000)),
+            ],
+            stream: false,
+            temperature: None,
+            max_tokens: Some(2_000),
+            extra: Default::default(),
+        };
+        request.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{"type":"function","function":{"name":"large","description":"d".repeat(4_000),"parameters":{"type":"object"}}}]),
+        );
+
+        let result = manager.truncate_request(&mut request, 5_000);
+        assert!(result.truncated);
+        assert!(
+            ContextManager::estimate_request_tokens(&request)
+                <= ContextManager::input_token_budget(&request, 5_000)
+        );
     }
 
     #[test]
