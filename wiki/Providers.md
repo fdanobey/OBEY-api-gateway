@@ -138,7 +138,7 @@ Maintainers synchronize both catalogs with `scripts/sync-bedrock-fallback.ps1`. 
 |-------|---------|-------------|
 | `cross_region_inference` | `false` | AWS SDK mode only: use a geographic inference-profile ID for models that publish one; unsupported and Mantle model IDs stay unchanged |
 | `global_inference_profile` | `false` | AWS SDK mode only: use a `global.` inference-profile ID for models that publish one; takes precedence over geographic cross-region inference |
-| `prompt_caching` | `false` | Enable prompt caching (Claude 3.5+ models) |
+| `prompt_caching` | `false` | Enable prompt caching only where the selected Bedrock model/API explicitly supports cache checkpoints; no synthetic Mantle header is added |
 | `custom_vpc_endpoint` | `false` | Use `base_url` as-is (no auto-generation) |
 | `reasoning` | `true` | Enable extended thinking for supported models |
 

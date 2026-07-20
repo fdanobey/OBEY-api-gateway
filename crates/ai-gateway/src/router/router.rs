@@ -1676,7 +1676,7 @@ impl Router {
         tracing::info!(provider = provider_name, %url, model = %provider_model.model, ttfb_timeout_secs, total_timeout_secs, "Calling provider");
 
         let pool_config = provider_cfg.connection_pool.clone();
-        let mut custom_headers = provider_cfg.custom_headers.clone();
+        let custom_headers = provider_cfg.custom_headers.clone();
         let provider_type = provider_cfg.provider_type.clone();
         let cross_region_inference = provider_cfg.cross_region_inference;
         let global_inference_profile = provider_cfg.global_inference_profile;
@@ -1718,11 +1718,15 @@ impl Router {
             };
         }
 
-        // Inject prompt caching header for Bedrock providers
+        // Prompt caching is configured in the request body using each Bedrock
+        // API's cache checkpoint fields. A synthetic HTTP header is not part of
+        // the Mantle Chat Completions contract and can make otherwise valid
+        // requests fail validation.
         if provider_type == "bedrock" && prompt_caching {
-            custom_headers.insert(
-                "x-amzn-bedrock-prompt-caching".to_string(),
-                "OPTIMIZED".to_string(),
+            tracing::debug!(
+                provider = provider_name,
+                model = %outgoing.model,
+                "Bedrock prompt caching enabled; no synthetic request header added"
             );
         }
 
@@ -4937,6 +4941,38 @@ mod tests {
     };
     use crate::config::{CircuitBreakerConfig, ExactCacheConfig, ModelGroup, ProviderModel};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn bedrock_sanitizer_keeps_reasoning_effort_and_drops_unknown_fields() {
+        let mut request = OpenAIRequest {
+            model: "zai.glm-5".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+                extra: Default::default(),
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: Some(16),
+            extra: Default::default(),
+        };
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), serde_json::json!("high"));
+        request
+            .extra
+            .insert("store".to_string(), serde_json::json!(false));
+
+        assert_eq!(
+            Router::sanitize_request_for_provider(&mut request, "bedrock"),
+            1
+        );
+        assert_eq!(
+            request.extra.get("reasoning_effort"),
+            Some(&serde_json::json!("high"))
+        );
+        assert!(!request.extra.contains_key("store"));
+    }
 
     pub(super) fn test_metrics() -> Arc<crate::metrics::Metrics> {
         Arc::new(crate::metrics::Metrics::new())

@@ -487,9 +487,9 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
           <div class="info-note" style="margin-top:-.5rem;margin-bottom:.75rem">API-key/Mantle providers always use the exact model IDs returned by AWS. Global and cross-region prefixes are never added to Mantle requests.</div>
           <div class="form-check">
             <input type="checkbox" class="prov-prompt-caching">
-            <label>Enable prompt caching</label>
+            <label>Enable prompt caching where explicitly supported</label>
           </div>
-          <div class="info-note" style="margin-top:-.5rem;margin-bottom:.75rem">Note: If you don't see cache usage, try selecting a different model and then selecting your desired model again.</div>
+          <div class="info-note" style="margin-top:-.5rem;margin-bottom:.75rem">GLM 5 does not advertise Bedrock prompt caching support. Enabling this setting will not add unsupported headers to Mantle requests.</div>
           <div class="form-check">
             <input type="checkbox" class="prov-custom-vpc">
             <label>Use custom VPC endpoint</label>
