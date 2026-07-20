@@ -13,6 +13,7 @@
 - [Routing & Failover](Routing-and-Failover)
 - [Streaming](Streaming)
 - [Caching](Caching)
+- [Token Compression](Token-Compression)
 
 ### Access Control
 - [Virtual Keys](Virtual-Keys)
