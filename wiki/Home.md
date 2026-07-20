@@ -28,6 +28,7 @@ AI providers go down. Rate limits hit. Models get deprecated. OBEY handles all o
 | [Smart Rate-Limit Handling](Routing-and-Failover#smart-rate-limit-failover) | Honors `Retry-After`, `X-RateLimit-Reset`, Anthropic headers, weekly quotas |
 | [Streaming Reliability](Streaming) | True SSE pass-through, early events, keep-alive, mid-stream failover |
 | [Response Caching](Caching) | Two-tier: in-memory exact-match + optional Qdrant semantic cache |
+| [Token Compression](Token-Compression) | Multi-engine payload compression with custom pipelines and cache-aware downgrades |
 | [Virtual Key Management](Virtual-Keys) | Per-caller keys with budgets, rate limits, model access, expiry |
 | [Guardrail Pipelines](Guardrail-Pipelines) | PII redaction, content moderation, prompt injection detection |
 | [OpenAI OAuth Login](OAuth-and-Codex) | Browser-based sign-in with ChatGPT Plus/Pro subscription |
@@ -106,6 +107,7 @@ See [Installation](Installation) for all setup options.
 - **[Routing & Failover](Routing-and-Failover)** — Intelligent routing, circuit breakers, priorities
 - **[Streaming](Streaming)** — Streaming reliability features
 - **[Caching](Caching)** — Exact-match and semantic cache
+- **[Token Compression](Token-Compression)** — Multi-engine payload compression
 - **[Virtual Keys](Virtual-Keys)** — Multi-tenant key management
 - **[Guardrail Pipelines](Guardrail-Pipelines)** — Policy enforcement and PII protection
 - **[OAuth & Codex](OAuth-and-Codex)** — OpenAI OAuth and Codex backend
