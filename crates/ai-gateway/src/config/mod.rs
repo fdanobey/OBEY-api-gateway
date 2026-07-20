@@ -394,14 +394,14 @@ pub struct Provider {
     /// provider's own /v1/models endpoint returns nothing.
     #[serde(default)]
     pub manual_models: Vec<String>,
-    /// Enable global inference (Bedrock only).
-    /// When true, AWS auto-selects the optimal region for the request.
-    /// Uses inference profile ARNs instead of model IDs.
+    /// Enable global inference (Bedrock AWS SDK mode only).
+    /// When true, supported models use their `global.` inference profile ID.
+    /// Mantle/API-key model IDs are never modified.
     #[serde(default)]
     pub global_inference_profile: bool,
-    /// Enable cross-region inference (Bedrock only).
-    /// When true, model IDs are prefixed with the region group (e.g., "us.") to
-    /// route requests across multiple regions for higher throughput.
+    /// Enable geographic cross-region inference (Bedrock AWS SDK mode only).
+    /// When true, supported model IDs receive a region-group prefix (for
+    /// example `us.`). Mantle/API-key model IDs are never modified.
     #[serde(default)]
     pub cross_region_inference: bool,
     /// Enable prompt caching for supported Bedrock models (Claude 3.5+).

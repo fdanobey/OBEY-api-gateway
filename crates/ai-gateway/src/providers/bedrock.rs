@@ -21,15 +21,18 @@ use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usag
 use crate::providers::{Model, ProviderClient, ProviderResponse, SSEEvent};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MantleApi {
+pub(crate) enum MantleApi {
     Chat,
     Responses,
     Messages,
 }
 
-fn mantle_api_for_model(model_id: &str) -> MantleApi {
+pub(crate) fn mantle_api_for_model(model_id: &str) -> MantleApi {
     let id = model_id.to_ascii_lowercase();
-    if id.starts_with("openai.gpt-5.6") || id == "openai.gpt-5.5" || id == "openai.gpt-5.4" {
+    if id.starts_with("openai.gpt-5.6")
+        || id.starts_with("openai.gpt-5.5")
+        || id.starts_with("openai.gpt-5.4")
+    {
         MantleApi::Responses
     } else if id.starts_with("anthropic.claude") {
         MantleApi::Messages
@@ -413,7 +416,7 @@ pub fn derive_region_group(region: &str) -> &str {
 /// returned unchanged to avoid double-prefixing. When `enabled` is `false`, the model ID
 /// is returned unchanged.
 pub fn apply_global_inference_prefix(model_id: &str, region: &str, enabled: bool) -> String {
-    if !enabled {
+    if !enabled || !model_supports_geo_inference(model_id) {
         return model_id.to_string();
     }
     let region_group = derive_region_group(region);
@@ -426,6 +429,47 @@ pub fn apply_global_inference_prefix(model_id: &str, region: &str, enabled: bool
     } else {
         format!("{}{}", prefix, model_id)
     }
+}
+
+pub fn apply_global_inference_profile(model_id: &str, enabled: bool) -> String {
+    if !enabled || !model_supports_global_inference(model_id) {
+        return model_id.to_string();
+    }
+    if model_id.starts_with("global.") {
+        model_id.to_string()
+    } else {
+        format!("global.{}", model_id)
+    }
+}
+
+pub fn model_supports_geo_inference(model_id: &str) -> bool {
+    matches!(
+        bedrock_base_model_id(model_id),
+        "anthropic.claude-sonnet-5"
+            | "anthropic.claude-sonnet-4-5-20250929-v1:0"
+            | "anthropic.claude-opus-4-8"
+            | "anthropic.claude-opus-4-7"
+            | "anthropic.claude-haiku-4-5-20251001-v1:0"
+            | "amazon.nova-pro-v1:0"
+            | "amazon.nova-lite-v1:0"
+            | "amazon.nova-micro-v1:0"
+            | "writer.palmyra-x5-v1:0"
+    )
+}
+
+pub fn model_supports_global_inference(model_id: &str) -> bool {
+    matches!(
+        bedrock_base_model_id(model_id),
+        "anthropic.claude-sonnet-5" | "anthropic.claude-sonnet-4-5-20250929-v1:0"
+    )
+}
+
+fn bedrock_base_model_id(model_id: &str) -> &str {
+    const PROFILE_PREFIXES: &[&str] = &["global.", "us.", "eu.", "ap.", "au.", "jp."];
+    PROFILE_PREFIXES
+        .iter()
+        .find_map(|prefix| model_id.strip_prefix(prefix))
+        .unwrap_or(model_id)
 }
 
 /// Check whether a model ID refers to a reasoning-capable model.
@@ -2640,6 +2684,10 @@ mod tests {
         );
         assert_eq!(mantle_api_for_model("openai.gpt-5.5"), MantleApi::Responses);
         assert_eq!(
+            mantle_api_for_model("openai.gpt-5.5-2026-04-23"),
+            MantleApi::Responses
+        );
+        assert_eq!(
             mantle_api_for_model("anthropic.claude-sonnet-5"),
             MantleApi::Messages
         );
@@ -2675,6 +2723,36 @@ mod tests {
             "response adapter works"
         );
         assert_eq!(response.usage.total_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn test_versioned_gpt_55_uses_responses_api() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_versioned",
+                "output_text": "versioned response adapter works",
+                "usage": {"input_tokens": 3, "output_tokens": 4}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = create_api_key_mode_provider_for_base_url(
+            "bedrock-test",
+            format!("{}/v1", server.uri()),
+            "test-api-key",
+        );
+        let mut request = create_test_chat_request(false);
+        request.model = "openai.gpt-5.5-2026-04-23".to_string();
+        let response = provider.chat_completion(request).await.unwrap().response;
+        assert_eq!(
+            response.choices[0].message.content_as_text(),
+            "versioned response adapter works"
+        );
     }
 
     #[tokio::test]
@@ -2922,14 +3000,24 @@ mod property_tests {
         prop::sample::select(BEDROCK_REGIONS)
     }
 
-    // Feature: bedrock-ui-integration, Property 2: Global inference profile model ID prefixing
+    fn arb_profile_model_id() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "anthropic.claude-sonnet-5".to_string(),
+            "anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+            "anthropic.claude-opus-4-8".to_string(),
+            "amazon.nova-pro-v1:0".to_string(),
+            "writer.palmyra-x5-v1:0".to_string(),
+        ])
+    }
+
+    // Feature: bedrock-ui-integration, Property 2: supported geo inference profile prefixing
     // **Validates: Requirements 4.3, 4.4**
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
         #[test]
         fn prop_global_inference_prefix_when_enabled(
-            model_id in arb_model_id(),
+            model_id in arb_profile_model_id(),
             region in arb_bedrock_region(),
         ) {
             let result = apply_global_inference_prefix(&model_id, region, true);
@@ -2969,7 +3057,7 @@ mod property_tests {
 
         #[test]
         fn prop_global_inference_no_double_prefix(
-            model_id in arb_model_id(),
+            model_id in arb_profile_model_id(),
             region in arb_bedrock_region(),
         ) {
             // Apply prefix once
@@ -2983,6 +3071,38 @@ mod property_tests {
                 "Double-prefixing must not occur: first='{}', second='{}'", once, twice
             );
         }
+    }
+
+    #[test]
+    fn inference_profiles_leave_unsupported_mantle_models_unchanged() {
+        for model_id in [
+            "zai.glm-5",
+            "moonshotai.kimi-k2.5",
+            "openai.gpt-5.6-sol",
+            "openai.gpt-5.5-2026-04-23",
+        ] {
+            assert_eq!(
+                apply_global_inference_prefix(model_id, "us-east-2", true),
+                model_id
+            );
+            assert_eq!(apply_global_inference_profile(model_id, true), model_id);
+        }
+    }
+
+    #[test]
+    fn global_profile_uses_global_prefix_only_for_supported_models() {
+        assert_eq!(
+            apply_global_inference_profile("anthropic.claude-sonnet-5", true),
+            "global.anthropic.claude-sonnet-5"
+        );
+        assert_eq!(
+            apply_global_inference_profile("global.anthropic.claude-sonnet-5", true),
+            "global.anthropic.claude-sonnet-5"
+        );
+        assert_eq!(
+            apply_global_inference_profile("anthropic.claude-opus-4-8", true),
+            "anthropic.claude-opus-4-8"
+        );
     }
 
     /// Known reasoning-capable model IDs that MUST return true.

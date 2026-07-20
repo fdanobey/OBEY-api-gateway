@@ -478,12 +478,13 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
           </div>
           <div class="form-check">
             <input type="checkbox" class="prov-global-inference">
-            <label>Use Global inference (auto-select optimal AWS Region)</label>
+            <label>Use global inference profile (AWS SDK only; supported models only)</label>
           </div>
           <div class="form-check">
             <input type="checkbox" class="prov-cross-region">
-            <label>Use cross-region inference</label>
+            <label>Use geographic cross-region inference (AWS SDK only; supported models only)</label>
           </div>
+          <div class="info-note" style="margin-top:-.5rem;margin-bottom:.75rem">API-key/Mantle providers always use the exact model IDs returned by AWS. Global and cross-region prefixes are never added to Mantle requests.</div>
           <div class="form-check">
             <input type="checkbox" class="prov-prompt-caching">
             <label>Enable prompt caching</label>
@@ -2288,15 +2289,9 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
   }
 
   function populateBedrockModelSelect(models, globalInference, region, selectEl, currentModel, manualModels) {
-    // Optionally prefix with region group for global inference
-    if (globalInference) {
-      var prefix = getBedrockRegionPrefix(region);
-      if (prefix) {
-        models = models.map(function(m) {
-          return m.indexOf(prefix) === 0 ? m : prefix + m;
-        });
-      }
-    }
+    // Mantle/API-key model IDs must be sent exactly as returned by AWS.
+    // Inference-profile IDs are an AWS SDK/Runtime concern and are resolved by
+    // the gateway only for models that publish geo/global profiles.
     // Merge with manual_models, deduplicate, sort
     (manualModels || []).forEach(function(m) {
       if (m && models.indexOf(m) === -1) models.push(m);

@@ -11,7 +11,10 @@ use crate::context::ContextManager;
 use crate::dashboard::CompressionEventHub;
 use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
 use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
-use crate::providers::bedrock::{apply_global_inference_prefix, model_supports_reasoning};
+use crate::providers::bedrock::{
+    apply_global_inference_prefix, apply_global_inference_profile, model_supports_reasoning,
+    BedrockProvider,
+};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::error::Error as StdError;
@@ -1593,6 +1596,28 @@ impl Router {
         // Resolve API key: try as env var first, fall back to using the value directly
         let api_key = provider_cfg.resolve_api_key().unwrap_or_default();
 
+        let is_bedrock_api_key = provider_cfg.provider_type == "bedrock" && !api_key.is_empty();
+        if is_bedrock_api_key {
+            use crate::providers::ProviderClient;
+            let mut bedrock_request = request.clone();
+            bedrock_request.model = provider_model.model.clone();
+            bedrock_request.stream = false;
+            let bedrock_client = BedrockProvider::new_with_config(
+                provider_name.to_string(),
+                provider_cfg
+                    .region
+                    .clone()
+                    .unwrap_or_else(|| "us-east-1".to_string()),
+                Some(api_key),
+                Some(provider_cfg.max_connections),
+                Some(provider_cfg.effective_total_timeout(&provider_model.model)),
+                provider_cfg.custom_headers.clone(),
+            )
+            .await?;
+            let result = bedrock_client.chat_completion(bedrock_request).await?;
+            return Ok(result.response);
+        }
+
         // OAuth bearer override (Req 6.2): when the provider declares
         // `auth_method: oauth` and the OAuth manager has a live,
         // non-expired access token, use it as the outgoing Bearer in place
@@ -1654,6 +1679,7 @@ impl Router {
         let mut custom_headers = provider_cfg.custom_headers.clone();
         let provider_type = provider_cfg.provider_type.clone();
         let cross_region_inference = provider_cfg.cross_region_inference;
+        let global_inference_profile = provider_cfg.global_inference_profile;
         let prompt_caching = provider_cfg.prompt_caching;
         let reasoning = provider_cfg.reasoning;
         let provider_region = provider_cfg.region.clone();
@@ -1680,10 +1706,16 @@ impl Router {
         outgoing.stream = false;
         let mut context_retry_attempt: usize = 0;
 
-        // Apply cross-region inference prefix for Bedrock providers
-        if provider_type == "bedrock" && cross_region_inference {
+        // Apply Bedrock inference profiles only in AWS SDK mode. Mantle model
+        // IDs never accept geo/global prefixes, and only some Runtime models
+        // publish inference profiles.
+        if provider_type == "bedrock" && api_key.is_empty() {
             let region = provider_region.as_deref().unwrap_or("us-east-1");
-            outgoing.model = apply_global_inference_prefix(&outgoing.model, region, true);
+            outgoing.model = if global_inference_profile {
+                apply_global_inference_profile(&outgoing.model, true)
+            } else {
+                apply_global_inference_prefix(&outgoing.model, region, cross_region_inference)
+            };
         }
 
         // Inject prompt caching header for Bedrock providers
