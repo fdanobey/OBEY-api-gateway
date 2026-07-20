@@ -137,6 +137,42 @@ cors:
   allowed_methods: ["GET", "POST", "OPTIONS"]
   allowed_headers: ["Content-Type", "Authorization"]
 
+# Token compression is opt-in. Provider/model-group `compression` blocks override
+# these defaults field-by-field; `level: none` explicitly disables auto-trigger.
+compression:
+  enabled: false
+  default_level: lite
+  auto_threshold_tokens: 0
+  caveman_output: false
+  compress_tool_definitions: false
+  language: en
+  language_packs_dir: "./language_packs"
+  time_budget_ms:
+    lite: 500
+    standard: 500
+    aggressive: 2000
+    ultra: 2000
+    rtk: 2000
+    stacked: 2000
+  protection_rules:
+    - code_blocks
+    - urls
+    - file_paths
+    - json_structures
+    - identifiers
+    - math_expressions
+    - tool_definitions
+    - structured_tool_output
+  precompressed_contexts: []
+  rtk:
+    grouping_strategy: balanced
+  perplexity:
+    enabled: false
+    redundancy_threshold: 0.5
+    compression_ratio_target: 5
+    model_path: "./models/perplexity_scorer.onnx"
+  custom_pipelines: {}
+
 # Tier-1 in-memory exact-match response cache.
 # Caches deterministic chat completions across stream and non-stream calls.
 # Eligibility: temperature <= temperature_threshold AND n == 1.

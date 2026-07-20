@@ -76,6 +76,7 @@ fn provider(base_url: &str) -> Provider {
         cross_region_inference: false,
         custom_vpc_endpoint: false,
         prompt_caching: false,
+        compression: None,
         reasoning: true,
         codex_base_url_override: None,
         codex_model_override: None,
@@ -101,6 +102,7 @@ fn base_config(base_url: &str) -> Config {
         model_groups: vec![ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
+            compression: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
                 model: "gpt-4".to_string(),
@@ -116,6 +118,7 @@ fn base_config(base_url: &str) -> Config {
         exact_cache: ExactCacheConfig::default(),
         prometheus: None,
         context: ai_gateway::config::ContextConfig::default(),
+        compression: Default::default(),
         first_launch_completed: false,
         tray: ai_gateway::config::TrayConfig::default(),
         codex_instructions_url: None,

@@ -2293,11 +2293,15 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 
   function saveConfig() {
     if(!validateActivePage()){setStatus('Validation failed — fix highlighted errors');showToast('Validation failed — fix highlighted errors',true);return;}
-    var cfg=collectConfig(); setStatus('Saving…');
-    fetch(apiUrl('config'),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)})
-      .then(function(r){if(!r.ok)return r.text().then(function(t){throw new Error(t);});return r.json();})
-      .then(function(){setStatus('Configuration saved');showToast('Configuration saved to file');})
-      .catch(function(err){setStatus('Save failed: '+err.message);showToast('Save failed: '+err.message,true);});
+    var cfg=collectConfig();
+    var controller=new AbortController();
+    var timeoutId=setTimeout(function(){controller.abort();},15000);
+    setStatus('Saving…');
+    fetch(apiUrl('config'),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg),signal:controller.signal})
+      .then(function(r){return r.text().then(function(text){var data=null;try{data=text?JSON.parse(text):null;}catch(_){}if(!r.ok)throw new Error((data&&data.error&&((data.error.details||[]).join(' ')||data.error.message))||text||('HTTP '+r.status));return data;});})
+      .then(function(){config=cfg;setStatus('Configuration saved');showToast('Configuration saved to file');})
+      .catch(function(err){var message=err.name==='AbortError'?'request timed out after 15 seconds':err.message;setStatus('Save failed: '+message);showToast('Save failed: '+message,true);})
+      .finally(function(){clearTimeout(timeoutId);});
   }
 
   document.getElementById('loop-weight-fields').addEventListener('input',updateLoopWeightSum);

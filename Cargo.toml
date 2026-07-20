@@ -27,6 +27,7 @@ dashmap = "6.1"
 proptest = "1.5"
 clap = { version = "4.5", features = ["derive"] }
 async-trait = "0.1"
+tiktoken-rs = "0.12"
 futures = "0.3"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 wiremock = "0.6"

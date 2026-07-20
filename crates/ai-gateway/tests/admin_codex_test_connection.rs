@@ -50,6 +50,7 @@ fn codex_test_config() -> Config {
             cross_region_inference: false,
             custom_vpc_endpoint: false,
             prompt_caching: false,
+            compression: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -59,6 +60,7 @@ fn codex_test_config() -> Config {
         model_groups: vec![ModelGroup {
             name: "codex-group".to_string(),
             version_fallback_enabled: false,
+            compression: None,
             models: vec![ProviderModel {
                 provider: "codex-provider".to_string(),
                 model: "gpt-4.1-nano".to_string(),
@@ -74,6 +76,7 @@ fn codex_test_config() -> Config {
         exact_cache: ExactCacheConfig::default(),
         prometheus: None,
         context: ai_gateway::config::ContextConfig::default(),
+        compression: Default::default(),
         first_launch_completed: false,
         tray: ai_gateway::config::TrayConfig::default(),
         codex_instructions_url: None,

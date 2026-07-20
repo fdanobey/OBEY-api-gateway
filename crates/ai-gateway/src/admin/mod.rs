@@ -1435,6 +1435,7 @@ mod tests {
                     cross_region_inference: false,
                     custom_vpc_endpoint: false,
                     prompt_caching: false,
+                    compression: None,
                     reasoning: true,
                     codex_base_url_override: None,
                     codex_model_override: None,
@@ -1469,6 +1470,7 @@ mod tests {
             .prop_map(|(name, vf, models)| ModelGroup {
                 name,
                 version_fallback_enabled: vf,
+                compression: None,
                 models,
             })
     }
@@ -1494,6 +1496,7 @@ mod tests {
                     exact_cache: ExactCacheConfig::default(),
                     prometheus: None,
                     context: ContextConfig::default(),
+                    compression: Default::default(),
                     first_launch_completed: false,
                     tray: TrayConfig::default(),
                     codex_instructions_url: None,
@@ -1563,6 +1566,17 @@ mod tests {
             html.contains("OBEY-API Admin"),
             "Should contain admin panel title"
         );
+    }
+
+    #[test]
+    fn config_save_ui_times_out_and_reports_server_errors() {
+        let asset = AdminAssets::get("index.html").expect("index embedded");
+        let html = std::str::from_utf8(&asset.data).unwrap();
+
+        assert!(html.contains("new AbortController()"));
+        assert!(html.contains("request timed out after 15 seconds"));
+        assert!(html.contains("data.error.details"));
+        assert!(html.contains("config=cfg;setStatus('Configuration saved')"));
     }
 
     #[test]
@@ -1828,6 +1842,7 @@ retry:
                 cross_region_inference: false,
                 custom_vpc_endpoint: false,
                 prompt_caching: false,
+                compression: None,
                 reasoning: true,
                 codex_base_url_override: None,
                 codex_model_override: None,
@@ -1837,6 +1852,7 @@ retry:
             model_groups: vec![ModelGroup {
                 name: "test-group".to_string(),
                 version_fallback_enabled: false,
+                compression: None,
                 models: vec![ProviderModel {
                     provider: "test".to_string(),
                     model: "gpt-4".to_string(),
@@ -1852,6 +1868,7 @@ retry:
             exact_cache: ExactCacheConfig::default(),
             prometheus: None,
             context: ContextConfig::default(),
+            compression: Default::default(),
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,

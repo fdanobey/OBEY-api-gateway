@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::ExactCache;
+use crate::compression::stats::CompressionStats;
 use crate::config::{load_and_validate_config, StreamingConfig};
 use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
 use crate::gateway::apply_runtime_config_update;
@@ -27,7 +28,7 @@ use crate::guardrail::{
     stream as guardrail_stream, BindingSelector, GuardrailContext, GuardrailEngine,
     PostCallOutcome, PreCallOutcome, RefusalDecision, StagePhase, ToolContext,
 };
-use crate::logger::LogEntry;
+use crate::logger::{CompressionLogMetadata, LogEntry};
 use crate::metrics::Metrics;
 use crate::models::openai::{Choice, OpenAIRequest, OpenAIResponse};
 use crate::providers::Model;
@@ -46,6 +47,7 @@ struct RequestLogContext {
     cost: f64,
     /// Detailed error message for failed requests (shown in dashboard log viewer).
     error_message: Option<String>,
+    compression: Option<CompressionLogMetadata>,
 }
 
 impl RequestLogContext {
@@ -54,6 +56,16 @@ impl RequestLogContext {
         trace_id: String,
         duration_ms: u64,
         response: &crate::models::openai::OpenAIResponse,
+    ) -> Self {
+        Self::from_response_with_compression(request, trace_id, duration_ms, response, None)
+    }
+
+    fn from_response_with_compression(
+        request: &OpenAIRequest,
+        trace_id: String,
+        duration_ms: u64,
+        response: &crate::models::openai::OpenAIResponse,
+        fallback_compression: Option<&CompressionStats>,
     ) -> Self {
         Self {
             trace_id,
@@ -84,6 +96,34 @@ impl RequestLogContext {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0),
             error_message: None,
+            compression: response
+                .extra
+                .get("gateway_compression")
+                .and_then(|value| serde_json::from_value::<CompressionStats>(value.clone()).ok())
+                .as_ref()
+                .map(CompressionLogMetadata::from)
+                .or_else(|| fallback_compression.map(CompressionLogMetadata::from)),
+        }
+    }
+
+    fn from_streaming_success(
+        request: &OpenAIRequest,
+        trace_id: String,
+        duration_ms: u64,
+        provider: String,
+        model: String,
+        compression: CompressionStats,
+    ) -> Self {
+        Self {
+            trace_id,
+            status_code: StatusCode::OK.as_u16(),
+            duration_ms,
+            provider,
+            requested_model: request.model.clone(),
+            responded_model: Some(model),
+            cost: 0.0,
+            error_message: None,
+            compression: Some(CompressionLogMetadata::from(&compression)),
         }
     }
 
@@ -122,6 +162,7 @@ impl RequestLogContext {
             responded_model: None,
             cost: 0.0,
             error_message,
+            compression: None,
         }
     }
 }
@@ -145,10 +186,24 @@ fn log_request(state: &super::AppState, request: &OpenAIRequest, context: &Reque
         response_body: context.error_message.clone(),
         requested_model: Some(request.model.clone()),
         responded_model: context.responded_model.clone(),
+        compression: context.compression.clone(),
     };
     if let Err(e) = state.logger.log(entry) {
         tracing::warn!(error = %e, trace_id = %context.trace_id, "Failed to write request log entry");
     }
+}
+
+fn strip_gateway_response_metadata(response: &mut OpenAIResponse) {
+    response.extra.remove("gateway_provider");
+    response.extra.remove("gateway_responded_model");
+    response.extra.remove("gateway_cost");
+    response.extra.remove("gateway_compression");
+}
+
+fn prepare_response_for_client(response: &OpenAIResponse) -> OpenAIResponse {
+    let mut client_response = response.clone();
+    strip_gateway_response_metadata(&mut client_response);
+    client_response
 }
 
 fn trace_id_from_headers(headers: &HeaderMap) -> String {
@@ -381,7 +436,8 @@ async fn chat_completions_non_stream(
         {
             state.metrics.record_cache_hit();
             request_guard.complete();
-            let mut http = Json(resp).into_response();
+            let client_response = prepare_response_for_client(&resp);
+            let mut http = Json(client_response).into_response();
             attach_trace_id_header(&mut http, &trace_id);
             return http;
         }
@@ -404,7 +460,8 @@ async fn chat_completions_non_stream(
                     ) {
                         Ok(resp) => {
                             request_guard.complete();
-                            let mut response = Json(resp).into_response();
+                            let client_response = prepare_response_for_client(&resp);
+                            let mut response = Json(client_response).into_response();
                             attach_trace_id_header(&mut response, &trace_id);
                             return response;
                         }
@@ -591,7 +648,8 @@ async fn chat_completions_non_stream(
                                     &response,
                                 );
                                 log_request(&state, &request, &log_context);
-                                let mut http_response = Json(response).into_response();
+                                let client_response = prepare_response_for_client(&response);
+                                let mut http_response = Json(client_response).into_response();
                                 attach_trace_id_header(&mut http_response, &trace_id);
                                 return http_response;
                             }
@@ -797,7 +855,8 @@ async fn chat_completions_non_stream(
                 &response,
             );
             log_request(&state, &request, &log_context);
-            let mut http_response = Json(response).into_response();
+            let client_response = prepare_response_for_client(&response);
+            let mut http_response = Json(client_response).into_response();
             attach_trace_id_header(&mut http_response, &trace_id);
             http_response
         }
@@ -1020,7 +1079,7 @@ async fn chat_completions_stream(
                     }
                     yield Ok(Event::default().data("[DONE]"));
                 }
-                Ok(StreamingResponse::PassThrough { byte_stream, provider, model }) => {
+                Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression }) => {
                     // True streaming pass-through (Req 3.1, 3.2). The early event
                     // above already reset the client idle timer; now relay the
                     // upstream chunks verbatim.
@@ -1083,6 +1142,7 @@ async fn chat_completions_stream(
                     let mut current_stream = byte_stream;
                     let mut current_provider = provider;
                     let mut current_model = model;
+                    let mut current_compression = compression;
 
                     'failover: loop {
                         // Defensive bound (see note above): unreachable in normal
@@ -1160,13 +1220,35 @@ async fn chat_completions_stream(
                         let final_outcome = { outcome.lock().await.clone() };
                         match final_outcome {
                             // Clean finish — relay already emitted `[DONE]`.
-                            RelayOutcome::Completed => break 'failover,
+                            RelayOutcome::Completed => {
+                                let duration_ms = start.elapsed().as_millis() as u64;
+                                let log_context = RequestLogContext::from_streaming_success(
+                                    &request,
+                                    stream_trace_id.clone(),
+                                    duration_ms,
+                                    current_provider.clone(),
+                                    current_model.clone(),
+                                    current_compression.clone(),
+                                );
+                                log_request(&state, &request, &log_context);
+                                break 'failover;
+                            }
                             // Post-content failure (Req 4.2): the relay already
                             // emitted the graceful error event + `[DONE]`. We
                             // cannot transparently fail over mid-content, so
                             // account the failed attempt against the circuit
                             // breaker + metrics (Req 4.5) and stop — no retry.
                             RelayOutcome::FailedAfterContent(reason) => {
+                                let duration_ms = start.elapsed().as_millis() as u64;
+                                let log_context = RequestLogContext::from_streaming_success(
+                                    &request,
+                                    stream_trace_id.clone(),
+                                    duration_ms,
+                                    current_provider.clone(),
+                                    current_model.clone(),
+                                    current_compression.clone(),
+                                );
+                                log_request(&state, &request, &log_context);
                                 state
                                     .router
                                     .record_streaming_failure(
@@ -1219,10 +1301,11 @@ async fn chat_completions_stream(
                                     // Another eligible provider — relay it,
                                     // reusing the SAME early-event id (Req 4.4:
                                     // do NOT emit a second role event).
-                                    Ok(StreamingResponse::PassThrough { byte_stream, provider, model }) => {
+                                    Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression }) => {
                                         current_stream = byte_stream;
                                         current_provider = provider;
                                         current_model = model;
+                                        current_compression = compression;
                                         continue 'failover;
                                     }
                                     // No eligible pass-through provider remains —
@@ -1459,13 +1542,15 @@ async fn stream_buffered_with_post_call(
         // relay pass-through chunks to the caller) so the post-call pipeline
         // sees the complete content.
         let mut assembled: Option<OpenAIResponse> = None;
+        let mut streaming_compression: Option<CompressionStats> = None;
         let mut disconnected = false;
 
         match state.router.route_request_streaming(&request).await {
             Ok(StreamingResponse::Buffered(response)) => {
                 assembled = Some(response);
             }
-            Ok(StreamingResponse::PassThrough { byte_stream, .. }) => {
+            Ok(StreamingResponse::PassThrough { byte_stream, compression, .. }) => {
+                streaming_compression = Some(compression.clone());
                 // Buffer the live SSE body under the 10 MB cap while emitting
                 // keep-alive comments during idle gaps (Req 10.1, 10.2).
                 let mut buf = guardrail_stream::SseBuffer::with_default_cap();
@@ -1561,6 +1646,13 @@ async fn stream_buffered_with_post_call(
                 return;
             }
         };
+        if let Some(compression) = streaming_compression.take() {
+            response.extra.insert(
+                "gateway_compression".to_string(),
+                serde_json::to_value(compression)
+                    .expect("CompressionStats serialization must succeed"),
+            );
+        }
 
         // Post-call guardrails on the assembled response, using the SAME ctx as
         // pre-call so PII re-injection works (Req 9.5). No artificial delay is
@@ -2430,7 +2522,8 @@ fn relay_passthrough_stream(
 }
 
 pub(crate) fn streaming_chunks_from_response(response: &OpenAIResponse) -> Vec<serde_json::Value> {
-    build_streaming_chunks(response, None)
+    let response = prepare_response_for_client(response);
+    build_streaming_chunks(&response, None)
 }
 
 /// Variant used after an early synthetic `role: assistant` event has already
@@ -2442,7 +2535,8 @@ pub(crate) fn streaming_chunks_after_early_event(
     id: &str,
     created: i64,
 ) -> Vec<serde_json::Value> {
-    build_streaming_chunks(response, Some((id, created)))
+    let response = prepare_response_for_client(response);
+    build_streaming_chunks(&response, Some((id, created)))
 }
 
 /// Core chunk synthesizer. When `early_event` is `Some`, the leading
@@ -2675,10 +2769,11 @@ fn reasoning_delta(choice: Option<&Choice>) -> Option<serde_json::Value> {
 mod tests {
     use super::{
         build_keepalive, chunk_carries_content, classify_relay_line, classify_stream_error,
-        early_event_chunk, emit_sse_error_event, relay_passthrough_stream, sse_error_payload,
-        streaming_chunks_after_early_event, streaming_chunks_from_response, RelayLineAction,
-        RelayOutcome,
+        early_event_chunk, emit_sse_error_event, prepare_response_for_client,
+        relay_passthrough_stream, sse_error_payload, streaming_chunks_after_early_event,
+        streaming_chunks_from_response, RelayLineAction, RelayOutcome, RequestLogContext,
     };
+    use crate::compression::{stats::CompressionStats, CompressionLevel};
     use crate::config::StreamingConfig;
     use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
     use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
@@ -2705,6 +2800,95 @@ mod tests {
             },
             extra: Default::default(),
         }
+    }
+
+    fn test_compression_stats() -> CompressionStats {
+        CompressionStats {
+            request_id: "route-safe".to_owned(),
+            level: CompressionLevel::Standard,
+            engines_applied: vec!["standard".to_owned()],
+            original_tokens: 100,
+            compressed_tokens: 75,
+            savings_percent: 25.0,
+            compression_time_ms: 4,
+            auto_triggered: false,
+            cache_downgrade_applied: false,
+            tool_definitions_tokens_saved: 0,
+            caveman_applied: false,
+            timed_out: false,
+            error: false,
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            engine_results: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn response_metadata_is_logged_but_removed_from_client_payload() {
+        let request = OpenAIRequest {
+            model: "requested-model".to_owned(),
+            messages: Vec::new(),
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+        let mut response = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!("ok"),
+            extra: Default::default(),
+        });
+        response
+            .extra
+            .insert("gateway_provider".to_owned(), serde_json::json!("provider"));
+        response.extra.insert(
+            "gateway_compression".to_owned(),
+            serde_json::to_value(test_compression_stats()).unwrap(),
+        );
+
+        let context = RequestLogContext::from_response(&request, "trace".to_owned(), 10, &response);
+        assert_eq!(
+            context
+                .compression
+                .as_ref()
+                .map(|metadata| metadata.compression_level.as_str()),
+            Some("standard")
+        );
+        let client_response = prepare_response_for_client(&response);
+        assert!(!client_response.extra.contains_key("gateway_compression"));
+        assert!(!client_response.extra.contains_key("gateway_provider"));
+        assert!(!serde_json::to_string(&client_response)
+            .unwrap()
+            .contains("gateway_compression"));
+    }
+
+    #[test]
+    fn streaming_log_context_uses_explicit_compression_metadata() {
+        let request = OpenAIRequest {
+            model: "requested-model".to_owned(),
+            messages: Vec::new(),
+            stream: true,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+        let context = RequestLogContext::from_streaming_success(
+            &request,
+            "trace".to_owned(),
+            10,
+            "provider".to_owned(),
+            "model".to_owned(),
+            test_compression_stats(),
+        );
+        assert_eq!(context.provider, "provider");
+        assert_eq!(context.responded_model.as_deref(), Some("model"));
+        assert_eq!(
+            context
+                .compression
+                .as_ref()
+                .map(|metadata| metadata.original_tokens),
+            Some(100)
+        );
     }
 
     #[test]
@@ -3897,9 +4081,10 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
         }
     }
 
-    // Req 11.5: guardrail counter/histogram metrics with the
-    // `obey_api_guardrail_` prefix.
+    // Compression metrics are emitted alongside guardrail metrics from the
+    // same in-repo metrics state.
     state.metrics.write_guardrail_prometheus(&mut out);
+    state.metrics.write_compression_prometheus(&mut out);
     state
         .loop_detector
         .metrics

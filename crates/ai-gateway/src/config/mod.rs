@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use crate::compression::config::{
+    CompressionConfig, ModelGroupCompressionOverride, ProviderCompressionOverride,
+};
 use crate::guardrail::GuardrailConfig;
 use crate::secrets;
 
@@ -64,6 +67,9 @@ pub struct Config {
     pub prometheus: Option<PrometheusConfig>,
     #[serde(default)]
     pub context: ContextConfig,
+    /// Token compression defaults. Disabled unless explicitly enabled.
+    #[serde(default)]
+    pub compression: CompressionConfig,
     #[serde(default)]
     pub first_launch_completed: bool,
     #[serde(default)]
@@ -402,6 +408,9 @@ pub struct Provider {
     /// When true, the gateway includes prompt caching headers in requests.
     #[serde(default)]
     pub prompt_caching: bool,
+    /// Optional provider-specific token compression override.
+    #[serde(default)]
+    pub compression: Option<ProviderCompressionOverride>,
     /// Use a custom VPC endpoint for Bedrock (Bedrock only).
     /// When true, the base_url field is used as-is instead of auto-generating
     /// the Bedrock Mantle endpoint from the region.
@@ -620,6 +629,9 @@ pub struct ModelGroup {
     pub name: String,
     #[serde(default)]
     pub version_fallback_enabled: bool,
+    /// Optional model-group token compression override.
+    #[serde(default)]
+    pub compression: Option<ModelGroupCompressionOverride>,
     pub models: Vec<ProviderModel>,
 }
 
@@ -1170,6 +1182,7 @@ mod runtime_resolution_tests {
             cross_region_inference: false,
             custom_vpc_endpoint: false,
             prompt_caching: false,
+            compression: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -1209,6 +1222,7 @@ mod runtime_resolution_tests {
             cross_region_inference: false,
             custom_vpc_endpoint: false,
             prompt_caching: false,
+            compression: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -1252,6 +1266,7 @@ mod runtime_resolution_tests {
             cross_region_inference: false,
             custom_vpc_endpoint: false,
             prompt_caching: false,
+            compression: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -1293,6 +1308,7 @@ mod runtime_resolution_tests {
             cross_region_inference: false,
             custom_vpc_endpoint: false,
             prompt_caching: false,
+            compression: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -1333,6 +1349,7 @@ mod runtime_resolution_tests {
             cross_region_inference: false,
             custom_vpc_endpoint: false,
             prompt_caching: false,
+            compression: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,

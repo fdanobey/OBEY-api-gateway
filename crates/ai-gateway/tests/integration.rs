@@ -49,6 +49,7 @@ fn test_config() -> Config {
             cross_region_inference: false,
             custom_vpc_endpoint: false,
             prompt_caching: false,
+            compression: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -58,6 +59,7 @@ fn test_config() -> Config {
         model_groups: vec![ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
+            compression: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
                 model: "gpt-4".to_string(),
@@ -73,6 +75,7 @@ fn test_config() -> Config {
         exact_cache: ExactCacheConfig::default(),
         prometheus: None,
         context: ai_gateway::config::ContextConfig::default(),
+        compression: Default::default(),
         first_launch_completed: false,
         tray: ai_gateway::config::TrayConfig::default(),
         codex_instructions_url: None,
@@ -1190,6 +1193,7 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
     cfg.model_groups = vec![ModelGroup {
         name: "gpt-4-group".to_string(),
         version_fallback_enabled: false,
+        compression: None,
         models: vec![
             ProviderModel {
                 provider: "primary".to_string(),
@@ -1514,6 +1518,7 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
     cfg.model_groups = vec![ModelGroup {
         name: "gpt-4-group".to_string(),
         version_fallback_enabled: false,
+        compression: None,
         models: vec![
             ProviderModel {
                 provider: "primary".to_string(),

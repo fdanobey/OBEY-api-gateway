@@ -9,9 +9,87 @@ use axum::{
 use chrono::DateTime;
 use rust_embed::Embed;
 use serde::Deserialize;
+use std::{collections::VecDeque, sync::Mutex};
+use tokio::sync::broadcast;
 
+use crate::compression::stats::{
+    sanitize_operational_metadata, CompressionStats, MAX_ENGINE_LABEL_LEN, MAX_MODEL_LEN,
+    MAX_PROVIDER_LEN, MAX_REQUEST_ID_LEN,
+};
 use crate::gateway::AppState;
 use crate::logger::LogFilter;
+
+const COMPRESSION_EVENT_CAPACITY: usize = 100;
+const COMPRESSION_REPLAY_CAPACITY: usize = 100;
+
+/// Bounded live and replay delivery for content-free compression statistics.
+#[derive(Debug)]
+pub struct CompressionEventHub {
+    sender: broadcast::Sender<CompressionStats>,
+    replay: Mutex<VecDeque<CompressionStats>>,
+}
+
+impl CompressionEventHub {
+    pub fn new() -> Self {
+        let (sender, _) = broadcast::channel(COMPRESSION_EVENT_CAPACITY);
+        Self {
+            sender,
+            replay: Mutex::new(VecDeque::with_capacity(COMPRESSION_REPLAY_CAPACITY)),
+        }
+    }
+
+    pub fn publish(&self, stats: CompressionStats) {
+        let stats = sanitize_compression_stats(stats);
+        let mut replay = self
+            .replay
+            .lock()
+            .expect("compression event replay mutex poisoned");
+        if replay.len() == COMPRESSION_REPLAY_CAPACITY {
+            replay.pop_front();
+        }
+        replay.push_back(stats.clone());
+        let _ = self.sender.send(stats);
+    }
+
+    pub fn subscribe(&self) -> CompressionEventSubscription {
+        let replay = self
+            .replay
+            .lock()
+            .expect("compression event replay mutex poisoned");
+        let receiver = self.sender.subscribe();
+        CompressionEventSubscription {
+            replay: replay.iter().cloned().collect(),
+            receiver,
+        }
+    }
+}
+
+impl Default for CompressionEventHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct CompressionEventSubscription {
+    pub replay: Vec<CompressionStats>,
+    pub receiver: broadcast::Receiver<CompressionStats>,
+}
+
+fn sanitize_compression_stats(mut stats: CompressionStats) -> CompressionStats {
+    stats.request_id = sanitize_operational_metadata(&stats.request_id, MAX_REQUEST_ID_LEN);
+    stats.provider = sanitize_operational_metadata(&stats.provider, MAX_PROVIDER_LEN);
+    stats.model = sanitize_operational_metadata(&stats.model, MAX_MODEL_LEN);
+    stats.engines_applied = stats
+        .engines_applied
+        .into_iter()
+        .map(|engine| sanitize_operational_metadata(&engine, MAX_ENGINE_LABEL_LEN))
+        .collect();
+    for result in &mut stats.engine_results {
+        result.engine_name =
+            sanitize_operational_metadata(&result.engine_name, MAX_ENGINE_LABEL_LEN);
+    }
+    stats
+}
 
 #[derive(Embed)]
 #[folder = "src/dashboard/static/"]
@@ -26,6 +104,7 @@ struct LogQueryParams {
     model: Option<String>,
     status_code: Option<u16>,
     trace_id: Option<String>,
+    compression_level: Option<String>,
     limit: Option<usize>,
 }
 
@@ -45,6 +124,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
     let mut subscription = state.loop_detector.events.subscribe();
+    let mut compression_subscription = state.compression_events.subscribe();
     for event in subscription.replay {
         let message = serde_json::json!({"type": "loop_detection", "data": event});
         if socket
@@ -52,6 +132,11 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
             .await
             .is_err()
         {
+            return;
+        }
+    }
+    for stats in compression_subscription.replay {
+        if send_compression_event(&mut socket, stats).await.is_err() {
             return;
         }
     }
@@ -64,6 +149,17 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
                     Ok(event) => {
                         let message = serde_json::json!({"type": "loop_detection", "data": event});
                         if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            event = compression_subscription.receiver.recv() => {
+                match event {
+                    Ok(stats) => {
+                        if send_compression_event(&mut socket, stats).await.is_err() {
                             break;
                         }
                     }
@@ -88,6 +184,18 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     }
 }
 
+async fn send_compression_event(
+    socket: &mut WebSocket,
+    stats: CompressionStats,
+) -> Result<(), axum::Error> {
+    let message = compression_message(stats);
+    socket.send(Message::Text(message.to_string().into())).await
+}
+
+fn compression_message(stats: CompressionStats) -> serde_json::Value {
+    serde_json::json!({"type": "compression", "data": stats})
+}
+
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(build_dashboard_snapshot(&state).await)
 }
@@ -103,6 +211,7 @@ async fn logs_handler(
         model: params.model,
         provider: params.provider,
         status_code: params.status_code,
+        compression_level: params.compression_level,
         limit: params.limit,
     };
 
@@ -232,13 +341,14 @@ fn mime_from_path(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::{stats::CompressionEngineStats, CompressionLevel};
     use crate::config::{
         AdminConfig, CircuitBreakerConfig, Config, ContextConfig, CorsConfig, DashboardConfig,
         ExactCacheConfig, LoggingConfig, ModelGroup, Provider, ProviderModel, RetryConfig,
         ServerConfig, TrayConfig,
     };
     use crate::gateway::GatewayServer;
-    use crate::logger::LogEntry;
+    use crate::logger::{CompressionLogMetadata, LogEntry};
     use axum::body::Body;
     use axum::http::Request;
     use chrono::{Datelike, Timelike};
@@ -281,6 +391,7 @@ mod tests {
                 cross_region_inference: false,
                 custom_vpc_endpoint: false,
                 prompt_caching: false,
+                compression: None,
                 reasoning: true,
                 codex_base_url_override: None,
                 codex_model_override: None,
@@ -290,6 +401,7 @@ mod tests {
             model_groups: vec![ModelGroup {
                 name: "default".to_string(),
                 version_fallback_enabled: false,
+                compression: None,
                 models: vec![ProviderModel {
                     provider: "test-provider".to_string(),
                     model: "gpt-4".to_string(),
@@ -305,6 +417,7 @@ mod tests {
             exact_cache: ExactCacheConfig::default(),
             prometheus: None,
             context: ContextConfig::default(),
+            compression: Default::default(),
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,
@@ -313,6 +426,105 @@ mod tests {
             loop_detection: Default::default(),
             guardrails: None,
         }
+    }
+
+    fn compression_stats(request_id: impl Into<String>) -> CompressionStats {
+        CompressionStats {
+            request_id: request_id.into(),
+            level: CompressionLevel::Standard,
+            engines_applied: vec!["standard".to_owned()],
+            original_tokens: 1_000,
+            compressed_tokens: 600,
+            savings_percent: 40.0,
+            compression_time_ms: 12,
+            auto_triggered: true,
+            cache_downgrade_applied: false,
+            tool_definitions_tokens_saved: 25,
+            caveman_applied: false,
+            timed_out: false,
+            error: false,
+            provider: "test-provider".to_owned(),
+            model: "gpt-4".to_owned(),
+            engine_results: vec![CompressionEngineStats {
+                engine_name: "standard".to_owned(),
+                tokens_before: 1_000,
+                tokens_after: 600,
+                tokens_saved: 400,
+                savings_percent: 40.0,
+                duration_ms: 12,
+                applied: true,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn compression_event_hub_replays_bounded_ring_and_live_events() {
+        let hub = CompressionEventHub::new();
+        for index in 0..(COMPRESSION_REPLAY_CAPACITY + 5) {
+            hub.publish(compression_stats(format!("request-{index}")));
+        }
+
+        let mut subscription = hub.subscribe();
+        assert_eq!(subscription.replay.len(), COMPRESSION_REPLAY_CAPACITY);
+        assert_eq!(subscription.replay[0].request_id, "request-5");
+        assert_eq!(
+            subscription.replay.last().unwrap().request_id,
+            format!("request-{}", COMPRESSION_REPLAY_CAPACITY + 4)
+        );
+
+        hub.publish(compression_stats("request-live"));
+        let live = subscription.receiver.recv().await.unwrap();
+        assert_eq!(live.request_id, "request-live");
+    }
+
+    #[test]
+    fn compression_event_hub_replay_is_reusable_and_sanitized() {
+        let hub = CompressionEventHub::default();
+        let mut stats = compression_stats("Bearer replay-secret");
+        stats.provider = "https://user:provider-secret@example.com".to_owned();
+        stats.model = "sk-model-secret".to_owned();
+        stats.engines_applied = vec!["Bearer engine-secret".to_owned()];
+        stats.engine_results[0].engine_name = "AKIAENGINESECRET".to_owned();
+        hub.publish(stats);
+
+        let first = hub.subscribe();
+        let second = hub.subscribe();
+        assert_eq!(first.replay, second.replay);
+        assert_eq!(first.replay.len(), 1);
+
+        let json = serde_json::to_string(&first.replay[0]).unwrap();
+        for secret in [
+            "replay-secret",
+            "provider-secret",
+            "model-secret",
+            "engine-secret",
+            "AKIAENGINESECRET",
+        ] {
+            assert!(!json.contains(secret));
+        }
+        for content_field in ["payload", "content", "messages", "prompt", "request_body"] {
+            assert!(first.replay[0]
+                .to_json_value()
+                .unwrap()
+                .get(content_field)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn compression_websocket_message_has_expected_safe_shape() {
+        let mut stats = compression_stats("request-123");
+        stats.model = "sk-websocket-secret".to_owned();
+
+        let message = compression_message(stats);
+
+        assert_eq!(message["type"], "compression");
+        assert_eq!(message["data"]["request_id"], "request-123");
+        assert_eq!(message["data"]["original_tokens"], 1_000);
+        assert_eq!(message["data"]["compressed_tokens"], 600);
+        assert!(message.get("payload").is_none());
+        assert!(message["data"].get("content").is_none());
+        assert!(!message.to_string().contains("websocket-secret"));
     }
 
     #[test]
@@ -425,6 +637,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_logs_filters_by_compression_level_and_provider() {
+        let mut config = test_config();
+        let database = tempfile::NamedTempFile::new().unwrap();
+        config.logging.database_path = database.path().to_string_lossy().into_owned();
+        let server = GatewayServer::new(config, None).await.unwrap();
+        for (trace_id, provider, level) in [
+            ("trace-standard", "test-provider", "standard"),
+            ("trace-lite", "test-provider", "lite"),
+            ("trace-other", "other-provider", "standard"),
+        ] {
+            server
+                .state
+                .logger
+                .log(LogEntry {
+                    trace_id: trace_id.to_owned(),
+                    timestamp: chrono::Utc::now(),
+                    method: "POST".to_owned(),
+                    path: "/v1/chat/completions".to_owned(),
+                    model: "gpt-4".to_owned(),
+                    provider: provider.to_owned(),
+                    status_code: 200,
+                    duration_ms: 12,
+                    cost: 0.0,
+                    request_body: None,
+                    response_body: None,
+                    requested_model: Some("gpt-4".to_owned()),
+                    responded_model: Some("gpt-4".to_owned()),
+                    compression: Some(CompressionLogMetadata {
+                        compression_level: level.to_owned(),
+                        original_tokens: 100,
+                        compressed_tokens: 80,
+                        savings_percent: 20.0,
+                        engines_applied: vec![level.to_owned()],
+                        duration_ms: 3,
+                        auto_triggered: false,
+                        cache_downgrade_applied: false,
+                        tool_definitions_tokens_saved: 0,
+                        caveman_applied: false,
+                        timed_out: false,
+                        error: false,
+                    }),
+                })
+                .unwrap();
+        }
+
+        let response = server
+            .build_router()
+            .oneshot(
+                Request::get("/dashboard/logs?provider=test-provider&compression_level=standard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let entries: Vec<LogEntry> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].trace_id, "trace-standard");
+        assert_eq!(
+            entries[0]
+                .compression
+                .as_ref()
+                .map(|metadata| metadata.compression_level.as_str()),
+            Some("standard")
+        );
+    }
+
+    #[tokio::test]
     async fn test_dashboard_errors_endpoint_returns_failed_logs() {
         let server = GatewayServer::new(test_config(), None).await.unwrap();
         server
@@ -444,6 +727,7 @@ mod tests {
                 response_body: None,
                 requested_model: Some("gpt-4".to_string()),
                 responded_model: None,
+                compression: None,
             })
             .unwrap();
 

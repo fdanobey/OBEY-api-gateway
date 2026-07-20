@@ -57,6 +57,8 @@ pub struct AppState {
     pub guardrail_engine: Arc<RwLock<Option<Arc<GuardrailEngine>>>>,
     /// Shared agent-loop detection state and middleware configuration.
     pub loop_detector: Arc<crate::loop_detection::middleware::LoopDetectorState>,
+    /// Shared replay/live stream for content-free compression statistics.
+    pub compression_events: Arc<crate::dashboard::CompressionEventHub>,
 }
 
 /// Core HTTP server wrapping Axum with middleware and integrated components.
@@ -75,7 +77,11 @@ impl GatewayServer {
 
         let config_arc = Arc::new(RwLock::new(config.clone()));
         let metrics = Arc::new(Metrics::new());
+        let compression_events = Arc::new(crate::dashboard::CompressionEventHub::new());
         let mut router = RequestRouter::new(config_arc.clone(), metrics.clone());
+        router.set_compression_event_hub(compression_events.clone());
+        let precompressed_manager = build_precompressed_manager(&config, config_path.as_deref());
+        router.set_precompressed_manager(precompressed_manager);
 
         let cache = match &config.semantic_cache {
             Some(sc) if sc.enabled => {
@@ -217,6 +223,7 @@ impl GatewayServer {
             virtual_key_manager,
             guardrail_engine: Arc::new(RwLock::new(guardrail_engine)),
             loop_detector,
+            compression_events,
         };
 
         Ok(Self { state })
@@ -581,13 +588,45 @@ impl GatewayServer {
     }
 }
 
+fn build_precompressed_manager(
+    config: &Config,
+    config_path: Option<&std::path::Path>,
+) -> Option<Arc<crate::compression::precompressed::PrecompressedManager>> {
+    let entries = config.compression.precompressed_contexts.clone();
+    if entries.is_empty() {
+        return None;
+    }
+
+    let root = config_path
+        .and_then(std::path::Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    match crate::compression::precompressed::PrecompressedManager::new(&root, entries) {
+        Ok(manager) => Some(Arc::new(manager)),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                root = %root.display(),
+                "Failed to initialize pre-compressed contexts; explicit references will remain literal and runtime compression will continue"
+            );
+            None
+        }
+    }
+}
+
 pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     let loop_detection = new_config.loop_detection.clone();
+    let compression = new_config.compression.clone();
+    let precompressed_manager = build_precompressed_manager(&new_config, Some(&state.config_path));
     {
         let mut cfg = state.config.write().await;
         *cfg = new_config;
     }
     state.loop_detector.apply_config(loop_detection).await;
+    state
+        .router
+        .reload_compression_runtime(compression, precompressed_manager);
     state.router.clear_circuit_breakers();
     state.router.clear_rate_limiters();
     state.router.clear_http_clients();
@@ -663,6 +702,11 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::{
+        config::PrecompressedEntry,
+        engines::CompressionLevel,
+        precompressed::{metadata_path_for, PrecompressedMetadata},
+    };
     use crate::config::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -706,6 +750,7 @@ mod tests {
                 cross_region_inference: false,
                 custom_vpc_endpoint: false,
                 prompt_caching: false,
+                compression: None,
                 reasoning: true,
                 codex_base_url_override: None,
                 codex_model_override: None,
@@ -715,6 +760,7 @@ mod tests {
             model_groups: vec![ModelGroup {
                 name: "test-group".to_string(),
                 version_fallback_enabled: false,
+                compression: None,
                 models: vec![ProviderModel {
                     provider: "test".to_string(),
                     model: "gpt-4".to_string(),
@@ -730,6 +776,7 @@ mod tests {
             exact_cache: ExactCacheConfig::default(),
             prometheus: None,
             context: crate::config::ContextConfig::default(),
+            compression: Default::default(),
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,
@@ -746,6 +793,7 @@ mod tests {
         assert!(server.is_ok());
         let server = server.unwrap();
         assert!(server.state.cache.is_none());
+        assert!(Arc::strong_count(&server.state.compression_events) >= 2);
     }
 
     #[tokio::test]
@@ -762,6 +810,126 @@ mod tests {
         server.reload_config(new_cfg).await.unwrap();
         let cfg = server.state.config.read().await;
         assert_eq!(cfg.server.port, 9999);
+    }
+
+    fn write_precompressed_context(directory: &std::path::Path, source: &str, artifact: &str) {
+        use chrono::Utc;
+
+        std::fs::write(directory.join("context.md"), source).unwrap();
+        std::fs::write(directory.join("context.compressed.md"), artifact).unwrap();
+        let metadata = PrecompressedMetadata::for_source(
+            100,
+            40,
+            CompressionLevel::Standard,
+            Utc::now(),
+            source.as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            metadata_path_for(directory.join("context.compressed.md")),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn configure_precompressed_context(config: &mut Config) {
+        config.compression.precompressed_contexts = vec![PrecompressedEntry {
+            source_path: "context.md".to_owned(),
+            compressed_path: "context.compressed.md".to_owned(),
+            content_hash: None,
+        }];
+    }
+
+    fn explicit_context_request() -> crate::models::openai::OpenAIRequest {
+        crate::models::openai::OpenAIRequest {
+            model: "test-group".to_owned(),
+            messages: vec![crate::models::openai::Message {
+                role: "system".to_owned(),
+                content: serde_json::json!("file://context.md"),
+                extra: Default::default(),
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_uses_config_directory_and_reloads_precompressed_manager() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("nested-config.yaml");
+        std::fs::write(&config_path, "test").unwrap();
+        write_precompressed_context(directory.path(), "First source.", "First artifact.");
+        let mut config = minimal_config();
+        configure_precompressed_context(&mut config);
+        let server = GatewayServer::new(config.clone(), Some(config_path))
+            .await
+            .unwrap();
+        let group = config.model_groups[0].clone();
+        let provider_model = group.models[0].clone();
+
+        let first = server
+            .state
+            .router
+            .prepare_compressed_request(
+                &explicit_context_request(),
+                &group,
+                &provider_model,
+                "gateway-manager-first",
+            )
+            .await;
+        assert_eq!(
+            first.messages[0].content,
+            serde_json::json!("First artifact.")
+        );
+
+        write_precompressed_context(directory.path(), "Second source.", "Second artifact.");
+        server.reload_config(config).await.unwrap();
+        let second = server
+            .state
+            .router
+            .prepare_compressed_request(
+                &explicit_context_request(),
+                &group,
+                &provider_model,
+                "gateway-manager-second",
+            )
+            .await;
+        assert_eq!(
+            second.messages[0].content,
+            serde_json::json!("Second artifact.")
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_continues_when_precompressed_manager_build_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.yaml");
+        std::fs::write(&config_path, "test").unwrap();
+        let mut config = minimal_config();
+        configure_precompressed_context(&mut config);
+
+        let server = GatewayServer::new(config.clone(), Some(config_path))
+            .await
+            .unwrap();
+        let group = config.model_groups[0].clone();
+        let provider_model = group.models[0].clone();
+        let prepared = server
+            .state
+            .router
+            .prepare_compressed_request(
+                &explicit_context_request(),
+                &group,
+                &provider_model,
+                "gateway-manager-failed",
+            )
+            .await;
+
+        assert_eq!(
+            prepared.messages[0].content,
+            serde_json::json!("file://context.md")
+        );
     }
 
     #[test]
@@ -946,6 +1114,7 @@ mod tests {
                         cross_region_inference: false,
                         custom_vpc_endpoint: false,
                         prompt_caching: false,
+                        compression: None,
                         reasoning: true,
                         codex_base_url_override: None,
                         codex_model_override: None,
@@ -995,6 +1164,7 @@ mod tests {
                     model_groups.push(ModelGroup {
                         name: format!("group-{}", g),
                         version_fallback_enabled: false,
+                        compression: None,
                         models,
                     });
                 }
@@ -1019,6 +1189,7 @@ mod tests {
                     exact_cache: ExactCacheConfig::default(),
                     prometheus: None,
                     context: ContextConfig::default(),
+                    compression: Default::default(),
                     first_launch_completed: false,
                     tray: TrayConfig::default(),
                     codex_instructions_url: None,
@@ -1567,6 +1738,7 @@ mod tests {
                         cross_region_inference: false,
                         custom_vpc_endpoint: false,
                         prompt_caching: false,
+                        compression: None,
                         reasoning: true,
                         codex_base_url_override: None,
                         codex_model_override: None,
@@ -1576,6 +1748,7 @@ mod tests {
                     model_groups: vec![ModelGroup {
                         name: format!("group-{}", provider_suffix),
                         version_fallback_enabled: false,
+                        compression: None,
                         models: vec![ProviderModel {
                             provider: new_provider_name.clone(),
                             model: "gpt-4".to_string(),
@@ -1591,6 +1764,7 @@ mod tests {
                     exact_cache: ExactCacheConfig::default(),
                     prometheus: None,
                     context: ContextConfig::default(),
+                    compression: Default::default(),
                     first_launch_completed: false,
                     tray: TrayConfig::default(),
                     codex_instructions_url: None,

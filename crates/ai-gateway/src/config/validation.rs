@@ -160,6 +160,17 @@ impl Config {
             ));
         }
 
+        // Validate compression configuration before it reaches the live request path.
+        if let Err(compression_errors) = self.compression.validate() {
+            errors.extend(compression_errors.into_iter().map(|error| {
+                ValidationError::InvalidValue {
+                    field: error.field,
+                    value: error.message,
+                    expected: "a valid token compression configuration".to_string(),
+                }
+            }));
+        }
+
         // Validate loop detection before the configuration reaches runtime state.
         if let Err(loop_errors) = self.loop_detection.validate() {
             errors.extend(
@@ -726,6 +737,7 @@ mod property_tests {
                 cross_region_inference: false,
                 custom_vpc_endpoint: false,
                 prompt_caching: false,
+                compression: None,
                 reasoning: true,
                 codex_base_url_override: None,
                 codex_model_override: None,
@@ -735,6 +747,7 @@ mod property_tests {
             model_groups: vec![ModelGroup {
                 name: "test-group".to_string(),
                 version_fallback_enabled: false,
+                compression: None,
                 models: vec![ProviderModel {
                     provider: "test-provider".to_string(),
                     model: "gpt-4".to_string(),
@@ -750,6 +763,7 @@ mod property_tests {
             exact_cache: ExactCacheConfig::default(),
             prometheus: None,
             context: ContextConfig::default(),
+            compression: Default::default(),
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,
@@ -1251,6 +1265,7 @@ model_groups:
                 cross_region_inference: false,
                 custom_vpc_endpoint: false,
                 prompt_caching,
+                compression: None,
                 reasoning,
                 codex_base_url_override: None,
                 codex_model_override: None,

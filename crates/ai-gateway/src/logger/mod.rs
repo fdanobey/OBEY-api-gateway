@@ -6,7 +6,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-use crate::config::LoggingConfig;
+use crate::{
+    compression::{
+        stats::{sanitize_operational_metadata, CompressionStats, MAX_ENGINE_LABEL_LEN},
+        CompressionLevel,
+    },
+    config::LoggingConfig,
+};
 
 #[derive(Debug, Error)]
 pub enum LoggerError {
@@ -21,6 +27,125 @@ pub enum LoggerError {
 }
 
 pub type Result<T> = std::result::Result<T, LoggerError>;
+
+const MAX_COMPRESSION_ENGINES: usize = 32;
+
+/// Content-free compression metadata persisted with a request log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompressionLogMetadata {
+    #[serde(alias = "level")]
+    pub compression_level: String,
+    pub original_tokens: u32,
+    pub compressed_tokens: u32,
+    pub savings_percent: f64,
+    pub engines_applied: Vec<String>,
+    pub duration_ms: u64,
+    pub auto_triggered: bool,
+    #[serde(default)]
+    pub cache_downgrade_applied: bool,
+    #[serde(default)]
+    pub tool_definitions_tokens_saved: u32,
+    #[serde(default)]
+    pub caveman_applied: bool,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub error: bool,
+}
+
+impl From<&CompressionStats> for CompressionLogMetadata {
+    fn from(stats: &CompressionStats) -> Self {
+        Self {
+            compression_level: compression_level_label(stats.level).to_owned(),
+            original_tokens: stats.original_tokens,
+            compressed_tokens: stats.compressed_tokens,
+            savings_percent: if stats.savings_percent.is_finite() {
+                stats.savings_percent.clamp(0.0, 100.0)
+            } else {
+                0.0
+            },
+            engines_applied: stats
+                .engines_applied
+                .iter()
+                .take(MAX_COMPRESSION_ENGINES)
+                .map(|engine| sanitize_operational_metadata(engine, MAX_ENGINE_LABEL_LEN))
+                .collect(),
+            duration_ms: stats.compression_time_ms,
+            auto_triggered: stats.auto_triggered,
+            cache_downgrade_applied: stats.cache_downgrade_applied,
+            tool_definitions_tokens_saved: stats.tool_definitions_tokens_saved,
+            caveman_applied: stats.caveman_applied,
+            timed_out: stats.timed_out,
+            error: stats.error,
+        }
+    }
+}
+
+impl CompressionLogMetadata {
+    fn sanitized(&self) -> Self {
+        let savings_percent = if self.original_tokens == 0 {
+            0.0
+        } else {
+            f64::from(self.original_tokens.saturating_sub(self.compressed_tokens)) * 100.0
+                / f64::from(self.original_tokens)
+        };
+
+        Self {
+            compression_level: sanitize_compression_level(&self.compression_level),
+            original_tokens: self.original_tokens,
+            compressed_tokens: self.compressed_tokens,
+            savings_percent,
+            engines_applied: self
+                .engines_applied
+                .iter()
+                .take(MAX_COMPRESSION_ENGINES)
+                .map(|engine| sanitize_operational_metadata(engine, MAX_ENGINE_LABEL_LEN))
+                .collect(),
+            duration_ms: self.duration_ms,
+            auto_triggered: self.auto_triggered,
+            cache_downgrade_applied: self.cache_downgrade_applied,
+            tool_definitions_tokens_saved: self.tool_definitions_tokens_saved,
+            caveman_applied: self.caveman_applied,
+            timed_out: self.timed_out,
+            error: self.error,
+        }
+    }
+}
+
+fn compression_level_label(level: CompressionLevel) -> &'static str {
+    match level {
+        CompressionLevel::None => "none",
+        CompressionLevel::Lite => "lite",
+        CompressionLevel::Standard => "standard",
+        CompressionLevel::Aggressive => "aggressive",
+        CompressionLevel::Ultra => "ultra",
+        CompressionLevel::Rtk => "rtk",
+        CompressionLevel::Stacked => "stacked",
+    }
+}
+
+fn sanitize_compression_level(level: &str) -> String {
+    let sanitized = sanitize_operational_metadata(level, 32).to_ascii_lowercase();
+    if sanitized
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        sanitized
+    } else {
+        String::new()
+    }
+}
+
+fn compression_log_metadata_from_json(json: &str) -> Option<CompressionLogMetadata> {
+    match serde_json::from_str::<CompressionLogMetadata>(json) {
+        Ok(metadata) => Some(metadata.sanitized()),
+        Err(error) => {
+            tracing::warn!(%error, "Ignoring malformed compression log metadata");
+            None
+        }
+    }
+}
 
 /// Log entry for a single request
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +165,9 @@ pub struct LogEntry {
     pub requested_model: Option<String>,
     /// The model version that actually responded (may differ if version fallback occurred)
     pub responded_model: Option<String>,
+    /// Content-free metadata describing request compression, when applied or attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<CompressionLogMetadata>,
 }
 
 /// Filter for querying log entries
@@ -51,6 +179,7 @@ pub struct LogFilter {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub status_code: Option<u16>,
+    pub compression_level: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -98,10 +227,15 @@ impl RequestLogger {
                 request_body TEXT,
                 response_body TEXT,
                 requested_model TEXT,
-                responded_model TEXT
+                responded_model TEXT,
+                compression_metadata TEXT,
+                compression_level TEXT
             )",
             [],
         )?;
+
+        Self::ensure_column(conn, "compression_metadata", "TEXT")?;
+        Self::ensure_column(conn, "compression_level", "TEXT")?;
 
         // Create indexes for common query patterns
         conn.execute(
@@ -129,6 +263,27 @@ impl RequestLogger {
             [],
         )?;
 
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_requests_compression_level ON requests(compression_level)",
+            [],
+        )?;
+
+        Ok(())
+    }
+
+    fn ensure_column(conn: &Connection, column_name: &str, column_type: &str) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(requests)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        if !columns.iter().any(|column| column == column_name) {
+            conn.execute(
+                &format!("ALTER TABLE requests ADD COLUMN {column_name} {column_type}"),
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -150,12 +305,24 @@ impl RequestLogger {
             None
         };
 
+        let compression = entry
+            .compression
+            .as_ref()
+            .map(CompressionLogMetadata::sanitized);
+        let compression_level = compression
+            .as_ref()
+            .map(|metadata| metadata.compression_level.clone());
+        let compression_metadata = compression
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
         conn.execute(
             "INSERT INTO requests (
                 trace_id, timestamp, method, path, model, provider,
                 status_code, duration_ms, cost, request_body, response_body,
-                requested_model, responded_model
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                requested_model, responded_model, compression_metadata, compression_level
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 entry.trace_id,
                 entry.timestamp.timestamp(),
@@ -170,6 +337,8 @@ impl RequestLogger {
                 response_body,
                 entry.requested_model,
                 entry.responded_model,
+                compression_metadata,
+                compression_level,
             ],
         )?;
 
@@ -282,7 +451,7 @@ impl RequestLogger {
     pub fn query(&self, filter: LogFilter) -> Result<Vec<LogEntry>> {
         let conn = self.conn.lock().unwrap();
 
-        let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model FROM requests WHERE 1=1");
+        let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata FROM requests WHERE 1=1");
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(ref trace_id) = filter.trace_id {
@@ -315,6 +484,11 @@ impl RequestLogger {
             params.push(Box::new(status_code));
         }
 
+        if let Some(ref compression_level) = filter.compression_level {
+            query.push_str(" AND compression_level = ? COLLATE NOCASE");
+            params.push(Box::new(compression_level.clone()));
+        }
+
         query.push_str(" ORDER BY timestamp DESC");
 
         if let Some(limit) = filter.limit {
@@ -327,6 +501,11 @@ impl RequestLogger {
         let mut stmt = conn.prepare(&query)?;
         let entries = stmt
             .query_map(param_refs.as_slice(), |row| {
+                let compression_json: Option<String> = row.get(13)?;
+                let compression = compression_json
+                    .as_deref()
+                    .and_then(compression_log_metadata_from_json);
+
                 Ok(LogEntry {
                     trace_id: row.get(0)?,
                     timestamp: DateTime::from_timestamp(row.get(1)?, 0).unwrap(),
@@ -341,6 +520,7 @@ impl RequestLogger {
                     response_body: row.get(10)?,
                     requested_model: row.get(11)?,
                     responded_model: row.get(12)?,
+                    compression,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -400,6 +580,244 @@ mod tests {
         (logger, temp_file)
     }
 
+    fn sample_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> LogEntry {
+        LogEntry {
+            trace_id: trace_id.to_owned(),
+            timestamp: Utc::now(),
+            method: "POST".to_owned(),
+            path: "/v1/chat/completions".to_owned(),
+            model: "gpt-4".to_owned(),
+            provider: "openai".to_owned(),
+            status_code: 200,
+            duration_ms: 1500,
+            cost: 0.05,
+            request_body: None,
+            response_body: None,
+            requested_model: None,
+            responded_model: None,
+            compression,
+        }
+    }
+
+    fn sample_compression(level: CompressionLevel) -> CompressionLogMetadata {
+        CompressionLogMetadata {
+            compression_level: compression_level_label(level).to_owned(),
+            original_tokens: 1_000,
+            compressed_tokens: 600,
+            savings_percent: 40.0,
+            engines_applied: vec!["semantic_dedup".to_owned(), "tool_schema".to_owned()],
+            duration_ms: 42,
+            auto_triggered: true,
+            cache_downgrade_applied: false,
+            tool_definitions_tokens_saved: 120,
+            caveman_applied: true,
+            timed_out: false,
+            error: false,
+        }
+    }
+
+    #[test]
+    fn migrates_old_schema_and_preserves_old_rows() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_file.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE requests (
+                id INTEGER PRIMARY KEY,
+                trace_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                cost REAL NOT NULL,
+                request_body TEXT,
+                response_body TEXT,
+                requested_model TEXT,
+                responded_model TEXT
+            );
+            INSERT INTO requests (
+                trace_id, timestamp, method, path, model, provider, status_code,
+                duration_ms, cost, request_body, response_body, requested_model, responded_model
+            ) VALUES (
+                'legacy', 1700000000, 'POST', '/v1/chat/completions', 'gpt-4',
+                'openai', 200, 10, 0.0, NULL, NULL, NULL, NULL
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let config = LoggingConfig {
+            database_path: temp_file.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let logger = RequestLogger::new(config.clone()).unwrap();
+        let legacy = logger
+            .query(LogFilter {
+                trace_id: Some("legacy".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert!(legacy[0].compression.is_none());
+        drop(logger);
+
+        RequestLogger::new(config).unwrap();
+        let conn = Connection::open(temp_file.path()).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(requests)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.contains(&"compression_metadata".to_owned()));
+        assert!(columns.contains(&"compression_level".to_owned()));
+    }
+
+    #[test]
+    fn compression_metadata_round_trips() {
+        let (logger, _temp) = create_test_logger();
+        let metadata = sample_compression(CompressionLevel::Aggressive);
+        logger
+            .log(sample_entry("compressed", Some(metadata.clone())))
+            .unwrap();
+
+        let results = logger
+            .query(LogFilter {
+                trace_id: Some("compressed".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results[0].compression.as_ref(), Some(&metadata));
+    }
+
+    #[test]
+    fn filters_compression_level_with_existing_filters() {
+        let (logger, _temp) = create_test_logger();
+        let mut matching = sample_entry(
+            "matching",
+            Some(sample_compression(CompressionLevel::Standard)),
+        );
+        matching.provider = "anthropic".to_owned();
+        matching.status_code = 201;
+        logger.log(matching).unwrap();
+
+        let mut wrong_level = sample_entry(
+            "wrong-level",
+            Some(sample_compression(CompressionLevel::Lite)),
+        );
+        wrong_level.provider = "anthropic".to_owned();
+        wrong_level.status_code = 201;
+        logger.log(wrong_level).unwrap();
+        logger
+            .log(sample_entry(
+                "wrong-provider",
+                Some(sample_compression(CompressionLevel::Standard)),
+            ))
+            .unwrap();
+
+        let results = logger
+            .query(LogFilter {
+                model: Some("gpt-4".to_owned()),
+                provider: Some("anthropic".to_owned()),
+                status_code: Some(201),
+                compression_level: Some("standard".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].trace_id, "matching");
+    }
+
+    #[test]
+    fn malformed_compression_metadata_is_ignored() {
+        let (logger, _temp) = create_test_logger();
+        logger.log(sample_entry("malformed", None)).unwrap();
+        logger
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE requests SET compression_metadata = ?1 WHERE trace_id = ?2",
+                params!["{not valid json", "malformed"],
+            )
+            .unwrap();
+
+        let results = logger
+            .query(LogFilter {
+                trace_id: Some("malformed".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].compression.is_none());
+    }
+
+    #[test]
+    fn compression_serialization_is_bounded_and_secret_free() {
+        let (logger, _temp) = create_test_logger();
+        let mut metadata = sample_compression(CompressionLevel::Ultra);
+        metadata.engines_applied = vec![
+            "semantic sk-super-secret-token-1234567890".repeat(10),
+            "Bearer another-secret".to_owned(),
+        ];
+        metadata.savings_percent = f64::NAN;
+        logger
+            .log(sample_entry("safe-metadata", Some(metadata)))
+            .unwrap();
+
+        let conn = logger.conn.lock().unwrap();
+        let json: String = conn
+            .query_row(
+                "SELECT compression_metadata FROM requests WHERE trace_id = ?1",
+                params!["safe-metadata"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!json.contains("super-secret-token"));
+        assert!(!json.contains("another-secret"));
+        let stored: CompressionLogMetadata = serde_json::from_str(&json).unwrap();
+        assert!(stored
+            .engines_applied
+            .iter()
+            .all(|engine| engine.len() <= MAX_ENGINE_LABEL_LEN));
+        assert_eq!(stored.savings_percent, 40.0);
+    }
+
+    #[test]
+    fn compression_metadata_from_stats_is_content_free() {
+        let stats = CompressionStats {
+            request_id: "request sk-request-secret".to_owned(),
+            level: CompressionLevel::Standard,
+            engines_applied: vec!["engine Bearer engine-secret".to_owned()],
+            original_tokens: 100,
+            compressed_tokens: 50,
+            savings_percent: 50.0,
+            compression_time_ms: 7,
+            auto_triggered: true,
+            cache_downgrade_applied: true,
+            tool_definitions_tokens_saved: 5,
+            caveman_applied: false,
+            timed_out: false,
+            error: false,
+            provider: "provider sk-provider-secret".to_owned(),
+            model: "model sk-model-secret".to_owned(),
+            engine_results: Vec::new(),
+        };
+
+        let json = serde_json::to_string(&CompressionLogMetadata::from(&stats)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["compression_level"],
+            "standard"
+        );
+        assert!(!json.contains("request-secret"));
+        assert!(!json.contains("provider-secret"));
+        assert!(!json.contains("model-secret"));
+        assert!(!json.contains("engine-secret"));
+    }
+
     #[test]
     fn test_log_and_query() {
         let (logger, _temp) = create_test_logger();
@@ -418,6 +836,7 @@ mod tests {
             response_body: Some(r#"{"choices":[]}"#.to_string()),
             requested_model: None,
             responded_model: None,
+            compression: None,
         };
 
         logger.log(entry.clone()).unwrap();
@@ -502,6 +921,7 @@ mod tests {
             response_body: None,
             requested_model: None,
             responded_model: None,
+            compression: None,
         };
 
         logger.log(old_entry).unwrap();
@@ -521,6 +941,7 @@ mod tests {
             response_body: None,
             requested_model: None,
             responded_model: None,
+            compression: None,
         };
 
         logger.log(recent_entry).unwrap();
@@ -590,6 +1011,7 @@ mod property_tests {
                         response_body,
                         requested_model: None,
                         responded_model: None,
+                        compression: None,
                     }
                 },
             )
@@ -672,6 +1094,7 @@ mod property_tests {
                 response_body: None,
                 requested_model: None,
                 responded_model: None,
+                compression: None,
             };
 
             logger.log(entry.clone()).unwrap();
@@ -734,6 +1157,7 @@ mod property_tests {
                 response_body: None,
                 requested_model: None,
                 responded_model: None,
+                compression: None,
             };
 
             logger.log(entry).unwrap();
@@ -793,6 +1217,7 @@ mod property_tests {
                 response_body: None,
                 requested_model: None,
                 responded_model: None,
+                compression: None,
             };
 
             logger.log(entry).unwrap();
@@ -850,6 +1275,7 @@ mod property_tests {
                 response_body: None,
                 requested_model: None,
                 responded_model: None,
+                compression: None,
             };
 
             logger.log(entry).unwrap();
@@ -918,6 +1344,7 @@ mod property_tests {
                 response_body: None,
                 requested_model: Some(requested.to_string()),
                 responded_model: Some(responded.to_string()),
+                compression: None,
             };
 
             logger.log(entry).unwrap();

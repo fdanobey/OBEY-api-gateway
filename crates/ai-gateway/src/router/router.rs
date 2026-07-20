@@ -1,5 +1,14 @@
+use crate::compression::{
+    caveman::apply_caveman_output,
+    config::CompressionConfig,
+    pipeline::{CompressionPipeline, CompressionRequestMetadata},
+    precompressed::{PrecompressedLoadStatus, PrecompressedManager},
+    stats::CompressionStats,
+    CompressiblePayload, CompressionContext,
+};
 use crate::config::{Config, ContextConfig, ModelGroup, Provider, ProviderModel};
 use crate::context::ContextManager;
+use crate::dashboard::CompressionEventHub;
 use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
 use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
 use crate::providers::bedrock::{apply_global_inference_prefix, model_supports_reasoning};
@@ -12,6 +21,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+const PRECOMPRESSED_CACHE_MARKER_KEY: &str = "cache_control";
+const PRECOMPRESSED_CACHE_MARKER_TYPE: &str = "obey_precompressed_context";
+
+struct CompressionRuntime {
+    pipeline: Arc<CompressionPipeline>,
+    precompressed_manager: Option<Arc<PrecompressedManager>>,
+}
+
 use super::{CircuitBreaker, LatencyTracker, RateLimiter};
 
 /// Intelligent router for provider selection and request routing
@@ -23,6 +40,10 @@ pub struct Router {
     http_clients: Arc<DashMap<String, reqwest::Client>>,
     /// Context manager for automatic context window handling
     context_manager: Arc<ContextManager>,
+    /// Request-scoped runtime snapshot for compression and pre-compressed contexts.
+    compression_runtime: Arc<std::sync::RwLock<CompressionRuntime>>,
+    /// Shared dashboard event stream for every provider-specific compression attempt.
+    compression_events: Option<Arc<CompressionEventHub>>,
     /// Shared metrics for recording provider-level stats
     metrics: Arc<crate::metrics::Metrics>,
     /// OAuth session manager used when a provider is configured with
@@ -65,6 +86,7 @@ pub enum StreamingResponse {
         byte_stream: reqwest::Response,
         provider: String,
         model: String,
+        compression: CompressionStats,
     },
     /// Buffer-and-replay fallback: a complete response the handler re-chunks.
     Buffered(OpenAIResponse),
@@ -73,9 +95,9 @@ pub enum StreamingResponse {
 impl Router {
     /// Create a new Router with the given configuration
     pub fn new(config: Arc<RwLock<Config>>, metrics: Arc<crate::metrics::Metrics>) -> Self {
-        let context_config = {
+        let (context_config, compression_config) = {
             let cfg = config.try_read().expect("config lock");
-            cfg.context.clone()
+            (cfg.context.clone(), cfg.compression.clone())
         };
         Self {
             config,
@@ -84,6 +106,11 @@ impl Router {
             rate_limiters: Arc::new(DashMap::new()),
             http_clients: Arc::new(DashMap::new()),
             context_manager: Arc::new(ContextManager::with_config(context_config)),
+            compression_runtime: Arc::new(std::sync::RwLock::new(CompressionRuntime {
+                pipeline: Arc::new(CompressionPipeline::from_config(compression_config)),
+                precompressed_manager: None,
+            })),
+            compression_events: None,
             metrics,
             oauth_manager: None,
             instructions_store: None,
@@ -99,6 +126,10 @@ impl Router {
         context_config: ContextConfig,
         metrics: Arc<crate::metrics::Metrics>,
     ) -> Self {
+        let compression_config = {
+            let cfg = config.try_read().expect("config lock");
+            cfg.compression.clone()
+        };
         Self {
             config,
             circuit_breakers: Arc::new(DashMap::new()),
@@ -106,6 +137,11 @@ impl Router {
             rate_limiters: Arc::new(DashMap::new()),
             http_clients: Arc::new(DashMap::new()),
             context_manager: Arc::new(ContextManager::with_config(context_config)),
+            compression_runtime: Arc::new(std::sync::RwLock::new(CompressionRuntime {
+                pipeline: Arc::new(CompressionPipeline::from_config(compression_config)),
+                precompressed_manager: None,
+            })),
+            compression_events: None,
             metrics,
             oauth_manager: None,
             instructions_store: None,
@@ -137,6 +173,440 @@ impl Router {
     #[allow(dead_code)]
     pub fn context_manager(&self) -> Arc<ContextManager> {
         self.context_manager.clone()
+    }
+
+    /// Attach the shared dashboard compression event hub.
+    pub fn set_compression_event_hub(&mut self, hub: Arc<CompressionEventHub>) {
+        self.compression_events = Some(hub);
+    }
+
+    /// Atomically replaces the pipeline used by requests that start after reload.
+    /// In-flight requests retain the snapshot they already cloned.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn reload_compression_pipeline(&self, config: CompressionConfig) {
+        let replacement = Arc::new(CompressionPipeline::from_config(config));
+        let mut runtime = self
+            .compression_runtime
+            .write()
+            .expect("compression runtime lock poisoned");
+        runtime.pipeline = replacement;
+    }
+
+    /// Atomically replaces both compression runtime components on hot reload.
+    pub fn reload_compression_runtime(
+        &self,
+        config: CompressionConfig,
+        manager: Option<Arc<PrecompressedManager>>,
+    ) {
+        let replacement = CompressionRuntime {
+            pipeline: Arc::new(CompressionPipeline::from_config(config)),
+            precompressed_manager: manager,
+        };
+        let mut runtime = self
+            .compression_runtime
+            .write()
+            .expect("compression runtime lock poisoned");
+        *runtime = replacement;
+    }
+
+    /// Atomically replaces the pre-compressed context manager used by new requests.
+    pub fn set_precompressed_manager(&self, manager: Option<Arc<PrecompressedManager>>) {
+        let mut runtime = self
+            .compression_runtime
+            .write()
+            .expect("compression runtime lock poisoned");
+        runtime.precompressed_manager = manager;
+    }
+
+    /// Test-only wrapper for the post-truncation compression path.
+    #[cfg(test)]
+    pub(crate) async fn prepare_compressed_request(
+        &self,
+        request: &OpenAIRequest,
+        model_group: &ModelGroup,
+        provider_model: &ProviderModel,
+        request_id: &str,
+    ) -> OpenAIRequest {
+        self.prepare_compressed_request_with_stats(request, model_group, provider_model, request_id)
+            .await
+            .0
+    }
+
+    async fn prepare_compressed_request_with_stats(
+        &self,
+        request: &OpenAIRequest,
+        model_group: &ModelGroup,
+        provider_model: &ProviderModel,
+        request_id: &str,
+    ) -> (OpenAIRequest, CompressionStats) {
+        let (global_config, provider_override, prompt_caching_enabled, default_context_window) = {
+            let config = self.config.read().await;
+            let provider = config
+                .providers
+                .iter()
+                .find(|provider| provider.name == provider_model.provider);
+            (
+                config.compression.clone(),
+                provider.and_then(|provider| provider.compression.clone()),
+                provider.is_some_and(|provider| provider.prompt_caching),
+                config.context.default_context_window,
+            )
+        };
+        let effective =
+            global_config.resolve(provider_override.as_ref(), model_group.compression.as_ref());
+        let caveman_output = effective.caveman_output;
+        let (pipeline, precompressed_manager) = {
+            let runtime = self
+                .compression_runtime
+                .read()
+                .expect("compression runtime lock poisoned");
+            (
+                runtime.pipeline.clone(),
+                runtime.precompressed_manager.clone(),
+            )
+        };
+        let context_window = self
+            .context_manager
+            .get_capabilities(&provider_model.model)
+            .map(|capabilities| capabilities.context_window)
+            .unwrap_or(default_context_window);
+        let context = CompressionContext {
+            model: provider_model.model.clone(),
+            context_window,
+            provider_name: provider_model.provider.clone(),
+            prompt_caching_enabled,
+            ..CompressionContext::default()
+        };
+        let metadata = CompressionRequestMetadata {
+            request_id: request_id.to_owned(),
+            ..CompressionRequestMetadata::default()
+        };
+        let mut payload = CompressiblePayload::from(request);
+        let inserted_markers = precompressed_manager
+            .as_deref()
+            .map(|manager| Self::load_precompressed_references(&mut payload, manager, request_id))
+            .unwrap_or_default();
+        Self::refresh_precompressed_metadata(&mut payload);
+        let mut result = if effective.auto_threshold_tokens > 0 {
+            pipeline
+                .compress_auto(payload, context, effective, metadata)
+                .await
+        } else {
+            pipeline
+                .compress_explicit(payload, context, effective, metadata)
+                .await
+        };
+
+        if result.timed_out {
+            warn!(
+                request_id,
+                provider = %provider_model.provider,
+                model = %provider_model.model,
+                original_tokens = result.original_tokens,
+                duration_ms = result.duration_ms,
+                "Compression timed out; forwarding original request"
+            );
+        } else {
+            debug!(
+                request_id,
+                provider = %provider_model.provider,
+                model = %provider_model.model,
+                original_tokens = result.original_tokens,
+                final_tokens = result.final_tokens,
+                engines_applied = result.engines_applied.len(),
+                duration_ms = result.duration_ms,
+                "Prepared outgoing request compression"
+            );
+        }
+
+        // Caveman output is applied after the pipeline's safe payload is selected.
+        // The helper itself refuses to mutate a cache-protected prefix.
+        let caveman_applied = apply_caveman_output(&mut result.payload, caveman_output);
+        if caveman_applied {
+            debug!(
+                request_id,
+                provider = %provider_model.provider,
+                model = %provider_model.model,
+                "Applied caveman output mode"
+            );
+        }
+
+        let stats = CompressionStats::from_pipeline_result(
+            &result,
+            caveman_applied,
+            &provider_model.provider,
+            &provider_model.model,
+        );
+        Self::remove_precompressed_markers(&mut result.payload, &inserted_markers);
+        stats.log();
+        self.metrics.record_compression(&stats);
+        if let Some(hub) = &self.compression_events {
+            hub.publish(stats.clone());
+        }
+        if Self::compression_savings_warning_required(&stats) {
+            warn!(
+                request_id = %stats.request_id,
+                provider = %stats.provider,
+                model = %stats.model,
+                level = ?stats.level,
+                original_tokens = stats.original_tokens,
+                compressed_tokens = stats.compressed_tokens,
+                tokens_saved = stats.tokens_saved(),
+                savings_percent = stats.savings_percent,
+                compression_time_ms = stats.compression_time_ms,
+                timed_out = stats.timed_out,
+                error = stats.error,
+                "Compression saved more than 50 percent of input tokens"
+            );
+        }
+
+        (result.payload.into_openai_request(), stats)
+    }
+
+    fn load_precompressed_references(
+        payload: &mut CompressiblePayload,
+        manager: &PrecompressedManager,
+        request_id: &str,
+    ) -> HashSet<usize> {
+        let mut inserted_markers = HashSet::new();
+        for message in &mut payload.messages {
+            let mut used_precompressed = false;
+            Self::replace_precompressed_value(
+                message.content.as_value_mut(),
+                manager,
+                true,
+                request_id,
+                &mut used_precompressed,
+            );
+            if used_precompressed {
+                message.cache_protected = true;
+                message.critical = true;
+                if !message.extra.contains_key(PRECOMPRESSED_CACHE_MARKER_KEY) {
+                    // Pipeline metadata refreshes discover cache boundaries from wire-shaped
+                    // values. This unique temporary marker survives every engine refresh and is
+                    // removed by original_index before the request is converted back to wire data.
+                    message.extra.insert(
+                        PRECOMPRESSED_CACHE_MARKER_KEY.to_owned(),
+                        serde_json::json!({"type": PRECOMPRESSED_CACHE_MARKER_TYPE}),
+                    );
+                    inserted_markers.insert(message.original_index);
+                }
+            }
+        }
+        payload.refresh_metadata();
+        inserted_markers
+    }
+
+    fn refresh_precompressed_metadata(payload: &mut CompressiblePayload) {
+        let counter = crate::compression::token_counter::TokenCounter::new();
+        let model = payload.model.clone();
+        for message in &mut payload.messages {
+            let wire_message = Message {
+                role: message.role.clone(),
+                content: message.content.as_value().clone(),
+                extra: message.extra.clone(),
+            };
+            let mut request = OpenAIRequest {
+                model: model.clone(),
+                messages: vec![wire_message],
+                stream: false,
+                temperature: None,
+                max_tokens: None,
+                extra: Default::default(),
+            };
+            let with_message = counter.count_request(&request);
+            request.messages.clear();
+            let without_message = counter.count_request(&request);
+            message.token_count = with_message.saturating_sub(without_message);
+        }
+    }
+
+    fn replace_precompressed_value(
+        value: &mut serde_json::Value,
+        manager: &PrecompressedManager,
+        root: bool,
+        request_id: &str,
+        used_precompressed: &mut bool,
+    ) {
+        match value {
+            serde_json::Value::String(text) if root => {
+                Self::replace_precompressed_string(text, manager, request_id, used_precompressed);
+            }
+            serde_json::Value::Array(parts) if root => {
+                for part in parts {
+                    match part {
+                        serde_json::Value::String(text) => Self::replace_precompressed_string(
+                            text,
+                            manager,
+                            request_id,
+                            used_precompressed,
+                        ),
+                        serde_json::Value::Object(_) => Self::replace_precompressed_content_block(
+                            part,
+                            manager,
+                            request_id,
+                            used_precompressed,
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+            serde_json::Value::Object(_) if root => Self::replace_precompressed_content_block(
+                value,
+                manager,
+                request_id,
+                used_precompressed,
+            ),
+            _ => {}
+        }
+    }
+
+    fn replace_precompressed_content_block(
+        value: &mut serde_json::Value,
+        manager: &PrecompressedManager,
+        request_id: &str,
+        used_precompressed: &mut bool,
+    ) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        let block_type = object.get("type").and_then(serde_json::Value::as_str);
+
+        if block_type == Some("file_reference") && object.len() == 2 {
+            let source_reference = object
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            if let Some(source_reference) = source_reference {
+                if let Some((content, hit)) =
+                    Self::load_precompressed_reference(manager, &source_reference, request_id)
+                {
+                    *value = serde_json::Value::String(content);
+                    *used_precompressed |= hit;
+                }
+            }
+            return;
+        }
+
+        match block_type {
+            Some("text" | "input_text" | "output_text") => {
+                if let Some(serde_json::Value::String(text)) = object.get_mut("text") {
+                    Self::replace_precompressed_string(
+                        text,
+                        manager,
+                        request_id,
+                        used_precompressed,
+                    );
+                }
+                return;
+            }
+            Some("system" | "documentation") => {
+                if let Some(content) = object.get_mut("content") {
+                    Self::replace_precompressed_value(
+                        content,
+                        manager,
+                        true,
+                        request_id,
+                        used_precompressed,
+                    );
+                }
+                return;
+            }
+            Some(_) => return,
+            None => {}
+        }
+
+        for key in ["system", "documentation", "content"] {
+            if let Some(content) = object.get_mut(key) {
+                Self::replace_precompressed_value(
+                    content,
+                    manager,
+                    true,
+                    request_id,
+                    used_precompressed,
+                );
+            }
+        }
+    }
+
+    fn replace_precompressed_string(
+        text: &mut String,
+        manager: &PrecompressedManager,
+        request_id: &str,
+        used_precompressed: &mut bool,
+    ) {
+        let Some(source_reference) = text.strip_prefix("file://") else {
+            return;
+        };
+        if source_reference.is_empty() {
+            return;
+        }
+        if let Some((content, hit)) =
+            Self::load_precompressed_reference(manager, source_reference, request_id)
+        {
+            *text = content;
+            *used_precompressed |= hit;
+        }
+    }
+
+    fn load_precompressed_reference(
+        manager: &PrecompressedManager,
+        source_reference: &str,
+        request_id: &str,
+    ) -> Option<(String, bool)> {
+        match manager.load(source_reference) {
+            Ok(loaded) => {
+                let hit = loaded.used_precompressed();
+                match loaded.status {
+                    PrecompressedLoadStatus::Hit => {
+                        if let Some(metadata) = loaded.metadata.as_ref() {
+                            debug!(
+                                request_id,
+                                original_tokens = metadata.original_tokens,
+                                compressed_tokens = metadata.compressed_tokens,
+                                level = ?metadata.level,
+                                "Loaded validated pre-compressed context"
+                            );
+                        }
+                    }
+                    PrecompressedLoadStatus::Stale(reason)
+                    | PrecompressedLoadStatus::RuntimeFallback(reason) => {
+                        debug!(
+                            request_id,
+                            ?reason,
+                            "Loaded original context for runtime compression fallback"
+                        );
+                    }
+                }
+                Some((loaded.content, hit))
+            }
+            Err(error) => {
+                debug!(
+                    request_id,
+                    error = %error,
+                    "Ignored explicit context reference not registered for pre-compression"
+                );
+                None
+            }
+        }
+    }
+
+    fn remove_precompressed_markers(
+        payload: &mut CompressiblePayload,
+        inserted_markers: &HashSet<usize>,
+    ) {
+        let marker = serde_json::json!({"type": PRECOMPRESSED_CACHE_MARKER_TYPE});
+        for message in &mut payload.messages {
+            if inserted_markers.contains(&message.original_index)
+                && message.extra.get(PRECOMPRESSED_CACHE_MARKER_KEY) == Some(&marker)
+            {
+                message.extra.remove(PRECOMPRESSED_CACHE_MARKER_KEY);
+            }
+        }
+    }
+
+    fn compression_savings_warning_required(stats: &CompressionStats) -> bool {
+        stats.savings_percent > 50.0
     }
 
     /// Get the instructions store (used by admin test-connection endpoint).
@@ -2021,12 +2491,26 @@ impl Router {
     /// Route request with failover orchestration
     ///
     /// Iterates through providers in order, attempts each with retry logic,
-    /// collects all attempts, returns aggregated error if all fail
+    /// collects all attempts, returns aggregated error if all fail.
+    /// Resolves the model group for direct callers before entering the
+    /// post-truncation group-aware implementation.
     ///
     /// Requirements: 8.1-8.10
     pub async fn route_with_failover(
         &self,
         request: &OpenAIRequest,
+        providers: Vec<ProviderModel>,
+    ) -> Result<OpenAIResponse, GatewayError> {
+        let model_group = self.find_model_group(&request.model).await?;
+        self.route_with_failover_for_group(request, &model_group, providers)
+            .await
+    }
+
+    /// Model-group-aware failover implementation used after pre-flight truncation.
+    async fn route_with_failover_for_group(
+        &self,
+        request: &OpenAIRequest,
+        model_group: &ModelGroup,
         providers: Vec<ProviderModel>,
     ) -> Result<OpenAIResponse, GatewayError> {
         let mut attempts = Vec::new();
@@ -2056,6 +2540,7 @@ impl Router {
 
         for provider_model in providers {
             let start = std::time::Instant::now();
+            let request_id = format!("route-{}", uuid::Uuid::new_v4());
 
             if let Some(budget_limit_usd) = provider_budgets.get(&provider_model.provider).copied()
             {
@@ -2141,8 +2626,16 @@ impl Router {
                 continue;
             }
 
+            let (prepared_request, compression) = self
+                .prepare_compressed_request_with_stats(
+                    request,
+                    model_group,
+                    &provider_model,
+                    &request_id,
+                )
+                .await;
             match self
-                .attempt_with_retry(&provider_model.provider, request, &provider_model)
+                .attempt_with_retry(&provider_model.provider, &prepared_request, &provider_model)
                 .await
             {
                 Ok(response) => {
@@ -2255,6 +2748,11 @@ impl Router {
                             "gateway_cost".to_string(),
                             serde_json::json!(candidate_cost),
                         );
+                        candidate.extra.insert(
+                            "gateway_compression".to_string(),
+                            serde_json::to_value(&compression)
+                                .expect("CompressionStats serialization must succeed"),
+                        );
                         truncated_candidates.push(candidate);
                         continue;
                     }
@@ -2334,6 +2832,11 @@ impl Router {
                     response
                         .extra
                         .insert("gateway_cost".to_string(), serde_json::json!(total_cost));
+                    response.extra.insert(
+                        "gateway_compression".to_string(),
+                        serde_json::to_value(&compression)
+                            .expect("CompressionStats serialization must succeed"),
+                    );
 
                     return Ok(response);
                 }
@@ -4012,7 +4515,7 @@ impl Router {
 
         // Route with failover
         let response = self
-            .route_with_failover(&prepared_request, providers)
+            .route_with_failover_for_group(&prepared_request, &model_group, providers)
             .await?;
 
         Ok(response)
@@ -4171,6 +4674,18 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             }
         };
 
+        // Compression is provider-specific and completes before model rewrite,
+        // sanitization, or the upstream streaming request starts.
+        let request_id = format!("stream-{}", uuid::Uuid::new_v4());
+        let (compressed_request, compression) = self
+            .prepare_compressed_request_with_stats(
+                &prepared_request,
+                &model_group,
+                &provider_model,
+                &request_id,
+            )
+            .await;
+
         // Inspect the chosen provider config. Clone every field needed for the
         // outgoing request before dropping the config guard — the guard must
         // not be held across the network `.await`.
@@ -4262,7 +4777,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
 
         // Build the outgoing request the same way attempt_with_retry does, but
         // request streaming from the provider.
-        let mut outgoing = prepared_request.clone();
+        let mut outgoing = compressed_request;
         outgoing.model = provider_model.model.clone();
         outgoing.stream = true;
         let stripped = Self::sanitize_request_for_provider(&mut outgoing, &provider_type);
@@ -4329,6 +4844,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             byte_stream: response,
             provider: provider_model.provider.clone(),
             model: provider_model.model.clone(),
+            compression,
         })
     }
 
@@ -4379,7 +4895,15 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::{
+        caveman::CAVEMAN_OUTPUT_SUFFIX,
+        config::{ModelGroupCompressionOverride, PrecompressedEntry, ProviderCompressionOverride},
+        engines::CompressionLevel,
+        precompressed::{metadata_path_for, PrecompressedMetadata},
+        token_counter::TokenCounter,
+    };
     use crate::config::{CircuitBreakerConfig, ExactCacheConfig, ModelGroup, ProviderModel};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     pub(super) fn test_metrics() -> Arc<crate::metrics::Metrics> {
         Arc::new(crate::metrics::Metrics::new())
@@ -4406,6 +4930,7 @@ mod tests {
             exact_cache: ExactCacheConfig::default(),
             prometheus: None,
             context: crate::config::ContextConfig::default(),
+            compression: Default::default(),
             first_launch_completed: false,
             tray: crate::config::TrayConfig::default(),
             codex_instructions_url: None,
@@ -4416,12 +4941,741 @@ mod tests {
         }
     }
 
+    fn test_provider(name: &str, base_url: String) -> crate::config::Provider {
+        crate::config::Provider {
+            name: name.to_string(),
+            provider_type: "openai".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            api_key_encrypted: None,
+            api_secret_env: None,
+            api_secret_encrypted: None,
+            auth_method: None,
+            resolved_api_key: None,
+            resolved_api_secret: None,
+            region: None,
+            timeout_seconds: 30,
+            ttfb_timeout_seconds: Some(5),
+            total_timeout_seconds: Some(5),
+            max_connections: 10,
+            rate_limit_per_minute: 0,
+            custom_headers: Default::default(),
+            connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+            budget: None,
+            manual_models: vec![],
+            global_inference_profile: false,
+            cross_region_inference: false,
+            prompt_caching: false,
+            compression: None,
+            custom_vpc_endpoint: false,
+            reasoning: true,
+            codex_base_url_override: None,
+            codex_model_override: None,
+            instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
+        }
+    }
+
+    fn test_model(provider: &str, priority: u32) -> ProviderModel {
+        ProviderModel {
+            provider: provider.to_string(),
+            model: "upstream-model".to_string(),
+            cost_per_million_input_tokens: 0.0,
+            cost_per_million_output_tokens: 0.0,
+            priority,
+        }
+    }
+
+    fn test_group(models: Vec<ProviderModel>) -> ModelGroup {
+        ModelGroup {
+            name: "test-group".to_string(),
+            version_fallback_enabled: false,
+            compression: None,
+            models,
+        }
+    }
+
+    fn compression_request(stream: bool) -> OpenAIRequest {
+        OpenAIRequest {
+            model: "test-group".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!(
+                    "Please actually use a very small number of checks in order to finish."
+                ),
+                extra: Default::default(),
+            }],
+            stream,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn compression_config(level: CompressionLevel, threshold: u32) -> CompressionConfig {
+        CompressionConfig {
+            enabled: true,
+            default_level: level,
+            auto_threshold_tokens: threshold,
+            ..CompressionConfig::default()
+        }
+    }
+
+    fn completion_response() -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "upstream-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+    }
+
+    fn request_content(request: &OpenAIRequest) -> &str {
+        request.messages[0].content.as_str().unwrap()
+    }
+
+    fn install_precompressed_fixture(
+        directory: &tempfile::TempDir,
+        source_name: &str,
+        source: &str,
+        artifact_name: &str,
+        artifact: &str,
+    ) -> Arc<PrecompressedManager> {
+        use chrono::Utc;
+
+        std::fs::write(directory.path().join(source_name), source).unwrap();
+        std::fs::write(directory.path().join(artifact_name), artifact).unwrap();
+        let metadata = PrecompressedMetadata::for_source(
+            100,
+            40,
+            CompressionLevel::Standard,
+            Utc::now(),
+            source.as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            metadata_path_for(directory.path().join(artifact_name)),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        Arc::new(
+            PrecompressedManager::new(
+                directory.path(),
+                [PrecompressedEntry {
+                    source_path: source_name.to_owned(),
+                    compressed_path: artifact_name.to_owned(),
+                    content_hash: None,
+                }],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn precompressed_router(
+        manager: Arc<PrecompressedManager>,
+    ) -> (Router, ModelGroup, ProviderModel) {
+        let mut config = create_test_config();
+        config.compression = compression_config(CompressionLevel::Standard, 0);
+        let provider_model = test_model("provider", 1);
+        let group = test_group(vec![provider_model.clone()]);
+        config.providers = vec![test_provider("provider", "http://localhost".to_owned())];
+        config.model_groups = vec![group.clone()];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        router.set_precompressed_manager(Some(manager));
+        (router, group, provider_model)
+    }
+
+    #[tokio::test]
+    async fn precompressed_hit_replaces_exact_reference_without_runtime_recompression() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = "Artifact actually retains this exact wording in order to prove bypass.";
+        let manager = install_precompressed_fixture(
+            &directory,
+            "context.md",
+            "Original source that should not reach the provider.",
+            "context.compressed.md",
+            artifact,
+        );
+        let (router, group, provider_model) = precompressed_router(manager);
+        let request = OpenAIRequest {
+            messages: vec![Message {
+                role: "system".to_owned(),
+                content: serde_json::json!("file://context.md"),
+                extra: Default::default(),
+            }],
+            ..compression_request(false)
+        };
+
+        let prepared = router
+            .prepare_compressed_request(&request, &group, &provider_model, "precompressed-hit")
+            .await;
+
+        assert_eq!(prepared.messages[0].content, serde_json::json!(artifact));
+        assert!(!prepared.messages[0].extra.contains_key("cache_control"));
+    }
+
+    #[tokio::test]
+    async fn stale_precompressed_source_uses_original_then_runtime_compression() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = install_precompressed_fixture(
+            &directory,
+            "context.md",
+            "Initial source.",
+            "context.compressed.md",
+            "Old artifact.",
+        );
+        let changed = (0..80)
+            .map(|index| {
+                format!(
+                    "Please actually use a very small number of checks in order to finish item {index}."
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        std::fs::write(directory.path().join("context.md"), &changed).unwrap();
+        let (router, group, provider_model) = precompressed_router(manager);
+        let request = OpenAIRequest {
+            messages: vec![Message {
+                role: "user".to_owned(),
+                content: serde_json::json!("file://context.md"),
+                extra: Default::default(),
+            }],
+            ..compression_request(false)
+        };
+
+        let prepared = router
+            .prepare_compressed_request(&request, &group, &provider_model, "precompressed-stale")
+            .await;
+        let content = prepared.messages[0].content.as_str().unwrap();
+
+        assert_ne!(content, changed);
+        assert!(!content.contains("actually"));
+        assert!(!content.contains("in order to"));
+        assert!(!prepared.messages[0].extra.contains_key("cache_control"));
+    }
+
+    #[tokio::test]
+    async fn precompressed_references_are_explicit_configured_and_root_constrained() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = install_precompressed_fixture(
+            &directory,
+            "context.md",
+            "Original source.",
+            "context.compressed.md",
+            "Validated artifact.",
+        );
+        let (router, group, provider_model) = precompressed_router(manager);
+        let literal = "Read context.md and ../secret.md without treating them as paths.";
+        let request = OpenAIRequest {
+            messages: vec![
+                Message {
+                    role: "user".to_owned(),
+                    content: serde_json::json!(literal),
+                    extra: Default::default(),
+                },
+                Message {
+                    role: "user".to_owned(),
+                    content: serde_json::json!("file://unknown.md"),
+                    extra: Default::default(),
+                },
+                Message {
+                    role: "user".to_owned(),
+                    content: serde_json::json!({"type":"file_reference","path":"../secret.md"}),
+                    extra: Default::default(),
+                },
+                Message {
+                    role: "user".to_owned(),
+                    content: serde_json::json!({"type":"file_reference","path":"context.md"}),
+                    extra: Default::default(),
+                },
+            ],
+            ..compression_request(false)
+        };
+        let disabled_group = ModelGroup {
+            compression: Some(ModelGroupCompressionOverride {
+                level: Some(CompressionLevel::None),
+                auto_threshold_tokens: Some(0),
+                caveman_output: Some(false),
+            }),
+            ..group
+        };
+
+        let prepared = router
+            .prepare_compressed_request(
+                &request,
+                &disabled_group,
+                &provider_model,
+                "precompressed-explicit",
+            )
+            .await;
+
+        assert_eq!(prepared.messages[0].content, serde_json::json!(literal));
+        assert_eq!(
+            prepared.messages[1].content,
+            serde_json::json!("file://unknown.md")
+        );
+        assert_eq!(
+            prepared.messages[2].content,
+            serde_json::json!({"type":"file_reference","path":"../secret.md"})
+        );
+        assert_eq!(
+            prepared.messages[3].content,
+            serde_json::json!("Validated artifact.")
+        );
+        assert!(prepared
+            .messages
+            .iter()
+            .all(|message| !message.extra.contains_key("cache_control")));
+    }
+
+    #[tokio::test]
+    async fn precompressed_manager_reload_changes_subsequent_requests() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        let first = install_precompressed_fixture(
+            &first_directory,
+            "context.md",
+            "First source.",
+            "context.compressed.md",
+            "First artifact.",
+        );
+        let second = install_precompressed_fixture(
+            &second_directory,
+            "context.md",
+            "Second source.",
+            "context.compressed.md",
+            "Second artifact.",
+        );
+        let (router, group, provider_model) = precompressed_router(first);
+        let request = OpenAIRequest {
+            messages: vec![Message {
+                role: "system".to_owned(),
+                content: serde_json::json!("file://context.md"),
+                extra: Default::default(),
+            }],
+            ..compression_request(false)
+        };
+
+        let before = router
+            .prepare_compressed_request(&request, &group, &provider_model, "manager-before")
+            .await;
+        let compression = {
+            let config = router.config.read().await;
+            config.compression.clone()
+        };
+        router.reload_compression_runtime(compression, Some(second));
+        let after = router
+            .prepare_compressed_request(&request, &group, &provider_model, "manager-after")
+            .await;
+
+        assert_eq!(
+            before.messages[0].content,
+            serde_json::json!("First artifact.")
+        );
+        assert_eq!(
+            after.messages[0].content,
+            serde_json::json!("Second artifact.")
+        );
+    }
+
+    #[tokio::test]
+    async fn compression_disabled_leaves_request_unchanged() {
+        let mut config = create_test_config();
+        let provider_model = test_model("provider", 1);
+        let group = test_group(vec![provider_model.clone()]);
+        config.providers = vec![test_provider("provider", "http://localhost".to_string())];
+        config.model_groups = vec![group.clone()];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let request = compression_request(false);
+
+        let prepared = router
+            .prepare_compressed_request(&request, &group, &provider_model, "disabled")
+            .await;
+
+        assert_eq!(
+            serde_json::to_value(prepared).unwrap(),
+            serde_json::to_value(request).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn compression_resolves_global_provider_model_group_precedence() {
+        let mut config = create_test_config();
+        config.compression = compression_config(CompressionLevel::Lite, 0);
+        let mut provider = test_provider("provider", "http://localhost".to_string());
+        provider.compression = Some(ProviderCompressionOverride {
+            enabled: Some(true),
+            level: Some(CompressionLevel::Standard),
+            auto_threshold_tokens: Some(0),
+            caveman_output: Some(false),
+        });
+        let provider_model = test_model("provider", 1);
+        let mut group = test_group(vec![provider_model.clone()]);
+        group.compression = Some(ModelGroupCompressionOverride {
+            level: Some(CompressionLevel::None),
+            auto_threshold_tokens: Some(0),
+            caveman_output: None,
+        });
+        config.providers = vec![provider];
+        config.model_groups = vec![group.clone()];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let request = compression_request(false);
+
+        let model_group_disabled = router
+            .prepare_compressed_request(&request, &group, &provider_model, "model-group")
+            .await;
+        assert_eq!(
+            request_content(&model_group_disabled),
+            request_content(&request)
+        );
+
+        group.compression = None;
+        let provider_compressed = router
+            .prepare_compressed_request(&request, &group, &provider_model, "provider")
+            .await;
+        assert_ne!(
+            request_content(&provider_compressed),
+            request_content(&request)
+        );
+        assert!(!request_content(&provider_compressed).contains("actually"));
+        assert!(!request_content(&provider_compressed).contains("in order to"));
+    }
+
+    #[tokio::test]
+    async fn compression_auto_threshold_is_strictly_greater_than() {
+        let mut config = create_test_config();
+        let provider_model = test_model("provider", 1);
+        let group = test_group(vec![provider_model.clone()]);
+        config.providers = vec![test_provider("provider", "http://localhost".to_string())];
+        config.model_groups = vec![group.clone()];
+        let request = compression_request(false);
+        let token_count = TokenCounter::new().count_request(&request);
+        config.compression = compression_config(CompressionLevel::Standard, token_count);
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let equal = router
+            .prepare_compressed_request(&request, &group, &provider_model, "equal")
+            .await;
+        assert_eq!(request_content(&equal), request_content(&request));
+
+        let above_config = compression_config(CompressionLevel::Standard, token_count - 1);
+        {
+            let mut config = router.config.write().await;
+            config.compression = above_config.clone();
+        }
+        router.reload_compression_pipeline(above_config);
+        let above = router
+            .prepare_compressed_request(&request, &group, &provider_model, "above")
+            .await;
+        assert_ne!(request_content(&above), request_content(&request));
+    }
+
+    #[tokio::test]
+    async fn compression_noop_returns_original_request() {
+        let mut config = create_test_config();
+        config.compression = compression_config(CompressionLevel::Lite, 0);
+        let provider_model = test_model("provider", 1);
+        let group = test_group(vec![provider_model.clone()]);
+        config.providers = vec![test_provider("provider", "http://localhost".to_string())];
+        config.model_groups = vec![group.clone()];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let request = OpenAIRequest {
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("already compact"),
+                extra: Default::default(),
+            }],
+            ..compression_request(false)
+        };
+
+        let prepared = router
+            .prepare_compressed_request(&request, &group, &provider_model, "noop")
+            .await;
+        assert_eq!(
+            serde_json::to_value(prepared).unwrap(),
+            serde_json::to_value(request).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn caveman_suffix_applies_and_skips_existing_output_instruction() {
+        let mut config = create_test_config();
+        config.compression.caveman_output = true;
+        let provider_model = test_model("provider", 1);
+        let group = test_group(vec![provider_model.clone()]);
+        config.providers = vec![test_provider("provider", "http://localhost".to_string())];
+        config.model_groups = vec![group.clone()];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let applied = router
+            .prepare_compressed_request(
+                &compression_request(false),
+                &group,
+                &provider_model,
+                "caveman",
+            )
+            .await;
+        assert_eq!(applied.messages[0].role, "system");
+        assert!(request_content(&applied).contains(CAVEMAN_OUTPUT_SUFFIX));
+
+        let existing = OpenAIRequest {
+            messages: vec![
+                Message {
+                    role: "system".to_string(),
+                    content: serde_json::json!("Respond in JSON format."),
+                    extra: Default::default(),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("answer"),
+                    extra: Default::default(),
+                },
+            ],
+            ..compression_request(false)
+        };
+        let skipped = router
+            .prepare_compressed_request(&existing, &group, &provider_model, "skip")
+            .await;
+        assert_eq!(skipped.messages.len(), existing.messages.len());
+        assert!(!skipped
+            .messages
+            .iter()
+            .any(|message| message.content_as_text().contains(CAVEMAN_OUTPUT_SUFFIX)));
+    }
+
+    #[tokio::test]
+    async fn buffered_provider_receives_compressed_body() {
+        use wiremock::matchers::{body_string_contains, method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(
+                "use a small number of checks to finish",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.compression = compression_config(CompressionLevel::Standard, 0);
+        let provider_model = test_model("provider", 1);
+        config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![provider_model])];
+        let mut router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let hub = Arc::new(CompressionEventHub::new());
+        router.set_compression_event_hub(hub.clone());
+        let replay_before = hub.subscribe().replay.len();
+
+        let response = router
+            .route_request(&compression_request(false))
+            .await
+            .unwrap();
+        assert!(response.extra.contains_key("gateway_compression"));
+        let replay = hub.subscribe().replay;
+        assert_eq!(replay.len(), replay_before + 1);
+        assert_eq!(replay[0].provider, "provider");
+        assert_eq!(replay[0].model, "upstream-model");
+    }
+
+    #[tokio::test]
+    async fn streaming_provider_receives_compressed_body_before_response() {
+        use wiremock::matchers::{body_string_contains, method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(
+                "use a small number of checks to finish",
+            ))
+            .and(body_string_contains("\"stream\":true"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.compression = compression_config(CompressionLevel::Standard, 0);
+        let provider_model = test_model("provider", 1);
+        config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![provider_model])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let response = router
+            .route_request_streaming(&compression_request(true))
+            .await
+            .unwrap();
+        assert!(matches!(response, StreamingResponse::PassThrough { .. }));
+        let StreamingResponse::PassThrough { compression, .. } = response else {
+            unreachable!()
+        };
+        assert_eq!(compression.provider, "provider");
+        assert_eq!(compression.model, "upstream-model");
+    }
+
+    #[tokio::test]
+    async fn failover_prepares_each_provider_from_original_request() {
+        use wiremock::matchers::{body_string_contains, method, path};
+
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(
+                "use a small number of checks to finish",
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&first)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(
+                "Please actually use a very small number of checks in order to finish.",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .expect(1)
+            .mount(&second)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.compression = compression_config(CompressionLevel::Lite, 0);
+        let mut first_provider = test_provider("first", first.uri());
+        first_provider.compression = Some(ProviderCompressionOverride {
+            enabled: Some(true),
+            level: Some(CompressionLevel::Standard),
+            auto_threshold_tokens: Some(0),
+            caveman_output: None,
+        });
+        let mut second_provider = test_provider("second", second.uri());
+        second_provider.compression = Some(ProviderCompressionOverride {
+            enabled: Some(false),
+            level: None,
+            auto_threshold_tokens: None,
+            caveman_output: None,
+        });
+        config.providers = vec![first_provider, second_provider];
+        config.model_groups = vec![test_group(vec![
+            test_model("first", 1),
+            test_model("second", 2),
+        ])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        router
+            .route_request(&compression_request(false))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn compression_records_metrics_for_operations_and_noops() {
+        let mut config = create_test_config();
+        config.compression = compression_config(CompressionLevel::Standard, 0);
+        let provider_model = test_model("provider", 1);
+        let group = test_group(vec![provider_model.clone()]);
+        config.providers = vec![test_provider("provider", "http://localhost".to_string())];
+        config.model_groups = vec![group.clone()];
+        let metrics = test_metrics();
+        let router = Router::new(Arc::new(RwLock::new(config)), metrics.clone());
+
+        router
+            .prepare_compressed_request(
+                &compression_request(false),
+                &group,
+                &provider_model,
+                "compressed",
+            )
+            .await;
+        let noop = OpenAIRequest {
+            messages: vec![Message {
+                role: "user".to_owned(),
+                content: serde_json::json!("compact"),
+                extra: Default::default(),
+            }],
+            ..compression_request(false)
+        };
+        router
+            .prepare_compressed_request(&noop, &group, &provider_model, "noop-metrics")
+            .await;
+
+        let mut out = String::new();
+        metrics.write_compression_prometheus(&mut out);
+        assert!(out
+            .contains("obey_compression_ratio_count{level=\"standard\",provider=\"provider\"} 2"));
+        assert!(out.contains(
+            "obey_compression_duration_seconds_count{level=\"standard\",provider=\"provider\"} 2"
+        ));
+    }
+
+    #[test]
+    fn compression_savings_warning_threshold_is_strictly_over_fifty_percent() {
+        let mut stats = CompressionStats {
+            request_id: "warning-test".to_owned(),
+            level: CompressionLevel::Standard,
+            engines_applied: Vec::new(),
+            original_tokens: 100,
+            compressed_tokens: 50,
+            savings_percent: 50.0,
+            compression_time_ms: 1,
+            auto_triggered: false,
+            cache_downgrade_applied: false,
+            tool_definitions_tokens_saved: 0,
+            caveman_applied: false,
+            timed_out: false,
+            error: false,
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            engine_results: Vec::new(),
+        };
+        assert!(!Router::compression_savings_warning_required(&stats));
+        stats.savings_percent = 51.0;
+        assert!(Router::compression_savings_warning_required(&stats));
+    }
+
+    #[tokio::test]
+    async fn pipeline_reload_changes_subsequent_request_snapshots() {
+        let mut config = create_test_config();
+        let provider_model = test_model("provider", 1);
+        let group = test_group(vec![provider_model.clone()]);
+        config.providers = vec![test_provider("provider", "http://localhost".to_string())];
+        config.model_groups = vec![group.clone()];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let request = compression_request(false);
+
+        let before = router
+            .prepare_compressed_request(&request, &group, &provider_model, "before-reload")
+            .await;
+        assert_eq!(request_content(&before), request_content(&request));
+
+        let replacement = compression_config(CompressionLevel::Standard, 0);
+        {
+            let mut config = router.config.write().await;
+            config.compression = replacement.clone();
+        }
+        router.reload_compression_pipeline(replacement);
+        let after = router
+            .prepare_compressed_request(&request, &group, &provider_model, "after-reload")
+            .await;
+        assert_ne!(request_content(&after), request_content(&request));
+    }
+
     #[tokio::test]
     async fn test_find_model_group_success() {
         let mut config = create_test_config();
         config.model_groups = vec![ModelGroup {
             name: "gpt-4-group".to_string(),
             version_fallback_enabled: false,
+            compression: None,
             models: vec![ProviderModel {
                 provider: "openai".to_string(),
                 model: "gpt-4".to_string(),
@@ -4453,6 +5707,7 @@ mod tests {
         config.model_groups = vec![ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
+            compression: None,
             models: vec![
                 ProviderModel {
                     provider: "provider-low-priority".to_string(),
@@ -4486,6 +5741,7 @@ mod tests {
         config.model_groups = vec![ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
+            compression: None,
             models: vec![
                 ProviderModel {
                     provider: "expensive-provider".to_string(),
@@ -4519,6 +5775,7 @@ mod tests {
         config.model_groups = vec![ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
+            compression: None,
             models: vec![
                 ProviderModel {
                     provider: "slow-provider".to_string(),
@@ -4576,6 +5833,7 @@ mod tests {
         config.model_groups = vec![ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: true,
+            compression: None,
             models: vec![
                 ProviderModel {
                     provider: "provider-1".to_string(),
@@ -4695,11 +5953,25 @@ mod tests {
             cross_region_inference: false,
             custom_vpc_endpoint: false,
             prompt_caching: false,
+            compression: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
+        }];
+        let providers = vec![ProviderModel {
+            provider: "budgeted-provider".to_string(),
+            model: "test-model".to_string(),
+            cost_per_million_input_tokens: 0.0,
+            cost_per_million_output_tokens: 0.0,
+            priority: 100,
+        }];
+        config.model_groups = vec![ModelGroup {
+            name: "test-group".to_string(),
+            version_fallback_enabled: false,
+            compression: None,
+            models: providers.clone(),
         }];
         let router_metrics = test_metrics();
         router_metrics.add_cost("budgeted-provider", 1.25);
@@ -4713,13 +5985,6 @@ mod tests {
             stream: false,
             extra: Default::default(),
         };
-        let providers = vec![ProviderModel {
-            provider: "budgeted-provider".to_string(),
-            model: "test-model".to_string(),
-            cost_per_million_input_tokens: 0.0,
-            cost_per_million_output_tokens: 0.0,
-            priority: 100,
-        }];
 
         let result = router.route_with_failover(&request, providers).await;
         assert!(matches!(result, Err(GatewayError::AllProvidersFailed(_))));
@@ -4830,6 +6095,7 @@ mod property_tests {
             .prop_map(|(name, version_fallback, models)| ModelGroup {
                 name,
                 version_fallback_enabled: version_fallback,
+                compression: None,
                 models,
             })
     }
@@ -4968,6 +6234,7 @@ mod property_tests {
         let invalid_group = ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
+            compression: None,
             models: vec![ProviderModel {
                 provider: "".to_string(), // Invalid: empty provider
                 model: "gpt-4".to_string(),
@@ -4988,6 +6255,7 @@ mod property_tests {
         let invalid_group2 = ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
+            compression: None,
             models: vec![ProviderModel {
                 provider: "openai".to_string(),
                 model: "".to_string(), // Invalid: empty model
@@ -5372,6 +6640,7 @@ mod property_tests {
             global_inference_profile: false,
             cross_region_inference: false,
             prompt_caching: false,
+            compression: None,
             reasoning: false,
             custom_vpc_endpoint: false,
             codex_base_url_override: None,
@@ -5385,6 +6654,7 @@ mod property_tests {
         let group = ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
+            compression: None,
             models: vec![
                 ProviderModel {
                     provider: "primary".to_string(),
@@ -5523,6 +6793,7 @@ mod property_tests {
             cross_region_inference: false,
             custom_vpc_endpoint: false,
             prompt_caching: false,
+            compression: None,
             reasoning: false,
             codex_base_url_override: None,
             codex_model_override: None,

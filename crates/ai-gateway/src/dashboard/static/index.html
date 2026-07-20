@@ -93,6 +93,16 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 
 /* Empty state */
 .empty{text-align:center;padding:2rem;color:var(--text-muted);font-size:.85rem}
+
+/* Compression summary */
+.compression-note{color:var(--text-muted);font-size:.78rem;margin:-.5rem 0 1rem}
+.compression-detail{min-width:15rem}
+.compression-detail summary{color:var(--primary);cursor:pointer;white-space:nowrap}
+.compression-detail summary:focus-visible{outline:2px solid var(--primary);outline-offset:2px;border-radius:3px}
+.compression-detail-grid{display:grid;grid-template-columns:max-content 1fr;gap:.2rem .6rem;margin-top:.5rem;color:var(--text-muted);font-size:.75rem}
+.compression-detail-grid dt{color:var(--text);font-weight:600}
+.compression-detail-grid dd{overflow-wrap:anywhere}
+@media(max-width:700px){.compression-detail{min-width:12rem}.compression-detail-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -112,6 +122,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
   <button class="tab-btn" role="tab" aria-selected="true" data-section="overview" id="tab-overview">Metrics Overview</button>
   <button class="tab-btn" role="tab" aria-selected="false" data-section="providers" id="tab-providers">Provider Health</button>
   <button class="tab-btn" role="tab" aria-selected="false" data-section="costs" id="tab-costs">Cost Breakdown</button>
+  <button class="tab-btn" role="tab" aria-selected="false" data-section="compression" id="tab-compression">Compression</button>
   <button class="tab-btn" role="tab" aria-selected="false" data-section="errors" id="tab-errors">Recent Errors</button>
   <button class="tab-btn" role="tab" aria-selected="false" data-section="logs" id="tab-logs">Log Viewer</button>
 </div>
@@ -189,6 +200,29 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     <div class="empty" id="cost-empty">No cost data yet</div>
   </section>
 
+  <!-- Compression Summary (Tasks 9.4, 9.5) -->
+  <section class="section" id="sec-compression" role="tabpanel" aria-labelledby="tab-compression">
+    <h2 class="section-title">Compression Summary</h2>
+    <p class="compression-note" id="compression-window-note">Live totals use the latest 500 compression events received in this browser session.</p>
+    <div class="cards">
+      <div class="card"><div class="card-label">Total Tokens Saved</div><div class="card-value" id="compression-total-saved" aria-live="polite">0</div></div>
+      <div class="card"><div class="card-label">Rolling Average Savings</div><div class="card-value" id="compression-avg-savings" aria-live="polite">0.0%</div></div>
+      <div class="card"><div class="card-label">Compression Events</div><div class="card-value" id="compression-event-count" aria-live="polite">0</div></div>
+    </div>
+    <div class="chart-row">
+      <div class="chart-box"><h3>Event Timeline — Tokens Saved</h3><canvas id="chart-compression-timeline" role="img" aria-label="Tokens saved by the latest compression events"></canvas></div>
+      <div class="chart-box"><h3>Tokens Saved by Compression Level</h3><canvas id="chart-compression-level" role="img" aria-label="Tokens saved grouped by compression level"></canvas></div>
+    </div>
+    <h2 class="section-title">Top Models / Providers</h2>
+    <div class="table-wrap" id="compression-top-wrap" hidden>
+      <table id="compression-top-table" aria-label="Top models and providers by compression savings">
+        <thead><tr><th>Model / Provider</th><th>Events</th><th>Tokens Saved</th><th>Average Savings</th></tr></thead>
+        <tbody id="compression-top-tbody"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="compression-empty">Waiting for compression events</div>
+  </section>
+
   <!-- Recent Errors (Req 16.11) -->
   <section class="section" id="sec-errors" role="tabpanel" aria-labelledby="tab-errors">
     <h2 class="section-title">Recent Errors</h2>
@@ -229,6 +263,19 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
         <label for="f-trace">Trace ID</label>
         <input type="text" id="f-trace" placeholder="Any">
       </div>
+      <div class="fg">
+        <label for="f-compression-level">Compression Level</label>
+        <select id="f-compression-level">
+          <option value="">All</option>
+          <option value="none">None</option>
+          <option value="lite">Lite</option>
+          <option value="standard">Standard</option>
+          <option value="aggressive">Aggressive</option>
+          <option value="ultra">Ultra</option>
+          <option value="rtk">RTK</option>
+          <option value="stacked">Stacked</option>
+        </select>
+      </div>
       <button type="submit" class="btn btn-primary">Search</button>
       <button type="reset" class="btn btn-secondary">Clear</button>
     </form>
@@ -237,7 +284,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
         <thead>
           <tr>
             <th>Timestamp</th><th>Trace ID</th><th>Provider</th><th>Model</th>
-            <th>Status</th><th>Duration</th><th>Cost</th>
+            <th>Status</th><th>Duration</th><th>Cost</th><th>Compression</th>
           </tr>
         </thead>
         <tbody id="logs-tbody"></tbody>
@@ -287,6 +334,17 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
   }
   function fmtCost(v){ return '$'+Number(v||0).toFixed(4); }
   function fmtPct(v){ return (Number(v||0)*100).toFixed(1)+'%'; }
+  function finiteNumber(v){ var n=Number(v);return Number.isFinite(n)?n:0; }
+  function fmtSavingsPct(v){ return Math.max(0,Math.min(100,finiteNumber(v))).toFixed(1)+'%'; }
+  function fmtTokens(v){ return Math.max(0,Math.round(finiteNumber(v))).toLocaleString(); }
+  function clearNode(node){ while(node.firstChild) node.removeChild(node.firstChild); }
+  function appendTextCell(row, value, className){
+    var cell=document.createElement('td');
+    cell.textContent=value;
+    if(className) cell.className=className;
+    row.appendChild(cell);
+    return cell;
+  }
   function fmtMs(v){
     var milliseconds = Math.max(0, Number(v)||0);
     if(milliseconds>=60000){
@@ -312,9 +370,13 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
   var reqRateData = [];
   var respTimeData = [];
   var costTrendData = [];
+  var compressionEvents = [];
   var MAX_POINTS = 60;
+  var MAX_COMPRESSION_EVENTS = 500;
+  var MAX_COMPRESSION_CHART_POINTS = 100;
+  var compressionSequence = 0;
 
-  var reqRateChart, respTimeChart, costProviderChart, costTrendChart;
+  var reqRateChart, respTimeChart, costProviderChart, costTrendChart, compressionTimelineChart, compressionLevelChart;
 
   function initCharts(){
     if(typeof Chart==='undefined') return;
@@ -334,6 +396,14 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 
     costTrendChart = new Chart($('chart-cost-trend'),{type:'line',
       data:{labels:[],datasets:[Object.assign({},baseDataset,{data:[],borderColor:'rgba(245,158,11,.8)',backgroundColor:'rgba(245,158,11,.1)'})]},
+      options:chartOpts});
+
+    compressionTimelineChart = new Chart($('chart-compression-timeline'),{type:'line',
+      data:{labels:[],datasets:[Object.assign({},baseDataset,{data:[],borderColor:'rgba(34,197,94,.8)',backgroundColor:'rgba(34,197,94,.1)'})]},
+      options:chartOpts});
+
+    compressionLevelChart = new Chart($('chart-compression-level'),{type:'bar',
+      data:{labels:[],datasets:[{data:[],backgroundColor:['#3b82f6','#22c55e','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#f97316','#64748b']}]},
       options:chartOpts});
   }
 
@@ -501,19 +571,131 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     tbody.innerHTML=html;
   }
 
+  function normalizeCompressionEvent(data){
+    var level=String(data.level||'unknown').toLowerCase();
+    var provider=String(data.provider||'Unknown provider');
+    var model=String(data.model||'Unknown model');
+    var original=Math.max(0,Math.round(finiteNumber(data.original_tokens)));
+    var compressed=Math.max(0,Math.round(finiteNumber(data.compressed_tokens)));
+    var saved=data.tokens_saved==null?Math.max(0,original-compressed):Math.max(0,Math.round(finiteNumber(data.tokens_saved)));
+    return {
+      sequence:++compressionSequence,
+      level:level,
+      provider:provider,
+      model:model,
+      originalTokens:original,
+      compressedTokens:compressed,
+      tokensSaved:saved,
+      savingsPercent:Math.max(0,Math.min(100,finiteNumber(data.savings_percent))),
+      compressionTimeMs:Math.max(0,finiteNumber(data.compression_time_ms)),
+      engines:Array.isArray(data.engines_applied)?data.engines_applied.slice(0,32).map(String):[]
+    };
+  }
+
+  function renderCompression(){
+    var totalSaved=0;
+    var totalPercent=0;
+    var levels=Object.create(null);
+    var dimensions=Object.create(null);
+    compressionEvents.forEach(function(event){
+      totalSaved+=event.tokensSaved;
+      totalPercent+=event.savingsPercent;
+      levels[event.level]=(levels[event.level]||0)+event.tokensSaved;
+      var key=event.model+' / '+event.provider;
+      var group=dimensions[key];
+      if(!group){group=dimensions[key]={label:key,events:0,tokensSaved:0,totalPercent:0};}
+      group.events++;group.tokensSaved+=event.tokensSaved;group.totalPercent+=event.savingsPercent;
+    });
+
+    $('compression-total-saved').textContent=fmtTokens(totalSaved);
+    $('compression-avg-savings').textContent=compressionEvents.length?fmtSavingsPct(totalPercent/compressionEvents.length):'0.0%';
+    $('compression-event-count').textContent=fmtTokens(compressionEvents.length);
+    $('compression-empty').style.display=compressionEvents.length?'none':'block';
+    $('compression-top-wrap').hidden=!compressionEvents.length;
+
+    if(compressionTimelineChart){
+      var timeline=compressionEvents.slice(-MAX_COMPRESSION_CHART_POINTS);
+      compressionTimelineChart.data.labels=timeline.map(function(event){return '#'+event.sequence;});
+      compressionTimelineChart.data.datasets[0].data=timeline.map(function(event){return event.tokensSaved;});
+      compressionTimelineChart.update('none');
+    }
+    if(compressionLevelChart){
+      var levelOrder=['none','lite','standard','aggressive','ultra','rtk','stacked','unknown'];
+      var labels=levelOrder.filter(function(level){return Object.prototype.hasOwnProperty.call(levels,level);});
+      compressionLevelChart.data.labels=labels;
+      compressionLevelChart.data.datasets[0].data=labels.map(function(level){return levels[level];});
+      compressionLevelChart.update('none');
+    }
+
+    var top=Object.keys(dimensions).map(function(key){return dimensions[key];});
+    top.sort(function(a,b){return b.tokensSaved-a.tokensSaved;});
+    top=top.slice(0,10);
+    var tbody=$('compression-top-tbody');
+    clearNode(tbody);
+    top.forEach(function(group){
+      var row=document.createElement('tr');
+      appendTextCell(row,group.label);
+      appendTextCell(row,fmtTokens(group.events));
+      appendTextCell(row,fmtTokens(group.tokensSaved));
+      appendTextCell(row,fmtSavingsPct(group.totalPercent/group.events));
+      tbody.appendChild(row);
+    });
+  }
+
+  function handleCompressionEvent(data){
+    compressionEvents.push(normalizeCompressionEvent(data));
+    if(compressionEvents.length>MAX_COMPRESSION_EVENTS) compressionEvents.shift();
+    renderCompression();
+  }
+
+  function appendCompressionDetail(row, compression){
+    var cell=document.createElement('td');
+    cell.className='compression-detail';
+    if(!compression){cell.textContent='—';row.appendChild(cell);return;}
+
+    var details=document.createElement('details');
+    var summary=document.createElement('summary');
+    var level=String(compression.compression_level||compression.level||'unknown');
+    summary.textContent=level+' · '+fmtSavingsPct(compression.savings_percent);
+    summary.setAttribute('aria-label','Show compression details for '+level+' level');
+    details.appendChild(summary);
+
+    var list=document.createElement('dl');
+    list.className='compression-detail-grid';
+    [
+      ['Level',level],
+      ['Tokens',fmtTokens(compression.original_tokens)+' → '+fmtTokens(compression.compressed_tokens)],
+      ['Savings',fmtSavingsPct(compression.savings_percent)],
+      ['Engines',Array.isArray(compression.engines_applied)&&compression.engines_applied.length?compression.engines_applied.slice(0,32).join(', '):'None'],
+      ['Duration',fmtMs(compression.duration_ms)]
+    ].forEach(function(item){
+      var term=document.createElement('dt');term.textContent=item[0];
+      var description=document.createElement('dd');description.textContent=item[1];
+      list.appendChild(term);list.appendChild(description);
+    });
+    details.appendChild(list);
+    cell.appendChild(details);
+    row.appendChild(cell);
+  }
+
   function renderLogs(logs){
     var tbody=$('logs-tbody');
-    if(!logs||!logs.length){tbody.innerHTML='';$('logs-empty').style.display='block';return;}
+    clearNode(tbody);
+    if(!logs||!logs.length){$('logs-empty').style.display='block';$('logs-empty').textContent='No logs match the selected filters';return;}
     $('logs-empty').style.display='none';
 
-    var html='';
-    logs.forEach(function(l){
-      html+='<tr><td>'+fmtTime(l.timestamp)+'</td><td>'+esc(l.trace_id||'')+'</td>'
-        +'<td>'+esc(l.provider||'')+'</td><td>'+esc(l.model||'')+'</td>'
-        +'<td>'+l.status_code+'</td><td>'+fmtMs(l.duration_ms)+'</td>'
-        +'<td>'+fmtCost(l.cost)+'</td></tr>';
+    logs.forEach(function(log){
+      var row=document.createElement('tr');
+      appendTextCell(row,fmtTime(log.timestamp));
+      appendTextCell(row,String(log.trace_id||''));
+      appendTextCell(row,String(log.provider||''));
+      appendTextCell(row,String(log.model||''));
+      appendTextCell(row,String(log.status_code==null?'':log.status_code));
+      appendTextCell(row,fmtMs(log.duration_ms));
+      appendTextCell(row,fmtCost(log.cost));
+      appendCompressionDetail(row,log.compression);
+      tbody.appendChild(row);
     });
-    tbody.innerHTML=html;
   }
 
   // --- WebSocket (Req 16.14, 40.1-40.7) ---
@@ -546,6 +728,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
           renderCosts(msg.data.cost_by_provider, msg.data.cumulative_cost);
         }
         if(msg.type==='errors'&&msg.data){ renderErrors(msg.data); }
+        if(msg.type==='compression'&&msg.data){ handleCompressionEvent(msg.data); }
       }catch(e){/* ignore parse errors */}
     };
 
@@ -577,9 +760,12 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     var model=$('f-model').value.trim(); if(model) params.set('model',model);
     var status=$('f-status').value.trim(); if(status) params.set('status_code',status);
     var trace=$('f-trace').value.trim(); if(trace) params.set('trace_id',trace);
+    var compressionLevel=$('f-compression-level').value; if(compressionLevel) params.set('compression_level',compressionLevel);
 
+    $('logs-empty').style.display='block';
+    $('logs-empty').textContent='Loading logs…';
     fetch(dashboardBasePath+'/logs?'+params.toString())
-      .then(function(r){return r.json();})
+      .then(function(r){if(!r.ok) throw new Error('HTTP '+r.status);return r.json();})
       .then(function(data){renderLogs(data.logs||data);})
       .catch(function(){$('logs-empty').style.display='block';$('logs-empty').textContent='Failed to fetch logs';});
   });
@@ -610,6 +796,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 
   // --- Init ---
   initCharts();
+  renderCompression();
   wsConnect();
   loadErrors();
   // Poll as fallback every 5s in case WS is not available

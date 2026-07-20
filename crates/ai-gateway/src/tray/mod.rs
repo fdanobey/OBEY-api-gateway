@@ -266,6 +266,7 @@ mod tests {
                 cross_region_inference: false,
                 custom_vpc_endpoint: false,
                 prompt_caching: false,
+                compression: None,
                 reasoning: true,
                 codex_base_url_override: None,
                 codex_model_override: None,
@@ -275,6 +276,7 @@ mod tests {
             model_groups: vec![ModelGroup {
                 name: "default".to_string(),
                 version_fallback_enabled: false,
+                compression: None,
                 models: vec![ProviderModel {
                     provider: "test-provider".to_string(),
                     model: "gpt-4".to_string(),
@@ -290,11 +292,13 @@ mod tests {
             exact_cache: ExactCacheConfig::default(),
             prometheus: None,
             context: ContextConfig::default(),
+            compression: Default::default(),
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,
             streaming: None,
             virtual_keys: Default::default(),
+            loop_detection: Default::default(),
             guardrails: None,
         }
     }

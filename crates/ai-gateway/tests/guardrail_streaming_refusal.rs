@@ -61,6 +61,7 @@ fn provider_named(name: &str, base_url: &str) -> Provider {
         cross_region_inference: false,
         custom_vpc_endpoint: false,
         prompt_caching: false,
+        compression: None,
         reasoning: true,
         codex_base_url_override: None,
         codex_model_override: None,
@@ -92,6 +93,7 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
         model_groups: vec![ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
+            compression: None,
             models: vec![
                 ProviderModel {
                     provider: "primary".to_string(),
@@ -116,6 +118,7 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
         exact_cache: ExactCacheConfig::default(),
         prometheus: None,
         context: ai_gateway::config::ContextConfig::default(),
+        compression: Default::default(),
         first_launch_completed: false,
         tray: ai_gateway::config::TrayConfig::default(),
         codex_instructions_url: None,

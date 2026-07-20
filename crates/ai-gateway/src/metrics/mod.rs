@@ -1,3 +1,7 @@
+use crate::compression::{
+    stats::{sanitize_operational_metadata, CompressionStats, MAX_PROVIDER_LEN},
+    CompressionLevel,
+};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,6 +59,110 @@ pub struct Metrics {
     /// Refusal failover outcome counter, keyed by (pipeline, outcome) where
     /// outcome ∈ {recovered, exhausted} (Req 12.11).
     guardrail_refusal_failover: Arc<DashMap<(String, String), AtomicU64>>,
+    /// Compression tokens saved counter, keyed by bounded (level, provider).
+    compression_tokens_saved: Arc<DashMap<CompressionMetricKey, AtomicU64>>,
+    /// Compression ratio histogram, keyed by bounded (level, provider).
+    compression_ratio: Arc<DashMap<CompressionMetricKey, CompressionHistogram>>,
+    /// Compression duration histogram, keyed by bounded (level, provider).
+    compression_duration_seconds: Arc<DashMap<CompressionMetricKey, CompressionHistogram>>,
+}
+
+/// Bounded label set for compression metrics: (level, provider).
+type CompressionMetricKey = (String, String);
+
+/// Compression ratios are `compressed_tokens / original_tokens`, clamped to
+/// `[0, 1]`; an empty original request has ratio `1.0`.
+const COMPRESSION_RATIO_BUCKETS: [f64; 8] = [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0];
+/// Compression durations in seconds, covering sub-millisecond through slow runs.
+const COMPRESSION_DURATION_BUCKETS_SECONDS: [f64; 10] =
+    [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0];
+const MAX_COMPRESSION_LEVEL_LABEL_LEN: usize = 16;
+const MAX_COMPRESSION_PROVIDER_LABEL_LEN: usize = 64;
+
+/// Histogram state with non-cumulative buckets, rendered cumulatively.
+#[derive(Debug)]
+struct CompressionHistogram {
+    buckets: Box<[AtomicU64]>,
+    count: AtomicU64,
+    sum_micros: AtomicU64,
+}
+
+impl CompressionHistogram {
+    fn new(bucket_count: usize) -> Self {
+        Self {
+            buckets: (0..bucket_count)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            count: AtomicU64::new(0),
+            sum_micros: AtomicU64::new(0),
+        }
+    }
+
+    fn observe(&self, value: f64, buckets: &[f64]) {
+        let observation = if value.is_finite() {
+            value.max(0.0)
+        } else {
+            0.0
+        };
+        saturating_atomic_add(&self.count, 1);
+        saturating_atomic_add(
+            &self.sum_micros,
+            (observation * 1_000_000.0).round().min(u64::MAX as f64) as u64,
+        );
+        if let Some(index) = buckets.iter().position(|boundary| observation <= *boundary) {
+            saturating_atomic_add(&self.buckets[index], 1);
+        }
+    }
+}
+
+fn saturating_atomic_add(target: &AtomicU64, amount: u64) {
+    let _ = target.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
+}
+
+fn compression_level_label(level: CompressionLevel) -> &'static str {
+    match level {
+        CompressionLevel::None => "none",
+        CompressionLevel::Lite => "lite",
+        CompressionLevel::Standard => "standard",
+        CompressionLevel::Aggressive => "aggressive",
+        CompressionLevel::Ultra => "ultra",
+        CompressionLevel::Rtk => "rtk",
+        CompressionLevel::Stacked => "stacked",
+    }
+}
+
+fn bounded_label(value: &str, max_bytes: usize) -> String {
+    let mut end = 0;
+    for (index, character) in value.char_indices() {
+        let next = index + character.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    if value.len() <= max_bytes {
+        value.to_owned()
+    } else {
+        value[..end].to_owned()
+    }
+}
+
+fn escape_prometheus_label(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            character if character.is_control() => escaped.push(' '),
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 /// Label set for the guardrail stage execution counter (Req 11.1).
@@ -256,6 +364,9 @@ impl Metrics {
             guardrail_stage_latency: Arc::new(DashMap::new()),
             guardrail_refusal_detected: Arc::new(DashMap::new()),
             guardrail_refusal_failover: Arc::new(DashMap::new()),
+            compression_tokens_saved: Arc::new(DashMap::new()),
+            compression_ratio: Arc::new(DashMap::new()),
+            compression_duration_seconds: Arc::new(DashMap::new()),
         }
     }
 
@@ -707,6 +818,126 @@ Total refusal failover outcomes by pipeline and outcome\n",
         }
     }
 
+    /// Record content-free compression metrics for one pipeline operation.
+    pub fn record_compression(&self, stats: &CompressionStats) {
+        let key = (
+            bounded_label(
+                compression_level_label(stats.level),
+                MAX_COMPRESSION_LEVEL_LABEL_LEN,
+            ),
+            bounded_label(
+                &sanitize_operational_metadata(&stats.provider, MAX_PROVIDER_LEN),
+                MAX_COMPRESSION_PROVIDER_LABEL_LEN,
+            ),
+        );
+        let tokens_saved = u64::from(stats.tokens_saved());
+        let ratio = if stats.original_tokens == 0 {
+            1.0
+        } else {
+            (f64::from(stats.compressed_tokens) / f64::from(stats.original_tokens)).clamp(0.0, 1.0)
+        };
+        let duration_seconds = stats.compression_time_ms as f64 / 1000.0;
+
+        let counter = self
+            .compression_tokens_saved
+            .entry(key.clone())
+            .or_insert_with(|| AtomicU64::new(0));
+        saturating_atomic_add(counter.value(), tokens_saved);
+        self.compression_ratio
+            .entry(key.clone())
+            .or_insert_with(|| CompressionHistogram::new(COMPRESSION_RATIO_BUCKETS.len()))
+            .observe(ratio, &COMPRESSION_RATIO_BUCKETS);
+        self.compression_duration_seconds
+            .entry(key)
+            .or_insert_with(|| {
+                CompressionHistogram::new(COMPRESSION_DURATION_BUCKETS_SECONDS.len())
+            })
+            .observe(duration_seconds, &COMPRESSION_DURATION_BUCKETS_SECONDS);
+    }
+
+    /// Append compression counter and histograms in Prometheus text format.
+    /// The ratio is `compressed_tokens / original_tokens` in `[0, 1]`; when
+    /// `original_tokens` is zero, the observed ratio is `1.0`.
+    pub fn write_compression_prometheus(&self, out: &mut String) {
+        if !self.compression_tokens_saved.is_empty() {
+            let mut rows: Vec<(CompressionMetricKey, u64)> = self
+                .compression_tokens_saved
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|left, right| left.0.cmp(&right.0));
+            out.push_str("# HELP obey_compression_tokens_saved_total Total tokens saved by compression operations\n");
+            out.push_str("# TYPE obey_compression_tokens_saved_total counter\n");
+            for ((level, provider), value) in rows {
+                out.push_str(&format!(
+                    "obey_compression_tokens_saved_total{{level=\"{}\",provider=\"{}\"}} {}\n",
+                    escape_prometheus_label(&level),
+                    escape_prometheus_label(&provider),
+                    value
+                ));
+            }
+        }
+        self.write_compression_histogram(
+            out,
+            "obey_compression_ratio",
+            "Compressed token ratio (compressed_tokens / original_tokens; 1.0 when original_tokens is zero)",
+            &self.compression_ratio,
+            &COMPRESSION_RATIO_BUCKETS,
+        );
+        self.write_compression_histogram(
+            out,
+            "obey_compression_duration_seconds",
+            "Compression operation duration in seconds",
+            &self.compression_duration_seconds,
+            &COMPRESSION_DURATION_BUCKETS_SECONDS,
+        );
+    }
+
+    fn write_compression_histogram(
+        &self,
+        out: &mut String,
+        name: &str,
+        help: &str,
+        values: &DashMap<CompressionMetricKey, CompressionHistogram>,
+        buckets: &[f64],
+    ) {
+        if values.is_empty() {
+            return;
+        }
+        let mut keys: Vec<CompressionMetricKey> =
+            values.iter().map(|entry| entry.key().clone()).collect();
+        keys.sort();
+        out.push_str(&format!("# HELP {name} {help}\n"));
+        out.push_str(&format!("# TYPE {name} histogram\n"));
+        for key in keys {
+            let Some(entry) = values.get(&key) else {
+                continue;
+            };
+            let histogram = entry.value();
+            let level = escape_prometheus_label(&key.0);
+            let provider = escape_prometheus_label(&key.1);
+            let mut cumulative = 0u64;
+            for (index, boundary) in buckets.iter().enumerate() {
+                cumulative =
+                    cumulative.saturating_add(histogram.buckets[index].load(Ordering::Relaxed));
+                out.push_str(&format!(
+                    "{name}_bucket{{level=\"{level}\",provider=\"{provider}\",le=\"{boundary}\"}} {cumulative}\n"
+                ));
+            }
+            let count = histogram.count.load(Ordering::Relaxed);
+            out.push_str(&format!(
+                "{name}_bucket{{level=\"{level}\",provider=\"{provider}\",le=\"+Inf\"}} {count}\n"
+            ));
+            let sum = histogram.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+            out.push_str(&format!(
+                "{name}_sum{{level=\"{level}\",provider=\"{provider}\"}} {sum}\n"
+            ));
+            out.push_str(&format!(
+                "{name}_count{{level=\"{level}\",provider=\"{provider}\"}} {count}\n"
+            ));
+        }
+    }
+
     /// Record cache hit
     #[inline]
     pub fn record_cache_hit(&self) {
@@ -1153,6 +1384,146 @@ mod tests {
         assert!(out.contains(
             "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"p\",stage=\"s\",provider=\"regex\",le=\"+Inf\"} 1"
         ));
+    }
+
+    fn compression_stats(
+        level: CompressionLevel,
+        provider: &str,
+        original_tokens: u32,
+        compressed_tokens: u32,
+        duration_ms: u64,
+    ) -> CompressionStats {
+        CompressionStats {
+            request_id: "metrics-test".to_owned(),
+            level,
+            engines_applied: Vec::new(),
+            original_tokens,
+            compressed_tokens,
+            savings_percent: if original_tokens == 0 {
+                0.0
+            } else {
+                f64::from(original_tokens.saturating_sub(compressed_tokens)) * 100.0
+                    / f64::from(original_tokens)
+            },
+            compression_time_ms: duration_ms,
+            auto_triggered: false,
+            cache_downgrade_applied: false,
+            tool_definitions_tokens_saved: 0,
+            caveman_applied: false,
+            timed_out: false,
+            error: false,
+            provider: provider.to_owned(),
+            model: "model".to_owned(),
+            engine_results: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn compression_prometheus_accumulates_counter_and_histograms() {
+        let metrics = Metrics::new();
+        metrics.record_compression(&compression_stats(
+            CompressionLevel::Standard,
+            "openai",
+            100,
+            50,
+            25,
+        ));
+        metrics.record_compression(&compression_stats(
+            CompressionLevel::Standard,
+            "openai",
+            100,
+            90,
+            200,
+        ));
+
+        let mut out = String::new();
+        metrics.write_compression_prometheus(&mut out);
+
+        assert!(out.contains("# TYPE obey_compression_tokens_saved_total counter"));
+        assert!(out.contains(
+            "obey_compression_tokens_saved_total{level=\"standard\",provider=\"openai\"} 60"
+        ));
+        assert!(out.contains("# TYPE obey_compression_ratio histogram"));
+        assert!(out.contains(
+            "obey_compression_ratio_bucket{level=\"standard\",provider=\"openai\",le=\"0.5\"} 1"
+        ));
+        assert!(out.contains(
+            "obey_compression_ratio_bucket{level=\"standard\",provider=\"openai\",le=\"0.9\"} 2"
+        ));
+        assert!(out.contains(
+            "obey_compression_ratio_bucket{level=\"standard\",provider=\"openai\",le=\"+Inf\"} 2"
+        ));
+        assert!(
+            out.contains("obey_compression_ratio_sum{level=\"standard\",provider=\"openai\"} 1.4")
+        );
+        assert!(
+            out.contains("obey_compression_ratio_count{level=\"standard\",provider=\"openai\"} 2")
+        );
+        assert!(out.contains("# TYPE obey_compression_duration_seconds histogram"));
+        assert!(out.contains(
+            "obey_compression_duration_seconds_bucket{level=\"standard\",provider=\"openai\",le=\"0.025\"} 1"
+        ));
+        assert!(out.contains(
+            "obey_compression_duration_seconds_bucket{level=\"standard\",provider=\"openai\",le=\"0.25\"} 2"
+        ));
+        assert!(out.contains(
+            "obey_compression_duration_seconds_sum{level=\"standard\",provider=\"openai\"} 0.225"
+        ));
+        assert!(out.contains(
+            "obey_compression_duration_seconds_count{level=\"standard\",provider=\"openai\"} 2"
+        ));
+    }
+
+    #[test]
+    fn compression_prometheus_uses_one_for_empty_original_ratio() {
+        let metrics = Metrics::new();
+        metrics.record_compression(&compression_stats(
+            CompressionLevel::None,
+            "provider",
+            0,
+            0,
+            0,
+        ));
+
+        let mut out = String::new();
+        metrics.write_compression_prometheus(&mut out);
+
+        assert!(out.contains(
+            "obey_compression_ratio_bucket{level=\"none\",provider=\"provider\",le=\"0.99\"} 0"
+        ));
+        assert!(out.contains(
+            "obey_compression_ratio_bucket{level=\"none\",provider=\"provider\",le=\"1\"} 1"
+        ));
+        assert!(out.contains("obey_compression_ratio_sum{level=\"none\",provider=\"provider\"} 1"));
+    }
+
+    #[test]
+    fn compression_prometheus_escapes_and_bounds_labels() {
+        let metrics = Metrics::new();
+        let provider = format!("{}\\\"\nrest", "x".repeat(60));
+        metrics.record_compression(&compression_stats(
+            CompressionLevel::Lite,
+            &provider,
+            10,
+            5,
+            1,
+        ));
+
+        let mut out = String::new();
+        metrics.write_compression_prometheus(&mut out);
+
+        assert!(out.contains("level=\"lite\",provider=\""));
+        assert!(out.contains("\\\\\\\" r"));
+        assert!(!out.contains("\nrest"));
+        assert_eq!(escape_prometheus_label("a\\\"\n\r"), "a\\\\\\\"\\n\\r");
+    }
+
+    #[test]
+    fn compression_prometheus_is_empty_before_recording() {
+        let metrics = Metrics::new();
+        let mut out = String::new();
+        metrics.write_compression_prometheus(&mut out);
+        assert!(out.is_empty());
     }
 
     // Property 33: Cost Calculation
