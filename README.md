@@ -1,4 +1,4 @@
-﻿<p align="center">
+<p align="center">
   <img src="Assets/logo.jpg" alt="OBEY API Gateway" width="200" />
 </p>
 
@@ -16,11 +16,11 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/fdanobey/OBEY-api-gateway/releases/latest">Download Latest Release</a></strong> Â· Windows installer and portable zip
+  <strong><a href="https://github.com/fdanobey/OBEY-api-gateway/releases/latest">Download Latest Release</a></strong> · Windows installer and portable zip
 </p>
 
 <p align="center">
-  <a href="https://github.com/fdanobey/OBEY-api-gateway/wiki">ðŸ“– Documentation Wiki</a>
+  <a href="https://github.com/fdanobey/OBEY-api-gateway/wiki">📖 Documentation Wiki</a>
 </p>
 
 <p align="center">
@@ -37,34 +37,34 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 
 ## Key Features
 
-- **Drop-in OpenAI replacement** â€” full `/v1/*` API compatibility (chat, completions, embeddings, images, audio, assistants)
-- **Multi-provider routing** â€” OpenAI, Ollama, AWS Bedrock, Groq, Together AI, NVIDIA NIM, vLLM, LM Studio
-- **Automatic failover** â€” circuit breakers + retry with exponential backoff across providers
-- **Smart rate-limit failover** â€” instantly skips providers that return 429 (or rate-limit-shaped 200 envelopes), honors `Retry-After` / `X-RateLimit-Reset` / Anthropic ISO reset headers, and supports weekly-quota providers like Nano-GPT through per-provider cooldown overrides
-- **Priority & cost-aware routing** â€” configure model groups with priority, cost, and latency-based selection
-- **Context window management** â€” automatic truncation when requests exceed model limits
-- **Streaming reliability** â€” true SSE pass-through for capable providers with early synthetic events (sub-500ms TTFB), configurable keep-alive, graceful in-stream error frames, mid-stream failover, and inter-chunk/total timeouts (see [Streaming Reliability](#streaming-reliability))
-- **Response caching** â€” built-in two-tier cache: in-memory exact-match (default-on, no setup) plus optional semantic Qdrant tier; works for both streaming and non-streaming requests, including tool-using clients
-- **OpenAI OAuth login** â€” browser-based sign-in with your ChatGPT Plus/Pro subscription (PKCE flow, automatic token refresh)
-- **Codex backend translation** â€” transparently routes OAuth-authenticated requests through the ChatGPT Codex backend, translating Chat Completions â†” Responses API on the fly
-- **Guardrail pipelines** â€” configurable pre-call and post-call policy enforcement with PII redaction/re-injection, regex scanning, Presidio NLP, OpenAI Moderation, Lakera, semantic prompt guard, and custom HTTP providers; includes refusal detection with automatic failover (see [Guardrail Pipelines](#guardrail-pipelines))
-- **Agent loop detection** â€” multi-signal confidence scorer detects repetitive agent behavior (tool-call repetition, content similarity, error cycling, response stagnation, token/cost velocity, context growth) and escalates through Warn â†’ Throttle â†’ Inject â†’ Hard-Stop enforcement levels; per-virtual-key overrides, session admin API, and Prometheus histograms (see [Agent Loop Detection](#agent-loop-detection))
-- **Virtual key management** â€” issue per-caller API keys (`vk_â€¦`) with independent USD/token budgets, rate limits, model-access restrictions, and expiry; authenticate callers without sharing real provider keys (see [Virtual Key Management](#virtual-key-management))
-- **Encrypted API key storage** â€” provider keys encrypted at rest with a machine-local master key
-- **Admin panel & dashboard** â€” embedded web UIs for configuration, metrics, and log viewing
-- **Prometheus metrics** â€” `/metrics` endpoint for existing monitoring infrastructure
-- **Request logging** â€” SQLite-based structured logging with configurable retention
-- **TLS support** â€” optional HTTPS with certificate configuration
-- **Windows system tray** â€” double-click desktop app with splash screen and tray menu
-- **Token compression** â€” 14 multi-engine compression strategies (lite, standard, aggressive, ultra, RTK, stacked, tool_def, language_pack, perplexity) with protection rules, caching, observability, and CLI tool for offline pre-compression (see [Token Compression](#token-compression))
-- **Hot config reload** â€” change settings through the admin UI without restarting
-- **Smart timeouts** â€” split TTFB / total timeouts with auto-detection of thinking models (o1, o3, DeepSeek-R1, Claude)
+- **Drop-in OpenAI replacement** — full `/v1/*` API compatibility (chat, completions, embeddings, images, audio, assistants)
+- **Multi-provider routing** — OpenAI, Ollama, AWS Bedrock, Groq, Together AI, NVIDIA NIM, vLLM, LM Studio
+- **Automatic failover** — circuit breakers + retry with exponential backoff across providers
+- **Smart rate-limit failover** — instantly skips providers that return 429 (or rate-limit-shaped 200 envelopes), honors `Retry-After` / `X-RateLimit-Reset` / Anthropic ISO reset headers, and supports weekly-quota providers like Nano-GPT through per-provider cooldown overrides
+- **Priority & cost-aware routing** — configure model groups with priority, cost, and latency-based selection
+- **Context window management** — automatic truncation when requests exceed model limits
+- **Streaming reliability** — true SSE pass-through for capable providers with early synthetic events (sub-500ms TTFB), configurable keep-alive, graceful in-stream error frames, mid-stream failover, and inter-chunk/total timeouts (see [Streaming Reliability](#streaming-reliability))
+- **Response caching** — built-in two-tier cache: in-memory exact-match (default-on, no setup) plus optional semantic Qdrant tier; works for both streaming and non-streaming requests, including tool-using clients
+- **OpenAI OAuth login** — browser-based sign-in with your ChatGPT Plus/Pro subscription (PKCE flow, automatic token refresh)
+- **Codex backend translation** — transparently routes OAuth-authenticated requests through the ChatGPT Codex backend, translating Chat Completions ↔ Responses API on the fly
+- **Guardrail pipelines** — configurable pre-call and post-call policy enforcement with PII redaction/re-injection, regex scanning, Presidio NLP, OpenAI Moderation, Lakera, semantic prompt guard, and custom HTTP providers; includes refusal detection with automatic failover (see [Guardrail Pipelines](#guardrail-pipelines))
+- **Agent loop detection** — multi-signal confidence scorer detects repetitive agent behavior (tool-call repetition, content similarity, error cycling, response stagnation, token/cost velocity, context growth) and escalates through Warn → Throttle → Inject → Hard-Stop enforcement levels; per-virtual-key overrides, session admin API, and Prometheus histograms (see [Agent Loop Detection](#agent-loop-detection))
+- **Virtual key management** — issue per-caller API keys (`vk_…`) with independent USD/token budgets, rate limits, model-access restrictions, and expiry; authenticate callers without sharing real provider keys (see [Virtual Key Management](#virtual-key-management))
+- **Encrypted API key storage** — provider keys encrypted at rest with a machine-local master key
+- **Admin panel & dashboard** — embedded web UIs for configuration, metrics, and log viewing
+- **Prometheus metrics** — `/metrics` endpoint for existing monitoring infrastructure
+- **Request logging** — SQLite-based structured logging with configurable retention
+- **TLS support** — optional HTTPS with certificate configuration
+- **Windows system tray** — double-click desktop app with splash screen and tray menu
+- **Token compression** — 9 multi-engine compression strategies (lite, standard, aggressive, ultra, RTK, stacked, tool_def, language_pack, perplexity) with hierarchical configuration, protection rules, cache-aware downgrades, and Prometheus observability (see [Token Compression](#token-compression))
+- **Hot config reload** — change settings through the admin UI without restarting
+- **Smart timeouts** — split TTFB / total timeouts with auto-detection of thinking models (o1, o3, DeepSeek-R1, Claude)
 
 ## Quick Start
 
 ### Option 1: Download (Windows)
 
-Grab the [latest release](https://github.com/fdanobey/OBEY-api-gateway/releases/latest) â€” either the installer (`.exe`) or portable zip. Double-click to run. The gateway starts on `http://localhost:8080` and opens the dashboard automatically on first launch.
+Grab the [latest release](https://github.com/fdanobey/OBEY-api-gateway/releases/latest) — either the installer (`.exe`) or portable zip. Double-click to run. The gateway starts on `http://localhost:8080` and opens the dashboard automatically on first launch.
 
 ### Option 2: Deploy to Railway
 
@@ -231,10 +231,10 @@ model_groups:
 
 Provider keys can be configured four ways:
 
-1. **Environment variable reference** â€” set `api_key_env: "OPENAI_API_KEY"` and export the env var
-2. **Admin UI** â€” enter keys through the web interface; they're encrypted automatically
-3. **Encrypted in config** â€” stored as `api_key_encrypted: "enc-v1:<nonce>:<ciphertext>"`
-4. **OAuth login** â€” for OpenAI providers, authenticate via browser sign-in (see below)
+1. **Environment variable reference** — set `api_key_env: "OPENAI_API_KEY"` and export the env var
+2. **Admin UI** — enter keys through the web interface; they're encrypted automatically
+3. **Encrypted in config** — stored as `api_key_encrypted: "enc-v1:<nonce>:<ciphertext>"`
+4. **OAuth login** — for OpenAI providers, authenticate via browser sign-in (see below)
 
 The master encryption key is stored outside the config file in your platform's secure directory (e.g. `%APPDATA%\ai-gateway\master.key` on Windows).
 
@@ -300,7 +300,7 @@ Bedrock-specific options:
 | `custom_vpc_endpoint` | `false` | Use `base_url` as-is instead of auto-generating the Mantle endpoint |
 | `reasoning` | `true` | Enable extended thinking for supported models |
 
-> **Claude Fable 5 prerequisite:** Before you can invoke Claude Fable 5 through Bedrock, you must opt into data sharing via the AWS Data Retention API by enabling `provider_data_share` on your account. There is no console UI for this at launch â€” it must be done programmatically (e.g. via the AWS CLI or SDK). This is a one-time, account-level setting; once enabled, the model works through the gateway like any other Bedrock model with no router-side changes needed.
+> **Claude Fable 5 prerequisite:** Before you can invoke Claude Fable 5 through Bedrock, you must opt into data sharing via the AWS Data Retention API by enabling `provider_data_share` on your account. There is no console UI for this at launch — it must be done programmatically (e.g. via the AWS CLI or SDK). This is a one-time, account-level setting; once enabled, the model works through the gateway like any other Bedrock model with no router-side changes needed.
 
 ### Response Caching
 
@@ -308,24 +308,24 @@ The gateway runs a two-tier response cache for chat completions. Both tiers cach
 
 | Tier | Backend | Default | Catches |
 |------|---------|---------|---------|
-| 1 â€” Exact | In-memory `DashMap`, SHA-256 keyed | **Enabled** | Byte-identical retries, agent loops, dedup |
-| 2 â€” Semantic | Qdrant + embedding provider | Disabled | Paraphrased / near-identical prompts |
+| 1 — Exact | In-memory `DashMap`, SHA-256 keyed | **Enabled** | Byte-identical retries, agent loops, dedup |
+| 2 — Semantic | Qdrant + embedding provider | Disabled | Paraphrased / near-identical prompts |
 
-**Eligibility (both tiers):** `temperature â‰¤ temperature_threshold` (default `0.15`) **and** `n == 1`. Higher temperatures imply non-determinism and are skipped to avoid replaying randomized output.
+**Eligibility (both tiers):** `temperature ≤ temperature_threshold` (default `0.15`) **and** `n == 1`. Higher temperatures imply non-determinism and are skipped to avoid replaying randomized output.
 
 **Key fields:** `model`, full `messages`, `tools`, `tool_choice`, `response_format`, `top_p`, `frequency_penalty`, `presence_penalty`, `stop`, `seed`, `n`, `max_tokens`. The `stream` flag and per-request transport metadata (`user`, request-id, trace-id) are intentionally excluded.
 
 **Write-side filter:** responses with `tool_calls`, `finish_reason: length`, or `finish_reason: content_filter` are never stored, regardless of eligibility.
 
 ```yaml
-# Tier 1 â€” exact-match in-memory cache (defaults shown; section optional)
+# Tier 1 — exact-match in-memory cache (defaults shown; section optional)
 exact_cache:
   enabled: true
   max_entries: 5000           # oldest-first eviction above this
   ttl_seconds: 3600
   temperature_threshold: 0.15
 
-# Tier 2 â€” semantic cache (optional, requires Qdrant)
+# Tier 2 — semantic cache (optional, requires Qdrant)
 # semantic_cache:
 #   enabled: true
 #   qdrant_url: "http://localhost:6334"     # gRPC port, not 6333
@@ -343,19 +343,19 @@ The dashboard's **Cache Hit Rate** card stays at `N/A` until the first eligible 
 
 When a client requests `stream: true`, the gateway improves perceived reliability for slow/thinking models and flaky upstreams:
 
-- **Early synthetic event** â€” emits a `role: assistant` SSE chunk within ~500ms so clients don't idle-timeout while the model "thinks" (skipped on cache hits).
-- **Configurable keep-alive** â€” periodic SSE comments keep client connections from timing out during long generations.
-- **True streaming pass-through** â€” for OpenAI-compatible providers, upstream SSE chunks are relayed in real time; providers needing response transformation (Bedrock, XML-tool rewrite, Kimi/Nano-GPT token sanitization) and Codex OAuth providers automatically fall back to buffer-and-replay.
-- **Graceful error frames** â€” TTFB / total / inter-chunk timeouts and mid-stream failures are surfaced as `{"error":{...}}` SSE events followed by `[DONE]`, never a silent disconnect.
-- **Mid-stream failover** â€” if a provider fails *before* any content reaches the client, the gateway transparently retries the next provider (no duplicate role event); after content has been sent it emits an error and closes.
-- **Truncation retry** â€” a `finish_reason: "length"` response that stops well short of the requested `max_tokens` is treated as a truncation and retried on the next provider; if every provider truncates, the longest partial is returned.
+- **Early synthetic event** — emits a `role: assistant` SSE chunk within ~500ms so clients don't idle-timeout while the model "thinks" (skipped on cache hits).
+- **Configurable keep-alive** — periodic SSE comments keep client connections from timing out during long generations.
+- **True streaming pass-through** — for OpenAI-compatible providers, upstream SSE chunks are relayed in real time; providers needing response transformation (Bedrock, XML-tool rewrite, Kimi/Nano-GPT token sanitization) and Codex OAuth providers automatically fall back to buffer-and-replay.
+- **Graceful error frames** — TTFB / total / inter-chunk timeouts and mid-stream failures are surfaced as `{"error":{...}}` SSE events followed by `[DONE]`, never a silent disconnect.
+- **Mid-stream failover** — if a provider fails *before* any content reaches the client, the gateway transparently retries the next provider (no duplicate role event); after content has been sent it emits an error and closes.
+- **Truncation retry** — a `finish_reason: "length"` response that stops well short of the requested `max_tokens` is treated as a truncation and retried on the next provider; if every provider truncates, the longest partial is returned.
 
 All fields are optional with safe defaults, so existing configs keep working unchanged:
 
 ```yaml
 streaming:
   emit_early_event: true            # synthetic role:assistant chunk before upstream responds
-  keepalive_interval_seconds: 5     # 0â€“60; 0 disables (axum default)
+  keepalive_interval_seconds: 5     # 0–60; 0 disables (axum default)
   passthrough_enabled: true         # true SSE relay for capable providers
   chunk_timeout_seconds: 60         # max gap between SSE chunks (min 5)
   retry_on_truncation: true         # failover on suspicious finish_reason=length
@@ -367,9 +367,9 @@ Timeouts are split into two phases for clarity:
 
 | Field | Default (standard) | Default (thinking models) | Description |
 |-------|-------------------|--------------------------|-------------|
-| `ttfb_timeout_seconds` | 30s | 120s | Time-to-first-byte â€” how long to wait for the provider to start responding |
-| `total_timeout_seconds` | 300s | 600s | Total round-trip â€” ceiling for the entire request including body transfer |
-| `timeout_seconds` | 30s | 30s | Legacy field â€” used as `total_timeout_seconds` when split fields are omitted |
+| `ttfb_timeout_seconds` | 30s | 120s | Time-to-first-byte — how long to wait for the provider to start responding |
+| `total_timeout_seconds` | 300s | 600s | Total round-trip — ceiling for the entire request including body transfer |
+| `timeout_seconds` | 30s | 30s | Legacy field — used as `total_timeout_seconds` when split fields are omitted |
 
 Thinking models (o1, o3, DeepSeek-R1, QwQ, Claude 3.5 Sonnet v2+, Claude Opus/4+) are detected automatically and get higher defaults. You can override per-provider:
 
@@ -398,72 +398,94 @@ When a timeout fires, the error response tells the user exactly which timeout wa
 
 ## Token Compression
 
-Token compression is opt-in and defaults to `disabled`. When enabled, the gateway can transparently compress request and response payloads before forwarding to providers, reducing token consumption and costs—especially for applications with large conversation histories or repetitive content.
+Token compression is opt-in and defaults to disabled. When enabled, the gateway can transparently compress request payloads before forwarding to providers, reducing token consumption and costs—especially for applications with large conversation histories or repetitive content.
 
-The system ships with 14 multi-engine compression strategies, each tuned for different content types and use cases:
+The system ships with 9 compression engines, each tuned for different content types and use cases. Named levels (lite, standard, aggressive, ultra, rtk, stacked) resolve to ordered engine chains; tool_def, language_pack, and perplexity are standalone engines that can be composed via custom pipelines:
 
 | Strategy | Use Case | Trade-off |
 |----------|----------|-----------|
-| `lite` | Minimal aggressive compression; best for single-turn requests | Lowest compression ratio; preserves readability |
-| `standard` | Balanced compression; default for multi-turn conversations | Good compression + retention of meaning |
-| `aggressive` | High compression; removes structure and whitespace | Medium compression ratio; may lose formatting context |
-| `ultra` | Maximum compression; removes all non-essential tokens | High compression; risky for complex logic/code |
-| `rtk` | Round-trip-knowledge; preserves semantic meaning for cached responses | High compression with semantic safety |
-| `stacked` | Layered compression; applies multiple strategies sequentially | Highest compression; slowest |
-| `tool_def` | Optimized for tool/function definitions | Compresses JSON schemas and callable signatures |
-| `language_pack` | Language-aware compression; detects dominant language | Respects linguistic boundaries |
-| `perplexity` | Perplexity-model optimized; high compression for long-context requests | Tailored for perplexity models |
-| And 5 others | Domain-specific and experimental strategies | Vary by use case |
+| lite | Minimal compression; best for single-turn requests | Lowest compression ratio; preserves readability |
+| standard | Balanced compression; default for multi-turn conversations | Good compression + retention of meaning |
+| aggressive | High compression; removes structure and whitespace | Medium compression ratio; may lose formatting context |
+| ultra | Maximum compression; removes all non-essential tokens | High compression; risky for complex logic/code |
+| rtk | Round-trip-knowledge; preserves semantic meaning for cached responses | High compression with semantic safety |
+| stacked | Layered compression; applies RTK + standard sequentially | Highest compression; slowest |
+| tool_def | Optimized for tool/function definitions | Compresses JSON schemas and callable signatures |
+| language_pack | Language-aware compression; detects dominant language | Respects linguistic boundaries |
+| perplexity | Perplexity-model optimized; high compression for long-context requests | Tailored for perplexity models |
 
 ### Configuration
 
 ```yaml
 compression:
-  enabled: false                         # Enable compression globally
-  strategy: standard                     # Default compression strategy
-  min_request_tokens: 1000              # Only compress if input >= threshold
-  min_response_tokens: 1000             # Only compress if output >= threshold
-  cache_compressed: true                # Cache compressed payloads for deduplication
-  per_key_overrides: true               # Allow per-virtual-key strategy override
+  enabled: false                         # Enable compression globally (default: false)
+  default_level: lite                    # Default compression level (default: lite)
+  auto_threshold_tokens: 0              # Auto-trigger threshold; 0 = disabled (default: 0)
+  caveman_output: false                  # Collapse output to extreme brevity (default: false)
+  compress_tool_definitions: false       # Compress tool/function definitions (default: false)
+  language: en                           # Language for language_pack engine (default: en)
+  language_packs_dir: ./language_packs   # Directory for language pack files
+  time_budget_ms:                        # Per-level time budgets in milliseconds
+    lite: 500
+    standard: 500
+    aggressive: 2000
+    ultra: 2000
+    rtk: 2000
+    stacked: 2000
+  protection_rules:                      # Content patterns never compressed
+    - code_blocks
+    - urls
+    - file_paths
+    - json_structures
+    - identifiers
+    - math_expressions
+    - tool_definitions
+    - structured_tool_output
+  precompressed_contexts: []            # Pre-compressed file mappings
+  rtk:
+    grouping_strategy: balanced         # aggressive | balanced | conservative
+  perplexity:
+    enabled: false                       # Requires an ONNX perplexity scorer model
+    redundancy_threshold: 0.5
+    compression_ratio_target: 5
+    model_path: ./models/perplexity_scorer.onnx
+  custom_pipelines: {}                  # Named custom engine chains
 ```
 
-### Per-Request Override
+Provider and model-group compression blocks override these defaults field-by-field. Setting level: none on a provider or model group explicitly disables compression for that scope.
 
-Callers can override the compression strategy via the `x-compression-strategy` header:
+### Custom Pipelines
 
-```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "x-compression-strategy: aggressive" \
-  -H "Authorization: Bearer vk_your_key_here" \
-  -d '{...}'
+Administrators can define named custom pipelines that chain any combination of the 9 engines in a specified order:
+
+```yaml
+compression:
+  custom_pipelines:
+    terminal_then_prose:
+      engines: [rtk, standard, lite]
 ```
 
-### CLI Tool (Offline Pre-Compression)
+Callers select a custom pipeline by name via the x-compression-pipeline request header.
 
-A bundled CLI tool allows offline compression testing and pre-compression of large payloads before sending to the gateway:
+### Cache-Aware Downgrade
 
-```bash
-# Compress a message file with the 'aggressive' strategy
-ai-gateway-compress --strategy aggressive --input messages.json --output messages.compressed.json
-
-# Benchmark compression ratios across all strategies
-ai-gateway-compress --benchmark messages.json
-```
-
-For detailed compression implementation, configuration examples, and performance tuning, see [`crates/ai-gateway/src/compression/`](crates/ai-gateway/src/compression/) and the [Token Compression Specification](.kiro/specs/token-compression/).
+When a provider supports prompt caching (e.g., Anthropic Claude) and a request contains cache_control markers, the gateway automatically preserves the cached prefix byte-for-byte. Aggressive, ultra, RTK, and stacked levels are downgraded to none for the protected prefix while still compressing the suffix, ensuring cache hits are not invalidated.
 
 ### Observability
 
+Compression execution is fully observable via Prometheus metrics:
+
 | Metric | Type | Description |
 |--------|------|-------------|
-| `obey_compression_enabled_total` | counter | Requests where compression was attempted |
-| `obey_compression_bytes_saved_total` | counter | Cumulative bytes saved across all compressions |
-| `obey_compression_latency_ms` | histogram | Compression latency per strategy |
-| `obey_compression_ratio` | histogram | Compression ratio (input / output) by strategy |
+| obey_compression_tokens_saved_total | counter | Total tokens saved by compression operations (by level and provider) |
+| obey_compression_ratio | histogram | Compressed token ratio (compressed / original; 1.0 when original is zero) |
+| obey_compression_duration_seconds | histogram | Compression operation duration in seconds |
+
+For detailed compression implementation, configuration examples, and performance tuning, see the compression source directory.
 
 ## Virtual Key Management
 
-Instead of every caller sharing your real provider keys, administrators can issue **virtual keys** (`vk_â€¦`) that authenticate individual callers to the gateway. Each key carries its own budgets, rate limits, model-access rules, and expiry, all enforced at the proxy layer before requests reach upstream providers. This enables multi-tenant usage tracking, cost control, and access governance without exposing provider credentials.
+Instead of every caller sharing your real provider keys, administrators can issue **virtual keys** (`vk_…`) that authenticate individual callers to the gateway. Each key carries its own budgets, rate limits, model-access rules, and expiry, all enforced at the proxy layer before requests reach upstream providers. This enables multi-tenant usage tracking, cost control, and access governance without exposing provider credentials.
 
 Virtual keys are stored encrypted in a dedicated SQLite database (`keys.db`), separate from request logs.
 
@@ -483,18 +505,18 @@ virtual_keys:
 | `optional` | Requests with a `vk_` bearer token are validated and tracked; requests without one pass through |
 | `required` | Every proxied request must present a valid virtual key (else `401`) |
 
-The enforcement pipeline runs in order: **authenticate â†’ model access â†’ budget â†’ rate limit â†’ forward**, then usage (spend + tokens) is recorded from the provider response.
+The enforcement pipeline runs in order: **authenticate → model access → budget → rate limit → forward**, then usage (spend + tokens) is recorded from the provider response.
 
 ### Per-Key Constraints
 
 | Constraint | Description |
 |------------|-------------|
-| `budget_limit_usd` | Cumulative USD spend cap (`0.01`â€“`999,999,999.99`) â†’ `429` when reached |
-| `token_budget` | Cumulative token cap (input + output) â†’ `429` when reached |
+| `budget_limit_usd` | Cumulative USD spend cap (`0.01`–`999,999,999.99`) → `429` when reached |
+| `token_budget` | Cumulative token cap (input + output) → `429` when reached |
 | `budget_window` | `daily` / `weekly` / `monthly` reset window (omit for a lifetime limit) |
-| `requests_per_minute` | Per-key RPM token-bucket â†’ `429` + `Retry-After` |
-| `tokens_per_minute` | Per-key TPM rolling 60s window â†’ `429` + `Retry-After` |
-| `model_access` | Whitelist of model group names (omit to allow all) â†’ `403` on denial |
+| `requests_per_minute` | Per-key RPM token-bucket → `429` + `Retry-After` |
+| `tokens_per_minute` | Per-key TPM rolling 60s window → `429` + `Retry-After` |
+| `model_access` | Whitelist of model group names (omit to allow all) → `403` on denial |
 | `expires_in` | `never`, `1_year`, `6_months`, `3_months`, `1_month`, `2_weeks`, `1_week`, `3_days`, `1_day` |
 
 ### Admin API
@@ -550,11 +572,11 @@ Guardrails are opt-in per virtual key, model group, or route and execute through
 
 | Action | Pre-Call | Post-Call | Behavior |
 |--------|:--------:|:---------:|----------|
-| `allow` | âœ“ | âœ“ | Pass through unmodified |
-| `block` | âœ“ | âœ“ | Reject with HTTP 403 (pre-call stops forwarding; post-call discards response) |
-| `mask` | âœ“ | | Replace each character with `*`, preserving byte length |
-| `redact` | âœ“ | âœ“ | Replace with placeholder tokens (pre-call) or `[REDACTED]` (post-call) |
-| `replace_with_policy_message` | | âœ“ | Replace assistant content with a configured message |
+| `allow` | ✓ | ✓ | Pass through unmodified |
+| `block` | ✓ | ✓ | Reject with HTTP 403 (pre-call stops forwarding; post-call discards response) |
+| `mask` | ✓ | | Replace each character with `*`, preserving byte length |
+| `redact` | ✓ | ✓ | Replace with placeholder tokens (pre-call) or `[REDACTED]` (post-call) |
+| `replace_with_policy_message` | | ✓ | Replace assistant content with a configured message |
 
 ### PII Redaction & Re-Injection
 
@@ -569,10 +591,10 @@ When a pre-call stage uses the `redact` action, detected PII values are replaced
 
 The gateway can detect model refusals (via phrase matching or tool-call omission) and optionally fail over to the next provider in the fallback ordering:
 
-- **Phrase matching** â€” case-insensitive regex patterns against assistant-role content (ships with a default list, overridable per-pipeline)
-- **Tool-omission signal** â€” fires when tools were provided but the model didn't call any
-- **Bounded failover** â€” re-dispatches the already-redacted request to the next eligible target (skipping open circuit breakers), attempting each at most once
-- **Toggle** â€” `failover_on_refusal` per-pipeline or per-binding, disabled by default
+- **Phrase matching** — case-insensitive regex patterns against assistant-role content (ships with a default list, overridable per-pipeline)
+- **Tool-omission signal** — fires when tools were provided but the model didn't call any
+- **Bounded failover** — re-dispatches the already-redacted request to the next eligible target (skipping open circuit breakers), attempting each at most once
+- **Toggle** — `failover_on_refusal` per-pipeline or per-binding, disabled by default
 
 ### Pipeline Ordering
 
@@ -639,15 +661,15 @@ guardrails:
 
 Each provider must declare a `failure_policy`:
 
-- **`fail_open`** â€” on timeout or error, skip the stage and continue the pipeline
-- **`fail_close`** â€” on timeout or error, halt the pipeline and return HTTP 503
+- **`fail_open`** — on timeout or error, skip the stage and continue the pipeline
+- **`fail_close`** — on timeout or error, halt the pipeline and return HTTP 503
 
 ### Observability
 
 Guardrail execution is fully observable:
 
 - Counter: `obey_api_guardrail_stage_executions_total{pipeline, stage, provider, action}`
-- Histogram: `obey_api_guardrail_stage_latency_ms{pipeline, stage, provider}` (buckets: 5â€“5000ms)
+- Histogram: `obey_api_guardrail_stage_latency_ms{pipeline, stage, provider}` (buckets: 5–5000ms)
 - Counter: `obey_api_guardrail_refusal_detected_total{pipeline, signal}`
 - Counter: `obey_api_guardrail_refusal_failover_total{pipeline, outcome}`
 - INFO logs for non-pass actions (never includes triggering content)
@@ -656,7 +678,7 @@ Guardrail execution is fully observable:
 
 ## Agent Loop Detection
 
-AI coding agents and automation pipelines can get stuck in repetitive loops â€” retrying the same tool call, cycling through identical errors, or regenerating near-identical content without progress. The loop detection system monitors request patterns per-session and applies graduated enforcement to break these loops before they burn tokens and cost.
+AI coding agents and automation pipelines can get stuck in repetitive loops — retrying the same tool call, cycling through identical errors, or regenerating near-identical content without progress. The loop detection system monitors request patterns per-session and applies graduated enforcement to break these loops before they burn tokens and cost.
 
 Loop detection is **opt-in** (disabled by default) and operates as Tower middleware on `/v1/chat/completions`.
 
@@ -682,11 +704,11 @@ Weights must sum to 1.0 and are fully configurable.
 
 | Level | Confidence | Consecutive | Behavior |
 |-------|-----------|-------------|----------|
-| **None** | â€” | â€” | Normal operation |
-| **Warn** | â‰¥ 0.30 | 3 | `x-loop-warning` response header with confidence and dominant signal |
-| **Throttle** | â‰¥ 0.50 | 5 | Artificial delay (default 2s) before forwarding |
-| **Inject** | â‰¥ 0.70 | 7 | System prompt instruction appended telling the model to change strategy |
-| **Hard-Stop** | â‰¥ 0.90 | 10 | Request rejected with HTTP 429 and `Retry-After: 60` |
+| **None** | — | — | Normal operation |
+| **Warn** | ≥ 0.30 | 3 | `x-loop-warning` response header with confidence and dominant signal |
+| **Throttle** | ≥ 0.50 | 5 | Artificial delay (default 2s) before forwarding |
+| **Inject** | ≥ 0.70 | 7 | System prompt instruction appended telling the model to change strategy |
+| **Hard-Stop** | ≥ 0.90 | 10 | Request rejected with HTTP 429 and `Retry-After: 60` |
 
 Enforcement de-escalates automatically after 5 consecutive low-confidence requests.
 
@@ -696,7 +718,7 @@ When the `inject` level is reached, the gateway appends a break instruction to t
 
 | Strategy | Behavior |
 |----------|----------|
-| `system_prompt_append` (default) | Appends a generic "loop detected â€” change approach" instruction |
+| `system_prompt_append` (default) | Appends a generic "loop detected — change approach" instruction |
 | `context_aware` | Tailors the instruction based on the dominant signal (e.g., names the repeated tool, or tells the model to stop retrying a failing operation) |
 
 A custom `break_instruction_template` (up to 2000 chars) can be configured globally or per virtual key.
@@ -770,7 +792,7 @@ Virtual keys can carry their own loop detection settings that merge with (and ov
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `obey_loop_confidence_score` | histogram | Per-virtual-key confidence distribution (buckets: 0.1â€“1.0) |
+| `obey_loop_confidence_score` | histogram | Per-virtual-key confidence distribution (buckets: 0.1–1.0) |
 | `obey_loop_enforcement_total` | counter | Enforcement transitions by level and virtual key |
 | `obey_loop_sessions_active` | gauge | Current active session count |
 | `obey_loop_sessions_evicted_total` | counter | Total sessions evicted by LRU |
@@ -833,7 +855,7 @@ All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` re
 
 1. Your app requests model `"gpt-4-group"`
 2. The gateway finds the matching model group
-3. Providers are sorted by priority â†’ cost â†’ latency
+3. Providers are sorted by priority → cost → latency
 4. Providers with open circuit breakers or exhausted rate limits are skipped
 5. The request goes to the highest-priority available provider
 6. On failure, the gateway retries with the next provider in the list
@@ -841,13 +863,13 @@ All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` re
 
 ### Circuit Breaker
 
-Each provider has an independent circuit breaker. After `failure_threshold` consecutive failures, the circuit opens and the provider is temporarily removed from rotation. Backoff follows a configurable sequence (e.g. 5s â†’ 10s â†’ 20s â†’ 40s â†’ 300s). Circuit breakers reset on config hot-reload.
+Each provider has an independent circuit breaker. After `failure_threshold` consecutive failures, the circuit opens and the provider is temporarily removed from rotation. Backoff follows a configurable sequence (e.g. 5s → 10s → 20s → 40s → 300s). Circuit breakers reset on config hot-reload.
 
 ### Rate Limit Handling
 
 When a provider returns a 429 (or a rate-limit-shaped HTTP 200 envelope from providers like Nano-GPT and OpenRouter), the gateway:
 
-1. Fails over to the next provider immediately â€” no retry against the rate-limited one
+1. Fails over to the next provider immediately — no retry against the rate-limited one
 2. Parses the upstream's reset signal and applies a per-provider cooldown
 3. Skips the cooled-down provider in `select_provider_order` until the window expires
 
@@ -861,7 +883,7 @@ Signals consulted, in order of preference:
 | `anthropic-ratelimit-*-reset` | RFC 3339 ISO timestamps |
 | `error.retry_after` / `retry_after_ms` body fields | numeric seconds / ms |
 | `error.reset_at` / `reset` body fields | epoch seconds or RFC 3339 |
-| Period markers in error message | "weekly limit" â†’ 7d, "daily limit" â†’ 24h, "hourly limit" â†’ 1h |
+| Period markers in error message | "weekly limit" → 7d, "daily limit" → 24h, "hourly limit" → 1h |
 
 The chosen cooldown is bounded by, in order: per-provider `max_rate_limit_cooldown_seconds`, the global `retry.max_rate_limit_cooldown_seconds` cap, and a hard 7-day safety backstop in the limiter.
 
@@ -889,8 +911,8 @@ Per-provider rate limiting is also enforced internally via a token bucket (`rate
 
 When a provider returns a context-length error, the gateway can automatically truncate the conversation and retry:
 
-- **`remove_oldest`** â€” removes oldest messages, preserving system messages
-- **`sliding_window`** â€” keeps only the N most recent messages
+- **`remove_oldest`** — removes oldest messages, preserving system messages
+- **`sliding_window`** — keeps only the N most recent messages
 
 ```yaml
 context:
@@ -902,10 +924,10 @@ context:
 
 ## Admin Panel & Dashboard
 
-Both are embedded SPAs compiled into the binary â€” no external dependencies.
+Both are embedded SPAs compiled into the binary — no external dependencies.
 
-- **Admin** (`/admin`) â€” provider configuration, API key management, circuit breaker status, config hot-reload
-- **Dashboard** (`/dashboard`) â€” real-time metrics via WebSocket, provider health, error logs, request log viewer
+- **Admin** (`/admin`) — provider configuration, API key management, circuit breaker status, config hot-reload
+- **Dashboard** (`/dashboard`) — real-time metrics via WebSocket, provider health, error logs, request log viewer
 
 ```yaml
 admin:
@@ -935,39 +957,40 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 
 ```
 .
-â”œâ”€â”€ Cargo.toml                        # Workspace manifest
-â”œâ”€â”€ crates/
-â”‚   â””â”€â”€ ai-gateway/
-â”‚       â”œâ”€â”€ Cargo.toml                # Crate manifest & dependencies
-â”‚       â”œâ”€â”€ build.rs                  # Windows resource embedding
-â”‚       â”œâ”€â”€ config.example.yaml       # Reference configuration
-â”‚       â””â”€â”€ src/
-â”‚           â”œâ”€â”€ main.rs               # Entry point, CLI, tray bootstrap
-â”‚           â”œâ”€â”€ lib.rs                # Public module exports
-â”‚           â”œâ”€â”€ config/               # Config structs & validation
-â”‚           â”œâ”€â”€ gateway/              # HTTP server, middleware, route handlers
-â”‚           â”œâ”€â”€ router/               # Provider selection, circuit breaker, rate limiter
-â”‚           â”œâ”€â”€ providers/            # Provider implementations (8 providers)
-â”‚           â”œâ”€â”€ context/              # Context window management & truncation
-â”‚           â”œâ”€â”€ guardrail/            # Guardrail pipelines: PII redaction/re-injection, regex, Presidio, semantic, refusal detection & failover
-â”‚           â”œâ”€â”€ loop_detection/      # Agent loop detection: multi-signal scoring, graduated enforcement, session management, admin API
-â”‚           â”œâ”€â”€ cache/                # Response caching: in-memory exact-match (tier 1) + optional Qdrant semantic (tier 2)
-â”‚           â”œâ”€â”€ admin/                # Admin panel routes & embedded UI
-â”‚           â”œâ”€â”€ dashboard/            # Dashboard routes & WebSocket metrics
-â”‚           â”œâ”€â”€ logger/               # SQLite request logging
-â”‚           â”œâ”€â”€ metrics/              # Prometheus metrics
-â”‚           â”œâ”€â”€ oauth/                # OpenAI OAuth 2.0 login (PKCE flow)
-â”‚           â”œâ”€â”€ virtual_keys/         # Virtual key management (auth, budgets, rate limits, usage, admin API)
-â”‚           â”œâ”€â”€ secrets.rs            # API key encryption/decryption
-â”‚           â”œâ”€â”€ error/                # Error types & HTTP status mapping
-â”‚           â”œâ”€â”€ models/               # OpenAI-compatible data models
-â”‚           â””â”€â”€ tray/                 # Windows system tray (feature-gated)
-â”œâ”€â”€ scripts/
-â”‚   â”œâ”€â”€ build-release.ps1             # Release packaging script
-â”‚   â”œâ”€â”€ build-installer.ps1           # Inno Setup installer build
-â”‚   â””â”€â”€ installer.iss                 # Inno Setup configuration
-â”œâ”€â”€ Assets/                           # Icons and logos
-â””â”€â”€ .github/workflows/release.yml     # CI/CD: build + GitHub Release on tag
+├── Cargo.toml                        # Workspace manifest
+├── crates/
+│   └── ai-gateway/
+│       ├── Cargo.toml                # Crate manifest & dependencies
+│       ├── build.rs                  # Windows resource embedding
+│       ├── config.example.yaml       # Reference configuration
+│       └── src/
+│           ├── main.rs               # Entry point, CLI, tray bootstrap
+│           ├── lib.rs                # Public module exports
+│           ├── config/               # Config structs & validation
+│           ├── gateway/              # HTTP server, middleware, route handlers
+│           ├── router/               # Provider selection, circuit breaker, rate limiter
+│           ├── providers/            # Provider implementations (8 providers)
+│           ├── context/              # Context window management & truncation
+│           ├── guardrail/            # Guardrail pipelines: PII redaction/re-injection, regex, Presidio, semantic, refusal detection & failover
+│           ├── loop_detection/      # Agent loop detection: multi-signal scoring, graduated enforcement, session management, admin API
+│           ├── cache/                # Response caching: in-memory exact-match (tier 1) + optional Qdrant semantic (tier 2)
+│           ├── admin/                # Admin panel routes & embedded UI
+│           ├── dashboard/            # Dashboard routes & WebSocket metrics
+│           ├── logger/               # SQLite request logging
+│           ├── metrics/              # Prometheus metrics
+│           ├── oauth/                # OpenAI OAuth 2.0 login (PKCE flow)
+│           ├── codex/               # Codex backend: Chat Completions → Responses API translation, model discovery, instructions store
+│           ├── virtual_keys/         # Virtual key management (auth, budgets, rate limits, usage, admin API)
+│           ├── secrets.rs            # API key encryption/decryption
+│           ├── error/                # Error types & HTTP status mapping
+│           ├── models/               # OpenAI-compatible data models
+│           └── tray/                 # Windows system tray (feature-gated)
+├── scripts/
+│   ├── build-release.ps1             # Release packaging script
+│   ├── build-installer.ps1           # Inno Setup installer build
+│   └── installer.iss                 # Inno Setup configuration
+├── Assets/                           # Icons and logos
+└── .github/workflows/release.yml     # CI/CD: build + GitHub Release on tag
 ```
 
 ## Technologies
@@ -1025,7 +1048,7 @@ Tests use `tower::ServiceExt::oneshot()` for integration testing (no port bindin
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Make your changes â€” match the existing code style and patterns
+3. Make your changes — match the existing code style and patterns
 4. Run `cargo test -p ai-gateway` and ensure all tests pass
 5. Run `cargo clippy -p ai-gateway` for lint checks
 6. Submit a pull request
@@ -1034,7 +1057,7 @@ Tests use `tower::ServiceExt::oneshot()` for integration testing (no port bindin
 
 - Keep patches focused and minimal
 - Pin dependency versions; justify new dependencies
-- Use environment variables for secrets â€” never hardcode API keys
+- Use environment variables for secrets — never hardcode API keys
 - Add tests for new routing logic or provider implementations
 - Property-based tests (`proptest`) are preferred for input validation
 
@@ -1054,7 +1077,7 @@ This project is licensed under the [MIT License](LICENSE).
 | Provider hammered with 429s every few minutes | Weekly-quota provider (Nano-GPT etc.) capped at the 24h global default | Set `max_rate_limit_cooldown_seconds: 604800` on that provider so its cooldown can extend to a full week when the upstream signals "weekly limit reached" |
 | Context-length errors loop | Truncation disabled or max retries hit | Enable `context.enabled: true` and increase `max_truncation_retries` |
 | Dashboard shows no data | WebSocket blocked by proxy | Ensure your reverse proxy passes `Upgrade: websocket` headers |
-| Cache Hit Rate stuck on `N/A` | Zero eligible requests observed yet | `N/A` means the cache has never been consulted. Send two identical requests with `temperature â‰¤ 0.15` and `n: 1`. Tool-using requests are eligible too. |
+| Cache Hit Rate stuck on `N/A` | Zero eligible requests observed yet | `N/A` means the cache has never been consulted. Send two identical requests with `temperature ≤ 0.15` and `n: 1`. Tool-using requests are eligible too. |
 | Agent gets 429 with `loop_detected` | Loop detection hard-stop triggered | The agent is stuck in a repetitive loop. Reset the session via `POST /admin/loop-detection/sessions/{id}/reset`, or adjust thresholds/consecutive counts. Check the `dominant_signal` field for the root cause. |
-| `x-loop-warning` header appearing | Loop confidence is elevated | Not blocking yet â€” the agent is showing repetitive patterns. Monitor the dominant signal. If false-positive, raise thresholds or lower the relevant signal weight. |
-| Timeout on large prompts | `total_timeout_seconds` too low for model | Increase the provider's `total_timeout_seconds`. For thinking models (o1, o3, DeepSeek-R1), also check `ttfb_timeout_seconds` â€” these models need longer to start responding |
+| `x-loop-warning` header appearing | Loop confidence is elevated | Not blocking yet — the agent is showing repetitive patterns. Monitor the dominant signal. If false-positive, raise thresholds or lower the relevant signal weight. |
+| Timeout on large prompts | `total_timeout_seconds` too low for model | Increase the provider's `total_timeout_seconds`. For thinking models (o1, o3, DeepSeek-R1), also check `ttfb_timeout_seconds` — these models need longer to start responding |

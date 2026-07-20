@@ -164,11 +164,12 @@ context:
 | `ADMIN_PASSWORD` | Admin panel password (when `admin.auth.enabled: true`) |
 | `RUST_LOG` | Tracing filter (e.g. `info`, `debug`, `ai_gateway=trace`) |
 
-Provider keys can now be configured in three ways:
+Provider keys can now be configured in four ways:
 
-- environment variable reference in [`api_key_env`](crates/ai-gateway/config.example.yaml)
-- plaintext key entered through the admin UI or YAML as migration/setup input
-- persisted encrypted value in `api_key_encrypted`
+- environment variable reference in `api_key_env` (the value is the env var name, not the key itself)
+- plaintext key entered through the admin UI or YAML as migration/setup input (encrypted on save)
+- persisted encrypted value in `api_key_encrypted` (format: enc-v1:<nonce>:<ciphertext>)
+- OAuth login for OpenAI providers (browser-based PKCE flow; see root README for details)
 
 ### Bedrock authentication modes
 
