@@ -38,6 +38,7 @@ tmp-*/
 *~
 
 # Agent / workflow metadata
+.kilo/
 .kilocode/
 .roo/
 .spec-workflow/
