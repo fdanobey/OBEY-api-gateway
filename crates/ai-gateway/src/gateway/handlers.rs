@@ -182,7 +182,7 @@ fn log_request(state: &super::AppState, request: &OpenAIRequest, context: &Reque
         status_code: context.status_code,
         duration_ms: context.duration_ms,
         cost: context.cost,
-        request_body: None,
+        request_body: serde_json::to_string(request).ok(),
         response_body: context.error_message.clone(),
         requested_model: Some(request.model.clone()),
         responded_model: context.responded_model.clone(),

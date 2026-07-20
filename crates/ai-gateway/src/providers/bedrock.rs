@@ -41,6 +41,35 @@ fn mantle_api_for_model(model_id: &str) -> MantleApi {
     }
 }
 
+pub(crate) fn normalize_mantle_chat_messages(request: &mut OpenAIRequest) -> usize {
+    let mut normalized = 0;
+    for message in &mut request.messages {
+        if message.role == "developer" {
+            message.role = "system".to_string();
+            normalized += 1;
+        }
+
+        if let serde_json::Value::Array(parts) = &mut message.content {
+            for part in parts {
+                let Some(object) = part.as_object_mut() else {
+                    continue;
+                };
+                match object.get("type").and_then(serde_json::Value::as_str) {
+                    Some("input_text" | "output_text") => {
+                        object.insert("type".to_string(), serde_json::json!("text"));
+                        normalized += 1;
+                    }
+                    _ => {}
+                }
+                if object.remove("cache_control").is_some() {
+                    normalized += 1;
+                }
+            }
+        }
+    }
+    normalized
+}
+
 pub(crate) fn sanitize_mantle_chat_request(request: &mut OpenAIRequest) -> usize {
     const MANTLE_CHAT_ALLOWED: &[&str] = &[
         "tools",
@@ -1371,7 +1400,16 @@ impl BedrockProvider {
     ) -> Result<ProviderResponse, GatewayError> {
         let start = Instant::now();
         let url = format!("{}/chat/completions", base_url);
+        let normalized = normalize_mantle_chat_messages(&mut request);
         let stripped = sanitize_mantle_chat_request(&mut request);
+        if normalized > 0 {
+            tracing::debug!(
+                provider = %self.name,
+                model = %request.model,
+                fields_normalized = normalized,
+                "Normalized Bedrock Mantle Chat Completions messages"
+            );
+        }
         if stripped > 0 {
             tracing::debug!(
                 provider = %self.name,
@@ -2728,6 +2766,35 @@ mod tests {
         // Legacy models are excluded.
         assert!(!ids.contains(&"amazon.nova-premier-v1:0".to_string()));
         assert!(!ids.contains(&"meta.llama3-1-405b-instruct-v1:0".to_string()));
+    }
+
+    #[test]
+    fn test_mantle_message_normalizer_converts_responses_content_parts() {
+        let mut request = create_test_chat_request(false);
+        request.messages = vec![
+            Message {
+                role: "developer".to_string(),
+                content: serde_json::json!([{
+                    "type": "input_text",
+                    "text": "instructions",
+                    "cache_control": {"type": "ephemeral"}
+                }]),
+                extra: Default::default(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([{"type": "output_text", "text": "previous"}]),
+                extra: Default::default(),
+            },
+        ];
+
+        assert_eq!(normalize_mantle_chat_messages(&mut request), 4);
+        assert_eq!(request.messages[0].role, "system");
+        assert_eq!(request.messages[0].content[0]["type"], "text");
+        assert!(request.messages[0].content[0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(request.messages[1].content[0]["type"], "text");
     }
 
     #[test]

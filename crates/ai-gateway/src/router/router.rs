@@ -13,7 +13,7 @@ use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
 use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
 use crate::providers::bedrock::{
     apply_global_inference_prefix, apply_global_inference_profile, model_supports_reasoning,
-    sanitize_mantle_chat_request, BedrockProvider,
+    normalize_mantle_chat_messages, sanitize_mantle_chat_request, BedrockProvider,
 };
 use dashmap::DashMap;
 use std::collections::HashSet;
@@ -1051,9 +1051,14 @@ impl Router {
     ) -> String {
         // Try to extract the provider's own error message, if any. Most
         // OpenAI-compatible envelopes look like {"error":{"message": "..."}}.
-        let provider_msg: Option<String> =
-            serde_json::from_str::<serde_json::Value>(body_or_message)
+        let parse_provider_message = |text: &str| {
+            serde_json::from_str::<serde_json::Value>(text)
                 .ok()
+                .or_else(|| {
+                    text.find('{').and_then(|start| {
+                        serde_json::from_str::<serde_json::Value>(&text[start..]).ok()
+                    })
+                })
                 .and_then(|v| {
                     v.get("error")
                         .and_then(|e| e.get("message"))
@@ -1064,7 +1069,9 @@ impl Router {
                                 .and_then(|m| m.as_str())
                                 .map(|s| s.to_string())
                         })
-                });
+                })
+        };
+        let provider_msg: Option<String> = parse_provider_message(body_or_message);
 
         let snippet = provider_msg
             .as_deref()
@@ -1744,6 +1751,17 @@ impl Router {
         }
 
         // Strip fields the target provider doesn't support to avoid 400/502 errors.
+        if provider_type == "bedrock" {
+            let normalized = normalize_mantle_chat_messages(&mut outgoing);
+            if normalized > 0 {
+                info!(
+                    provider = provider_name,
+                    model = %provider_model.model,
+                    fields_normalized = normalized,
+                    "Normalized request messages for Bedrock Mantle compatibility"
+                );
+            }
+        }
         let stripped = Self::sanitize_request_for_provider(&mut outgoing, &provider_type);
         if stripped > 0 {
             info!(
@@ -4941,6 +4959,15 @@ mod tests {
     };
     use crate::config::{CircuitBreakerConfig, ExactCacheConfig, ModelGroup, ProviderModel};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn friendly_failure_reason_extracts_json_from_provider_prefix() {
+        let message = r#"HTTP 400: {"error":{"message":"Invalid content part"}}"#;
+        assert_eq!(
+            Router::friendly_failure_reason(Some(400), message),
+            "Provider rejected the request: Invalid content part"
+        );
+    }
 
     #[test]
     fn bedrock_sanitizer_keeps_reasoning_effort_and_drops_unknown_fields() {
