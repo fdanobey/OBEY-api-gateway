@@ -13,7 +13,7 @@ use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
 use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
 use crate::providers::bedrock::{
     apply_global_inference_prefix, apply_global_inference_profile, model_supports_reasoning,
-    BedrockProvider,
+    sanitize_mantle_chat_request, BedrockProvider,
 };
 use dashmap::DashMap;
 use std::collections::HashSet;
@@ -4288,6 +4288,7 @@ impl Router {
                     .retain(|k, _| NIM_ALLOWED.contains(&k.as_str()));
                 before - outgoing.extra.len()
             }
+            "bedrock" => sanitize_mantle_chat_request(outgoing),
             // Other provider types pass through unmodified
             _ => 0,
         }

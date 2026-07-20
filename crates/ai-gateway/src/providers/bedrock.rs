@@ -27,7 +27,7 @@ pub(crate) enum MantleApi {
     Messages,
 }
 
-pub(crate) fn mantle_api_for_model(model_id: &str) -> MantleApi {
+fn mantle_api_for_model(model_id: &str) -> MantleApi {
     let id = model_id.to_ascii_lowercase();
     if id.starts_with("openai.gpt-5.6")
         || id.starts_with("openai.gpt-5.5")
@@ -39,6 +39,31 @@ pub(crate) fn mantle_api_for_model(model_id: &str) -> MantleApi {
     } else {
         MantleApi::Chat
     }
+}
+
+pub(crate) fn sanitize_mantle_chat_request(request: &mut OpenAIRequest) -> usize {
+    const MANTLE_CHAT_ALLOWED: &[&str] = &[
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "stop",
+        "seed",
+        "response_format",
+        "reasoning_effort",
+        "logprobs",
+        "top_logprobs",
+        "service_tier",
+        "user",
+    ];
+
+    let before = request.extra.len();
+    request
+        .extra
+        .retain(|key, _| MANTLE_CHAT_ALLOWED.contains(&key.as_str()));
+    before - request.extra.len()
 }
 
 /// Default pool idle timeout in seconds
@@ -1338,7 +1363,7 @@ impl BedrockProvider {
     /// Sends request to the Bedrock Mantle endpoint which is OpenAI-compatible.
     async fn chat_completion_api_key(
         &self,
-        request: OpenAIRequest,
+        mut request: OpenAIRequest,
         http_client: &Client,
         api_key: &str,
         base_url: &str,
@@ -1346,6 +1371,15 @@ impl BedrockProvider {
     ) -> Result<ProviderResponse, GatewayError> {
         let start = Instant::now();
         let url = format!("{}/chat/completions", base_url);
+        let stripped = sanitize_mantle_chat_request(&mut request);
+        if stripped > 0 {
+            tracing::debug!(
+                provider = %self.name,
+                model = %request.model,
+                fields_removed = stripped,
+                "Sanitized Bedrock Mantle Chat Completions request"
+            );
+        }
 
         // Build request with Bearer token and custom headers
         let mut req_builder = http_client
@@ -1419,8 +1453,15 @@ impl BedrockProvider {
         let start = Instant::now();
         let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
         let url = format!("{}/openai/v1/responses", root);
-        let input = request
-            .messages
+        let OpenAIRequest {
+            model,
+            messages,
+            temperature,
+            max_tokens,
+            extra,
+            ..
+        } = request;
+        let input = messages
             .iter()
             .map(|message| {
                 serde_json::json!({
@@ -1430,13 +1471,27 @@ impl BedrockProvider {
             })
             .collect::<Vec<_>>();
         let mut body = serde_json::json!({
-            "model": request.model,
+            "model": model.clone(),
             "input": input,
-            "max_output_tokens": request.max_tokens.unwrap_or(2048),
+            "max_output_tokens": max_tokens.unwrap_or(2048),
             "stream": false
         });
-        if let Some(temperature) = request.temperature {
+        if let Some(temperature) = temperature {
             body["temperature"] = serde_json::json!(temperature);
+        }
+        for key in [
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "reasoning",
+            "metadata",
+            "service_tier",
+            "store",
+            "truncation",
+        ] {
+            if let Some(value) = extra.get(key) {
+                body[key] = value.clone();
+            }
         }
         let value = self
             .post_mantle_json(http_client, api_key, &url, custom_headers, &body)
@@ -1463,7 +1518,7 @@ impl BedrockProvider {
         let usage = value.get("usage");
         Ok(ProviderResponse {
             response: self.openai_response_from_text(
-                &request.model,
+                &model,
                 content,
                 usage
                     .and_then(|value| value.get("input_tokens"))
@@ -2673,6 +2728,33 @@ mod tests {
         // Legacy models are excluded.
         assert!(!ids.contains(&"amazon.nova-premier-v1:0".to_string()));
         assert!(!ids.contains(&"meta.llama3-1-405b-instruct-v1:0".to_string()));
+    }
+
+    #[test]
+    fn test_mantle_chat_sanitizer_removes_gateway_only_fields() {
+        let mut request = create_test_chat_request(false);
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), serde_json::json!("high"));
+        request
+            .extra
+            .insert("store".to_string(), serde_json::json!(false));
+        request
+            .extra
+            .insert("parallel_tool_calls".to_string(), serde_json::json!(true));
+        request.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}]),
+        );
+
+        assert_eq!(sanitize_mantle_chat_request(&mut request), 1);
+        assert_eq!(
+            request.extra.get("reasoning_effort"),
+            Some(&serde_json::json!("high"))
+        );
+        assert!(!request.extra.contains_key("store"));
+        assert!(request.extra.contains_key("parallel_tool_calls"));
+        assert!(request.extra.contains_key("tools"));
     }
 
     #[test]
