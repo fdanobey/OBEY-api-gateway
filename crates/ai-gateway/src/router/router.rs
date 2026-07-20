@@ -2693,7 +2693,14 @@ impl Router {
                 .attempt_with_retry(&provider_model.provider, &prepared_request, &provider_model)
                 .await
             {
-                Ok(response) => {
+                Ok(mut response) => {
+                    if Self::promote_reasoning_to_content(&mut response) {
+                        warn!(
+                            provider = %provider_model.provider,
+                            model = %provider_model.model,
+                            "Provider returned reasoning without answer content; promoted reasoning to content"
+                        );
+                    }
                     // Validate that the response actually contains usable content.
                     // Some overwhelmed providers return 200 with empty choices or
                     // null content and no tool_calls — treat these as failures so
@@ -2961,6 +2968,28 @@ impl Router {
         Err(GatewayError::AllProvidersFailed(AggregatedError::new(
             attempts,
         )))
+    }
+
+    fn promote_reasoning_to_content(response: &mut OpenAIResponse) -> bool {
+        let Some(choice) = response.choices.first_mut() else {
+            return false;
+        };
+        if !Self::content_is_empty(&choice.message.content) {
+            return false;
+        }
+        for key in ["reasoning", "reasoning_content"] {
+            if let Some(text) = choice
+                .message
+                .extra
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                choice.message.content = serde_json::Value::String(text.to_string());
+                return true;
+            }
+        }
+        false
     }
 
     /// Check whether a provider response contains usable assistant content.
@@ -4960,6 +4989,38 @@ mod tests {
     };
     use crate::config::{CircuitBreakerConfig, ExactCacheConfig, ModelGroup, ProviderModel};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn reasoning_only_response_is_promoted_to_content() {
+        let mut response = OpenAIResponse {
+            id: "test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1,
+            model: "zai.glm-5".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String(String::new()),
+                    extra: serde_json::Map::from_iter([(
+                        "reasoning".to_string(),
+                        serde_json::json!("reasoning fallback"),
+                    )]),
+                },
+                finish_reason: Some("length".to_string()),
+                extra: Default::default(),
+            }],
+            usage: Usage::default(),
+            extra: Default::default(),
+        };
+
+        assert!(Router::promote_reasoning_to_content(&mut response));
+        assert_eq!(
+            response.choices[0].message.content_as_text(),
+            "reasoning fallback"
+        );
+        assert!(Router::response_has_content(&response));
+    }
 
     #[test]
     fn friendly_failure_reason_extracts_json_from_provider_prefix() {
