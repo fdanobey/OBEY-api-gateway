@@ -166,6 +166,9 @@ pub struct ProviderSettings {
     /// Presidio provider: entity types to detect (at least one required).
     #[serde(default)]
     pub entities: Vec<String>,
+    /// Presidio provider: analyzer language code. Defaults to `en`.
+    #[serde(default)]
+    pub language: Option<String>,
     /// Presidio provider: minimum confidence score threshold (0.0–1.0).
     #[serde(default)]
     pub confidence_threshold: Option<f32>,

@@ -626,6 +626,7 @@ guardrails:
       type: presidio
       failure_policy: fail_open
       endpoint: "http://presidio:3000/analyze"
+      language: en
       entities: [EMAIL_ADDRESS, US_SSN, CREDIT_CARD]
       confidence_threshold: 0.6
 

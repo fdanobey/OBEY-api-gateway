@@ -95,6 +95,53 @@ pub(crate) fn sanitize_mantle_chat_request(request: &mut OpenAIRequest) -> usize
     before - request.extra.len()
 }
 
+fn responses_tools_from_chat(tools: &serde_json::Value) -> serde_json::Value {
+    let Some(items) = tools.as_array() else {
+        return tools.clone();
+    };
+
+    serde_json::Value::Array(
+        items
+            .iter()
+            .map(|tool| {
+                let Some(function) = tool
+                    .get("function")
+                    .filter(|_| {
+                        tool.get("type").and_then(serde_json::Value::as_str) == Some("function")
+                    })
+                    .and_then(serde_json::Value::as_object)
+                else {
+                    return tool.clone();
+                };
+
+                let mut flattened = serde_json::Map::new();
+                flattened.insert("type".to_string(), serde_json::json!("function"));
+                for key in ["name", "description", "parameters", "strict"] {
+                    if let Some(value) = function.get(key) {
+                        flattened.insert(key.to_string(), value.clone());
+                    }
+                }
+                serde_json::Value::Object(flattened)
+            })
+            .collect(),
+    )
+}
+
+fn responses_tool_choice_from_chat(tool_choice: &serde_json::Value) -> serde_json::Value {
+    let Some(function) = tool_choice
+        .get("function")
+        .filter(|_| tool_choice.get("type").and_then(serde_json::Value::as_str) == Some("function"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return tool_choice.clone();
+    };
+
+    match function.get("name") {
+        Some(name) => serde_json::json!({"type": "function", "name": name}),
+        None => tool_choice.clone(),
+    }
+}
+
 /// Default pool idle timeout in seconds
 const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 
@@ -698,50 +745,6 @@ impl BedrockProvider {
             region,
             auth_mode,
         })
-    }
-
-    pub async fn chat_completion_with_context_retry(
-        &self,
-        mut request: OpenAIRequest,
-        context_manager: &crate::context::ContextManager,
-    ) -> Result<ProviderResponse, GatewayError> {
-        let mut attempt = 0;
-        loop {
-            match self.chat_completion(request.clone()).await {
-                Ok(response) => return Ok(response),
-                Err(GatewayError::Provider {
-                    provider,
-                    message,
-                    status_code: Some(status_code),
-                }) if context_manager.is_context_length_error(status_code, &message) => {
-                    match context_manager.handle_context_error(
-                        &mut request,
-                        attempt,
-                        Some(&message),
-                    ) {
-                        Ok(result) => {
-                            attempt += 1;
-                            tracing::info!(
-                                provider = %provider,
-                                model = %request.model,
-                                attempt,
-                                original_tokens = result.original_tokens,
-                                final_tokens = result.final_tokens,
-                                messages_removed = result.messages_removed,
-                                "Bedrock context-length error detected, truncated request and retrying"
-                            );
-                        }
-                        Err(error) => {
-                            return Err(GatewayError::InvalidRequest(format!(
-                                "Request exceeds Bedrock model context limits and cannot be truncated further: {}",
-                                error
-                            )));
-                        }
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
     }
 
     /// Get a reference to the AWS SDK client if using SDK authentication mode.
@@ -1572,7 +1575,11 @@ impl BedrockProvider {
             "truncation",
         ] {
             if let Some(value) = extra.get(key) {
-                body[key] = value.clone();
+                body[key] = match key {
+                    "tools" => responses_tools_from_chat(value),
+                    "tool_choice" => responses_tool_choice_from_chat(value),
+                    _ => value.clone(),
+                };
             }
         }
         let value = self
@@ -2869,6 +2876,47 @@ mod tests {
     }
 
     #[test]
+    fn test_responses_tools_flatten_chat_function_shape() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object"},
+                "strict": true
+            }
+        }]);
+
+        assert_eq!(
+            responses_tools_from_chat(&tools),
+            serde_json::json!([{
+                "type": "function",
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object"},
+                "strict": true
+            }])
+        );
+    }
+
+    #[test]
+    fn test_responses_tool_choice_flattens_chat_function_shape() {
+        let tool_choice = serde_json::json!({
+            "type": "function",
+            "function": {"name": "read_file"}
+        });
+
+        assert_eq!(
+            responses_tool_choice_from_chat(&tool_choice),
+            serde_json::json!({"type": "function", "name": "read_file"})
+        );
+        assert_eq!(
+            responses_tool_choice_from_chat(&serde_json::json!("auto")),
+            serde_json::json!("auto")
+        );
+    }
+
+    #[test]
     fn test_mantle_api_dispatch() {
         assert_eq!(mantle_api_for_model("openai.gpt-oss-120b"), MantleApi::Chat);
         assert_eq!(
@@ -2979,90 +3027,6 @@ mod tests {
             "messages adapter works"
         );
         assert_eq!(response.usage.total_tokens, 11);
-    }
-
-    #[tokio::test]
-    async fn test_api_key_context_error_truncates_and_retries() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
-
-        #[derive(Clone)]
-        struct ContextThenSuccess;
-
-        impl Respond for ContextThenSuccess {
-            fn respond(&self, request: &Request) -> ResponseTemplate {
-                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-                let messages = body["messages"].as_array().unwrap();
-                if messages.len() > 3 {
-                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                        "error": {
-                            "message": "This model's maximum context length is 100 tokens. However, your messages resulted in 300 tokens."
-                        }
-                    }))
-                } else {
-                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                        "id": "chatcmpl-retry",
-                        "object": "chat.completion",
-                        "created": 1,
-                        "model": "zai.glm-5",
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "retry worked"},
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22}
-                    }))
-                }
-            }
-        }
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ContextThenSuccess)
-            .expect(2)
-            .mount(&server)
-            .await;
-        let provider =
-            create_api_key_mode_provider_for_base_url("bedrock-test", server.uri(), "test-api-key");
-        let mut request = create_test_chat_request(false);
-        request.model = "zai.glm-5".to_string();
-        request.messages = vec![
-            Message {
-                role: "system".to_string(),
-                content: serde_json::json!("system"),
-                extra: Default::default(),
-            },
-            Message {
-                role: "user".to_string(),
-                content: serde_json::json!("a".repeat(120)),
-                extra: Default::default(),
-            },
-            Message {
-                role: "assistant".to_string(),
-                content: serde_json::json!("b".repeat(120)),
-                extra: Default::default(),
-            },
-            Message {
-                role: "user".to_string(),
-                content: serde_json::json!("c".repeat(120)),
-                extra: Default::default(),
-            },
-            Message {
-                role: "assistant".to_string(),
-                content: serde_json::json!("d".repeat(120)),
-                extra: Default::default(),
-            },
-        ];
-        let context_manager = crate::context::ContextManager::new();
-        let response = provider
-            .chat_completion_with_context_retry(request, &context_manager)
-            .await
-            .expect("context error should truncate and retry");
-        assert_eq!(
-            response.response.choices[0].message.content_as_text(),
-            "retry worked"
-        );
     }
 
     #[tokio::test]

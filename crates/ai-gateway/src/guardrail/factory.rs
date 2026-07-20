@@ -152,6 +152,7 @@ fn build_provider(
                 http_client.clone(),
                 endpoint,
                 settings.entities.clone(),
+                settings.language.clone(),
                 settings.confidence_threshold,
                 timeout,
             ))

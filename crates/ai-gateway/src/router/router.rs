@@ -15,6 +15,7 @@ use crate::providers::bedrock::{
     apply_global_inference_prefix, apply_global_inference_profile, model_supports_reasoning,
     normalize_mantle_chat_messages, sanitize_mantle_chat_request, BedrockProvider,
 };
+use crate::providers::{ProviderClient, ProviderResponse};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::error::Error as StdError;
@@ -1518,6 +1519,50 @@ impl Router {
         (truncated_request, result.truncated)
     }
 
+    async fn dispatch_buffered_with_context_retry<C: ProviderClient + ?Sized>(
+        &self,
+        client: &C,
+        mut request: OpenAIRequest,
+    ) -> Result<ProviderResponse, GatewayError> {
+        let mut attempt = 0;
+        loop {
+            match client.chat_completion(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(GatewayError::Provider {
+                    provider,
+                    message,
+                    status_code: Some(status_code),
+                }) if self.is_context_length_error(status_code, &message) => {
+                    match self.context_manager.handle_context_error(
+                        &mut request,
+                        attempt,
+                        Some(&message),
+                    ) {
+                        Ok(result) => {
+                            attempt += 1;
+                            info!(
+                                provider = %provider,
+                                model = %request.model,
+                                attempt,
+                                original_tokens = result.original_tokens,
+                                final_tokens = result.final_tokens,
+                                messages_removed = result.messages_removed,
+                                "Buffered provider context-length error detected, truncated request and retrying"
+                            );
+                        }
+                        Err(error) => {
+                            return Err(GatewayError::InvalidRequest(format!(
+                                "Request exceeds provider context limits and cannot be truncated further: {}",
+                                error
+                            )));
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Attempt request with retry logic and exponential backoff
     ///
     /// Implements retry with backoff sequence [1s, 2s, 4s]
@@ -1591,11 +1636,12 @@ impl Router {
                 vec![], // reasoning_models_allowlist — TODO: wire from gateway config
             );
 
-            use crate::providers::ProviderClient;
             let mut codex_request = request.clone();
             // Rewrite the model from the group name to the actual provider model ID
             codex_request.model = provider_model.model.clone();
-            let result = codex_client.chat_completion(codex_request).await?;
+            let result = self
+                .dispatch_buffered_with_context_retry(&codex_client, codex_request)
+                .await?;
             return Ok(result.response);
         }
         // ─── End Codex dispatch ──────────────────────────────────────────────
@@ -1620,8 +1666,8 @@ impl Router {
                 provider_cfg.custom_headers.clone(),
             )
             .await?;
-            return Ok(bedrock_client
-                .chat_completion_with_context_retry(bedrock_request, &self.context_manager)
+            return Ok(self
+                .dispatch_buffered_with_context_retry(&bedrock_client, bedrock_request)
                 .await?
                 .response);
         }
@@ -4989,6 +5035,101 @@ mod tests {
     };
     use crate::config::{CircuitBreakerConfig, ExactCacheConfig, ModelGroup, ProviderModel};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct ContextThenSuccessClient {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderClient for ContextThenSuccessClient {
+        async fn chat_completion(
+            &self,
+            request: OpenAIRequest,
+        ) -> Result<ProviderResponse, GatewayError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                return Err(GatewayError::Provider {
+                    provider: "adapter".to_string(),
+                    message: "This model's maximum context length is 100 tokens. However, your messages resulted in 300 tokens.".to_string(),
+                    status_code: Some(400),
+                });
+            }
+            assert!(request.messages.len() <= 3);
+            Ok(ProviderResponse {
+                response: serde_json::from_value(completion_response())
+                    .expect("fixture should deserialize"),
+                provider_name: "adapter".to_string(),
+                latency_ms: 1,
+            })
+        }
+
+        async fn chat_completion_stream(
+            &self,
+            _request: OpenAIRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>>
+                        + Send,
+                >,
+            >,
+            GatewayError,
+        > {
+            unreachable!()
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
+            Ok(Vec::new())
+        }
+
+        fn provider_name(&self) -> &str {
+            "adapter"
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_adapter_context_error_truncates_and_retries() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+        let client = ContextThenSuccessClient {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut request = compression_request(false);
+        request.model = "adapter-model".to_string();
+        request.messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: serde_json::json!("system"),
+                extra: Default::default(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!("a".repeat(120)),
+                extra: Default::default(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("b".repeat(120)),
+                extra: Default::default(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!("c".repeat(120)),
+                extra: Default::default(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("d".repeat(120)),
+                extra: Default::default(),
+            },
+        ];
+
+        let response = router
+            .dispatch_buffered_with_context_retry(&client, request)
+            .await
+            .expect("shared wrapper should truncate and retry");
+        assert_eq!(response.provider_name, "adapter");
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn reasoning_only_response_is_promoted_to_content() {

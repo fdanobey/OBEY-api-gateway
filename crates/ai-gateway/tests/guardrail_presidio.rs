@@ -32,10 +32,19 @@ fn configured_entities() -> Vec<String> {
 
 /// Build a provider pointed at `endpoint` with the standard test config.
 fn provider_for(endpoint: String, timeout_secs: Option<u64>) -> PresidioProvider {
+    provider_for_language(endpoint, None, timeout_secs)
+}
+
+fn provider_for_language(
+    endpoint: String,
+    language: Option<&str>,
+    timeout_secs: Option<u64>,
+) -> PresidioProvider {
     PresidioProvider::new(
         reqwest::Client::new(),
         endpoint,
         configured_entities(),
+        language.map(str::to_string),
         Some(0.5),
         timeout_secs,
     )
@@ -75,6 +84,24 @@ async fn request_payload_contains_text_and_configured_entities() {
         json!(["EMAIL_ADDRESS", "US_SSN"]),
         "payload includes the configured entity list (Req 6.1)"
     );
+    assert_eq!(body["language"], "en", "payload includes Presidio language");
+}
+
+#[tokio::test]
+async fn request_payload_uses_configured_language() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/analyze"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    let provider = provider_for_language(format!("{}/analyze", server.uri()), Some("es"), None);
+    provider.analyze("correo").await.expect("analyze succeeds");
+
+    let requests = server.received_requests().await.expect("recording enabled");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("payload is JSON");
+    assert_eq!(body["language"], "es");
 }
 
 #[tokio::test]

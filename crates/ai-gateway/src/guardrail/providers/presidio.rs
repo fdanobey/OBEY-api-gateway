@@ -1,6 +1,6 @@
 //! Presidio-compatible guardrail provider (Req 6).
 //!
-//! POSTs `{ text, entities }` to a configurable Presidio-compatible HTTP
+//! POSTs `{ text, entities, language }` to a configurable Presidio-compatible HTTP
 //! endpoint (Req 6.1) and maps returned entities into [`Finding`]s. Only
 //! entities whose type appears in the configured entity list are mapped; every
 //! other detected entity is ignored (Req 6.2). Entities whose confidence score
@@ -28,6 +28,9 @@ pub const MAX_TIMEOUT_SECS: u64 = 30;
 
 /// Default Presidio request timeout in seconds (Req 6.5).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 5;
+
+/// Default language sent to the Presidio analyzer.
+pub const DEFAULT_LANGUAGE: &str = "en";
 
 /// Default minimum confidence score threshold (Req 6.6).
 pub const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.5;
@@ -68,6 +71,8 @@ struct PresidioRequest<'a> {
     text: &'a str,
     /// The configured entity types to detect.
     entities: &'a [String],
+    /// Language understood by the configured Presidio analyzer.
+    language: &'a str,
 }
 
 /// Filter a set of detected Presidio entities into [`Finding`]s (Req 6.2, 6.6).
@@ -103,6 +108,8 @@ pub struct PresidioProvider {
     endpoint: String,
     /// Entity types to detect and map (Req 6.3); others are ignored.
     entities: Vec<String>,
+    /// Language sent to the Presidio analyzer.
+    language: String,
     /// Fast membership lookup for `entities`.
     entity_set: HashSet<String>,
     /// Minimum confidence score threshold (Req 6.6).
@@ -121,10 +128,15 @@ impl PresidioProvider {
         http_client: Client,
         endpoint: String,
         entities: Vec<String>,
+        language: Option<String>,
         confidence_threshold: Option<f32>,
         timeout_secs: Option<u64>,
     ) -> Self {
         let entity_set = entities.iter().cloned().collect();
+        let language = language
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
         let confidence_threshold = confidence_threshold
             .unwrap_or(DEFAULT_CONFIDENCE_THRESHOLD)
             .clamp(0.0, 1.0);
@@ -132,6 +144,7 @@ impl PresidioProvider {
             http_client,
             endpoint,
             entities,
+            language,
             entity_set,
             confidence_threshold,
             timeout: clamp_timeout(timeout_secs),
@@ -145,6 +158,7 @@ impl GuardrailProvider for PresidioProvider {
         let payload = PresidioRequest {
             text: content,
             entities: &self.entities,
+            language: &self.language,
         };
 
         let response = self
@@ -280,6 +294,7 @@ mod tests {
             Client::new(),
             "http://presidio:3000/analyze".to_string(),
             vec!["EMAIL_ADDRESS".to_string()],
+            None,
             None,
             None,
         );
