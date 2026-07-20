@@ -214,14 +214,15 @@ impl ContextManager {
             return Err(ContextError::MaxRetriesExceeded);
         }
 
-        // Priority order for determining context window:
-        // 1. Cached model capabilities (from /models endpoint or prior calls)
-        // 2. Limit parsed from the provider's error response body
-        // 3. Configured default_context_window (defaults to 32768)
-        let context_window = self
-            .get_capabilities(&request.model)
-            .map(|caps| caps.context_window)
-            .or_else(|| error_body.and_then(Self::parse_context_limit_from_error))
+        // Prefer the provider's concrete limit from the current failure. Model
+        // capability caches can be stale or can describe a neighboring model
+        // variant with a larger context window.
+        let context_window = error_body
+            .and_then(Self::parse_context_limit_from_error)
+            .or_else(|| {
+                self.get_capabilities(&request.model)
+                    .map(|caps| caps.context_window)
+            })
             .unwrap_or(self.config.default_context_window);
 
         let result = self.truncate_request(request, context_window);
@@ -386,6 +387,41 @@ mod tests {
         assert!(manager.is_context_length_error(413, "Input is too long"));
         assert!(!manager.is_context_length_error(400, "Invalid API key"));
         assert!(!manager.is_context_length_error(500, "Internal server error"));
+    }
+
+    #[test]
+    fn test_context_error_uses_provider_limit_over_cached_capability() {
+        let manager = ContextManager::new();
+        manager.store_capabilities(ModelCapabilities::new(
+            "test-model".to_string(),
+            1_000_000,
+            None,
+            false,
+        ));
+        let mut request = OpenAIRequest {
+            model: "test-model".to_string(),
+            messages: vec![
+                create_test_message("system", "system"),
+                create_test_message("user", &"x".repeat(80_000)),
+                create_test_message("assistant", &"y".repeat(80_000)),
+                create_test_message("user", &"z".repeat(80_000)),
+            ],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+
+        let result = manager
+            .handle_context_error(
+                &mut request,
+                0,
+                Some("This model's maximum context length is 32768 tokens"),
+            )
+            .expect("provider limit should trigger truncation");
+        assert!(result.truncated);
+        assert!(result.messages_removed > 0);
+        assert!(result.final_tokens <= 24_576);
     }
 
     #[test]

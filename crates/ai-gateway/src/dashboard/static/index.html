@@ -564,9 +564,10 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 
     var html='';
     errors.forEach(function(e){
+      var errorText=e.error||e.response_body||'';
       html+='<tr><td>'+fmtTime(e.timestamp)+'</td><td>'+esc(e.provider||'')+'</td>'
         +'<td>'+esc(e.model||'')+'</td><td>'+esc(String(e.status_code||''))+'</td>'
-        +'<td>'+esc(e.error||'')+'</td></tr>';
+        +'<td class="failure-reason" title="'+esc(errorText)+'">'+esc(errorText)+'</td></tr>';
     });
     tbody.innerHTML=html;
   }

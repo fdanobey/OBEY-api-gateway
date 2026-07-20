@@ -700,6 +700,50 @@ impl BedrockProvider {
         })
     }
 
+    pub async fn chat_completion_with_context_retry(
+        &self,
+        mut request: OpenAIRequest,
+        context_manager: &crate::context::ContextManager,
+    ) -> Result<ProviderResponse, GatewayError> {
+        let mut attempt = 0;
+        loop {
+            match self.chat_completion(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(GatewayError::Provider {
+                    provider,
+                    message,
+                    status_code: Some(status_code),
+                }) if context_manager.is_context_length_error(status_code, &message) => {
+                    match context_manager.handle_context_error(
+                        &mut request,
+                        attempt,
+                        Some(&message),
+                    ) {
+                        Ok(result) => {
+                            attempt += 1;
+                            tracing::info!(
+                                provider = %provider,
+                                model = %request.model,
+                                attempt,
+                                original_tokens = result.original_tokens,
+                                final_tokens = result.final_tokens,
+                                messages_removed = result.messages_removed,
+                                "Bedrock context-length error detected, truncated request and retrying"
+                            );
+                        }
+                        Err(error) => {
+                            return Err(GatewayError::InvalidRequest(format!(
+                                "Request exceeds Bedrock model context limits and cannot be truncated further: {}",
+                                error
+                            )));
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Get a reference to the AWS SDK client if using SDK authentication mode.
     /// Returns None if using API key authentication.
     #[allow(dead_code)] // used in tests
@@ -2935,6 +2979,90 @@ mod tests {
             "messages adapter works"
         );
         assert_eq!(response.usage.total_tokens, 11);
+    }
+
+    #[tokio::test]
+    async fn test_api_key_context_error_truncates_and_retries() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct ContextThenSuccess;
+
+        impl Respond for ContextThenSuccess {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let messages = body["messages"].as_array().unwrap();
+                if messages.len() > 3 {
+                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {
+                            "message": "This model's maximum context length is 100 tokens. However, your messages resulted in 300 tokens."
+                        }
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "chatcmpl-retry",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "zai.glm-5",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "retry worked"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22}
+                    }))
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ContextThenSuccess)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider =
+            create_api_key_mode_provider_for_base_url("bedrock-test", server.uri(), "test-api-key");
+        let mut request = create_test_chat_request(false);
+        request.model = "zai.glm-5".to_string();
+        request.messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: serde_json::json!("system"),
+                extra: Default::default(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!("a".repeat(120)),
+                extra: Default::default(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("b".repeat(120)),
+                extra: Default::default(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!("c".repeat(120)),
+                extra: Default::default(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("d".repeat(120)),
+                extra: Default::default(),
+            },
+        ];
+        let context_manager = crate::context::ContextManager::new();
+        let response = provider
+            .chat_completion_with_context_retry(request, &context_manager)
+            .await
+            .expect("context error should truncate and retry");
+        assert_eq!(
+            response.response.choices[0].message.content_as_text(),
+            "retry worked"
+        );
     }
 
     #[tokio::test]

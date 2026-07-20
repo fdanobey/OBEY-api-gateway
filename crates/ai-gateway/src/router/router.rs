@@ -1605,7 +1605,6 @@ impl Router {
 
         let is_bedrock_api_key = provider_cfg.provider_type == "bedrock" && !api_key.is_empty();
         if is_bedrock_api_key {
-            use crate::providers::ProviderClient;
             let mut bedrock_request = request.clone();
             bedrock_request.model = provider_model.model.clone();
             bedrock_request.stream = false;
@@ -1621,8 +1620,10 @@ impl Router {
                 provider_cfg.custom_headers.clone(),
             )
             .await?;
-            let result = bedrock_client.chat_completion(bedrock_request).await?;
-            return Ok(result.response);
+            return Ok(bedrock_client
+                .chat_completion_with_context_retry(bedrock_request, &self.context_manager)
+                .await?
+                .response);
         }
 
         // OAuth bearer override (Req 6.2): when the provider declares
