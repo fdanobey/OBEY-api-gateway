@@ -84,7 +84,7 @@ The screenshot below shows compression enabled with the `Standard` default level
 
 ![Token Compression configured](images/admin-compression-configured.png)
 
-> **Perplexity / ONNX:** Enabling the perplexity engine also requires an external ONNX model at the configured path and a compatible ONNX runtime in the gateway environment. The admin panel does not install either dependency.
+> **Perplexity / ONNX:** Enter the desired model path, then use **Download missing** in the Compression panel. The gateway downloads and verifies the pinned Apache-2.0 Kompress-Small model, tokenizer, and matching ONNX Runtime on the server/container—not in your browser. Save the configuration after the panel reports both model and runtime ready. Docker users should mount a writable persistent volume at `/app/models`.
 
 ---
 
@@ -267,7 +267,7 @@ compression:
 
 ## Perplexity Engine
 
-The perplexity engine uses an ONNX neural model to score token redundancy and remove low-information content. It requires a pre-trained perplexity scorer model file.
+The perplexity engine uses the pinned Kompress-Small ONNX token-classification model to score token redundancy and remove low-information content. The admin panel installs the graph, external weights, tokenizer, and platform ONNX Runtime into the directory containing `model_path`. The full bundle is approximately 350 MB.
 
 ```yaml
 compression:
@@ -278,7 +278,7 @@ compression:
     model_path: ./models/perplexity_scorer.onnx
 ```
 
-> **Note:** The perplexity engine is disabled by default and requires downloading or training a compatible ONNX model. Without it, perplexity-based compression is skipped silently.
+> **Note:** The perplexity engine remains disabled by default. Install the approved assets from Admin → Compression, wait for both readiness indicators, then enable and save the setting. If assets or model initialization are unavailable, the gateway safely leaves the request unchanged instead of representing heuristic scoring as ONNX inference.
 
 ---
 

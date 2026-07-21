@@ -84,10 +84,11 @@ docker run -d \
   -e OPENAI_API_KEY=sk-... \
   -v $(pwd)/config.yaml:/app/config.yaml \
   -v ai-gateway-data:/data \
+  -v ai-gateway-models:/app/models \
   obey-api-gateway --config /app/config.yaml
 ```
 
-> **Persist your keys:** the image sets `AI_GATEWAY_DATA_DIR=/data` and declares it as a volume. Mount a named volume (or host path) at `/data` as shown above so the encryption master key survives container restarts and rebuilds. Without it, the key regenerates on each container recreation and any `api_key_encrypted` values already saved in your `config.yaml` become undecryptable.
+> **Persist keys and ONNX assets:** `/data` stores the encryption master key; `/app/models` stores the optional Perplexity model/runtime downloaded from Admin → Compression. Mount both named volumes as shown so keys and the roughly 350 MB ONNX bundle survive container replacement. The gateway process must be able to write `/app/models`; a read-only bind mount produces an actionable install error.
 
 #### Updating (Docker)
 
@@ -107,6 +108,7 @@ docker run -d --name obey-api-gateway \
   -e OPENAI_API_KEY=sk-... \
   -v $(pwd)/config.yaml:/app/config.yaml \
   -v ai-gateway-data:/data \
+  -v ai-gateway-models:/app/models \
   obey-api-gateway --config /app/config.yaml
 ```
 
@@ -122,11 +124,13 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml
       - ai-gateway-data:/data
+      - ai-gateway-models:/app/models
     environment:
       - OPENAI_API_KEY=sk-...
 
 volumes:
   ai-gateway-data:
+  ai-gateway-models:
 ```
 
 ```bash
@@ -135,7 +139,7 @@ git pull origin master
 docker compose up -d --build
 ```
 
-> **Note:** Your encrypted keys and config persist in the `ai-gateway-data` volume across rebuilds. Never `docker volume rm ai-gateway-data` unless you intend to reset all stored secrets.
+> **Note:** Encrypted keys persist in `ai-gateway-data`; downloaded ONNX assets persist in `ai-gateway-models`. Never remove either volume unless you intend to reset that data.
 
 ### Option 4: Build from Source
 

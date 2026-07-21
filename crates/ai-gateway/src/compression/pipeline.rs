@@ -13,6 +13,7 @@ use super::{
         language_pack::{LanguagePackEngine, LanguagePackLevel},
         lite::LiteEngine,
         perplexity::{PerplexityEngine, PerplexityEngineConfig},
+        perplexity_onnx::OnnxRedundancyScorerLoader,
         rtk::RtkEngine,
         standard::StandardEngine,
         tool_def::{ToolDefinitionCompressionReport, ToolDefinitionEngine},
@@ -294,11 +295,8 @@ impl CompressionPipeline {
             RTK,
             Arc::new(RtkEngine::from_config(&snapshot.rtk)),
         );
-        insert_engine(
-            &mut engines,
-            PERPLEXITY,
-            Arc::new(PerplexityEngine::heuristic_fallback(perplexity_config)),
-        );
+        let perplexity_engine = build_perplexity_engine(&snapshot.perplexity, perplexity_config);
+        insert_engine(&mut engines, PERPLEXITY, Arc::new(perplexity_engine));
         insert_engine(
             &mut engines,
             LANGUAGE_PACK,
@@ -725,6 +723,21 @@ impl CompressionPipeline {
     }
 }
 
+fn build_perplexity_engine(
+    config: &super::config::PerplexityConfig,
+    engine_config: PerplexityEngineConfig,
+) -> PerplexityEngine {
+    if config.enabled {
+        PerplexityEngine::with_model_loader(
+            engine_config,
+            &config.model_path,
+            Arc::new(OnnxRedundancyScorerLoader::new()),
+        )
+    } else {
+        PerplexityEngine::heuristic_fallback(engine_config)
+    }
+}
+
 fn insert_engine<T>(engines: &mut HashMap<String, RegisteredEngine>, name: &str, engine: Arc<T>)
 where
     T: CompressionEngine + 'static,
@@ -961,6 +974,33 @@ mod tests {
                 .map(|(name, engine)| (name.to_owned(), engine))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn perplexity_engine_selection_respects_enabled_flag_and_model_path() {
+        let disabled = super::build_perplexity_engine(
+            &super::super::config::PerplexityConfig::default(),
+            PerplexityEngineConfig::default(),
+        );
+        assert_eq!(
+            disabled.availability().unwrap().kind,
+            super::super::engines::perplexity::ScorerKind::HeuristicFallback
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let model_path = directory.path().join("missing.onnx");
+        let enabled_config = super::super::config::PerplexityConfig {
+            enabled: true,
+            model_path: model_path.display().to_string(),
+            ..super::super::config::PerplexityConfig::default()
+        };
+        let enabled =
+            super::build_perplexity_engine(&enabled_config, PerplexityEngineConfig::default());
+        assert!(matches!(
+            enabled.availability(),
+            Err(super::super::engines::perplexity::ScorerError::ModelAssetUnavailable { path })
+                if path == model_path
+        ));
     }
 
     #[test]

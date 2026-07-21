@@ -242,6 +242,8 @@ The chat completions endpoint echoes request correlation through the `x-trace-id
 
 Both are embedded SPAs served from the binary. The admin UI now round-trips the live Rust config schema, including retry backoff arrays, circuit-breaker backoff arrays, semantic cache settings, and context controls. YAML imports are loaded into the form for review and are only applied after an explicit save.
 
+The Compression tab also reports optional ONNX model/runtime readiness and can install the pinned Kompress-Small bundle directly on the gateway host. Source and packaged builds use the same workflow. Docker deployments should mount a writable persistent volume at `/app/models`; the default `./models/perplexity_scorer.onnx` resolves there because the image working directory is `/app`.
+
 The dashboard supports:
 - Real-time metrics over WebSocket
 - Provider and per-model circuit-breaker visibility

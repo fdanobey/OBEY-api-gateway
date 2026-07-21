@@ -228,6 +228,17 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 /* Token compression */
 .compression-note{padding:.75rem 1rem;margin-bottom:1rem;border:1px solid rgba(13,110,253,.25);border-radius:var(--radius);background:rgba(13,110,253,.05);font-size:.82rem;color:var(--text)}
 .compression-note strong{display:block;margin-bottom:.2rem}
+.onnx-asset-panel{margin-top:.8rem;padding:.85rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)}
+.onnx-asset-grid{display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-bottom:.65rem}
+.onnx-asset-state{display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.5rem .65rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);font-size:.78rem}
+.onnx-asset-state strong{font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted)}
+.onnx-asset-state span{font-weight:600}
+.onnx-asset-state .ready{color:var(--success)}
+.onnx-asset-state .missing{color:var(--danger)}
+.onnx-resolved-path{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.72rem;overflow-wrap:anywhere;color:var(--text-muted);margin-bottom:.65rem}
+.onnx-asset-actions{display:flex;align-items:center;gap:.65rem;flex-wrap:wrap}
+.onnx-asset-message{font-size:.75rem;color:var(--text-muted)}
+@media(max-width:600px){.onnx-asset-grid{grid-template-columns:1fr}}
 .compression-rule-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.25rem 1rem}
 .compression-editor{margin-top:.75rem}
 .compression-row{display:grid;gap:.6rem;align-items:end;padding:.75rem;margin-bottom:.5rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)}
@@ -862,7 +873,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
   <section class="page" id="page-compression" role="tabpanel" aria-labelledby="tab-compression-config">
     <h2>Token Compression</h2>
     <div class="error" id="compression-validation-summary" role="alert"></div>
-    <div class="compression-note"><strong>Compression is disabled by default.</strong> Enable it only after selecting and testing a suitable level. Perplexity/ONNX mode additionally requires an external ONNX model file and a compatible runtime in the gateway environment.</div>
+    <div class="compression-note"><strong>Compression is disabled by default.</strong> Enable it only after selecting and testing a suitable level. The Perplexity / ONNX section can install its approved model and runtime directly into the configured gateway path.</div>
     <fieldset><legend>Global Behavior</legend>
       <div class="form-check"><input type="checkbox" id="compression-enabled"><label for="compression-enabled">Enable token compression globally</label></div>
       <div class="form-row">
@@ -905,12 +916,23 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     </fieldset>
     <fieldset><legend>Perplexity / ONNX</legend>
       <div class="form-check"><input type="checkbox" id="compression-perplexity-enabled"><label for="compression-perplexity-enabled">Enable perplexity engine</label></div>
-      <div class="hint" style="margin-top:-.4rem;margin-bottom:.8rem">Actual ONNX compression requires an external model at the configured path and an available ONNX runtime; the admin panel does not install either dependency.</div>
+      <div class="hint" style="margin-top:-.4rem;margin-bottom:.8rem">Model-backed scoring requires the approved ONNX bundle. Assets are downloaded by the gateway process, so Docker paths and volume permissions apply.</div>
       <div class="form-row">
         <div class="form-group"><label for="compression-redundancy-threshold">Redundancy threshold</label><input type="number" id="compression-redundancy-threshold" min="0" max="1" step="0.01" value="0.5"><div class="hint">0.0–1.0 inclusive.</div><div class="error" role="alert"></div></div>
         <div class="form-group"><label for="compression-ratio-target">Compression ratio target</label><input type="number" id="compression-ratio-target" min="1" max="20" step="1" value="5"><div class="hint">1–20 inclusive.</div><div class="error" role="alert"></div></div>
       </div>
       <div class="form-group"><label for="compression-model-path">ONNX model path</label><input type="text" id="compression-model-path" value="./models/perplexity_scorer.onnx" autocomplete="off"><div class="error" role="alert"></div></div>
+      <div class="onnx-asset-panel" id="onnx-asset-panel" aria-live="polite">
+        <div class="onnx-asset-grid">
+          <div class="onnx-asset-state"><strong>Model bundle</strong><span id="onnx-model-state">Checking…</span></div>
+          <div class="onnx-asset-state"><strong>Runtime</strong><span id="onnx-runtime-state">Checking…</span></div>
+        </div>
+        <div class="onnx-resolved-path" id="onnx-resolved-path">Resolving configured path…</div>
+        <div class="onnx-asset-actions">
+          <button type="button" class="btn btn-secondary btn-sm" id="onnx-install-assets" disabled>Check ONNX assets</button>
+          <span class="onnx-asset-message" id="onnx-asset-message"></span>
+        </div>
+      </div>
     </fieldset>
     <fieldset><legend>Precompressed Contexts</legend>
       <div class="hint">Map source contexts to precompressed artifacts. Content hash is optional.</div>
@@ -2496,6 +2518,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     document.getElementById('compression-redundancy-threshold').value = perplexity.redundancy_threshold != null ? perplexity.redundancy_threshold : 0.5;
     document.getElementById('compression-ratio-target').value = perplexity.compression_ratio_target != null ? perplexity.compression_ratio_target : 5;
     document.getElementById('compression-model-path').value = perplexity.model_path != null ? perplexity.model_path : './models/perplexity_scorer.onnx';
+    scheduleOnnxStatusRefresh();
     var preList = document.getElementById('compression-precompressed-list'); preList.textContent = '';
     (compression.precompressed_contexts || []).forEach(addPrecompressedRow);
     var pipelineList = document.getElementById('compression-pipelines-list'); pipelineList.textContent = '';
@@ -2523,6 +2546,85 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     };
   }
 
+  var onnxStatusTimer = null;
+  var onnxStatusRequest = 0;
+
+  function onnxResponseJson(response) {
+    return response.text().then(function(text) {
+      var data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (_) {}
+      if (!response.ok) throw new Error((data && data.error && data.error.message) || text || ('HTTP ' + response.status));
+      return data;
+    });
+  }
+
+  function setOnnxState(element, ready, readyText, missingText) {
+    element.textContent = ready ? readyText : missingText;
+    element.className = ready ? 'ready' : 'missing';
+  }
+
+  function renderOnnxStatus(status) {
+    var modelReady = !!(status.model_valid && status.tokenizer_available && status.external_data_available);
+    setOnnxState(document.getElementById('onnx-model-state'), modelReady, 'Ready', 'Missing');
+    setOnnxState(document.getElementById('onnx-runtime-state'), !!status.runtime_available, 'Ready', 'Missing');
+    document.getElementById('onnx-resolved-path').textContent = 'Gateway path: ' + status.resolved_model_path;
+    var missing = (status.missing_assets || []).concat(status.invalid_assets || []);
+    var button = document.getElementById('onnx-install-assets');
+    button.disabled = !!status.ready;
+    button.textContent = status.ready ? 'ONNX assets ready' : 'Download missing: ' + missing.join(', ');
+    document.getElementById('onnx-asset-message').textContent = status.ready ? 'Save the configuration to enable model-backed scoring.' : 'Downloads run on the gateway host and may take several minutes.';
+  }
+
+  function refreshOnnxStatus() {
+    var path = document.getElementById('compression-model-path').value.trim();
+    var requestId = ++onnxStatusRequest;
+    if (!path) {
+      document.getElementById('onnx-asset-message').textContent = 'Enter a model path to check assets.';
+      document.getElementById('onnx-install-assets').disabled = true;
+      return;
+    }
+    document.getElementById('onnx-asset-message').textContent = 'Checking gateway filesystem…';
+    fetch(apiUrl('onnx/status') + '?model_path=' + encodeURIComponent(path))
+      .then(onnxResponseJson)
+      .then(function(status) { if (requestId === onnxStatusRequest) renderOnnxStatus(status); })
+      .catch(function(error) {
+        if (requestId !== onnxStatusRequest) return;
+        document.getElementById('onnx-asset-message').textContent = error.message;
+        document.getElementById('onnx-install-assets').disabled = false;
+      });
+  }
+
+  function scheduleOnnxStatusRefresh() {
+    clearTimeout(onnxStatusTimer);
+    onnxStatusTimer = setTimeout(refreshOnnxStatus, 300);
+  }
+
+  function installOnnxAssets() {
+    var button = document.getElementById('onnx-install-assets');
+    var path = document.getElementById('compression-model-path').value.trim();
+    if (!path) { showToast('Enter an ONNX model path first', true); return; }
+    button.disabled = true;
+    button.textContent = 'Downloading ONNX assets…';
+    document.getElementById('onnx-asset-message').textContent = 'The gateway is downloading and verifying model/runtime files.';
+    setStatus('Installing ONNX assets…');
+    fetch(apiUrl('onnx/install'), {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model_path:path})})
+      .then(onnxResponseJson)
+      .then(function(result) {
+        renderOnnxStatus(result.status);
+        setStatus('ONNX assets installed');
+        showToast('ONNX assets installed on the gateway host');
+      })
+      .catch(function(error) {
+        button.disabled = false;
+        button.textContent = 'Retry ONNX asset download';
+        document.getElementById('onnx-asset-message').textContent = error.message;
+        setStatus('ONNX asset installation failed');
+        showToast('ONNX install failed: ' + error.message, true);
+      });
+  }
+
+  document.getElementById('compression-model-path').addEventListener('input', scheduleOnnxStatusRefresh);
+  document.getElementById('onnx-install-assets').addEventListener('click', installOnnxAssets);
   document.getElementById('compression-add-precompressed').addEventListener('click', function() { addPrecompressedRow(null); });
   document.getElementById('compression-add-pipeline').addEventListener('click', function() { addCompressionPipelineRow('', null); });
 

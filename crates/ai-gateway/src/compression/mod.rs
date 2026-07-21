@@ -1,5 +1,6 @@
 //! Token-compression pipeline scaffolding and public API.
 
+pub mod assets;
 pub mod caveman;
 pub mod config;
 pub mod engines;

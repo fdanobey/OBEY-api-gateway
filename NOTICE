@@ -33,3 +33,30 @@ The file is vendored verbatim from the upstream commit named above and
 is compiled into the `ai-gateway` crate via `include_str!` for use as
 the Codex system `instructions` payload. No modifications have been
 made to the upstream content.
+
+---------------------------------------------------------------------
+Downloaded optional asset: Kompress-Small ONNX token compressor
+---------------------------------------------------------------------
+
+Upstream model: https://huggingface.co/chopratejas/kompress-small
+Revision:       eacbdc589d039a1a39f76a92844979ad4e266bcd
+License:        Apache License, Version 2.0
+License URL:    https://www.apache.org/licenses/LICENSE-2.0
+
+The model is not bundled with this repository or release archives. When an
+administrator requests installation, the gateway downloads the pinned ONNX
+graph, external weights, and tokenizer from the immutable revision above and
+verifies gateway-pinned sizes and SHA-256 digests before activation.
+
+---------------------------------------------------------------------
+Downloaded optional runtime: Microsoft ONNX Runtime
+---------------------------------------------------------------------
+
+Upstream repo: https://github.com/microsoft/onnxruntime
+Release:       v1.22.0
+License:       MIT License
+License URL:   https://github.com/microsoft/onnxruntime/blob/v1.22.0/LICENSE
+
+The runtime is not bundled with this repository or release archives. The admin
+asset workflow downloads the official platform archive from the pinned release
+and extracts only the CPU runtime shared library after verifying the archive.

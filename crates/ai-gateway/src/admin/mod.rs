@@ -8,6 +8,7 @@ use axum::{
 };
 use base64::Engine;
 use rust_embed::Embed;
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::{load_and_validate_config, save_config, Config};
@@ -50,8 +51,13 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
 
     let loop_detection_api = crate::loop_detection::admin::routes();
 
+    let onnx_api = Router::new()
+        .route("/status", get(onnx_status))
+        .route("/install", post(onnx_install));
+
     Router::new()
         .nest("/config", config_api)
+        .nest("/onnx", onnx_api)
         .nest("/loop-detection", loop_detection_api)
         .nest_service("/keys", virtual_keys_api)
         .route("/providers/models", get(proxy_provider_models))
@@ -543,6 +549,86 @@ fn normalize_config_for_storage(
     }
 
     Ok(config)
+}
+
+#[derive(Debug, Deserialize)]
+struct OnnxStatusQuery {
+    model_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OnnxInstallRequest {
+    model_path: String,
+}
+
+async fn onnx_status(
+    State(state): State<AppState>,
+    Query(query): Query<OnnxStatusQuery>,
+) -> Response {
+    let configured = if let Some(path) = query.model_path {
+        path
+    } else {
+        state
+            .config
+            .read()
+            .await
+            .compression
+            .perplexity
+            .model_path
+            .clone()
+    };
+    match state
+        .onnx_assets
+        .status(std::path::Path::new(&configured))
+        .await
+    {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
+        Err(error) => onnx_error_response(error),
+    }
+}
+
+async fn onnx_install(
+    State(state): State<AppState>,
+    Json(request): Json<OnnxInstallRequest>,
+) -> Response {
+    match state
+        .onnx_assets
+        .install(std::path::Path::new(&request.model_path))
+        .await
+    {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(error) => onnx_error_response(error),
+    }
+}
+
+fn onnx_error_response(error: crate::compression::assets::OnnxAssetError) -> Response {
+    use crate::compression::assets::OnnxAssetError;
+    let (status, error_type) = match &error {
+        OnnxAssetError::InvalidModelPath | OnnxAssetError::UnsafeDestination { .. } => {
+            (StatusCode::BAD_REQUEST, "onnx_asset_path_error")
+        }
+        OnnxAssetError::UnsupportedPlatform { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "onnx_platform_error")
+        }
+        OnnxAssetError::Download { .. }
+        | OnnxAssetError::TooLarge { .. }
+        | OnnxAssetError::Integrity { .. }
+        | OnnxAssetError::Archive(_) => (StatusCode::BAD_GATEWAY, "onnx_download_error"),
+        OnnxAssetError::Io { .. } if error.is_permission_denied() => {
+            (StatusCode::FORBIDDEN, "onnx_permission_error")
+        }
+        OnnxAssetError::Io { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "onnx_io_error"),
+    };
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": error.to_string(),
+                "type": error_type
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// GET /admin/config — return current configuration (Req 13.12)
@@ -1611,6 +1697,22 @@ mod tests {
         assert!(html.contains("cfg.compression=collectCompression()"));
         assert!(html.contains("collectCompressionOverride(card,'prov')"));
         assert!(html.contains("collectCompressionOverride(card,'grp')"));
+        for marker in [
+            "onnx-model-state",
+            "onnx-runtime-state",
+            "onnx-resolved-path",
+            "onnx-install-assets",
+            "function refreshOnnxStatus()",
+            "function installOnnxAssets()",
+            "apiUrl('onnx/status')",
+            "apiUrl('onnx/install')",
+        ] {
+            assert!(
+                html.contains(marker),
+                "missing ONNX admin UI marker {marker}"
+            );
+        }
+        assert!(html.contains("element.textContent = ready ? readyText : missingText"));
     }
 
     #[test]
@@ -1922,6 +2024,59 @@ retry:
         let encoded =
             base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
         format!("Basic {}", encoded)
+    }
+
+    #[tokio::test]
+    async fn onnx_status_reports_configured_missing_assets_and_uses_admin_auth() {
+        let user_env = "ONNX_ADMIN_TEST_USER";
+        let pass_env = "ONNX_ADMIN_TEST_PASS";
+        std::env::set_var(user_env, "admin");
+        std::env::set_var(pass_env, "secret");
+        let mut config = test_config_with_auth_env(true, user_env, pass_env);
+        let directory = tempfile::tempdir().unwrap();
+        config.compression.perplexity.model_path =
+            directory.path().join("missing.onnx").display().to_string();
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        let unauthorized = axum::http::Request::get("/admin/onnx/status")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), unauthorized)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = axum::http::Request::get("/admin/onnx/status")
+            .header("Authorization", basic_auth_header("admin", "secret"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, authorized).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["ready"], false);
+        assert!(body["missing_assets"]
+            .as_array()
+            .is_some_and(|assets| assets.iter().any(|asset| asset == "model")));
+        std::env::remove_var(user_env);
+        std::env::remove_var(pass_env);
+    }
+
+    #[tokio::test]
+    async fn onnx_status_rejects_empty_override() {
+        let config = test_config_with_auth(false);
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+        let request = axum::http::Request::get("/admin/onnx/status?model_path=")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

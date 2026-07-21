@@ -59,6 +59,8 @@ pub struct AppState {
     pub loop_detector: Arc<crate::loop_detection::middleware::LoopDetectorState>,
     /// Shared replay/live stream for content-free compression statistics.
     pub compression_events: Arc<crate::dashboard::CompressionEventHub>,
+    /// Shared installer/status service for the optional ONNX compression assets.
+    pub onnx_assets: Arc<crate::compression::assets::OnnxAssetManager>,
 }
 
 /// Core HTTP server wrapping Axum with middleware and integrated components.
@@ -224,6 +226,13 @@ impl GatewayServer {
             guardrail_engine: Arc::new(RwLock::new(guardrail_engine)),
             loop_detector,
             compression_events,
+            onnx_assets: Arc::new(crate::compression::assets::OnnxAssetManager::new().map_err(
+                |error| {
+                    GatewayError::Configuration(format!(
+                        "Failed to initialize ONNX asset manager: {error}"
+                    ))
+                },
+            )?),
         };
 
         Ok(Self { state })

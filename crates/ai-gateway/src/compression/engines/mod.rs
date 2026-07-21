@@ -11,6 +11,7 @@ pub mod aggressive;
 pub mod language_pack;
 pub mod lite;
 pub mod perplexity;
+pub mod perplexity_onnx;
 pub mod rtk;
 pub mod standard;
 pub mod tool_def;

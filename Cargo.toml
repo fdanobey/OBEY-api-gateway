@@ -29,6 +29,12 @@ clap = { version = "4.5", features = ["derive"] }
 async-trait = "0.1"
 tiktoken-rs = "0.12"
 futures = "0.3"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic"] }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+sha2 = "0.10"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1.0"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 wiremock = "0.6"
 rcgen = "0.13"
