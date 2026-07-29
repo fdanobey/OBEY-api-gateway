@@ -1544,6 +1544,7 @@ mod tests {
                 cost_per_million_input_tokens: cost_in,
                 cost_per_million_output_tokens: cost_out,
                 priority,
+                structured_output_passthrough: None,
             })
     }
 
@@ -1557,6 +1558,7 @@ mod tests {
                 name,
                 version_fallback_enabled: vf,
                 compression: None,
+                structured_output: None,
                 models,
             })
     }
@@ -1583,6 +1585,7 @@ mod tests {
                     prometheus: None,
                     context: ContextConfig::default(),
                     compression: Default::default(),
+                    structured_output: None,
                     first_launch_completed: false,
                     tray: TrayConfig::default(),
                     codex_instructions_url: None,
@@ -1989,12 +1992,14 @@ retry:
                 name: "test-group".to_string(),
                 version_fallback_enabled: false,
                 compression: None,
+                structured_output: None,
                 models: vec![ProviderModel {
                     provider: "test".to_string(),
                     model: "gpt-4".to_string(),
                     cost_per_million_input_tokens: 0.0,
                     cost_per_million_output_tokens: 0.0,
                     priority: 100,
+                    structured_output_passthrough: None,
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -2005,6 +2010,7 @@ retry:
             prometheus: None,
             context: ContextConfig::default(),
             compression: Default::default(),
+            structured_output: None,
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,

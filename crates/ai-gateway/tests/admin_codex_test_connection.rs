@@ -61,12 +61,14 @@ fn codex_test_config() -> Config {
             name: "codex-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: vec![ProviderModel {
                 provider: "codex-provider".to_string(),
                 model: "gpt-4.1-nano".to_string(),
                 cost_per_million_input_tokens: 30.0,
                 cost_per_million_output_tokens: 60.0,
                 priority: 100,
+                structured_output_passthrough: None,
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -84,6 +86,7 @@ fn codex_test_config() -> Config {
         virtual_keys: Default::default(),
         loop_detection: Default::default(),
         guardrails: None,
+        structured_output: None,
     }
 }
 

@@ -5230,6 +5230,7 @@ mod tests {
             prometheus: None,
             context: crate::config::ContextConfig::default(),
             compression: Default::default(),
+            structured_output: None,
             first_launch_completed: false,
             tray: crate::config::TrayConfig::default(),
             codex_instructions_url: None,
@@ -5282,6 +5283,7 @@ mod tests {
             cost_per_million_input_tokens: 0.0,
             cost_per_million_output_tokens: 0.0,
             priority,
+            structured_output_passthrough: None,
         }
     }
 
@@ -5290,6 +5292,7 @@ mod tests {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models,
         }
     }
@@ -5975,12 +5978,14 @@ mod tests {
             name: "gpt-4-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: vec![ProviderModel {
                 provider: "openai".to_string(),
                 model: "gpt-4".to_string(),
                 cost_per_million_input_tokens: 10.0,
                 cost_per_million_output_tokens: 30.0,
                 priority: 100,
+                structured_output_passthrough: None,
             }],
         }];
 
@@ -6007,6 +6012,7 @@ mod tests {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: vec![
                 ProviderModel {
                     provider: "provider-low-priority".to_string(),
@@ -6014,6 +6020,7 @@ mod tests {
                     cost_per_million_input_tokens: 10.0,
                     cost_per_million_output_tokens: 30.0,
                     priority: 200,
+                    structured_output_passthrough: None,
                 },
                 ProviderModel {
                     provider: "provider-high-priority".to_string(),
@@ -6021,6 +6028,7 @@ mod tests {
                     cost_per_million_input_tokens: 10.0,
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
+                    structured_output_passthrough: None,
                 },
             ],
         }];
@@ -6041,6 +6049,7 @@ mod tests {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: vec![
                 ProviderModel {
                     provider: "expensive-provider".to_string(),
@@ -6048,6 +6057,7 @@ mod tests {
                     cost_per_million_input_tokens: 20.0,
                     cost_per_million_output_tokens: 60.0,
                     priority: 100,
+                    structured_output_passthrough: None,
                 },
                 ProviderModel {
                     provider: "cheap-provider".to_string(),
@@ -6055,6 +6065,7 @@ mod tests {
                     cost_per_million_input_tokens: 5.0,
                     cost_per_million_output_tokens: 15.0,
                     priority: 100,
+                    structured_output_passthrough: None,
                 },
             ],
         }];
@@ -6075,6 +6086,7 @@ mod tests {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: vec![
                 ProviderModel {
                     provider: "slow-provider".to_string(),
@@ -6082,6 +6094,7 @@ mod tests {
                     cost_per_million_input_tokens: 10.0,
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
+                    structured_output_passthrough: None,
                 },
                 ProviderModel {
                     provider: "fast-provider".to_string(),
@@ -6089,6 +6102,7 @@ mod tests {
                     cost_per_million_input_tokens: 10.5,
                     cost_per_million_output_tokens: 31.0,
                     priority: 100,
+                    structured_output_passthrough: None,
                 },
             ],
         }];
@@ -6133,6 +6147,7 @@ mod tests {
             name: "test-group".to_string(),
             version_fallback_enabled: true,
             compression: None,
+            structured_output: None,
             models: vec![
                 ProviderModel {
                     provider: "provider-1".to_string(),
@@ -6140,6 +6155,7 @@ mod tests {
                     cost_per_million_input_tokens: 10.0,
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
+                    structured_output_passthrough: None,
                 },
                 ProviderModel {
                     provider: "provider-2".to_string(),
@@ -6147,6 +6163,7 @@ mod tests {
                     cost_per_million_input_tokens: 10.0,
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
+                    structured_output_passthrough: None,
                 },
                 ProviderModel {
                     provider: "provider-3".to_string(),
@@ -6154,6 +6171,7 @@ mod tests {
                     cost_per_million_input_tokens: 10.0,
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
+                    structured_output_passthrough: None,
                 },
             ],
         }];
@@ -6265,11 +6283,13 @@ mod tests {
             cost_per_million_input_tokens: 0.0,
             cost_per_million_output_tokens: 0.0,
             priority: 100,
+            structured_output_passthrough: None,
         }];
         config.model_groups = vec![ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: providers.clone(),
         }];
         let router_metrics = test_metrics();
@@ -6380,6 +6400,7 @@ mod property_tests {
                     cost_per_million_input_tokens: input_cost,
                     cost_per_million_output_tokens: output_cost,
                     priority,
+                    structured_output_passthrough: None,
                 }
             })
     }
@@ -6395,6 +6416,7 @@ mod property_tests {
                 name,
                 version_fallback_enabled: version_fallback,
                 compression: None,
+                structured_output: None,
                 models,
             })
     }
@@ -6534,12 +6556,14 @@ mod property_tests {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: vec![ProviderModel {
                 provider: "".to_string(), // Invalid: empty provider
                 model: "gpt-4".to_string(),
                 cost_per_million_input_tokens: 10.0,
                 cost_per_million_output_tokens: 30.0,
                 priority: 100,
+                structured_output_passthrough: None,
             }],
         };
 
@@ -6555,12 +6579,14 @@ mod property_tests {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: vec![ProviderModel {
                 provider: "openai".to_string(),
                 model: "".to_string(), // Invalid: empty model
                 cost_per_million_input_tokens: 10.0,
                 cost_per_million_output_tokens: 30.0,
                 priority: 100,
+                structured_output_passthrough: None,
             }],
         };
 
@@ -6954,6 +6980,7 @@ mod property_tests {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: vec![
                 ProviderModel {
                     provider: "primary".to_string(),
@@ -6961,6 +6988,7 @@ mod property_tests {
                     cost_per_million_input_tokens: 10.0,
                     cost_per_million_output_tokens: 30.0,
                     priority: 1,
+                    structured_output_passthrough: None,
                 },
                 ProviderModel {
                     provider: "backup".to_string(),
@@ -6968,6 +6996,7 @@ mod property_tests {
                     cost_per_million_input_tokens: 11.0,
                     cost_per_million_output_tokens: 31.0,
                     priority: 2,
+                    structured_output_passthrough: None,
                 },
             ],
         };

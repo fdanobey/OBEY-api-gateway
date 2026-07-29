@@ -52,7 +52,7 @@ impl<'a> ChatToResponsesTranslator<'a> {
     /// * [`CodexError::UnsupportedFeature`] with `feature = "input_audio"`
     ///   when any user message contains an `input_audio` content part
     ///   (Req 14.3).
-    #[tracing::instrument(skip(req))]
+    #[tracing::instrument(skip(req, self))]
     pub fn translate(&self, req: &OpenAIRequest) -> Result<Value, CodexError> {
         // -- Req 14.3: reject audio output up front. -----------------------
         if req.extra.contains_key("audio") {
@@ -83,7 +83,7 @@ impl<'a> ChatToResponsesTranslator<'a> {
             message_count = req.messages.len(),
             tool_count = tool_count,
             effort = self.mapped_effort,
-            "translating chat completion to Codex responses request"
+            "OpenAI Codex Prompt injected."
         );
 
         // -- Top-level envelope (Req 2.1, 2.2, 2.3, 2.6, 2.7, 2.8, 2.12) ---
@@ -352,8 +352,35 @@ fn convert_user_array_content(parts: &[Value]) -> Result<Vec<Value>, CodexError>
                 out.push(json!({"type": "input_text", "text": text}));
             }
             Some("image_url") => {
-                let image_url = part.get("image_url").cloned().unwrap_or(Value::Null);
-                out.push(json!({"type": "input_image", "image_url": image_url}));
+                let image_url = part
+                    .get("image_url")
+                    .and_then(|value| match value {
+                        Value::String(url) => Some(url.clone()),
+                        Value::Object(image) => {
+                            image.get("url").and_then(Value::as_str).map(str::to_owned)
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        CodexError::Translation(
+                            "image_url content part missing string image_url.url".to_string(),
+                        )
+                    })?;
+
+                let detail = part
+                    .get("image_url")
+                    .and_then(Value::as_object)
+                    .and_then(|image| image.get("detail"))
+                    .or_else(|| part.get("detail"))
+                    .cloned();
+
+                let mut input_image = Map::new();
+                input_image.insert("type".to_string(), json!("input_image"));
+                input_image.insert("image_url".to_string(), json!(image_url));
+                if let Some(detail) = detail {
+                    input_image.insert("detail".to_string(), detail);
+                }
+                out.push(Value::Object(input_image));
             }
             // Req 14.3
             Some("input_audio") => {
@@ -513,7 +540,7 @@ mod tests {
             "user",
             json!([
                 {"type":"text","text":"look"},
-                {"type":"image_url","image_url":{"url":"https://x.example/p.png"}},
+                {"type":"image_url","image_url":{"url":"https://x.example/p.png","detail":"high"}},
             ]),
         );
         let req = req_with(vec![m]);
@@ -522,8 +549,37 @@ mod tests {
         assert_eq!(content[0], json!({"type":"input_text","text":"look"}));
         assert_eq!(
             content[1],
-            json!({"type":"input_image","image_url":{"url":"https://x.example/p.png"}})
+            json!({"type":"input_image","image_url":"https://x.example/p.png","detail":"high"})
         );
+    }
+
+    #[test]
+    fn user_array_content_string_image_url_is_preserved() {
+        let m = msg(
+            "user",
+            json!([{"type":"image_url","image_url":"data:image/png;base64,AAEC"}]),
+        );
+        let req = req_with(vec![m]);
+        let out = translator().translate(&req).unwrap();
+        assert_eq!(
+            out["input"][0]["content"][0],
+            json!({"type":"input_image","image_url":"data:image/png;base64,AAEC"})
+        );
+    }
+
+    #[test]
+    fn user_array_content_image_url_without_url_returns_translation_error() {
+        let m = msg(
+            "user",
+            json!([{"type":"image_url","image_url":{"detail":"low"}}]),
+        );
+        let req = req_with(vec![m]);
+        match translator().translate(&req) {
+            Err(CodexError::Translation(message)) => {
+                assert!(message.contains("image_url.url"));
+            }
+            other => panic!("expected image URL translation error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -31,6 +31,7 @@ mod oauth;
 mod providers;
 mod router;
 mod secrets;
+mod structured_output;
 #[cfg(feature = "tray")]
 mod tray;
 mod virtual_keys;

@@ -60,12 +60,14 @@ fn test_config() -> Config {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
                 model: "gpt-4".to_string(),
                 cost_per_million_input_tokens: 30.0,
                 cost_per_million_output_tokens: 60.0,
                 priority: 100,
+                structured_output_passthrough: None,
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -83,6 +85,7 @@ fn test_config() -> Config {
         virtual_keys: Default::default(),
         loop_detection: Default::default(),
         guardrails: None,
+        structured_output: None,
     }
 }
 
@@ -1194,6 +1197,7 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
         name: "gpt-4-group".to_string(),
         version_fallback_enabled: false,
         compression: None,
+        structured_output: None,
         models: vec![
             ProviderModel {
                 provider: "primary".to_string(),
@@ -1201,6 +1205,7 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
                 cost_per_million_input_tokens: 30.0,
                 cost_per_million_output_tokens: 60.0,
                 priority: 100,
+                structured_output_passthrough: None,
             },
             ProviderModel {
                 provider: "backup".to_string(),
@@ -1208,6 +1213,7 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
                 cost_per_million_input_tokens: 30.0,
                 cost_per_million_output_tokens: 60.0,
                 priority: 200,
+                structured_output_passthrough: None,
             },
         ],
     }];
@@ -1519,6 +1525,7 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
         name: "gpt-4-group".to_string(),
         version_fallback_enabled: false,
         compression: None,
+        structured_output: None,
         models: vec![
             ProviderModel {
                 provider: "primary".to_string(),
@@ -1526,6 +1533,7 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
                 cost_per_million_input_tokens: 30.0,
                 cost_per_million_output_tokens: 60.0,
                 priority: 100,
+                structured_output_passthrough: None,
             },
             ProviderModel {
                 provider: "backup".to_string(),
@@ -1533,6 +1541,7 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
                 cost_per_million_input_tokens: 30.0,
                 cost_per_million_output_tokens: 60.0,
                 priority: 200,
+                structured_output_passthrough: None,
             },
         ],
     }];

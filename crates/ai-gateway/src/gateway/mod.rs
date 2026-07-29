@@ -23,6 +23,7 @@ use crate::logger::RequestLogger;
 use crate::metrics::Metrics;
 use crate::oauth::{OAuthManager, OAuthTokenStore};
 use crate::router::router::Router as RequestRouter;
+use crate::structured_output::StructuredOutputEngine;
 use crate::virtual_keys::VirtualKeyManager;
 
 /// Shared application state accessible by all route handlers.
@@ -55,6 +56,13 @@ pub struct AppState {
     /// `state.guardrail_engine.read().await.clone()` and run the whole request
     /// against that clone.
     pub guardrail_engine: Arc<RwLock<Option<Arc<GuardrailEngine>>>>,
+    /// Structured-output engine snapshot.
+    ///
+    /// `None` (inner) when no top-level `structured_output` section is configured.
+    /// The lock-and-`Arc` shape matches the guardrail engine so hot-reload can
+    /// atomically replace the engine while in-flight requests retain their
+    /// existing snapshot.
+    pub structured_output_engine: Arc<RwLock<Option<Arc<StructuredOutputEngine>>>>,
     /// Shared agent-loop detection state and middleware configuration.
     pub loop_detector: Arc<crate::loop_detection::middleware::LoopDetectorState>,
     /// Shared replay/live stream for content-free compression statistics.
@@ -202,6 +210,12 @@ impl GatewayServer {
             None => None,
         };
 
+        let structured_output_engine = StructuredOutputEngine::from_config_with_metrics(
+            &config,
+            metrics.structured_output_metrics(),
+        )
+        .map(Arc::new);
+
         let loop_detector = Arc::new(crate::loop_detection::middleware::LoopDetectorState::new(
             config_arc.clone(),
             config.loop_detection.clone(),
@@ -224,6 +238,7 @@ impl GatewayServer {
             codex_models_discovery: Arc::new(crate::codex::models_discovery::ModelsDiscovery::new()),
             virtual_key_manager,
             guardrail_engine: Arc::new(RwLock::new(guardrail_engine)),
+            structured_output_engine: Arc::new(RwLock::new(structured_output_engine)),
             loop_detector,
             compression_events,
             onnx_assets: Arc::new(crate::compression::assets::OnnxAssetManager::new().map_err(
@@ -628,10 +643,21 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     let loop_detection = new_config.loop_detection.clone();
     let compression = new_config.compression.clone();
     let precompressed_manager = build_precompressed_manager(&new_config, Some(&state.config_path));
+
+    // Build the replacement snapshot before publishing the validated config. The
+    // constructor is currently infallible, and keeping this ordering ensures a
+    // future fallible variant can abort before either live value is replaced.
+    let rebuilt_structured_output_engine = StructuredOutputEngine::from_config_with_metrics(
+        &new_config,
+        state.metrics.structured_output_metrics(),
+    )
+    .map(Arc::new);
+
     {
         let mut cfg = state.config.write().await;
         *cfg = new_config;
     }
+    *state.structured_output_engine.write().await = rebuilt_structured_output_engine;
     state.loop_detector.apply_config(loop_detection).await;
     state
         .router
@@ -770,12 +796,14 @@ mod tests {
                 name: "test-group".to_string(),
                 version_fallback_enabled: false,
                 compression: None,
+                structured_output: None,
                 models: vec![ProviderModel {
                     provider: "test".to_string(),
                     model: "gpt-4".to_string(),
                     cost_per_million_input_tokens: 0.0,
                     cost_per_million_output_tokens: 0.0,
                     priority: 100,
+                    structured_output_passthrough: None,
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -786,6 +814,7 @@ mod tests {
             prometheus: None,
             context: crate::config::ContextConfig::default(),
             compression: Default::default(),
+            structured_output: None,
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,
@@ -803,6 +832,111 @@ mod tests {
         let server = server.unwrap();
         assert!(server.state.cache.is_none());
         assert!(Arc::strong_count(&server.state.compression_events) >= 2);
+    }
+
+    #[tokio::test]
+    async fn gateway_initializes_structured_output_engine_only_when_configured() {
+        let server = GatewayServer::new(minimal_config(), None).await.unwrap();
+        assert!(server.state.structured_output_engine.read().await.is_none());
+
+        let mut config = minimal_config();
+        config.structured_output = Some(Default::default());
+        let server = GatewayServer::new(config, None).await.unwrap();
+        assert!(server.state.structured_output_engine.read().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reload_structured_output_engine_preserves_old_arc_and_applies_new_policy() {
+        let mut config = minimal_config();
+        config.structured_output = Some(crate::structured_output::config::StructuredOutputConfig {
+            enabled: true,
+            max_retries: 1,
+            retry_temperature: 0.1,
+            passthrough_providers: Vec::new(),
+        });
+        let server = GatewayServer::new(config, None).await.unwrap();
+        let old_snapshot = server
+            .state
+            .structured_output_engine
+            .read()
+            .await
+            .clone()
+            .expect("configured engine");
+
+        let mut new_config = minimal_config();
+        new_config.structured_output =
+            Some(crate::structured_output::config::StructuredOutputConfig {
+                enabled: true,
+                max_retries: 4,
+                retry_temperature: 0.7,
+                passthrough_providers: Vec::new(),
+            });
+        new_config.model_groups[0].models[0].structured_output_passthrough = Some(true);
+        let expected_config = new_config.clone();
+        server.reload_config(new_config).await.unwrap();
+
+        assert_eq!(*server.state.config.read().await, expected_config);
+        let new_snapshot = server
+            .state
+            .structured_output_engine
+            .read()
+            .await
+            .clone()
+            .expect("reloaded engine");
+        assert!(!Arc::ptr_eq(&old_snapshot, &new_snapshot));
+        assert_eq!(
+            old_snapshot.effective_config("test-group", "test", "gpt-4"),
+            crate::structured_output::config::EffectiveConfig {
+                enabled: true,
+                max_retries: 1,
+                retry_temperature: 0.1,
+                passthrough: false,
+            }
+        );
+        assert_eq!(
+            new_snapshot.effective_config("test-group", "test", "gpt-4"),
+            crate::structured_output::config::EffectiveConfig {
+                enabled: true,
+                max_retries: 4,
+                retry_temperature: 0.7,
+                passthrough: true,
+            }
+        );
+        assert!(Arc::ptr_eq(
+            &old_snapshot.metrics(),
+            &new_snapshot.metrics()
+        ));
+        assert!(Arc::ptr_eq(
+            &new_snapshot.metrics(),
+            &server.state.metrics.structured_output_metrics()
+        ));
+    }
+
+    #[tokio::test]
+    async fn reload_without_structured_output_clears_engine_but_retains_snapshot() {
+        let mut config = minimal_config();
+        config.structured_output = Some(Default::default());
+        let server = GatewayServer::new(config, None).await.unwrap();
+        let old_snapshot = server
+            .state
+            .structured_output_engine
+            .read()
+            .await
+            .clone()
+            .expect("configured engine");
+
+        server.reload_config(minimal_config()).await.unwrap();
+
+        assert!(server.state.structured_output_engine.read().await.is_none());
+        assert_eq!(
+            old_snapshot.effective_config("test-group", "test", "gpt-4"),
+            crate::structured_output::config::EffectiveConfig {
+                enabled: true,
+                max_retries: 1,
+                retry_temperature: 0.0,
+                passthrough: false,
+            }
+        );
     }
 
     #[tokio::test]
@@ -1167,6 +1301,7 @@ mod tests {
                             cost_per_million_input_tokens: 0.0,
                             cost_per_million_output_tokens: 0.0,
                             priority: 100,
+                            structured_output_passthrough: None,
                         });
                     }
 
@@ -1174,6 +1309,7 @@ mod tests {
                         name: format!("group-{}", g),
                         version_fallback_enabled: false,
                         compression: None,
+                        structured_output: None,
                         models,
                     });
                 }
@@ -1199,6 +1335,7 @@ mod tests {
                     prometheus: None,
                     context: ContextConfig::default(),
                     compression: Default::default(),
+                    structured_output: None,
                     first_launch_completed: false,
                     tray: TrayConfig::default(),
                     codex_instructions_url: None,
@@ -1758,12 +1895,14 @@ mod tests {
                         name: format!("group-{}", provider_suffix),
                         version_fallback_enabled: false,
                         compression: None,
+                        structured_output: None,
                         models: vec![ProviderModel {
                             provider: new_provider_name.clone(),
                             model: "gpt-4".to_string(),
                             cost_per_million_input_tokens: 0.0,
                             cost_per_million_output_tokens: 0.0,
                             priority: 100,
+                            structured_output_passthrough: None,
                         }],
                     }],
                     circuit_breaker: CircuitBreakerConfig::default(),
@@ -1774,6 +1913,7 @@ mod tests {
                     prometheus: None,
                     context: ContextConfig::default(),
                     compression: Default::default(),
+                    structured_output: None,
                     first_launch_completed: false,
                     tray: TrayConfig::default(),
                     codex_instructions_url: None,

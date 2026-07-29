@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::guardrail::GuardrailConfig;
 use crate::secrets;
+use crate::structured_output::config::StructuredOutputConfigError;
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../config.example.yaml");
 
@@ -181,6 +182,25 @@ impl Config {
                         value: error.to_string(),
                         expected: "a valid loop detection configuration".to_string(),
                     }),
+            );
+        }
+
+        let configured_provider_names: std::collections::HashSet<&str> = self
+            .providers
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect();
+
+        if let Some(structured_output) = &self.structured_output {
+            self.validate_structured_output_config(
+                "structured_output",
+                structured_output.validate(),
+                &mut errors,
+            );
+            self.warn_for_unknown_structured_output_providers(
+                "structured_output",
+                &structured_output.passthrough_providers,
+                &configured_provider_names,
             );
         }
 
@@ -404,6 +424,24 @@ impl Config {
                 errors.push(ValidationError::EmptyModelGroup(group.name.clone()));
             }
 
+            if let Some(structured_output) = &group.structured_output {
+                let scope = format!("model_groups.{}.structured_output", group.name);
+                self.validate_structured_output_config(
+                    &scope,
+                    structured_output.validate(),
+                    &mut errors,
+                );
+                if let Some(passthrough_providers) =
+                    structured_output.passthrough_providers.as_deref()
+                {
+                    self.warn_for_unknown_structured_output_providers(
+                        &scope,
+                        passthrough_providers,
+                        &configured_provider_names,
+                    );
+                }
+            }
+
             // Validate each model has provider and model fields (4.3)
             for model in &group.models {
                 if model.provider.is_empty() {
@@ -430,6 +468,52 @@ impl Config {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    fn validate_structured_output_config(
+        &self,
+        scope: &str,
+        result: Result<(), Vec<StructuredOutputConfigError>>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        if let Err(structured_output_errors) = result {
+            errors.extend(structured_output_errors.into_iter().map(|error| {
+                let field = match &error {
+                    StructuredOutputConfigError::InvalidRange { field, .. } => {
+                        format!("{scope}.{field}")
+                    }
+                    StructuredOutputConfigError::TooManyPassthroughProviders { .. } => {
+                        format!("{scope}.passthrough_providers")
+                    }
+                    StructuredOutputConfigError::PassthroughProviderTooLong { index, .. } => {
+                        format!("{scope}.passthrough_providers[{index}]")
+                    }
+                };
+
+                ValidationError::InvalidValue {
+                    field,
+                    value: error.to_string(),
+                    expected: "a valid structured output configuration".to_string(),
+                }
+            }));
+        }
+    }
+
+    fn warn_for_unknown_structured_output_providers(
+        &self,
+        scope: &str,
+        passthrough_providers: &[String],
+        configured_provider_names: &std::collections::HashSet<&str>,
+    ) {
+        for provider_name in passthrough_providers {
+            if !configured_provider_names.contains(provider_name.as_str()) {
+                tracing::warn!(
+                    scope,
+                    provider = %provider_name,
+                    "Structured-output passthrough provider does not match a configured provider"
+                );
+            }
         }
     }
 
@@ -698,6 +782,22 @@ pub fn save_config(path: &Path, config: &Config) -> Result<(), String> {
 mod property_tests {
     use super::*;
     use proptest::prelude::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     // Helper to create minimal valid config
     fn minimal_valid_config() -> Config {
@@ -748,12 +848,14 @@ mod property_tests {
                 name: "test-group".to_string(),
                 version_fallback_enabled: false,
                 compression: None,
+                structured_output: None,
                 models: vec![ProviderModel {
                     provider: "test-provider".to_string(),
                     model: "gpt-4".to_string(),
                     cost_per_million_input_tokens: 10.0,
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
+                    structured_output_passthrough: None,
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -770,6 +872,7 @@ mod property_tests {
             streaming: None,
             virtual_keys: Default::default(),
             loop_detection: Default::default(),
+            structured_output: None,
             guardrails: None,
         }
     }
@@ -1054,6 +1157,84 @@ model_groups:
             )),
             "Should contain InvalidValue error for keepalive_interval_seconds"
         );
+    }
+
+    #[test]
+    fn structured_output_validation_aggregates_global_and_all_group_errors() {
+        let mut config = minimal_valid_config();
+        config.structured_output = Some(crate::structured_output::config::StructuredOutputConfig {
+            max_retries: 6,
+            retry_temperature: 3.0,
+            ..Default::default()
+        });
+        config.model_groups[0].structured_output =
+            Some(crate::structured_output::config::StructuredOutputOverride {
+                max_retries: Some(7),
+                retry_temperature: Some(f32::NAN),
+                ..Default::default()
+            });
+
+        let errors = config.validate().unwrap_err();
+        let structured_output_fields: Vec<&str> = errors
+            .iter()
+            .filter_map(|error| match error {
+                ValidationError::InvalidValue { field, .. }
+                    if field.contains("structured_output") =>
+                {
+                    Some(field.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(structured_output_fields.len(), 4);
+        assert!(structured_output_fields.contains(&"structured_output.max_retries"));
+        assert!(structured_output_fields.contains(&"structured_output.retry_temperature"));
+        assert!(structured_output_fields
+            .contains(&"model_groups.test-group.structured_output.max_retries"));
+        assert!(structured_output_fields
+            .contains(&"model_groups.test-group.structured_output.retry_temperature"));
+    }
+
+    #[test]
+    fn unknown_structured_output_passthrough_provider_warns_without_failing_validation() {
+        use tracing::subscriber::with_default;
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer({
+                let output = Arc::clone(&output);
+                move || CapturedWriter(Arc::clone(&output))
+            })
+            .finish();
+
+        let mut config = minimal_valid_config();
+        config.structured_output = Some(crate::structured_output::config::StructuredOutputConfig {
+            passthrough_providers: vec!["not-configured".to_string()],
+            ..Default::default()
+        });
+        config.model_groups[0].structured_output =
+            Some(crate::structured_output::config::StructuredOutputOverride {
+                passthrough_providers: Some(vec!["also-not-configured".to_string()]),
+                ..Default::default()
+            });
+
+        assert!(with_default(subscriber, || config.validate()).is_ok());
+
+        let warnings = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            warnings
+                .matches(
+                    "Structured-output passthrough provider does not match a configured provider"
+                )
+                .count(),
+            2
+        );
+        assert!(warnings.contains("not-configured"));
+        assert!(warnings.contains("also-not-configured"));
+        assert!(!warnings.contains("schema"));
     }
 
     #[test]

@@ -17,11 +17,12 @@ use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cache::ExactCache;
 use crate::compression::stats::CompressionStats;
-use crate::config::{load_and_validate_config, StreamingConfig};
+use crate::compression::token_counter::TokenCounter;
+use crate::config::{load_and_validate_config, ModelGroup, ProviderModel, StreamingConfig};
 use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
 use crate::gateway::apply_runtime_config_update;
 use crate::guardrail::{
@@ -34,6 +35,12 @@ use crate::models::openai::{Choice, OpenAIRequest, OpenAIResponse};
 use crate::providers::Model;
 use crate::router::trace_id::generate_trace_id;
 use crate::router::StreamingResponse;
+use crate::structured_output::validator::{
+    ChoiceValidationOutcome, ChoiceValidationResult, SchemaViolation,
+};
+use crate::structured_output::{
+    StructuredOutputEngine, StructuredOutputOutcome, ValidationDecision, ValidationSkipReason,
+};
 use crate::virtual_keys::models::AuthenticatedKey;
 
 #[derive(Debug, Clone)]
@@ -219,6 +226,229 @@ fn attach_trace_id_header(response: &mut Response, trace_id: &str) {
     if let Ok(header_value) = HeaderValue::from_str(trace_id) {
         response.headers_mut().insert(header_name, header_value);
     }
+}
+
+const VALIDATION_STATUS_HEADER: &str = "x-obey-validation-status";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationResponseStatus {
+    NotApplicable,
+    Passed,
+    Failed,
+    Skipped,
+}
+
+impl ValidationResponseStatus {
+    fn from_outcome(outcome: StructuredOutputOutcome) -> Self {
+        match outcome {
+            StructuredOutputOutcome::NotApplicable => Self::NotApplicable,
+            StructuredOutputOutcome::Pass => Self::Passed,
+            StructuredOutputOutcome::Fail => Self::Failed,
+            StructuredOutputOutcome::Skipped => Self::Skipped,
+        }
+    }
+
+    fn header_value(self) -> Option<&'static str> {
+        match self {
+            Self::NotApplicable => None,
+            Self::Passed => Some("passed"),
+            Self::Failed => Some("failed"),
+            Self::Skipped => Some("skipped"),
+        }
+    }
+}
+
+fn attach_validation_status_header(
+    response: &mut Response,
+    status: ValidationResponseStatus,
+    applicable_json_schema: bool,
+) {
+    if !applicable_json_schema {
+        return;
+    }
+    let Some(value) = status.header_value() else {
+        return;
+    };
+    response.headers_mut().insert(
+        HeaderName::from_static(VALIDATION_STATUS_HEADER),
+        HeaderValue::from_static(value),
+    );
+}
+
+fn requests_json_schema(request: &OpenAIRequest) -> bool {
+    request
+        .extra
+        .get("response_format")
+        .and_then(|value| value.as_object())
+        .and_then(|response_format| response_format.get("type"))
+        .and_then(|value| value.as_str())
+        == Some("json_schema")
+}
+
+fn cache_allowed_for_validation(
+    request: &OpenAIRequest,
+    validation_status: ValidationResponseStatus,
+) -> bool {
+    !requests_json_schema(request) || matches!(validation_status, ValidationResponseStatus::Passed)
+}
+
+fn force_eager_structured_stream(request: &OpenAIRequest) -> bool {
+    request.stream && requests_json_schema(request)
+}
+
+fn structured_stream_overflow_events(trace_id: &str) -> Vec<Event> {
+    let message = format!(
+        "Buffered streaming response exceeded the {} byte structured output buffer limit",
+        guardrail_stream::MAX_STREAM_BUFFER_BYTES
+    );
+    emit_sse_error_event("structured_output_buffer_overflow", &message, trace_id)
+}
+
+fn should_cache_eager_structured(
+    request: &OpenAIRequest,
+    response: Option<&OpenAIResponse>,
+    validation_status: Option<ValidationResponseStatus>,
+) -> bool {
+    validation_status.is_some_and(|status| cache_allowed_for_validation(request, status))
+        && response.is_some_and(crate::router::router::Router::should_cache_response)
+}
+
+fn rechunk_structured_response(response: &OpenAIResponse) -> Vec<Event> {
+    let client_response = prepare_response_for_client(response);
+    let mut events = guardrail_stream::rechunk_full(&client_response)
+        .into_iter()
+        .map(|chunk| Event::default().data(chunk.to_string()))
+        .collect::<Vec<_>>();
+    events.push(Event::default().data("[DONE]"));
+    events
+}
+
+fn eager_sse_response(
+    events: Vec<Event>,
+    streaming_config: &StreamingConfig,
+    trace_id: &str,
+    validation_status: Option<ValidationResponseStatus>,
+) -> Response {
+    let stream = futures::stream::iter(events.into_iter().map(Ok::<_, Infallible>));
+    let mut response = Sse::new(stream)
+        .keep_alive(build_keepalive(streaming_config))
+        .into_response();
+    if let Some(status) = validation_status {
+        attach_validation_status_header(&mut response, status, true);
+    }
+    attach_trace_id_header(&mut response, trace_id);
+    response
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StructuredOutputFailure {
+    violations: Vec<SchemaViolation>,
+    previous_output: String,
+}
+
+fn collect_structured_output_failure(
+    response: &OpenAIResponse,
+    choices: &[ChoiceValidationOutcome],
+) -> StructuredOutputFailure {
+    let mut violations = Vec::new();
+    let mut previous_outputs = Vec::new();
+
+    for (index, choice) in choices.iter().enumerate() {
+        match &choice.result {
+            ChoiceValidationResult::Pass | ChoiceValidationResult::Skipped => {}
+            ChoiceValidationResult::JsonParseError {
+                byte_offset,
+                expected,
+            } => {
+                violations.push(SchemaViolation {
+                    path: format!("/choices/{index}"),
+                    expected: format!("valid JSON at byte {byte_offset}: {expected}"),
+                    actual: "invalid JSON".to_owned(),
+                });
+                if let Some(response_choice) = response.choices.get(index) {
+                    previous_outputs.push(response_choice.message.content_as_text());
+                }
+            }
+            ChoiceValidationResult::SchemaViolations(choice_violations) => {
+                violations.extend(choice_violations.iter().cloned());
+                if let Some(response_choice) = response.choices.get(index) {
+                    previous_outputs.push(response_choice.message.content_as_text());
+                }
+            }
+        }
+    }
+
+    StructuredOutputFailure {
+        violations,
+        previous_output: previous_outputs.join("\n"),
+    }
+}
+
+fn response_provider_model(response: &OpenAIResponse) -> Option<(&str, &str)> {
+    Some((
+        response.extra.get("gateway_provider")?.as_str()?,
+        response.extra.get("gateway_responded_model")?.as_str()?,
+    ))
+}
+
+fn find_selected_provider_model(
+    model_group: &ModelGroup,
+    provider: &str,
+    model: &str,
+) -> Option<ProviderModel> {
+    model_group
+        .models
+        .iter()
+        .find(|candidate| candidate.provider == provider && candidate.model == model)
+        .cloned()
+}
+
+fn tool_context(request: &OpenAIRequest, response: &OpenAIResponse) -> ToolContext {
+    ToolContext {
+        tool_use_allowed: request
+            .extra
+            .get("tool_choice")
+            .and_then(|value| value.as_str())
+            .map_or(true, |tool_choice| tool_choice != "none"),
+        tools_provided: request
+            .extra
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .is_some_and(|tools| !tools.is_empty()),
+        finish_reason_is_tool_call: response
+            .choices
+            .first()
+            .and_then(|choice| choice.finish_reason.as_deref())
+            == Some("tool_calls"),
+        has_tool_calls: response.choices.first().is_some_and(|choice| {
+            choice
+                .message
+                .extra
+                .get("tool_calls")
+                .and_then(|value| value.as_array())
+                .is_some_and(|tool_calls| !tool_calls.is_empty())
+        }),
+    }
+}
+
+fn consume_provider_error_attempts(error: &GatewayError) -> usize {
+    match error {
+        GatewayError::AllProvidersFailed(aggregated) => aggregated.attempts.len().max(1),
+        _ => 1,
+    }
+}
+
+fn validation_skip_category(reason: &ValidationSkipReason) -> &'static str {
+    match reason {
+        ValidationSkipReason::Disabled => "disabled",
+        ValidationSkipReason::Passthrough => "passthrough",
+        ValidationSkipReason::Malformed(_) => "malformed",
+        ValidationSkipReason::CompileFailed(_) => "compile_failure",
+    }
+}
+
+fn default_context_window() -> usize {
+    crate::config::ContextConfig::default().default_context_window as usize
 }
 
 use super::AppState;
@@ -420,11 +650,10 @@ async fn chat_completions_non_stream(
     let mut request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
     tracing::debug!(model = %request.model, "Routing non-stream request");
 
-    // Snapshot the guardrail engine once for the whole request (Req 1.8): a
-    // concurrent hot-reload swaps `AppState.guardrail_engine` wholesale, but this
-    // request keeps its cloned `Arc` snapshot. `None` means guardrails are not
-    // configured and this handler behaves byte-for-byte as before.
+    // Snapshot request-scoped engines once and release both hot-reload locks
+    // before cache lookup, provider routing, validation, or corrective retries.
     let guardrail_engine = state.guardrail_engine.read().await.clone();
+    let structured_output_engine = state.structured_output_engine.read().await.clone();
 
     // Tier-1: exact-match in-memory cache.  Lookup is always safe — eligibility
     // (deterministic temperature, n=1) is enforced internally.  Tool-using
@@ -622,8 +851,13 @@ async fn chat_completions_non_stream(
                                 // Cannot resolve model group — re-inject on current response and return.
                                 engine.reinject_response(&mut response, &guardrail_ctx);
                                 // fall through to caching/return below
-                                let cacheable =
-                                    crate::router::router::Router::should_cache_response(&response);
+                                let cacheable = cache_allowed_for_validation(
+                                    &request,
+                                    ValidationResponseStatus::NotApplicable,
+                                )
+                                    && crate::router::router::Router::should_cache_response(
+                                        &response,
+                                    );
                                 if cacheable {
                                     let response_json =
                                         serde_json::to_string(&response).unwrap_or_default();
@@ -831,9 +1065,315 @@ async fn chat_completions_non_stream(
                     }
                 }
             }
-            // Cache responses that are safe to replay.  Filter applies to
-            // both tiers (no tool_calls, complete finish_reason, etc.).
-            let cacheable = crate::router::router::Router::should_cache_response(&response);
+            // Structured-output validation runs only after the complete
+            // guardrail/refusal pipeline and before either cache write.
+            let mut validation_status = ValidationResponseStatus::NotApplicable;
+            if let Some(engine) = structured_output_engine.as_ref() {
+                let model_group = state.router.find_model_group(&request.model).await.ok();
+                if let (Some(model_group), Some((provider, model))) =
+                    (model_group.as_ref(), response_provider_model(&response))
+                {
+                    let decision_started = Instant::now();
+                    let validation_decision =
+                        engine.should_validate(&request, &model_group.name, provider, model);
+                    let decision_latency_ms = decision_started.elapsed().as_secs_f64() * 1_000.0;
+                    match validation_decision {
+                        ValidationDecision::NotApplicable => {}
+                        ValidationDecision::Skipped(reason) => {
+                            validation_status = ValidationResponseStatus::Skipped;
+                            state.metrics.observe_structured_output_latency(
+                                provider,
+                                model,
+                                decision_latency_ms,
+                            );
+                            tracing::warn!(
+                                trace_id = %trace_id,
+                                category = validation_skip_category(&reason),
+                                "structured output validation skipped"
+                            );
+                        }
+                        ValidationDecision::Validate(schema_context) => {
+                            let initial_provider = provider.to_owned();
+                            let initial_model = model.to_owned();
+                            let mut gateway_processing_ms = decision_latency_ms;
+                            let mut validation = engine
+                                .validate_response(
+                                    &schema_context,
+                                    &response,
+                                    &initial_provider,
+                                    &initial_model,
+                                )
+                                .await;
+                            gateway_processing_ms += validation.latency_ms;
+                            validation_status =
+                                ValidationResponseStatus::from_outcome(validation.outcome);
+
+                            if validation.outcome == StructuredOutputOutcome::Fail {
+                                let initial_failure = collect_structured_output_failure(
+                                    &response,
+                                    &validation.choices,
+                                );
+                                tracing::info!(
+                                    trace_id = %trace_id,
+                                    provider = %initial_provider,
+                                    model = %initial_model,
+                                    error_count = initial_failure.violations.len(),
+                                    retry_attempt = 0,
+                                    category = "validation_failed",
+                                    "structured output validation failed"
+                                );
+
+                                let original_failed_response = response.clone();
+                                let effective_config = engine.effective_config(
+                                    &model_group.name,
+                                    &initial_provider,
+                                    &initial_model,
+                                );
+                                let target = find_selected_provider_model(
+                                    model_group,
+                                    &initial_provider,
+                                    &initial_model,
+                                );
+
+                                if effective_config.max_retries == 0 {
+                                    validation_status = ValidationResponseStatus::Failed;
+                                } else if let Some(target) = target {
+                                    let context_window = state
+                                        .router
+                                        .context_manager()
+                                        .get_capabilities(&target.model)
+                                        .map(|capabilities| capabilities.context_window as usize)
+                                        .unwrap_or_else(default_context_window);
+                                    let mut remaining_attempts =
+                                        usize::from(effective_config.max_retries);
+                                    let mut last_successful_response = response.clone();
+                                    let mut successful_retry_count = 0usize;
+                                    let mut provider_error_count = 0usize;
+
+                                    while remaining_attempts > 0 {
+                                        let failure = collect_structured_output_failure(
+                                            &last_successful_response,
+                                            &validation.choices,
+                                        );
+                                        let request_tokens =
+                                            TokenCounter::new().count_request(&request) as usize;
+                                        let prompt_started = Instant::now();
+                                        let retry_request = engine.build_retry_request(
+                                            &request,
+                                            &schema_context,
+                                            &failure.violations,
+                                            &failure.previous_output,
+                                            &effective_config,
+                                            false,
+                                            context_window,
+                                            request_tokens,
+                                        );
+                                        gateway_processing_ms +=
+                                            prompt_started.elapsed().as_secs_f64() * 1_000.0;
+
+                                        let retry_result = state
+                                            .router
+                                            .route_with_failover(
+                                                &retry_request,
+                                                vec![target.clone()],
+                                            )
+                                            .await;
+                                        match retry_result {
+                                            Ok(mut retry_response) => {
+                                                successful_retry_count += 1;
+                                                remaining_attempts -= 1;
+
+                                                if let Some(guardrail) = guardrail_engine.as_ref() {
+                                                    let retry_tool_context =
+                                                        tool_context(&request, &retry_response);
+                                                    let guardrail_started = Instant::now();
+                                                    let guardrail_result = guardrail
+                                                        .run_post_call(
+                                                            &mut retry_response,
+                                                            &selector,
+                                                            &mut guardrail_ctx,
+                                                            &trace_id,
+                                                            &retry_tool_context,
+                                                        )
+                                                        .await;
+                                                    gateway_processing_ms +=
+                                                        guardrail_started.elapsed().as_secs_f64()
+                                                            * 1_000.0;
+                                                    match guardrail_result {
+                                                        (PostCallOutcome::Block(block), _) => {
+                                                            return guardrail_error_response(
+                                                                &state,
+                                                                &request,
+                                                                &mut request_guard,
+                                                                &trace_id,
+                                                                GatewayError::GuardrailPolicyViolation {
+                                                                    category: block.entity_label,
+                                                                },
+                                                            );
+                                                        }
+                                                        (PostCallOutcome::ServiceFailure, _) => {
+                                                            return guardrail_error_response(
+                                                                &state,
+                                                                &request,
+                                                                &mut request_guard,
+                                                                &trace_id,
+                                                                GatewayError::GuardrailUnavailable(
+                                                                    "guardrail service unavailable"
+                                                                        .to_owned(),
+                                                                ),
+                                                            );
+                                                        }
+                                                        (
+                                                            PostCallOutcome::Proceed,
+                                                            RefusalDecision::Refusal(_),
+                                                        ) => {
+                                                            last_successful_response =
+                                                                retry_response;
+                                                            break;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+
+                                                let (retry_provider, retry_model) =
+                                                    response_provider_model(&retry_response)
+                                                        .map(|(provider, model)| {
+                                                            (provider.to_owned(), model.to_owned())
+                                                        })
+                                                        .unwrap_or_else(|| {
+                                                            (
+                                                                target.provider.clone(),
+                                                                target.model.clone(),
+                                                            )
+                                                        });
+                                                validation = engine
+                                                    .validate_response(
+                                                        &schema_context,
+                                                        &retry_response,
+                                                        &retry_provider,
+                                                        &retry_model,
+                                                    )
+                                                    .await;
+                                                gateway_processing_ms += validation.latency_ms;
+                                                validation_status =
+                                                    ValidationResponseStatus::from_outcome(
+                                                        validation.outcome,
+                                                    );
+                                                last_successful_response = retry_response;
+
+                                                if validation.outcome
+                                                    == StructuredOutputOutcome::Fail
+                                                {
+                                                    let failure = collect_structured_output_failure(
+                                                        &last_successful_response,
+                                                        &validation.choices,
+                                                    );
+                                                    tracing::info!(
+                                                        trace_id = %trace_id,
+                                                        provider = %retry_provider,
+                                                        model = %retry_model,
+                                                        error_count = failure.violations.len(),
+                                                        retry_attempt = successful_retry_count,
+                                                        category = "validation_failed",
+                                                        "structured output validation failed"
+                                                    );
+                                                }
+
+                                                if validation.outcome
+                                                    == StructuredOutputOutcome::Pass
+                                                {
+                                                    response = last_successful_response.clone();
+                                                    state.metrics.record_structured_output_retry(
+                                                        &initial_provider,
+                                                        &initial_model,
+                                                        "recovered",
+                                                    );
+                                                    break;
+                                                }
+                                                if validation.outcome
+                                                    == StructuredOutputOutcome::Skipped
+                                                {
+                                                    response = last_successful_response.clone();
+                                                    validation_status =
+                                                        ValidationResponseStatus::Skipped;
+                                                    tracing::warn!(
+                                                        trace_id = %trace_id,
+                                                        category = "validation_internal_skip",
+                                                        "structured output validation skipped"
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                            Err(error) => {
+                                                let consumed =
+                                                    consume_provider_error_attempts(&error)
+                                                        .min(remaining_attempts);
+                                                provider_error_count += consumed;
+                                                remaining_attempts -= consumed;
+                                                tracing::warn!(
+                                                    trace_id = %trace_id,
+                                                    category = "provider_error",
+                                                    "structured output retry attempt failed"
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    if validation_status == ValidationResponseStatus::Failed {
+                                        response = last_successful_response.clone();
+                                        if successful_retry_count + provider_error_count > 0 {
+                                            state.metrics.record_structured_output_retry(
+                                                &initial_provider,
+                                                &initial_model,
+                                                "exhausted",
+                                            );
+                                        }
+                                        tracing::warn!(
+                                            trace_id = %trace_id,
+                                            category = "retry_exhausted",
+                                            successful_retry_count,
+                                            provider_error_count,
+                                            "structured output retry exhausted"
+                                        );
+                                    }
+                                } else {
+                                    validation_status = ValidationResponseStatus::Failed;
+                                    response = original_failed_response;
+                                    tracing::warn!(
+                                        trace_id = %trace_id,
+                                        category = "retry_dispatch_setup",
+                                        "structured output retry setup failed"
+                                    );
+                                }
+                            } else if validation.outcome == StructuredOutputOutcome::Skipped {
+                                tracing::warn!(
+                                    trace_id = %trace_id,
+                                    category = "validation_internal_skip",
+                                    "structured output validation skipped"
+                                );
+                            }
+
+                            state.metrics.observe_structured_output_latency(
+                                &initial_provider,
+                                &initial_model,
+                                gateway_processing_ms,
+                            );
+                        }
+                    }
+                } else if requests_json_schema(&request) {
+                    validation_status = ValidationResponseStatus::Skipped;
+                    tracing::warn!(
+                        trace_id = %trace_id,
+                        category = "routing_metadata",
+                        "structured output validation skipped"
+                    );
+                }
+            }
+
+            // Cache responses that are safe to replay. Structured-output skips
+            // and failures are never written to either cache tier.
+            let cacheable = cache_allowed_for_validation(&request, validation_status)
+                && crate::router::router::Router::should_cache_response(&response);
             if cacheable {
                 let response_json = serde_json::to_string(&response).unwrap_or_default();
                 if !response_json.is_empty() {
@@ -857,6 +1397,11 @@ async fn chat_completions_non_stream(
             log_request(&state, &request, &log_context);
             let client_response = prepare_response_for_client(&response);
             let mut http_response = Json(client_response).into_response();
+            attach_validation_status_header(
+                &mut http_response,
+                validation_status,
+                requests_json_schema(&request),
+            );
             attach_trace_id_header(&mut http_response, &trace_id);
             http_response
         }
@@ -898,7 +1443,13 @@ async fn chat_completions_stream(
         .clone()
         .unwrap_or_default();
 
-    // Tier-1 cache lookup for streaming requests.  The cached payload is a
+    // Snapshot request-scoped engines once before cache lookup, pre-call
+    // processing, routing, or validation. The hot-reload locks are never held
+    // across an await below.
+    let guardrail_engine = state.guardrail_engine.read().await.clone();
+    let structured_output_engine = state.structured_output_engine.read().await.clone();
+
+    // Tier-1 cache lookup for streaming requests. The cached payload is a
     // full non-streaming `OpenAIResponse` JSON; we re-emit it as SSE chunks
     // using the same path as a fresh provider response.  This means a single
     // cached entry serves both stream and non-stream callers identically.
@@ -927,29 +1478,19 @@ async fn chat_completions_stream(
     }
 
     // -----------------------------------------------------------------
-    // Guardrail hooks (opt-in) for streaming (Req 10). Mirrors the non-stream
-    // handler: snapshot the engine once (Req 1.8), run pre-call BEFORE routing,
-    // and — when a post-call pipeline is bound — force the buffered path so the
-    // assembled response can be analyzed before any bytes reach the caller.
-    //
-    // Cache hits above are served WITHOUT guardrail evaluation (same documented
-    // limitation as the non-stream path). When the engine is `None`, or no
-    // post-call stage is bound, the existing pass-through/buffered SSE behavior
-    // below is preserved byte-for-byte.
+    // Guardrail hooks (opt-in) for streaming (Req 10). Run pre-call before
+    // routing; any bound post-call stage later forces full-response buffering.
+    // Cache hits above intentionally bypass both guardrails and validation.
     // -----------------------------------------------------------------
-    let guardrail_engine = state.guardrail_engine.read().await.clone();
+    let mut guardrail_ctx = GuardrailContext::new();
+    let selector = BindingSelector::new(
+        virtual_key_id,
+        Some(request.model.clone()),
+        Some("/v1/chat/completions".to_string()),
+    );
     if let Some(engine) = guardrail_engine.as_ref() {
         // Request-scoped context carrying the PII Re_Injection_Map from pre-call
         // redaction into post-call re-injection (Req 9.5).
-        let mut guardrail_ctx = GuardrailContext::new();
-        // Bindings resolve from the authenticated virtual-key id (when key
-        // enforcement is active), the requested model group, and the route path
-        // (Req 1.3, 1.7), matching the non-stream handler.
-        let selector = BindingSelector::new(
-            virtual_key_id.clone(),
-            Some(request.model.clone()),
-            Some("/v1/chat/completions".to_string()),
-        );
 
         // Pre-call runs before routing. Nothing has streamed yet, so on a
         // terminal pre-call outcome we return a plain JSON error response
@@ -1006,7 +1547,7 @@ async fn chat_completions_stream(
             .iter()
             .any(|s| s.phase == StagePhase::PostCall);
         let needs_buffering = post_call_bound || !guardrail_ctx.is_empty();
-        if needs_buffering {
+        if needs_buffering && !force_eager_structured_stream(&request) {
             return stream_buffered_with_post_call(
                 state,
                 request,
@@ -1020,8 +1561,25 @@ async fn chat_completions_stream(
             .await;
         }
         // No post-call pipeline and no pending re-injection: fall through to the
-        // existing SSE behavior with the (possibly pre-call-mutated) request.
-        // `guardrail_ctx` is dropped.
+        // normal SSE path unless structured output below forces eager buffering.
+    }
+
+    // A streaming JSON-schema request is always resolved eagerly. This occurs
+    // before synthetic early events or construction of a lazy SSE body, so the
+    // validation status header is final before the first response byte.
+    if force_eager_structured_stream(&request) {
+        return stream_eager_structured_output(
+            state,
+            request,
+            trace_id,
+            start,
+            streaming_config,
+            guardrail_engine,
+            structured_output_engine,
+            selector,
+            guardrail_ctx,
+        )
+        .await;
     }
 
     // Req 1: resolve the effective streaming settings — done above so all SSE
@@ -1481,6 +2039,679 @@ async fn chat_completions_stream(
     Sse::new(stream)
         .keep_alive(build_keepalive(&streaming_config))
         .into_response()
+}
+
+#[derive(Debug)]
+enum EagerPostCallResult {
+    Response(OpenAIResponse),
+    Terminal {
+        events: Vec<Event>,
+        error: GatewayError,
+    },
+}
+
+enum EagerSinglePostCall {
+    Response {
+        response: OpenAIResponse,
+        refusal: bool,
+        replaced: bool,
+    },
+    Terminal(EagerPostCallResult),
+}
+
+async fn finalize_single_eager_post_call(
+    engine: &GuardrailEngine,
+    request: &OpenAIRequest,
+    mut response: OpenAIResponse,
+    selector: &BindingSelector,
+    guardrail_ctx: &mut GuardrailContext,
+    trace_id: &str,
+) -> EagerSinglePostCall {
+    let tool_ctx = tool_context(request, &response);
+    let (post_outcome, refusal) = engine
+        .run_post_call(&mut response, selector, guardrail_ctx, trace_id, &tool_ctx)
+        .await;
+    match post_outcome {
+        PostCallOutcome::Proceed => EagerSinglePostCall::Response {
+            response,
+            refusal: refusal.is_refusal(),
+            replaced: false,
+        },
+        PostCallOutcome::Replaced => EagerSinglePostCall::Response {
+            response,
+            refusal: false,
+            replaced: true,
+        },
+        PostCallOutcome::Block(block) => {
+            EagerSinglePostCall::Terminal(EagerPostCallResult::Terminal {
+                events: vec![
+                    Event::default().data(
+                        guardrail_stream::block_frame_payload(&block.entity_label).to_string(),
+                    ),
+                    Event::default().data("[DONE]"),
+                ],
+                error: GatewayError::GuardrailPolicyViolation {
+                    category: block.entity_label,
+                },
+            })
+        }
+        PostCallOutcome::ServiceFailure => {
+            let message = "guardrail service unavailable".to_owned();
+            EagerSinglePostCall::Terminal(EagerPostCallResult::Terminal {
+                events: emit_sse_error_event("guardrail_unavailable", &message, trace_id),
+                error: GatewayError::GuardrailUnavailable(message),
+            })
+        }
+    }
+}
+
+async fn finalize_eager_post_call(
+    state: &AppState,
+    request: &OpenAIRequest,
+    mut response: OpenAIResponse,
+    guardrail_engine: Option<&Arc<GuardrailEngine>>,
+    selector: &BindingSelector,
+    guardrail_ctx: &mut GuardrailContext,
+    trace_id: &str,
+) -> EagerPostCallResult {
+    let Some(engine) = guardrail_engine else {
+        return EagerPostCallResult::Response(response);
+    };
+
+    let tool_ctx = tool_context(request, &response);
+    match engine
+        .run_post_call(&mut response, selector, guardrail_ctx, trace_id, &tool_ctx)
+        .await
+    {
+        (PostCallOutcome::Proceed, RefusalDecision::NotRefusal)
+        | (PostCallOutcome::Replaced, _) => EagerPostCallResult::Response(response),
+        (PostCallOutcome::Block(block), _) => EagerPostCallResult::Terminal {
+            events: vec![
+                Event::default()
+                    .data(guardrail_stream::block_frame_payload(&block.entity_label).to_string()),
+                Event::default().data("[DONE]"),
+            ],
+            error: GatewayError::GuardrailPolicyViolation {
+                category: block.entity_label,
+            },
+        },
+        (PostCallOutcome::ServiceFailure, _) => {
+            let message = "guardrail service unavailable".to_owned();
+            EagerPostCallResult::Terminal {
+                events: emit_sse_error_event("guardrail_unavailable", &message, trace_id),
+                error: GatewayError::GuardrailUnavailable(message),
+            }
+        }
+        (PostCallOutcome::Proceed, RefusalDecision::Refusal(_)) => {
+            let model_group = match state.router.find_model_group(&request.model).await {
+                Ok(model_group) => model_group,
+                Err(_) => {
+                    engine.reinject_response(&mut response, guardrail_ctx);
+                    return EagerPostCallResult::Response(response);
+                }
+            };
+            let fallback_order = state.router.select_provider_order(&model_group).await;
+            let already_tried_provider = response
+                .extra
+                .get("gateway_provider")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let mut tried = vec![already_tried_provider];
+            let mut last_response = response;
+            let mut skip_reinjection = false;
+
+            for target in &fallback_order {
+                if tried.contains(&target.provider) {
+                    continue;
+                }
+                let target_key = format!("{}:{}", target.provider, target.model);
+                let circuit_breaker = state.router.get_circuit_breaker(&target_key).await;
+                if !circuit_breaker.is_available().await {
+                    continue;
+                }
+                tried.push(target.provider.clone());
+
+                let Ok(candidate) = state
+                    .router
+                    .route_with_failover(request, vec![target.clone()])
+                    .await
+                else {
+                    tracing::debug!(
+                        trace_id,
+                        provider = %target.provider,
+                        model = %target.model,
+                        category = "refusal_provider_error",
+                        "structured streaming refusal failover provider failed"
+                    );
+                    continue;
+                };
+
+                match finalize_single_eager_post_call(
+                    engine,
+                    request,
+                    candidate,
+                    selector,
+                    guardrail_ctx,
+                    trace_id,
+                )
+                .await
+                {
+                    EagerSinglePostCall::Response {
+                        response: candidate,
+                        refusal,
+                        replaced,
+                    } => {
+                        last_response = candidate;
+                        if replaced {
+                            skip_reinjection = true;
+                            break;
+                        }
+                        if !refusal {
+                            break;
+                        }
+                    }
+                    EagerSinglePostCall::Terminal(result) => return result,
+                }
+            }
+
+            if !skip_reinjection {
+                engine.reinject_response(&mut last_response, guardrail_ctx);
+            }
+            EagerPostCallResult::Response(last_response)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn validate_eager_structured_response(
+    state: &AppState,
+    request: &OpenAIRequest,
+    mut response: OpenAIResponse,
+    engine: Option<&Arc<StructuredOutputEngine>>,
+    guardrail_engine: Option<&Arc<GuardrailEngine>>,
+    selector: &BindingSelector,
+    guardrail_ctx: &mut GuardrailContext,
+    trace_id: &str,
+) -> Result<(OpenAIResponse, ValidationResponseStatus), EagerPostCallResult> {
+    let Some(engine) = engine else {
+        tracing::warn!(
+            trace_id,
+            category = "disabled",
+            "structured streaming validation skipped"
+        );
+        return Ok((response, ValidationResponseStatus::Skipped));
+    };
+    let model_group = match state.router.find_model_group(&request.model).await {
+        Ok(model_group) => model_group,
+        Err(_) => {
+            tracing::warn!(
+                trace_id,
+                category = "routing_metadata",
+                "structured streaming validation skipped"
+            );
+            return Ok((response, ValidationResponseStatus::Skipped));
+        }
+    };
+    let Some((provider, model)) = response_provider_model(&response) else {
+        tracing::warn!(
+            trace_id,
+            category = "routing_metadata",
+            "structured streaming validation skipped"
+        );
+        return Ok((response, ValidationResponseStatus::Skipped));
+    };
+
+    let decision_started = Instant::now();
+    let validation_decision = engine.should_validate(request, &model_group.name, provider, model);
+    let decision_latency_ms = decision_started.elapsed().as_secs_f64() * 1_000.0;
+    match validation_decision {
+        ValidationDecision::NotApplicable => {
+            Ok((response, ValidationResponseStatus::NotApplicable))
+        }
+        ValidationDecision::Skipped(reason) => {
+            state
+                .metrics
+                .observe_structured_output_latency(provider, model, decision_latency_ms);
+            tracing::warn!(
+                trace_id,
+                category = validation_skip_category(&reason),
+                "structured streaming validation skipped"
+            );
+            Ok((response, ValidationResponseStatus::Skipped))
+        }
+        ValidationDecision::Validate(schema_context) => {
+            let initial_provider = provider.to_owned();
+            let initial_model = model.to_owned();
+            let mut gateway_processing_ms = decision_latency_ms;
+            let mut validation = engine
+                .validate_response(
+                    &schema_context,
+                    &response,
+                    &initial_provider,
+                    &initial_model,
+                )
+                .await;
+            gateway_processing_ms += validation.latency_ms;
+            let mut status = ValidationResponseStatus::from_outcome(validation.outcome);
+
+            if validation.outcome == StructuredOutputOutcome::Fail {
+                let initial_failure =
+                    collect_structured_output_failure(&response, &validation.choices);
+                tracing::info!(
+                    trace_id,
+                    provider = %initial_provider,
+                    model = %initial_model,
+                    error_count = initial_failure.violations.len(),
+                    retry_attempt = 0,
+                    category = "validation_failed",
+                    "structured streaming output validation failed"
+                );
+                let original_failed_response = response.clone();
+                let effective_config =
+                    engine.effective_config(&model_group.name, &initial_provider, &initial_model);
+                let target =
+                    find_selected_provider_model(&model_group, &initial_provider, &initial_model);
+
+                if effective_config.max_retries == 0 {
+                    status = ValidationResponseStatus::Failed;
+                } else if let Some(target) = target {
+                    let context_window = state
+                        .router
+                        .context_manager()
+                        .get_capabilities(&target.model)
+                        .map(|capabilities| capabilities.context_window as usize)
+                        .unwrap_or_else(default_context_window);
+                    let mut remaining_attempts = usize::from(effective_config.max_retries);
+                    let mut last_successful_response = response.clone();
+                    let mut successful_retry_count = 0usize;
+                    let mut provider_error_count = 0usize;
+
+                    while remaining_attempts > 0 {
+                        let failure = collect_structured_output_failure(
+                            &last_successful_response,
+                            &validation.choices,
+                        );
+                        let request_tokens = TokenCounter::new().count_request(request) as usize;
+                        let prompt_started = Instant::now();
+                        let retry_request = engine.build_retry_request(
+                            request,
+                            &schema_context,
+                            &failure.violations,
+                            &failure.previous_output,
+                            &effective_config,
+                            true,
+                            context_window,
+                            request_tokens,
+                        );
+                        gateway_processing_ms += prompt_started.elapsed().as_secs_f64() * 1_000.0;
+                        debug_assert!(!retry_request.stream);
+
+                        match state
+                            .router
+                            .route_with_failover(&retry_request, vec![target.clone()])
+                            .await
+                        {
+                            Ok(retry_response) => {
+                                successful_retry_count += 1;
+                                remaining_attempts -= 1;
+                                let retry_response = if let Some(guardrail) = guardrail_engine {
+                                    let guardrail_started = Instant::now();
+                                    let post_call = finalize_single_eager_post_call(
+                                        guardrail,
+                                        request,
+                                        retry_response,
+                                        selector,
+                                        guardrail_ctx,
+                                        trace_id,
+                                    )
+                                    .await;
+                                    gateway_processing_ms +=
+                                        guardrail_started.elapsed().as_secs_f64() * 1_000.0;
+                                    match post_call {
+                                        EagerSinglePostCall::Response {
+                                            response,
+                                            refusal: true,
+                                            ..
+                                        } => {
+                                            last_successful_response = response;
+                                            break;
+                                        }
+                                        EagerSinglePostCall::Response { response, .. } => response,
+                                        EagerSinglePostCall::Terminal(terminal) => {
+                                            return Err(terminal)
+                                        }
+                                    }
+                                } else {
+                                    retry_response
+                                };
+                                let (retry_provider, retry_model) =
+                                    response_provider_model(&retry_response)
+                                        .map(|(provider, model)| {
+                                            (provider.to_owned(), model.to_owned())
+                                        })
+                                        .unwrap_or_else(|| {
+                                            (target.provider.clone(), target.model.clone())
+                                        });
+                                validation = engine
+                                    .validate_response(
+                                        &schema_context,
+                                        &retry_response,
+                                        &retry_provider,
+                                        &retry_model,
+                                    )
+                                    .await;
+                                gateway_processing_ms += validation.latency_ms;
+                                status = ValidationResponseStatus::from_outcome(validation.outcome);
+                                last_successful_response = retry_response;
+
+                                if validation.outcome == StructuredOutputOutcome::Pass {
+                                    response = last_successful_response.clone();
+                                    state.metrics.record_structured_output_retry(
+                                        &initial_provider,
+                                        &initial_model,
+                                        "recovered",
+                                    );
+                                    break;
+                                }
+                                if validation.outcome == StructuredOutputOutcome::Skipped {
+                                    response = last_successful_response.clone();
+                                    tracing::warn!(
+                                        trace_id,
+                                        category = "validation_internal_skip",
+                                        "structured streaming validation skipped"
+                                    );
+                                    break;
+                                }
+                                let retry_failure = collect_structured_output_failure(
+                                    &last_successful_response,
+                                    &validation.choices,
+                                );
+                                tracing::info!(
+                                    trace_id,
+                                    provider = %retry_provider,
+                                    model = %retry_model,
+                                    error_count = retry_failure.violations.len(),
+                                    retry_attempt = successful_retry_count,
+                                    category = "validation_failed",
+                                    "structured streaming output validation failed"
+                                );
+                            }
+                            Err(error) => {
+                                let consumed =
+                                    consume_provider_error_attempts(&error).min(remaining_attempts);
+                                provider_error_count += consumed;
+                                remaining_attempts -= consumed;
+                                tracing::warn!(
+                                    trace_id,
+                                    category = "provider_error",
+                                    "structured streaming retry provider failed"
+                                );
+                            }
+                        }
+                    }
+
+                    if status == ValidationResponseStatus::Failed {
+                        response = last_successful_response;
+                        if successful_retry_count + provider_error_count > 0 {
+                            state.metrics.record_structured_output_retry(
+                                &initial_provider,
+                                &initial_model,
+                                "exhausted",
+                            );
+                        }
+                        tracing::warn!(
+                            trace_id,
+                            category = "retry_exhausted",
+                            successful_retry_count,
+                            provider_error_count,
+                            "structured streaming retry exhausted"
+                        );
+                    }
+                } else {
+                    response = original_failed_response;
+                    status = ValidationResponseStatus::Failed;
+                    tracing::warn!(
+                        trace_id,
+                        category = "retry_dispatch_setup",
+                        "structured streaming retry setup failed"
+                    );
+                }
+            } else if validation.outcome == StructuredOutputOutcome::Skipped {
+                tracing::warn!(
+                    trace_id,
+                    category = "validation_internal_skip",
+                    "structured streaming validation skipped"
+                );
+            }
+
+            state.metrics.observe_structured_output_latency(
+                &initial_provider,
+                &initial_model,
+                gateway_processing_ms,
+            );
+            Ok((response, status))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_eager_structured_output(
+    state: AppState,
+    request: OpenAIRequest,
+    trace_id: String,
+    start: std::time::Instant,
+    streaming_config: StreamingConfig,
+    guardrail_engine: Option<Arc<GuardrailEngine>>,
+    structured_output_engine: Option<Arc<StructuredOutputEngine>>,
+    selector: BindingSelector,
+    mut guardrail_ctx: GuardrailContext,
+) -> Response {
+    let mut request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
+    let mut response = match state.router.route_request_streaming(&request).await {
+        Ok(StreamingResponse::Buffered(response)) => response,
+        Ok(StreamingResponse::PassThrough {
+            byte_stream,
+            provider,
+            model,
+            compression,
+        }) => {
+            let mut buffer = guardrail_stream::SseBuffer::with_default_cap();
+            let mut bytes = byte_stream.bytes_stream();
+            while let Some(chunk) = bytes.next().await {
+                match chunk {
+                    Ok(chunk) if buffer.push_bytes(&chunk).is_ok() => {}
+                    Ok(_) => {
+                        let message = format!(
+                            "Buffered streaming response exceeded the {} byte structured output buffer limit",
+                            guardrail_stream::MAX_STREAM_BUFFER_BYTES
+                        );
+                        let error = GatewayError::GuardrailUnavailable(message);
+                        let duration_ms = request_guard.complete();
+                        let log_context = RequestLogContext::from_error(
+                            &request,
+                            trace_id.clone(),
+                            duration_ms,
+                            &error,
+                        );
+                        log_request(&state, &request, &log_context);
+                        return eager_sse_response(
+                            structured_stream_overflow_events(&trace_id),
+                            &streaming_config,
+                            &trace_id,
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        let gateway_error = GatewayError::GuardrailUnavailable(format!(
+                            "Upstream streaming response could not be buffered: {error}"
+                        ));
+                        let duration_ms = request_guard.complete();
+                        let log_context = RequestLogContext::from_error(
+                            &request,
+                            trace_id.clone(),
+                            duration_ms,
+                            &gateway_error,
+                        );
+                        log_request(&state, &request, &log_context);
+                        return eager_sse_response(
+                            emit_sse_error_event(
+                                "stream_error",
+                                &gateway_error.to_string(),
+                                &trace_id,
+                            ),
+                            &streaming_config,
+                            &trace_id,
+                            None,
+                        );
+                    }
+                }
+            }
+
+            let assembled = match buffer.assemble() {
+                Ok(assembled) => assembled,
+                Err(message) => {
+                    let gateway_error = GatewayError::GuardrailUnavailable(message);
+                    let duration_ms = request_guard.complete();
+                    let log_context = RequestLogContext::from_error(
+                        &request,
+                        trace_id.clone(),
+                        duration_ms,
+                        &gateway_error,
+                    );
+                    log_request(&state, &request, &log_context);
+                    return eager_sse_response(
+                        emit_sse_error_event("stream_error", &gateway_error.to_string(), &trace_id),
+                        &streaming_config,
+                        &trace_id,
+                        None,
+                    );
+                }
+            };
+            if !assembled.complete {
+                let message = "Upstream stream ended before a complete structured output response";
+                let gateway_error = GatewayError::GuardrailUnavailable(message.to_owned());
+                let duration_ms = request_guard.complete();
+                let log_context = RequestLogContext::from_error(
+                    &request,
+                    trace_id.clone(),
+                    duration_ms,
+                    &gateway_error,
+                );
+                log_request(&state, &request, &log_context);
+                return eager_sse_response(
+                    emit_sse_error_event("stream_error", message, &trace_id),
+                    &streaming_config,
+                    &trace_id,
+                    None,
+                );
+            }
+
+            let mut response = assembled.response;
+            response.extra.insert(
+                "gateway_provider".to_owned(),
+                serde_json::Value::String(provider),
+            );
+            response.extra.insert(
+                "gateway_responded_model".to_owned(),
+                serde_json::Value::String(model),
+            );
+            response.extra.insert(
+                "gateway_compression".to_owned(),
+                serde_json::to_value(compression)
+                    .expect("CompressionStats serialization must succeed"),
+            );
+            response
+        }
+        Err(error) => {
+            let duration_ms = request_guard.complete();
+            let log_context =
+                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
+            log_request(&state, &request, &log_context);
+            let (error_type, message) = classify_stream_error(&error);
+            return eager_sse_response(
+                emit_sse_error_event(error_type, &message, &trace_id),
+                &streaming_config,
+                &trace_id,
+                None,
+            );
+        }
+    };
+
+    response = match finalize_eager_post_call(
+        &state,
+        &request,
+        response,
+        guardrail_engine.as_ref(),
+        &selector,
+        &mut guardrail_ctx,
+        &trace_id,
+    )
+    .await
+    {
+        EagerPostCallResult::Response(response) => response,
+        EagerPostCallResult::Terminal { events, error } => {
+            let duration_ms = request_guard.complete();
+            let log_context =
+                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
+            log_request(&state, &request, &log_context);
+            return eager_sse_response(events, &streaming_config, &trace_id, None);
+        }
+    };
+
+    let (response, validation_status) = match validate_eager_structured_response(
+        &state,
+        &request,
+        response,
+        structured_output_engine.as_ref(),
+        guardrail_engine.as_ref(),
+        &selector,
+        &mut guardrail_ctx,
+        &trace_id,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(EagerPostCallResult::Terminal { events, error }) => {
+            let duration_ms = request_guard.complete();
+            let log_context =
+                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
+            log_request(&state, &request, &log_context);
+            return eager_sse_response(events, &streaming_config, &trace_id, None);
+        }
+        Err(EagerPostCallResult::Response(_)) => unreachable!(),
+    };
+
+    if should_cache_eager_structured(&request, Some(&response), Some(validation_status)) {
+        if let Ok(json) = serde_json::to_string(&response) {
+            state.exact_cache.set(&request, json.clone());
+            let skip_semantic =
+                request.extra.contains_key("tools") || request.extra.contains_key("tool_choice");
+            if !skip_semantic {
+                if let Some(cache) = state.cache.as_ref() {
+                    if let Err(error) = cache.set(&request, &json, 0.0).await {
+                        tracing::warn!(
+                            trace_id,
+                            category = "semantic_cache_write",
+                            "failed to cache validated structured streaming response: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let events = rechunk_structured_response(&response);
+    let duration_ms = request_guard.complete();
+    let log_context =
+        RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
+    log_request(&state, &request, &log_context);
+    eager_sse_response(
+        events,
+        &streaming_config,
+        &trace_id,
+        Some(validation_status),
+    )
 }
 
 /// Streaming handler variant used when a post-call guardrail pipeline is bound
@@ -2768,16 +3999,27 @@ fn reasoning_delta(choice: Option<&Choice>) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_keepalive, chunk_carries_content, classify_relay_line, classify_stream_error,
-        early_event_chunk, emit_sse_error_event, prepare_response_for_client,
-        relay_passthrough_stream, sse_error_payload, streaming_chunks_after_early_event,
-        streaming_chunks_from_response, RelayLineAction, RelayOutcome, RequestLogContext,
+        attach_validation_status_header, build_keepalive, cache_allowed_for_validation,
+        chunk_carries_content, classify_relay_line, classify_stream_error,
+        collect_structured_output_failure, eager_sse_response, early_event_chunk,
+        emit_sse_error_event, force_eager_structured_stream, prepare_response_for_client,
+        rechunk_structured_response, relay_passthrough_stream, should_cache_eager_structured,
+        sse_error_payload, streaming_chunks_after_early_event, streaming_chunks_from_response,
+        structured_stream_overflow_events, RelayLineAction, RelayOutcome, RequestLogContext,
+        ValidationResponseStatus,
     };
     use crate::compression::{stats::CompressionStats, CompressionLevel};
     use crate::config::StreamingConfig;
     use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
     use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
+    use crate::structured_output::validator::{
+        ChoiceValidationOutcome, ChoiceValidationResult, SchemaViolation,
+    };
+    use crate::structured_output::StructuredOutputOutcome;
+    use axum::response::{IntoResponse, Response};
+    use axum::Json;
     use futures::StreamExt;
+    use proptest::prelude::*;
     use std::time::Duration;
 
     fn base_response(message: Message) -> OpenAIResponse {
@@ -2821,6 +4063,363 @@ mod tests {
             model: "model".to_owned(),
             engine_results: Vec::new(),
         }
+    }
+
+    fn request_with_response_format(
+        stream: bool,
+        response_format: serde_json::Value,
+    ) -> OpenAIRequest {
+        let mut request = OpenAIRequest {
+            model: "test-model".to_owned(),
+            messages: Vec::new(),
+            stream,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+        request
+            .extra
+            .insert("response_format".to_owned(), response_format);
+        request
+    }
+
+    fn validation_outcome_strategy() -> impl Strategy<Value = StructuredOutputOutcome> {
+        prop_oneof![
+            Just(StructuredOutputOutcome::Pass),
+            Just(StructuredOutputOutcome::Fail),
+            Just(StructuredOutputOutcome::Skipped),
+        ]
+    }
+
+    fn json_value_strategy() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|value| serde_json::json!(value)),
+            prop::collection::vec(any::<char>(), 0..64)
+                .prop_map(|characters| serde_json::Value::String(characters.into_iter().collect())),
+        ];
+
+        leaf.prop_recursive(4, 64, 8, |inner| {
+            let key = prop::collection::vec(any::<char>(), 0..24)
+                .prop_map(|characters| characters.into_iter().collect::<String>());
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..8).prop_map(serde_json::Value::Array),
+                prop::collection::btree_map(key, inner, 0..8).prop_map(|entries| {
+                    serde_json::Value::Object(entries.into_iter().collect())
+                }),
+            ]
+        })
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SkipScenario {
+        SchemaCompilationFailure,
+        InternalError,
+        Timeout,
+    }
+
+    fn skip_scenario_strategy() -> impl Strategy<Value = SkipScenario> {
+        prop_oneof![
+            Just(SkipScenario::SchemaCompilationFailure),
+            Just(SkipScenario::InternalError),
+            Just(SkipScenario::Timeout),
+        ]
+    }
+
+    fn response_body_bytes(response: Response) -> Vec<u8> {
+        futures::executor::block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .expect("in-memory response body must be readable")
+            .to_vec()
+    }
+
+    fn assert_skipped_header_is_only_header_change(
+        before: &axum::http::HeaderMap,
+        response: &Response,
+    ) {
+        assert_eq!(response.headers().len(), before.len() + 1);
+        for (name, value) in before {
+            assert_eq!(response.headers().get(name), Some(value));
+        }
+        assert_eq!(
+            response
+                .headers()
+                .get("x-obey-validation-status")
+                .and_then(|value| value.to_str().ok()),
+            Some("skipped")
+        );
+    }
+
+    // Feature: structured-output-validation, Property 12: Cache Write Gating
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn prop_cache_write_gating(
+            outcome in validation_outcome_strategy(),
+            otherwise_cacheable in any::<bool>(),
+        ) {
+            let request = request_with_response_format(
+                false,
+                serde_json::json!({
+                    "type": "json_schema",
+                    "json_schema": {"schema": {"type": "object"}},
+                }),
+            );
+            let status = ValidationResponseStatus::from_outcome(outcome);
+            let mut response = base_response(Message {
+                role: "assistant".to_owned(),
+                content: serde_json::json!({"arbitrary": "body"}),
+                extra: Default::default(),
+            });
+            response.choices[0].finish_reason = Some(
+                if otherwise_cacheable { "stop" } else { "length" }.to_owned(),
+            );
+
+            let router_allows = crate::router::router::Router::should_cache_response(&response);
+            let cache_write_allowed =
+                cache_allowed_for_validation(&request, status) && router_allows;
+
+            prop_assert_eq!(router_allows, otherwise_cacheable);
+            prop_assert_eq!(
+                cache_write_allowed,
+                outcome == StructuredOutputOutcome::Pass && otherwise_cacheable,
+            );
+        }
+    }
+
+    // Feature: structured-output-validation, Property 13: Skip Scenario Identity
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn prop_skip_scenario_identity(
+            scenario in skip_scenario_strategy(),
+            json_body in json_value_strategy(),
+            utf8_characters in prop::collection::vec(any::<char>(), 0..512),
+        ) {
+            let expected_json = serde_json::to_vec(&json_body)
+                .expect("generated JSON body must serialize");
+            let mut json_response = Json(json_body).into_response();
+            let json_headers_before = json_response.headers().clone();
+            attach_validation_status_header(
+                &mut json_response,
+                ValidationResponseStatus::Skipped,
+                true,
+            );
+            assert_skipped_header_is_only_header_change(&json_headers_before, &json_response);
+            prop_assert_eq!(
+                response_body_bytes(json_response),
+                expected_json,
+                "JSON body changed for {:?}",
+                scenario,
+            );
+
+            let expected_utf8 = utf8_characters.into_iter().collect::<String>().into_bytes();
+            let mut byte_response = Response::new(axum::body::Body::from(expected_utf8.clone()));
+            let byte_headers_before = byte_response.headers().clone();
+            attach_validation_status_header(
+                &mut byte_response,
+                ValidationResponseStatus::Skipped,
+                true,
+            );
+            assert_skipped_header_is_only_header_change(&byte_headers_before, &byte_response);
+            prop_assert_eq!(
+                response_body_bytes(byte_response),
+                expected_utf8,
+                "UTF-8 body bytes changed for {:?}",
+                scenario,
+            );
+        }
+    }
+
+    #[test]
+    fn structured_streaming_forces_eager_buffering_only_for_json_schema() {
+        let mut request = request_with_response_format(
+            true,
+            serde_json::json!({"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}),
+        );
+        assert!(force_eager_structured_stream(&request));
+
+        request.stream = false;
+        assert!(!force_eager_structured_stream(&request));
+        request.stream = true;
+        request.extra.insert(
+            "response_format".to_owned(),
+            serde_json::json!({"type": "json_object"}),
+        );
+        assert!(!force_eager_structured_stream(&request));
+    }
+
+    #[tokio::test]
+    async fn eager_structured_sse_attaches_header_before_complete_body() {
+        let response = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!("{\"id\":1}"),
+            extra: Default::default(),
+        });
+        let events = rechunk_structured_response(&response);
+        let response = eager_sse_response(
+            events,
+            &StreamingConfig::default(),
+            "trace-eager",
+            Some(ValidationResponseStatus::Passed),
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-obey-validation-status")
+                .and_then(|value| value.to_str().ok()),
+            Some("passed")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("{\\\"id\\\":1}"));
+        assert!(body.contains("data: [DONE]"));
+        assert!(body.trim_end().ends_with("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn structured_overflow_is_terminal_and_skips_validation_header() {
+        let request = request_with_response_format(
+            true,
+            serde_json::json!({"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}),
+        );
+        assert!(!should_cache_eager_structured(&request, None, None));
+        assert!(!should_cache_eager_structured(
+            &request,
+            None,
+            Some(ValidationResponseStatus::Passed)
+        ));
+        let response = eager_sse_response(
+            structured_stream_overflow_events("trace-overflow"),
+            &StreamingConfig::default(),
+            "trace-overflow",
+            None,
+        );
+        assert!(response.headers().get("x-obey-validation-status").is_none());
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("structured_output_buffer_overflow"));
+        assert!(body.contains("data: [DONE]"));
+        assert!(body.trim_end().ends_with("data: [DONE]"));
+    }
+
+    #[test]
+    fn validation_cache_gate_allows_only_pass_for_applicable_requests() {
+        let structured_request = request_with_response_format(
+            false,
+            serde_json::json!({"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}),
+        );
+        let non_structured_requests = [
+            request_with_response_format(false, serde_json::json!({"type": "json_object"})),
+            request_with_response_format(false, serde_json::json!({"type": "text"})),
+        ];
+        let statuses = [
+            ValidationResponseStatus::NotApplicable,
+            ValidationResponseStatus::Passed,
+            ValidationResponseStatus::Failed,
+            ValidationResponseStatus::Skipped,
+        ];
+
+        for status in statuses {
+            assert_eq!(
+                cache_allowed_for_validation(&structured_request, status),
+                status == ValidationResponseStatus::Passed
+            );
+            for request in &non_structured_requests {
+                assert!(cache_allowed_for_validation(request, status));
+            }
+        }
+    }
+
+    #[test]
+    fn validation_status_centralizes_header_policy() {
+        let cases = [
+            (StructuredOutputOutcome::NotApplicable, None),
+            (StructuredOutputOutcome::Pass, Some("passed")),
+            (StructuredOutputOutcome::Fail, Some("failed")),
+            (StructuredOutputOutcome::Skipped, Some("skipped")),
+        ];
+
+        for (outcome, expected_header) in cases {
+            let status = ValidationResponseStatus::from_outcome(outcome);
+            assert_eq!(status.header_value(), expected_header);
+
+            let mut response = ().into_response();
+            attach_validation_status_header(&mut response, status, true);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-obey-validation-status")
+                    .and_then(|value| value.to_str().ok()),
+                expected_header
+            );
+        }
+        let mut response = ().into_response();
+        attach_validation_status_header(&mut response, ValidationResponseStatus::Skipped, false);
+        assert!(response.headers().get("x-obey-validation-status").is_none());
+    }
+
+    #[test]
+    fn structured_output_failure_collects_every_failed_choice() {
+        let response = OpenAIResponse {
+            choices: vec![
+                Choice {
+                    index: 0,
+                    message: Message {
+                        role: "assistant".to_owned(),
+                        content: serde_json::json!("not-json"),
+                        extra: Default::default(),
+                    },
+                    finish_reason: Some("stop".to_owned()),
+                    extra: Default::default(),
+                },
+                Choice {
+                    index: 1,
+                    message: Message {
+                        role: "assistant".to_owned(),
+                        content: serde_json::json!("{\"id\":\"wrong\"}"),
+                        extra: Default::default(),
+                    },
+                    finish_reason: Some("stop".to_owned()),
+                    extra: Default::default(),
+                },
+            ],
+            ..base_response(Message {
+                role: "assistant".to_owned(),
+                content: serde_json::json!(null),
+                extra: Default::default(),
+            })
+        };
+        let choices = vec![
+            ChoiceValidationOutcome {
+                result: ChoiceValidationResult::JsonParseError {
+                    byte_offset: 2,
+                    expected: "object".to_owned(),
+                },
+                internal_skip: None,
+            },
+            ChoiceValidationOutcome {
+                result: ChoiceValidationResult::SchemaViolations(vec![SchemaViolation {
+                    path: "/id".to_owned(),
+                    expected: "integer".to_owned(),
+                    actual: "string".to_owned(),
+                }]),
+                internal_skip: None,
+            },
+        ];
+
+        let failure = collect_structured_output_failure(&response, &choices);
+        assert_eq!(failure.violations.len(), 2);
+        assert_eq!(failure.violations[0].path, "/choices/0");
+        assert_eq!(failure.violations[1].path, "/id");
+        assert!(failure.previous_output.contains("not-json"));
+        assert!(failure.previous_output.contains("wrong"));
     }
 
     #[test]
@@ -4085,6 +5684,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
     // same in-repo metrics state.
     state.metrics.write_guardrail_prometheus(&mut out);
     state.metrics.write_compression_prometheus(&mut out);
+    state.metrics.write_structured_output_prometheus(&mut out);
     state
         .loop_detector
         .metrics

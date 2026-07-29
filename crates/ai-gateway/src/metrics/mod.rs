@@ -2,6 +2,7 @@ use crate::compression::{
     stats::{sanitize_operational_metadata, CompressionStats, MAX_PROVIDER_LEN},
     CompressionLevel,
 };
+use crate::structured_output::metrics::StructuredOutputMetrics;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +60,8 @@ pub struct Metrics {
     /// Refusal failover outcome counter, keyed by (pipeline, outcome) where
     /// outcome ∈ {recovered, exhausted} (Req 12.11).
     guardrail_refusal_failover: Arc<DashMap<(String, String), AtomicU64>>,
+    /// Structured output validation, retry, and latency metrics.
+    structured_output: Arc<StructuredOutputMetrics>,
     /// Compression tokens saved counter, keyed by bounded (level, provider).
     compression_tokens_saved: Arc<DashMap<CompressionMetricKey, AtomicU64>>,
     /// Compression ratio histogram, keyed by bounded (level, provider).
@@ -364,6 +367,7 @@ impl Metrics {
             guardrail_stage_latency: Arc::new(DashMap::new()),
             guardrail_refusal_detected: Arc::new(DashMap::new()),
             guardrail_refusal_failover: Arc::new(DashMap::new()),
+            structured_output: Arc::new(StructuredOutputMetrics::new()),
             compression_tokens_saved: Arc::new(DashMap::new()),
             compression_ratio: Arc::new(DashMap::new()),
             compression_duration_seconds: Arc::new(DashMap::new()),
@@ -816,6 +820,34 @@ Total refusal failover outcomes by pipeline and outcome\n",
                 ));
             }
         }
+    }
+
+    pub fn structured_output_metrics(&self) -> Arc<StructuredOutputMetrics> {
+        Arc::clone(&self.structured_output)
+    }
+
+    /// Record a structured output validation outcome.
+    pub fn record_structured_output_validation(&self, provider: &str, model: &str, status: &str) {
+        self.structured_output
+            .record_structured_output_validation(provider, model, status);
+    }
+
+    /// Record a structured output retry outcome.
+    pub fn record_structured_output_retry(&self, provider: &str, model: &str, outcome: &str) {
+        self.structured_output
+            .record_structured_output_retry(provider, model, outcome);
+    }
+
+    /// Observe structured output validation and retry latency in milliseconds.
+    pub fn observe_structured_output_latency(&self, provider: &str, model: &str, latency_ms: f64) {
+        self.structured_output
+            .observe_structured_output_latency(provider, model, latency_ms);
+    }
+
+    /// Append structured output metrics in Prometheus text format.
+    pub fn write_structured_output_prometheus(&self, out: &mut String) {
+        self.structured_output
+            .write_structured_output_prometheus(out);
     }
 
     /// Record content-free compression metrics for one pipeline operation.
@@ -1301,6 +1333,33 @@ mod tests {
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.cache_hit_rate, Some(2.0 / 3.0));
+    }
+
+    #[test]
+    fn structured_output_prometheus_is_exposed_through_metrics() {
+        let metrics = Metrics::new();
+        metrics.record_structured_output_validation("openai", "gpt-4o", "pass");
+        metrics.record_structured_output_retry("openai", "gpt-4o", "recovered");
+        metrics.observe_structured_output_latency("openai", "gpt-4o", 12.5);
+
+        let mut out = String::new();
+        metrics.write_structured_output_prometheus(&mut out);
+
+        assert!(out.contains(
+            "# HELP obey_api_structured_output_validations_total Structured output validation outcomes by provider, model, and status"
+        ));
+        assert!(out.contains("# TYPE obey_api_structured_output_validations_total counter"));
+        assert!(out.contains(
+            "obey_api_structured_output_validations_total{provider=\"openai\",model=\"gpt-4o\",status=\"pass\"} 1"
+        ));
+        assert!(out.contains("# TYPE obey_api_structured_output_retries_total counter"));
+        assert!(out.contains(
+            "obey_api_structured_output_retries_total{provider=\"openai\",model=\"gpt-4o\",outcome=\"recovered\"} 1"
+        ));
+        assert!(out.contains("# TYPE obey_api_structured_output_latency_ms histogram"));
+        assert!(out.contains(
+            "obey_api_structured_output_latency_ms_count{provider=\"openai\",model=\"gpt-4o\"} 1"
+        ));
     }
 
     #[test]

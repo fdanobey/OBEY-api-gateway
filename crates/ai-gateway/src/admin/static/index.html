@@ -269,6 +269,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="loop-detection" id="tab-loop-detection" aria-controls="page-loop-detection">Loop Detection</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="virtual-keys" id="tab-virtual-keys" aria-controls="page-virtual-keys">Virtual Keys</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="guardrails" id="tab-guardrails" aria-controls="page-guardrails">Guardrails</button></li>
+    <li role="presentation"><button class="nav-btn" role="tab" type="button" data-page="structured-output" id="tab-structured-output" aria-controls="page-structured-output">Structured Output</button></li>
   </ul>
   <div class="nav-footer">
     <a href="/dashboard" id="dashboard-link">Open Dashboard &rarr;</a>
@@ -1286,6 +1287,40 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       <button class="btn btn-secondary" data-action="reset">Reset</button>
     </div>
   </section>
+
+  <!-- Structured Output Validation -->
+  <section class="page" id="page-structured-output" role="tabpanel" aria-labelledby="tab-structured-output">
+    <h2>Structured Output Validation</h2>
+    <p class="hint">Validate model responses against caller-declared JSON schemas and auto-retry with corrective prompts when validation fails.</p>
+    <fieldset><legend>Global Settings</legend>
+      <div class="form-check">
+        <input type="checkbox" id="so-enabled" checked>
+        <label for="so-enabled">Enable structured output validation</label>
+      </div>
+      <div class="hint" style="margin-top:-.5rem;margin-bottom:1rem;margin-left:1.5rem">When enabled, the gateway validates responses against the caller's <code>response_format</code> JSON Schema and retries on failure.</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="so-max-retries">Max Retries</label>
+          <input type="number" id="so-max-retries" value="1" min="0" max="5">
+          <div class="hint">0–5. Corrective retry attempts before returning the failed response.</div>
+        </div>
+        <div class="form-group">
+          <label for="so-retry-temp">Retry Temperature</label>
+          <input type="number" id="so-retry-temp" value="0" min="0" max="2" step="0.1">
+          <div class="hint">0.0–2.0. Temperature for corrective retry requests (lower = more deterministic).</div>
+        </div>
+      </div>
+      <div class="form-group">
+        <label for="so-passthrough">Passthrough Providers</label>
+        <input type="text" id="so-passthrough" placeholder="openai, anthropic">
+        <div class="hint">Comma-separated provider names that skip validation (native constrained decoding). Max 50 entries, 128 chars each.</div>
+      </div>
+    </fieldset>
+    <div class="actions">
+      <button class="btn btn-primary" data-action="save">Save</button>
+      <button class="btn btn-secondary" data-action="reset">Reset</button>
+    </div>
+  </section>
 </main>
 
 <div class="status-bar" role="status" aria-live="polite">
@@ -1835,6 +1870,44 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     return ok;
   }
 
+  // --- Structured Output Validation ---
+  function populateStructuredOutput(so) {
+    if (!so) {
+      document.getElementById('so-enabled').checked = false;
+      document.getElementById('so-max-retries').value = 1;
+      document.getElementById('so-retry-temp').value = 0;
+      document.getElementById('so-passthrough').value = '';
+      return;
+    }
+    document.getElementById('so-enabled').checked = so.enabled !== false;
+    document.getElementById('so-max-retries').value = so.max_retries != null ? so.max_retries : 1;
+    document.getElementById('so-retry-temp').value = so.retry_temperature != null ? so.retry_temperature : 0;
+    document.getElementById('so-passthrough').value = (so.passthrough_providers || []).join(', ');
+  }
+
+  function collectStructuredOutput() {
+    var enabled = document.getElementById('so-enabled').checked;
+    var maxRetries = parseInt(document.getElementById('so-max-retries').value, 10);
+    var retryTemp = parseFloat(document.getElementById('so-retry-temp').value);
+    var passthrough = document.getElementById('so-passthrough').value.split(',').map(function(s){return s.trim();}).filter(Boolean);
+    return { enabled: enabled, max_retries: isNaN(maxRetries) ? 1 : maxRetries, retry_temperature: isNaN(retryTemp) ? 0 : retryTemp, passthrough_providers: passthrough };
+  }
+
+  function validateStructuredOutputPage() {
+    clearAllErrors(document.getElementById('page-structured-output'));
+    var ok = true;
+    var mr = document.getElementById('so-max-retries');
+    var rt = document.getElementById('so-retry-temp');
+    if (!validateNonNegativeInt(mr, 'Max retries')) ok = false;
+    else if (parseInt(mr.value, 10) > 5) { showError(mr, 'Must be between 0 and 5'); ok = false; }
+    if (isNaN(parseFloat(rt.value))) { showError(rt, 'Retry temperature must be a number'); ok = false; }
+    else if (parseFloat(rt.value) < 0 || parseFloat(rt.value) > 2) { showError(rt, 'Must be between 0.0 and 2.0'); ok = false; }
+    var pp = document.getElementById('so-passthrough').value.split(',').map(function(s){return s.trim();}).filter(Boolean);
+    if (pp.length > 50) { showError(document.getElementById('so-passthrough'), 'Maximum 50 providers'); ok = false; }
+    pp.forEach(function(p){ if (p.length > 128) { showError(document.getElementById('so-passthrough'), 'Each provider name must be at most 128 characters'); ok = false; } });
+    return ok;
+  }
+
     /** Map page id to its validator. */
     var pageValidators = {
         'page-server': validateServerPage,
@@ -1848,7 +1921,8 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         'page-context': validateContextPage,
         'page-streaming': validateStreamingPage,
         'page-loop-detection': validateLoopDetectionPage,
-        'page-guardrails': validateGuardrailsPage
+        'page-guardrails': validateGuardrailsPage,
+        'page-structured-output': validateStructuredOutputPage
     };
 
   /** Validate the currently active page. Returns true if valid. */
@@ -2684,6 +2758,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       fetchModelsForProvider(cfg.semantic_cache.embedding_provider, document.getElementById('cache-embed-model'), cfg.semantic_cache.embedding_model||'text-embedding-3-small');
     }
     populateGuardrails(cfg.guardrails);
+    populateStructuredOutput(cfg.structured_output);
   }
 
   // --- Collect Config from UI ---
@@ -2701,7 +2776,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     var originalProviders = (config && config.providers) || [];
     cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
     var originalGroups = (config && config.model_groups) || [];
-    cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container .form-row').forEach(function(row){g.models.push({provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});});cfg.model_groups.push(g);});
+    cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container .form-row').forEach(function(row,modelIndex){var originalModel=(originalGroup&&originalGroup.models&&originalGroup.models[modelIndex])||{};var m=JSON.parse(JSON.stringify(originalModel));Object.assign(m,{provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});g.models.push(m);});cfg.model_groups.push(g);});
     var retryMax=parseInt(document.getElementById('retry-max').value,10);
     var retryBackoff=parseFloat(document.getElementById('retry-backoff').value);
     var retryMultiplier=parseFloat(document.getElementById('retry-multiplier').value);
@@ -2716,6 +2791,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     cfg.streaming={emit_early_event:document.getElementById('stream-early-event').checked,keepalive_interval_seconds:parseInt(document.getElementById('stream-keepalive').value,10),passthrough_enabled:document.getElementById('stream-passthrough').checked,chunk_timeout_seconds:parseInt(document.getElementById('stream-chunk-timeout').value,10),retry_on_truncation:document.getElementById('stream-retry-truncation').checked};
     cfg.loop_detection=collectLoopDetection();
     cfg.guardrails=collectGuardrails();
+    if(document.getElementById('so-enabled').checked || (config && config.structured_output)){cfg.structured_output=collectStructuredOutput();}else{delete cfg.structured_output;}
     return cfg;
   }
 

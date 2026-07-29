@@ -103,12 +103,14 @@ fn base_config(base_url: &str) -> Config {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
                 model: "gpt-4".to_string(),
                 cost_per_million_input_tokens: 30.0,
                 cost_per_million_output_tokens: 60.0,
                 priority: 100,
+                structured_output_passthrough: None,
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -126,6 +128,7 @@ fn base_config(base_url: &str) -> Config {
         virtual_keys: Default::default(),
         loop_detection: Default::default(),
         guardrails: None,
+        structured_output: None,
     }
 }
 

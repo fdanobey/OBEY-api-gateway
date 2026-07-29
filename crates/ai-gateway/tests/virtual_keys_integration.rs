@@ -108,12 +108,14 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            structured_output: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
                 model: TEST_MODEL.to_string(),
                 cost_per_million_input_tokens: 30.0,
                 cost_per_million_output_tokens: 60.0,
                 priority: 100,
+                structured_output_passthrough: None,
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -134,6 +136,7 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
         },
         loop_detection: Default::default(),
         guardrails: None,
+        structured_output: None,
     }
 }
 

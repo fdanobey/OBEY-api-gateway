@@ -7,6 +7,7 @@ use crate::compression::config::{
 };
 use crate::guardrail::GuardrailConfig;
 use crate::secrets;
+use crate::structured_output::config::{StructuredOutputConfig, StructuredOutputOverride};
 
 pub mod validation;
 pub use validation::{
@@ -92,6 +93,10 @@ pub struct Config {
     /// Runtime agent-loop detection settings. Disabled by default.
     #[serde(default)]
     pub loop_detection: crate::loop_detection::LoopDetectionConfig,
+    /// Global structured-output defaults. Absent configuration leaves the
+    /// feature unconfigured for backward compatibility.
+    #[serde(default)]
+    pub structured_output: Option<StructuredOutputConfig>,
     /// Guardrail pipelines (opt-in pre-call/post-call policy enforcement).
     /// Absent section disables all guardrail processing. See
     /// [`crate::guardrail::GuardrailConfig`].
@@ -632,6 +637,9 @@ pub struct ModelGroup {
     /// Optional model-group token compression override.
     #[serde(default)]
     pub compression: Option<ModelGroupCompressionOverride>,
+    /// Optional model-group structured-output override.
+    #[serde(default)]
+    pub structured_output: Option<StructuredOutputOverride>,
     pub models: Vec<ProviderModel>,
 }
 
@@ -646,6 +654,10 @@ pub struct ProviderModel {
     pub cost_per_million_output_tokens: f64,
     #[serde(default = "default_priority")]
     pub priority: u32,
+    /// Explicitly enable or disable native structured-output passthrough for
+    /// this provider/model entry. `None` defers to higher-level policy.
+    #[serde(default)]
+    pub structured_output_passthrough: Option<bool>,
 }
 
 fn default_priority() -> u32 {
@@ -1118,6 +1130,63 @@ retry_on_truncation: false
         assert!(cfg.passthrough_enabled);
         assert_eq!(cfg.chunk_timeout_seconds, 60);
         assert!(cfg.retry_on_truncation);
+    }
+
+    #[test]
+    fn structured_output_yaml_deserializes_at_every_config_level() {
+        let yaml = r#"
+server:
+  host: 127.0.0.1
+  port: 8080
+providers:
+  - name: openai
+    type: openai
+model_groups:
+  - name: default
+    structured_output:
+      max_retries: 3
+      passthrough_providers: [openai]
+    models:
+      - provider: openai
+        model: gpt-4o
+        structured_output_passthrough: true
+structured_output:
+  enabled: true
+  max_retries: 2
+  retry_temperature: 0.4
+  passthrough_providers: [openai]
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let global = config.structured_output.as_ref().unwrap();
+        assert!(global.enabled);
+        assert_eq!(global.max_retries, 2);
+        assert_eq!(global.retry_temperature, 0.4);
+        assert_eq!(global.passthrough_providers, vec!["openai"]);
+
+        let group_override = config.model_groups[0].structured_output.as_ref().unwrap();
+        assert_eq!(group_override.max_retries, Some(3));
+        assert_eq!(
+            group_override.passthrough_providers.as_deref(),
+            Some(["openai".to_string()].as_slice())
+        );
+        assert_eq!(
+            config.model_groups[0].models[0].structured_output_passthrough,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn structured_output_yaml_fields_default_to_none_when_absent() {
+        let model: ProviderModel =
+            serde_yaml::from_str("provider: openai\nmodel: gpt-4o\n").unwrap();
+        assert_eq!(model.structured_output_passthrough, None);
+
+        let group: ModelGroup = serde_yaml::from_str(
+            "name: default\nmodels:\n  - provider: openai\n    model: gpt-4o\n",
+        )
+        .unwrap();
+        assert_eq!(group.structured_output, None);
     }
 
     #[test]
