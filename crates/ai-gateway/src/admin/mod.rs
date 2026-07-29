@@ -67,6 +67,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/oauth/openai/status", get(oauth_status))
         .route("/oauth/openai/usage", get(oauth_usage))
         .route("/oauth/openai/logout", post(oauth_logout))
+        .route("/metrics/reset-active", post(reset_active_requests))
         .route("/", get(index_handler))
         .route("/{*path}", get(static_handler))
         .route_layer(middleware::from_fn_with_state(state, admin_auth_middleware))
@@ -774,6 +775,34 @@ async fn reload_config(State(state): State<AppState>) -> Response {
         Json(json!({
             "status": "ok",
             "message": "Configuration reloaded successfully"
+        })),
+    )
+        .into_response()
+}
+
+/// POST /admin/metrics/reset-active — reset the active request counter
+///
+/// Recovery mechanism for accumulated counter drift caused by process
+/// aborts, panics, or other scenarios where `complete_request` was not
+/// properly called. Should only be used when the system is known to be
+/// idle or when the active request count is clearly stuck.
+async fn reset_active_requests(State(state): State<AppState>) -> Response {
+    let previous = state.metrics.reset_active_requests();
+    tracing::info!(
+        previous_count = previous,
+        "Admin endpoint reset active request counter"
+    );
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "previous_count": previous,
+            "message": if previous > 0 {
+                format!("Active request counter reset from {} to 0", previous)
+            } else {
+                "Active request counter was already 0".to_string()
+            }
         })),
     )
         .into_response()

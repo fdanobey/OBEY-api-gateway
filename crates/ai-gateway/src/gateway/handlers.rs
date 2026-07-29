@@ -588,7 +588,8 @@ impl Drop for RequestCompleteGuard {
             let duration_ms = self.start.elapsed().as_millis() as u64;
             tracing::debug!(
                 duration_ms,
-                "Stream dropped before completion, completing request metrics via guard"
+                source = "drop",
+                "RequestCompleteGuard dropped without explicit complete — completing request metrics via Drop (this is expected for cancelled streams)"
             );
             self.metrics.complete_request(duration_ms);
         }
@@ -1424,7 +1425,8 @@ async fn chat_completions_stream(
     virtual_key_id: Option<String>,
 ) -> Response {
     state.metrics.start_request();
-    let start = std::time::Instant::now();
+    let start = Instant::now();
+    let mut request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
     tracing::debug!(
         trace_id = %trace_id,
         model = %request.model,
@@ -1456,9 +1458,7 @@ async fn chat_completions_stream(
     if let Some(cached_json) = state.exact_cache.get(&request) {
         if let Ok(cached_resp) = serde_json::from_str::<OpenAIResponse>(&cached_json) {
             state.metrics.record_cache_hit();
-            state
-                .metrics
-                .complete_request(start.elapsed().as_millis() as u64);
+            request_guard.complete();
             let stream_trace_id = trace_id.clone();
             let stream = async_stream::stream! {
                 tracing::debug!(trace_id = %stream_trace_id, "Streaming cached response from exact cache");
@@ -1501,32 +1501,46 @@ async fn chat_completions_stream(
         {
             PreCallOutcome::Proceed => {}
             PreCallOutcome::Block(block) => {
-                let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
                 let err = GatewayError::GuardrailPolicyViolation {
                     category: block.entity_label,
                 };
-                return guardrail_error_response(&state, &request, &mut guard, &trace_id, err);
-            }
-            PreCallOutcome::InvalidAction => {
-                let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
                 return guardrail_error_response(
                     &state,
                     &request,
-                    &mut guard,
+                    &mut request_guard,
+                    &trace_id,
+                    err,
+                );
+            }
+            PreCallOutcome::InvalidAction => {
+                return guardrail_error_response(
+                    &state,
+                    &request,
+                    &mut request_guard,
                     &trace_id,
                     GatewayError::GuardrailInvalidAction,
                 );
             }
             PreCallOutcome::Timeout => {
-                let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
                 let err = GatewayError::GuardrailUnavailable("guardrail scan timeout".to_string());
-                return guardrail_error_response(&state, &request, &mut guard, &trace_id, err);
+                return guardrail_error_response(
+                    &state,
+                    &request,
+                    &mut request_guard,
+                    &trace_id,
+                    err,
+                );
             }
             PreCallOutcome::ServiceFailure => {
-                let mut guard = RequestCompleteGuard::new(state.metrics.clone(), start);
                 let err =
                     GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
-                return guardrail_error_response(&state, &request, &mut guard, &trace_id, err);
+                return guardrail_error_response(
+                    &state,
+                    &request,
+                    &mut request_guard,
+                    &trace_id,
+                    err,
+                );
             }
         }
 
@@ -1557,6 +1571,7 @@ async fn chat_completions_stream(
                 engine.clone(),
                 selector,
                 guardrail_ctx,
+                request_guard,
             )
             .await;
         }
@@ -1572,12 +1587,12 @@ async fn chat_completions_stream(
             state,
             request,
             trace_id,
-            start,
             streaming_config,
             guardrail_engine,
             structured_output_engine,
             selector,
             guardrail_ctx,
+            request_guard,
         )
         .await;
     }
@@ -1600,9 +1615,6 @@ async fn chat_completions_stream(
         let stream_trace_id = trace_id.clone();
 
         let streaming_config_relay = streaming_config.clone();
-        // Construct the guard before building the lazy SSE generator so dropping
-        // an unpolled body still decrements `active_requests`.
-        let request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
         let stream = async_stream::stream! {
             // Drop guard: ensures active_requests is decremented even if the
             // client disconnects and the stream is cancelled mid-flight.
@@ -1950,7 +1962,6 @@ async fn chat_completions_stream(
     // Route the request first (provider always returns non-streaming JSON).
     // Errors here happen BEFORE any SSE chunks are sent, so we return a
     // normal JSON error response with the proper HTTP status code.
-    let mut request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
     let response = match state.router.route_request(&request).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -2500,14 +2511,13 @@ async fn stream_eager_structured_output(
     state: AppState,
     request: OpenAIRequest,
     trace_id: String,
-    start: std::time::Instant,
     streaming_config: StreamingConfig,
     guardrail_engine: Option<Arc<GuardrailEngine>>,
     structured_output_engine: Option<Arc<StructuredOutputEngine>>,
     selector: BindingSelector,
     mut guardrail_ctx: GuardrailContext,
+    mut request_guard: RequestCompleteGuard,
 ) -> Response {
-    let mut request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
     let mut response = match state.router.route_request_streaming(&request).await {
         Ok(StreamingResponse::Buffered(response)) => response,
         Ok(StreamingResponse::PassThrough {
@@ -2743,6 +2753,7 @@ async fn stream_buffered_with_post_call(
     engine: Arc<GuardrailEngine>,
     selector: BindingSelector,
     mut guardrail_ctx: GuardrailContext,
+    request_guard: RequestCompleteGuard,
 ) -> Response {
     let emit_early = streaming_config.emit_early_event;
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -2756,7 +2767,6 @@ async fn stream_buffered_with_post_call(
     let discard_on_disconnect =
         guardrail_stream::disconnect_discards_partial(&engine.resolver().resolve(&selector));
 
-    let request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
     let stream_trace_id = trace_id.clone();
 
     let stream = async_stream::stream! {
@@ -4005,12 +4015,13 @@ mod tests {
         emit_sse_error_event, force_eager_structured_stream, prepare_response_for_client,
         rechunk_structured_response, relay_passthrough_stream, should_cache_eager_structured,
         sse_error_payload, streaming_chunks_after_early_event, streaming_chunks_from_response,
-        structured_stream_overflow_events, RelayLineAction, RelayOutcome, RequestLogContext,
-        ValidationResponseStatus,
+        structured_stream_overflow_events, RelayLineAction, RelayOutcome, RequestCompleteGuard,
+        RequestLogContext, ValidationResponseStatus,
     };
     use crate::compression::{stats::CompressionStats, CompressionLevel};
     use crate::config::StreamingConfig;
     use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
+    use crate::metrics::Metrics;
     use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
     use crate::structured_output::validator::{
         ChoiceValidationOutcome, ChoiceValidationResult, SchemaViolation,
@@ -4020,7 +4031,21 @@ mod tests {
     use axum::Json;
     use futures::StreamExt;
     use proptest::prelude::*;
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn request_guard_drop_completes_active_request() {
+        let metrics = Arc::new(Metrics::new());
+        metrics.start_request();
+
+        {
+            let _guard = RequestCompleteGuard::new(metrics.clone(), Instant::now());
+            assert_eq!(metrics.snapshot().active_requests, 1);
+        }
+
+        assert_eq!(metrics.snapshot().active_requests, 0);
+    }
 
     fn base_response(message: Message) -> OpenAIResponse {
         OpenAIResponse {

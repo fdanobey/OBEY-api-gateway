@@ -377,8 +377,8 @@ impl Metrics {
     /// Increment request count and mark request as active
     #[inline]
     pub fn start_request(&self) {
+        let prev_active = self.active_requests.fetch_add(1, Ordering::Relaxed);
         self.request_count.fetch_add(1, Ordering::Relaxed);
-        self.active_requests.fetch_add(1, Ordering::Relaxed);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -386,6 +386,14 @@ impl Metrics {
             .as_secs();
         self.last_request_time.store(now, Ordering::Relaxed);
         self.requests_last_minute.fetch_add(1, Ordering::Relaxed);
+
+        if prev_active > 0 && prev_active % 100 == 0 {
+            tracing::warn!(
+                active_requests = prev_active + 1,
+                "Active request counter exceeded {} — possible counter drift or extreme concurrency",
+                prev_active + 1
+            );
+        }
     }
 
     /// Record completed request with response time
@@ -413,6 +421,25 @@ impl Metrics {
         self.total_response_time_ms
             .fetch_add(duration_ms, Ordering::Relaxed);
         self.completed_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Force-reset the active request counter to zero.
+    ///
+    /// This is a recovery mechanism for accumulated counter drift caused by
+    /// process aborts, panics, or other scenarios where `complete_request`
+    /// was not properly called. Should only be used when the system is known
+    /// to be idle (no requests in flight).
+    ///
+    /// Returns the previous value that was reset.
+    pub fn reset_active_requests(&self) -> u64 {
+        let previous = self.active_requests.swap(0, Ordering::Relaxed);
+        if previous > 0 {
+            tracing::warn!(
+                previous_count = previous,
+                "Active request counter was reset from non-zero value; this indicates counter drift from process aborts or incomplete request tracking"
+            );
+        }
+        previous
     }
 
     /// Record successful provider request
@@ -1212,6 +1239,25 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.active_requests, 0);
         assert_eq!(snapshot.avg_response_time_ms, 50.0);
+    }
+
+    #[test]
+    fn test_reset_active_requests_returns_previous_and_sets_zero() {
+        let metrics = Metrics::new();
+
+        assert_eq!(metrics.reset_active_requests(), 0);
+        assert_eq!(metrics.snapshot().active_requests, 0);
+
+        for _ in 0..5 {
+            metrics.start_request();
+        }
+        assert_eq!(metrics.snapshot().active_requests, 5);
+
+        let previous = metrics.reset_active_requests();
+        assert_eq!(previous, 5);
+        assert_eq!(metrics.snapshot().active_requests, 0);
+
+        assert_eq!(metrics.reset_active_requests(), 0);
     }
 
     #[test]
