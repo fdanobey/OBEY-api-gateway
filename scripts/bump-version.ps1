@@ -35,9 +35,17 @@ switch ($Bump) {
 $newVersion = "$major.$minor.$patch"
 Write-Host "Bumping: $oldVersion -> $newVersion" -ForegroundColor Cyan
 
-# --- Update Cargo.toml (first occurrence of version = "x.y.z") ---
-$cargoContent = $cargoContent -replace "version\s*=\s*`"$oldVersion`"", "version = `"$newVersion`""
-Set-Content $cargoPath -Value $cargoContent -NoNewline
+# --- Update Cargo.toml (only the package version, not dependency versions) ---
+$cargoLines = Get-Content $cargoPath
+$replaced = $false
+for ($i = 0; $i -lt $cargoLines.Count; $i++) {
+    if (-not $replaced -and $cargoLines[$i] -match "^version\s*=\s*`"$oldVersion`"") {
+        $cargoLines[$i] = "version = `"$newVersion`""
+        $replaced = $true
+        break
+    }
+}
+Set-Content $cargoPath -Value $cargoLines
 Write-Host "  Updated $cargoPath" -ForegroundColor Green
 
 # --- Update installer.iss ---
