@@ -1,6 +1,6 @@
 [package]
 name = "ai-gateway"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 build = "build.rs"
 
@@ -69,7 +69,7 @@ image = { version = "0.25.8", optional = true, default-features = false, feature
 tray-item = { version = "0.10.0", optional = true }
 winit = { version = "0.30.12", optional = true }
 winapi = { version = "0.3.9", optional = true, features = ["errhandlingapi", "handleapi", "minwinbase", "processthreadsapi", "synchapi", "winbase", "winerror", "winnt", "winuser"] }
-winrt-notification = { version = "0.5.1", optional = true }
+winrt-notification = { version = "0.5.2", optional = true }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1.12"
