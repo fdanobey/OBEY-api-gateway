@@ -5247,9 +5247,9 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
     }
     document.getElementById('mem-extract-min-turns').value = mem.auto_extract_min_turns || 4;
     var q = mem.qdrant || {};
-    document.getElementById('mem-qdrant-url').value = q.url || '';
-    document.getElementById('mem-qdrant-collection').value = q.collection_name || '';
-    document.getElementById('mem-qdrant-fts-weight').value = q.fts_weight != null ? q.fts_weight : 0.5;
+    document.getElementById('mem-qdrant-url').value = q.qdrant_url || '';
+    document.getElementById('mem-qdrant-collection').value = q.qdrant_collection || '';
+    document.getElementById('mem-qdrant-fts-weight').value = q.fts_weight != null ? q.fts_weight : 0.4;
     document.getElementById('mem-qdrant-vector-weight').value = q.vector_weight != null ? q.vector_weight : 0.5;
     memLoadStats();
     memLoadProjects();
@@ -5273,9 +5273,9 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
     var qUrl = document.getElementById('mem-qdrant-url').value.trim();
     if (qUrl) {
       mem.qdrant = {
-        url: qUrl,
-        collection_name: document.getElementById('mem-qdrant-collection').value.trim() || 'ai_gateway_memories',
-        fts_weight: parseFloat(document.getElementById('mem-qdrant-fts-weight').value) || 0.5,
+        qdrant_url: qUrl,
+        qdrant_collection: document.getElementById('mem-qdrant-collection').value.trim() || 'obey_memories',
+        fts_weight: parseFloat(document.getElementById('mem-qdrant-fts-weight').value) || 0.4,
         vector_weight: parseFloat(document.getElementById('mem-qdrant-vector-weight').value) || 0.5
       };
     }
