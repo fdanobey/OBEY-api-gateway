@@ -989,6 +989,12 @@ All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` re
 | `GET` | `/admin/loop-detection/sessions/{id}` | Session detail with signal history |
 | `POST` | `/admin/loop-detection/sessions/{id}/reset` | Reset session enforcement state |
 | `GET` | `/admin/loop-detection/stats` | Aggregate loop detection stats |
+| `GET` | `/admin/memory/entries?namespace=...` | List memory entries for a namespace |
+| `POST` | `/admin/memory/entries` | Create a memory entry |
+| `DELETE` | `/admin/memory/entries/{id}` | Delete a memory entry |
+| `DELETE` | `/admin/memory/namespaces/{namespace}` | Clear all entries in a namespace |
+| `GET` | `/admin/memory/stats` | Memory store statistics |
+| `GET` | `/admin/memory/projects` | List detected project namespaces |
 | `GET` | `/health` | Health check |
 | `GET` | `/metrics` | Prometheus metrics |
 | `POST` | `/v1/chat/completions` | Chat completions (streaming + non-streaming) |
@@ -1078,8 +1084,8 @@ context:
 
 Both are embedded SPAs compiled into the binary — no external dependencies.
 
-- **Admin** (`/admin`) — provider configuration, API key management, circuit breaker status, token compression & tool compression settings, config hot-reload
-- **Dashboard** (`/dashboard`) — real-time metrics via WebSocket, provider health, compression statistics (token & tool), error logs, request log viewer
+- **Admin** (`/admin`) — provider configuration, API key management, circuit breaker status, token compression & tool compression settings, persistent memory configuration & entry browser, config hot-reload
+- **Dashboard** (`/dashboard`) — real-time metrics via WebSocket, provider health, compression statistics (token & tool), persistent memory event visualizations (injection/extraction/eviction timeline, namespace activity), error logs, request log viewer
 
 ```yaml
 admin:

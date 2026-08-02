@@ -270,6 +270,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="virtual-keys" id="tab-virtual-keys" aria-controls="page-virtual-keys">Virtual Keys</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="guardrails" id="tab-guardrails" aria-controls="page-guardrails">Guardrails</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" type="button" data-page="structured-output" id="tab-structured-output" aria-controls="page-structured-output">Structured Output</button></li>
+    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="memory" id="tab-memory" aria-controls="page-memory">Persistent Memory</button></li>
   </ul>
   <div class="nav-footer">
     <a href="/dashboard" id="dashboard-link">Open Dashboard &rarr;</a>
@@ -341,6 +342,42 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
           <label for="admin-pass-env">Password Env Variable</label>
           <input type="text" id="admin-pass-env" placeholder="ADMIN_PASSWORD">
         </div>
+      </div>
+    </fieldset>
+    <fieldset><legend>Dashboard</legend>
+      <div class="form-check">
+        <input type="checkbox" id="dash-enabled" checked>
+        <label for="dash-enabled">Enable Dashboard</label>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="dash-path">Dashboard Path</label>
+          <input type="text" id="dash-path" value="/dashboard" autocomplete="off">
+          <div class="hint">URL path where the real-time dashboard is served</div>
+        </div>
+        <div class="form-group">
+          <label for="dash-interval">Metrics Update Interval (seconds)</label>
+          <input type="number" id="dash-interval" value="1" min="1" max="60">
+          <div class="hint">How often the WebSocket pushes metrics to connected dashboards</div>
+        </div>
+      </div>
+    </fieldset>
+    <fieldset><legend>Prometheus Metrics</legend>
+      <div class="form-check">
+        <input type="checkbox" id="prom-enabled">
+        <label for="prom-enabled">Enable Prometheus Endpoint</label>
+      </div>
+      <div class="form-group">
+        <label for="prom-path">Metrics Path</label>
+        <input type="text" id="prom-path" value="/metrics" autocomplete="off">
+        <div class="hint">URL path for the Prometheus scrape endpoint</div>
+      </div>
+    </fieldset>
+    <fieldset><legend>Codex Backend</legend>
+      <div class="form-group">
+        <label for="codex-url">Codex Instructions URL <span class="hint-inline">(optional)</span></label>
+        <input type="text" id="codex-url" placeholder="Leave blank for default" autocomplete="off">
+        <div class="hint">Override the source URL for Codex system prompt instructions. Only relevant when using OpenAI OAuth with Codex backend translation.</div>
       </div>
     </fieldset>
     <div class="actions">
@@ -815,7 +852,30 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
   <!-- Caching (Req 13.9) -->
   <section class="page" id="page-caching" role="tabpanel" aria-labelledby="tab-caching">
     <h2>Caching</h2>
-    <fieldset><legend>Qdrant Connection</legend>
+    <fieldset><legend>Exact Match Cache (Tier 1 — In-Memory)</legend>
+      <div class="form-check">
+        <input type="checkbox" id="ecache-enabled" checked>
+        <label for="ecache-enabled">Enable Exact Cache</label>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="ecache-max-entries">Max Entries</label>
+          <input type="number" id="ecache-max-entries" value="5000" min="1" max="100000">
+          <div class="hint">Oldest entries are evicted past this limit (default: 5000)</div>
+        </div>
+        <div class="form-group">
+          <label for="ecache-ttl">TTL (seconds)</label>
+          <input type="number" id="ecache-ttl" value="3600" min="0">
+          <div class="hint">Per-entry time-to-live (default: 3600)</div>
+        </div>
+      </div>
+      <div class="form-group">
+        <label for="ecache-temp-threshold">Temperature Threshold</label>
+        <input type="number" id="ecache-temp-threshold" value="0.15" min="0" max="2" step="0.01" style="max-width:200px">
+        <div class="hint">Requests with temperature above this value are not cached (default: 0.15)</div>
+      </div>
+    </fieldset>
+    <fieldset><legend>Semantic Cache (Tier 2 — Qdrant)</legend>
       <div class="form-check">
         <input type="checkbox" id="cache-enabled">
         <label for="cache-enabled">Enable Semantic Cache</label>
@@ -886,7 +946,6 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         <div class="form-group"><label for="compression-language-packs-dir">Language packs directory</label><input type="text" id="compression-language-packs-dir" value="./language_packs" autocomplete="off"><div class="error" role="alert"></div></div>
       </div>
       <div class="form-check"><input type="checkbox" id="compression-caveman"><label for="compression-caveman">Use terse “caveman” output</label></div>
-      <div class="form-check"><input type="checkbox" id="compression-tool-definitions"><label for="compression-tool-definitions">Compress tool definitions</label></div>
     </fieldset>
     <fieldset><legend>Time Budgets (milliseconds)</legend>
       <div class="hint" style="margin-bottom:.75rem">Each enabled engine must have a positive processing budget.</div>
@@ -1408,6 +1467,206 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     <div class="actions">
       <button class="btn btn-primary" data-action="save">Save</button>
       <button class="btn btn-secondary" data-action="reset">Reset</button>
+    </div>
+  </section>
+
+  <!-- Persistent Memory -->
+  <section class="page" id="page-memory" role="tabpanel" aria-labelledby="tab-memory">
+    <h2>Persistent Memory</h2>
+    <p class="hint" style="margin-bottom:1.5rem">Cross-session memory system that extracts facts, preferences, and decisions from conversations and injects them into future requests.</p>
+
+    <fieldset><legend>General</legend>
+      <div class="form-row">
+        <div class="form-group">
+          <div class="form-check"><input type="checkbox" id="mem-enabled"><label for="mem-enabled">Enable Persistent Memory</label></div>
+        </div>
+        <div class="form-group">
+          <label for="mem-db-path">Database Path</label>
+          <input type="text" id="mem-db-path" value="./memory.db" autocomplete="off">
+          <div class="hint">SQLite file for memory persistence</div>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="mem-injection-strategy">Injection Strategy</label>
+          <select id="mem-injection-strategy">
+            <option value="system_prompt_prefix">System Prompt Prefix</option>
+            <option value="synthetic_message">Synthetic Message</option>
+          </select>
+          <div class="hint">How recalled memories are placed in outgoing requests</div>
+        </div>
+        <div class="form-group">
+          <label for="mem-max-injection-tokens">Max Injection Tokens</label>
+          <input type="number" id="mem-max-injection-tokens" value="500" min="0" max="10000">
+          <div class="hint">Token budget for injected memories (0–10000)</div>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="mem-decay-hours">Decay Schedule (hours)</label>
+          <input type="number" id="mem-decay-hours" value="24" min="1" max="8760">
+          <div class="hint">How often relevance decay runs (1–8760)</div>
+        </div>
+        <div class="form-group">
+          <label for="mem-max-per-ns">Max Memories per Namespace</label>
+          <input type="number" id="mem-max-per-ns" value="1000" min="1" max="100000">
+          <div class="hint">Oldest low-score entries are evicted past this limit</div>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <div class="form-check"><input type="checkbox" id="mem-allow-sensitive"><label for="mem-allow-sensitive">Allow Sensitive Storage</label></div>
+          <div class="hint">When disabled, PII-like content is rejected</div>
+        </div>
+        <div class="form-group">
+          <div class="form-check"><input type="checkbox" id="mem-show-feedback" checked><label for="mem-show-feedback">Show Feedback</label></div>
+          <div class="hint">Include memory metadata in response headers</div>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset><legend>Automatic Extraction</legend>
+      <div class="form-check" style="margin-bottom:1rem"><input type="checkbox" id="mem-auto-extract"><label for="mem-auto-extract">Enable Auto-Extract</label></div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="mem-extract-provider">Extraction Provider</label>
+          <input type="text" id="mem-extract-provider" placeholder="e.g. openai" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label for="mem-extract-model">Extraction Model</label>
+          <input type="text" id="mem-extract-model" placeholder="e.g. gpt-4o-mini" autocomplete="off">
+        </div>
+      </div>
+      <div class="form-group">
+        <label for="mem-extract-min-turns">Min Turns Before Extraction</label>
+        <input type="number" id="mem-extract-min-turns" value="4" min="1" max="100" style="max-width:200px">
+        <div class="hint">Minimum conversation turns before triggering extraction</div>
+      </div>
+    </fieldset>
+
+    <fieldset><legend>Vector Search (Qdrant)</legend>
+      <p class="hint" style="margin-bottom:.75rem">Optional Qdrant integration for semantic memory retrieval alongside BM25 lexical search.</p>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="mem-qdrant-url">Qdrant URL</label>
+          <input type="text" id="mem-qdrant-url" placeholder="http://localhost:6334" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label for="mem-qdrant-collection">Collection Name</label>
+          <input type="text" id="mem-qdrant-collection" placeholder="ai_gateway_memories" autocomplete="off">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="mem-qdrant-fts-weight">FTS Weight</label>
+          <input type="number" id="mem-qdrant-fts-weight" value="0.5" step="0.1" min="0" max="1">
+        </div>
+        <div class="form-group">
+          <label for="mem-qdrant-vector-weight">Vector Weight</label>
+          <input type="number" id="mem-qdrant-vector-weight" value="0.5" step="0.1" min="0" max="1">
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset><legend>Memory Store — Live Stats</legend>
+      <div id="mem-stats-panel" style="margin-bottom:1rem">
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:.75rem">
+          <div style="padding:.6rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)">
+            <div style="font-size:.7rem;color:var(--text-muted);text-transform:uppercase">Total Entries</div>
+            <div style="font-size:1.2rem;font-weight:700" id="mem-stat-total">—</div>
+          </div>
+          <div style="padding:.6rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)">
+            <div style="font-size:.7rem;color:var(--text-muted);text-transform:uppercase">Namespaces</div>
+            <div style="font-size:1.2rem;font-weight:700" id="mem-stat-ns">—</div>
+          </div>
+          <div style="padding:.6rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)">
+            <div style="font-size:.7rem;color:var(--text-muted);text-transform:uppercase">Avg Relevance</div>
+            <div style="font-size:1.2rem;font-weight:700" id="mem-stat-relevance">—</div>
+          </div>
+          <div style="padding:.6rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)">
+            <div style="font-size:.7rem;color:var(--text-muted);text-transform:uppercase">Storage Size</div>
+            <div style="font-size:1.2rem;font-weight:700" id="mem-stat-size">—</div>
+          </div>
+          <div style="padding:.6rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)">
+            <div style="font-size:.7rem;color:var(--text-muted);text-transform:uppercase">Last Decay</div>
+            <div style="font-size:1.2rem;font-weight:700" id="mem-stat-decay">—</div>
+          </div>
+        </div>
+        <button class="btn btn-secondary btn-sm" id="mem-refresh-stats" style="margin-top:.75rem">Refresh Stats</button>
+      </div>
+    </fieldset>
+
+    <fieldset><legend>Memory Browser</legend>
+      <div style="display:flex;gap:.5rem;align-items:end;margin-bottom:1rem;flex-wrap:wrap">
+        <div class="form-group" style="flex:1;min-width:200px;margin:0">
+          <label for="mem-browse-ns">Namespace</label>
+          <input type="text" id="mem-browse-ns" placeholder="user::project::abc123" autocomplete="off">
+        </div>
+        <button class="btn btn-primary btn-sm" id="mem-browse-btn">List Entries</button>
+        <button class="btn btn-danger btn-sm" id="mem-clear-ns-btn" title="Delete all entries in this namespace">Clear Namespace</button>
+      </div>
+      <div id="mem-entries-wrap" style="display:none">
+        <div style="overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)">
+          <table style="width:100%;border-collapse:collapse;font-size:.8rem" aria-label="Memory entries">
+            <thead><tr>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Content</th>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Type</th>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Score</th>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Accessed</th>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Actions</th>
+            </tr></thead>
+            <tbody id="mem-entries-tbody"></tbody>
+          </table>
+        </div>
+        <div style="font-size:.75rem;color:var(--text-muted);margin-top:.5rem" id="mem-entries-info"></div>
+      </div>
+      <div id="mem-entries-empty" style="text-align:center;padding:1rem;color:var(--text-muted);font-size:.85rem">Enter a namespace to browse memories</div>
+    </fieldset>
+
+    <fieldset><legend>Create Memory Entry</legend>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="mem-create-ns">Namespace</label>
+          <input type="text" id="mem-create-ns" placeholder="user::project::abc123" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label for="mem-create-type">Memory Type</label>
+          <select id="mem-create-type">
+            <option value="fact">Fact</option>
+            <option value="preference">Preference</option>
+            <option value="context">Context</option>
+            <option value="decision">Decision</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group">
+        <label for="mem-create-content">Content</label>
+        <textarea id="mem-create-content" rows="3" placeholder="Memory content (5–4096 characters)"></textarea>
+      </div>
+      <button class="btn btn-primary btn-sm" id="mem-create-btn">Create Entry</button>
+      <span id="mem-create-status" style="font-size:.8rem;margin-left:.75rem"></span>
+    </fieldset>
+
+    <fieldset><legend>Detected Projects</legend>
+      <div id="mem-projects-wrap" style="display:none">
+        <div style="overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)">
+          <table style="width:100%;border-collapse:collapse;font-size:.8rem" aria-label="Detected project namespaces">
+            <thead><tr>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Namespace</th>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Entries</th>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Last Activity</th>
+            </tr></thead>
+            <tbody id="mem-projects-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div id="mem-projects-empty" style="text-align:center;padding:1rem;color:var(--text-muted);font-size:.85rem">Loading projects…</div>
+      <button class="btn btn-secondary btn-sm" id="mem-refresh-projects" style="margin-top:.75rem">Refresh</button>
+    </fieldset>
+
+    <div class="actions">
+      <button class="btn btn-primary" id="mem-save-btn">Save Memory Config</button>
+      <button class="btn btn-secondary" id="mem-reset-btn">Reset</button>
     </div>
   </section>
 </main>
@@ -2621,7 +2880,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
   var COMPRESSION_ENGINES = ['lite','standard','aggressive','ultra','rtk','perplexity','tool_def','language_pack'];
   var COMPRESSION_RULES = ['code_blocks','urls','file_paths','json_structures','identifiers','math_expressions','tool_definitions','structured_tool_output'];
   var COMPRESSION_DEFAULTS = {
-    enabled:false,default_level:'lite',auto_threshold_tokens:0,caveman_output:false,compress_tool_definitions:false,language:'en',language_packs_dir:'./language_packs',
+    enabled:false,default_level:'lite',auto_threshold_tokens:0,caveman_output:false,language:'en',language_packs_dir:'./language_packs',
     time_budget_ms:{lite:500,standard:500,aggressive:2000,ultra:2000,rtk:2000,stacked:2000},protection_rules:COMPRESSION_RULES.slice(),precompressed_contexts:[],
     rtk:{grouping_strategy:'balanced'},perplexity:{enabled:false,redundancy_threshold:0.5,compression_ratio_target:5,model_path:'./models/perplexity_scorer.onnx'},custom_pipelines:{}
   };
@@ -2668,7 +2927,6 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     document.getElementById('compression-default-level').value = compression.default_level || 'lite';
     document.getElementById('compression-threshold').value = compression.auto_threshold_tokens != null ? compression.auto_threshold_tokens : 0;
     document.getElementById('compression-caveman').checked = !!compression.caveman_output;
-    document.getElementById('compression-tool-definitions').checked = !!compression.compress_tool_definitions;
     document.getElementById('compression-language').value = compression.language != null ? compression.language : 'en';
     document.getElementById('compression-language-packs-dir').value = compression.language_packs_dir != null ? compression.language_packs_dir : './language_packs';
     var budgets = compression.time_budget_ms || COMPRESSION_DEFAULTS.time_budget_ms;
@@ -2703,7 +2961,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     });
     return {
       enabled:document.getElementById('compression-enabled').checked,default_level:document.getElementById('compression-default-level').value,auto_threshold_tokens:parseInt(document.getElementById('compression-threshold').value,10),
-      caveman_output:document.getElementById('compression-caveman').checked,compress_tool_definitions:document.getElementById('compression-tool-definitions').checked,language:document.getElementById('compression-language').value.trim(),language_packs_dir:document.getElementById('compression-language-packs-dir').value.trim(),
+      caveman_output:document.getElementById('compression-caveman').checked,language:document.getElementById('compression-language').value.trim(),language_packs_dir:document.getElementById('compression-language-packs-dir').value.trim(),
       time_budget_ms:budgets,protection_rules:Array.from(document.querySelectorAll('[data-compression-rule]:checked')).map(function(input) { return input.dataset.compressionRule; }),precompressed_contexts:contexts,
       rtk:{grouping_strategy:document.getElementById('compression-rtk-grouping').value},perplexity:{enabled:document.getElementById('compression-perplexity-enabled').checked,redundancy_threshold:parseFloat(document.getElementById('compression-redundancy-threshold').value),compression_ratio_target:parseInt(document.getElementById('compression-ratio-target').value,10),model_path:document.getElementById('compression-model-path').value.trim()},custom_pipelines:pipelines
     };
@@ -2830,6 +3088,10 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     if (cfg.server) { document.getElementById('srv-host').value=cfg.server.host||'127.0.0.1'; document.getElementById('srv-port').value=cfg.server.port||3000; document.getElementById('srv-timeout').value=cfg.server.request_timeout_seconds||30; document.getElementById('srv-max-body').value=cfg.server.max_request_size_mb||10; }
     document.getElementById('tls-enabled').checked=!!(cfg.tls&&cfg.tls.enabled); document.getElementById('tls-cert').value=(cfg.tls&&cfg.tls.cert_path)||''; document.getElementById('tls-key').value=(cfg.tls&&cfg.tls.key_path)||'';
     if (cfg.admin) { document.getElementById('admin-path').value=cfg.admin.path||'/admin'; if(cfg.admin.auth){document.getElementById('admin-auth-enabled').checked=!!cfg.admin.auth.enabled; document.getElementById('admin-user-env').value=cfg.admin.auth.username_env||''; document.getElementById('admin-pass-env').value=cfg.admin.auth.password_env||'';} }
+    var dc=cfg.dashboard||{}; document.getElementById('dash-enabled').checked=dc.enabled!==false; document.getElementById('dash-path').value=dc.path||'/dashboard'; document.getElementById('dash-interval').value=dc.metrics_update_interval_seconds||1;
+    var pc=cfg.prometheus||{}; document.getElementById('prom-enabled').checked=!!pc.enabled; document.getElementById('prom-path').value=pc.path||'/metrics';
+    document.getElementById('codex-url').value=cfg.codex_instructions_url||'';
+    var ec=cfg.exact_cache||{}; document.getElementById('ecache-enabled').checked=ec.enabled!==false; document.getElementById('ecache-max-entries').value=ec.max_entries||5000; document.getElementById('ecache-ttl').value=ec.ttl_seconds!=null?ec.ttl_seconds:3600; document.getElementById('ecache-temp-threshold').value=ec.temperature_threshold!=null?ec.temperature_threshold:0.15;
     provList.innerHTML=''; if(cfg.providers){cfg.providers.forEach(function(p){addProviderCard(p);});}
     grpList.innerHTML=''; if(cfg.model_groups){cfg.model_groups.forEach(function(g){addGroupCard(g);});}
     if(cfg.retry){document.getElementById('retry-max').value=cfg.retry.max_retries_per_provider||1; document.getElementById('retry-backoff').value=(cfg.retry.backoff_sequence_seconds&&cfg.retry.backoff_sequence_seconds[0])||1; if(cfg.retry.backoff_sequence_seconds&&cfg.retry.backoff_sequence_seconds.length>1&&cfg.retry.backoff_sequence_seconds[0]){document.getElementById('retry-multiplier').value=(cfg.retry.backoff_sequence_seconds[1]/cfg.retry.backoff_sequence_seconds[0]).toFixed(2).replace(/\.00$/,'');}else{document.getElementById('retry-multiplier').value=2;} document.getElementById('retry-jitter-enabled').value=cfg.retry.jitter_enabled===false?'false':'true'; document.getElementById('retry-jitter-ratio').value=cfg.retry.jitter_ratio!=null?cfg.retry.jitter_ratio:0.2;}
@@ -2849,6 +3111,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     populateGuardrails(cfg.guardrails);
     populateStructuredOutput(cfg.structured_output);
     populateToolCompression(cfg.tool_compression);
+    populateMemory(cfg.memory);
   }
 
   // --- Collect Config from UI ---
@@ -2863,6 +3126,10 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     cfg.server = { host:document.getElementById('srv-host').value.trim(), port:parseInt(document.getElementById('srv-port').value,10), request_timeout_seconds:parseInt(document.getElementById('srv-timeout').value,10), max_request_size_mb:parseInt(document.getElementById('srv-max-body').value,10) };
     cfg.tls=document.getElementById('tls-enabled').checked?{enabled:true,cert_path:document.getElementById('tls-cert').value.trim(),key_path:document.getElementById('tls-key').value.trim()}:null;
     cfg.admin=cfg.admin||{}; cfg.admin.enabled=cfg.admin.enabled!==false; cfg.admin.path=document.getElementById('admin-path').value.trim(); cfg.admin.auth={enabled:document.getElementById('admin-auth-enabled').checked,username_env:document.getElementById('admin-user-env').value.trim()||null,password_env:document.getElementById('admin-pass-env').value.trim()||null};
+    cfg.dashboard={enabled:document.getElementById('dash-enabled').checked,path:document.getElementById('dash-path').value.trim()||'/dashboard',metrics_update_interval_seconds:parseInt(document.getElementById('dash-interval').value,10)||1};
+    cfg.prometheus=document.getElementById('prom-enabled').checked?{enabled:true,path:document.getElementById('prom-path').value.trim()||'/metrics'}:null;
+    var codexUrl=document.getElementById('codex-url').value.trim(); if(codexUrl){cfg.codex_instructions_url=codexUrl;}else{delete cfg.codex_instructions_url;}
+    cfg.exact_cache={enabled:document.getElementById('ecache-enabled').checked,max_entries:parseInt(document.getElementById('ecache-max-entries').value,10)||5000,ttl_seconds:parseInt(document.getElementById('ecache-ttl').value,10)||3600,temperature_threshold:parseFloat(document.getElementById('ecache-temp-threshold').value)||0.15};
     var originalProviders = (config && config.providers) || [];
     cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
     var originalGroups = (config && config.model_groups) || [];
@@ -2879,6 +3146,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     cfg.context={enabled:document.getElementById('context-enabled').checked,truncation_strategy:document.getElementById('context-strategy').value,sliding_window_size:parseInt(document.getElementById('context-window-size').value,10),capabilities_cache_ttl_seconds:parseInt(document.getElementById('context-cache-ttl').value,10),max_truncation_retries:parseInt(document.getElementById('context-max-retries').value,10)};
     cfg.compression=collectCompression();
     cfg.tool_compression=collectToolCompression();
+    cfg.memory=collectMemory();
     cfg.streaming={emit_early_event:document.getElementById('stream-early-event').checked,keepalive_interval_seconds:parseInt(document.getElementById('stream-keepalive').value,10),passthrough_enabled:document.getElementById('stream-passthrough').checked,chunk_timeout_seconds:parseInt(document.getElementById('stream-chunk-timeout').value,10),retry_on_truncation:document.getElementById('stream-retry-truncation').checked};
     cfg.loop_detection=collectLoopDetection();
     cfg.guardrails=collectGuardrails();
@@ -4944,6 +5212,214 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
   });
   document.getElementById('tc-reset-btn').addEventListener('click', function() {
     if (config) populateToolCompression(config.tool_compression);
+  });
+
+  // --- Persistent Memory Admin ---
+  function populateMemory(mem) {
+    if (!mem) mem = {};
+    document.getElementById('mem-enabled').checked = !!mem.enabled;
+    document.getElementById('mem-db-path').value = mem.database_path || './memory.db';
+    document.getElementById('mem-injection-strategy').value = mem.injection_strategy || 'system_prompt_prefix';
+    document.getElementById('mem-max-injection-tokens').value = mem.max_injection_tokens != null ? mem.max_injection_tokens : 500;
+    document.getElementById('mem-decay-hours').value = mem.decay_schedule_hours || 24;
+    document.getElementById('mem-max-per-ns').value = mem.max_memories_per_namespace || 1000;
+    document.getElementById('mem-allow-sensitive').checked = !!mem.allow_sensitive_storage;
+    document.getElementById('mem-show-feedback').checked = mem.show_feedback !== false;
+    document.getElementById('mem-auto-extract').checked = !!mem.auto_extract_enabled;
+    document.getElementById('mem-extract-provider').value = mem.auto_extract_provider || '';
+    document.getElementById('mem-extract-model').value = mem.auto_extract_model || '';
+    document.getElementById('mem-extract-min-turns').value = mem.auto_extract_min_turns || 4;
+    var q = mem.qdrant || {};
+    document.getElementById('mem-qdrant-url').value = q.url || '';
+    document.getElementById('mem-qdrant-collection').value = q.collection_name || '';
+    document.getElementById('mem-qdrant-fts-weight').value = q.fts_weight != null ? q.fts_weight : 0.5;
+    document.getElementById('mem-qdrant-vector-weight').value = q.vector_weight != null ? q.vector_weight : 0.5;
+    memLoadStats();
+    memLoadProjects();
+  }
+
+  function collectMemory() {
+    var mem = {
+      enabled: document.getElementById('mem-enabled').checked,
+      database_path: document.getElementById('mem-db-path').value.trim() || './memory.db',
+      injection_strategy: document.getElementById('mem-injection-strategy').value,
+      max_injection_tokens: parseInt(document.getElementById('mem-max-injection-tokens').value, 10) || 500,
+      auto_extract_enabled: document.getElementById('mem-auto-extract').checked,
+      auto_extract_provider: document.getElementById('mem-extract-provider').value.trim(),
+      auto_extract_model: document.getElementById('mem-extract-model').value.trim(),
+      auto_extract_min_turns: parseInt(document.getElementById('mem-extract-min-turns').value, 10) || 4,
+      decay_schedule_hours: parseInt(document.getElementById('mem-decay-hours').value, 10) || 24,
+      max_memories_per_namespace: parseInt(document.getElementById('mem-max-per-ns').value, 10) || 1000,
+      allow_sensitive_storage: document.getElementById('mem-allow-sensitive').checked,
+      show_feedback: document.getElementById('mem-show-feedback').checked
+    };
+    var qUrl = document.getElementById('mem-qdrant-url').value.trim();
+    if (qUrl) {
+      mem.qdrant = {
+        url: qUrl,
+        collection_name: document.getElementById('mem-qdrant-collection').value.trim() || 'ai_gateway_memories',
+        fts_weight: parseFloat(document.getElementById('mem-qdrant-fts-weight').value) || 0.5,
+        vector_weight: parseFloat(document.getElementById('mem-qdrant-vector-weight').value) || 0.5
+      };
+    }
+    return mem;
+  }
+
+  function memApiUrl(path) { return apiUrl('memory/' + path); }
+
+  function memLoadStats() {
+    fetch(memApiUrl('stats'))
+      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function(s) {
+        document.getElementById('mem-stat-total').textContent = s.total_count != null ? s.total_count : '—';
+        var nsCount = s.memories_per_namespace ? Object.keys(s.memories_per_namespace).length : 0;
+        document.getElementById('mem-stat-ns').textContent = nsCount;
+        document.getElementById('mem-stat-relevance').textContent = s.average_relevance_score != null ? s.average_relevance_score.toFixed(3) : '—';
+        document.getElementById('mem-stat-size').textContent = s.storage_size_bytes != null ? formatBytes(s.storage_size_bytes) : '—';
+        document.getElementById('mem-stat-decay').textContent = s.last_decay_cycle ? new Date(s.last_decay_cycle).toLocaleString() : 'Never';
+      })
+      .catch(function() {
+        document.getElementById('mem-stat-total').textContent = '—';
+        document.getElementById('mem-stat-ns').textContent = '—';
+        document.getElementById('mem-stat-relevance').textContent = '—';
+        document.getElementById('mem-stat-size').textContent = '—';
+        document.getElementById('mem-stat-decay').textContent = '—';
+      });
+  }
+
+  function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1048576).toFixed(1) + ' MB';
+  }
+
+  function memLoadProjects() {
+    fetch(memApiUrl('projects'))
+      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function(projects) {
+        var tbody = document.getElementById('mem-projects-tbody');
+        tbody.innerHTML = '';
+        if (!projects || !projects.length) {
+          document.getElementById('mem-projects-wrap').style.display = 'none';
+          document.getElementById('mem-projects-empty').textContent = 'No detected projects';
+          document.getElementById('mem-projects-empty').style.display = 'block';
+          return;
+        }
+        document.getElementById('mem-projects-wrap').style.display = 'block';
+        document.getElementById('mem-projects-empty').style.display = 'none';
+        projects.forEach(function(p) {
+          var row = document.createElement('tr');
+          var td1 = document.createElement('td'); td1.textContent = p.namespace; td1.style.padding = '.4rem .5rem'; td1.style.fontFamily = 'monospace'; td1.style.fontSize = '.75rem'; row.appendChild(td1);
+          var td2 = document.createElement('td'); td2.textContent = p.entry_count; td2.style.padding = '.4rem .5rem'; row.appendChild(td2);
+          var td3 = document.createElement('td'); td3.textContent = p.last_activity ? new Date(p.last_activity).toLocaleString() : '—'; td3.style.padding = '.4rem .5rem'; row.appendChild(td3);
+          tbody.appendChild(row);
+        });
+      })
+      .catch(function() {
+        document.getElementById('mem-projects-wrap').style.display = 'none';
+        document.getElementById('mem-projects-empty').textContent = 'Failed to load projects';
+      });
+  }
+
+  function memBrowseEntries() {
+    var ns = document.getElementById('mem-browse-ns').value.trim();
+    if (!ns) { document.getElementById('mem-entries-empty').textContent = 'Enter a namespace'; return; }
+    fetch(memApiUrl('entries') + '?namespace=' + encodeURIComponent(ns) + '&limit=50')
+      .then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
+      .then(function(data) {
+        var entries = data.entries || [];
+        var tbody = document.getElementById('mem-entries-tbody');
+        tbody.innerHTML = '';
+        if (!entries.length) {
+          document.getElementById('mem-entries-wrap').style.display = 'none';
+          document.getElementById('mem-entries-empty').textContent = 'No entries in this namespace';
+          document.getElementById('mem-entries-empty').style.display = 'block';
+          return;
+        }
+        document.getElementById('mem-entries-wrap').style.display = 'block';
+        document.getElementById('mem-entries-empty').style.display = 'none';
+        document.getElementById('mem-entries-info').textContent = 'Showing ' + entries.length + ' of ' + (data.total_count || entries.length) + ' entries';
+        entries.forEach(function(entry) {
+          var row = document.createElement('tr');
+          var td1 = document.createElement('td'); td1.textContent = entry.content.length > 80 ? entry.content.substring(0, 80) + '…' : entry.content; td1.style.padding = '.4rem .5rem'; td1.style.maxWidth = '300px'; td1.style.overflow = 'hidden'; td1.title = entry.content; row.appendChild(td1);
+          var td2 = document.createElement('td'); td2.textContent = entry.memory_type || '—'; td2.style.padding = '.4rem .5rem'; row.appendChild(td2);
+          var td3 = document.createElement('td'); td3.textContent = entry.relevance_score != null ? entry.relevance_score.toFixed(3) : '—'; td3.style.padding = '.4rem .5rem'; row.appendChild(td3);
+          var td4 = document.createElement('td'); td4.textContent = entry.last_accessed_at ? new Date(entry.last_accessed_at).toLocaleString() : '—'; td4.style.padding = '.4rem .5rem'; td4.style.fontSize = '.75rem'; row.appendChild(td4);
+          var td5 = document.createElement('td'); td5.style.padding = '.4rem .5rem';
+          var delBtn = document.createElement('button');
+          delBtn.className = 'btn btn-danger btn-sm';
+          delBtn.textContent = 'Delete';
+          delBtn.title = 'Delete entry ' + entry.id;
+          delBtn.addEventListener('click', function() { memDeleteEntry(entry.id); });
+          td5.appendChild(delBtn);
+          row.appendChild(td5);
+          tbody.appendChild(row);
+        });
+      })
+      .catch(function(err) {
+        document.getElementById('mem-entries-wrap').style.display = 'none';
+        document.getElementById('mem-entries-empty').textContent = 'Error: ' + err.message;
+        document.getElementById('mem-entries-empty').style.display = 'block';
+      });
+  }
+
+  function memDeleteEntry(id) {
+    if (!confirm('Delete this memory entry?')) return;
+    fetch(memApiUrl('entries/' + id), { method: 'DELETE' })
+      .then(function(r) { if (!r.ok && r.status !== 204) throw new Error('HTTP ' + r.status); showToast('Entry deleted'); memBrowseEntries(); })
+      .catch(function(err) { showToast('Delete failed: ' + err.message, true); });
+  }
+
+  function memClearNamespace() {
+    var ns = document.getElementById('mem-browse-ns').value.trim();
+    if (!ns) return;
+    if (!confirm('Delete ALL entries in namespace "' + ns + '"? This cannot be undone.')) return;
+    fetch(memApiUrl('namespaces/' + encodeURIComponent(ns)), { method: 'DELETE' })
+      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function(data) { showToast('Cleared ' + (data.deleted_count || 0) + ' entries'); memBrowseEntries(); memLoadStats(); })
+      .catch(function(err) { showToast('Clear failed: ' + err.message, true); });
+  }
+
+  function memCreateEntry() {
+    var ns = document.getElementById('mem-create-ns').value.trim();
+    var content = document.getElementById('mem-create-content').value.trim();
+    var memType = document.getElementById('mem-create-type').value;
+    var statusEl = document.getElementById('mem-create-status');
+    if (!ns || !content) { statusEl.textContent = 'Namespace and content are required'; statusEl.style.color = 'var(--danger)'; return; }
+    statusEl.textContent = 'Creating…'; statusEl.style.color = 'var(--text-muted)';
+    fetch(memApiUrl('entries'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ namespace: ns, content: content, memory_type: memType })
+    })
+      .then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
+      .then(function() { statusEl.textContent = 'Created successfully'; statusEl.style.color = 'var(--success)'; document.getElementById('mem-create-content').value = ''; memLoadStats(); })
+      .catch(function(err) { statusEl.textContent = 'Error: ' + err.message; statusEl.style.color = 'var(--danger)'; });
+  }
+
+  document.getElementById('mem-refresh-stats').addEventListener('click', memLoadStats);
+  document.getElementById('mem-refresh-projects').addEventListener('click', memLoadProjects);
+  document.getElementById('mem-browse-btn').addEventListener('click', memBrowseEntries);
+  document.getElementById('mem-clear-ns-btn').addEventListener('click', memClearNamespace);
+  document.getElementById('mem-create-btn').addEventListener('click', memCreateEntry);
+
+  document.getElementById('mem-save-btn').addEventListener('click', function() {
+    var memCfg = collectMemory();
+    setStatus('Saving memory config…');
+    // Merge memory config into the full config and PUT
+    var fullCfg = config ? JSON.parse(JSON.stringify(config)) : {};
+    fullCfg.memory = memCfg;
+    fetch(apiUrl('config'), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(fullCfg)
+    })
+      .then(function(r) { if (!r.ok) return r.text().then(function(t) { throw new Error(t || 'HTTP ' + r.status); }); return r.text(); })
+      .then(function() { setStatus('Memory config saved'); showToast('Memory settings saved'); if (config) config.memory = memCfg; })
+      .catch(function(err) { setStatus('Failed: ' + err.message); showToast('Save failed: ' + err.message, true); });
+  });
+  document.getElementById('mem-reset-btn').addEventListener('click', function() {
+    if (config) populateMemory(config.memory);
   });
 
   // --- Init: load config on startup ---

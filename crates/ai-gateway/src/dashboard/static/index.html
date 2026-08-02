@@ -124,6 +124,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
   <button class="tab-btn" role="tab" aria-selected="false" data-section="costs" id="tab-costs">Cost Breakdown</button>
   <button class="tab-btn" role="tab" aria-selected="false" data-section="compression" id="tab-compression">Compression</button>
   <button class="tab-btn" role="tab" aria-selected="false" data-section="errors" id="tab-errors">Recent Errors</button>
+  <button class="tab-btn" role="tab" aria-selected="false" data-section="memory" id="tab-memory">Memory</button>
   <button class="tab-btn" role="tab" aria-selected="false" data-section="logs" id="tab-logs">Log Viewer</button>
 </div>
 
@@ -332,6 +333,36 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
       </table>
     </div>
     <div class="empty" id="errors-empty">No errors recorded</div>
+  </section>
+
+  <!-- Persistent Memory Metrics -->
+  <section class="section" id="sec-memory" role="tabpanel" aria-labelledby="tab-memory">
+    <h2 class="section-title">Persistent Memory</h2>
+    <div class="cards">
+      <div class="card"><div class="card-label">Total Events</div><div class="card-value" id="mem-event-count" aria-live="polite">0</div></div>
+      <div class="card"><div class="card-label">Injections</div><div class="card-value" id="mem-injections" aria-live="polite" style="color:var(--primary)">0</div></div>
+      <div class="card"><div class="card-label">Extractions</div><div class="card-value" id="mem-extractions" aria-live="polite" style="color:var(--success)">0</div></div>
+      <div class="card"><div class="card-label">Evictions</div><div class="card-value" id="mem-evictions" aria-live="polite" style="color:var(--warning)">0</div></div>
+      <div class="card"><div class="card-label">Total Memories Affected</div><div class="card-value" id="mem-total-count" aria-live="polite">0</div></div>
+    </div>
+    <div class="chart-row">
+      <div class="chart-box"><h3>Memory Events Timeline</h3><canvas id="chart-mem-timeline" role="img" aria-label="Memory events over time showing injections, extractions, and evictions"></canvas></div>
+      <div class="chart-box"><h3>Event Type Distribution</h3><canvas id="chart-mem-types" role="img" aria-label="Pie chart showing distribution of memory event types"></canvas></div>
+    </div>
+    <h2 class="section-title" style="margin-top:1.5rem">Namespace Activity</h2>
+    <div class="table-wrap" id="mem-ns-table-wrap" hidden>
+      <table id="mem-ns-table" aria-label="Memory namespace activity">
+        <thead><tr>
+          <th>Namespace</th>
+          <th>Injections</th>
+          <th>Extractions</th>
+          <th>Evictions</th>
+          <th>Last Event</th>
+        </tr></thead>
+        <tbody id="mem-ns-tbody"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="mem-ns-empty">Waiting for memory events…</div>
   </section>
 
   <!-- Log Viewer (Req 16.13, 33.6) -->
@@ -829,6 +860,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
         }
         if(msg.type==='errors'&&msg.data){ renderErrors(msg.data); }
         if(msg.type==='compression'&&msg.data){ handleCompressionEvent(msg.data); handleToolCompressionEvent(msg.data); }
+        if(msg.type==='memory'&&msg.data){ handleMemoryEvent(msg.data); }
       }catch(e){/* ignore parse errors */}
     };
 
@@ -1212,9 +1244,146 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     });
   }
 
+  // --- Persistent Memory Dashboard ---
+  var memEvents = [];
+  var MEM_MAX_EVENTS = 500;
+  var memTotalInjections = 0;
+  var memTotalExtractions = 0;
+  var memTotalEvictions = 0;
+  var memTotalCount = 0;
+  var memNamespaces = {};
+  var memTimelineChart = null;
+  var memTypesChart = null;
+
+  function initMemoryCharts() {
+    if (typeof Chart === 'undefined') return;
+    memTimelineChart = new Chart($('chart-mem-timeline'), {
+      type: 'line',
+      data: { labels: [], datasets: [
+        { label: 'Injections', data: [], borderWidth: 2, pointRadius: 0, tension: 0.3, borderColor: 'rgba(59,130,246,.8)', backgroundColor: 'rgba(59,130,246,.1)', fill: true },
+        { label: 'Extractions', data: [], borderWidth: 2, pointRadius: 0, tension: 0.3, borderColor: 'rgba(34,197,94,.8)', backgroundColor: 'rgba(34,197,94,.1)', fill: true },
+        { label: 'Evictions', data: [], borderWidth: 2, pointRadius: 0, tension: 0.3, borderColor: 'rgba(245,158,11,.8)', backgroundColor: 'rgba(245,158,11,.1)', fill: true }
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, animation: { duration: 300 },
+        scales: { x: { grid: { color: 'rgba(71,85,105,.3)' }, ticks: { color: '#94a3b8', maxTicksLimit: 12 } },
+                  y: { grid: { color: 'rgba(71,85,105,.3)' }, ticks: { color: '#94a3b8' }, beginAtZero: true } },
+        plugins: { legend: { labels: { color: '#94a3b8' } } } }
+    });
+    memTypesChart = new Chart($('chart-mem-types'), {
+      type: 'doughnut',
+      data: { labels: ['Injections', 'Extractions', 'Evictions'], datasets: [{
+        data: [0, 0, 0],
+        backgroundColor: ['rgba(59,130,246,.7)', 'rgba(34,197,94,.7)', 'rgba(245,158,11,.7)'],
+        borderColor: ['rgba(59,130,246,1)', 'rgba(34,197,94,1)', 'rgba(245,158,11,1)'],
+        borderWidth: 1
+      }]},
+      options: { responsive: true, maintainAspectRatio: false, animation: { duration: 300 },
+        plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8' } } } }
+    });
+  }
+
+  function handleMemoryEvent(data) {
+    var eventType = data.event_type;
+    var count = data.count || 1;
+    var ns = data.namespace || 'unknown';
+    var ts = data.timestamp || new Date().toISOString();
+
+    memTotalCount += count;
+    if (eventType === 'injection') memTotalInjections += count;
+    else if (eventType === 'extraction') memTotalExtractions += count;
+    else if (eventType === 'eviction') memTotalEvictions += count;
+
+    var now = new Date(ts);
+    var label = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0') + ':' + String(now.getSeconds()).padStart(2, '0');
+    memEvents.push({ type: eventType, count: count, namespace: ns, time: label, ts: now.getTime() });
+    if (memEvents.length > MEM_MAX_EVENTS) memEvents.shift();
+
+    // Track namespace activity
+    if (!memNamespaces[ns]) memNamespaces[ns] = { injections: 0, extractions: 0, evictions: 0, lastEvent: ts };
+    if (eventType === 'injection') memNamespaces[ns].injections += count;
+    else if (eventType === 'extraction') memNamespaces[ns].extractions += count;
+    else if (eventType === 'eviction') memNamespaces[ns].evictions += count;
+    memNamespaces[ns].lastEvent = ts;
+
+    renderMemoryMetrics();
+  }
+
+  function renderMemoryMetrics() {
+    var total = memTotalInjections + memTotalExtractions + memTotalEvictions;
+    $('mem-event-count').textContent = total;
+    $('mem-injections').textContent = memTotalInjections;
+    $('mem-extractions').textContent = memTotalExtractions;
+    $('mem-evictions').textContent = memTotalEvictions;
+    $('mem-total-count').textContent = memTotalCount;
+
+    // Update timeline chart
+    if (memTimelineChart && memEvents.length > 0) {
+      var bucketCount = Math.min(30, memEvents.length);
+      var bucketSize = Math.max(1, Math.floor(memEvents.length / bucketCount));
+      var labels = [], inj = [], ext = [], evi = [];
+      for (var i = 0; i < memEvents.length; i += bucketSize) {
+        var slice = memEvents.slice(i, i + bucketSize);
+        var sInj = 0, sExt = 0, sEvi = 0;
+        for (var j = 0; j < slice.length; j++) {
+          if (slice[j].type === 'injection') sInj += slice[j].count;
+          else if (slice[j].type === 'extraction') sExt += slice[j].count;
+          else if (slice[j].type === 'eviction') sEvi += slice[j].count;
+        }
+        labels.push(slice[slice.length - 1].time);
+        inj.push(sInj); ext.push(sExt); evi.push(sEvi);
+      }
+      memTimelineChart.data.labels = labels;
+      memTimelineChart.data.datasets[0].data = inj;
+      memTimelineChart.data.datasets[1].data = ext;
+      memTimelineChart.data.datasets[2].data = evi;
+      memTimelineChart.update('none');
+    }
+
+    // Update types doughnut chart
+    if (memTypesChart) {
+      memTypesChart.data.datasets[0].data = [memTotalInjections, memTotalExtractions, memTotalEvictions];
+      memTypesChart.update('none');
+    }
+
+    // Update namespace table
+    renderMemoryNamespaces();
+  }
+
+  function renderMemoryNamespaces() {
+    var keys = Object.keys(memNamespaces);
+    if (!keys.length) {
+      $('mem-ns-table-wrap').hidden = true;
+      $('mem-ns-empty').style.display = 'block';
+      return;
+    }
+    $('mem-ns-table-wrap').hidden = false;
+    $('mem-ns-empty').style.display = 'none';
+    // Sort by total activity descending
+    keys.sort(function(a, b) {
+      var totalA = memNamespaces[a].injections + memNamespaces[a].extractions + memNamespaces[a].evictions;
+      var totalB = memNamespaces[b].injections + memNamespaces[b].extractions + memNamespaces[b].evictions;
+      return totalB - totalA;
+    });
+    var tbody = $('mem-ns-tbody');
+    var html = '';
+    keys.slice(0, 20).forEach(function(ns) {
+      var d = memNamespaces[ns];
+      var lastTime = d.lastEvent ? new Date(d.lastEvent).toLocaleTimeString() : '—';
+      html += '<tr><td style="font-family:monospace;font-size:.75rem">' + escHtml(ns) + '</td>'
+        + '<td>' + d.injections + '</td>'
+        + '<td>' + d.extractions + '</td>'
+        + '<td>' + d.evictions + '</td>'
+        + '<td style="font-size:.75rem">' + lastTime + '</td></tr>';
+    });
+    tbody.innerHTML = html;
+  }
+
+  function escHtml(s) { var d = document.createElement('span'); d.textContent = s; return d.innerHTML; }
+
   // --- Init ---
   initCharts();
   initTcSavingsChart();
+  initMemoryCharts();
   renderCompression();
   wsConnect();
   loadErrors();
