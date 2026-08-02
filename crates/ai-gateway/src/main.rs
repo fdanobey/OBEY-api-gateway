@@ -26,6 +26,7 @@ mod guardrail;
 mod logger;
 #[allow(dead_code, unused_imports)]
 mod loop_detection;
+#[allow(dead_code, unused_imports)]
 mod memory;
 mod metrics;
 mod models;
@@ -33,7 +34,9 @@ mod oauth;
 mod providers;
 mod router;
 mod secrets;
+#[allow(dead_code, unused_imports)]
 mod structured_output;
+#[allow(dead_code, unused_imports)]
 mod tool_compression;
 #[cfg(feature = "tray")]
 mod tray;

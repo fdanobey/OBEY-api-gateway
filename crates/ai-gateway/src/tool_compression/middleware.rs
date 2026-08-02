@@ -24,7 +24,18 @@ use crate::metrics::Metrics;
 use super::{
     config::CompressionLevel,
     stage::CompressionStage,
-    stages::{auto_tuner::AutoTuner, feedback_loop::FeedbackLoop},
+    stages::{
+        auto_tuner::AutoTuner,
+        cache_placement::CachePlacementOptimizer,
+        canonical_rewriter::CanonicalRewriter,
+        deduplicator::SchemaDeduplicator,
+        feedback_loop::FeedbackLoop,
+        minifier::SchemaMinifier,
+        namespace_grouper::NamespaceGrouper,
+        pruner::ToolPruner,
+        semantic_retriever::SemanticRetriever,
+        truncator::DescriptionTruncator,
+    },
     state::ToolCompressionState,
     types::{CompressionContext, ToolDefinition},
     validation::validate_compressed_tools,
@@ -94,6 +105,30 @@ impl<S> Layer<S> for ToolCompressionLayer {
                 Arc::new(AutoTuner::new(&super::config::AutoTuningConfig::default()))
             });
 
+        // Build pipeline stages in fixed order from config.
+        // Order: Minifier → Truncator → Semantic Retriever → Deduplicator →
+        //        Pruner → Namespace Grouper → Cache Placement → Canonical Rewriter
+        let pipeline: Vec<Box<dyn CompressionStage>> = self
+            .config
+            .try_read()
+            .map(|c| {
+                let tc = &c.tool_compression;
+                let mut stages: Vec<Box<dyn CompressionStage>> = Vec::with_capacity(8);
+                stages.push(Box::new(SchemaMinifier));
+                stages.push(Box::new(DescriptionTruncator::new()));
+                stages.push(Box::new(SemanticRetriever::new(tc)));
+                stages.push(Box::new(SchemaDeduplicator));
+                stages.push(Box::new(ToolPruner::new(&tc.pruning)));
+                stages.push(Box::new(NamespaceGrouper::new(&tc.namespace_grouping)));
+                stages.push(Box::new(CachePlacementOptimizer));
+                stages.push(Box::new(CanonicalRewriter::new(
+                    &tc.canonical_rewriting.allowed_models,
+                    Arc::new(dashmap::DashMap::new()),
+                )));
+                stages
+            })
+            .unwrap_or_default();
+
         ToolCompressionService {
             inner,
             config: Arc::clone(&self.config),
@@ -101,7 +136,7 @@ impl<S> Layer<S> for ToolCompressionLayer {
             metrics: Arc::clone(&self.metrics),
             compression_events: Arc::clone(&self.compression_events),
             enabled: self.enabled,
-            pipeline: Arc::from(Vec::<Box<dyn CompressionStage>>::new().into_boxed_slice()),
+            pipeline: Arc::from(pipeline.into_boxed_slice()),
             feedback_loop,
             auto_tuner,
         }

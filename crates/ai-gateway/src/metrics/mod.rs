@@ -881,6 +881,7 @@ Total refusal failover outcomes by pipeline and outcome\n",
     }
 
     /// Record a structured output validation outcome.
+    #[allow(dead_code)]
     pub fn record_structured_output_validation(&self, provider: &str, model: &str, status: &str) {
         self.structured_output
             .record_structured_output_validation(provider, model, status);
@@ -942,6 +943,7 @@ Total refusal failover outcomes by pipeline and outcome\n",
     }
 
     /// Record tool compression pipeline metrics for one request.
+    #[allow(dead_code)]
     pub fn record_tool_compression(
         &self,
         model_group: &str,
@@ -986,6 +988,7 @@ Total refusal failover outcomes by pipeline and outcome\n",
     }
 
     /// Record the number of tools pruned for a model group (gauge — overwrites previous value).
+    #[allow(dead_code)]
     pub fn record_tool_compression_tools_pruned(&self, model_group: &str, count: u64) {
         let key = bounded_label(model_group, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
         self.tool_compression_tools_pruned
@@ -996,6 +999,7 @@ Total refusal failover outcomes by pipeline and outcome\n",
 
     /// Record the current feedback-loop compression level for a model group (gauge).
     /// Level is encoded as integer: 0=low, 1=medium, 2=high, 3=max.
+    #[allow(dead_code)]
     pub fn record_tool_compression_feedback_level(&self, model_group: &str, level: u64) {
         let key = bounded_label(model_group, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
         self.tool_compression_feedback_level
@@ -1006,6 +1010,7 @@ Total refusal failover outcomes by pipeline and outcome\n",
 
     /// Record the current feedback-loop error rate for a model group (gauge).
     /// Rate is stored as micros (rate * 1_000_000) to avoid float atomics.
+    #[allow(dead_code)]
     pub fn record_tool_compression_feedback_error_rate(&self, model_group: &str, rate: f64) {
         let key = bounded_label(model_group, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
         let rate_micros = (rate.clamp(0.0, 1.0) * 1_000_000.0).round() as u64;
@@ -1016,6 +1021,7 @@ Total refusal failover outcomes by pipeline and outcome\n",
     }
 
     /// Increment the feedback-loop adjustment counter for a model group.
+    #[allow(dead_code)]
     pub fn record_tool_compression_feedback_adjustment(&self, model_group: &str) {
         let key = bounded_label(model_group, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
         self.tool_compression_feedback_adjustments

@@ -278,8 +278,8 @@ impl CompressionStage for NamespaceGrouper {
         tokens_saved
     }
 
-    fn is_enabled(&self, config: &ToolCompressionConfig, _level: CompressionLevel) -> bool {
-        config.namespace_grouping.enabled
+    fn is_enabled(&self, _config: &ToolCompressionConfig, _level: CompressionLevel) -> bool {
+        self.enabled
     }
 }
 

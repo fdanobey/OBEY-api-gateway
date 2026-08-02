@@ -6,6 +6,7 @@
 
 use serde_json::Value;
 
+#[allow(unused_imports)]
 use crate::tool_compression::config::{CompressionLevel, MinificationConfig, ToolCompressionConfig};
 use crate::tool_compression::stage::CompressionStage;
 use crate::tool_compression::types::{CompressionContext, ProviderCaps, ToolDefinition};
