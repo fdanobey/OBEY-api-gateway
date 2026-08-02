@@ -29,6 +29,9 @@ AI providers go down. Rate limits hit. Models get deprecated. OBEY handles all o
 | [Streaming Reliability](Streaming) | True SSE pass-through, early events, keep-alive, mid-stream failover |
 | [Response Caching](Caching) | Two-tier: in-memory exact-match + optional Qdrant semantic cache |
 | [Token Compression](Token-Compression) | Multi-engine payload compression with custom pipelines and cache-aware downgrades |
+| [Tool Definition Compression](Tool-Definition-Compression) | Multi-stage pipeline to reduce tool/function definition token overhead with feedback loop |
+| [Structured Output Validation](Structured-Output) | JSON Schema validation of model responses with automatic corrective retries |
+| [Persistent Memory](Persistent-Memory) | Cross-session memory extraction, decay, and injection with namespace isolation |
 | [Virtual Key Management](Virtual-Keys) | Per-caller keys with budgets, rate limits, model access, expiry |
 | [Guardrail Pipelines](Guardrail-Pipelines) | PII redaction, content moderation, prompt injection detection |
 | [OpenAI OAuth Login](OAuth-and-Codex) | Browser-based sign-in with ChatGPT Plus/Pro subscription |
@@ -108,6 +111,9 @@ See [Installation](Installation) for all setup options.
 - **[Streaming](Streaming)** — Streaming reliability features
 - **[Caching](Caching)** — Exact-match and semantic cache
 - **[Token Compression](Token-Compression)** — Multi-engine payload compression
+- **[Tool Definition Compression](Tool-Definition-Compression)** — Reduce tool/function definition tokens
+- **[Structured Output](Structured-Output)** — JSON Schema validation with corrective retries
+- **[Persistent Memory](Persistent-Memory)** — Cross-session memory extraction and injection
 - **[Virtual Keys](Virtual-Keys)** — Multi-tenant key management
 - **[Guardrail Pipelines](Guardrail-Pipelines)** — Policy enforcement and PII protection
 - **[OAuth & Codex](OAuth-and-Codex)** — OpenAI OAuth and Codex backend

@@ -27,6 +27,8 @@ The Admin Panel provides a visual interface for managing all gateway configurati
 | **Streaming** | SSE reliability configuration |
 | **Virtual Keys** | Key creation, management, usage tracking |
 | **Guardrails** | Pipeline configuration, provider setup |
+| **Structured Output** | JSON Schema validation settings, retries, passthrough providers |
+| **Persistent Memory** | Memory store config, browser, extraction, vector search, live stats |
 
 ### Configuration Actions
 
@@ -69,7 +71,9 @@ The Dashboard provides real-time metrics, provider health, and log viewing via W
 | **Metrics Overview** | Total requests, avg response time, request rate, active requests, cost, cache hit rate |
 | **Provider Health** | Per-provider circuit breaker status, latency, error rates |
 | **Cost Breakdown** | Spending by provider and model |
+| **Compression** | Token compression events/timelines and tool compression statistics (reduction ratio, pruning, feedback levels, progressive disclosure) |
 | **Recent Errors** | Latest error logs with details |
+| **Memory** | Persistent memory events timeline (injections, extractions, evictions), event type distribution, namespace activity |
 | **Log Viewer** | Searchable, filterable request log table |
 
 ### Real-Time Metrics
@@ -172,6 +176,34 @@ curl -X POST http://localhost:8080/admin/oauth/openai/logout   # Logout
 curl http://localhost:8080/dashboard/metrics   # Current metrics snapshot
 curl http://localhost:8080/dashboard/errors    # Recent errors
 curl "http://localhost:8080/dashboard/logs?limit=100&provider=openai"  # Filtered logs
+```
+
+### Memory
+
+```bash
+curl "http://localhost:8080/admin/memory/entries?namespace=user::project::myapp"  # List entries
+curl -X POST http://localhost:8080/admin/memory/entries \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace":"user::project::myapp","memory_type":"fact","content":"Uses React 19"}'
+curl -X DELETE http://localhost:8080/admin/memory/entries/{id}            # Delete entry
+curl -X DELETE http://localhost:8080/admin/memory/namespaces/{namespace}  # Clear namespace
+curl http://localhost:8080/admin/memory/stats                             # Store statistics
+curl http://localhost:8080/admin/memory/projects                          # Detected projects
+```
+
+### ONNX Assets
+
+```bash
+curl http://localhost:8080/admin/onnx/status                # Model/runtime readiness
+curl -X POST http://localhost:8080/admin/onnx/install \
+  -H 'Content-Type: application/json' \
+  -d '{"model_path":"./models/perplexity_scorer.onnx"}'    # Install assets
+```
+
+### Metrics
+
+```bash
+curl -X POST http://localhost:8080/admin/metrics/reset-active  # Reset active request counter
 ```
 
 ---

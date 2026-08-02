@@ -10,6 +10,9 @@
 - [Streaming](Streaming)
 - [Caching](Caching)
 - [Token Compression](Token-Compression)
+- [Tool Definition Compression](Tool-Definition-Compression)
+- [Structured Output](Structured-Output)
+- [Persistent Memory](Persistent-Memory)
 ### Access Control
 - [Virtual Keys](Virtual-Keys)
 - [Guardrail Pipelines](Guardrail-Pipelines)
