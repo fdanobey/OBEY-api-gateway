@@ -82,6 +82,7 @@ fn provider(base_url: &str) -> Provider {
         codex_model_override: None,
         instructions_override: None,
         max_rate_limit_cooldown_seconds: None,
+        memory: None,
     }
 }
 
@@ -104,6 +105,7 @@ fn base_config(base_url: &str) -> Config {
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
                 model: "gpt-4".to_string(),
@@ -128,7 +130,9 @@ fn base_config(base_url: &str) -> Config {
         virtual_keys: Default::default(),
         loop_detection: Default::default(),
         guardrails: None,
+        tool_compression: Default::default(),
         structured_output: None,
+        memory: None,
     }
 }
 

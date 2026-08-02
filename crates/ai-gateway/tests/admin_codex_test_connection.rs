@@ -56,12 +56,14 @@ fn codex_test_config() -> Config {
             codex_model_override: None,
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
+            memory: None,
         }],
         model_groups: vec![ModelGroup {
             name: "codex-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models: vec![ProviderModel {
                 provider: "codex-provider".to_string(),
                 model: "gpt-4.1-nano".to_string(),
@@ -86,7 +88,9 @@ fn codex_test_config() -> Config {
         virtual_keys: Default::default(),
         loop_detection: Default::default(),
         guardrails: None,
+        tool_compression: Default::default(),
         structured_output: None,
+        memory: None,
     }
 }
 

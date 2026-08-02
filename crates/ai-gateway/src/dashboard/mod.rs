@@ -3,12 +3,13 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use rust_embed::Embed;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, sync::Mutex};
 use tokio::sync::broadcast;
 
@@ -21,6 +22,94 @@ use crate::logger::LogFilter;
 
 const COMPRESSION_EVENT_CAPACITY: usize = 100;
 const COMPRESSION_REPLAY_CAPACITY: usize = 100;
+const MEMORY_EVENT_CAPACITY: usize = 100;
+const MEMORY_REPLAY_CAPACITY: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryEventType {
+    Injection,
+    Extraction,
+    Eviction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryDashboardEvent {
+    pub event_type: MemoryEventType,
+    pub namespace: String,
+    pub count: u32,
+    pub timestamp: String,
+}
+
+impl MemoryDashboardEvent {
+    pub fn new(event_type: MemoryEventType, namespace: &str, count: u32) -> Self {
+        Self {
+            event_type,
+            namespace: hashed_namespace(namespace),
+            count,
+            timestamp: Utc::now().to_rfc3339(),
+        }
+    }
+}
+
+pub fn hashed_namespace(namespace: &str) -> String {
+    let digest = Sha256::digest(namespace.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[derive(Debug)]
+pub struct MemoryEventHub {
+    sender: broadcast::Sender<MemoryDashboardEvent>,
+    replay: Mutex<VecDeque<MemoryDashboardEvent>>,
+}
+
+impl MemoryEventHub {
+    pub fn new() -> Self {
+        let (sender, _) = broadcast::channel(MEMORY_EVENT_CAPACITY);
+        Self {
+            sender,
+            replay: Mutex::new(VecDeque::with_capacity(MEMORY_REPLAY_CAPACITY)),
+        }
+    }
+
+    pub fn publish(&self, event: MemoryDashboardEvent) {
+        let mut replay = self
+            .replay
+            .lock()
+            .expect("memory event replay mutex poisoned");
+        if replay.len() == MEMORY_REPLAY_CAPACITY {
+            replay.pop_front();
+        }
+        replay.push_back(event.clone());
+        let _ = self.sender.send(event);
+    }
+
+    pub fn subscribe(&self) -> MemoryEventSubscription {
+        let replay = self
+            .replay
+            .lock()
+            .expect("memory event replay mutex poisoned");
+        let receiver = self.sender.subscribe();
+        MemoryEventSubscription {
+            replay: replay.iter().cloned().collect(),
+            receiver,
+        }
+    }
+}
+
+impl Default for MemoryEventHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct MemoryEventSubscription {
+    pub replay: Vec<MemoryDashboardEvent>,
+    pub receiver: broadcast::Receiver<MemoryDashboardEvent>,
+}
 
 /// Bounded live and replay delivery for content-free compression statistics.
 #[derive(Debug)]
@@ -75,6 +164,67 @@ pub struct CompressionEventSubscription {
     pub receiver: broadcast::Receiver<CompressionStats>,
 }
 
+/// Event emitted by the tool compression middleware after each compression.
+///
+/// Published to the compression events hub for dashboard WebSocket delivery.
+/// Contains all fields required for real-time monitoring of compression activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCompressionEvent {
+    /// Unique request identifier for correlation.
+    pub request_id: String,
+    /// Model group the request targeted.
+    pub model_group: String,
+    /// Effective compression level applied.
+    pub level: String,
+    /// Estimated token count of the original tools array.
+    pub original_tokens: u64,
+    /// Estimated token count of the compressed tools array.
+    pub compressed_tokens: u64,
+    /// Names of compression strategies that were applied.
+    pub strategies_applied: Vec<String>,
+    /// Number of tools pruned by the Tool Pruner stage.
+    pub tools_pruned_count: usize,
+    /// Whether the semantic retrieval stage was active for this request.
+    pub semantic_retrieval_active: bool,
+    /// Names of tools deferred by semantic retrieval (below similarity threshold).
+    pub tools_deferred: Vec<String>,
+    /// Whether the feedback loop adjusted the compression level for this request.
+    pub feedback_adjusted: bool,
+}
+
+impl CompressionEventHub {
+    /// Publish a tool compression event as a synthetic `CompressionStats` entry
+    /// so existing dashboard subscribers receive it alongside normal compression
+    /// events.
+    pub fn publish_tool_compression(&self, event: ToolCompressionEvent) {
+        let tokens_saved = event.original_tokens.saturating_sub(event.compressed_tokens);
+        let savings_percent = if event.original_tokens > 0 {
+            (tokens_saved as f64 / event.original_tokens as f64) * 100.0
+        } else {
+            0.0
+        };
+        let stats = CompressionStats {
+            request_id: event.request_id.clone(),
+            provider: event.model_group.clone(),
+            model: event.level.clone(),
+            original_tokens: event.original_tokens as u32,
+            compressed_tokens: event.compressed_tokens as u32,
+            savings_percent,
+            compression_time_ms: 0,
+            level: crate::compression::CompressionLevel::None,
+            engines_applied: event.strategies_applied,
+            engine_results: Vec::new(),
+            timed_out: false,
+            auto_triggered: false,
+            cache_downgrade_applied: false,
+            tool_definitions_tokens_saved: tokens_saved as u32,
+            caveman_applied: false,
+            error: false,
+        };
+        self.publish(stats);
+    }
+}
+
 fn sanitize_compression_stats(mut stats: CompressionStats) -> CompressionStats {
     stats.request_id = sanitize_operational_metadata(&stats.request_id, MAX_REQUEST_ID_LEN);
     stats.provider = sanitize_operational_metadata(&stats.provider, MAX_PROVIDER_LEN);
@@ -115,6 +265,11 @@ pub fn dashboard_routes(state: AppState) -> Router<AppState> {
         .route("/metrics", get(metrics_handler))
         .route("/errors", get(errors_handler))
         .route("/logs", get(logs_handler))
+        .route("/tool-compression/config", get(tool_compression_config_handler))
+        .route("/tool-compression/overrides", get(tool_compression_overrides_handler))
+        .route("/tool-compression/stats", get(tool_compression_stats_handler))
+        .route("/tool-compression/test", post(tool_compression_test_handler))
+        .route("/tool-compression/activity", get(tool_compression_activity_handler))
         .route("/", get(index_handler))
         .route("/{*path}", get(static_handler))
 }
@@ -125,6 +280,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
     let mut subscription = state.loop_detector.events.subscribe();
     let mut compression_subscription = state.compression_events.subscribe();
+    let mut memory_subscription = state.memory_events.subscribe();
     for event in subscription.replay {
         let message = serde_json::json!({"type": "loop_detection", "data": event});
         if socket
@@ -137,6 +293,11 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     }
     for stats in compression_subscription.replay {
         if send_compression_event(&mut socket, stats).await.is_err() {
+            return;
+        }
+    }
+    for event in memory_subscription.replay {
+        if send_memory_event(&mut socket, event).await.is_err() {
             return;
         }
     }
@@ -160,6 +321,17 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
                 match event {
                     Ok(stats) => {
                         if send_compression_event(&mut socket, stats).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            event = memory_subscription.receiver.recv() => {
+                match event {
+                    Ok(event) => {
+                        if send_memory_event(&mut socket, event).await.is_err() {
                             break;
                         }
                     }
@@ -194,6 +366,18 @@ async fn send_compression_event(
 
 fn compression_message(stats: CompressionStats) -> serde_json::Value {
     serde_json::json!({"type": "compression", "data": stats})
+}
+
+async fn send_memory_event(
+    socket: &mut WebSocket,
+    event: MemoryDashboardEvent,
+) -> Result<(), axum::Error> {
+    let message = memory_message(event);
+    socket.send(Message::Text(message.to_string().into())).await
+}
+
+fn memory_message(event: MemoryDashboardEvent) -> serde_json::Value {
+    serde_json::json!({"type": "memory_event", "data": event})
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -338,6 +522,303 @@ fn mime_from_path(path: &str) -> &'static str {
     }
 }
 
+// ─── Tool Compression Dashboard Handlers ──────────────────────────────────────
+
+/// GET /dashboard/tool-compression/config — serve current tool compression config as JSON.
+async fn tool_compression_config_handler(State(state): State<AppState>) -> Response {
+    let config = state.config.read().await;
+    let tc_config = &config.tool_compression;
+    (StatusCode::OK, Json(serde_json::to_value(tc_config).unwrap_or_default())).into_response()
+}
+
+/// GET /dashboard/tool-compression/overrides — serve per-model-group overrides.
+async fn tool_compression_overrides_handler(State(state): State<AppState>) -> Response {
+    let config = state.config.read().await;
+    let overrides = &config.tool_compression.model_group_overrides;
+    (StatusCode::OK, Json(serde_json::to_value(overrides).unwrap_or_default())).into_response()
+}
+
+/// GET /dashboard/tool-compression/stats — serve real-time compression statistics.
+async fn tool_compression_stats_handler(State(state): State<AppState>) -> Response {
+    let tc_state = &state.tool_compression_state;
+
+    // Build per-group feedback summary
+    let feedback_groups: Vec<serde_json::Value> = tc_state
+        .feedback_loop
+        .group_names()
+        .into_iter()
+        .filter_map(|name| {
+            tc_state.feedback_loop.get_state(&name).map(|fs| {
+                serde_json::json!({
+                    "group": name,
+                    "level": format!("{:?}", fs.current_level),
+                    "error_rate": fs.current_error_rate(),
+                    "baseline_rate": fs.baseline_rate,
+                    "locked": fs.locked,
+                    "recovery_counter": fs.recovery_counter,
+                    "window_size": fs.window.len(),
+                })
+            })
+        })
+        .collect();
+
+    let stats = serde_json::json!({
+        "feedback_groups": feedback_groups,
+        "feedback_group_count": tc_state.feedback_loop.group_names().len(),
+        "cached_descriptions": tc_state.description_compressor.len(),
+        "active_sessions": tc_state.disclosure_state.len(),
+        "semantic_embeddings": tc_state.semantic_state.len(),
+        "namespaces": tc_state.namespace_state.len(),
+    });
+    (StatusCode::OK, Json(stats)).into_response()
+}
+
+/// POST /dashboard/tool-compression/test — apply compression to sample input.
+///
+/// Accepts `{"tools": [...]}`, runs the configured compression pipeline stages,
+/// and returns a side-by-side comparison of original vs compressed output with
+/// token estimates and reduction percentage.
+async fn tool_compression_test_handler(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    use crate::tool_compression::config::CompressionLevel as TcLevel;
+    use crate::tool_compression::stage::CompressionStage;
+    use crate::tool_compression::stages::deduplicator::SchemaDeduplicator;
+    use crate::tool_compression::stages::minifier::SchemaMinifier;
+    use crate::tool_compression::stages::truncator::DescriptionTruncator;
+    use crate::tool_compression::types::{CompressionContext, ProviderCaps, ToolDefinition};
+    use std::time::Instant;
+
+    let tools = body.get("tools").and_then(|v| v.as_array());
+    let Some(tools_arr) = tools else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "message": "Request body must contain a 'tools' array" }
+            })),
+        )
+            .into_response();
+    };
+
+    if tools_arr.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "original": [],
+                "compressed": [],
+                "original_tokens": 0,
+                "compressed_tokens": 0,
+                "reduction_percent": 0.0,
+                "strategies_applied": []
+            })),
+        )
+            .into_response();
+    }
+
+    // Compute original token estimate (chars / 4).
+    let original_json = serde_json::to_string_pretty(tools_arr).unwrap_or_default();
+    let original_tokens = original_json.len() as u64 / 4;
+
+    // Read current config for compression settings.
+    let config = state.config.read().await;
+    let tc_config = &config.tool_compression;
+    let level = tc_config.level;
+
+    // Build ToolDefinition vec from the input.
+    let mut tools_vec: Vec<ToolDefinition> = tools_arr
+        .iter()
+        .map(|raw| {
+            let name = raw
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            ToolDefinition {
+                raw: raw.clone(),
+                name,
+                content_hash: 0,
+            }
+        })
+        .collect();
+
+    // Build a compression context with current config level.
+    let mut ctx = CompressionContext {
+        level,
+        provider_caps: ProviderCaps::conservative(),
+        ..Default::default()
+    };
+    // For deduplicator to work, enable $ref support in test context.
+    ctx.provider_caps.supports_ref = true;
+    ctx.provider_caps.supports_nullable = true;
+
+    // Instantiate pipeline stages that don't require session state.
+    let stages: Vec<Box<dyn CompressionStage>> = vec![
+        Box::new(SchemaMinifier),
+        Box::new(DescriptionTruncator::with_state(std::sync::Arc::clone(
+            &state.tool_compression_state,
+        ))),
+        Box::new(SchemaDeduplicator),
+    ];
+
+    let start = Instant::now();
+
+    // Run enabled stages.
+    for stage in &stages {
+        if stage.is_enabled(tc_config, level) {
+            stage.apply(&mut tools_vec, &mut ctx);
+        }
+    }
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    // Build compressed output.
+    let compressed_arr: Vec<serde_json::Value> = tools_vec.iter().map(|t| t.raw.clone()).collect();
+    let compressed_json = serde_json::to_string_pretty(&compressed_arr).unwrap_or_default();
+    let compressed_tokens = compressed_json.len() as u64 / 4;
+
+    let reduction_percent = if original_tokens > 0 {
+        ((original_tokens as f64 - compressed_tokens as f64) / original_tokens as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let level_str = match level {
+        TcLevel::Low => "low",
+        TcLevel::Medium => "medium",
+        TcLevel::High => "high",
+        TcLevel::Max => "max",
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "original": tools_arr,
+            "compressed": compressed_arr,
+            "original_tokens": original_tokens,
+            "compressed_tokens": compressed_tokens,
+            "reduction_percent": (reduction_percent * 10.0).round() / 10.0,
+            "strategies_applied": ctx.strategies_applied,
+            "level": level_str,
+            "compression_time_ms": (elapsed_ms * 100.0).round() / 100.0,
+            "tool_count": tools_arr.len(),
+        })),
+    )
+        .into_response()
+}
+
+/// GET /dashboard/tool-compression/activity — pruning and disclosure activity.
+async fn tool_compression_activity_handler(State(state): State<AppState>) -> Response {
+    let tc_state = &state.tool_compression_state;
+    let config = state.config.read().await;
+
+    // Pruning activity: per-key usage frequencies with top tools
+    let key_usage: Vec<serde_json::Value> = tc_state
+        .key_usage
+        .iter()
+        .take(50) // Limit response size
+        .map(|entry| {
+            let mut top_tools: Vec<serde_json::Value> = entry
+                .value()
+                .entries
+                .iter()
+                .take(20)
+                .map(|(tool_name, (call_count, _tick))| {
+                    serde_json::json!({
+                        "tool_name": tool_name.clone(),
+                        "call_count": *call_count,
+                    })
+                })
+                .collect();
+            top_tools.sort_by(|a, b| {
+                let ac = a["call_count"].as_u64().unwrap_or(0);
+                let bc = b["call_count"].as_u64().unwrap_or(0);
+                bc.cmp(&ac)
+            });
+            serde_json::json!({
+                "api_key": entry.key().clone(),
+                "tool_count": entry.value().entries.len(),
+                "top_tools": top_tools,
+            })
+        })
+        .collect();
+
+    // Currently pruned tools per session (tools with zero calls past threshold)
+    let pruned_sessions: Vec<serde_json::Value> = tc_state
+        .session_usage
+        .iter()
+        .take(50)
+        .filter_map(|entry| {
+            let session_id = entry.key().clone();
+            let usage_map = entry.value();
+            let request_count = tc_state
+                .session_request_count
+                .get(&session_id)
+                .map(|r| *r)
+                .unwrap_or(0);
+            let min_requests = config.tool_compression.pruning.min_requests;
+            if request_count < min_requests as u64 {
+                return None;
+            }
+            let pruned: Vec<String> = usage_map
+                .iter()
+                .filter(|(_name, count)| **count == 0)
+                .map(|(name, _count)| name.clone())
+                .collect();
+            if pruned.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "request_count": request_count,
+                "pruned_tools": pruned,
+            }))
+        })
+        .collect();
+
+    // always_include allowlist from config
+    let always_include = &config.tool_compression.pruning.always_include;
+
+    // Disclosure activity: active sessions with details
+    let disclosure_sessions: Vec<serde_json::Value> = tc_state
+        .disclosure_state
+        .iter()
+        .take(50)
+        .map(|entry| {
+            let tool_names: Vec<String> = entry.value().iter().take(20).cloned().collect();
+            serde_json::json!({
+                "session_id": entry.key().clone(),
+                "disclosed_tools": entry.value().len(),
+                "tool_names": tool_names,
+            })
+        })
+        .collect();
+
+    // get_tool_schema call frequency from disclosure state
+    let total_disclosed: usize = tc_state
+        .disclosure_state
+        .iter()
+        .map(|entry| entry.value().len())
+        .sum();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "pruning": {
+                "key_usage_entries": key_usage,
+                "pruned_sessions": pruned_sessions,
+                "always_include": always_include,
+            },
+            "disclosure": {
+                "active_sessions": disclosure_sessions,
+                "total_active_sessions": tc_state.disclosure_state.len(),
+                "total_disclosed_tools": total_disclosed,
+            }
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +873,7 @@ mod tests {
                 custom_vpc_endpoint: false,
                 prompt_caching: false,
                 compression: None,
+                memory: None,
                 reasoning: true,
                 codex_base_url_override: None,
                 codex_model_override: None,
@@ -403,6 +885,7 @@ mod tests {
                 version_fallback_enabled: false,
                 compression: None,
                 structured_output: None,
+                memory: None,
                 models: vec![ProviderModel {
                     provider: "test-provider".to_string(),
                     model: "gpt-4".to_string(),
@@ -428,6 +911,8 @@ mod tests {
             virtual_keys: Default::default(),
             loop_detection: Default::default(),
             guardrails: None,
+            tool_compression: Default::default(),
+            memory: None,
         }
     }
 
@@ -528,6 +1013,39 @@ mod tests {
         assert!(message.get("payload").is_none());
         assert!(message["data"].get("content").is_none());
         assert!(!message.to_string().contains("websocket-secret"));
+    }
+
+    #[test]
+    fn memory_event_hashes_namespace_and_contains_no_content() {
+        let namespace = "user::vk_secret_value::project::project-hash";
+        let event = MemoryDashboardEvent::new(MemoryEventType::Injection, namespace, 4);
+        let message = memory_message(event.clone());
+
+        assert_eq!(event.namespace.len(), 16);
+        assert_eq!(event.namespace, hashed_namespace(namespace));
+        assert_eq!(event.namespace, hashed_namespace(namespace));
+        assert!(!message.to_string().contains("vk_secret_value"));
+        assert_eq!(message["type"], "memory_event");
+        assert_eq!(message["data"]["event_type"], "injection");
+        assert_eq!(message["data"]["count"], 4);
+        for field in ["content", "messages", "prompt", "request_body", "payload"] {
+            assert!(message["data"].get(field).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_event_hub_replay_is_bounded() {
+        let hub = MemoryEventHub::new();
+        for index in 0..(MEMORY_REPLAY_CAPACITY + 5) {
+            hub.publish(MemoryDashboardEvent::new(
+                MemoryEventType::Extraction,
+                &format!("user::vk-{index}"),
+                index as u32,
+            ));
+        }
+        let subscription = hub.subscribe();
+        assert_eq!(subscription.replay.len(), MEMORY_REPLAY_CAPACITY);
+        assert_eq!(subscription.replay[0].count, 5);
     }
 
     #[test]
@@ -681,6 +1199,10 @@ mod tests {
                         timed_out: false,
                         error: false,
                     }),
+                    memories_injected: 0,
+                    memories_stored: 0,
+                    injection_tokens: 0,
+                    detected_project: None,
                 })
                 .unwrap();
         }
@@ -731,6 +1253,10 @@ mod tests {
                 requested_model: Some("gpt-4".to_string()),
                 responded_model: None,
                 compression: None,
+                memories_injected: 0,
+                memories_stored: 0,
+                injection_tokens: 0,
+                detected_project: None,
             })
             .unwrap();
 

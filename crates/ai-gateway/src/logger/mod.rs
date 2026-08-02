@@ -168,6 +168,14 @@ pub struct LogEntry {
     /// Content-free metadata describing request compression, when applied or attempted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<CompressionLogMetadata>,
+    #[serde(default)]
+    pub memories_injected: u32,
+    #[serde(default)]
+    pub memories_stored: u32,
+    #[serde(default)]
+    pub injection_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_project: Option<String>,
 }
 
 /// Filter for querying log entries
@@ -229,13 +237,21 @@ impl RequestLogger {
                 requested_model TEXT,
                 responded_model TEXT,
                 compression_metadata TEXT,
-                compression_level TEXT
+                compression_level TEXT,
+                memories_injected INTEGER NOT NULL DEFAULT 0,
+                memories_stored INTEGER NOT NULL DEFAULT 0,
+                injection_tokens INTEGER NOT NULL DEFAULT 0,
+                detected_project TEXT
             )",
             [],
         )?;
 
         Self::ensure_column(conn, "compression_metadata", "TEXT")?;
         Self::ensure_column(conn, "compression_level", "TEXT")?;
+        Self::ensure_column(conn, "memories_injected", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::ensure_column(conn, "memories_stored", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::ensure_column(conn, "injection_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::ensure_column(conn, "detected_project", "TEXT")?;
 
         // Create indexes for common query patterns
         conn.execute(
@@ -321,8 +337,12 @@ impl RequestLogger {
             "INSERT INTO requests (
                 trace_id, timestamp, method, path, model, provider,
                 status_code, duration_ms, cost, request_body, response_body,
-                requested_model, responded_model, compression_metadata, compression_level
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                requested_model, responded_model, compression_metadata, compression_level,
+                memories_injected, memories_stored, injection_tokens, detected_project
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                ?16, ?17, ?18, ?19
+            )",
             params![
                 entry.trace_id,
                 entry.timestamp.timestamp(),
@@ -339,6 +359,10 @@ impl RequestLogger {
                 entry.responded_model,
                 compression_metadata,
                 compression_level,
+                entry.memories_injected,
+                entry.memories_stored,
+                entry.injection_tokens,
+                entry.detected_project,
             ],
         )?;
 
@@ -451,7 +475,7 @@ impl RequestLogger {
     pub fn query(&self, filter: LogFilter) -> Result<Vec<LogEntry>> {
         let conn = self.conn.lock().unwrap();
 
-        let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata FROM requests WHERE 1=1");
+        let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project FROM requests WHERE 1=1");
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(ref trace_id) = filter.trace_id {
@@ -521,6 +545,10 @@ impl RequestLogger {
                     requested_model: row.get(11)?,
                     responded_model: row.get(12)?,
                     compression,
+                    memories_injected: row.get(14)?,
+                    memories_stored: row.get(15)?,
+                    injection_tokens: row.get(16)?,
+                    detected_project: row.get(17)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -596,6 +624,10 @@ mod tests {
             requested_model: None,
             responded_model: None,
             compression,
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
         }
     }
 
@@ -837,6 +869,10 @@ mod tests {
             requested_model: None,
             responded_model: None,
             compression: None,
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
         };
 
         logger.log(entry.clone()).unwrap();
@@ -851,6 +887,36 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].trace_id, "test-123");
         assert_eq!(results[0].model, "gpt-4");
+    }
+
+    #[test]
+    fn memory_observability_fields_serialize_default_and_round_trip() {
+        let (logger, _temp) = create_test_logger();
+        let default_json = serde_json::to_value(sample_entry("defaults", None)).unwrap();
+        assert_eq!(default_json["memories_injected"], 0);
+        assert_eq!(default_json["memories_stored"], 0);
+        assert_eq!(default_json["injection_tokens"], 0);
+        assert!(default_json.get("detected_project").is_none());
+
+        let mut entry = sample_entry("memory-counts", None);
+        entry.memories_injected = 3;
+        entry.memories_stored = 2;
+        entry.injection_tokens = 240;
+        entry.detected_project = Some("0123456789abcdef".to_owned());
+        logger.log(entry).unwrap();
+
+        let result = logger
+            .query(LogFilter {
+                trace_id: Some("memory-counts".to_owned()),
+                ..Default::default()
+            })
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(result.memories_injected, 3);
+        assert_eq!(result.memories_stored, 2);
+        assert_eq!(result.injection_tokens, 240);
+        assert_eq!(result.detected_project.as_deref(), Some("0123456789abcdef"));
     }
 
     #[test]
@@ -922,6 +988,10 @@ mod tests {
             requested_model: None,
             responded_model: None,
             compression: None,
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
         };
 
         logger.log(old_entry).unwrap();
@@ -942,6 +1012,10 @@ mod tests {
             requested_model: None,
             responded_model: None,
             compression: None,
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
         };
 
         logger.log(recent_entry).unwrap();
@@ -1012,6 +1086,10 @@ mod property_tests {
                         requested_model: None,
                         responded_model: None,
                         compression: None,
+                        memories_injected: 0,
+                        memories_stored: 0,
+                        injection_tokens: 0,
+                        detected_project: None,
                     }
                 },
             )
@@ -1095,6 +1173,10 @@ mod property_tests {
                 requested_model: None,
                 responded_model: None,
                 compression: None,
+                memories_injected: 0,
+                memories_stored: 0,
+                injection_tokens: 0,
+                detected_project: None,
             };
 
             logger.log(entry.clone()).unwrap();
@@ -1158,6 +1240,10 @@ mod property_tests {
                 requested_model: None,
                 responded_model: None,
                 compression: None,
+                memories_injected: 0,
+                memories_stored: 0,
+                injection_tokens: 0,
+                detected_project: None,
             };
 
             logger.log(entry).unwrap();
@@ -1218,6 +1304,10 @@ mod property_tests {
                 requested_model: None,
                 responded_model: None,
                 compression: None,
+                memories_injected: 0,
+                memories_stored: 0,
+                injection_tokens: 0,
+                detected_project: None,
             };
 
             logger.log(entry).unwrap();
@@ -1276,6 +1366,10 @@ mod property_tests {
                 requested_model: None,
                 responded_model: None,
                 compression: None,
+                memories_injected: 0,
+                memories_stored: 0,
+                injection_tokens: 0,
+                detected_project: None,
             };
 
             logger.log(entry).unwrap();
@@ -1345,6 +1439,10 @@ mod property_tests {
                 requested_model: Some(requested.to_string()),
                 responded_model: Some(responded.to_string()),
                 compression: None,
+                memories_injected: 0,
+                memories_stored: 0,
+                injection_tokens: 0,
+                detected_project: None,
             };
 
             logger.log(entry).unwrap();

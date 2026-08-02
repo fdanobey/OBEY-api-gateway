@@ -3,6 +3,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::guardrail::GuardrailConfig;
+use crate::memory::MemoryConfigError;
 use crate::secrets;
 use crate::structured_output::config::StructuredOutputConfigError;
 
@@ -191,6 +192,28 @@ impl Config {
             .map(|provider| provider.name.as_str())
             .collect();
 
+        if let Some(memory) = &self.memory {
+            self.validate_memory_config("memory", memory.validate(), &mut errors);
+            self.validate_memory_config(
+                "memory",
+                memory.validate_with_provider_names(configured_provider_names.iter().copied()),
+                &mut errors,
+            );
+
+            if let Some(qdrant) = &memory.qdrant {
+                let embedding_provider = qdrant.embedding_provider.trim();
+                if !embedding_provider.is_empty()
+                    && !configured_provider_names.contains(embedding_provider)
+                {
+                    errors.push(ValidationError::InvalidValue {
+                        field: "memory.qdrant.embedding_provider".to_string(),
+                        value: qdrant.embedding_provider.clone(),
+                        expected: "the exact name of a configured provider".to_string(),
+                    });
+                }
+            }
+        }
+
         if let Some(structured_output) = &self.structured_output {
             self.validate_structured_output_config(
                 "structured_output",
@@ -211,6 +234,14 @@ impl Config {
 
         // Validate provider timeouts and env vars
         for provider in &self.providers {
+            if let Some(memory) = &provider.memory {
+                self.validate_memory_config(
+                    &format!("providers.{}.memory", provider.name),
+                    memory.validate(),
+                    &mut errors,
+                );
+            }
+
             if provider.timeout_seconds == 0 {
                 errors.push(ValidationError::InvalidTimeout(provider.timeout_seconds));
             }
@@ -420,6 +451,14 @@ impl Config {
 
         // Validate model groups (21.8)
         for group in &self.model_groups {
+            if let Some(memory) = &group.memory {
+                self.validate_memory_config(
+                    &format!("model_groups.{}.memory", group.name),
+                    memory.validate(),
+                    &mut errors,
+                );
+            }
+
             if group.models.is_empty() {
                 errors.push(ValidationError::EmptyModelGroup(group.name.clone()));
             }
@@ -468,6 +507,25 @@ impl Config {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    fn validate_memory_config(
+        &self,
+        scope: &str,
+        result: Result<(), Vec<MemoryConfigError>>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        if let Err(memory_errors) = result {
+            errors.extend(
+                memory_errors
+                    .into_iter()
+                    .map(|error| ValidationError::InvalidValue {
+                        field: format!("{scope}.{}", error.field),
+                        value: error.message,
+                        expected: "a valid persistent memory configuration".to_string(),
+                    }),
+            );
         }
     }
 
@@ -838,6 +896,7 @@ mod property_tests {
                 custom_vpc_endpoint: false,
                 prompt_caching: false,
                 compression: None,
+                memory: None,
                 reasoning: true,
                 codex_base_url_override: None,
                 codex_model_override: None,
@@ -848,6 +907,7 @@ mod property_tests {
                 name: "test-group".to_string(),
                 version_fallback_enabled: false,
                 compression: None,
+                memory: None,
                 structured_output: None,
                 models: vec![ProviderModel {
                     provider: "test-provider".to_string(),
@@ -866,6 +926,7 @@ mod property_tests {
             prometheus: None,
             context: ContextConfig::default(),
             compression: Default::default(),
+            memory: None,
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,
@@ -874,6 +935,7 @@ mod property_tests {
             loop_detection: Default::default(),
             structured_output: None,
             guardrails: None,
+            tool_compression: Default::default(),
         }
     }
 
@@ -1134,6 +1196,113 @@ model_groups:
 
     // Streaming Reliability, Task 1.3: StreamingConfig validation
     // **Validates: Requirements 7.4**
+
+    #[test]
+    fn valid_enabled_memory_config_is_accepted() {
+        let mut config = minimal_valid_config();
+        config.memory = Some(crate::memory::MemoryConfig {
+            enabled: true,
+            auto_extract_enabled: true,
+            auto_extract_provider: "test-provider".to_string(),
+            auto_extract_model: "gpt-4o-mini".to_string(),
+            ..Default::default()
+        });
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn memory_local_validation_errors_are_aggregated_with_scoped_fields() {
+        let mut config = minimal_valid_config();
+        config.memory = Some(crate::memory::MemoryConfig {
+            database_path: " ".to_string(),
+            max_injection_tokens: 10_001,
+            auto_extract_enabled: true,
+            auto_extract_provider: " ".to_string(),
+            auto_extract_model: String::new(),
+            auto_extract_min_turns: 0,
+            decay_schedule_hours: 0,
+            max_memories_per_namespace: 0,
+            ..Default::default()
+        });
+
+        let errors = config.validate().unwrap_err();
+        let fields: Vec<&str> = errors
+            .iter()
+            .filter_map(|error| match error {
+                ValidationError::InvalidValue { field, .. } if field.starts_with("memory.") => {
+                    Some(field.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        for field in [
+            "memory.database_path",
+            "memory.max_injection_tokens",
+            "memory.auto_extract_provider",
+            "memory.auto_extract_model",
+            "memory.auto_extract_min_turns",
+            "memory.decay_schedule_hours",
+            "memory.max_memories_per_namespace",
+        ] {
+            assert!(fields.contains(&field), "missing {field}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn missing_memory_provider_references_are_rejected_at_field_level() {
+        let mut config = minimal_valid_config();
+        config.memory = Some(crate::memory::MemoryConfig {
+            auto_extract_enabled: true,
+            auto_extract_provider: "missing-auto".to_string(),
+            auto_extract_model: "extractor".to_string(),
+            qdrant: Some(crate::memory::MemoryQdrantConfig {
+                qdrant_url: "https://qdrant.example.com".to_string(),
+                embedding_provider: "missing-embedding".to_string(),
+                embedding_model: "embedder".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, value, .. }
+                if field == "memory.auto_extract_provider" && value.contains("missing-auto")
+        )));
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, value, .. }
+                if field == "memory.qdrant.embedding_provider" && value == "missing-embedding"
+        )));
+    }
+
+    #[test]
+    fn invalid_provider_and_model_group_memory_overrides_are_aggregated() {
+        let mut config = minimal_valid_config();
+        config.providers[0].memory = Some(crate::memory::ProviderMemoryOverride {
+            max_injection_tokens: Some(10_001),
+            ..Default::default()
+        });
+        config.model_groups[0].memory = Some(crate::memory::ModelGroupMemoryOverride {
+            max_injection_tokens: Some(10_001),
+            ..Default::default()
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, .. }
+                if field == "providers.test-provider.memory.max_injection_tokens"
+        )));
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, .. }
+                if field == "model_groups.test-group.memory.max_injection_tokens"
+        )));
+    }
 
     #[test]
     fn test_streaming_keepalive_above_max_rejected() {
@@ -1447,6 +1616,7 @@ model_groups:
                 custom_vpc_endpoint: false,
                 prompt_caching,
                 compression: None,
+                memory: None,
                 reasoning,
                 codex_base_url_override: None,
                 codex_model_override: None,

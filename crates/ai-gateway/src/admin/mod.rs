@@ -16,6 +16,8 @@ use crate::gateway::apply_runtime_config_update;
 use crate::gateway::AppState;
 use crate::secrets;
 
+pub mod tool_compression;
+
 /// Embedded admin panel static assets (Req 13.17, 13.18, 1.3).
 #[derive(Embed)]
 #[folder = "src/admin/static/"]
@@ -50,6 +52,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         crate::virtual_keys::admin::routes(std::sync::Arc::clone(&state.virtual_key_manager));
 
     let loop_detection_api = crate::loop_detection::admin::routes();
+    let memory_api = crate::memory::admin::routes(state.memory_system.clone());
 
     let onnx_api = Router::new()
         .route("/status", get(onnx_status))
@@ -59,6 +62,8 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .nest("/config", config_api)
         .nest("/onnx", onnx_api)
         .nest("/loop-detection", loop_detection_api)
+        .nest("/memory", memory_api)
+        .nest("/tool-compression", tool_compression::routes())
         .nest_service("/keys", virtual_keys_api)
         .route("/providers/models", get(proxy_provider_models))
         .route("/test-connection", post(test_connection))
@@ -1551,6 +1556,7 @@ mod tests {
                     custom_vpc_endpoint: false,
                     prompt_caching: false,
                     compression: None,
+                    memory: None,
                     reasoning: true,
                     codex_base_url_override: None,
                     codex_model_override: None,
@@ -1588,6 +1594,7 @@ mod tests {
                 version_fallback_enabled: vf,
                 compression: None,
                 structured_output: None,
+                memory: None,
                 models,
             })
     }
@@ -1622,6 +1629,8 @@ mod tests {
                     virtual_keys: Default::default(),
                     loop_detection: Default::default(),
                     guardrails: None,
+                    tool_compression: Default::default(),
+                    memory: None,
                 })
             })
         })
@@ -2011,6 +2020,7 @@ retry:
                 custom_vpc_endpoint: false,
                 prompt_caching: false,
                 compression: None,
+                memory: None,
                 reasoning: true,
                 codex_base_url_override: None,
                 codex_model_override: None,
@@ -2022,6 +2032,7 @@ retry:
                 version_fallback_enabled: false,
                 compression: None,
                 structured_output: None,
+                memory: None,
                 models: vec![ProviderModel {
                     provider: "test".to_string(),
                     model: "gpt-4".to_string(),
@@ -2047,6 +2058,8 @@ retry:
             virtual_keys: Default::default(),
             loop_detection: Default::default(),
             guardrails: None,
+            tool_compression: Default::default(),
+            memory: None,
         }
     }
 
@@ -2133,6 +2146,41 @@ retry:
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let authorized = axum::http::Request::get("/admin/loop-detection/sessions")
+            .header("Authorization", basic_auth_header("admin", "secret"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, authorized).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        std::env::remove_var(user_env);
+        std::env::remove_var(pass_env);
+    }
+
+    #[tokio::test]
+    async fn memory_admin_routes_share_parent_authentication() {
+        let user_env = "MEMORY_ADMIN_TEST_USER";
+        let pass_env = "MEMORY_ADMIN_TEST_PASS";
+        std::env::set_var(user_env, "admin");
+        std::env::set_var(pass_env, "secret");
+        let mut config = test_config_with_auth_env(true, user_env, pass_env);
+        config.memory = Some(crate::memory::MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            ..Default::default()
+        });
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        let unauthorized = axum::http::Request::get("/admin/memory/stats")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), unauthorized)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = axum::http::Request::get("/admin/memory/stats")
             .header("Authorization", basic_auth_header("admin", "secret"))
             .body(axum::body::Body::empty())
             .unwrap();

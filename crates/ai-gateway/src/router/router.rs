@@ -10,6 +10,10 @@ use crate::config::{Config, ContextConfig, ModelGroup, Provider, ProviderModel};
 use crate::context::ContextManager;
 use crate::dashboard::CompressionEventHub;
 use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
+use crate::memory::{
+    CompressionExtractionInput, CompressionMessageSnapshot, CompressionRemovalReport,
+    ExtractionPolicy, MemorySystem, ResolvedNamespace,
+};
 use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
 use crate::providers::bedrock::{
     apply_global_inference_prefix, apply_global_inference_profile, model_supports_reasoning,
@@ -50,6 +54,8 @@ pub struct Router {
     compression_events: Option<Arc<CompressionEventHub>>,
     /// Shared metrics for recording provider-level stats
     metrics: Arc<crate::metrics::Metrics>,
+    /// Hot-reloadable memory snapshot used by the compression heuristic hook.
+    memory_system: Option<Arc<RwLock<Option<Arc<MemorySystem>>>>>,
     /// OAuth session manager used when a provider is configured with
     /// `auth_method: oauth`. `None` while OAuth is not wired up (pre-task
     /// 14.1) — in that state OAuth bearer resolution is silently skipped and
@@ -116,6 +122,7 @@ impl Router {
             })),
             compression_events: None,
             metrics,
+            memory_system: None,
             oauth_manager: None,
             instructions_store: None,
             oauth_usage_tracker: None,
@@ -147,6 +154,7 @@ impl Router {
             })),
             compression_events: None,
             metrics,
+            memory_system: None,
             oauth_manager: None,
             instructions_store: None,
             oauth_usage_tracker: None,
@@ -182,6 +190,11 @@ impl Router {
     /// Attach the shared dashboard compression event hub.
     pub fn set_compression_event_hub(&mut self, hub: Arc<CompressionEventHub>) {
         self.compression_events = Some(hub);
+    }
+
+    /// Attach the hot-reloadable memory snapshot used after compression locks release.
+    pub fn set_memory_system(&mut self, memory_system: Arc<RwLock<Option<Arc<MemorySystem>>>>) {
+        self.memory_system = Some(memory_system);
     }
 
     /// Atomically replaces the pipeline used by requests that start after reload.
@@ -243,7 +256,7 @@ impl Router {
         provider_model: &ProviderModel,
         request_id: &str,
     ) -> (OpenAIRequest, CompressionStats) {
-        let (global_config, provider_override, prompt_caching_enabled, default_context_window) = {
+        let (global_config, provider_override, prompt_caching_enabled, default_context_window, tool_compression_enabled) = {
             let config = self.config.read().await;
             let provider = config
                 .providers
@@ -254,6 +267,7 @@ impl Router {
                 provider.and_then(|provider| provider.compression.clone()),
                 provider.is_some_and(|provider| provider.prompt_caching),
                 config.context.default_context_window,
+                config.tool_compression.enabled,
             )
         };
         let effective =
@@ -279,6 +293,7 @@ impl Router {
             context_window,
             provider_name: provider_model.provider.clone(),
             prompt_caching_enabled,
+            tool_compression_applied: tool_compression_enabled,
             ..CompressionContext::default()
         };
         let metadata = CompressionRequestMetadata {
@@ -342,6 +357,9 @@ impl Router {
             &provider_model.model,
         );
         Self::remove_precompressed_markers(&mut result.payload, &inserted_markers);
+        let prepared_request = result.payload.into_openai_request();
+        self.run_memory_compression_hook(request, &prepared_request, request_id)
+            .await;
         stats.log();
         self.metrics.record_compression(&stats);
         if let Some(hub) = &self.compression_events {
@@ -364,7 +382,118 @@ impl Router {
             );
         }
 
-        (result.payload.into_openai_request(), stats)
+        (prepared_request, stats)
+    }
+
+    async fn run_memory_compression_hook(
+        &self,
+        before_request: &OpenAIRequest,
+        after_request: &OpenAIRequest,
+        request_id: &str,
+    ) {
+        let Some(handle) = &self.memory_system else {
+            return;
+        };
+        let Some(memory) = handle.read().await.clone() else {
+            return;
+        };
+        let config = memory.config.read().await.clone();
+        if !config.enabled {
+            return;
+        }
+
+        let counter = crate::compression::token_counter::TokenCounter::new();
+        let before_owned = before_request
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let content = message.content_as_text();
+                let tokens = Self::message_token_count(&counter, before_request, message);
+                (index.to_string(), content, tokens)
+            })
+            .collect::<Vec<_>>();
+        let after_owned = after_request
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let content = message.content_as_text();
+                let tokens = Self::message_token_count(&counter, after_request, message);
+                (index.to_string(), content, tokens)
+            })
+            .collect::<Vec<_>>();
+        let before = before_owned
+            .iter()
+            .map(|(id, content, tokens)| CompressionMessageSnapshot {
+                message_id: id,
+                content,
+                tokens: *tokens,
+            })
+            .collect::<Vec<_>>();
+        let after = after_owned
+            .iter()
+            .map(|(id, content, tokens)| CompressionMessageSnapshot {
+                message_id: id,
+                content,
+                tokens: *tokens,
+            })
+            .collect::<Vec<_>>();
+        let removals = before
+            .iter()
+            .map(|snapshot| CompressionRemovalReport {
+                message_id: snapshot.message_id,
+                tokens_before: snapshot.tokens,
+                tokens_after: after
+                    .iter()
+                    .find(|candidate| candidate.message_id == snapshot.message_id)
+                    .map_or(0, |candidate| candidate.tokens),
+            })
+            .collect::<Vec<_>>();
+
+        let candidates = match memory
+            .extractor
+            .compression_candidates(CompressionExtractionInput {
+                before: &before,
+                after: &after,
+                removals: &removals,
+            }) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                warn!(request_id, error = %error, "Memory compression heuristic failed");
+                return;
+            }
+        };
+        if candidates.is_empty() {
+            return;
+        }
+
+        let context = memory.context_detector.detect(before_request);
+        let namespace = ResolvedNamespace::resolve(None, &context);
+        let extractor = memory.extractor.clone();
+        let source_request_id = uuid::Uuid::parse_str(request_id).ok();
+        let policy = ExtractionPolicy {
+            allow_sensitive_storage: config.allow_sensitive_storage,
+            max_memories_per_namespace: config.max_memories_per_namespace as usize,
+        };
+        tokio::spawn(async move {
+            if let Err(error) = extractor
+                .persist_compression_candidates(candidates, &namespace, source_request_id, policy)
+                .await
+            {
+                warn!(error = %error, "Failed to persist memory compression candidates");
+            }
+        });
+    }
+
+    fn message_token_count(
+        counter: &crate::compression::token_counter::TokenCounter,
+        request: &OpenAIRequest,
+        message: &Message,
+    ) -> u32 {
+        let mut one = request.clone();
+        one.messages = vec![message.clone()];
+        counter.count_request(&one)
     }
 
     fn load_precompressed_references(
@@ -1470,6 +1599,17 @@ impl Router {
             return Some(Duration::from_secs(HOUR));
         }
         None
+    }
+
+    /// Apply context truncation at the handler/router lifecycle boundary.
+    /// Memory injection must consume the returned request and run before routing,
+    /// because provider-specific compression occurs inside the route methods.
+    pub fn prepare_post_truncation_request(&self, request: &OpenAIRequest) -> OpenAIRequest {
+        let (prepared, truncated) = self.check_and_truncate_context(request);
+        if truncated {
+            info!(model = %request.model, "Applied pre-flight context truncation");
+        }
+        prepared
     }
 
     /// Check and potentially truncate context before routing
@@ -4624,11 +4764,7 @@ impl Router {
         &self,
         request: &OpenAIRequest,
     ) -> Result<OpenAIResponse, GatewayError> {
-        // Pre-flight context check/truncation before provider selection.
-        let (prepared_request, truncated) = self.check_and_truncate_context(request);
-        if truncated {
-            info!(model = %request.model, "Applied pre-flight context truncation");
-        }
+        let prepared_request = request.clone();
 
         // Find model group
         let model_group = self.find_model_group(&prepared_request.model).await?;
@@ -4733,11 +4869,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         request: &OpenAIRequest,
         exclude: &[String],
     ) -> Result<StreamingResponse, GatewayError> {
-        // Pre-flight context check/truncation before provider selection.
-        let (prepared_request, truncated) = self.check_and_truncate_context(request);
-        if truncated {
-            info!(model = %request.model, "Applied pre-flight context truncation (streaming)");
-        }
+        let prepared_request = request.clone();
 
         // Effective streaming configuration (defaults when section absent).
         let streaming_config = self
@@ -5238,6 +5370,8 @@ mod tests {
             virtual_keys: Default::default(),
             loop_detection: Default::default(),
             guardrails: None,
+            tool_compression: Default::default(),
+            memory: None,
         }
     }
 
@@ -5273,6 +5407,7 @@ mod tests {
             codex_model_override: None,
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
+            memory: None,
         }
     }
 
@@ -5293,6 +5428,7 @@ mod tests {
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models,
         }
     }
@@ -5979,6 +6115,8 @@ mod tests {
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
+
             models: vec![ProviderModel {
                 provider: "openai".to_string(),
                 model: "gpt-4".to_string(),
@@ -6013,6 +6151,7 @@ mod tests {
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models: vec![
                 ProviderModel {
                     provider: "provider-low-priority".to_string(),
@@ -6050,6 +6189,7 @@ mod tests {
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models: vec![
                 ProviderModel {
                     provider: "expensive-provider".to_string(),
@@ -6087,6 +6227,7 @@ mod tests {
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models: vec![
                 ProviderModel {
                     provider: "slow-provider".to_string(),
@@ -6148,6 +6289,7 @@ mod tests {
             version_fallback_enabled: true,
             compression: None,
             structured_output: None,
+            memory: None,
             models: vec![
                 ProviderModel {
                     provider: "provider-1".to_string(),
@@ -6276,6 +6418,7 @@ mod tests {
             codex_model_override: None,
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
+            memory: None,
         }];
         let providers = vec![ProviderModel {
             provider: "budgeted-provider".to_string(),
@@ -6290,6 +6433,7 @@ mod tests {
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models: providers.clone(),
         }];
         let router_metrics = test_metrics();
@@ -6417,6 +6561,7 @@ mod property_tests {
                 version_fallback_enabled: version_fallback,
                 compression: None,
                 structured_output: None,
+                memory: None,
                 models,
             })
     }
@@ -6557,6 +6702,7 @@ mod property_tests {
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models: vec![ProviderModel {
                 provider: "".to_string(), // Invalid: empty provider
                 model: "gpt-4".to_string(),
@@ -6580,6 +6726,7 @@ mod property_tests {
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models: vec![ProviderModel {
                 provider: "openai".to_string(),
                 model: "".to_string(), // Invalid: empty model
@@ -6972,6 +7119,7 @@ mod property_tests {
             codex_model_override: None,
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
+            memory: None,
         };
 
         config.providers = vec![make_provider("primary"), make_provider("backup")];
@@ -6981,6 +7129,7 @@ mod property_tests {
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models: vec![
                 ProviderModel {
                     provider: "primary".to_string(),
@@ -7127,6 +7276,7 @@ mod property_tests {
             codex_model_override: None,
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
+            memory: None,
         }
     }
 

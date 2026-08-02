@@ -289,6 +289,11 @@ pub struct CompressionContext {
     pub language: String,
     pub protection_scanner: Arc<ProtectionScanner>,
     pub token_counter: Arc<TokenCounter>,
+    /// When `true`, the tool compression middleware has already processed tool
+    /// definitions for this request. Engines that operate on tool descriptions
+    /// (e.g. `ToolDefinitionEngine`) should skip their own compression to avoid
+    /// redundant double-processing.
+    pub tool_compression_applied: bool,
 }
 
 impl CompressionContext {
@@ -312,6 +317,7 @@ impl Default for CompressionContext {
             language: "en".to_owned(),
             protection_scanner: Arc::new(ProtectionScanner::default()),
             token_counter: Arc::new(TokenCounter::default()),
+            tool_compression_applied: false,
         }
     }
 }

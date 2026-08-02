@@ -20,6 +20,7 @@ use crate::config::Config;
 use crate::error::GatewayError;
 use crate::guardrail::GuardrailEngine;
 use crate::logger::RequestLogger;
+use crate::memory::MemorySystem;
 use crate::metrics::Metrics;
 use crate::oauth::{OAuthManager, OAuthTokenStore};
 use crate::router::router::Router as RequestRouter;
@@ -63,12 +64,19 @@ pub struct AppState {
     /// atomically replace the engine while in-flight requests retain their
     /// existing snapshot.
     pub structured_output_engine: Arc<RwLock<Option<Arc<StructuredOutputEngine>>>>,
+    /// Hot-reloadable persistent-memory snapshot. Initialization failures leave
+    /// this empty so the gateway remains available without memory.
+    pub memory_system: Arc<RwLock<Option<Arc<MemorySystem>>>>,
     /// Shared agent-loop detection state and middleware configuration.
     pub loop_detector: Arc<crate::loop_detection::middleware::LoopDetectorState>,
     /// Shared replay/live stream for content-free compression statistics.
     pub compression_events: Arc<crate::dashboard::CompressionEventHub>,
+    /// Shared bounded replay/live stream for content-free memory activity.
+    pub memory_events: Arc<crate::dashboard::MemoryEventHub>,
     /// Shared installer/status service for the optional ONNX compression assets.
     pub onnx_assets: Arc<crate::compression::assets::OnnxAssetManager>,
+    /// Shared state for the tool definition compression pipeline.
+    pub tool_compression_state: Arc<crate::tool_compression::ToolCompressionState>,
 }
 
 /// Core HTTP server wrapping Axum with middleware and integrated components.
@@ -88,7 +96,10 @@ impl GatewayServer {
         let config_arc = Arc::new(RwLock::new(config.clone()));
         let metrics = Arc::new(Metrics::new());
         let compression_events = Arc::new(crate::dashboard::CompressionEventHub::new());
+        let memory_events = Arc::new(crate::dashboard::MemoryEventHub::new());
+        let memory_system = Arc::new(RwLock::new(build_memory_system(&config).await));
         let mut router = RequestRouter::new(config_arc.clone(), metrics.clone());
+        router.set_memory_system(memory_system.clone());
         router.set_compression_event_hub(compression_events.clone());
         let precompressed_manager = build_precompressed_manager(&config, config_path.as_deref());
         router.set_precompressed_manager(precompressed_manager);
@@ -239,8 +250,10 @@ impl GatewayServer {
             virtual_key_manager,
             guardrail_engine: Arc::new(RwLock::new(guardrail_engine)),
             structured_output_engine: Arc::new(RwLock::new(structured_output_engine)),
+            memory_system,
             loop_detector,
             compression_events,
+            memory_events,
             onnx_assets: Arc::new(crate::compression::assets::OnnxAssetManager::new().map_err(
                 |error| {
                     GatewayError::Configuration(format!(
@@ -248,6 +261,9 @@ impl GatewayServer {
                     ))
                 },
             )?),
+            tool_compression_state: Arc::new(
+                crate::tool_compression::ToolCompressionState::new(&config.tool_compression),
+            ),
         };
 
         Ok(Self { state })
@@ -342,6 +358,17 @@ impl GatewayServer {
         let api_routes =
             api_routes.layer(crate::loop_detection::middleware::LoopDetectorLayer::new(
                 self.state.loop_detector.clone(),
+            ));
+
+        // --- Tool definition compression (Req 9.1-9.8) ---
+        // Positioned after guardrails/loop-detection (outer) but before provider
+        // dispatch (inner handler). When disabled, this is a zero-cost passthrough.
+        let api_routes =
+            api_routes.layer(crate::tool_compression::ToolCompressionLayer::new(
+                self.state.config.clone(),
+                self.state.tool_compression_state.clone(),
+                self.state.metrics.clone(),
+                self.state.compression_events.clone(),
             ));
 
         // --- Virtual key authentication + enforcement (Req 2.1, 2.4, 5.5, 6.4,
@@ -612,6 +639,42 @@ impl GatewayServer {
     }
 }
 
+async fn build_memory_vector_tier(
+    config: &Config,
+) -> Option<Arc<dyn crate::memory::MemoryVectorTier>> {
+    let qdrant = config.memory.as_ref()?.qdrant.as_ref()?;
+    let Some(provider) = config
+        .providers
+        .iter()
+        .find(|provider| provider.name == qdrant.embedding_provider)
+    else {
+        tracing::warn!(provider = %qdrant.embedding_provider, "Memory vector tier disabled: embedding provider not found");
+        return None;
+    };
+    match crate::memory::QdrantMemoryVectorTier::new(qdrant, provider).await {
+        Ok(tier) => Some(Arc::new(tier)),
+        Err(error) => {
+            tracing::warn!(error = %error, "Memory vector tier unavailable; FTS5 remains enabled");
+            None
+        }
+    }
+}
+
+async fn build_memory_system(config: &Config) -> Option<Arc<MemorySystem>> {
+    let memory_config = config.memory.as_ref()?.clone();
+    if !memory_config.enabled {
+        return None;
+    }
+    let vector_tier = build_memory_vector_tier(config).await;
+    match MemorySystem::new_with_vector(memory_config, None, None, vector_tier).await {
+        Ok(system) => Some(Arc::new(system)),
+        Err(error) => {
+            tracing::error!(error = %error, "Memory system initialization failed; gateway will continue without memory");
+            None
+        }
+    }
+}
+
 fn build_precompressed_manager(
     config: &Config,
     config_path: Option<&std::path::Path>,
@@ -642,6 +705,23 @@ fn build_precompressed_manager(
 pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     let loop_detection = new_config.loop_detection.clone();
     let compression = new_config.compression.clone();
+    let requested_memory = new_config.memory.clone();
+    let current_memory_snapshot = state.memory_system.read().await.clone();
+    let current_memory_config = match &current_memory_snapshot {
+        Some(system) => Some(system.config.read().await.clone()),
+        None => None,
+    };
+    let qdrant_config_changed = current_memory_config
+        .as_ref()
+        .and_then(|config| config.qdrant.as_ref())
+        != requested_memory
+            .as_ref()
+            .and_then(|config| config.qdrant.as_ref());
+    let rebuilt_memory_vector = if qdrant_config_changed {
+        Some(build_memory_vector_tier(&new_config).await)
+    } else {
+        None
+    };
     let precompressed_manager = build_precompressed_manager(&new_config, Some(&state.config_path));
 
     // Build the replacement snapshot before publishing the validated config. The
@@ -666,6 +746,61 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     state.router.clear_rate_limiters();
     state.router.clear_http_clients();
     state.router.clear_model_capabilities();
+
+    // Reset tool compression state on config reload (feedback loops, descriptions, etc.)
+    {
+        let cfg = state.config.read().await;
+        state
+            .tool_compression_state
+            .reset_on_reload(&cfg.tool_compression);
+    }
+
+    let current_memory = current_memory_snapshot;
+    let replacement_memory = match (current_memory, requested_memory) {
+        (_, None) => Some(None),
+        (_, Some(config)) if !config.enabled => Some(None),
+        (Some(system), Some(config)) => {
+            let current_path = system.config.read().await.database_path.clone();
+            if config.database_path != current_path {
+                tracing::warn!(
+                    requested_path = %config.database_path,
+                    current_path = %current_path,
+                    "Ignoring memory database_path hot-reload change; restart required"
+                );
+                None
+            } else {
+                match system.reload(config).await {
+                    Ok(()) => {
+                        if let Some(tier) = rebuilt_memory_vector.clone() {
+                            system.set_vector_tier(tier).await;
+                        }
+                        Some(Some(system))
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Failed to reload memory system; retaining previous snapshot");
+                        None
+                    }
+                }
+            }
+        }
+        (None, Some(config)) => match MemorySystem::new_with_vector(
+            config,
+            None,
+            None,
+            rebuilt_memory_vector.clone().unwrap_or(None),
+        )
+        .await
+        {
+            Ok(system) => Some(Some(Arc::new(system))),
+            Err(error) => {
+                tracing::error!(error = %error, "Failed to enable memory on hot-reload; memory remains disabled");
+                None
+            }
+        },
+    };
+    if let Some(replacement) = replacement_memory {
+        *state.memory_system.write().await = replacement;
+    }
 
     // --- Rebuild the guardrail engine snapshot (Req 1.8) ---
     // A freshly built `Arc<GuardrailEngine>` is swapped in; in-flight requests
@@ -760,6 +895,7 @@ mod tests {
             admin: AdminConfig::default(),
             dashboard: DashboardConfig::default(),
             cors: CorsConfig::default(),
+            memory: None,
             providers: vec![Provider {
                 name: "test".to_string(),
                 provider_type: "openai".to_string(),
@@ -779,6 +915,7 @@ mod tests {
                 rate_limit_per_minute: 0,
                 custom_headers: Default::default(),
                 connection_pool: ProviderConnectionPoolConfig::default(),
+                memory: None,
                 budget: None,
                 manual_models: vec![],
                 global_inference_profile: false,
@@ -795,6 +932,7 @@ mod tests {
             model_groups: vec![ModelGroup {
                 name: "test-group".to_string(),
                 version_fallback_enabled: false,
+                memory: None,
                 compression: None,
                 structured_output: None,
                 models: vec![ProviderModel {
@@ -822,6 +960,7 @@ mod tests {
             virtual_keys: Default::default(),
             loop_detection: Default::default(),
             guardrails: None,
+            tool_compression: Default::default(),
         }
     }
 
@@ -831,7 +970,97 @@ mod tests {
         assert!(server.is_ok());
         let server = server.unwrap();
         assert!(server.state.cache.is_none());
+        assert!(server.state.memory_system.read().await.is_none());
         assert!(Arc::strong_count(&server.state.compression_events) >= 2);
+    }
+
+    #[tokio::test]
+    async fn gateway_memory_reload_preserves_store_and_rejects_path_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("memory.db");
+        let mut config = minimal_config();
+        config.memory = Some(crate::memory::MemoryConfig {
+            enabled: true,
+            database_path: database_path.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        let server = GatewayServer::new(config.clone(), None).await.unwrap();
+        let memory = server
+            .state
+            .memory_system
+            .read()
+            .await
+            .clone()
+            .expect("memory enabled");
+        let entry = memory
+            .store
+            .store_entry(
+                crate::memory::NewMemoryEntry {
+                    namespace: "user::reload".to_owned(),
+                    content: "Reload persistence fact".to_owned(),
+                    memory_type: crate::memory::MemoryType::Fact,
+                    source_request_id: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        config.memory.as_mut().unwrap().max_injection_tokens = 123;
+        server.reload_config(config.clone()).await.unwrap();
+        let reloaded = server.state.memory_system.read().await.clone().unwrap();
+        assert!(Arc::ptr_eq(&memory, &reloaded));
+        assert!(reloaded.store.get_entry_by_id(entry.id).unwrap().is_some());
+
+        config.memory.as_mut().unwrap().database_path = directory
+            .path()
+            .join("other.db")
+            .to_string_lossy()
+            .into_owned();
+        server.reload_config(config).await.unwrap();
+        let retained = server.state.memory_system.read().await.clone().unwrap();
+        assert!(Arc::ptr_eq(&memory, &retained));
+        assert!(retained.store.get_entry_by_id(entry.id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn gateway_qdrant_startup_failure_preserves_fts_memory() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("memory.db");
+        let mut config = minimal_config();
+        config.providers[0].base_url = Some("http://127.0.0.1:9".to_owned());
+        config.memory = Some(crate::memory::MemoryConfig {
+            enabled: true,
+            database_path: database_path.to_string_lossy().into_owned(),
+            qdrant: Some(crate::memory::MemoryQdrantConfig {
+                qdrant_url: "http://127.0.0.1:9".to_owned(),
+                embedding_provider: config.providers[0].name.clone(),
+                embedding_model: "text-embedding-3-small".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let server = GatewayServer::new(config, None).await.unwrap();
+        let memory = server
+            .state
+            .memory_system
+            .read()
+            .await
+            .clone()
+            .expect("FTS memory must remain enabled");
+        memory
+            .store
+            .store_entry(
+                crate::memory::NewMemoryEntry {
+                    namespace: "user::fallback".to_owned(),
+                    content: "FTS remains available when Qdrant is down.".to_owned(),
+                    memory_type: crate::memory::MemoryType::Fact,
+                    source_request_id: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(memory.store.namespace_count("user::fallback").unwrap(), 1);
     }
 
     #[tokio::test]
@@ -1251,6 +1480,7 @@ mod tests {
                         rate_limit_per_minute: 0,
                         custom_headers: Default::default(),
                         connection_pool: ProviderConnectionPoolConfig::default(),
+                        memory: None,
                         budget: None,
                         manual_models: vec![],
                         global_inference_profile: false,
@@ -1308,6 +1538,7 @@ mod tests {
                     model_groups.push(ModelGroup {
                         name: format!("group-{}", g),
                         version_fallback_enabled: false,
+                        memory: None,
                         compression: None,
                         structured_output: None,
                         models,
@@ -1325,6 +1556,7 @@ mod tests {
                     admin: AdminConfig::default(),
                     dashboard: DashboardConfig::default(),
                     cors: CorsConfig::default(),
+                    memory: None,
                     providers,
                     model_groups,
                     circuit_breaker: CircuitBreakerConfig::default(),
@@ -1343,6 +1575,7 @@ mod tests {
                     virtual_keys: Default::default(),
                     loop_detection: Default::default(),
                     guardrails: None,
+                    tool_compression: Default::default(),
                 };
 
                 let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -1859,6 +2092,7 @@ mod tests {
                     admin: AdminConfig::default(),
                     dashboard: DashboardConfig::default(),
                     cors: CorsConfig::default(),
+                    memory: None,
                     providers: vec![Provider {
                         name: new_provider_name.clone(),
                         provider_type: "openai".to_string(),
@@ -1878,6 +2112,7 @@ mod tests {
                         rate_limit_per_minute: 0,
                         custom_headers: Default::default(),
                         connection_pool: ProviderConnectionPoolConfig::default(),
+                        memory: None,
                         budget: None,
                         manual_models: vec![],
                         global_inference_profile: false,
@@ -1894,6 +2129,7 @@ mod tests {
                     model_groups: vec![ModelGroup {
                         name: format!("group-{}", provider_suffix),
                         version_fallback_enabled: false,
+                        memory: None,
                         compression: None,
                         structured_output: None,
                         models: vec![ProviderModel {
@@ -1921,6 +2157,7 @@ mod tests {
                     virtual_keys: Default::default(),
                     loop_detection: Default::default(),
                     guardrails: None,
+                    tool_compression: Default::default(),
                 };
 
                 // Write new config to disk
@@ -2016,9 +2253,14 @@ mod tests {
             path: "/metrics".to_string(),
         });
 
+        let directory = tempfile::tempdir().unwrap();
+        let memory_path = directory.path().join("memory.db");
+        cfg.memory = Some(crate::memory::MemoryConfig {
+            enabled: true,
+            database_path: memory_path.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
         let server = GatewayServer::new(cfg, None).await.unwrap();
-
-        // Record some metrics so the output is non-trivial
         server.state.metrics.start_request();
         server.state.metrics.complete_request(150);
         server.state.metrics.record_provider_success("openai", 100);
@@ -2084,6 +2326,11 @@ mod tests {
         );
         assert!(text.contains("obey_api_cache_hit_rate"));
         assert!(text.contains("obey_api_cost_by_provider_dollars{provider=\"openai\"} 0.05"));
+        assert!(text.contains("obey_memory_retrievals_total{namespace_type=\"project\"} 0"));
+        assert!(text.contains("obey_memory_stores_total{extraction_method=\"explicit\"} 0"));
+        assert!(text.contains("obey_memory_injection_tokens_total 0"));
+        assert!(text.contains("obey_memory_project_detections_total{context_type=\"user\"} 0"));
+        assert!(text.contains("obey_memory_decay_evictions_total 0"));
     }
 
     #[tokio::test]

@@ -6,8 +6,10 @@ use crate::compression::config::{
     CompressionConfig, ModelGroupCompressionOverride, ProviderCompressionOverride,
 };
 use crate::guardrail::GuardrailConfig;
+use crate::memory::{MemoryConfig, ModelGroupMemoryOverride, ProviderMemoryOverride};
 use crate::secrets;
 use crate::structured_output::config::{StructuredOutputConfig, StructuredOutputOverride};
+use crate::tool_compression::config::ToolCompressionConfig;
 
 pub mod validation;
 pub use validation::{
@@ -71,6 +73,10 @@ pub struct Config {
     /// Token compression defaults. Disabled unless explicitly enabled.
     #[serde(default)]
     pub compression: CompressionConfig,
+    /// Global persistent-memory settings. Absent configuration leaves memory
+    /// unconfigured for backward compatibility.
+    #[serde(default)]
+    pub memory: Option<MemoryConfig>,
     #[serde(default)]
     pub first_launch_completed: bool,
     #[serde(default)]
@@ -102,6 +108,11 @@ pub struct Config {
     /// [`crate::guardrail::GuardrailConfig`].
     #[serde(default)]
     pub guardrails: Option<GuardrailConfig>,
+    /// Tool definition compression middleware. Absent section defaults to
+    /// disabled with zero performance impact. See
+    /// [`crate::tool_compression::config::ToolCompressionConfig`].
+    #[serde(default)]
+    pub tool_compression: ToolCompressionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -416,6 +427,9 @@ pub struct Provider {
     /// Optional provider-specific token compression override.
     #[serde(default)]
     pub compression: Option<ProviderCompressionOverride>,
+    /// Optional provider-specific persistent-memory override.
+    #[serde(default)]
+    pub memory: Option<ProviderMemoryOverride>,
     /// Use a custom VPC endpoint for Bedrock (Bedrock only).
     /// When true, the base_url field is used as-is instead of auto-generating
     /// the Bedrock Mantle endpoint from the region.
@@ -637,6 +651,9 @@ pub struct ModelGroup {
     /// Optional model-group token compression override.
     #[serde(default)]
     pub compression: Option<ModelGroupCompressionOverride>,
+    /// Optional model-group persistent-memory override.
+    #[serde(default)]
+    pub memory: Option<ModelGroupMemoryOverride>,
     /// Optional model-group structured-output override.
     #[serde(default)]
     pub structured_output: Option<StructuredOutputOverride>,
@@ -1190,6 +1207,81 @@ structured_output:
     }
 
     #[test]
+    fn memory_yaml_deserializes_at_every_config_level_and_serializes_snake_case() {
+        let yaml = r#"
+server:
+  host: 127.0.0.1
+  port: 8080
+providers:
+  - name: openai
+    type: openai
+    memory:
+      enabled: true
+      injection_strategy: synthetic_message
+      max_injection_tokens: 250
+model_groups:
+  - name: default
+    memory:
+      enabled: false
+      injection_strategy: system_prompt_prefix
+      max_injection_tokens: 125
+    models:
+      - provider: openai
+        model: gpt-4o
+memory:
+  enabled: true
+  injection_strategy: synthetic_message
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.memory.as_ref().unwrap().injection_strategy,
+            crate::memory::InjectionStrategy::SyntheticMessage
+        );
+        assert_eq!(
+            config.providers[0].memory.as_ref().unwrap().enabled,
+            Some(true)
+        );
+        assert_eq!(
+            config.model_groups[0]
+                .memory
+                .as_ref()
+                .unwrap()
+                .max_injection_tokens,
+            Some(125)
+        );
+
+        let serialized = serde_yaml::to_string(&config).unwrap();
+        assert!(serialized.contains("injection_strategy: synthetic_message"));
+        assert!(serialized.contains("injection_strategy: system_prompt_prefix"));
+        assert!(!serialized.contains("SyntheticMessage"));
+        assert!(!serialized.contains("SystemPromptPrefix"));
+    }
+
+    #[test]
+    fn absent_memory_fields_deserialize_to_none() {
+        let yaml = r#"
+server:
+  host: 127.0.0.1
+  port: 8080
+providers:
+  - name: openai
+    type: openai
+model_groups:
+  - name: default
+    models:
+      - provider: openai
+        model: gpt-4o
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.memory.is_none());
+        assert!(config.providers[0].memory.is_none());
+        assert!(config.model_groups[0].memory.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn test_config_missing_streaming_section_defaults_to_none() {
         // A config document with no top-level `streaming` key deserializes to
         // `None`; callers fall back to `StreamingConfig::default()` at use time.
@@ -1252,6 +1344,7 @@ mod runtime_resolution_tests {
             custom_vpc_endpoint: false,
             prompt_caching: false,
             compression: None,
+            memory: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -1292,6 +1385,7 @@ mod runtime_resolution_tests {
             custom_vpc_endpoint: false,
             prompt_caching: false,
             compression: None,
+            memory: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -1336,6 +1430,7 @@ mod runtime_resolution_tests {
             custom_vpc_endpoint: false,
             prompt_caching: false,
             compression: None,
+            memory: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -1378,6 +1473,7 @@ mod runtime_resolution_tests {
             custom_vpc_endpoint: false,
             prompt_caching: false,
             compression: None,
+            memory: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -1419,6 +1515,7 @@ mod runtime_resolution_tests {
             custom_vpc_endpoint: false,
             prompt_caching: false,
             compression: None,
+            memory: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,

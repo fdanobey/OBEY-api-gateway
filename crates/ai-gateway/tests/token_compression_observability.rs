@@ -120,6 +120,10 @@ fn log_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> Log
         requested_model: Some("gpt-4".to_owned()),
         responded_model: Some("gpt-4".to_owned()),
         compression,
+        memories_injected: 0,
+        memories_stored: 0,
+        injection_tokens: 0,
+        detected_project: None,
     }
 }
 

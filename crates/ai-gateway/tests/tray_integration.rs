@@ -49,6 +49,7 @@ fn test_config() -> Config {
             custom_vpc_endpoint: false,
             prompt_caching: false,
             compression: None,
+            memory: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -60,6 +61,7 @@ fn test_config() -> Config {
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
                 model: "gpt-4".to_string(),
@@ -77,12 +79,14 @@ fn test_config() -> Config {
         prometheus: None,
         context: ContextConfig::default(),
         compression: Default::default(),
+        memory: None,
         first_launch_completed: false,
         tray: TrayConfig::default(),
         codex_instructions_url: None,
         streaming: None,
         virtual_keys: Default::default(),
         guardrails: None,
+        tool_compression: Default::default(),
         structured_output: None,
     }
 }

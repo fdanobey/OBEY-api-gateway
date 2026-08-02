@@ -68,10 +68,29 @@ pub struct Metrics {
     compression_ratio: Arc<DashMap<CompressionMetricKey, CompressionHistogram>>,
     /// Compression duration histogram, keyed by bounded (level, provider).
     compression_duration_seconds: Arc<DashMap<CompressionMetricKey, CompressionHistogram>>,
+    /// Tool compression requests total, keyed by (model_group, level).
+    tool_compression_requests_total: Arc<DashMap<ToolCompressionMetricKey, AtomicU64>>,
+    /// Tool compression tokens saved total, keyed by (model_group, level).
+    tool_compression_tokens_saved_total: Arc<DashMap<ToolCompressionMetricKey, AtomicU64>>,
+    /// Tool compression ratio histogram, keyed by (model_group, level).
+    tool_compression_ratio: Arc<DashMap<ToolCompressionMetricKey, CompressionHistogram>>,
+    /// Tool compression pipeline duration histogram (ms), keyed by (model_group, level).
+    tool_compression_duration_ms: Arc<DashMap<ToolCompressionMetricKey, CompressionHistogram>>,
+    /// Tool compression tools pruned gauge, keyed by model_group.
+    tool_compression_tools_pruned: Arc<DashMap<String, AtomicU64>>,
+    /// Tool compression feedback current level gauge, keyed by model_group.
+    tool_compression_feedback_level: Arc<DashMap<String, AtomicU64>>,
+    /// Tool compression feedback error rate gauge (stored as micros, i.e. rate * 1_000_000), keyed by model_group.
+    tool_compression_feedback_error_rate: Arc<DashMap<String, AtomicU64>>,
+    /// Tool compression feedback adjustments counter, keyed by model_group.
+    tool_compression_feedback_adjustments: Arc<DashMap<String, AtomicU64>>,
 }
 
 /// Bounded label set for compression metrics: (level, provider).
 type CompressionMetricKey = (String, String);
+
+/// Bounded label set for tool compression metrics: (model_group, level).
+type ToolCompressionMetricKey = (String, String);
 
 /// Compression ratios are `compressed_tokens / original_tokens`, clamped to
 /// `[0, 1]`; an empty original request has ratio `1.0`.
@@ -371,6 +390,14 @@ impl Metrics {
             compression_tokens_saved: Arc::new(DashMap::new()),
             compression_ratio: Arc::new(DashMap::new()),
             compression_duration_seconds: Arc::new(DashMap::new()),
+            tool_compression_requests_total: Arc::new(DashMap::new()),
+            tool_compression_tokens_saved_total: Arc::new(DashMap::new()),
+            tool_compression_ratio: Arc::new(DashMap::new()),
+            tool_compression_duration_ms: Arc::new(DashMap::new()),
+            tool_compression_tools_pruned: Arc::new(DashMap::new()),
+            tool_compression_feedback_level: Arc::new(DashMap::new()),
+            tool_compression_feedback_error_rate: Arc::new(DashMap::new()),
+            tool_compression_feedback_adjustments: Arc::new(DashMap::new()),
         }
     }
 
@@ -912,6 +939,272 @@ Total refusal failover outcomes by pipeline and outcome\n",
                 CompressionHistogram::new(COMPRESSION_DURATION_BUCKETS_SECONDS.len())
             })
             .observe(duration_seconds, &COMPRESSION_DURATION_BUCKETS_SECONDS);
+    }
+
+    /// Record tool compression pipeline metrics for one request.
+    pub fn record_tool_compression(
+        &self,
+        model_group: &str,
+        level: &str,
+        tokens_saved: u64,
+        ratio: f64,
+        duration_ms: u64,
+    ) {
+        let key = (
+            bounded_label(model_group, MAX_COMPRESSION_PROVIDER_LABEL_LEN),
+            bounded_label(level, MAX_COMPRESSION_LEVEL_LABEL_LEN),
+        );
+
+        // Increment request counter
+        let counter = self
+            .tool_compression_requests_total
+            .entry(key.clone())
+            .or_insert_with(|| AtomicU64::new(0));
+        saturating_atomic_add(counter.value(), 1);
+
+        // Accumulate tokens saved
+        let saved_counter = self
+            .tool_compression_tokens_saved_total
+            .entry(key.clone())
+            .or_insert_with(|| AtomicU64::new(0));
+        saturating_atomic_add(saved_counter.value(), tokens_saved);
+
+        // Observe compression ratio
+        self.tool_compression_ratio
+            .entry(key.clone())
+            .or_insert_with(|| CompressionHistogram::new(COMPRESSION_RATIO_BUCKETS.len()))
+            .observe(ratio.clamp(0.0, 1.0), &COMPRESSION_RATIO_BUCKETS);
+
+        // Observe pipeline duration
+        let duration_seconds = duration_ms as f64 / 1000.0;
+        self.tool_compression_duration_ms
+            .entry(key)
+            .or_insert_with(|| {
+                CompressionHistogram::new(COMPRESSION_DURATION_BUCKETS_SECONDS.len())
+            })
+            .observe(duration_seconds, &COMPRESSION_DURATION_BUCKETS_SECONDS);
+    }
+
+    /// Record the number of tools pruned for a model group (gauge — overwrites previous value).
+    pub fn record_tool_compression_tools_pruned(&self, model_group: &str, count: u64) {
+        let key = bounded_label(model_group, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
+        self.tool_compression_tools_pruned
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .store(count, Ordering::Relaxed);
+    }
+
+    /// Record the current feedback-loop compression level for a model group (gauge).
+    /// Level is encoded as integer: 0=low, 1=medium, 2=high, 3=max.
+    pub fn record_tool_compression_feedback_level(&self, model_group: &str, level: u64) {
+        let key = bounded_label(model_group, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
+        self.tool_compression_feedback_level
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .store(level, Ordering::Relaxed);
+    }
+
+    /// Record the current feedback-loop error rate for a model group (gauge).
+    /// Rate is stored as micros (rate * 1_000_000) to avoid float atomics.
+    pub fn record_tool_compression_feedback_error_rate(&self, model_group: &str, rate: f64) {
+        let key = bounded_label(model_group, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
+        let rate_micros = (rate.clamp(0.0, 1.0) * 1_000_000.0).round() as u64;
+        self.tool_compression_feedback_error_rate
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .store(rate_micros, Ordering::Relaxed);
+    }
+
+    /// Increment the feedback-loop adjustment counter for a model group.
+    pub fn record_tool_compression_feedback_adjustment(&self, model_group: &str) {
+        let key = bounded_label(model_group, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
+        self.tool_compression_feedback_adjustments
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Append tool compression metrics in Prometheus text exposition format.
+    pub fn write_tool_compression_prometheus(&self, out: &mut String) {
+        // Counter: obey_tool_compression_requests_total
+        if !self.tool_compression_requests_total.is_empty() {
+            let mut rows: Vec<(ToolCompressionMetricKey, u64)> = self
+                .tool_compression_requests_total
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push_str("# HELP obey_tool_compression_requests_total Total requests where tool compression was applied\n");
+            out.push_str("# TYPE obey_tool_compression_requests_total counter\n");
+            for ((model_group, level), value) in &rows {
+                out.push_str(&format!(
+                    "obey_tool_compression_requests_total{{model_group=\"{}\",compression_level=\"{}\"}} {}\n",
+                    escape_prometheus_label(model_group),
+                    escape_prometheus_label(level),
+                    value
+                ));
+            }
+        }
+
+        // Counter: obey_tool_compression_tokens_saved_total
+        if !self.tool_compression_tokens_saved_total.is_empty() {
+            let mut rows: Vec<(ToolCompressionMetricKey, u64)> = self
+                .tool_compression_tokens_saved_total
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push_str("# HELP obey_tool_compression_tokens_saved_total Total tokens saved by tool compression\n");
+            out.push_str("# TYPE obey_tool_compression_tokens_saved_total counter\n");
+            for ((model_group, level), value) in &rows {
+                out.push_str(&format!(
+                    "obey_tool_compression_tokens_saved_total{{model_group=\"{}\",compression_level=\"{}\"}} {}\n",
+                    escape_prometheus_label(model_group),
+                    escape_prometheus_label(level),
+                    value
+                ));
+            }
+        }
+
+        // Histogram: obey_tool_compression_reduction_ratio
+        self.write_tool_compression_histogram(
+            out,
+            "obey_tool_compression_reduction_ratio",
+            "Ratio of tokens saved by tool compression (1.0 - compressed/original)",
+            &self.tool_compression_ratio,
+            &COMPRESSION_RATIO_BUCKETS,
+        );
+
+        // Histogram: obey_tool_compression_latency_seconds
+        self.write_tool_compression_histogram(
+            out,
+            "obey_tool_compression_latency_seconds",
+            "Tool compression pipeline latency in seconds",
+            &self.tool_compression_duration_ms,
+            &COMPRESSION_DURATION_BUCKETS_SECONDS,
+        );
+
+        // Gauge: obey_tool_compression_tools_pruned
+        if !self.tool_compression_tools_pruned.is_empty() {
+            let mut rows: Vec<(String, u64)> = self
+                .tool_compression_tools_pruned
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push_str("# HELP obey_tool_compression_tools_pruned Current count of tools pruned per model group\n");
+            out.push_str("# TYPE obey_tool_compression_tools_pruned gauge\n");
+            for (model_group, value) in &rows {
+                out.push_str(&format!(
+                    "obey_tool_compression_tools_pruned{{model_group=\"{}\"}} {}\n",
+                    escape_prometheus_label(model_group),
+                    value
+                ));
+            }
+        }
+
+        // Gauge: obey_tool_compression_feedback_level
+        if !self.tool_compression_feedback_level.is_empty() {
+            let mut rows: Vec<(String, u64)> = self
+                .tool_compression_feedback_level
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push_str("# HELP obey_tool_compression_feedback_level Current feedback-adjusted compression level per model group (0=low, 1=medium, 2=high, 3=max)\n");
+            out.push_str("# TYPE obey_tool_compression_feedback_level gauge\n");
+            for (model_group, value) in &rows {
+                out.push_str(&format!(
+                    "obey_tool_compression_feedback_level{{model_group=\"{}\"}} {}\n",
+                    escape_prometheus_label(model_group),
+                    value
+                ));
+            }
+        }
+
+        // Gauge: obey_tool_compression_feedback_error_rate
+        if !self.tool_compression_feedback_error_rate.is_empty() {
+            let mut rows: Vec<(String, u64)> = self
+                .tool_compression_feedback_error_rate
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push_str("# HELP obey_tool_compression_feedback_error_rate Current tool-call error rate per model group\n");
+            out.push_str("# TYPE obey_tool_compression_feedback_error_rate gauge\n");
+            for (model_group, value) in &rows {
+                let rate = *value as f64 / 1_000_000.0;
+                out.push_str(&format!(
+                    "obey_tool_compression_feedback_error_rate{{model_group=\"{}\"}} {:.6}\n",
+                    escape_prometheus_label(model_group),
+                    rate
+                ));
+            }
+        }
+
+        // Counter: obey_tool_compression_feedback_adjustments_total
+        if !self.tool_compression_feedback_adjustments.is_empty() {
+            let mut rows: Vec<(String, u64)> = self
+                .tool_compression_feedback_adjustments
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push_str("# HELP obey_tool_compression_feedback_adjustments_total Total feedback-loop level adjustments per model group\n");
+            out.push_str("# TYPE obey_tool_compression_feedback_adjustments_total counter\n");
+            for (model_group, value) in &rows {
+                out.push_str(&format!(
+                    "obey_tool_compression_feedback_adjustments_total{{model_group=\"{}\"}} {}\n",
+                    escape_prometheus_label(model_group),
+                    value
+                ));
+            }
+        }
+    }
+
+    fn write_tool_compression_histogram(
+        &self,
+        out: &mut String,
+        name: &str,
+        help: &str,
+        values: &DashMap<ToolCompressionMetricKey, CompressionHistogram>,
+        buckets: &[f64],
+    ) {
+        if values.is_empty() {
+            return;
+        }
+        let mut keys: Vec<ToolCompressionMetricKey> =
+            values.iter().map(|entry| entry.key().clone()).collect();
+        keys.sort();
+        out.push_str(&format!("# HELP {name} {help}\n"));
+        out.push_str(&format!("# TYPE {name} histogram\n"));
+        for key in keys {
+            let Some(entry) = values.get(&key) else {
+                continue;
+            };
+            let histogram = entry.value();
+            let model_group = escape_prometheus_label(&key.0);
+            let level = escape_prometheus_label(&key.1);
+            let mut cumulative = 0u64;
+            for (index, boundary) in buckets.iter().enumerate() {
+                cumulative =
+                    cumulative.saturating_add(histogram.buckets[index].load(Ordering::Relaxed));
+                out.push_str(&format!(
+                    "{name}_bucket{{model_group=\"{model_group}\",compression_level=\"{level}\",le=\"{boundary}\"}} {cumulative}\n"
+                ));
+            }
+            let count = histogram.count.load(Ordering::Relaxed);
+            out.push_str(&format!(
+                "{name}_bucket{{model_group=\"{model_group}\",compression_level=\"{level}\",le=\"+Inf\"}} {count}\n"
+            ));
+            let sum = histogram.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+            out.push_str(&format!(
+                "{name}_sum{{model_group=\"{model_group}\",compression_level=\"{level}\"}} {sum}\n"
+            ));
+            out.push_str(&format!(
+                "{name}_count{{model_group=\"{model_group}\",compression_level=\"{level}\"}} {count}\n"
+            ));
+        }
     }
 
     /// Append compression counter and histograms in Prometheus text format.

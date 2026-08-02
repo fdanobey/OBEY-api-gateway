@@ -4363,17 +4363,42 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       });
   }
 
-  function addBindingRow(container, key, pipeline, failover) {
-    var row = document.createElement('div');
-    var isVirtualKey = container.id === 'gr-bindings-vk';
-    row.className = 'guardrail-binding-row';
-    row.innerHTML = '<div class="form-group" style="margin:0"><label>Apply to</label>' + (isVirtualKey ? '<select class="gr-binding-key"></select><div class="hint">Choose by name. The saved rule automatically uses the virtual key ID.</div>' : '<input type="text" class="gr-binding-key" value="' + escapeHtml(key || '') + '"><div class="hint">Enter the exact model group name or route shown in this section.</div>') + '</div>' +
-      '<div class="form-group" style="margin:0"><label>Rule</label><select class="gr-binding-pipeline"><option value="">— choose —</option></select><div class="hint">The guardrail rule to run for this target.</div></div>' +
-      '<div class="form-check" style="margin:0;align-self:center"><input type="checkbox" class="gr-binding-failover"><label>Try another model after refusal</label></div>' +
-      '<button type="button" class="btn btn-danger btn-sm gr-remove-binding" style="align-self:center" aria-label="Remove target">✕</button>';
-    container.appendChild(row);
-    if (isVirtualKey) populateGuardrailVirtualKeySelect(row.querySelector('.gr-binding-key'), key);
-    var pipeSel = row.querySelector('.gr-binding-pipeline');
+function populateGuardrailModelGroupSelect(select, selectedName) {
+select.innerHTML = '<option value="">— choose a model group —</option>';
+var groups = (config && config.model_groups) || [];
+groups.forEach(function(group) {
+if (!group || !group.name) return;
+var option = document.createElement('option');
+option.value = group.name;
+option.textContent = group.name;
+select.appendChild(option);
+});
+if (selectedName && !groups.some(function(group) { return group && group.name === selectedName; })) {
+var unavailable = document.createElement('option');
+unavailable.value = selectedName;
+unavailable.textContent = selectedName + ' (not in config)';
+unavailable.disabled = true;
+select.appendChild(unavailable);
+}
+select.value = selectedName || '';
+}
+
+function addBindingRow(container, key, pipeline, failover) {
+var row = document.createElement('div');
+var isVirtualKey = container.id === 'gr-bindings-vk';
+var isModelGroup = container.id === 'gr-bindings-mg';
+var targetField = isVirtualKey || isModelGroup
+? '<select class="gr-binding-key"></select><div class="hint">' + (isVirtualKey ? 'Choose by name. The saved rule automatically uses the virtual key ID.' : 'Choose an existing model group from the configuration.') + '</div>'
+: '<input type="text" class="gr-binding-key" value="' + escapeHtml(key || '') + '"><div class="hint">Enter the exact route shown in this section.</div>';
+row.className = 'guardrail-binding-row';
+row.innerHTML = '<div class="form-group" style="margin:0"><label>Apply to</label>' + targetField + '</div>' +
+'<div class="form-group" style="margin:0"><label>Rule</label><select class="gr-binding-pipeline"><option value="">— choose —</option></select><div class="hint">The guardrail rule to run for this target.</div></div>' +
+'<div class="form-check" style="margin:0;align-self:center"><input type="checkbox" class="gr-binding-failover"><label>Try another model after refusal</label></div>' +
+'<button type="button" class="btn btn-danger btn-sm gr-remove-binding" style="align-self:center" aria-label="Remove target">✕</button>';
+container.appendChild(row);
+if (isVirtualKey) populateGuardrailVirtualKeySelect(row.querySelector('.gr-binding-key'), key);
+if (isModelGroup) populateGuardrailModelGroupSelect(row.querySelector('.gr-binding-key'), key);
+var pipeSel = row.querySelector('.gr-binding-pipeline');
     getGuardrailPipelineNames().forEach(function(n) { var o = document.createElement('option'); o.value = n; o.textContent = n; pipeSel.appendChild(o); });
     if (pipeline) pipeSel.value = pipeline;
     if (failover) row.querySelector('.gr-binding-failover').checked = true;
@@ -4514,12 +4539,12 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         if (!provider.value || !providerNames[provider.value]) { showError(provider, 'Choose an existing guardrail type'); valid = false; }
       });
     });
-    document.querySelectorAll('.guardrail-binding-row').forEach(function(row) {
-      var target = row.querySelector('.gr-binding-key');
-      var rule = row.querySelector('.gr-binding-pipeline');
-      if (!target.value.trim()) { showError(target, 'Enter what this rule applies to'); valid = false; }
-      if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing rule'); valid = false; }
-    });
+document.querySelectorAll('.guardrail-binding-row').forEach(function(row) {
+var target = row.querySelector('.gr-binding-key');
+var rule = row.querySelector('.gr-binding-pipeline');
+if (!target.value.trim()) { showError(target, target.tagName === 'SELECT' ? 'Choose what this rule applies to' : 'Enter what this rule applies to'); valid = false; }
+if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing rule'); valid = false; }
+});
     var globalRule = document.getElementById('gr-global-pipeline');
     if (globalRule.value && !ruleNames[globalRule.value]) { showError(globalRule, 'Choose an existing rule'); valid = false; }
     return valid;

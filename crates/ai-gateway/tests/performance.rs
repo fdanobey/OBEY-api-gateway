@@ -57,6 +57,7 @@ fn test_config() -> Config {
             custom_vpc_endpoint: false,
             prompt_caching: false,
             compression: None,
+            memory: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -67,6 +68,7 @@ fn test_config() -> Config {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            memory: None,
             structured_output: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
@@ -85,6 +87,7 @@ fn test_config() -> Config {
         prometheus: None,
         context: ai_gateway::config::ContextConfig::default(),
         compression: Default::default(),
+        memory: None,
         first_launch_completed: false,
         tray: ai_gateway::config::TrayConfig::default(),
         codex_instructions_url: None,
@@ -92,6 +95,7 @@ fn test_config() -> Config {
         virtual_keys: Default::default(),
         loop_detection: Default::default(),
         guardrails: None,
+        tool_compression: Default::default(),
         structured_output: None,
     }
 }

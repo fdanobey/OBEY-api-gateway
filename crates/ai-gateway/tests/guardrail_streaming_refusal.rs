@@ -62,6 +62,7 @@ fn provider_named(name: &str, base_url: &str) -> Provider {
         custom_vpc_endpoint: false,
         prompt_caching: false,
         compression: None,
+        memory: None,
         reasoning: true,
         codex_base_url_override: None,
         codex_model_override: None,
@@ -94,6 +95,7 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            memory: None,
             structured_output: None,
             models: vec![
                 ProviderModel {
@@ -122,6 +124,7 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
         prometheus: None,
         context: ai_gateway::config::ContextConfig::default(),
         compression: Default::default(),
+        memory: None,
         first_launch_completed: false,
         tray: ai_gateway::config::TrayConfig::default(),
         codex_instructions_url: None,
@@ -133,6 +136,7 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
         virtual_keys: Default::default(),
         loop_detection: Default::default(),
         guardrails: Some(guardrails),
+        tool_compression: Default::default(),
         structured_output: None,
     }
 }

@@ -103,12 +103,14 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
             codex_model_override: None,
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
+            memory: None,
         }],
         model_groups: vec![ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
             structured_output: None,
+            memory: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
                 model: TEST_MODEL.to_string(),
@@ -136,7 +138,9 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
         },
         loop_detection: Default::default(),
         guardrails: None,
+        tool_compression: Default::default(),
         structured_output: None,
+        memory: None,
     }
 }
 

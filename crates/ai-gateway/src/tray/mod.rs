@@ -300,6 +300,7 @@ mod tests {
             virtual_keys: Default::default(),
             loop_detection: Default::default(),
             guardrails: None,
+            tool_compression: Default::default(),
         }
     }
 

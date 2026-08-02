@@ -156,6 +156,7 @@ fn base_config(provider_uri: &str) -> Config {
             custom_vpc_endpoint: false,
             prompt_caching: false,
             compression: None,
+            memory: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -166,6 +167,7 @@ fn base_config(provider_uri: &str) -> Config {
             name: "structured-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            memory: None,
             structured_output: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
@@ -194,6 +196,7 @@ fn base_config(provider_uri: &str) -> Config {
         prometheus: None,
         context: ContextConfig::default(),
         compression: Default::default(),
+        memory: None,
         first_launch_completed: false,
         tray: TrayConfig::default(),
         codex_instructions_url: None,
@@ -206,6 +209,7 @@ fn base_config(provider_uri: &str) -> Config {
         loop_detection: Default::default(),
         structured_output: None,
         guardrails: None,
+        tool_compression: Default::default(),
     }
 }
 

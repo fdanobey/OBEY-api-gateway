@@ -50,6 +50,7 @@ fn test_config() -> Config {
             custom_vpc_endpoint: false,
             prompt_caching: false,
             compression: None,
+            memory: None,
             reasoning: true,
             codex_base_url_override: None,
             codex_model_override: None,
@@ -60,6 +61,7 @@ fn test_config() -> Config {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
             compression: None,
+            memory: None,
             structured_output: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
@@ -78,6 +80,7 @@ fn test_config() -> Config {
         prometheus: None,
         context: ai_gateway::config::ContextConfig::default(),
         compression: Default::default(),
+        memory: None,
         first_launch_completed: false,
         tray: ai_gateway::config::TrayConfig::default(),
         codex_instructions_url: None,
@@ -85,6 +88,7 @@ fn test_config() -> Config {
         virtual_keys: Default::default(),
         loop_detection: Default::default(),
         guardrails: None,
+        tool_compression: Default::default(),
         structured_output: None,
     }
 }
@@ -1185,11 +1189,13 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
     let primary = Provider {
         name: "primary".to_string(),
         base_url: Some(primary_uri.to_string()),
+        memory: None,
         ..template.clone()
     };
     let backup = Provider {
         name: "backup".to_string(),
         base_url: Some(backup_uri.to_string()),
+        memory: None,
         ..template
     };
     cfg.providers = vec![primary, backup];
@@ -1197,6 +1203,7 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
         name: "gpt-4-group".to_string(),
         version_fallback_enabled: false,
         compression: None,
+        memory: None,
         structured_output: None,
         models: vec![
             ProviderModel {
@@ -1513,11 +1520,13 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
     let primary = Provider {
         name: "primary".to_string(),
         base_url: Some(primary_uri.to_string()),
+        memory: None,
         ..template.clone()
     };
     let backup = Provider {
         name: "backup".to_string(),
         base_url: Some(backup_uri.to_string()),
+        memory: None,
         ..template
     };
     cfg.providers = vec![primary, backup];
@@ -1525,6 +1534,7 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
         name: "gpt-4-group".to_string(),
         version_fallback_enabled: false,
         compression: None,
+        memory: None,
         structured_output: None,
         models: vec![
             ProviderModel {

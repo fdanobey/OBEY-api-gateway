@@ -17,6 +17,7 @@ mod codex;
 #[allow(dead_code, unused_imports)]
 mod compression;
 mod config;
+mod description_utils;
 mod context;
 mod dashboard;
 mod error;
@@ -25,6 +26,7 @@ mod guardrail;
 mod logger;
 #[allow(dead_code, unused_imports)]
 mod loop_detection;
+mod memory;
 mod metrics;
 mod models;
 mod oauth;
@@ -32,6 +34,7 @@ mod providers;
 mod router;
 mod secrets;
 mod structured_output;
+mod tool_compression;
 #[cfg(feature = "tray")]
 mod tray;
 mod virtual_keys;

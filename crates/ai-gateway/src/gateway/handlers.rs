@@ -30,6 +30,10 @@ use crate::guardrail::{
     PostCallOutcome, PreCallOutcome, RefusalDecision, StagePhase, ToolContext,
 };
 use crate::logger::{CompressionLogMetadata, LogEntry};
+use crate::memory::{
+    format_feedback_suffix, ContextType, EffectiveMemoryConfig, ExtractionCounts,
+    ExtractionMessage, ExtractionRole, InjectionResult, MemoryRequestResult, ResolvedNamespace,
+};
 use crate::metrics::Metrics;
 use crate::models::openai::{Choice, OpenAIRequest, OpenAIResponse};
 use crate::providers::Model;
@@ -55,9 +59,32 @@ struct RequestLogContext {
     /// Detailed error message for failed requests (shown in dashboard log viewer).
     error_message: Option<String>,
     compression: Option<CompressionLogMetadata>,
+    memories_injected: u32,
+    memories_stored: u32,
+    injection_tokens: u32,
+    detected_project: Option<String>,
 }
 
 impl RequestLogContext {
+    fn with_memory(
+        mut self,
+        memory: Option<(&ContextType, &InjectionResult)>,
+        extraction: Option<ExtractionCounts>,
+    ) -> Self {
+        if let Some((context, injection)) = memory {
+            self.memories_injected = injection.memories_injected;
+            self.injection_tokens = injection.injection_tokens;
+            self.detected_project = match context {
+                ContextType::Project(hash) => Some(hash.clone()),
+                ContextType::Agent(_) | ContextType::User => None,
+            };
+        }
+        if let Some(extraction) = extraction {
+            self.memories_stored = extraction.stored;
+        }
+        self
+    }
+
     fn from_response(
         request: &OpenAIRequest,
         trace_id: String,
@@ -110,6 +137,10 @@ impl RequestLogContext {
                 .as_ref()
                 .map(CompressionLogMetadata::from)
                 .or_else(|| fallback_compression.map(CompressionLogMetadata::from)),
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
         }
     }
 
@@ -131,6 +162,10 @@ impl RequestLogContext {
             cost: 0.0,
             error_message: None,
             compression: Some(CompressionLogMetadata::from(&compression)),
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
         }
     }
 
@@ -170,6 +205,10 @@ impl RequestLogContext {
             cost: 0.0,
             error_message,
             compression: None,
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
         }
     }
 }
@@ -194,6 +233,10 @@ fn log_request(state: &super::AppState, request: &OpenAIRequest, context: &Reque
         requested_model: Some(request.model.clone()),
         responded_model: context.responded_model.clone(),
         compression: context.compression.clone(),
+        memories_injected: context.memories_injected,
+        memories_stored: context.memories_stored,
+        injection_tokens: context.injection_tokens,
+        detected_project: context.detected_project.clone(),
     };
     if let Err(e) = state.logger.log(entry) {
         tracing::warn!(error = %e, trace_id = %context.trace_id, "Failed to write request log entry");
@@ -273,6 +316,18 @@ fn attach_validation_status_header(
         HeaderName::from_static(VALIDATION_STATUS_HEADER),
         HeaderValue::from_static(value),
     );
+}
+
+fn requests_structured_output(request: &OpenAIRequest) -> bool {
+    matches!(
+        request
+            .extra
+            .get("response_format")
+            .and_then(|value| value.as_object())
+            .and_then(|response_format| response_format.get("type"))
+            .and_then(|value| value.as_str()),
+        Some("json_object" | "json_schema")
+    )
 }
 
 fn requests_json_schema(request: &OpenAIRequest) -> bool {
@@ -449,6 +504,211 @@ fn validation_skip_category(reason: &ValidationSkipReason) -> &'static str {
 
 fn default_context_window() -> usize {
     crate::config::ContextConfig::default().default_context_window as usize
+}
+
+#[derive(Clone)]
+struct MemoryRequestContext {
+    system: Arc<crate::memory::MemorySystem>,
+    context: ContextType,
+    namespace: ResolvedNamespace,
+    effective: EffectiveMemoryConfig,
+    injection: InjectionResult,
+    extraction_messages: Vec<ExtractionMessage>,
+}
+
+async fn preprocess_memory_request(
+    state: &AppState,
+    request: &mut OpenAIRequest,
+    virtual_key_id: Option<&str>,
+) -> Option<MemoryRequestContext> {
+    let system = state.memory_system.read().await.clone()?;
+    let model_group = state.router.find_model_group(&request.model).await.ok()?;
+    let ordered = state.router.select_provider_order(&model_group).await;
+    let provider_model = ordered.first().or_else(|| model_group.models.first())?;
+    let (effective, default_context_window) = {
+        let config = state.config.read().await;
+        let memory = config.memory.as_ref()?;
+        let provider_override = config
+            .providers
+            .iter()
+            .find(|provider| provider.name == provider_model.provider)
+            .and_then(|provider| provider.memory.as_ref());
+        (
+            memory.resolve(provider_override, model_group.memory.as_ref()),
+            config.context.default_context_window,
+        )
+    };
+    if !effective.enabled {
+        return None;
+    }
+
+    let extraction_messages = extraction_messages(request);
+    let query = request
+        .messages
+        .iter()
+        .map(|message| message.content_as_text())
+        .filter(|content| !content.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let context_window = state
+        .router
+        .context_manager()
+        .get_capabilities(&provider_model.model)
+        .map(|capabilities| capabilities.context_window)
+        .unwrap_or(default_context_window);
+    let post_truncation_tokens = TokenCounter::new().count_request(request);
+    let result: MemoryRequestResult = match system
+        .process_request(
+            request,
+            &query,
+            context_window,
+            post_truncation_tokens,
+            effective,
+            virtual_key_id,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!(error = %error, "Memory request preprocessing failed; routing unchanged");
+            return None;
+        }
+    };
+
+    if result.injection.injection_tokens > 200 {
+        tracing::info!(
+            memories_injected = result.injection.memories_injected,
+            injection_tokens = result.injection.injection_tokens,
+            "Memory injection added more than 200 tokens"
+        );
+    }
+    if result.injection.memories_injected > 0 {
+        state
+            .memory_events
+            .publish(crate::dashboard::MemoryDashboardEvent::new(
+                crate::dashboard::MemoryEventType::Injection,
+                result
+                    .namespace
+                    .context_scope
+                    .as_deref()
+                    .unwrap_or(&result.namespace.user_scope),
+                result.injection.memories_injected,
+            ));
+    }
+
+    Some(MemoryRequestContext {
+        system,
+        context: result.context,
+        namespace: result.namespace,
+        effective,
+        injection: result.injection,
+        extraction_messages,
+    })
+}
+
+fn extraction_messages(request: &OpenAIRequest) -> Vec<ExtractionMessage> {
+    request
+        .messages
+        .iter()
+        .map(|message| {
+            let role = match message.role.as_str() {
+                "user" => ExtractionRole::User,
+                "assistant" => ExtractionRole::Assistant,
+                _ => ExtractionRole::Other,
+            };
+            ExtractionMessage::caller(role, message.content_as_text())
+        })
+        .collect()
+}
+
+fn append_feedback_to_response(response: &mut OpenAIResponse, suffix: &str) -> bool {
+    let Some(choice) = response.choices.first_mut() else {
+        return false;
+    };
+    if !choice.message.extra.get("tool_calls").is_none() {
+        return false;
+    }
+    match &mut choice.message.content {
+        serde_json::Value::String(content) => {
+            content.push_str(suffix);
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn finalize_memory_response(
+    state: &AppState,
+    request: &OpenAIRequest,
+    response: &mut OpenAIResponse,
+    memory: Option<&MemoryRequestContext>,
+    request_id: Option<uuid::Uuid>,
+) -> (Option<String>, ExtractionCounts) {
+    let Some(memory) = memory else {
+        return (None, ExtractionCounts::default());
+    };
+    let response_content = response
+        .choices
+        .first()
+        .map(|choice| choice.message.content_as_text())
+        .unwrap_or_default();
+    let extraction = match memory
+        .system
+        .extract_explicit_response(&memory.extraction_messages, &memory.namespace, request_id)
+        .await
+    {
+        Ok(extraction) => extraction,
+        Err(error) => {
+            tracing::warn!(error = %error, "Memory response extraction failed");
+            return (None, ExtractionCounts::default());
+        }
+    };
+    if extraction.stored > 0 {
+        state
+            .memory_events
+            .publish(crate::dashboard::MemoryDashboardEvent::new(
+                crate::dashboard::MemoryEventType::Extraction,
+                memory
+                    .namespace
+                    .context_scope
+                    .as_deref()
+                    .unwrap_or(&memory.namespace.user_scope),
+                extraction.stored,
+            ));
+    }
+    let _automatic = memory
+        .system
+        .schedule_automatic_extraction(
+            &memory.extraction_messages,
+            &response_content,
+            &memory.namespace,
+            request_id,
+        )
+        .await;
+    let suffix = if !memory.effective.show_feedback || requests_structured_output(request) {
+        None
+    } else {
+        format_feedback_suffix(
+            memory.injection.memories_injected,
+            extraction.stored,
+            extraction.sensitive_rejected,
+        )
+    };
+    (suffix, extraction)
+}
+
+fn memory_feedback_chunk(request: &OpenAIRequest, suffix: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("chatcmpl-memory-{}", uuid::Uuid::new_v4()),
+        "object": "chat.completion.chunk",
+        "created": chrono::Utc::now().timestamp(),
+        "model": request.model,
+        "choices": [{
+            "index": 0,
+            "delta": { "content": suffix },
+            "finish_reason": null
+        }]
+    })
 }
 
 use super::AppState;
@@ -792,6 +1052,13 @@ async fn chat_completions_non_stream(
         }
     }
 
+    // Context truncation is centralized here so memory observes the exact
+    // post-truncation request. Router compression remains provider-specific and
+    // therefore runs only after this handler-side injection boundary.
+    request = state.router.prepare_post_truncation_request(&request);
+    let memory_context =
+        preprocess_memory_request(&state, &mut request, virtual_key_id.as_deref()).await;
+
     match state.router.route_request(&request).await {
         Ok(mut response) => {
             // Post-call guardrails run on the freshly routed response BEFORE it
@@ -881,6 +1148,12 @@ async fn chat_completions_non_stream(
                                     trace_id.clone(),
                                     duration_ms,
                                     &response,
+                                )
+                                .with_memory(
+                                    memory_context
+                                        .as_ref()
+                                        .map(|memory| (&memory.context, &memory.injection)),
+                                    None,
                                 );
                                 log_request(&state, &request, &log_context);
                                 let client_response = prepare_response_for_client(&response);
@@ -1388,12 +1661,30 @@ async fn chat_completions_non_stream(
                     }
                 }
             }
+            let request_uuid = uuid::Uuid::parse_str(&trace_id).ok();
+            let (memory_suffix, memory_extraction) = finalize_memory_response(
+                &state,
+                &request,
+                &mut response,
+                memory_context.as_ref(),
+                request_uuid,
+            )
+            .await;
+            if let Some(suffix) = memory_suffix {
+                append_feedback_to_response(&mut response, &suffix);
+            }
             let duration_ms = request_guard.complete();
             let log_context = RequestLogContext::from_response(
                 &request,
                 trace_id.clone(),
                 duration_ms,
                 &response,
+            )
+            .with_memory(
+                memory_context
+                    .as_ref()
+                    .map(|memory| (&memory.context, &memory.injection)),
+                Some(memory_extraction),
             );
             log_request(&state, &request, &log_context);
             let client_response = prepare_response_for_client(&response);
@@ -1432,6 +1723,41 @@ async fn chat_completions_stream(
         model = %request.model,
         "Client requested streaming response; gateway currently buffers the full upstream response before synthesizing SSE"
     );
+
+    request = state.router.prepare_post_truncation_request(&request);
+    let memory_context =
+        preprocess_memory_request(&state, &mut request, virtual_key_id.as_deref()).await;
+
+    let memory_extraction = if let Some(memory) = memory_context.as_ref() {
+        match memory
+            .system
+            .extract_explicit_response(
+                &memory.extraction_messages,
+                &memory.namespace,
+                uuid::Uuid::parse_str(&trace_id).ok(),
+            )
+            .await
+        {
+            Ok(extraction) => Some(extraction),
+            Err(error) => {
+                tracing::warn!(error = %error, "Streaming memory explicit extraction failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let memory_suffix = memory_context.as_ref().and_then(|memory| {
+        if !memory.effective.show_feedback || requests_structured_output(&request) {
+            return None;
+        }
+        let extraction = memory_extraction.unwrap_or_default();
+        format_feedback_suffix(
+            memory.injection.memories_injected,
+            extraction.stored,
+            extraction.sensitive_rejected,
+        )
+    });
 
     // Streaming Reliability (Req 2): resolve the effective streaming settings
     // up front so every SSE path below (cache replay, early event, and the
@@ -1647,6 +1973,9 @@ async fn chat_completions_stream(
                     for chunk in streaming_chunks_after_early_event(&response, &response_id, created) {
                         yield Ok(Event::default().data(chunk.to_string()));
                     }
+                    if let Some(suffix) = memory_suffix.as_deref() {
+                        yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+                    }
                     yield Ok(Event::default().data("[DONE]"));
                 }
                 Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression }) => {
@@ -1775,6 +2104,7 @@ async fn chat_completions_stream(
                             request.clone(),
                             outcome.clone(),
                             xml_detect,
+                            memory_suffix.clone(),
                         );
                         // The relay emits its own terminal `[DONE]` (or a graceful
                         // error event that appends one, or — on pre-content
@@ -1892,6 +2222,9 @@ async fn chat_completions_stream(
                                         log_request(&state, &request, &log_context);
                                         for chunk in streaming_chunks_after_early_event(&response, &response_id, created) {
                                             yield Ok(Event::default().data(chunk.to_string()));
+                                        }
+                                        if let Some(suffix) = memory_suffix.as_deref() {
+                                            yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
                                         }
                                         yield Ok(Event::default().data("[DONE]"));
                                         break 'failover;
@@ -2039,10 +2372,13 @@ async fn chat_completions_stream(
             );
         }
 
-        for chunk in streaming_chunks_from_response(&response) {
-            yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
-        }
-        yield Ok(Event::default().data("[DONE]"));
+    for chunk in streaming_chunks_from_response(&response) {
+        yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
+    }
+    if let Some(suffix) = memory_suffix.as_deref() {
+        yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+    }
+    yield Ok(Event::default().data("[DONE]"));
     };
 
     request_guard.complete();
@@ -3495,6 +3831,7 @@ fn relay_passthrough_stream(
     request: OpenAIRequest,
     outcome: Arc<tokio::sync::Mutex<RelayOutcome>>,
     xml_detect: Option<XmlToolDetect>,
+    memory_suffix: Option<String>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         let chunk_timeout = Duration::from_secs(streaming_config.chunk_timeout_seconds);
@@ -3757,6 +4094,9 @@ fn relay_passthrough_stream(
                     }
                 }
             }
+            if let Some(suffix) = memory_suffix.as_deref() {
+                yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+            }
             yield Ok(Event::default().data("[DONE]"));
         }
     }
@@ -4009,11 +4349,12 @@ fn reasoning_delta(choice: Option<&Choice>) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_validation_status_header, build_keepalive, cache_allowed_for_validation,
-        chunk_carries_content, classify_relay_line, classify_stream_error,
-        collect_structured_output_failure, eager_sse_response, early_event_chunk,
-        emit_sse_error_event, force_eager_structured_stream, prepare_response_for_client,
-        rechunk_structured_response, relay_passthrough_stream, should_cache_eager_structured,
+        append_feedback_to_response, attach_validation_status_header, build_keepalive,
+        cache_allowed_for_validation, chunk_carries_content, classify_relay_line,
+        classify_stream_error, collect_structured_output_failure, eager_sse_response,
+        early_event_chunk, emit_sse_error_event, force_eager_structured_stream,
+        memory_feedback_chunk, prepare_response_for_client, rechunk_structured_response,
+        relay_passthrough_stream, requests_structured_output, should_cache_eager_structured,
         sse_error_payload, streaming_chunks_after_early_event, streaming_chunks_from_response,
         structured_stream_overflow_events, RelayLineAction, RelayOutcome, RequestCompleteGuard,
         RequestLogContext, ValidationResponseStatus,
@@ -4021,6 +4362,7 @@ mod tests {
     use crate::compression::{stats::CompressionStats, CompressionLevel};
     use crate::config::StreamingConfig;
     use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
+    use crate::memory::{ContextType, ExtractionCounts, InjectionResult};
     use crate::metrics::Metrics;
     use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
     use crate::structured_output::validator::{
@@ -4516,6 +4858,75 @@ mod tests {
     }
 
     #[test]
+    fn memory_log_context_records_request_counts_and_project_hash() {
+        let request = OpenAIRequest {
+            model: "requested-model".to_owned(),
+            messages: Vec::new(),
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+        let response = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!("ok"),
+            extra: Default::default(),
+        });
+        let context = RequestLogContext::from_response(&request, "trace".to_owned(), 10, &response)
+            .with_memory(
+                Some((
+                    &ContextType::Project("0123456789abcdef".to_owned()),
+                    &InjectionResult {
+                        memories_injected: 3,
+                        injection_tokens: 240,
+                        ..InjectionResult::default()
+                    },
+                )),
+                Some(ExtractionCounts {
+                    stored: 2,
+                    ..ExtractionCounts::default()
+                }),
+            );
+        assert_eq!(context.memories_injected, 3);
+        assert_eq!(context.memories_stored, 2);
+        assert_eq!(context.injection_tokens, 240);
+        assert_eq!(
+            context.detected_project.as_deref(),
+            Some("0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn memory_feedback_helpers_suppress_structured_and_require_string_content() {
+        let mut request =
+            request_with_response_format(false, serde_json::json!({"type": "json_object"}));
+        assert!(requests_structured_output(&request));
+        request.extra.remove("response_format");
+        assert!(!requests_structured_output(&request));
+
+        let mut response = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!("answer"),
+            extra: Default::default(),
+        });
+        assert!(append_feedback_to_response(&mut response, " suffix"));
+        assert_eq!(
+            response.choices[0].message.content,
+            serde_json::json!("answer suffix")
+        );
+        response.choices[0].message.content = serde_json::json!({"value": 1});
+        assert!(!append_feedback_to_response(&mut response, " suffix"));
+    }
+
+    #[test]
+    fn memory_feedback_chunk_is_content_delta_for_before_done_insertion() {
+        let request = request_with_response_format(false, serde_json::json!({"type": "text"}));
+        let chunk = memory_feedback_chunk(&request, "\n\n---\nfeedback");
+        assert_eq!(chunk["choices"][0]["delta"]["content"], "\n\n---\nfeedback");
+        assert!(chunk["choices"][0]["finish_reason"].is_null());
+    }
+
+    #[test]
     fn streaming_chunks_include_reasoning_before_content() {
         let mut extra = serde_json::Map::new();
         extra.insert("reasoning".to_string(), serde_json::json!("thinking step"));
@@ -4877,6 +5288,7 @@ mod tests {
             request,
             mk_outcome(),
             None,
+            None,
         );
         let events: Vec<_> = stream.collect().await;
         // 2 forwarded chunks + 1 terminal [DONE]. Malformed + upstream [DONE] dropped.
@@ -4901,6 +5313,7 @@ mod tests {
             metrics,
             request,
             mk_outcome(),
+            None,
             None,
         );
         let events: Vec<_> = stream.collect().await;
@@ -4927,6 +5340,7 @@ mod tests {
             metrics,
             request.clone(),
             mk_outcome(),
+            None,
             None,
         );
         let _events: Vec<_> = stream.collect().await;
@@ -4959,6 +5373,7 @@ mod tests {
             metrics,
             request.clone(),
             mk_outcome(),
+            None,
             None,
         );
         let _events: Vec<_> = stream.collect().await;
@@ -5026,6 +5441,7 @@ mod tests {
             request,
             mk_outcome(),
             None,
+            None,
         );
 
         let text = relay_to_sse_text(stream).await;
@@ -5068,6 +5484,7 @@ mod tests {
             metrics,
             request,
             mk_outcome(),
+            None,
             None,
         );
 
@@ -5151,6 +5568,7 @@ mod tests {
             request,
             outcome.clone(),
             None,
+            None,
         );
         let events: Vec<_> = stream.collect().await;
         assert!(
@@ -5182,6 +5600,7 @@ mod tests {
             metrics,
             request,
             outcome.clone(),
+            None,
             None,
         );
         let _events: Vec<_> = stream.collect().await;
@@ -5709,11 +6128,15 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
     // same in-repo metrics state.
     state.metrics.write_guardrail_prometheus(&mut out);
     state.metrics.write_compression_prometheus(&mut out);
+    state.metrics.write_tool_compression_prometheus(&mut out);
     state.metrics.write_structured_output_prometheus(&mut out);
     state
         .loop_detector
         .metrics
         .write_prometheus(&mut out, state.loop_detector.sessions.len());
+    if let Some(memory) = state.memory_system.read().await.clone() {
+        memory.metrics.write_prometheus(&mut out);
+    }
 
     (
         StatusCode::OK,

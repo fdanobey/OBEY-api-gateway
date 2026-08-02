@@ -56,7 +56,10 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Request logging** — SQLite-based structured logging with configurable retention
 - **TLS support** — optional HTTPS with certificate configuration
 - **Windows system tray** — double-click desktop app with splash screen and tray menu
+- **Structured output validation** — JSON Schema validation of model responses with automatic retry on schema violations, per-model-group policies, and Prometheus metrics (see [Structured Output Validation](#structured-output-validation))
+- **Persistent memory store** — cross-session memory extraction, namespace-scoped storage with decay scheduling, context-aware injection, sensitive data filtering, and Qdrant-backed retrieval
 - **Token compression** — 9 multi-engine compression strategies (lite, standard, aggressive, ultra, RTK, stacked, tool_def, language_pack, perplexity) with hierarchical configuration, protection rules, cache-aware downgrades, and Prometheus observability (see [Token Compression](#token-compression))
+- **Tool definition compression** — 12-stage pipeline for reducing token waste from large `tools` arrays: schema minification, description truncation, deduplication with `$ref`, frequency-based pruning, progressive disclosure with namespace grouping, semantic retrieval (TF-IDF + embeddings), canonical text rewriting, cache-aware placement, and adaptive feedback loop with auto-tuning; provider-aware, per-model-group overrides, zero overhead when disabled (see [Tool Definition Compression](#tool-definition-compression))
 - **Hot config reload** — change settings through the admin UI without restarting
 - **Smart timeouts** — split TTFB / total timeouts with auto-detection of thinking models (o1, o3, DeepSeek-R1, Claude)
 
@@ -487,6 +490,135 @@ Compression execution is fully observable via Prometheus metrics:
 
 For detailed compression implementation, configuration examples, and performance tuning, see the compression source directory.
 
+## Tool Definition Compression
+
+When MCP servers or agentic frameworks provide 50–200+ tool definitions per request, the `tools` array alone can consume 10,000–50,000 tokens. Tool Definition Compression is a dedicated Tower middleware that intercepts the `tools` field and applies a 12-stage pipeline to reduce its token footprint without degrading model tool-calling accuracy.
+
+The middleware is **opt-in** (disabled by default, zero per-request overhead when off) and sits after guardrails but before provider dispatch.
+
+### Compression Stages (fixed order)
+
+| # | Stage | Level | Description |
+|---|-------|-------|-------------|
+| 1 | Schema Minifier | All | Remove `title`, `additionalProperties: false`, empty descriptions; collapse single-element `anyOf`/`oneOf`; nullable union simplification |
+| 2 | Description Truncator | Low+ | Example removal (Low), first-sentence extraction (Medium), full removal (High), large enum replacement (Max) |
+| 3 | Schema Deduplicator | Medium+ | Replace duplicate parameter schemas across tools with `$ref` / `$defs` references |
+| 4 | Tool Pruner | Max | Remove tools with zero calls after `min_requests` threshold; respects `always_include` globs |
+| 5 | Progressive Disclosure | High+ | Replace full schemas with minimal name+description listing; synthetic `get_tool_schema` tool for on-demand retrieval |
+| 6 | Namespace Grouper | High+ | Cluster tools by prefix, emit namespace summaries with `get_tools_in_namespace` drill-down |
+| 7 | Semantic Retriever | Config | TF-IDF/BM25 (or embedding) hybrid scoring; keep top-K tools relevant to user message; defer the rest |
+| 8 | Description Compressor | Config | TF-IDF token-importance scoring; remove parameter-redundant tokens from descriptions |
+| 9 | Canonical Rewriter | Max | Convert JSON Schema to compact `tool: / desc: / params:` text format for supported models |
+| 10 | Cache Placement | High+ | Reorder stable tools before new/modified tools for prefix cache hits |
+| 11 | Feedback Loop | Always | Rolling-window error detection; auto-reduces compression level on quality regression |
+| 12 | Auto-Tuner | Always | Model tier detection (glob patterns → Low/Medium/High); prompt cache skip when all hashes match |
+
+### Configuration
+
+```yaml
+tool_compression:
+  enabled: false                      # Zero overhead when disabled (default)
+  level: medium                       # low | medium | high | max
+  progressive_disclosure: false       # Enable two-tier listing with get_tool_schema
+  cache_placement: true               # Reorder for prefix cache hits
+  deduplication: true                 # $ref dedup for identical schemas
+
+  pruning:
+    enabled: false
+    min_requests: 5                   # Session requests before pruning activates
+    always_include: ["github_*"]      # Glob patterns never pruned
+
+  minification:
+    remove_titles: true
+    collapse_single_unions: true
+    remove_additional_properties: true
+    remove_empty_descriptions: true
+
+  description_truncation:
+    tool_level: first_sentence        # none | first_sentence | remove
+    parameter_level: remove           # none | remove
+    remove_examples: true
+    min_preserve_length: 20
+
+  semantic_retrieval:
+    enabled: false
+    top_k: 20
+    similarity_threshold: 0.3
+    frequency_weight: 0.3
+
+  canonical_rewriting:
+    enabled: false
+    allowed_models: ["gpt-4*", "claude-3*"]
+
+  feedback_loop:
+    enabled: true
+    error_threshold: 0.10
+    recovery_window: 50
+    rolling_window: 100
+
+  auto_tuning:
+    enabled: true
+    model_tiers:
+      "gpt-4o*": 1                    # Tier 1 → Low compression
+      "gpt-4*": 2                     # Tier 2 → Medium
+      "gpt-3.5*": 3                   # Tier 3 → High
+
+  namespace_grouping:
+    enabled: false
+    min_tools_for_grouping: 10
+
+  precomputed_descriptions:
+    enabled: false
+    method: tfidf                      # tfidf | manual | model
+
+  # Per-model-group overrides
+  model_group_overrides:
+    coding-group:
+      level: high
+      progressive_disclosure: true
+```
+
+### Request Headers
+
+| Header | Description |
+|--------|-------------|
+| `X-Tool-Compression-Disable: true` | Bypass compression for this request |
+| `X-Tool-Compression-Level: <level>` | Override compression level (none/low/medium/high/max) |
+
+### Response Headers
+
+| Header | Description |
+|--------|-------------|
+| `X-Tool-Compression-Level` | Effective compression level applied |
+| `X-Tool-Compression-Ratio` | Reduction ratio (e.g., `0.65` = 65% reduction) |
+| `X-Tool-Compression-Tokens-Saved` | Estimated tokens saved |
+
+### Admin API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/admin/tool-compression/feedback` | List feedback loop states per model group |
+| `POST` | `/admin/tool-compression/feedback/:group/lock` | Lock a group's compression level |
+| `POST` | `/admin/tool-compression/feedback/:group/unlock` | Unlock a group |
+| `POST` | `/admin/tool-compression/feedback/:group/reset` | Reset feedback state |
+| `POST` | `/admin/tool-compression/feedback/reset-all` | Reset all feedback state |
+| `GET` | `/admin/tool-compression/descriptions` | List pre-computed compressed descriptions |
+| `POST` | `/admin/tool-compression/descriptions/recompute` | Trigger description recomputation |
+
+### Provider Awareness
+
+The pipeline respects per-provider capabilities automatically:
+
+| Provider | `$ref` support | Nullable shorthand | Prompt caching | Canonical format | Max tools |
+|----------|:-:|:-:|:-:|:-:|:-:|
+| OpenAI | ✓ | ✓ | ✓ | ✓ | 128 |
+| Anthropic | ✗ | ✗ | ✓ | ✓ | 200 |
+| Google | ✓ | ✓ | ✓ | ✗ | 128 |
+| Groq | ✗ | ✓ | ✗ | ✗ | 64 |
+| Bedrock | ✗ | ✗ | ✓ | ✗ | 200 |
+
+Stages that require unsupported features (e.g., `$ref` deduplication on Anthropic) are automatically skipped.
+
 ## Virtual Key Management
 
 Instead of every caller sharing your real provider keys, administrators can issue **virtual keys** (`vk_…`) that authenticate individual callers to the gateway. Each key carries its own budgets, rate limits, model-access rules, and expiry, all enforced at the proxy layer before requests reach upstream providers. This enables multi-tenant usage tracking, cost control, and access governance without exposing provider credentials.
@@ -822,6 +954,21 @@ When a session reaches the hard-stop level, the gateway returns:
 
 HTTP status: `429 Too Many Requests` with `Retry-After: 60`.
 
+## Structured Output Validation
+
+When the caller specifies `response_format: { type: "json_schema", json_schema: {...} }`, the gateway validates model responses against the provided schema before returning them. Invalid responses are automatically retried (up to a configurable limit) by re-prompting the model with the validation errors.
+
+This is opt-in and defaults to disabled:
+
+```yaml
+structured_output:
+  enabled: true
+  max_retries: 2                      # Retry invalid responses up to N times
+  validate_choices: true              # Validate all choices in the response
+```
+
+Per-model-group overrides are supported via `structured_output.model_group_overrides`. Prometheus metrics track validation attempts, failures, retry counts, and latency.
+
 ## API Endpoints
 
 All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` response header for correlation.
@@ -986,6 +1133,10 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── oauth/                # OpenAI OAuth 2.0 login (PKCE flow)
 │           ├── codex/               # Codex backend: Chat Completions → Responses API translation, model discovery, instructions store
 │           ├── virtual_keys/         # Virtual key management (auth, budgets, rate limits, usage, admin API)
+│           ├── compression/          # Token compression engines & pipelines
+│           ├── tool_compression/     # Tool definition compression: 12-stage pipeline, provider-aware middleware
+│           ├── structured_output/    # JSON Schema response validation with retry
+│           ├── memory/               # Persistent memory store: extraction, injection, decay, namespaces, Qdrant
 │           ├── secrets.rs            # API key encryption/decryption
 │           ├── error/                # Error types & HTTP status mapping
 │           ├── models/               # OpenAI-compatible data models
