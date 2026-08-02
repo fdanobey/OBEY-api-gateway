@@ -1530,11 +1530,11 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       <div class="form-row">
         <div class="form-group">
           <label for="mem-extract-provider">Extraction Provider</label>
-          <input type="text" id="mem-extract-provider" placeholder="e.g. openai" autocomplete="off">
+          <select id="mem-extract-provider"><option value="">-- select provider --</option></select>
         </div>
         <div class="form-group">
           <label for="mem-extract-model">Extraction Model</label>
-          <input type="text" id="mem-extract-model" placeholder="e.g. gpt-4o-mini" autocomplete="off">
+          <select id="mem-extract-model"><option value="">-- select provider first --</option></select>
         </div>
       </div>
       <div class="form-group">
@@ -2301,6 +2301,11 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       var cur = cacheSel.value;
       cacheSel.innerHTML = '<option value="">-- select provider --</option>' + names.map(function(n){return '<option value="'+n+'"'+(n===cur?' selected':'')+'>'+n+'</option>';}).join('');
     }
+    var memExtSel = document.getElementById('mem-extract-provider');
+    if (memExtSel) {
+      var cur = memExtSel.value;
+      memExtSel.innerHTML = '<option value="">-- select provider --</option>' + names.map(function(n){return '<option value="'+n+'"'+(n===cur?' selected':'')+'>'+n+'</option>';}).join('');
+    }
   }
 
   document.getElementById('providers-list').addEventListener('input', function(e) {
@@ -2311,6 +2316,14 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
   document.getElementById('cache-embed-provider').addEventListener('change', function() {
     var prov = this.value;
     var mdlSel = document.getElementById('cache-embed-model');
+    if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
+    else { mdlSel.innerHTML = '<option value="">-- select provider first --</option>'; }
+  });
+
+  // When memory extraction provider changes, fetch its models
+  document.getElementById('mem-extract-provider').addEventListener('change', function() {
+    var prov = this.value;
+    var mdlSel = document.getElementById('mem-extract-model');
     if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
     else { mdlSel.innerHTML = '<option value="">-- select provider first --</option>'; }
   });
@@ -5227,7 +5240,11 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
     document.getElementById('mem-show-feedback').checked = mem.show_feedback !== false;
     document.getElementById('mem-auto-extract').checked = !!mem.auto_extract_enabled;
     document.getElementById('mem-extract-provider').value = mem.auto_extract_provider || '';
-    document.getElementById('mem-extract-model').value = mem.auto_extract_model || '';
+    if (mem.auto_extract_provider) {
+      fetchModelsForProvider(mem.auto_extract_provider, document.getElementById('mem-extract-model'), mem.auto_extract_model || '');
+    } else {
+      document.getElementById('mem-extract-model').innerHTML = '<option value="">-- select provider first --</option>';
+    }
     document.getElementById('mem-extract-min-turns').value = mem.auto_extract_min_turns || 4;
     var q = mem.qdrant || {};
     document.getElementById('mem-qdrant-url').value = q.url || '';
@@ -5402,6 +5419,38 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
   document.getElementById('mem-browse-btn').addEventListener('click', memBrowseEntries);
   document.getElementById('mem-clear-ns-btn').addEventListener('click', memClearNamespace);
   document.getElementById('mem-create-btn').addEventListener('click', memCreateEntry);
+
+  // Qdrant URL cross-population: sync between Caching and Memory sections.
+  // If one field is populated and the other is empty, fill the empty one.
+  // Once a user explicitly types in a field, it's marked as manually set.
+  var qdrantManuallySet = { cache: false, memory: false };
+  var cacheQdrantEl = document.getElementById('cache-qdrant-url');
+  var memQdrantEl = document.getElementById('mem-qdrant-url');
+
+  cacheQdrantEl.addEventListener('input', function() {
+    qdrantManuallySet.cache = true;
+    if (!qdrantManuallySet.memory && !memQdrantEl.value) {
+      memQdrantEl.value = cacheQdrantEl.value;
+    }
+  });
+  memQdrantEl.addEventListener('input', function() {
+    qdrantManuallySet.memory = true;
+    if (!qdrantManuallySet.cache && !cacheQdrantEl.value) {
+      cacheQdrantEl.value = memQdrantEl.value;
+    }
+  });
+
+  // On config load, pre-populate empty Qdrant URL from the other if available
+  var origPopulateMemory = populateMemory;
+  populateMemory = function(mem) {
+    origPopulateMemory(mem);
+    qdrantManuallySet.cache = false;
+    qdrantManuallySet.memory = false;
+    var cacheVal = cacheQdrantEl.value.trim();
+    var memVal = memQdrantEl.value.trim();
+    if (cacheVal && !memVal) { memQdrantEl.value = cacheVal; }
+    else if (memVal && !cacheVal) { cacheQdrantEl.value = memVal; }
+  };
 
   document.getElementById('mem-save-btn').addEventListener('click', function() {
     var memCfg = collectMemory();
