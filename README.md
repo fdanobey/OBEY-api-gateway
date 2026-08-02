@@ -1078,8 +1078,8 @@ context:
 
 Both are embedded SPAs compiled into the binary — no external dependencies.
 
-- **Admin** (`/admin`) — provider configuration, API key management, circuit breaker status, config hot-reload
-- **Dashboard** (`/dashboard`) — real-time metrics via WebSocket, provider health, error logs, request log viewer
+- **Admin** (`/admin`) — provider configuration, API key management, circuit breaker status, token compression & tool compression settings, config hot-reload
+- **Dashboard** (`/dashboard`) — real-time metrics via WebSocket, provider health, compression statistics (token & tool), error logs, request log viewer
 
 ```yaml
 admin:

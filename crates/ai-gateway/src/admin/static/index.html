@@ -946,6 +946,95 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       <button type="button" class="btn btn-secondary btn-sm" id="compression-add-pipeline">+ Add Pipeline</button>
     </fieldset>
     <div class="actions"><button class="btn btn-primary" data-action="save">Save</button><button class="btn btn-secondary" data-action="reset">Reset</button></div>
+
+    <h2 style="margin-top:2rem">Tool Compression</h2>
+    <div class="compression-note"><strong>Tool compression reduces token usage from tool/function definitions.</strong> Configure strategies, truncation behavior, feedback loops, and per-model-group overrides below.</div>
+    <div class="error" id="tc-validation-summary" role="alert"></div>
+    <div id="tc-save-success" class="hint" style="display:none;color:var(--success);font-weight:600;margin-bottom:1rem" role="status"></div>
+
+    <fieldset><legend>Global Behavior</legend>
+      <div class="form-check"><input type="checkbox" id="tc-cfg-enabled"><label for="tc-cfg-enabled">Enable tool compression globally</label></div>
+      <div class="form-row">
+        <div class="form-group"><label for="tc-cfg-level">Compression Level</label><select id="tc-cfg-level"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></div>
+      </div>
+    </fieldset>
+
+    <fieldset><legend>Strategies</legend>
+      <div class="compression-rule-grid">
+        <div class="form-check"><input type="checkbox" id="tc-cfg-minification" checked><label for="tc-cfg-minification">Minification</label></div>
+        <div class="form-check"><input type="checkbox" id="tc-cfg-deduplication" checked><label for="tc-cfg-deduplication">Deduplication</label></div>
+        <div class="form-check"><input type="checkbox" id="tc-cfg-pruning"><label for="tc-cfg-pruning">Pruning</label></div>
+        <div class="form-check"><input type="checkbox" id="tc-cfg-progressive-disclosure"><label for="tc-cfg-progressive-disclosure">Progressive Disclosure</label></div>
+        <div class="form-check"><input type="checkbox" id="tc-cfg-cache-placement" checked><label for="tc-cfg-cache-placement">Cache Placement</label></div>
+        <div class="form-check"><input type="checkbox" id="tc-cfg-semantic-retrieval"><label for="tc-cfg-semantic-retrieval">Semantic Retrieval</label></div>
+        <div class="form-check"><input type="checkbox" id="tc-cfg-canonical-rewriting"><label for="tc-cfg-canonical-rewriting">Canonical Rewriting</label></div>
+        <div class="form-check"><input type="checkbox" id="tc-cfg-namespace-grouping"><label for="tc-cfg-namespace-grouping">Namespace Grouping</label></div>
+        <div class="form-check"><input type="checkbox" id="tc-cfg-description-compression"><label for="tc-cfg-description-compression">Description Compression</label></div>
+      </div>
+    </fieldset>
+
+    <fieldset><legend>Description Truncation</legend>
+      <div class="form-row">
+        <div class="form-group"><label for="tc-cfg-trunc-tool">Tool-Level</label><select id="tc-cfg-trunc-tool"><option value="none">None</option><option value="first_sentence">First Sentence</option><option value="remove">Remove</option></select></div>
+        <div class="form-group"><label for="tc-cfg-trunc-param">Parameter-Level</label><select id="tc-cfg-trunc-param"><option value="none">None</option><option value="remove">Remove</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="form-check"><input type="checkbox" id="tc-cfg-trunc-examples" checked><label for="tc-cfg-trunc-examples">Remove Examples</label></div>
+        <div class="form-group"><label for="tc-cfg-trunc-min-len">Min Preserve Length</label><input type="number" id="tc-cfg-trunc-min-len" min="0" max="200" value="20"><div class="hint">Characters to always keep in descriptions.</div></div>
+      </div>
+    </fieldset>
+
+    <fieldset><legend>Feedback Loop</legend>
+      <div class="form-check"><input type="checkbox" id="tc-cfg-feedback-enabled" checked><label for="tc-cfg-feedback-enabled">Enable Feedback Loop</label></div>
+      <div class="form-row">
+        <div class="form-group"><label for="tc-cfg-feedback-threshold">Error Threshold</label><input type="number" id="tc-cfg-feedback-threshold" min="0" max="1" step="0.01" value="0.10"><div class="hint">0.0–1.0. Downgrades compression level when error rate exceeds this value.</div></div>
+        <div class="form-group"><label for="tc-cfg-feedback-recovery">Recovery Window</label><input type="number" id="tc-cfg-feedback-recovery" min="1" max="1000" value="50"><div class="hint">Requests to observe before attempting recovery.</div></div>
+        <div class="form-group"><label for="tc-cfg-feedback-window">Rolling Window</label><input type="number" id="tc-cfg-feedback-window" min="10" max="10000" value="100"><div class="hint">Number of recent results to track.</div></div>
+      </div>
+    </fieldset>
+
+    <fieldset><legend>Auto-Tuning</legend>
+      <div class="form-check"><input type="checkbox" id="tc-cfg-autotune-enabled" checked><label for="tc-cfg-autotune-enabled">Enable Auto-Tuning</label></div>
+    </fieldset>
+
+    <fieldset><legend>Always-Include Allowlist</legend>
+      <div class="hint" style="margin-bottom:.75rem">Tool names or glob patterns that should never be pruned.</div>
+      <div style="display:flex;gap:.5rem;margin-bottom:.75rem;align-items:center">
+        <input type="text" id="tc-always-input" placeholder="Tool name or glob pattern" style="max-width:300px">
+        <button type="button" class="btn btn-secondary btn-sm" id="tc-always-add-btn">+ Add</button>
+      </div>
+      <div id="tc-always-list" style="display:flex;flex-wrap:wrap;gap:.4rem;margin-bottom:.5rem"></div>
+    </fieldset>
+
+    <fieldset><legend>Model Group Overrides</legend>
+      <div class="hint" style="margin-bottom:.75rem">Per-model-group compression levels and strategy overrides. Group-level values take precedence over global defaults.</div>
+      <div id="tc-overrides-table-wrap" style="margin-bottom:.75rem" hidden>
+        <table class="item-list" style="width:100%;font-size:.85rem;border-collapse:collapse">
+          <thead><tr><th style="text-align:left;padding:.4rem .5rem;border-bottom:1px solid var(--border)">Model Group</th><th style="text-align:left;padding:.4rem .5rem;border-bottom:1px solid var(--border)">Level</th><th style="text-align:left;padding:.4rem .5rem;border-bottom:1px solid var(--border)">Strategies</th><th style="width:60px;padding:.4rem .5rem;border-bottom:1px solid var(--border)"></th></tr></thead>
+          <tbody id="tc-overrides-tbody"></tbody>
+        </table>
+      </div>
+      <div class="hint" id="tc-overrides-empty">No model group overrides configured.</div>
+      <details style="margin-top:.5rem" id="tc-override-add-details">
+        <summary style="font-size:.85rem;cursor:pointer;color:var(--primary)">Add Override</summary>
+        <div class="form-row" style="margin-top:.5rem">
+          <div class="form-group"><label for="tc-override-group">Model Group</label><select id="tc-override-group"><option value="">Select group…</option></select></div>
+          <div class="form-group"><label for="tc-override-level">Level</label><select id="tc-override-level"><option value="">(inherit global)</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></div>
+        </div>
+        <div class="compression-rule-grid" style="margin-bottom:.5rem">
+          <div class="form-check"><input type="checkbox" id="tc-override-dedup"><label for="tc-override-dedup">Dedup</label></div>
+          <div class="form-check"><input type="checkbox" id="tc-override-pruning"><label for="tc-override-pruning">Pruning</label></div>
+          <div class="form-check"><input type="checkbox" id="tc-override-disclosure"><label for="tc-override-disclosure">Disclosure</label></div>
+          <div class="form-check"><input type="checkbox" id="tc-override-cache"><label for="tc-override-cache">Cache</label></div>
+          <div class="form-check"><input type="checkbox" id="tc-override-semantic"><label for="tc-override-semantic">Semantic</label></div>
+          <div class="form-check"><input type="checkbox" id="tc-override-canonical"><label for="tc-override-canonical">Canonical</label></div>
+          <div class="form-check"><input type="checkbox" id="tc-override-namespace"><label for="tc-override-namespace">Namespace</label></div>
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm" id="tc-override-add-btn">Add Override</button>
+      </details>
+    </fieldset>
+
+    <div class="actions"><button class="btn btn-primary" id="tc-save-btn" data-action="save-tc">Save Tool Compression</button><button class="btn btn-secondary" id="tc-reset-btn" data-action="reset-tc">Reset</button></div>
   </section>
 
   <!-- Context (Req 13.10) -->
@@ -2759,6 +2848,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     }
     populateGuardrails(cfg.guardrails);
     populateStructuredOutput(cfg.structured_output);
+    populateToolCompression(cfg.tool_compression);
   }
 
   // --- Collect Config from UI ---
@@ -2788,6 +2878,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     cfg.semantic_cache={enabled:document.getElementById('cache-enabled').checked,qdrant_url:document.getElementById('cache-qdrant-url').value.trim(),collection_name:document.getElementById('cache-collection').value.trim(),embedding_provider:document.getElementById('cache-embed-provider').value,embedding_model:document.getElementById('cache-embed-model').value.trim(),similarity_threshold:parseFloat(document.getElementById('cache-threshold').value),ttl_seconds:parseInt(document.getElementById('cache-ttl').value,10),max_cache_size:parseInt(document.getElementById('cache-max-entries').value,10)};
     cfg.context={enabled:document.getElementById('context-enabled').checked,truncation_strategy:document.getElementById('context-strategy').value,sliding_window_size:parseInt(document.getElementById('context-window-size').value,10),capabilities_cache_ttl_seconds:parseInt(document.getElementById('context-cache-ttl').value,10),max_truncation_retries:parseInt(document.getElementById('context-max-retries').value,10)};
     cfg.compression=collectCompression();
+    cfg.tool_compression=collectToolCompression();
     cfg.streaming={emit_early_event:document.getElementById('stream-early-event').checked,keepalive_interval_seconds:parseInt(document.getElementById('stream-keepalive').value,10),passthrough_enabled:document.getElementById('stream-passthrough').checked,chunk_timeout_seconds:parseInt(document.getElementById('stream-chunk-timeout').value,10),retry_on_truncation:document.getElementById('stream-retry-truncation').checked};
     cfg.loop_detection=collectLoopDetection();
     cfg.guardrails=collectGuardrails();
@@ -4627,6 +4718,233 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
   document.getElementById('add-binding-vk').addEventListener('click', function() { addBindingRow(document.getElementById('gr-bindings-vk'), '', '', false); });
   document.getElementById('add-binding-mg').addEventListener('click', function() { addBindingRow(document.getElementById('gr-bindings-mg'), '', '', false); });
   document.getElementById('add-binding-route').addEventListener('click', function() { addBindingRow(document.getElementById('gr-bindings-routes'), '', '', false); });
+
+  // ─── Tool Compression Config ───────────────────────────────────────────────
+  var tcOverridesData = {};
+  var tcAlwaysIncludeList = [];
+
+  function populateToolCompression(tc) {
+    tc = tc || {};
+    document.getElementById('tc-cfg-enabled').checked = !!tc.enabled;
+    document.getElementById('tc-cfg-level').value = tc.level || 'medium';
+
+    var minif = tc.minification || {};
+    document.getElementById('tc-cfg-minification').checked = minif.remove_titles !== false && minif.collapse_single_unions !== false && minif.remove_additional_properties !== false && minif.remove_empty_descriptions !== false;
+    document.getElementById('tc-cfg-deduplication').checked = tc.deduplication !== false;
+    var prun = tc.pruning || {};
+    document.getElementById('tc-cfg-pruning').checked = !!prun.enabled;
+    document.getElementById('tc-cfg-progressive-disclosure').checked = !!tc.progressive_disclosure;
+    document.getElementById('tc-cfg-cache-placement').checked = tc.cache_placement !== false;
+    var sr = tc.semantic_retrieval || {};
+    document.getElementById('tc-cfg-semantic-retrieval').checked = !!sr.enabled;
+    var cr = tc.canonical_rewriting || {};
+    document.getElementById('tc-cfg-canonical-rewriting').checked = !!cr.enabled;
+    var ns = tc.namespace_grouping || {};
+    document.getElementById('tc-cfg-namespace-grouping').checked = !!ns.enabled;
+    var dc = tc.precomputed_descriptions || {};
+    document.getElementById('tc-cfg-description-compression').checked = !!dc.enabled;
+
+    var trunc = tc.description_truncation || {};
+    document.getElementById('tc-cfg-trunc-tool').value = trunc.tool_level || 'first_sentence';
+    document.getElementById('tc-cfg-trunc-param').value = trunc.parameter_level || 'remove';
+    document.getElementById('tc-cfg-trunc-examples').checked = trunc.remove_examples !== false;
+    document.getElementById('tc-cfg-trunc-min-len').value = trunc.min_preserve_length != null ? trunc.min_preserve_length : 20;
+
+    var fb = tc.feedback_loop || {};
+    document.getElementById('tc-cfg-feedback-enabled').checked = fb.enabled !== false;
+    document.getElementById('tc-cfg-feedback-threshold').value = fb.error_threshold != null ? fb.error_threshold : 0.10;
+    document.getElementById('tc-cfg-feedback-recovery').value = fb.recovery_window != null ? fb.recovery_window : 50;
+    document.getElementById('tc-cfg-feedback-window').value = fb.rolling_window != null ? fb.rolling_window : 100;
+
+    var at = tc.auto_tuning || {};
+    document.getElementById('tc-cfg-autotune-enabled').checked = at.enabled !== false;
+
+    // Always-include
+    tcAlwaysIncludeList = (prun.always_include || []).slice();
+    renderTcAlwaysInclude();
+
+    // Overrides
+    tcOverridesData = tc.model_group_overrides ? JSON.parse(JSON.stringify(tc.model_group_overrides)) : {};
+    renderTcOverrides();
+    populateTcOverrideGroupDropdown();
+  }
+
+  function collectToolCompression() {
+    return {
+      enabled: document.getElementById('tc-cfg-enabled').checked,
+      level: document.getElementById('tc-cfg-level').value,
+      deduplication: document.getElementById('tc-cfg-deduplication').checked,
+      progressive_disclosure: document.getElementById('tc-cfg-progressive-disclosure').checked,
+      cache_placement: document.getElementById('tc-cfg-cache-placement').checked,
+      minification: {
+        remove_titles: document.getElementById('tc-cfg-minification').checked,
+        collapse_single_unions: document.getElementById('tc-cfg-minification').checked,
+        remove_additional_properties: document.getElementById('tc-cfg-minification').checked,
+        remove_empty_descriptions: document.getElementById('tc-cfg-minification').checked
+      },
+      pruning: {
+        enabled: document.getElementById('tc-cfg-pruning').checked,
+        always_include: tcAlwaysIncludeList.slice()
+      },
+      description_truncation: {
+        tool_level: document.getElementById('tc-cfg-trunc-tool').value,
+        parameter_level: document.getElementById('tc-cfg-trunc-param').value,
+        remove_examples: document.getElementById('tc-cfg-trunc-examples').checked,
+        min_preserve_length: parseInt(document.getElementById('tc-cfg-trunc-min-len').value, 10) || 20
+      },
+      feedback_loop: {
+        enabled: document.getElementById('tc-cfg-feedback-enabled').checked,
+        error_threshold: parseFloat(document.getElementById('tc-cfg-feedback-threshold').value) || 0.10,
+        recovery_window: parseInt(document.getElementById('tc-cfg-feedback-recovery').value, 10) || 50,
+        rolling_window: parseInt(document.getElementById('tc-cfg-feedback-window').value, 10) || 100
+      },
+      auto_tuning: {
+        enabled: document.getElementById('tc-cfg-autotune-enabled').checked
+      },
+      semantic_retrieval: {
+        enabled: document.getElementById('tc-cfg-semantic-retrieval').checked
+      },
+      canonical_rewriting: {
+        enabled: document.getElementById('tc-cfg-canonical-rewriting').checked
+      },
+      namespace_grouping: {
+        enabled: document.getElementById('tc-cfg-namespace-grouping').checked
+      },
+      precomputed_descriptions: {
+        enabled: document.getElementById('tc-cfg-description-compression').checked
+      },
+      model_group_overrides: JSON.parse(JSON.stringify(tcOverridesData))
+    };
+  }
+
+  // Always-include management
+  function renderTcAlwaysInclude() {
+    var container = document.getElementById('tc-always-list');
+    container.innerHTML = '';
+    tcAlwaysIncludeList.forEach(function(item) {
+      var tag = document.createElement('span');
+      tag.style.cssText = 'display:inline-flex;align-items:center;gap:.3rem;padding:.2rem .5rem;border-radius:999px;background:rgba(13,110,253,.08);border:1px solid rgba(13,110,253,.2);font-size:.8rem;color:var(--primary)';
+      tag.textContent = item;
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = '\u00d7';
+      btn.title = 'Remove ' + item;
+      btn.setAttribute('aria-label', 'Remove ' + item + ' from always-include list');
+      btn.style.cssText = 'background:none;border:none;color:var(--danger);cursor:pointer;font-size:1rem;line-height:1;padding:0';
+      btn.addEventListener('click', function() { tcAlwaysIncludeList = tcAlwaysIncludeList.filter(function(x) { return x !== item; }); renderTcAlwaysInclude(); });
+      tag.appendChild(btn);
+      container.appendChild(tag);
+    });
+    if (!tcAlwaysIncludeList.length) {
+      container.innerHTML = '<span style="font-size:.8rem;color:var(--text-muted)">No patterns configured</span>';
+    }
+  }
+
+  document.getElementById('tc-always-add-btn').addEventListener('click', function() {
+    var input = document.getElementById('tc-always-input');
+    var val = input.value.trim();
+    if (!val) return;
+    if (tcAlwaysIncludeList.indexOf(val) !== -1) { input.value = ''; return; }
+    tcAlwaysIncludeList.push(val);
+    input.value = '';
+    renderTcAlwaysInclude();
+  });
+  document.getElementById('tc-always-input').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); document.getElementById('tc-always-add-btn').click(); }
+  });
+
+  // Override management
+  function renderTcOverrides() {
+    var tbody = document.getElementById('tc-overrides-tbody');
+    tbody.innerHTML = '';
+    var keys = Object.keys(tcOverridesData);
+    if (!keys.length) {
+      document.getElementById('tc-overrides-table-wrap').hidden = true;
+      document.getElementById('tc-overrides-empty').style.display = 'block';
+      return;
+    }
+    document.getElementById('tc-overrides-table-wrap').hidden = false;
+    document.getElementById('tc-overrides-empty').style.display = 'none';
+    keys.sort().forEach(function(groupName) {
+      var ov = tcOverridesData[groupName] || {};
+      var row = document.createElement('tr');
+      var td1 = document.createElement('td'); td1.textContent = groupName; td1.style.padding = '.4rem .5rem'; row.appendChild(td1);
+      var td2 = document.createElement('td'); td2.textContent = ov.level || '(inherit)'; td2.style.padding = '.4rem .5rem'; row.appendChild(td2);
+      var strategies = [];
+      if (ov.deduplication === true) strategies.push('Dedup');
+      if (ov.pruning && ov.pruning.enabled) strategies.push('Pruning');
+      if (ov.progressive_disclosure === true) strategies.push('Disclosure');
+      if (ov.cache_placement === true) strategies.push('Cache');
+      if (ov.semantic_retrieval && ov.semantic_retrieval.enabled) strategies.push('Semantic');
+      if (ov.canonical_rewriting && ov.canonical_rewriting.enabled) strategies.push('Canonical');
+      if (ov.namespace_grouping && ov.namespace_grouping.enabled) strategies.push('Namespace');
+      var td3 = document.createElement('td'); td3.textContent = strategies.join(', ') || '(none)'; td3.style.padding = '.4rem .5rem'; row.appendChild(td3);
+      var td4 = document.createElement('td'); td4.style.padding = '.4rem .5rem';
+      var rmBtn = document.createElement('button');
+      rmBtn.className = 'btn btn-danger btn-sm';
+      rmBtn.textContent = 'Remove';
+      rmBtn.title = 'Remove override for ' + groupName;
+      rmBtn.addEventListener('click', function() { delete tcOverridesData[groupName]; renderTcOverrides(); populateTcOverrideGroupDropdown(); });
+      td4.appendChild(rmBtn);
+      row.appendChild(td4);
+      tbody.appendChild(row);
+    });
+  }
+
+  function populateTcOverrideGroupDropdown() {
+    var sel = document.getElementById('tc-override-group');
+    while (sel.options.length > 1) sel.remove(1);
+    var existing = Object.keys(tcOverridesData);
+    var groups = (config && config.model_groups) || [];
+    groups.forEach(function(g) {
+      if (existing.indexOf(g.name) === -1) {
+        var opt = document.createElement('option');
+        opt.value = g.name; opt.textContent = g.name;
+        sel.appendChild(opt);
+      }
+    });
+  }
+
+  document.getElementById('tc-override-add-btn').addEventListener('click', function() {
+    var groupName = document.getElementById('tc-override-group').value;
+    if (!groupName) return;
+    var ov = {};
+    var level = document.getElementById('tc-override-level').value;
+    if (level) ov.level = level;
+    if (document.getElementById('tc-override-dedup').checked) ov.deduplication = true;
+    if (document.getElementById('tc-override-pruning').checked) ov.pruning = { enabled: true };
+    if (document.getElementById('tc-override-disclosure').checked) ov.progressive_disclosure = true;
+    if (document.getElementById('tc-override-cache').checked) ov.cache_placement = true;
+    if (document.getElementById('tc-override-semantic').checked) ov.semantic_retrieval = { enabled: true };
+    if (document.getElementById('tc-override-canonical').checked) ov.canonical_rewriting = { enabled: true };
+    if (document.getElementById('tc-override-namespace').checked) ov.namespace_grouping = { enabled: true };
+    tcOverridesData[groupName] = ov;
+    renderTcOverrides();
+    populateTcOverrideGroupDropdown();
+    // Reset form
+    document.getElementById('tc-override-group').value = '';
+    document.getElementById('tc-override-level').value = '';
+    document.getElementById('tc-override-dedup').checked = false;
+    document.getElementById('tc-override-pruning').checked = false;
+    document.getElementById('tc-override-disclosure').checked = false;
+    document.getElementById('tc-override-cache').checked = false;
+    document.getElementById('tc-override-semantic').checked = false;
+    document.getElementById('tc-override-canonical').checked = false;
+    document.getElementById('tc-override-namespace').checked = false;
+  });
+
+  // Dedicated save/reset for tool compression section
+  document.getElementById('tc-save-btn').addEventListener('click', function() {
+    var tcCfg = collectToolCompression();
+    setStatus('Saving tool compression…');
+    fetch(apiUrl('config/reload'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tool_compression: tcCfg }) })
+      .then(function(r) { if (!r.ok) return r.text().then(function(t) { throw new Error(t || 'HTTP ' + r.status); }); return r.text(); })
+      .then(function() { setStatus('Tool compression saved'); showToast('Tool compression settings saved'); if (config) config.tool_compression = tcCfg; })
+      .catch(function(err) { setStatus('Failed: ' + err.message); showToast('Save failed: ' + err.message, true); });
+  });
+  document.getElementById('tc-reset-btn').addEventListener('click', function() {
+    if (config) populateToolCompression(config.tool_compression);
+  });
 
   // --- Init: load config on startup ---
   loadConfig();
