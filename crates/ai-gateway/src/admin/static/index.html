@@ -1545,7 +1545,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     </fieldset>
 
     <fieldset><legend>Vector Search (Qdrant)</legend>
-      <p class="hint" style="margin-bottom:.75rem">Optional Qdrant integration for semantic memory retrieval alongside BM25 lexical search.</p>
+      <p class="hint" style="margin-bottom:.75rem">Optional Qdrant integration for semantic memory retrieval alongside BM25 lexical search. Requires an embedding provider and model.</p>
       <div class="form-row">
         <div class="form-group">
           <label for="mem-qdrant-url">Qdrant URL</label>
@@ -1553,13 +1553,24 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         </div>
         <div class="form-group">
           <label for="mem-qdrant-collection">Collection Name</label>
-          <input type="text" id="mem-qdrant-collection" placeholder="ai_gateway_memories" autocomplete="off">
+          <input type="text" id="mem-qdrant-collection" placeholder="obey_memories" autocomplete="off">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="mem-qdrant-embed-provider">Embedding Provider</label>
+          <select id="mem-qdrant-embed-provider"><option value="">-- select provider --</option></select>
+          <div class="hint">Required when Qdrant is configured</div>
+        </div>
+        <div class="form-group">
+          <label for="mem-qdrant-embed-model">Embedding Model</label>
+          <select id="mem-qdrant-embed-model"><option value="">-- select provider first --</option></select>
         </div>
       </div>
       <div class="form-row">
         <div class="form-group">
           <label for="mem-qdrant-fts-weight">FTS Weight</label>
-          <input type="number" id="mem-qdrant-fts-weight" value="0.5" step="0.1" min="0" max="1">
+          <input type="number" id="mem-qdrant-fts-weight" value="0.4" step="0.1" min="0" max="1">
         </div>
         <div class="form-group">
           <label for="mem-qdrant-vector-weight">Vector Weight</label>
@@ -2306,6 +2317,11 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       var cur = memExtSel.value;
       memExtSel.innerHTML = '<option value="">-- select provider --</option>' + names.map(function(n){return '<option value="'+n+'"'+(n===cur?' selected':'')+'>'+n+'</option>';}).join('');
     }
+    var memQdrantEmbedSel = document.getElementById('mem-qdrant-embed-provider');
+    if (memQdrantEmbedSel) {
+      var cur = memQdrantEmbedSel.value;
+      memQdrantEmbedSel.innerHTML = '<option value="">-- select provider --</option>' + names.map(function(n){return '<option value="'+n+'"'+(n===cur?' selected':'')+'>'+n+'</option>';}).join('');
+    }
   }
 
   document.getElementById('providers-list').addEventListener('input', function(e) {
@@ -2324,6 +2340,14 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
   document.getElementById('mem-extract-provider').addEventListener('change', function() {
     var prov = this.value;
     var mdlSel = document.getElementById('mem-extract-model');
+    if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
+    else { mdlSel.innerHTML = '<option value="">-- select provider first --</option>'; }
+  });
+
+  // When memory Qdrant embedding provider changes, fetch its models
+  document.getElementById('mem-qdrant-embed-provider').addEventListener('change', function() {
+    var prov = this.value;
+    var mdlSel = document.getElementById('mem-qdrant-embed-model');
     if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
     else { mdlSel.innerHTML = '<option value="">-- select provider first --</option>'; }
   });
@@ -5249,6 +5273,12 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
     var q = mem.qdrant || {};
     document.getElementById('mem-qdrant-url').value = q.qdrant_url || '';
     document.getElementById('mem-qdrant-collection').value = q.qdrant_collection || '';
+    document.getElementById('mem-qdrant-embed-provider').value = q.embedding_provider || '';
+    if (q.embedding_provider) {
+      fetchModelsForProvider(q.embedding_provider, document.getElementById('mem-qdrant-embed-model'), q.embedding_model || '');
+    } else {
+      document.getElementById('mem-qdrant-embed-model').innerHTML = '<option value="">-- select provider first --</option>';
+    }
     document.getElementById('mem-qdrant-fts-weight').value = q.fts_weight != null ? q.fts_weight : 0.4;
     document.getElementById('mem-qdrant-vector-weight').value = q.vector_weight != null ? q.vector_weight : 0.5;
     memLoadStats();
@@ -5271,10 +5301,14 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
       show_feedback: document.getElementById('mem-show-feedback').checked
     };
     var qUrl = document.getElementById('mem-qdrant-url').value.trim();
-    if (qUrl) {
+    var qEmbedProv = document.getElementById('mem-qdrant-embed-provider').value.trim();
+    var qEmbedModel = document.getElementById('mem-qdrant-embed-model').value.trim();
+    if (qUrl && qEmbedProv && qEmbedModel) {
       mem.qdrant = {
         qdrant_url: qUrl,
         qdrant_collection: document.getElementById('mem-qdrant-collection').value.trim() || 'obey_memories',
+        embedding_provider: qEmbedProv,
+        embedding_model: qEmbedModel,
         fts_weight: parseFloat(document.getElementById('mem-qdrant-fts-weight').value) || 0.4,
         vector_weight: parseFloat(document.getElementById('mem-qdrant-vector-weight').value) || 0.5
       };
