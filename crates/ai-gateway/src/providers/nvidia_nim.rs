@@ -19,13 +19,13 @@ pub struct NimFallbackModel {
 }
 
 // BEGIN NVIDIA NIM FALLBACK MODELS
-/// Probe provenance: catalog=https://integrate.api.nvidia.com/v1/models; probed=2026-07-19T00:00:00Z; git_rev=manual
+/// Probe provenance: catalog=https://integrate.api.nvidia.com/v1/models; probed=2026-08-03T10:13:34.2943330Z; git_rev=ff65df5
 pub const NVIDIA_NIM_FALLBACK_MODELS: &[NimFallbackModel] = &[
     NimFallbackModel {
         id: "openai/gpt-oss-120b",
         owned_by: "openai",
         supports_vision: false,
-        context_window: Some(128_000),
+        context_window: Some(128000),
         max_completion_tokens: None,
         source_url: "https://build.nvidia.com/openai/gpt-oss-120b",
     },
@@ -38,12 +38,12 @@ pub const NVIDIA_NIM_FALLBACK_MODELS: &[NimFallbackModel] = &[
         source_url: "https://build.nvidia.com/meta/llama-3.1-70b-instruct",
     },
     NimFallbackModel {
-        id: "nvidia/nemotron-3-nano",
-        owned_by: "nvidia",
+        id: "google/diffusiongemma-26b-a4b-it",
+        owned_by: "google",
         supports_vision: false,
         context_window: None,
         max_completion_tokens: None,
-        source_url: "https://build.nvidia.com/nvidia/nemotron-3-nano",
+        source_url: "https://build.nvidia.com/google/diffusiongemma-26b-a4b-it",
     },
 ];
 // END NVIDIA NIM FALLBACK MODELS
