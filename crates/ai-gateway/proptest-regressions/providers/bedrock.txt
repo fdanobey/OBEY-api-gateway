@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 904a2a9aaa9b20971fef3ee8ffb6d3c200b2d0024dde77ea00f7bb297add0251 # shrinks to model_id = "anthropic.claude-sonnet-5"

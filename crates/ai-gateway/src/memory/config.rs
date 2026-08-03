@@ -189,6 +189,11 @@ pub struct MemoryQdrantConfig {
     pub embedding_model: String,
     pub fts_weight: f32,
     pub vector_weight: f32,
+    /// Manual override for the embedding vector dimension.
+    /// When set, bypasses both the lookup table and the probe-on-first-store
+    /// logic, using this value directly when creating or validating a Qdrant
+    /// collection. Existing configs without this field deserialize as `None`.
+    pub vector_dimension: Option<u64>,
 }
 
 impl Default for MemoryQdrantConfig {
@@ -201,6 +206,7 @@ impl Default for MemoryQdrantConfig {
             embedding_model: String::new(),
             fts_weight: 0.4,
             vector_weight: 0.6,
+            vector_dimension: None,
         }
     }
 }
@@ -252,6 +258,17 @@ impl MemoryQdrantConfig {
                     "sum is {weight_sum}; expected finite non-negative weights with a sum greater than 0"
                 ),
             ));
+        }
+
+        if let Some(d) = self.vector_dimension {
+            if d == 0 || d > 65536 {
+                errors.push(MemoryConfigError::new(
+                    "qdrant.vector_dimension",
+                    format!(
+                        "has value {d}; expected a value in 1..=65536"
+                    ),
+                ));
+            }
         }
     }
 }
@@ -953,5 +970,80 @@ qdrant:
         assert!(serde_yaml::from_str::<MemoryQdrantConfig>("surprise: true").is_err());
         assert!(serde_yaml::from_str::<ProviderMemoryOverride>("surprise: true").is_err());
         assert!(serde_yaml::from_str::<ModelGroupMemoryOverride>("surprise: true").is_err());
+    }
+
+    // **Validates: Requirements 3.1, 3.2, 3.3, 3.4**
+    //
+    // Preservation: MemoryQdrantConfig YAML without vector_dimension field
+    // deserializes correctly. Currently the struct has no such field, so any
+    // valid YAML for the current fields works. After the fix adds the field,
+    // this test verifies it defaults to None (backward compatible).
+    #[test]
+    fn preservation_qdrant_config_without_vector_dimension_deserializes() {
+        let yaml = r#"
+qdrant_url: https://qdrant.example.com:6333
+qdrant_collection: obey_memories
+similarity_threshold: 0.7
+embedding_provider: openai
+embedding_model: text-embedding-3-small
+fts_weight: 0.4
+vector_weight: 0.6
+"#;
+        let config: MemoryQdrantConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.qdrant_url, "https://qdrant.example.com:6333");
+        assert_eq!(config.qdrant_collection, "obey_memories");
+        assert!((config.similarity_threshold - 0.7).abs() < f32::EPSILON);
+        assert_eq!(config.embedding_provider, "openai");
+        assert_eq!(config.embedding_model, "text-embedding-3-small");
+        assert!((config.fts_weight - 0.4).abs() < f32::EPSILON);
+        assert!((config.vector_weight - 0.6).abs() < f32::EPSILON);
+        assert_eq!(config.vector_dimension, None);
+    }
+
+    // **Validates: Requirements 3.4**
+    //
+    // Preservation: MemoryQdrantConfig::default() remains stable. This captures
+    // the current default field values to guard against accidental regressions.
+    #[test]
+    fn preservation_qdrant_config_default_unchanged() {
+        let defaults = MemoryQdrantConfig::default();
+        assert_eq!(defaults.qdrant_url, "");
+        assert_eq!(defaults.qdrant_collection, "obey_memories");
+        assert!((defaults.similarity_threshold - 0.7).abs() < f32::EPSILON);
+        assert_eq!(defaults.embedding_provider, "");
+        assert_eq!(defaults.embedding_model, "");
+        assert!((defaults.fts_weight - 0.4).abs() < f32::EPSILON);
+        assert!((defaults.vector_weight - 0.6).abs() < f32::EPSILON);
+        assert_eq!(defaults.vector_dimension, None);
+    }
+
+    // **Validates: Requirements 3.3, 3.4**
+    //
+    // Preservation: Validation continues to pass for valid MemoryQdrantConfig
+    // without a vector_dimension field. After the fix, this proves configs
+    // without the optional field remain valid.
+    #[test]
+    fn preservation_qdrant_config_validation_passes_without_vector_dimension() {
+        let config = MemoryQdrantConfig {
+            qdrant_url: "https://qdrant.example.com:6333".to_owned(),
+            qdrant_collection: "obey_memories".to_owned(),
+            similarity_threshold: 0.7,
+            embedding_provider: "openai".to_owned(),
+            embedding_model: "text-embedding-3-small".to_owned(),
+            fts_weight: 0.4,
+            vector_weight: 0.6,
+            vector_dimension: None,
+        };
+        config.validate().unwrap();
+    }
+
+    // **Validates: Requirements 3.4**
+    //
+    // Preservation: Empty/default YAML deserializes to MemoryQdrantConfig::default()
+    // confirming serde(default) behavior is stable.
+    #[test]
+    fn preservation_qdrant_config_empty_yaml_matches_default() {
+        let config: MemoryQdrantConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(config, MemoryQdrantConfig::default());
     }
 }

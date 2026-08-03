@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qdrant_client::qdrant::{
-    CreateCollectionBuilder, Distance, PointStruct, SearchPointsBuilder, UpsertPointsBuilder,
-    VectorParamsBuilder,
+    vectors_config, CreateCollectionBuilder, Distance, PointStruct, SearchPointsBuilder,
+    UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use reqwest::Client;
@@ -17,7 +17,6 @@ use crate::config::Provider;
 
 use super::{MemoryEntry, MemoryError, MemoryQdrantConfig};
 
-const DEFAULT_VECTOR_DIMENSION: u64 = 1536;
 pub(crate) const VECTOR_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -41,6 +40,7 @@ pub struct QdrantMemoryVectorTier {
     embedding_model: String,
     embedding_base_url: String,
     embedding_api_key: String,
+    vector_dimension_override: Option<u64>,
 }
 
 impl QdrantMemoryVectorTier {
@@ -89,12 +89,24 @@ impl QdrantMemoryVectorTier {
             embedding_model: config.embedding_model.clone(),
             embedding_base_url: base_url,
             embedding_api_key: api_key,
+            vector_dimension_override: config.vector_dimension,
         };
         tier.ensure_collection().await?;
         Ok(tier)
     }
 
     async fn ensure_collection(&self) -> Result<(), MemoryError> {
+        // Resolve dimension first (three-tier: override → lookup → probe)
+        let dimension = if let Some(d) = self.vector_dimension_override {
+            tracing::info!("Using manual vector_dimension override: {d}");
+            d
+        } else if let Some(d) = vector_dimension_for_model(&self.embedding_model) {
+            d
+        } else {
+            tracing::warn!("Model not in lookup table, falling back to probe embedding");
+            self.probe_dimension().await?
+        };
+
         let exists = self
             .qdrant
             .collection_exists(&self.collection)
@@ -102,14 +114,41 @@ impl QdrantMemoryVectorTier {
             .map_err(|error| {
                 MemoryError::Qdrant(format!("Qdrant collection check failed: {error}"))
             })?;
-        if !exists {
+
+        if exists {
+            // Validate existing collection's vector dimension against resolved dimension
+            let info = self
+                .qdrant
+                .collection_info(&self.collection)
+                .await
+                .map_err(|error| {
+                    MemoryError::Qdrant(format!("Qdrant collection info query failed: {error}"))
+                })?;
+
+            let existing_dimension = info
+                .result
+                .and_then(|ci| ci.config)
+                .and_then(|cfg| cfg.params)
+                .and_then(|params| params.vectors_config)
+                .and_then(|vc| vc.config)
+                .and_then(|config| match config {
+                    vectors_config::Config::Params(params) => Some(params.size),
+                    vectors_config::Config::ParamsMap(_) => None,
+                });
+
+            if let Some(existing) = existing_dimension {
+                if existing != dimension {
+                    return Err(MemoryError::Qdrant(format!(
+                        "Qdrant collection '{}' has vector dimension {} but the configured embedding model produces dimension {}. Recreate the collection or set vector_dimension = {} in config.",
+                        self.collection, existing, dimension, dimension
+                    )));
+                }
+            }
+        } else {
             self.qdrant
                 .create_collection(
                     CreateCollectionBuilder::new(&self.collection).vectors_config(
-                        VectorParamsBuilder::new(
-                            vector_dimension_for_model(&self.embedding_model),
-                            Distance::Cosine,
-                        ),
+                        VectorParamsBuilder::new(dimension, Distance::Cosine),
                     ),
                 )
                 .await
@@ -118,6 +157,17 @@ impl QdrantMemoryVectorTier {
                 })?;
         }
         Ok(())
+    }
+
+    async fn probe_dimension(&self) -> Result<u64, MemoryError> {
+        let embedding = self.embed("dimension probe").await?;
+        let dimension = embedding.len() as u64;
+        tracing::info!(
+            dimension,
+            model = %self.embedding_model,
+            "Probed embedding dimension for unrecognized model"
+        );
+        Ok(dimension)
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
@@ -242,17 +292,29 @@ fn normalize_qdrant_url(url: &str) -> String {
     }
 }
 
-fn vector_dimension_for_model(model: &str) -> u64 {
+fn vector_dimension_for_model(model: &str) -> Option<u64> {
     match model {
-        "text-embedding-3-large" => 3072,
-        "text-embedding-3-small" | "text-embedding-ada-002" => 1536,
-        _ => DEFAULT_VECTOR_DIMENSION,
+        "text-embedding-3-large" => Some(3072),
+        "text-embedding-3-small" | "text-embedding-ada-002" => Some(1536),
+        "nomic-embed-text" => Some(768),
+        "all-MiniLM-L6-v2" => Some(384),
+        "bge-small-en-v1.5" => Some(384),
+        "bge-base-en-v1.5" => Some(768),
+        "bge-large-en-v1.5" => Some(1024),
+        "mxbai-embed-large-v1" => Some(1024),
+        "e5-mistral-7b-instruct" => Some(4096),
+        "voyage-large-2" => Some(1536),
+        "voyage-code-2" => Some(1536),
+        "embed-english-v3.0" => Some(1024),
+        "embed-multilingual-v3.0" => Some(1024),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn normalizes_transport_urls() {
@@ -268,5 +330,63 @@ mod tests {
             normalize_embedding_base_url("http://localhost:8080/v1/"),
             "http://localhost:8080/v1"
         );
+    }
+
+    // **Validates: Requirements 3.1, 3.2, 3.3, 3.4**
+    //
+    // Preservation: Known OpenAI models must continue to return their correct
+    // dimensions from the lookup table without any probe call. This test MUST
+    // PASS on both unfixed and fixed code.
+    proptest! {
+        #[test]
+        fn preservation_known_openai_models_return_correct_dimension(
+            (model, expected_dim) in prop::sample::select(vec![
+                ("text-embedding-3-small", 1536u64),
+                ("text-embedding-3-large", 3072u64),
+                ("text-embedding-ada-002", 1536u64),
+            ])
+        ) {
+            let resolved = vector_dimension_for_model(model);
+            prop_assert_eq!(
+                resolved,
+                Some(expected_dim),
+                "vector_dimension_for_model(\"{}\") returned {:?} but expected Some({}) (preservation violated)",
+                model,
+                resolved,
+                expected_dim
+            );
+        }
+    }
+
+    // **Validates: Requirements 1.1, 1.2**
+    //
+    // Bug Condition Exploration: non-OpenAI models should return their actual
+    // embedding dimension, NOT the default 1536. This test is EXPECTED TO FAIL
+    // on unfixed code, proving the bug exists.
+    proptest! {
+        #[test]
+        fn bug_condition_non_openai_models_return_correct_dimension(
+            (model, expected_dim) in prop::sample::select(vec![
+                ("nomic-embed-text", 768u64),
+                ("all-MiniLM-L6-v2", 384u64),
+                ("bge-small-en-v1.5", 384u64),
+                ("bge-base-en-v1.5", 768u64),
+                ("bge-large-en-v1.5", 1024u64),
+                ("mxbai-embed-large-v1", 1024u64),
+                ("e5-mistral-7b-instruct", 4096u64),
+                ("embed-english-v3.0", 1024u64),
+                ("embed-multilingual-v3.0", 1024u64),
+            ])
+        ) {
+            let resolved = vector_dimension_for_model(model);
+            prop_assert_eq!(
+                resolved,
+                Some(expected_dim),
+                "vector_dimension_for_model(\"{}\") returned {:?} but expected Some({})",
+                model,
+                resolved,
+                expected_dim
+            );
+        }
     }
 }

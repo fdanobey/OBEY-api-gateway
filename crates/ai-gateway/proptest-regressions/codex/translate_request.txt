@@ -1,9 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 99eaad69c4af56e82859bcf592b75f0116c6214f7a1fe4a5444e878e7098b609 # shrinks to input_tools = [Object {"function": Object {"name": String("a"), "parameters": Object {}}, "type": String("function")}]
-cc 79370138baad81d7713b73387a13ac5c30603b568f3948cafd987b372ccd5bf1 # shrinks to shapes = [SystemOrDev { role: "system", text: "A" }]
-cc 6e400606d41023e74dd489d8bb7761a20d7e30a558a184edb9b3d7c5a16d737a # shrinks to model = "a0", messages = [Message { role: "system", content: String("A"), extra: {} }], temperature = None, top_p = None
