@@ -7,6 +7,7 @@ pub mod admin;
 pub mod config;
 pub mod context_detector;
 pub mod decay;
+pub mod extraction_adapter;
 pub mod extractor;
 pub mod injector;
 pub mod metrics;
@@ -20,6 +21,7 @@ pub use config::{
     EffectiveMemoryConfig, MemoryConfig, MemoryConfigError, MemoryQdrantConfig,
     MemoryValidationResult, ModelGroupMemoryOverride, ProviderMemoryOverride,
 };
+pub use extraction_adapter::GatewayExtractionAdapter;
 pub use context_detector::ContextDetector;
 pub use decay::{DecayScheduler, VectorRetryCallback};
 pub use extractor::{

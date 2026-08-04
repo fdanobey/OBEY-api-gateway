@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::error::GatewayError;
 use crate::guardrail::GuardrailEngine;
 use crate::logger::RequestLogger;
-use crate::memory::MemorySystem;
+use crate::memory::{GatewayExtractionAdapter, MemoryExtractionProvider, MemorySystem};
 use crate::metrics::Metrics;
 use crate::oauth::{OAuthManager, OAuthTokenStore};
 use crate::router::router::Router as RequestRouter;
@@ -97,7 +97,7 @@ impl GatewayServer {
         let metrics = Arc::new(Metrics::new());
         let compression_events = Arc::new(crate::dashboard::CompressionEventHub::new());
         let memory_events = Arc::new(crate::dashboard::MemoryEventHub::new());
-        let memory_system = Arc::new(RwLock::new(build_memory_system(&config).await));
+        let memory_system = Arc::new(RwLock::new(build_memory_system(&config, config_arc.clone()).await));
         let mut router = RequestRouter::new(config_arc.clone(), metrics.clone());
         router.set_memory_system(memory_system.clone());
         router.set_compression_event_hub(compression_events.clone());
@@ -660,13 +660,27 @@ async fn build_memory_vector_tier(
     }
 }
 
-async fn build_memory_system(config: &Config) -> Option<Arc<MemorySystem>> {
+async fn build_memory_system(
+    config: &Config,
+    config_arc: Arc<RwLock<Config>>,
+) -> Option<Arc<MemorySystem>> {
     let memory_config = config.memory.as_ref()?.clone();
     if !memory_config.enabled {
         return None;
     }
     let vector_tier = build_memory_vector_tier(config).await;
-    match MemorySystem::new_with_vector(memory_config, None, None, vector_tier).await {
+    // Always supply the extraction adapter so auto_extract can be toggled
+    // via hot-reload without requiring a gateway restart.
+    let extraction_provider: Arc<dyn MemoryExtractionProvider> =
+        Arc::new(GatewayExtractionAdapter::new(config_arc));
+    match MemorySystem::new_with_vector(
+        memory_config,
+        None,
+        Some(extraction_provider),
+        vector_tier,
+    )
+    .await
+    {
         Ok(system) => Some(Arc::new(system)),
         Err(error) => {
             tracing::error!(error = %error, "Memory system initialization failed; gateway will continue without memory");
@@ -783,18 +797,22 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
                 }
             }
         }
-        (None, Some(config)) => match MemorySystem::new_with_vector(
-            config,
-            None,
-            None,
-            rebuilt_memory_vector.clone().unwrap_or(None),
-        )
-        .await
-        {
-            Ok(system) => Some(Some(Arc::new(system))),
-            Err(error) => {
-                tracing::error!(error = %error, "Failed to enable memory on hot-reload; memory remains disabled");
-                None
+        (None, Some(config)) => {
+            let extraction_provider: Arc<dyn MemoryExtractionProvider> =
+                Arc::new(GatewayExtractionAdapter::new(state.config.clone()));
+            match MemorySystem::new_with_vector(
+                config,
+                None,
+                Some(extraction_provider),
+                rebuilt_memory_vector.clone().unwrap_or(None),
+            )
+            .await
+            {
+                Ok(system) => Some(Some(Arc::new(system))),
+                Err(error) => {
+                    tracing::error!(error = %error, "Failed to enable memory on hot-reload; memory remains disabled");
+                    None
+                }
             }
         },
     };
