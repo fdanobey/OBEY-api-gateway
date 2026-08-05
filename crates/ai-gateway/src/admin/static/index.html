@@ -1567,17 +1567,28 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
           <select id="mem-qdrant-embed-model"><option value="">-- select provider first --</option></select>
         </div>
       </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label for="mem-qdrant-fts-weight">FTS Weight</label>
-          <input type="number" id="mem-qdrant-fts-weight" value="0.4" step="0.1" min="0" max="1">
-        </div>
-        <div class="form-group">
-          <label for="mem-qdrant-vector-weight">Vector Weight</label>
-          <input type="number" id="mem-qdrant-vector-weight" value="0.5" step="0.1" min="0" max="1">
-        </div>
-      </div>
-    </fieldset>
+<div class="form-row">
+<div class="form-group">
+<label for="mem-qdrant-fts-weight">FTS Weight</label>
+<input type="number" id="mem-qdrant-fts-weight" value="0.4" step="0.1" min="0" max="1">
+</div>
+<div class="form-group">
+<label for="mem-qdrant-vector-weight">Vector Weight</label>
+<input type="number" id="mem-qdrant-vector-weight" value="0.5" step="0.1" min="0" max="1">
+</div>
+</div>
+<div class="form-row">
+<div class="form-group">
+<label for="mem-qdrant-vector-dimension">Vector Dimension Override</label>
+<input type="number" id="mem-qdrant-vector-dimension" placeholder="auto-detect" min="1" max="65536" autocomplete="off">
+<div class="hint">Leave empty for auto-detection from model. Set manually when the Qdrant collection has a different dimension than the model's default.</div>
+</div>
+<div class="form-group" style="display:flex;align-items:flex-end">
+<button class="btn btn-secondary btn-sm" id="mem-qdrant-recreate" type="button">Recreate Collection</button>
+<div class="hint" style="margin-left:.5rem">Deletes and recreates the Qdrant collection. All vector data is lost.</div>
+</div>
+</div>
+</fieldset>
 
     <fieldset><legend>Memory Store — Live Stats</legend>
       <div id="mem-stats-panel" style="margin-bottom:1rem">
@@ -5279,9 +5290,11 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
     } else {
       document.getElementById('mem-qdrant-embed-model').innerHTML = '<option value="">-- select provider first --</option>';
     }
-    document.getElementById('mem-qdrant-fts-weight').value = q.fts_weight != null ? q.fts_weight : 0.4;
-    document.getElementById('mem-qdrant-vector-weight').value = q.vector_weight != null ? q.vector_weight : 0.5;
-    memLoadStats();
+document.getElementById('mem-qdrant-fts-weight').value = q.fts_weight != null ? q.fts_weight : 0.4;
+document.getElementById('mem-qdrant-vector-weight').value = q.vector_weight != null ? q.vector_weight : 0.5;
+var vdEl = document.getElementById('mem-qdrant-vector-dimension');
+vdEl.value = q.vector_dimension != null ? q.vector_dimension : '';
+memLoadStats();
     memLoadProjects();
   }
 
@@ -5304,14 +5317,18 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
     var qEmbedProv = document.getElementById('mem-qdrant-embed-provider').value.trim();
     var qEmbedModel = document.getElementById('mem-qdrant-embed-model').value.trim();
     if (qUrl && qEmbedProv && qEmbedModel) {
-      mem.qdrant = {
-        qdrant_url: qUrl,
-        qdrant_collection: document.getElementById('mem-qdrant-collection').value.trim() || 'obey_memories',
-        embedding_provider: qEmbedProv,
-        embedding_model: qEmbedModel,
-        fts_weight: parseFloat(document.getElementById('mem-qdrant-fts-weight').value) || 0.4,
-        vector_weight: parseFloat(document.getElementById('mem-qdrant-vector-weight').value) || 0.5
-      };
+mem.qdrant = {
+qdrant_url: qUrl,
+qdrant_collection: document.getElementById('mem-qdrant-collection').value.trim() || 'obey_memories',
+embedding_provider: qEmbedProv,
+embedding_model: qEmbedModel,
+fts_weight: parseFloat(document.getElementById('mem-qdrant-fts-weight').value) || 0.4,
+vector_weight: parseFloat(document.getElementById('mem-qdrant-vector-weight').value) || 0.5
+};
+var vdVal = document.getElementById('mem-qdrant-vector-dimension').value.trim();
+if (vdVal) {
+mem.qdrant.vector_dimension = parseInt(vdVal, 10) || null;
+}
     }
     return mem;
   }
@@ -5453,6 +5470,25 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
   document.getElementById('mem-browse-btn').addEventListener('click', memBrowseEntries);
   document.getElementById('mem-clear-ns-btn').addEventListener('click', memClearNamespace);
   document.getElementById('mem-create-btn').addEventListener('click', memCreateEntry);
+
+document.getElementById('mem-qdrant-recreate').addEventListener('click', function() {
+  var btn = document.getElementById('mem-qdrant-recreate');
+  if (!confirm('This will DELETE the Qdrant collection and all its vector data, then recreate it from the current config. Continue?')) return;
+  btn.disabled = true;
+  btn.textContent = 'Recreating...';
+  fetch(memApiUrl('qdrant/collection'), { method: 'DELETE' })
+    .then(function(r) { return r.json().then(function(d) { if (!r.ok) throw new Error((d.error && d.error.message) || 'HTTP ' + r.status); return d; }); })
+    .then(function(d) {
+      btn.disabled = false;
+      btn.textContent = 'Recreate Collection';
+      setStatus('Qdrant collection recreated: ' + (d.message || 'OK'));
+    })
+    .catch(function(err) {
+      btn.disabled = false;
+      btn.textContent = 'Recreate Collection';
+      setStatus('Recreate failed: ' + err.message);
+    });
+});
 
   // Qdrant URL cross-population: sync between Caching and Memory sections.
   // If one field is populated and the other is empty, fill the empty one.

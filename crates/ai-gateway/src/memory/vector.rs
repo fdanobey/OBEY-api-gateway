@@ -284,7 +284,7 @@ fn normalize_embedding_base_url(url: &str) -> String {
     url
 }
 
-fn normalize_qdrant_url(url: &str) -> String {
+pub(crate) fn normalize_qdrant_url(url: &str) -> String {
     if url.contains(":6333") {
         url.replace(":6333", ":6334")
     } else {

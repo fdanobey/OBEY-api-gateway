@@ -290,14 +290,22 @@ impl MemoryStore {
         )
     }
 
-    pub fn mark_unconfigured_vector_entries_pending(&self) -> Result<u64, MemoryError> {
-        let updated = self.connection()?.execute(
-            "UPDATE memories SET vector_index_status = 'pending'
-             WHERE vector_index_status = 'not_configured'",
-            [],
-        )?;
-        u64::try_from(updated).map_err(store_external_error)
-    }
+pub fn mark_unconfigured_vector_entries_pending(&self) -> Result<u64, MemoryError> {
+let updated = self.connection()?.execute(
+"UPDATE memories SET vector_index_status = 'pending'
+WHERE vector_index_status = 'not_configured'",
+[],
+)?;
+u64::try_from(updated).map_err(store_external_error)
+}
+
+pub fn mark_all_vector_entries_pending(&self) -> Result<u64, MemoryError> {
+let updated = self.connection()?.execute(
+"UPDATE memories SET vector_index_status = 'pending'",
+[],
+)?;
+u64::try_from(updated).map_err(store_external_error)
+}
 
     pub fn mark_vector_pending(&self, id: Uuid) -> Result<bool, MemoryError> {
         Ok(self.connection()?.execute(
