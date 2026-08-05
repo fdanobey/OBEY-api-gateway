@@ -986,7 +986,10 @@ async fn chat_completions_non_stream(
     // A request-scoped context carries the PII Re_Injection_Map from pre-call
     // redaction into post-call re-injection (Req 9.5); it is dropped when this
     // function returns (Req 2.6 / 4.6).
-    let mut guardrail_ctx = GuardrailContext::new();
+    let mut guardrail_ctx = guardrail_engine
+        .as_ref()
+        .map(|e| e.new_context())
+        .unwrap_or_default();
     // Bindings resolve from the authenticated virtual-key id (when key
     // enforcement is active), the requested model group, and the route path
     // (Req 1.3, 1.7).
@@ -1808,7 +1811,10 @@ async fn chat_completions_stream(
     // routing; any bound post-call stage later forces full-response buffering.
     // Cache hits above intentionally bypass both guardrails and validation.
     // -----------------------------------------------------------------
-    let mut guardrail_ctx = GuardrailContext::new();
+    let mut guardrail_ctx = guardrail_engine
+        .as_ref()
+        .map(|e| e.new_context())
+        .unwrap_or_default();
     let selector = BindingSelector::new(
         virtual_key_id,
         Some(request.model.clone()),

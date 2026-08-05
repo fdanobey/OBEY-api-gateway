@@ -30,6 +30,15 @@ pub struct GuardrailConfig {
     /// Bindings that attach pipelines to virtual keys, model groups, or routes.
     #[serde(default)]
     pub bindings: GuardrailBindings,
+    /// Maximum number of distinct PII values tracked for re-injection per request.
+    /// Values beyond this cap are still redacted but not restored downstream.
+    /// Defaults to 256. Range: 1–10000. (Req 4.3, 4.12).
+    #[serde(default = "default_max_reinjection_entries")]
+    pub max_reinjection_entries: usize,
+}
+
+fn default_max_reinjection_entries() -> usize {
+    256
 }
 
 /// A named, ordered sequence of guardrail stages.

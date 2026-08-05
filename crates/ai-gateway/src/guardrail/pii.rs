@@ -31,6 +31,12 @@ use crate::models::openai::Message;
 /// Maximum number of distinct Re_Injection_Map entries per request (Req 4.3).
 pub const MAX_REINJECTION_ENTRIES: usize = 256;
 
+/// Minimum configurable re-injection cap.
+pub const MIN_REINJECTION_ENTRIES: usize = 1;
+
+/// Maximum configurable re-injection cap.
+pub const MAX_CONFIGURABLE_REINJECTION_ENTRIES: usize = 10_000;
+
 /// System instruction prepended to a redacted request so the LLM preserves
 /// placeholder tokens verbatim in its response (Req 4.4).
 #[allow(dead_code)] // public constant; used by tests and inject_redaction_notice
@@ -212,7 +218,7 @@ fn try_merge_into_leading(messages: &mut Vec<Message>, instruction_text: &str) -
 ///
 /// Owned by the request handler and dropped at the end of the request scope so
 /// the map is held only in memory for the request-response cycle (Req 2.6, 4.6).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct GuardrailContext {
     /// Ordered Re_Injection_Map: placeholder → original sensitive value.
     reinjection_map: Vec<(String, String)>,
@@ -221,6 +227,16 @@ pub struct GuardrailContext {
     /// De-duplication index: (entity_type, original_value) → placeholder, so an
     /// identical value of the same entity type reuses its placeholder (Req 4.3).
     dedup: HashMap<(String, String), String>,
+    /// Maximum number of re-injection entries (configurable per-deployment).
+    max_entries: usize,
+    /// Count of overflow placeholders (redacted but not tracked for reinjection).
+    overflow_count: usize,
+}
+
+impl Default for GuardrailContext {
+    fn default() -> Self {
+        Self::with_capacity(MAX_REINJECTION_ENTRIES)
+    }
 }
 
 /// Outcome of [`GuardrailContext::placeholder_for`].
@@ -266,9 +282,20 @@ impl PlaceholderResult {
 }
 
 impl GuardrailContext {
-    /// Create an empty context.
+    /// Create an empty context with the default 256-entry cap.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an empty context with an explicit re-injection cap.
+    pub fn with_capacity(max_entries: usize) -> Self {
+        Self {
+            reinjection_map: Vec::new(),
+            next_sequence: HashMap::new(),
+            dedup: HashMap::new(),
+            max_entries: max_entries.clamp(MIN_REINJECTION_ENTRIES, MAX_CONFIGURABLE_REINJECTION_ENTRIES),
+            overflow_count: 0,
+        }
     }
 
     /// Number of Re_Injection_Map entries recorded so far.
@@ -286,6 +313,12 @@ impl GuardrailContext {
     #[allow(dead_code)] // public API / test-only; unused in the binary build
     pub fn reinjection_map(&self) -> &[(String, String)] {
         &self.reinjection_map
+    }
+
+    /// Number of overflow placeholders (redacted without reinjection entries).
+    #[allow(dead_code)] // public API; used by handler/metrics
+    pub fn overflow_count(&self) -> usize {
+        self.overflow_count
     }
 
     /// Result from [`GuardrailContext::placeholder_for`] indicating the
@@ -311,7 +344,8 @@ impl GuardrailContext {
         // Enforce the per-request entry cap (Req 4.12): the first 256 distinct
         // values get re-injection entries; excess values are still redacted but
         // no re-injection entry is created for them.
-        if self.reinjection_map.len() >= MAX_REINJECTION_ENTRIES {
+        if self.reinjection_map.len() >= self.max_entries {
+            self.overflow_count += 1;
             return PlaceholderResult::Overflow(placeholder);
         }
 
@@ -365,10 +399,13 @@ impl GuardrailContext {
         }
 
         if overflow_count > 0 {
-            tracing::warn!(
+            tracing::error!(
                 excluded_count = overflow_count,
-                cap = MAX_REINJECTION_ENTRIES,
-                "PII redaction: {overflow_count} detected value(s) exceeded the {MAX_REINJECTION_ENTRIES}-entry re-injection cap and were redacted without re-injection entries"
+                cap = self.max_entries,
+                overflow_total = self.overflow_count,
+                "PII redaction: {overflow_count} detected value(s) exceeded the {}-entry re-injection cap and were redacted without re-injection entries (total overflow: {})",
+                self.max_entries,
+                self.overflow_count,
             );
         }
 
@@ -410,6 +447,113 @@ impl GuardrailContext {
         }
 
         self.warn_corrupted_fragments(&out);
+        out
+    }
+
+    /// Safe re-injection that replaces overflow placeholders with `[REDACTED]`
+    /// instead of leaving raw `<<PII_TYPE_N>>` tokens in the output.
+    ///
+    /// This is the hardened version of [`reinject`] used when the context may
+    /// have overflowed its re-injection cap. Mapped placeholders are restored
+    /// normally; any residual `<<PII_*_*>>` token that is NOT in the
+    /// reinjection map (i.e., an overflow placeholder) is replaced with
+    /// `[REDACTED]` so it cannot leak into the final user-visible response.
+    ///
+    /// Additionally, corrupted `<<PII_` fragments that are not complete
+    /// placeholders are also replaced with `[REDACTED]` to prevent partial
+    /// placeholder leakage.
+    pub fn reinject_safe(&self, content: &str) -> String {
+        let mut out = content.to_string();
+
+        for (placeholder, original) in &self.reinjection_map {
+            if out.contains(placeholder.as_str()) {
+                out = out.replace(placeholder.as_str(), original);
+            } else {
+                tracing::warn!(
+                    placeholder = %placeholder,
+                    "PII re-injection (safe): expected placeholder missing from response; skipping substitution"
+                );
+            }
+        }
+
+        if self.overflow_count > 0 {
+            let complete_placeholders: std::collections::HashSet<&str> =
+                self.reinjection_map.iter().map(|(p, _)| p.as_str()).collect();
+
+            out = PLACEHOLDER_RE
+                .replace_all(&out, |caps: &regex::Captures| {
+                    let matched = caps.get(0).unwrap().as_str();
+                    if complete_placeholders.contains(matched) {
+                        matched.to_string()
+                    } else {
+                        tracing::warn!(
+                            placeholder = %matched,
+                            "PII re-injection (safe): overflow placeholder replaced with [REDACTED] to prevent token leakage"
+                        );
+                        "[REDACTED]".to_string()
+                    }
+                })
+                .to_string();
+        }
+
+        out = self.replace_corrupted_fragments(out);
+
+        if self.overflow_count > 0 {
+            tracing::warn!(
+                overflow_count = self.overflow_count,
+                mapped_entries = self.reinjection_map.len(),
+                "PII re-injection (safe): completed with {} overflow placeholder(s) replaced with [REDACTED]",
+                self.overflow_count,
+            );
+        }
+
+        out
+    }
+
+    /// Replace corrupted `<<PII_` fragments (not complete placeholders) with
+    /// `[REDACTED]` and log each occurrence.
+    fn replace_corrupted_fragments(&self, content: String) -> String {
+        let complete: Vec<(usize, usize)> = PLACEHOLDER_RE
+            .find_iter(&content)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+
+        let mut replacements: Vec<(usize, usize)> = Vec::new();
+        let mut search_from = 0usize;
+        while let Some(rel) = content[search_from..].find(PLACEHOLDER_PREFIX) {
+            let at = search_from + rel;
+            let is_complete = complete.iter().any(|&(s, _)| s == at);
+            if !is_complete {
+                let end = (at + 32).min(content.len());
+                let fragment_end = content
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain(std::iter::once(content.len()))
+                    .find(|&i| i >= end)
+                    .unwrap_or(content.len());
+
+                let fragment = &content[at..fragment_end];
+                tracing::warn!(
+                    fragment = %fragment,
+                    "PII re-injection (safe): corrupted placeholder fragment replaced with [REDACTED]"
+                );
+                replacements.push((at, fragment_end));
+            }
+            search_from = at + PLACEHOLDER_PREFIX.len();
+            if search_from >= content.len() {
+                break;
+            }
+        }
+
+        if replacements.is_empty() {
+            return content;
+        }
+
+        replacements.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut out = content;
+        for (start, end) in replacements {
+            out.replace_range(start..end, "[REDACTED]");
+        }
         out
     }
 

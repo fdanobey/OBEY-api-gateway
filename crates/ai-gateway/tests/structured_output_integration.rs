@@ -254,6 +254,7 @@ fn post_call_redaction_guardrail() -> GuardrailConfig {
         }],
         global_default_pipeline: Some("post-call-redaction".to_string()),
         bindings: Default::default(),
+        ..Default::default()
     }
 }
 

@@ -180,6 +180,7 @@ fn refusal_failover_guardrails() -> GuardrailConfig {
         }],
         global_default_pipeline: Some("refusal_pipeline".to_string()),
         bindings: Default::default(),
+        ..Default::default()
     }
 }
 

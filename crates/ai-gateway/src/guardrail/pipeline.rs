@@ -506,6 +506,7 @@ mod tests {
                 routes: HashMap::from([("/v1/chat".to_string(), "route".to_string())]),
                 failover_on_refusal: HashMap::new(),
             },
+            ..Default::default()
         }
     }
 
@@ -789,6 +790,7 @@ mod tests {
                 routes,
                 failover_on_refusal: HashMap::new(),
             },
+            ..Default::default()
         };
 
         Scenario {
@@ -883,6 +885,7 @@ mod tests {
                     routes,
                     failover_on_refusal: failover_on_refusal_bindings.clone(),
                 },
+                ..Default::default()
             };
 
             let registry = registry_with(&[("p", "regex")]);

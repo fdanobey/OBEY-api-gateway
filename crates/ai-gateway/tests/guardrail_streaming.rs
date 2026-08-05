@@ -171,6 +171,7 @@ fn post_call_guardrails(action: PolicyAction, failure_policy: FailurePolicy) -> 
         }],
         global_default_pipeline: Some("post_pipeline".to_string()),
         bindings: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -505,6 +506,7 @@ fn pre_call_redact_guardrails() -> GuardrailConfig {
         }],
         global_default_pipeline: Some("pre_only".to_string()),
         bindings: Default::default(),
+        ..Default::default()
     }
 }
 

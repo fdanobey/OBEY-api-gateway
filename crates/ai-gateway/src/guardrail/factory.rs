@@ -117,7 +117,8 @@ pub fn build_engine(
     metrics: Option<Arc<Metrics>>,
 ) -> Result<GuardrailEngine, RegistryBuildError> {
     let registry = build_registry(config, http_client, semantic_cache)?;
-    let engine = GuardrailEngine::new(config, &registry, metrics)?;
+    let max_entries = config.max_reinjection_entries;
+    let engine = GuardrailEngine::new_with_capacity(config, &registry, metrics, max_entries)?;
     Ok(engine)
 }
 

@@ -1785,6 +1785,7 @@ model_groups:
             }],
             global_default_pipeline: None,
             bindings: GuardrailBindings::default(),
+            ..Default::default()
         }
     }
 
@@ -2302,6 +2303,7 @@ model_groups:
                 pipelines: pipeline_configs,
                 global_default_pipeline: None,
                 bindings: binding_cfg.clone(),
+                ..Default::default()
             };
             let config = config_with_guardrails(guardrails);
 

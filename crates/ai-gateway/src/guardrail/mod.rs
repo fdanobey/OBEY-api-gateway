@@ -41,8 +41,8 @@ pub use factory::{build_engine, build_registry, RegistryBuildError};
 #[allow(unused_imports)]
 pub use pii::{
     inject_redaction_notice, mask, GuardrailContext, PlaceholderResult,
-    DEFAULT_REDACTION_NOTICE_INSTRUCTION, MAX_REINJECTION_ENTRIES,
-    PRESERVE_PLACEHOLDERS_INSTRUCTION,
+    DEFAULT_REDACTION_NOTICE_INSTRUCTION, MAX_CONFIGURABLE_REINJECTION_ENTRIES,
+    MAX_REINJECTION_ENTRIES, MIN_REINJECTION_ENTRIES, PRESERVE_PLACEHOLDERS_INSTRUCTION,
 };
 #[allow(unused_imports)]
 pub use pipeline::{
@@ -181,6 +181,8 @@ pub struct GuardrailEngine {
     policy_message: String,
     /// Compiled refusal detector for post-call refusal detection (Req 12.1, 12.12).
     refusal_detector: RefusalDetector,
+    /// Maximum re-injection entries per request (configurable).
+    max_reinjection_entries: usize,
 }
 
 impl std::fmt::Debug for GuardrailEngine {
@@ -189,6 +191,7 @@ impl std::fmt::Debug for GuardrailEngine {
             .field("resolver", &self.resolver)
             .field("has_metrics", &self.metrics.is_some())
             .field("max_content_chars", &self.max_content_chars)
+            .field("max_reinjection_entries", &self.max_reinjection_entries)
             .field("refusal_detector", &self.refusal_detector)
             .finish()
     }
@@ -206,7 +209,32 @@ impl GuardrailEngine {
         metrics: Option<Arc<Metrics>>,
     ) -> Result<Self, PipelineResolverError> {
         let resolver = PipelineResolver::new(config, registry)?;
-        Ok(Self::with_resolver(resolver, metrics))
+        Ok(Self {
+            resolver,
+            metrics,
+            max_content_chars: DEFAULT_MAX_CONTENT_CHARS,
+            policy_message: DEFAULT_POLICY_MESSAGE.to_string(),
+            refusal_detector: RefusalDetector::default_detector(),
+            max_reinjection_entries: config.max_reinjection_entries,
+        })
+    }
+
+    /// Build an engine with explicit re-injection capacity.
+    pub fn new_with_capacity(
+        config: &GuardrailConfig,
+        registry: &ProviderRegistry,
+        metrics: Option<Arc<Metrics>>,
+        max_reinjection_entries: usize,
+    ) -> Result<Self, PipelineResolverError> {
+        let resolver = PipelineResolver::new(config, registry)?;
+        Ok(Self {
+            resolver,
+            metrics,
+            max_content_chars: DEFAULT_MAX_CONTENT_CHARS,
+            policy_message: DEFAULT_POLICY_MESSAGE.to_string(),
+            refusal_detector: RefusalDetector::default_detector(),
+            max_reinjection_entries,
+        })
     }
 
     /// Build an engine from an already-compiled [`PipelineResolver`].
@@ -217,12 +245,24 @@ impl GuardrailEngine {
             max_content_chars: DEFAULT_MAX_CONTENT_CHARS,
             policy_message: DEFAULT_POLICY_MESSAGE.to_string(),
             refusal_detector: RefusalDetector::default_detector(),
+            max_reinjection_entries: pii::MAX_REINJECTION_ENTRIES,
         }
+    }
+
+    /// The configured re-injection entry cap.
+    pub fn max_reinjection_entries(&self) -> usize {
+        self.max_reinjection_entries
     }
 
     /// Borrow the underlying resolver (used by the handler and diagnostics).
     pub fn resolver(&self) -> &PipelineResolver {
         &self.resolver
+    }
+
+    /// Create a request-scoped guardrail context using this engine's
+    /// configured re-injection capacity.
+    pub fn new_context(&self) -> GuardrailContext {
+        GuardrailContext::with_capacity(self.max_reinjection_entries)
     }
 
     /// The configured content clamp in UTF-8 characters.
@@ -646,10 +686,15 @@ impl GuardrailEngine {
         // Skipped when refusal-failover will be triggered (handler re-dispatches
         // and re-injects on the finally selected response).
         if terminal.is_none() && !refusal_decision.is_refusal() && !ctx.is_empty() {
+            let has_overflow = ctx.overflow_count() > 0;
             for choice in response.choices.iter_mut() {
                 let slots = collect_text_slots(&choice.message.content);
                 for (slot, text) in slots {
-                    let restored = ctx.reinject(&text);
+                    let restored = if has_overflow {
+                        ctx.reinject_safe(&text)
+                    } else {
+                        ctx.reinject(&text)
+                    };
                     if restored != text {
                         set_text_slot(&mut choice.message.content, slot, restored);
                     }
@@ -676,14 +721,23 @@ impl GuardrailEngine {
     /// This is the public entry point for the handler's refusal-failover loop
     /// (task 17.2): after the loop settles on a final response, the handler
     /// calls this exactly once so re-injection runs on the chosen response.
+    ///
+    /// Uses [`GuardrailContext::reinject_safe`] when any overflow placeholders
+    /// were generated (values redacted but not tracked for re-injection), so
+    /// raw `<<PII_TYPE_N>>` tokens cannot leak into the user-visible response.
     pub fn reinject_response(&self, response: &mut OpenAIResponse, ctx: &GuardrailContext) {
         if ctx.is_empty() {
             return;
         }
+        let has_overflow = ctx.overflow_count() > 0;
         for choice in response.choices.iter_mut() {
             let slots = collect_text_slots(&choice.message.content);
             for (slot, text) in slots {
-                let restored = ctx.reinject(&text);
+                let restored = if has_overflow {
+                    ctx.reinject_safe(&text)
+                } else {
+                    ctx.reinject(&text)
+                };
                 if restored != text {
                     set_text_slot(&mut choice.message.content, slot, restored);
                 }
@@ -1103,6 +1157,7 @@ mod engine_tests {
             }],
             global_default_pipeline: Some("pl".to_string()),
             bindings: GuardrailBindings::default(),
+            ..Default::default()
         };
         GuardrailEngine::new(&config, &registry, None).unwrap()
     }
@@ -1397,6 +1452,7 @@ mod engine_tests {
             }],
             global_default_pipeline: None,
             bindings: GuardrailBindings::default(),
+            ..Default::default()
         };
         let engine = GuardrailEngine::new(&config, &registry, None).unwrap();
 
@@ -1586,6 +1642,7 @@ mod engine_tests {
             }],
             global_default_pipeline: Some("pl".to_string()),
             bindings: GuardrailBindings::default(),
+            ..Default::default()
         };
         GuardrailEngine::new(&config, &registry, None).unwrap()
     }
@@ -2399,6 +2456,7 @@ mod engine_tests {
             }],
             global_default_pipeline: Some("pl".to_string()),
             bindings: GuardrailBindings::default(),
+            ..Default::default()
         };
         GuardrailEngine::new(&config, &registry, Some(metrics)).unwrap()
     }
