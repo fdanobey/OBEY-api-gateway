@@ -34,6 +34,15 @@ pub enum GatewayError {
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error("Request context requires {estimated_requirement} tokens, but the largest declared model context is {largest_supported_context:?}")]
+    ContextCapacityExceeded {
+        estimated_requirement: u64,
+        largest_supported_context: Option<u32>,
+    },
+
+    #[error("Smart-routing budget exceeded for period: {period}")]
+    SmartRoutingBudgetExceeded { period: String },
+
     #[error("Authentication failed: {0}")]
     Authentication(String),
 
@@ -104,6 +113,8 @@ impl GatewayError {
         use axum::http::StatusCode;
         match self {
             GatewayError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            GatewayError::ContextCapacityExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            GatewayError::SmartRoutingBudgetExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
             GatewayError::Authentication(_) => StatusCode::UNAUTHORIZED,
             GatewayError::AllProvidersFailed(_) => StatusCode::BAD_GATEWAY,
             GatewayError::RateLimitExceeded(_) => StatusCode::TOO_MANY_REQUESTS,

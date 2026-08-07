@@ -19,24 +19,20 @@ use crate::tool_compression::types::{CompressionContext, ToolDefinition};
 // ─── Compiled regex patterns ──────────────────────────────────────────────────
 
 /// Matches inline example patterns like `e.g., ...` up to sentence end or closing paren.
-static RE_EG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\s*e\.g\.,?\s*[^.)\n]*[.)]?").unwrap()
-});
+static RE_EG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\s*e\.g\.,?\s*[^.)\n]*[.)]?").unwrap());
 
 /// Matches `for example:` followed by content up to period or newline.
-static RE_FOR_EXAMPLE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\s*for example:\s*[^.\n]*\.?").unwrap()
-});
+static RE_FOR_EXAMPLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\s*for example:\s*[^.\n]*\.?").unwrap());
 
 /// Matches `Example:` followed by content to end of line.
-static RE_EXAMPLE_LABEL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\s*Example:\s*[^\n]*").unwrap()
-});
+static RE_EXAMPLE_LABEL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\s*Example:\s*[^\n]*").unwrap());
 
 /// Matches fenced code blocks (``` ... ```).
-static RE_FENCED_CODE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)```[^\n]*\n.*?```").unwrap()
-});
+static RE_FENCED_CODE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)```[^\n]*\n.*?```").unwrap());
 
 // ─── DescriptionTruncator ─────────────────────────────────────────────────────
 
@@ -109,7 +105,8 @@ impl CompressionStage for DescriptionTruncator {
         }
 
         if total_saved > 0 {
-            ctx.strategies_applied.push("description_truncator".to_string());
+            ctx.strategies_applied
+                .push("description_truncator".to_string());
         }
         ctx.tokens_saved += total_saved;
         total_saved
@@ -448,9 +445,11 @@ mod tests {
         stage.apply(&mut tools, &mut ctx);
 
         assert!(tools[0].raw["function"].get("description").is_none());
-        assert!(tools[0].raw["function"]["parameters"]["properties"]["query"]
-            .get("description")
-            .is_none());
+        assert!(
+            tools[0].raw["function"]["parameters"]["properties"]["query"]
+                .get("description")
+                .is_none()
+        );
     }
 
     // ─── Max level enum replacement ──────────────────────────────────
@@ -640,7 +639,9 @@ mod tests {
 
         assert!(saved > 0);
         assert_eq!(ctx.tokens_saved, saved);
-        assert!(ctx.strategies_applied.contains(&"description_truncator".to_string()));
+        assert!(ctx
+            .strategies_applied
+            .contains(&"description_truncator".to_string()));
     }
 
     // ─── Property Tests ──────────────────────────────────────────────

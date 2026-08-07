@@ -14,6 +14,7 @@ tray = [
     "dep:winrt-notification",
 ]
 headless = []
+ml-router = []
 
 [lib]
 path = "src/lib.rs"

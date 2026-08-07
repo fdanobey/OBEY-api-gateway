@@ -105,6 +105,9 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
                     cost_per_million_output_tokens: 60.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
                 ProviderModel {
                     provider: "backup".to_string(),
@@ -113,6 +116,9 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
                     cost_per_million_output_tokens: 60.0,
                     priority: 200,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
             ],
         }],
@@ -137,6 +143,7 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
         loop_detection: Default::default(),
         guardrails: Some(guardrails),
         tool_compression: Default::default(),
+        smart_routing: Default::default(),
         structured_output: None,
     }
 }

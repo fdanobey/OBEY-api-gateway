@@ -28,7 +28,10 @@ pub struct CanonicalRewriter {
 impl CanonicalRewriter {
     /// Create a new `CanonicalRewriter` with the given allowed model patterns
     /// and shared schema storage.
-    pub fn new(allowed_model_patterns: &[String], original_schemas: Arc<DashMap<String, Value>>) -> Self {
+    pub fn new(
+        allowed_model_patterns: &[String],
+        original_schemas: Arc<DashMap<String, Value>>,
+    ) -> Self {
         let allowed_models = allowed_model_patterns
             .iter()
             .map(|p| GlobPattern::new(p))
@@ -133,10 +136,20 @@ impl CanonicalRewriter {
                 if is_object_with_properties(child_schema) {
                     // Deeper than 1 level — emit as JSON Schema inline
                     let json_repr = serde_json::to_string(child_schema).unwrap_or_default();
-                    let req_str = if child_required { "required" } else { "optional" };
+                    let req_str = if child_required {
+                        "required"
+                    } else {
+                        "optional"
+                    };
                     out.push(format!("{full_name}.{child_key}({json_repr}, {req_str})"));
                 } else {
-                    self.format_param_entry(out, child_key, child_schema, child_required, Some(&full_name));
+                    self.format_param_entry(
+                        out,
+                        child_key,
+                        child_schema,
+                        child_required,
+                        Some(&full_name),
+                    );
                 }
             }
             return;
@@ -155,10 +168,7 @@ impl CanonicalRewriter {
     fn extract_type_string(&self, schema: &Value) -> String {
         // Handle enum
         if let Some(enum_values) = schema.get("enum").and_then(|v| v.as_array()) {
-            let vals: Vec<&str> = enum_values
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect();
+            let vals: Vec<&str> = enum_values.iter().filter_map(|v| v.as_str()).collect();
             return format!("enum[{}]", vals.join(","));
         }
 
@@ -217,11 +227,7 @@ impl CanonicalRewriter {
 }
 
 impl CompressionStage for CanonicalRewriter {
-    fn apply(
-        &self,
-        tools: &mut Vec<ToolDefinition>,
-        ctx: &mut CompressionContext,
-    ) -> u64 {
+    fn apply(&self, tools: &mut Vec<ToolDefinition>, ctx: &mut CompressionContext) -> u64 {
         // Activation checks
         if self.allowed_models.is_empty() {
             return 0;
@@ -237,7 +243,8 @@ impl CompressionStage for CanonicalRewriter {
 
         for tool in tools.iter_mut() {
             // Store original schema before rewriting
-            self.original_schemas.insert(tool.name.clone(), tool.raw.clone());
+            self.original_schemas
+                .insert(tool.name.clone(), tool.raw.clone());
 
             // Estimate original tokens (chars / 4)
             let original_json = serde_json::to_string(&tool.raw).unwrap_or_default();
@@ -260,7 +267,8 @@ impl CompressionStage for CanonicalRewriter {
         }
 
         if tokens_saved > 0 {
-            ctx.strategies_applied.push("canonical_rewriter".to_string());
+            ctx.strategies_applied
+                .push("canonical_rewriter".to_string());
             ctx.tokens_saved += tokens_saved;
         }
 
@@ -352,10 +360,7 @@ mod tests {
 
     #[test]
     fn noop_when_model_does_not_match() {
-        let rewriter = CanonicalRewriter::new(
-            &["gpt-4*".to_string()],
-            Arc::new(DashMap::new()),
-        );
+        let rewriter = CanonicalRewriter::new(&["gpt-4*".to_string()], Arc::new(DashMap::new()));
         let mut tools = vec![make_tool(
             "test",
             serde_json::json!({
@@ -370,10 +375,7 @@ mod tests {
 
     #[test]
     fn noop_when_provider_does_not_support_canonical() {
-        let rewriter = CanonicalRewriter::new(
-            &["gpt-4*".to_string()],
-            Arc::new(DashMap::new()),
-        );
+        let rewriter = CanonicalRewriter::new(&["gpt-4*".to_string()], Arc::new(DashMap::new()));
         let mut tools = vec![make_tool(
             "test",
             serde_json::json!({
@@ -437,7 +439,9 @@ mod tests {
         assert_eq!(*schemas.get("get_weather").unwrap().value(), raw);
 
         // Strategy recorded
-        assert!(ctx.strategies_applied.contains(&"canonical_rewriter".to_string()));
+        assert!(ctx
+            .strategies_applied
+            .contains(&"canonical_rewriter".to_string()));
     }
 
     #[test]
@@ -608,16 +612,17 @@ mod property_tests {
             Just("boolean".to_string()),
         ];
 
-        (name_strat, desc_strat, prop::collection::vec((("[a-z_]{2,8}"), param_type_strat), 1..=4))
+        (
+            name_strat,
+            desc_strat,
+            prop::collection::vec((("[a-z_]{2,8}"), param_type_strat), 1..=4),
+        )
             .prop_map(|(name, desc, params)| {
                 let mut properties = serde_json::Map::new();
                 let mut required = Vec::new();
 
                 for (i, (param_name, param_type)) in params.iter().enumerate() {
-                    properties.insert(
-                        param_name.clone(),
-                        json!({"type": param_type}),
-                    );
+                    properties.insert(param_name.clone(), json!({"type": param_type}));
                     if i == 0 {
                         required.push(json!(param_name.clone()));
                     }

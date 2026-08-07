@@ -7,7 +7,9 @@
 use serde_json::Value;
 
 #[allow(unused_imports)]
-use crate::tool_compression::config::{CompressionLevel, MinificationConfig, ToolCompressionConfig};
+use crate::tool_compression::config::{
+    CompressionLevel, MinificationConfig, ToolCompressionConfig,
+};
 use crate::tool_compression::stage::CompressionStage;
 use crate::tool_compression::types::{CompressionContext, ProviderCaps, ToolDefinition};
 
@@ -104,10 +106,7 @@ pub fn minify_value(value: &mut Value, provider_caps: &ProviderCaps) {
                                             map.insert(k, v);
                                         }
                                     }
-                                    map.insert(
-                                        "nullable".to_string(),
-                                        Value::Bool(true),
-                                    );
+                                    map.insert("nullable".to_string(), Value::Bool(true));
                                     // Recurse on the modified map
                                     for (_k, v) in map.iter_mut() {
                                         minify_value(v, provider_caps);
@@ -444,7 +443,13 @@ mod property_tests {
                 Just(depth),
             )
                 .prop_map(
-                    move |(field_names, inject_title, inject_add_props, inject_empty_desc, depth)| {
+                    move |(
+                        field_names,
+                        inject_title,
+                        inject_add_props,
+                        inject_empty_desc,
+                        depth,
+                    )| {
                         build_nested_schema(
                             &field_names,
                             depth,
@@ -585,7 +590,8 @@ mod property_tests {
                 if map.contains_key(field_name) {
                     return false;
                 }
-                map.values().all(|v| assert_no_field_anywhere(v, field_name))
+                map.values()
+                    .all(|v| assert_no_field_anywhere(v, field_name))
             }
             Value::Array(arr) => arr.iter().all(|v| assert_no_field_anywhere(v, field_name)),
             _ => true,

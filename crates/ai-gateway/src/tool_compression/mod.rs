@@ -25,9 +25,9 @@ pub use middleware::{
 };
 pub use stage::CompressionStage;
 pub use state::ToolCompressionState;
+pub use tfidf::TfIdfScorer;
 pub use types::{
     ApiKeyId, CompressionContext, DisclosureSet, ProviderCapabilityMap, ProviderCaps, SessionId,
     ToolDefinition, ToolUsageMap,
 };
-pub use tfidf::TfIdfScorer;
 pub use usage::{KeyUsageState, UsageTracker};

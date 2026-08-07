@@ -147,9 +147,8 @@ impl QdrantMemoryVectorTier {
         } else {
             self.qdrant
                 .create_collection(
-                    CreateCollectionBuilder::new(&self.collection).vectors_config(
-                        VectorParamsBuilder::new(dimension, Distance::Cosine),
-                    ),
+                    CreateCollectionBuilder::new(&self.collection)
+                        .vectors_config(VectorParamsBuilder::new(dimension, Distance::Cosine)),
                 )
                 .await
                 .map_err(|error| {

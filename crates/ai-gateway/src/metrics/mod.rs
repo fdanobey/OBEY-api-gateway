@@ -84,6 +84,9 @@ pub struct Metrics {
     tool_compression_feedback_error_rate: Arc<DashMap<String, AtomicU64>>,
     /// Tool compression feedback adjustments counter, keyed by model_group.
     tool_compression_feedback_adjustments: Arc<DashMap<String, AtomicU64>>,
+    /// Lazily allocated Smart Routing metrics. Disabled gateways retain no
+    /// Smart Routing metric maps or counters.
+    smart_routing: Mutex<Option<Arc<SmartRoutingMetricState>>>,
 }
 
 /// Bounded label set for compression metrics: (level, provider).
@@ -100,6 +103,64 @@ const COMPRESSION_DURATION_BUCKETS_SECONDS: [f64; 10] =
     [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0];
 const MAX_COMPRESSION_LEVEL_LABEL_LEN: usize = 16;
 const MAX_COMPRESSION_PROVIDER_LABEL_LEN: usize = 64;
+
+const SMART_ROUTING_SCORE_BUCKETS: [f64; 10] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+const SMART_ROUTING_LATENCY_BUCKETS_MS: [f64; 10] =
+    [0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0];
+const SMART_ROUTING_COST_BUCKETS_USD: [f64; 10] =
+    [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
+const SMART_ROUTING_QUALITY_BUCKETS: [f64; 10] = SMART_ROUTING_SCORE_BUCKETS;
+#[allow(dead_code)]
+const SMART_ROUTING_GROUP_BUCKETS: u64 = 64;
+
+/// Metric values for a complete Smart Routing decision. All string labels are
+/// normalized to finite enumerations or a fixed group bucket before storage.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct SmartRoutingDecisionMetric<'a> {
+    pub tier: &'a str,
+    pub classifier: &'a str,
+    pub group: &'a str,
+    pub score: f64,
+    pub estimated_cost_usd: f64,
+    pub classifier_latency_ms: f64,
+    pub task_type: &'a str,
+    pub quality: f64,
+    pub context_filtered: bool,
+    pub experiment: Option<&'a str>,
+}
+
+#[derive(Debug)]
+struct SmartRoutingMetricState {
+    decisions: DashMap<(String, String, String, String), AtomicU64>,
+    scores: DashMap<(String, String), CompressionHistogram>,
+    cascade_transitions: DashMap<(String, String), AtomicU64>,
+    estimated_cost: DashMap<String, CompressionHistogram>,
+    classifier_latency: DashMap<String, CompressionHistogram>,
+    simhash: DashMap<String, AtomicU64>,
+    task_types: DashMap<String, AtomicU64>,
+    quality: DashMap<String, CompressionHistogram>,
+    semantic_cache: DashMap<String, AtomicU64>,
+    context_filtered: DashMap<String, AtomicU64>,
+}
+
+impl SmartRoutingMetricState {
+    #[allow(dead_code)]
+    fn new() -> Self {
+        Self {
+            decisions: DashMap::new(),
+            scores: DashMap::new(),
+            cascade_transitions: DashMap::new(),
+            estimated_cost: DashMap::new(),
+            classifier_latency: DashMap::new(),
+            simhash: DashMap::new(),
+            task_types: DashMap::new(),
+            quality: DashMap::new(),
+            semantic_cache: DashMap::new(),
+            context_filtered: DashMap::new(),
+        }
+    }
+}
 
 /// Histogram state with non-cumulative buckets, rendered cumulatively.
 #[derive(Debug)]
@@ -185,6 +246,79 @@ fn escape_prometheus_label(value: &str) -> String {
         }
     }
     escaped
+}
+
+#[allow(dead_code)]
+fn smart_routing_enum_label(value: &str, allowed: &[&str]) -> String {
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    if allowed.contains(&normalized.as_str()) {
+        normalized
+    } else {
+        "other".to_owned()
+    }
+}
+
+#[allow(dead_code)]
+fn smart_routing_tier_label(value: &str) -> String {
+    smart_routing_enum_label(value, &["fast", "balanced", "powerful"])
+}
+
+#[allow(dead_code)]
+fn smart_routing_classifier_label(value: &str) -> String {
+    smart_routing_enum_label(value, &["heuristic", "ml", "llm", "composite"])
+}
+
+#[allow(dead_code)]
+fn smart_routing_task_label(value: &str) -> String {
+    smart_routing_enum_label(
+        value,
+        &[
+            "code_generation",
+            "math_reasoning",
+            "creative_writing",
+            "factual_qa",
+            "tool_use",
+            "summarization",
+            "general",
+        ],
+    )
+}
+
+#[allow(dead_code)]
+fn smart_routing_experiment_label(value: Option<&str>) -> String {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("control") => "control".to_owned(),
+        Some("variant") => "variant".to_owned(),
+        Some(_) => "other".to_owned(),
+        None => "none".to_owned(),
+    }
+}
+
+#[allow(dead_code)]
+fn smart_routing_outcome_label(hit: bool) -> String {
+    if hit {
+        "hit".to_owned()
+    } else {
+        "miss".to_owned()
+    }
+}
+
+#[allow(dead_code)]
+fn smart_routing_group_label(value: &str) -> String {
+    if value.is_empty() {
+        return "unknown".to_owned();
+    }
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("bucket_{:02}", hash % SMART_ROUTING_GROUP_BUCKETS)
+}
+
+#[allow(dead_code)]
+fn smart_routing_transition_label(value: &str) -> String {
+    smart_routing_enum_label(value, &["fast", "balanced", "powerful", "none"])
 }
 
 /// Label set for the guardrail stage execution counter (Req 11.1).
@@ -398,7 +532,147 @@ impl Metrics {
             tool_compression_feedback_level: Arc::new(DashMap::new()),
             tool_compression_feedback_error_rate: Arc::new(DashMap::new()),
             tool_compression_feedback_adjustments: Arc::new(DashMap::new()),
+            smart_routing: Mutex::new(None),
         }
+    }
+
+    /// Allocate Smart Routing metric state once. Until this method is called,
+    /// recording is a no-op and Prometheus exposition contains no Smart Routing
+    /// metric registration.
+    #[allow(dead_code)]
+    pub fn enable_smart_routing(&self) {
+        let mut state = self
+            .smart_routing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.get_or_insert_with(|| Arc::new(SmartRoutingMetricState::new()));
+    }
+
+    fn smart_routing_state(&self) -> Option<Arc<SmartRoutingMetricState>> {
+        self.smart_routing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Record bounded Smart Routing decision telemetry. Raw model groups are
+    /// reduced to one of 64 stable buckets before becoming labels.
+    #[allow(dead_code)]
+    pub fn record_smart_routing_decision(&self, decision: SmartRoutingDecisionMetric<'_>) {
+        let Some(state) = self.smart_routing_state() else {
+            return;
+        };
+        let tier = smart_routing_tier_label(decision.tier);
+        let classifier = smart_routing_classifier_label(decision.classifier);
+        let group = smart_routing_group_label(decision.group);
+        let experiment = smart_routing_experiment_label(decision.experiment);
+        let task_type = smart_routing_task_label(decision.task_type);
+        let filtered = if decision.context_filtered {
+            "true"
+        } else {
+            "false"
+        }
+        .to_owned();
+
+        saturating_atomic_add(
+            state
+                .decisions
+                .entry((tier.clone(), classifier.clone(), group, experiment))
+                .or_insert_with(|| AtomicU64::new(0))
+                .value(),
+            1,
+        );
+        state
+            .scores
+            .entry((tier.clone(), classifier.clone()))
+            .or_insert_with(|| CompressionHistogram::new(SMART_ROUTING_SCORE_BUCKETS.len()))
+            .observe(decision.score.clamp(0.0, 1.0), &SMART_ROUTING_SCORE_BUCKETS);
+        state
+            .estimated_cost
+            .entry(tier.clone())
+            .or_insert_with(|| CompressionHistogram::new(SMART_ROUTING_COST_BUCKETS_USD.len()))
+            .observe(decision.estimated_cost_usd, &SMART_ROUTING_COST_BUCKETS_USD);
+        state
+            .classifier_latency
+            .entry(classifier)
+            .or_insert_with(|| CompressionHistogram::new(SMART_ROUTING_LATENCY_BUCKETS_MS.len()))
+            .observe(
+                decision.classifier_latency_ms,
+                &SMART_ROUTING_LATENCY_BUCKETS_MS,
+            );
+        saturating_atomic_add(
+            state
+                .task_types
+                .entry(task_type)
+                .or_insert_with(|| AtomicU64::new(0))
+                .value(),
+            1,
+        );
+        state
+            .quality
+            .entry(tier)
+            .or_insert_with(|| CompressionHistogram::new(SMART_ROUTING_QUALITY_BUCKETS.len()))
+            .observe(
+                decision.quality.clamp(0.0, 1.0),
+                &SMART_ROUTING_QUALITY_BUCKETS,
+            );
+        saturating_atomic_add(
+            state
+                .context_filtered
+                .entry(filtered)
+                .or_insert_with(|| AtomicU64::new(0))
+                .value(),
+            1,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn record_smart_routing_cascade_transition(&self, from_tier: &str, to_tier: &str) {
+        let Some(state) = self.smart_routing_state() else {
+            return;
+        };
+        let key = (
+            smart_routing_transition_label(from_tier),
+            smart_routing_transition_label(to_tier),
+        );
+        saturating_atomic_add(
+            state
+                .cascade_transitions
+                .entry(key)
+                .or_insert_with(|| AtomicU64::new(0))
+                .value(),
+            1,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn record_smart_routing_simhash(&self, hit: bool) {
+        let Some(state) = self.smart_routing_state() else {
+            return;
+        };
+        saturating_atomic_add(
+            state
+                .simhash
+                .entry(smart_routing_outcome_label(hit))
+                .or_insert_with(|| AtomicU64::new(0))
+                .value(),
+            1,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn record_smart_routing_semantic_cache(&self, hit: bool) {
+        let Some(state) = self.smart_routing_state() else {
+            return;
+        };
+        saturating_atomic_add(
+            state
+                .semantic_cache
+                .entry(smart_routing_outcome_label(hit))
+                .or_insert_with(|| AtomicU64::new(0))
+                .value(),
+            1,
+        );
     }
 
     /// Increment request count and mark request as active
@@ -1216,7 +1490,88 @@ Total refusal failover outcomes by pipeline and outcome\n",
     /// Append compression counter and histograms in Prometheus text format.
     /// The ratio is `compressed_tokens / original_tokens` in `[0, 1]`; when
     /// `original_tokens` is zero, the observed ratio is `1.0`.
+    pub fn write_smart_routing_prometheus(&self, out: &mut String) {
+        let Some(state) = self.smart_routing_state() else {
+            return;
+        };
+        write_smart_routing_counter4(
+            out,
+            "obey_api_smart_routing_decisions_total",
+            "Total Smart Routing decisions by bounded routing dimensions",
+            ["tier", "classifier", "group", "experiment"],
+            &state.decisions,
+        );
+        write_smart_routing_histogram2(
+            out,
+            "obey_api_smart_routing_score",
+            "Smart Routing normalized decision score",
+            ["tier", "classifier"],
+            &state.scores,
+            &SMART_ROUTING_SCORE_BUCKETS,
+        );
+        write_smart_routing_counter2(
+            out,
+            "obey_api_smart_routing_cascade_transitions_total",
+            "Total Smart Routing cascade transitions",
+            ["from_tier", "to_tier"],
+            &state.cascade_transitions,
+        );
+        write_smart_routing_histogram1(
+            out,
+            "obey_api_smart_routing_estimated_cost_usd",
+            "Estimated Smart Routing request cost in US dollars",
+            "tier",
+            &state.estimated_cost,
+            &SMART_ROUTING_COST_BUCKETS_USD,
+        );
+        write_smart_routing_histogram1(
+            out,
+            "obey_api_smart_routing_classifier_latency_ms",
+            "Smart Routing classifier latency in milliseconds",
+            "classifier",
+            &state.classifier_latency,
+            &SMART_ROUTING_LATENCY_BUCKETS_MS,
+        );
+        write_smart_routing_counter1(
+            out,
+            "obey_api_smart_routing_simhash_total",
+            "Smart Routing SimHash cache lookups",
+            "result",
+            &state.simhash,
+        );
+        write_smart_routing_counter1(
+            out,
+            "obey_api_smart_routing_task_type_total",
+            "Smart Routing decisions by bounded task type",
+            "task_type",
+            &state.task_types,
+        );
+        write_smart_routing_histogram1(
+            out,
+            "obey_api_smart_routing_quality",
+            "Smart Routing normalized observed quality",
+            "tier",
+            &state.quality,
+            &SMART_ROUTING_QUALITY_BUCKETS,
+        );
+        write_smart_routing_counter1(
+            out,
+            "obey_api_smart_routing_semantic_cache_total",
+            "Smart Routing semantic cache lookups",
+            "result",
+            &state.semantic_cache,
+        );
+        write_smart_routing_counter1(
+            out,
+            "obey_api_smart_routing_context_filtered_total",
+            "Smart Routing decisions with context filtering status",
+            "filtered",
+            &state.context_filtered,
+        );
+    }
+
     pub fn write_compression_prometheus(&self, out: &mut String) {
+        self.write_smart_routing_prometheus(out);
         if !self.compression_tokens_saved.is_empty() {
             let mut rows: Vec<(CompressionMetricKey, u64)> = self
                 .compression_tokens_saved
@@ -1490,6 +1845,152 @@ Total refusal failover outcomes by pipeline and outcome\n",
     }
 }
 
+fn write_smart_routing_counter1(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    label: &str,
+    values: &DashMap<String, AtomicU64>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    let mut rows: Vec<(String, u64)> = values
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+    for (value, count) in rows {
+        out.push_str(&format!("{name}{{{label}=\"{value}\"}} {count}\n"));
+    }
+}
+
+fn write_smart_routing_counter2(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    labels: [&str; 2],
+    values: &DashMap<(String, String), AtomicU64>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    let mut rows: Vec<((String, String), u64)> = values
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+    for ((first, second), count) in rows {
+        out.push_str(&format!(
+            "{name}{{{}=\"{first}\",{}=\"{second}\"}} {count}\n",
+            labels[0], labels[1]
+        ));
+    }
+}
+
+fn write_smart_routing_counter4(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    labels: [&str; 4],
+    values: &DashMap<(String, String, String, String), AtomicU64>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    let mut rows: Vec<((String, String, String, String), u64)> = values
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+    for ((first, second, third, fourth), count) in rows {
+        out.push_str(&format!(
+            "{name}{{{}=\"{first}\",{}=\"{second}\",{}=\"{third}\",{}=\"{fourth}\"}} {count}\n",
+            labels[0], labels[1], labels[2], labels[3]
+        ));
+    }
+}
+
+fn write_smart_routing_histogram1(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    label: &str,
+    values: &DashMap<String, CompressionHistogram>,
+    buckets: &[f64],
+) {
+    if values.is_empty() {
+        return;
+    }
+    let mut keys: Vec<String> = values.iter().map(|entry| entry.key().clone()).collect();
+    keys.sort();
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+    for key in keys {
+        let Some(entry) = values.get(&key) else {
+            continue;
+        };
+        write_smart_routing_histogram_samples(
+            out,
+            name,
+            &format!("{label}=\"{key}\""),
+            entry.value(),
+            buckets,
+        );
+    }
+}
+
+fn write_smart_routing_histogram2(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    labels: [&str; 2],
+    values: &DashMap<(String, String), CompressionHistogram>,
+    buckets: &[f64],
+) {
+    if values.is_empty() {
+        return;
+    }
+    let mut keys: Vec<(String, String)> = values.iter().map(|entry| entry.key().clone()).collect();
+    keys.sort();
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+    for key in keys {
+        let Some(entry) = values.get(&key) else {
+            continue;
+        };
+        write_smart_routing_histogram_samples(
+            out,
+            name,
+            &format!("{}=\"{}\",{}=\"{}\"", labels[0], key.0, labels[1], key.1),
+            entry.value(),
+            buckets,
+        );
+    }
+}
+
+fn write_smart_routing_histogram_samples(
+    out: &mut String,
+    name: &str,
+    labels: &str,
+    histogram: &CompressionHistogram,
+    buckets: &[f64],
+) {
+    let mut cumulative = 0u64;
+    for (index, boundary) in buckets.iter().enumerate() {
+        cumulative = cumulative.saturating_add(histogram.buckets[index].load(Ordering::Relaxed));
+        out.push_str(&format!(
+            "{name}_bucket{{{labels},le=\"{boundary}\"}} {cumulative}\n"
+        ));
+    }
+    let count = histogram.count.load(Ordering::Relaxed);
+    out.push_str(&format!("{name}_bucket{{{labels},le=\"+Inf\"}} {count}\n"));
+    let sum = histogram.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    out.push_str(&format!("{name}_sum{{{labels}}} {sum}\n"));
+    out.push_str(&format!("{name}_count{{{labels}}} {count}\n"));
+}
+
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
@@ -1499,6 +2000,85 @@ impl Default for Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn smart_routing_decision<'a>(group: &'a str) -> SmartRoutingDecisionMetric<'a> {
+        SmartRoutingDecisionMetric {
+            tier: "fast",
+            classifier: "heuristic",
+            group,
+            score: 0.35,
+            estimated_cost_usd: 0.004,
+            classifier_latency_ms: 1.5,
+            task_type: "code_generation",
+            quality: 0.8,
+            context_filtered: true,
+            experiment: Some("control"),
+        }
+    }
+
+    #[test]
+    fn smart_routing_disabled_has_no_state_or_registration() {
+        let metrics = Metrics::new();
+        metrics.record_smart_routing_decision(smart_routing_decision("private-group"));
+        metrics.record_smart_routing_cascade_transition("fast", "balanced");
+        metrics.record_smart_routing_simhash(true);
+        metrics.record_smart_routing_semantic_cache(false);
+
+        assert!(metrics.smart_routing_state().is_none());
+        let mut out = String::new();
+        metrics.write_smart_routing_prometheus(&mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn smart_routing_renders_bounded_labels_and_histograms() {
+        let metrics = Metrics::new();
+        metrics.enable_smart_routing();
+        metrics.record_smart_routing_decision(smart_routing_decision(
+            "tenant/request/content must never become a raw label",
+        ));
+        metrics.record_smart_routing_decision(SmartRoutingDecisionMetric {
+            tier: "unbounded-tier",
+            classifier: "custom-classifier",
+            task_type: "private-task",
+            experiment: Some("secret-experiment-name"),
+            context_filtered: false,
+            ..smart_routing_decision("")
+        });
+        metrics.record_smart_routing_cascade_transition("fast", "balanced");
+        metrics.record_smart_routing_cascade_transition("arbitrary", "powerful");
+        metrics.record_smart_routing_simhash(true);
+        metrics.record_smart_routing_simhash(false);
+        metrics.record_smart_routing_semantic_cache(true);
+        metrics.record_smart_routing_semantic_cache(false);
+
+        let mut out = String::new();
+        metrics.write_smart_routing_prometheus(&mut out);
+
+        assert!(out.contains("obey_api_smart_routing_decisions_total"));
+        assert!(out.contains("tier=\"fast\",classifier=\"heuristic\",group=\"bucket_"));
+        assert!(out.contains(
+            "tier=\"other\",classifier=\"other\",group=\"unknown\",experiment=\"other\""
+        ));
+        assert!(out.contains(
+"obey_api_smart_routing_score_bucket{tier=\"fast\",classifier=\"heuristic\",le=\"0.1\"} 0"
+));
+        assert!(out.contains(
+"obey_api_smart_routing_score_bucket{tier=\"fast\",classifier=\"heuristic\",le=\"0.4\"} 1"
+));
+        assert!(out.contains("obey_api_smart_routing_cascade_transitions_total"));
+        assert!(out.contains("obey_api_smart_routing_estimated_cost_usd"));
+        assert!(out.contains("obey_api_smart_routing_classifier_latency_ms"));
+        assert!(out.contains("obey_api_smart_routing_simhash_total{result=\"hit\"} 1"));
+        assert!(out.contains("obey_api_smart_routing_task_type_total{task_type=\"other\"} 1"));
+        assert!(out.contains("obey_api_smart_routing_quality"));
+        assert!(out.contains("obey_api_smart_routing_semantic_cache_total{result=\"miss\"} 1"));
+        assert!(out.contains("obey_api_smart_routing_context_filtered_total{filtered=\"true\"} 1"));
+        assert!(!out.contains("tenant/request/content"));
+        assert!(!out.contains("secret-experiment-name"));
+        assert!(!out.contains("custom-classifier"));
+        assert!(!out.contains("private-task"));
+    }
 
     #[test]
     fn test_metrics_initialization() {

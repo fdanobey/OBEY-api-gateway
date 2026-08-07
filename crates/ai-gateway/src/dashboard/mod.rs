@@ -197,7 +197,9 @@ impl CompressionEventHub {
     /// so existing dashboard subscribers receive it alongside normal compression
     /// events.
     pub fn publish_tool_compression(&self, event: ToolCompressionEvent) {
-        let tokens_saved = event.original_tokens.saturating_sub(event.compressed_tokens);
+        let tokens_saved = event
+            .original_tokens
+            .saturating_sub(event.compressed_tokens);
         let savings_percent = if event.original_tokens > 0 {
             (tokens_saved as f64 / event.original_tokens as f64) * 100.0
         } else {
@@ -265,11 +267,26 @@ pub fn dashboard_routes(state: AppState) -> Router<AppState> {
         .route("/metrics", get(metrics_handler))
         .route("/errors", get(errors_handler))
         .route("/logs", get(logs_handler))
-        .route("/tool-compression/config", get(tool_compression_config_handler))
-        .route("/tool-compression/overrides", get(tool_compression_overrides_handler))
-        .route("/tool-compression/stats", get(tool_compression_stats_handler))
-        .route("/tool-compression/test", post(tool_compression_test_handler))
-        .route("/tool-compression/activity", get(tool_compression_activity_handler))
+        .route(
+            "/tool-compression/config",
+            get(tool_compression_config_handler),
+        )
+        .route(
+            "/tool-compression/overrides",
+            get(tool_compression_overrides_handler),
+        )
+        .route(
+            "/tool-compression/stats",
+            get(tool_compression_stats_handler),
+        )
+        .route(
+            "/tool-compression/test",
+            post(tool_compression_test_handler),
+        )
+        .route(
+            "/tool-compression/activity",
+            get(tool_compression_activity_handler),
+        )
         .route("/", get(index_handler))
         .route("/{*path}", get(static_handler))
 }
@@ -528,14 +545,22 @@ fn mime_from_path(path: &str) -> &'static str {
 async fn tool_compression_config_handler(State(state): State<AppState>) -> Response {
     let config = state.config.read().await;
     let tc_config = &config.tool_compression;
-    (StatusCode::OK, Json(serde_json::to_value(tc_config).unwrap_or_default())).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(tc_config).unwrap_or_default()),
+    )
+        .into_response()
 }
 
 /// GET /dashboard/tool-compression/overrides — serve per-model-group overrides.
 async fn tool_compression_overrides_handler(State(state): State<AppState>) -> Response {
     let config = state.config.read().await;
     let overrides = &config.tool_compression.model_group_overrides;
-    (StatusCode::OK, Json(serde_json::to_value(overrides).unwrap_or_default())).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(overrides).unwrap_or_default()),
+    )
+        .into_response()
 }
 
 /// GET /dashboard/tool-compression/stats — serve real-time compression statistics.
@@ -893,6 +918,9 @@ mod tests {
                     cost_per_million_output_tokens: 0.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -912,6 +940,7 @@ mod tests {
             loop_detection: Default::default(),
             guardrails: None,
             tool_compression: Default::default(),
+            smart_routing: Default::default(),
             memory: None,
         }
     }

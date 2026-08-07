@@ -118,6 +118,9 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
                 cost_per_million_output_tokens: 60.0,
                 priority: 100,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -139,6 +142,7 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
         loop_detection: Default::default(),
         guardrails: None,
         tool_compression: Default::default(),
+        smart_routing: Default::default(),
         structured_output: None,
         memory: None,
     }

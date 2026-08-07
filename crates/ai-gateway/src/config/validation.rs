@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::guardrail::GuardrailConfig;
 use crate::memory::MemoryConfigError;
 use crate::secrets;
+use crate::smart_routing::config::MAX_CONTEXT_WINDOW_TOKENS;
 use crate::structured_output::config::StructuredOutputConfigError;
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../config.example.yaml");
@@ -191,6 +192,40 @@ impl Config {
             .iter()
             .map(|provider| provider.name.as_str())
             .collect();
+        let configured_model_group_names: std::collections::HashSet<&str> = self
+            .model_groups
+            .iter()
+            .map(|group| group.name.as_str())
+            .collect();
+
+        if let Err(smart_routing_errors) = self.smart_routing.validate() {
+            errors.extend(smart_routing_errors.into_iter().map(|error| {
+                ValidationError::InvalidValue {
+                    field: format!("smart_routing.{}", error.field),
+                    value: error.message,
+                    expected: "a valid smart routing configuration".to_string(),
+                }
+            }));
+        }
+
+        for group in self.smart_routing.model_group_overrides.keys() {
+            if !configured_model_group_names.contains(group.as_str()) {
+                errors.push(ValidationError::InvalidValue {
+                    field: format!("smart_routing.model_group_overrides.{group}"),
+                    value: group.clone(),
+                    expected: "the exact name of a configured model group".to_string(),
+                });
+            }
+        }
+        for group in self.smart_routing.budget_limits.keys() {
+            if !configured_model_group_names.contains(group.as_str()) {
+                errors.push(ValidationError::InvalidValue {
+                    field: format!("smart_routing.budget_limits.{group}"),
+                    value: group.clone(),
+                    expected: "the exact name of a configured model group".to_string(),
+                });
+            }
+        }
 
         if let Some(memory) = &self.memory {
             self.validate_memory_config("memory", memory.validate(), &mut errors);
@@ -492,6 +527,32 @@ impl Config {
                     errors.push(ValidationError::MissingModelField {
                         group: group.name.clone(),
                     });
+                }
+                if model.context_window > MAX_CONTEXT_WINDOW_TOKENS {
+                    errors.push(ValidationError::InvalidValue {
+                        field: format!(
+                            "model_groups.{}.models.{}.context_window",
+                            group.name, model.model
+                        ),
+                        value: model.context_window.to_string(),
+                        expected: format!(
+                            "0 for unknown, or a token count in 1..={MAX_CONTEXT_WINDOW_TOKENS}"
+                        ),
+                    });
+                }
+
+                let mut specializations = std::collections::HashSet::new();
+                for specialization in &model.specializations {
+                    if !specializations.insert(*specialization) {
+                        errors.push(ValidationError::InvalidValue {
+                            field: format!(
+                                "model_groups.{}.models.{}.specializations",
+                                group.name, model.model
+                            ),
+                            value: format!("duplicate {specialization:?}"),
+                            expected: "each task type at most once".to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -916,6 +977,9 @@ mod property_tests {
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -936,7 +1000,66 @@ mod property_tests {
             structured_output: None,
             guardrails: None,
             tool_compression: Default::default(),
+            smart_routing: Default::default(),
         }
+    }
+
+    #[test]
+    fn smart_routing_unknown_group_keys_are_rejected() {
+        let mut config = minimal_valid_config();
+        config.smart_routing.model_group_overrides.insert(
+            "missing-override".to_string(),
+            crate::smart_routing::config::SmartRoutingOverride::default(),
+        );
+        config.smart_routing.budget_limits.insert(
+            "missing-budget".to_string(),
+            crate::smart_routing::config::BudgetLimits {
+                hourly_limit_usd: Some(1.0),
+                ..Default::default()
+            },
+        );
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, .. }
+                if field == "smart_routing.model_group_overrides.missing-override"
+        )));
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, .. }
+                if field == "smart_routing.budget_limits.missing-budget"
+        )));
+    }
+
+    #[test]
+    fn provider_model_context_and_duplicate_specializations_are_rejected() {
+        let mut config = minimal_valid_config();
+        let model = &mut config.model_groups[0].models[0];
+        model.context_window = MAX_CONTEXT_WINDOW_TOKENS + 1;
+        model.specializations = vec![
+            crate::smart_routing::tier::TaskType::CodeGeneration,
+            crate::smart_routing::tier::TaskType::CodeGeneration,
+        ];
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, .. } if field.ends_with(".context_window")
+        )));
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, .. } if field.ends_with(".specializations")
+        )));
+    }
+
+    #[test]
+    fn provider_model_zero_and_plausible_context_windows_are_valid() {
+        let mut config = minimal_valid_config();
+        config.model_groups[0].models[0].context_window = 0;
+        assert!(config.validate().is_ok());
+        config.model_groups[0].models[0].context_window = 1_000_000;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

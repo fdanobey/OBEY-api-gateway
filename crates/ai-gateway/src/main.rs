@@ -17,9 +17,9 @@ mod codex;
 #[allow(dead_code, unused_imports)]
 mod compression;
 mod config;
-mod description_utils;
 mod context;
 mod dashboard;
+mod description_utils;
 mod error;
 mod gateway;
 mod guardrail;
@@ -34,6 +34,8 @@ mod oauth;
 mod providers;
 mod router;
 mod secrets;
+#[allow(dead_code, unused_imports)]
+mod smart_routing;
 #[allow(dead_code, unused_imports)]
 mod structured_output;
 #[allow(dead_code, unused_imports)]

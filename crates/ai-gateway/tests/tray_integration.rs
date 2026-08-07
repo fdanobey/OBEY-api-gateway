@@ -69,6 +69,9 @@ fn test_config() -> Config {
                 cost_per_million_output_tokens: 0.0,
                 priority: 100,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             }],
         }],
         circuit_breaker: Default::default(),
@@ -87,6 +90,7 @@ fn test_config() -> Config {
         virtual_keys: Default::default(),
         guardrails: None,
         tool_compression: Default::default(),
+        smart_routing: Default::default(),
         structured_output: None,
     }
 }

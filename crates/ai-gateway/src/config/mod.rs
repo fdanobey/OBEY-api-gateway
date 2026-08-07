@@ -8,6 +8,8 @@ use crate::compression::config::{
 use crate::guardrail::GuardrailConfig;
 use crate::memory::{MemoryConfig, ModelGroupMemoryOverride, ProviderMemoryOverride};
 use crate::secrets;
+use crate::smart_routing::config::SmartRoutingConfig;
+use crate::smart_routing::tier::{SmartRoutingTier, TaskType};
 use crate::structured_output::config::{StructuredOutputConfig, StructuredOutputOverride};
 use crate::tool_compression::config::ToolCompressionConfig;
 
@@ -113,6 +115,9 @@ pub struct Config {
     /// [`crate::tool_compression::config::ToolCompressionConfig`].
     #[serde(default)]
     pub tool_compression: ToolCompressionConfig,
+    /// Complexity- and task-aware model routing. Disabled by default.
+    #[serde(default)]
+    pub smart_routing: SmartRoutingConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -675,6 +680,15 @@ pub struct ProviderModel {
     /// this provider/model entry. `None` defers to higher-level policy.
     #[serde(default)]
     pub structured_output_passthrough: Option<bool>,
+    /// Optional smart-routing capability tier. `None` preserves legacy routing.
+    #[serde(default)]
+    pub tier: Option<SmartRoutingTier>,
+    /// Maximum model context in tokens. `0` means unknown capacity.
+    #[serde(default)]
+    pub context_window: u32,
+    /// Task categories this model should be preferred for within its tier.
+    #[serde(default)]
+    pub specializations: Vec<TaskType>,
 }
 
 fn default_priority() -> u32 {
@@ -1198,12 +1212,41 @@ structured_output:
         let model: ProviderModel =
             serde_yaml::from_str("provider: openai\nmodel: gpt-4o\n").unwrap();
         assert_eq!(model.structured_output_passthrough, None);
+        assert_eq!(model.tier, None);
+        assert_eq!(model.context_window, 0);
+        assert!(model.specializations.is_empty());
 
         let group: ModelGroup = serde_yaml::from_str(
             "name: default\nmodels:\n  - provider: openai\n    model: gpt-4o\n",
         )
         .unwrap();
         assert_eq!(group.structured_output, None);
+    }
+
+    #[test]
+    fn provider_model_smart_routing_fields_deserialize_and_default() {
+        let legacy: ProviderModel =
+            serde_yaml::from_str("provider: openai\nmodel: gpt-4o\n").unwrap();
+        assert_eq!(legacy.tier, None);
+        assert_eq!(legacy.context_window, 0);
+        assert!(legacy.specializations.is_empty());
+
+        let configured: ProviderModel = serde_yaml::from_str(
+            r#"
+provider: openai
+model: gpt-4o
+tier: balanced
+context_window: 128000
+specializations: [code_generation, factual_qa]
+"#,
+        )
+        .unwrap();
+        assert_eq!(configured.tier, Some(SmartRoutingTier::Balanced));
+        assert_eq!(configured.context_window, 128_000);
+        assert_eq!(
+            configured.specializations,
+            vec![TaskType::CodeGeneration, TaskType::FactualQA]
+        );
     }
 
     #[test]

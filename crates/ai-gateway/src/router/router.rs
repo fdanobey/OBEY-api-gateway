@@ -20,6 +20,10 @@ use crate::providers::bedrock::{
     normalize_mantle_chat_messages, sanitize_mantle_chat_request, BedrockProvider,
 };
 use crate::providers::{ProviderClient, ProviderResponse};
+use crate::smart_routing::budget_controller::BudgetController;
+use crate::smart_routing::{
+    PinnedRoutingContext, RoutingPlanOutcome, RoutingPlanningError, SmartRouter, SmartRoutingInput,
+};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::error::Error as StdError;
@@ -39,6 +43,37 @@ struct CompressionRuntime {
 
 use super::{CircuitBreaker, LatencyTracker, RateLimiter};
 
+fn smart_routing_tier_name(tier: crate::smart_routing::tier::SmartRoutingTier) -> &'static str {
+    match tier {
+        crate::smart_routing::tier::SmartRoutingTier::Fast => "fast",
+        crate::smart_routing::tier::SmartRoutingTier::Balanced => "balanced",
+        crate::smart_routing::tier::SmartRoutingTier::Powerful => "powerful",
+    }
+}
+
+fn smart_routing_classifier_name(
+    classifier: crate::smart_routing::tier::ClassifierUsed,
+) -> &'static str {
+    match classifier {
+        crate::smart_routing::tier::ClassifierUsed::Heuristic => "heuristic",
+        crate::smart_routing::tier::ClassifierUsed::Ml => "ml",
+        crate::smart_routing::tier::ClassifierUsed::Llm => "llm",
+        crate::smart_routing::tier::ClassifierUsed::Composite => "composite",
+    }
+}
+
+fn smart_routing_task_name(task: crate::smart_routing::tier::TaskType) -> &'static str {
+    match task {
+        crate::smart_routing::tier::TaskType::CodeGeneration => "code_generation",
+        crate::smart_routing::tier::TaskType::MathReasoning => "math_reasoning",
+        crate::smart_routing::tier::TaskType::CreativeWriting => "creative_writing",
+        crate::smart_routing::tier::TaskType::FactualQA => "factual_qa",
+        crate::smart_routing::tier::TaskType::ToolUse => "tool_use",
+        crate::smart_routing::tier::TaskType::Summarization => "summarization",
+        crate::smart_routing::tier::TaskType::General => "general",
+    }
+}
+
 /// Intelligent router for provider selection and request routing
 pub struct Router {
     config: Arc<RwLock<Config>>,
@@ -54,6 +89,9 @@ pub struct Router {
     compression_events: Option<Arc<CompressionEventHub>>,
     /// Shared metrics for recording provider-level stats
     metrics: Arc<crate::metrics::Metrics>,
+    /// Atomically swappable Smart Router snapshot. Requests clone one snapshot
+    /// before classification, so reload never changes an in-flight decision.
+    smart_router: Arc<std::sync::RwLock<Option<Arc<SmartRouter>>>>,
     /// Hot-reloadable memory snapshot used by the compression heuristic hook.
     memory_system: Option<Arc<RwLock<Option<Arc<MemorySystem>>>>>,
     /// OAuth session manager used when a provider is configured with
@@ -103,12 +141,106 @@ pub enum StreamingResponse {
 }
 
 impl Router {
+    fn build_smart_router(
+        smart_routing_config: crate::smart_routing::config::SmartRoutingConfig,
+    ) -> Option<Arc<SmartRouter>> {
+        if !smart_routing_config.enabled {
+            return None;
+        }
+        SmartRouter::new(smart_routing_config.clone())
+            .map(|router| {
+                let mut router = router;
+                #[cfg(feature = "ml-router")]
+                if matches!(
+                    smart_routing_config.classifier,
+                    crate::smart_routing::config::ClassifierMode::Ml
+                        | crate::smart_routing::config::ClassifierMode::Composite
+                ) {
+                    if let Some(ml_model_path) = &smart_routing_config.ml_model_path {
+                        match crate::smart_routing::ml_classifier::OnnxMlAdapter::load(ml_model_path)
+                        {
+                            Ok(adapter) => {
+                                router = router.with_ml_classifier(Arc::new(adapter));
+                                tracing::info!(
+                                    path = %ml_model_path,
+                                    "Smart-routing ONNX ML classifier loaded"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    path = %ml_model_path,
+                                    "Smart-routing ONNX ML classifier unavailable; falling back to heuristic"
+                                );
+                            }
+                        }
+                    }
+                }
+                if smart_routing_config.budget_limits.is_empty() {
+                    return router;
+                }
+                let state_path = smart_routing_config
+                    .online_optimizer
+                    .state_path
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("smart_routing_state.json"))
+                    .with_extension("budget.json");
+                match BudgetController::load(state_path) {
+                    Ok(controller) => router.with_budget(Arc::new(controller)),
+                    Err(error) => {
+                        warn!(error = %error, "Smart-routing budget state unavailable; budget checks remain conservatively unavailable");
+                        router
+                    }
+                }
+            })
+            .map(Arc::new)
+            .map_err(|error| tracing::error!(error = %error, "Failed to initialize Smart Router"))
+            .ok()
+    }
+
+    pub fn reload_smart_router(
+        &self,
+        config: crate::smart_routing::config::SmartRoutingConfig,
+    ) -> Result<(), String> {
+        let replacement = if config.enabled {
+            Self::build_smart_router(config.clone())
+                .ok_or_else(|| "failed to initialize Smart Router replacement".to_string())?
+                .into()
+        } else {
+            None
+        };
+        if config.enabled {
+            self.metrics.enable_smart_routing();
+        }
+        *self
+            .smart_router
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
+        Ok(())
+    }
+
+    fn smart_router_snapshot(&self) -> Option<Arc<SmartRouter>> {
+        self.smart_router
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Create a new Router with the given configuration
     pub fn new(config: Arc<RwLock<Config>>, metrics: Arc<crate::metrics::Metrics>) -> Self {
-        let (context_config, compression_config) = {
+        let (context_config, compression_config, smart_routing_config) = {
             let cfg = config.try_read().expect("config lock");
-            (cfg.context.clone(), cfg.compression.clone())
+            (
+                cfg.context.clone(),
+                cfg.compression.clone(),
+                cfg.smart_routing.clone(),
+            )
         };
+        let smart_router = Self::build_smart_router(smart_routing_config.clone());
+        if smart_routing_config.enabled {
+            metrics.enable_smart_routing();
+        }
         Self {
             config,
             circuit_breakers: Arc::new(DashMap::new()),
@@ -122,6 +254,7 @@ impl Router {
             })),
             compression_events: None,
             metrics,
+            smart_router: Arc::new(std::sync::RwLock::new(smart_router)),
             memory_system: None,
             oauth_manager: None,
             instructions_store: None,
@@ -137,10 +270,14 @@ impl Router {
         context_config: ContextConfig,
         metrics: Arc<crate::metrics::Metrics>,
     ) -> Self {
-        let compression_config = {
+        let (compression_config, smart_routing_config) = {
             let cfg = config.try_read().expect("config lock");
-            cfg.compression.clone()
+            (cfg.compression.clone(), cfg.smart_routing.clone())
         };
+        let smart_router = Self::build_smart_router(smart_routing_config.clone());
+        if smart_routing_config.enabled {
+            metrics.enable_smart_routing();
+        }
         Self {
             config,
             circuit_breakers: Arc::new(DashMap::new()),
@@ -154,6 +291,7 @@ impl Router {
             })),
             compression_events: None,
             metrics,
+            smart_router: Arc::new(std::sync::RwLock::new(smart_router)),
             memory_system: None,
             oauth_manager: None,
             instructions_store: None,
@@ -256,7 +394,13 @@ impl Router {
         provider_model: &ProviderModel,
         request_id: &str,
     ) -> (OpenAIRequest, CompressionStats) {
-        let (global_config, provider_override, prompt_caching_enabled, default_context_window, tool_compression_enabled) = {
+        let (
+            global_config,
+            provider_override,
+            prompt_caching_enabled,
+            default_context_window,
+            tool_compression_enabled,
+        ) = {
             let config = self.config.read().await;
             let provider = config
                 .providers
@@ -769,6 +913,52 @@ impl Router {
             "Model '{}' not found in any model group",
             model
         )))
+    }
+
+    async fn smart_routing_plan(
+        &self,
+        request: &OpenAIRequest,
+        model_group: &ModelGroup,
+    ) -> Result<Option<crate::smart_routing::CandidatePlan>, GatewayError> {
+        let Some(smart_router) = self.smart_router_snapshot() else {
+            return Ok(None);
+        };
+        let pinned_model = (request.model != model_group.name).then(|| request.model.clone());
+        let pinned_context = PinnedRoutingContext {
+            model: pinned_model,
+            ..PinnedRoutingContext::default()
+        };
+        let input = SmartRoutingInput {
+            request_id: request
+                .extra
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unavailable"),
+            request,
+            model_group,
+            pinned_context: &pinned_context,
+        };
+        match smart_router.plan(&input).await {
+            Ok(RoutingPlanOutcome::Route(plan)) => Ok(Some(plan)),
+            Ok(RoutingPlanOutcome::CacheHit(_)) => Err(GatewayError::Cache(
+                "smart-routing semantic cache payload integration is unavailable".to_string(),
+            )),
+            Ok(RoutingPlanOutcome::BudgetRejected(rejection)) => {
+                Err(GatewayError::SmartRoutingBudgetExceeded {
+                    period: format!("{:?}", rejection.reason).to_ascii_lowercase(),
+                })
+            }
+            Err(RoutingPlanningError::ContextCapacity(error)) => {
+                Err(GatewayError::ContextCapacityExceeded {
+                    estimated_requirement: error.estimated_requirement,
+                    largest_supported_context: error.largest_known_context,
+                })
+            }
+            Err(RoutingPlanningError::NoCandidates) => Err(GatewayError::InvalidRequest(
+                "No models are configured for the requested model group".to_string(),
+            )),
+            Err(RoutingPlanningError::DisabledForModelGroup) => Ok(None),
+        }
     }
 
     /// Select provider order based on priority, cost, latency, and availability
@@ -4770,6 +4960,17 @@ impl Router {
         let model_group = self.find_model_group(&prepared_request.model).await?;
         debug!(group = %model_group.name, "Found model group");
 
+        let (model_group, mut routing_decision, routing_bypassed) = if let Some(plan) = self
+            .smart_routing_plan(&prepared_request, &model_group)
+            .await?
+        {
+            let mut filtered_group = model_group.clone();
+            filtered_group.models = plan.candidates;
+            (filtered_group, Some(plan.decision), plan.bypassed)
+        } else {
+            (model_group, None, true)
+        };
+
         // Select provider order
         let providers = self.select_provider_order(&model_group).await;
         debug!(count = providers.len(), "Selected providers");
@@ -4780,10 +4981,83 @@ impl Router {
             ));
         }
 
-        // Route with failover
-        let response = self
+        // Route with failover and bounded response-quality cascade.
+        let original_request = prepared_request.clone();
+        let mut response = self
             .route_with_failover_for_group(&prepared_request, &model_group, providers)
             .await?;
+        if let (Some(smart_router), Some(decision)) =
+            (self.smart_router_snapshot(), routing_decision.as_mut())
+        {
+            let cascade_config = smart_router.cascade_config();
+            while cascade_config.enabled {
+                let failed = smart_router.cascade_evaluator().is_failure_signal(
+                    crate::smart_routing::cascade::CascadeEvaluationInput::response(
+                        &original_request,
+                        &response,
+                    ),
+                    cascade_config,
+                );
+                let Some(_failure) = failed else {
+                    break;
+                };
+                let Some(next_tier) = crate::smart_routing::cascade::CascadeEvaluator::next_tier(
+                    decision.tier,
+                    decision.escalation_count,
+                    cascade_config.max_escalations,
+                ) else {
+                    break;
+                };
+                let context_safe_group = self.find_model_group(&original_request.model).await?;
+                let next = smart_router.filter_by_tier(
+                    &context_safe_group,
+                    next_tier,
+                    decision.task_type,
+                    None,
+                );
+                if next.bypassed || next.model_group.models.is_empty() {
+                    break;
+                }
+                let escalated_providers = self.select_provider_order(&next.model_group).await;
+                if escalated_providers.is_empty() {
+                    break;
+                }
+                response = self
+                    .route_with_failover_for_group(
+                        &original_request,
+                        &next.model_group,
+                        escalated_providers,
+                    )
+                    .await?;
+                self.metrics.record_smart_routing_cascade_transition(
+                    smart_routing_tier_name(decision.tier),
+                    smart_routing_tier_name(next_tier),
+                );
+                decision.tier = next_tier;
+                decision.escalated = true;
+                decision.escalation_count = decision.escalation_count.saturating_add(1);
+            }
+        }
+        if let Some(decision) = routing_decision.filter(|_| !routing_bypassed) {
+            self.metrics.record_smart_routing_decision(
+                crate::metrics::SmartRoutingDecisionMetric {
+                    tier: smart_routing_tier_name(decision.tier),
+                    classifier: smart_routing_classifier_name(decision.classifier),
+                    group: &model_group.name,
+                    score: decision.score.value(),
+                    estimated_cost_usd: 0.0,
+                    classifier_latency_ms: 0.0,
+                    task_type: smart_routing_task_name(decision.task_type),
+                    quality: 0.0,
+                    context_filtered: decision.context_filtered,
+                    experiment: None,
+                },
+            );
+            response.extra.insert(
+                "gateway_smart_routing".to_string(),
+                serde_json::to_value(decision).unwrap_or(serde_json::Value::Null),
+            );
+        }
 
         Ok(response)
     }
@@ -4882,6 +5156,16 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
 
         // Model group + provider order (same selection path as route_request).
         let model_group = self.find_model_group(&prepared_request.model).await?;
+        let routing_plan = self
+            .smart_routing_plan(&prepared_request, &model_group)
+            .await?;
+        let (model_group, routing_decision, routing_bypassed) = if let Some(plan) = routing_plan {
+            let mut filtered_group = model_group.clone();
+            filtered_group.models = plan.candidates;
+            (filtered_group, Some(plan.decision), plan.bypassed)
+        } else {
+            (model_group, None, true)
+        };
         let providers = self.select_provider_order(&model_group).await;
         if providers.is_empty() {
             return Err(GatewayError::InvalidRequest(
@@ -4890,7 +5174,9 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         }
 
         // Pass-through disabled globally → buffer the whole request.
-        if !streaming_config.passthrough_enabled {
+        if !streaming_config.passthrough_enabled
+            || (routing_decision.is_some() && !routing_bypassed)
+        {
             debug!("Streaming pass-through disabled, using buffered path");
             return Ok(StreamingResponse::Buffered(
                 self.route_request(request).await?,
@@ -5371,6 +5657,7 @@ mod tests {
             loop_detection: Default::default(),
             guardrails: None,
             tool_compression: Default::default(),
+            smart_routing: Default::default(),
             memory: None,
         }
     }
@@ -5419,6 +5706,9 @@ mod tests {
             cost_per_million_output_tokens: 0.0,
             priority,
             structured_output_passthrough: None,
+            tier: None,
+            context_window: 0,
+            specializations: vec![],
         }
     }
 
@@ -6124,6 +6414,9 @@ mod tests {
                 cost_per_million_output_tokens: 30.0,
                 priority: 100,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             }],
         }];
 
@@ -6160,6 +6453,9 @@ mod tests {
                     cost_per_million_output_tokens: 30.0,
                     priority: 200,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
                 ProviderModel {
                     provider: "provider-high-priority".to_string(),
@@ -6168,6 +6464,9 @@ mod tests {
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
             ],
         }];
@@ -6198,6 +6497,9 @@ mod tests {
                     cost_per_million_output_tokens: 60.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
                 ProviderModel {
                     provider: "cheap-provider".to_string(),
@@ -6206,6 +6508,9 @@ mod tests {
                     cost_per_million_output_tokens: 15.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
             ],
         }];
@@ -6236,6 +6541,9 @@ mod tests {
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
                 ProviderModel {
                     provider: "fast-provider".to_string(),
@@ -6244,6 +6552,9 @@ mod tests {
                     cost_per_million_output_tokens: 31.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
             ],
         }];
@@ -6265,6 +6576,32 @@ mod tests {
         // Costs are within 10%, so should sort by latency
         assert_eq!(order[0].provider, "fast-provider");
         assert_eq!(order[1].provider, "slow-provider");
+    }
+
+    #[tokio::test]
+    async fn disabled_smart_routing_preserves_provider_order() {
+        let mut config = create_test_config();
+        assert!(!config.smart_routing.enabled);
+        let group = test_group(vec![test_model("slow", 20), test_model("fast", 10)]);
+        config.model_groups.push(group.clone());
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        assert!(router.smart_router_snapshot().is_none());
+
+        let direct = router.select_provider_order(&group).await;
+        let request = OpenAIRequest {
+            model: group.name.clone(),
+            messages: vec![],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: serde_json::Map::new(),
+        };
+        assert!(router
+            .smart_routing_plan(&request, &group)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(direct, router.select_provider_order(&group).await);
     }
 
     #[tokio::test]
@@ -6298,6 +6635,9 @@ mod tests {
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
                 ProviderModel {
                     provider: "provider-2".to_string(),
@@ -6306,6 +6646,9 @@ mod tests {
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
                 ProviderModel {
                     provider: "provider-3".to_string(),
@@ -6314,6 +6657,9 @@ mod tests {
                     cost_per_million_output_tokens: 30.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
             ],
         }];
@@ -6427,6 +6773,9 @@ mod tests {
             cost_per_million_output_tokens: 0.0,
             priority: 100,
             structured_output_passthrough: None,
+            tier: None,
+            context_window: 0,
+            specializations: vec![],
         }];
         config.model_groups = vec![ModelGroup {
             name: "test-group".to_string(),
@@ -6545,6 +6894,9 @@ mod property_tests {
                     cost_per_million_output_tokens: output_cost,
                     priority,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 }
             })
     }
@@ -6710,6 +7062,9 @@ mod property_tests {
                 cost_per_million_output_tokens: 30.0,
                 priority: 100,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             }],
         };
 
@@ -6734,6 +7089,9 @@ mod property_tests {
                 cost_per_million_output_tokens: 30.0,
                 priority: 100,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             }],
         };
 
@@ -7138,6 +7496,9 @@ mod property_tests {
                     cost_per_million_output_tokens: 30.0,
                     priority: 1,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
                 ProviderModel {
                     provider: "backup".to_string(),
@@ -7146,6 +7507,9 @@ mod property_tests {
                     cost_per_million_output_tokens: 31.0,
                     priority: 2,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 },
             ],
         };

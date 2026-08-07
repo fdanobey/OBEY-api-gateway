@@ -46,17 +46,20 @@ pub fn routes<S>(state: impl Into<MemoryAdminState>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-Router::new()
-.route("/entries", get(list_entries).post(create_entry))
-.route("/entries/{id}", axum::routing::delete(delete_entry))
-.route(
-"/namespaces/{namespace}",
-axum::routing::delete(clear_namespace),
-)
-.route("/stats", get(stats))
-.route("/projects", get(projects))
-.route("/qdrant/collection", axum::routing::delete(recreate_qdrant_collection))
-.with_state(state.into())
+    Router::new()
+        .route("/entries", get(list_entries).post(create_entry))
+        .route("/entries/{id}", axum::routing::delete(delete_entry))
+        .route(
+            "/namespaces/{namespace}",
+            axum::routing::delete(clear_namespace),
+        )
+        .route("/stats", get(stats))
+        .route("/projects", get(projects))
+        .route(
+            "/qdrant/collection",
+            axum::routing::delete(recreate_qdrant_collection),
+        )
+        .with_state(state.into())
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,82 +208,84 @@ async fn stats(State(state): State<MemoryAdminState>) -> Response {
 }
 
 async fn projects(State(state): State<MemoryAdminState>) -> Response {
-let system = match resolve_system(&state).await {
-Ok(system) => system,
-Err(response) => return response,
-};
-match system.store.list_project_namespaces() {
-Ok(projects) => Json(Value::Array(
-projects
-.into_iter()
-.map(|project| {
-json!({
-"namespace": project.namespace,
-"entry_count": project.entry_count,
-"last_activity": project.last_activity,
-})
-})
-.collect(),
-))
-.into_response(),
-Err(error) => memory_error(error),
-}
+    let system = match resolve_system(&state).await {
+        Ok(system) => system,
+        Err(response) => return response,
+    };
+    match system.store.list_project_namespaces() {
+        Ok(projects) => Json(Value::Array(
+            projects
+                .into_iter()
+                .map(|project| {
+                    json!({
+                    "namespace": project.namespace,
+                    "entry_count": project.entry_count,
+                    "last_activity": project.last_activity,
+                    })
+                })
+                .collect(),
+        ))
+        .into_response(),
+        Err(error) => memory_error(error),
+    }
 }
 
 async fn recreate_qdrant_collection(State(state): State<MemoryAdminState>) -> Response {
-let system = match resolve_system(&state).await {
-Ok(system) => system,
-Err(response) => return response,
-};
-let qdrant_config = match system.config.read().await.qdrant.clone() {
-Some(config) => config,
-None => return error_response(
-StatusCode::BAD_REQUEST,
-"Qdrant is not configured in memory settings",
-"not_configured",
-),
-};
-let qdrant_url = super::vector::normalize_qdrant_url(&qdrant_config.qdrant_url);
-let qdrant = match qdrant_client::Qdrant::from_url(&qdrant_url).build() {
-Ok(client) => client,
-Err(error) => {
-return error_response(
-StatusCode::INTERNAL_SERVER_ERROR,
-&format!("Failed to create Qdrant client: {error}"),
-"qdrant_client_error",
-);
-}
-};
-let collection = &qdrant_config.qdrant_collection;
-match qdrant.collection_exists(collection).await {
-Ok(exists) => {
-if exists {
-if let Err(error) = qdrant.delete_collection(collection).await {
-return error_response(
-StatusCode::INTERNAL_SERVER_ERROR,
-&format!("Failed to delete Qdrant collection: {error}"),
-"qdrant_delete_error",
-);
-}
-}
-}
-Err(error) => {
-return error_response(
-StatusCode::INTERNAL_SERVER_ERROR,
-&format!("Failed to check Qdrant collection: {error}"),
-"qdrant_check_error",
-);
-}
-}
-let providers = system.config.read().await;
-let provider_config = system.config.read().await;
-drop(providers);
-let _ = provider_config;
-system.set_vector_tier(None).await;
-if let Err(error) = system.store.mark_all_vector_entries_pending() {
-tracing::warn!(error = %error, "Failed to mark vector entries pending after collection recreation");
-}
-(
+    let system = match resolve_system(&state).await {
+        Ok(system) => system,
+        Err(response) => return response,
+    };
+    let qdrant_config = match system.config.read().await.qdrant.clone() {
+        Some(config) => config,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Qdrant is not configured in memory settings",
+                "not_configured",
+            )
+        }
+    };
+    let qdrant_url = super::vector::normalize_qdrant_url(&qdrant_config.qdrant_url);
+    let qdrant = match qdrant_client::Qdrant::from_url(&qdrant_url).build() {
+        Ok(client) => client,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create Qdrant client: {error}"),
+                "qdrant_client_error",
+            );
+        }
+    };
+    let collection = &qdrant_config.qdrant_collection;
+    match qdrant.collection_exists(collection).await {
+        Ok(exists) => {
+            if exists {
+                if let Err(error) = qdrant.delete_collection(collection).await {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("Failed to delete Qdrant collection: {error}"),
+                        "qdrant_delete_error",
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to check Qdrant collection: {error}"),
+                "qdrant_check_error",
+            );
+        }
+    }
+    let providers = system.config.read().await;
+    let provider_config = system.config.read().await;
+    drop(providers);
+    let _ = provider_config;
+    system.set_vector_tier(None).await;
+    if let Err(error) = system.store.mark_all_vector_entries_pending() {
+        tracing::warn!(error = %error, "Failed to mark vector entries pending after collection recreation");
+    }
+    (
 StatusCode::OK,
 Json(json!({
 "message": format!("Qdrant collection '{}' recreated successfully. Reload config or restart gateway to reinitialize vector tier.", collection)

@@ -36,10 +36,7 @@ impl DescriptionCompressor {
     /// For `Tfidf` method: builds vocabulary from tool parameters and scores
     /// description tokens for importance, removing parameter-redundant tokens.
     /// For `Manual` method: uses descriptions from config directly.
-    pub fn new(
-        config: &PrecomputedDescriptionsConfig,
-        tools: &[ToolDefinition],
-    ) -> Self {
+    pub fn new(config: &PrecomputedDescriptionsConfig, tools: &[ToolDefinition]) -> Self {
         let compressed = Arc::new(DashMap::new());
         let originals = Arc::new(DashMap::new());
 
@@ -165,7 +162,8 @@ impl DescriptionCompressor {
             let Some(description) = extract_description(&tool.raw) else {
                 continue;
             };
-            self.originals.insert(tool.name.clone(), description.clone());
+            self.originals
+                .insert(tool.name.clone(), description.clone());
 
             let (param_names, param_types) = extract_param_vocab(&tool.raw);
             let param_name_refs: Vec<&str> = param_names.iter().map(|s| s.as_str()).collect();
@@ -185,11 +183,7 @@ impl DescriptionCompressor {
 }
 
 impl CompressionStage for DescriptionCompressor {
-    fn apply(
-        &self,
-        tools: &mut Vec<ToolDefinition>,
-        ctx: &mut CompressionContext,
-    ) -> u64 {
+    fn apply(&self, tools: &mut Vec<ToolDefinition>, ctx: &mut CompressionContext) -> u64 {
         let mut tokens_saved: u64 = 0;
 
         for tool in tools.iter_mut() {
@@ -321,10 +315,7 @@ mod tests {
     fn make_tool(name: &str, desc: &str, params: &[(&str, &str)]) -> ToolDefinition {
         let mut properties = serde_json::Map::new();
         for (pname, ptype) in params {
-            properties.insert(
-                pname.to_string(),
-                serde_json::json!({"type": ptype}),
-            );
+            properties.insert(pname.to_string(), serde_json::json!({"type": ptype}));
         }
         let raw = serde_json::json!({
             "type": "function",
@@ -355,10 +346,17 @@ mod tests {
                 m
             },
         };
-        let tools = vec![make_tool("search_repos", "Search for repositories by name", &[("query", "string")])];
+        let tools = vec![make_tool(
+            "search_repos",
+            "Search for repositories by name",
+            &[("query", "string")],
+        )];
         let dc = DescriptionCompressor::new(&config, &tools);
 
-        assert_eq!(dc.get_compressed("search_repos"), Some("Search repos".to_string()));
+        assert_eq!(
+            dc.get_compressed("search_repos"),
+            Some("Search repos".to_string())
+        );
     }
 
     #[test]
@@ -372,7 +370,11 @@ mod tests {
             make_tool(
                 "search_repos",
                 "Search for GitHub repositories by name, language, and star count",
-                &[("query", "string"), ("language", "string"), ("min_stars", "integer")],
+                &[
+                    ("query", "string"),
+                    ("language", "string"),
+                    ("min_stars", "integer"),
+                ],
             ),
             make_tool(
                 "send_message",
@@ -388,7 +390,10 @@ mod tests {
         let original = dc.get_original("search_repos").unwrap();
         let comp = compressed.unwrap();
         // The compressed version should not be longer than original
-        assert!(comp.len() <= original.len() || comp.split_whitespace().count() <= original.split_whitespace().count());
+        assert!(
+            comp.len() <= original.len()
+                || comp.split_whitespace().count() <= original.split_whitespace().count()
+        );
     }
 
     #[test]
@@ -396,7 +401,10 @@ mod tests {
         let compressed = Arc::new(DashMap::new());
         let originals = Arc::new(DashMap::new());
         compressed.insert("test_tool".to_string(), "Short desc".to_string());
-        originals.insert("test_tool".to_string(), "A much longer original description for the test tool".to_string());
+        originals.insert(
+            "test_tool".to_string(),
+            "A much longer original description for the test tool".to_string(),
+        );
 
         let dc = DescriptionCompressor::with_state(
             compressed,

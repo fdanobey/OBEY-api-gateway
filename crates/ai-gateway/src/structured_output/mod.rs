@@ -487,6 +487,9 @@ structured_output:
             cost_per_million_output_tokens: 0.0,
             priority: 100,
             structured_output_passthrough: provider_override,
+            tier: None,
+            context_window: 0,
+            specializations: vec![],
         });
 
         StructuredOutputEngine::from_config(&config).unwrap()

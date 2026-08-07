@@ -93,8 +93,7 @@ impl CompressionStage for SchemaDeduplicator {
 
             let net_savings = total_without_dedup - total_with_dedup;
             let hash_hex = format!("{:016x}", representative.hash);
-            let ref_value =
-                Value::String(format!("#/$defs/{}", hash_hex));
+            let ref_value = Value::String(format!("#/$defs/{}", hash_hex));
 
             // Parse the canonical JSON back to a Value for $defs
             let schema_value: Value =
@@ -119,11 +118,8 @@ impl CompressionStage for SchemaDeduplicator {
 
         // Inject $defs into each tool that has replaced schemas
         if !defs_to_inject.is_empty() {
-            let defs_value = Value::Object(
-                defs_to_inject
-                    .into_iter()
-                    .collect::<Map<String, Value>>(),
-            );
+            let defs_value =
+                Value::Object(defs_to_inject.into_iter().collect::<Map<String, Value>>());
 
             for tool in tools.iter_mut() {
                 if let Some(params) = tool
@@ -136,11 +132,9 @@ impl CompressionStage for SchemaDeduplicator {
                         .get("properties")
                         .and_then(|p| p.as_object())
                         .map(|props| {
-                            props.values().any(|v| {
-                                v.as_object()
-                                    .and_then(|obj| obj.get("$ref"))
-                                    .is_some()
-                            })
+                            props
+                                .values()
+                                .any(|v| v.as_object().and_then(|obj| obj.get("$ref")).is_some())
                         })
                         .unwrap_or(false);
 
@@ -270,7 +264,9 @@ mod tests {
         let saved = stage.apply(&mut tools, &mut ctx);
 
         assert_eq!(saved, 0);
-        assert!(!ctx.strategies_applied.contains(&"schema_deduplicator".to_string()));
+        assert!(!ctx
+            .strategies_applied
+            .contains(&"schema_deduplicator".to_string()));
     }
 
     #[test]
@@ -324,12 +320,21 @@ mod tests {
         let saved = stage.apply(&mut tools, &mut ctx);
 
         assert!(saved > 0);
-        assert!(ctx.strategies_applied.contains(&"schema_deduplicator".to_string()));
+        assert!(ctx
+            .strategies_applied
+            .contains(&"schema_deduplicator".to_string()));
 
         // Each tool should have $defs and a $ref in the shared property
         for tool in &tools {
-            let props = tool.raw.pointer("/function/parameters/properties/shared").unwrap();
-            assert!(props.get("$ref").is_some(), "Expected $ref in tool {}", tool.name);
+            let props = tool
+                .raw
+                .pointer("/function/parameters/properties/shared")
+                .unwrap();
+            assert!(
+                props.get("$ref").is_some(),
+                "Expected $ref in tool {}",
+                tool.name
+            );
 
             let defs = tool.raw.pointer("/function/parameters/$defs").unwrap();
             assert!(defs.as_object().unwrap().len() == 1);
@@ -475,11 +480,7 @@ mod property_tests {
 
     /// Generate a random JSON object with 2-5 keys of type string/integer/boolean.
     fn random_schema_object() -> impl Strategy<Value = Value> {
-        prop::collection::vec(
-            ("[a-z]{2,6}", leaf_value()),
-            2..=5usize,
-        )
-        .prop_map(|entries| {
+        prop::collection::vec(("[a-z]{2,6}", leaf_value()), 2..=5usize).prop_map(|entries| {
             let mut map = Map::new();
             for (key, val) in entries {
                 map.insert(key, val);
@@ -491,11 +492,7 @@ mod property_tests {
     /// Generate a pair of JSON objects that are identical in content but have
     /// keys inserted in different (shuffled) order.
     fn shuffled_key_pair() -> impl Strategy<Value = (Value, Value)> {
-        prop::collection::vec(
-            ("[a-z]{2,6}", leaf_value()),
-            2..=5usize,
-        )
-        .prop_flat_map(|entries| {
+        prop::collection::vec(("[a-z]{2,6}", leaf_value()), 2..=5usize).prop_flat_map(|entries| {
             // Deduplicate by key (keep first occurrence) to avoid
             // forward/reverse producing different values for the same key.
             let mut seen = std::collections::HashSet::new();
@@ -507,8 +504,7 @@ mod property_tests {
             // Create forward-order map
             let forward: Map<String, Value> = unique_entries.into_iter().collect();
             // Create reverse-order map (same keys/values, different insertion order)
-            let reversed: Map<String, Value> =
-                entries_clone.into_iter().rev().collect();
+            let reversed: Map<String, Value> = entries_clone.into_iter().rev().collect();
             Just((Value::Object(forward), Value::Object(reversed)))
         })
     }

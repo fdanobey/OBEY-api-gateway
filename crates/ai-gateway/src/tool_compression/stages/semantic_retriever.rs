@@ -63,10 +63,8 @@ impl SemanticRetriever {
 
     /// Build a TF-IDF scorer from tool descriptions.
     fn build_scorer(tools: &[ToolDefinition]) -> (TfIdfScorer, Vec<String>) {
-        let descriptions: Vec<String> = tools
-            .iter()
-            .map(|t| Self::extract_description(t))
-            .collect();
+        let descriptions: Vec<String> =
+            tools.iter().map(|t| Self::extract_description(t)).collect();
         let doc_refs: Vec<&str> = descriptions.iter().map(|s| s.as_str()).collect();
         let scorer = TfIdfScorer::new(&doc_refs);
         (scorer, descriptions)
@@ -141,9 +139,7 @@ impl CompressionStage for SemanticRetriever {
         let hybrid_scores: Vec<f32> = similarity_scores
             .iter()
             .zip(freq_scores.iter())
-            .map(|(&sim, &freq)| {
-                (1.0 - self.frequency_weight) * sim + self.frequency_weight * freq
-            })
+            .map(|(&sim, &freq)| (1.0 - self.frequency_weight) * sim + self.frequency_weight * freq)
             .collect();
 
         // Build indexed scores and sort descending
@@ -186,10 +182,8 @@ impl CompressionStage for SemanticRetriever {
 
         // Rebuild tools vec keeping only kept indices (preserve original order)
         keep_indices.sort_unstable();
-        let kept_tools: Vec<ToolDefinition> = keep_indices
-            .iter()
-            .map(|&idx| tools[idx].clone())
-            .collect();
+        let kept_tools: Vec<ToolDefinition> =
+            keep_indices.iter().map(|&idx| tools[idx].clone()).collect();
         *tools = kept_tools;
 
         if total_saved > 0 {
@@ -293,7 +287,10 @@ mod tests {
     fn test_defers_low_scoring_tools() {
         let retriever = make_retriever(2, 0.0, 0.0); // pure semantic, no threshold filter
         let mut tools = vec![
-            make_tool("search_repos", "Search GitHub repositories by name and language"),
+            make_tool(
+                "search_repos",
+                "Search GitHub repositories by name and language",
+            ),
             make_tool("send_message", "Send a Slack message to a channel"),
             make_tool("get_weather", "Get weather forecast for a location"),
             make_tool("list_repos", "List all GitHub repositories for a user"),
@@ -305,7 +302,9 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert_eq!(ctx.deferred_tools.len(), 2);
         assert!(saved > 0);
-        assert!(ctx.strategies_applied.contains(&"semantic_retriever".to_string()));
+        assert!(ctx
+            .strategies_applied
+            .contains(&"semantic_retriever".to_string()));
     }
 
     #[test]

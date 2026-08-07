@@ -24,11 +24,7 @@ const MAX_HASHES_PER_SESSION: usize = 200;
 pub struct CachePlacementOptimizer;
 
 impl CompressionStage for CachePlacementOptimizer {
-    fn apply(
-        &self,
-        tools: &mut Vec<ToolDefinition>,
-        ctx: &mut CompressionContext,
-    ) -> u64 {
+    fn apply(&self, tools: &mut Vec<ToolDefinition>, ctx: &mut CompressionContext) -> u64 {
         // First request in session: passthrough, just store hashes for next time.
         let previous_hashes = match &ctx.previous_hashes {
             Some(hashes) if !hashes.is_empty() => hashes,
@@ -100,8 +96,7 @@ impl CompressionStage for CachePlacementOptimizer {
     }
 
     fn is_enabled(&self, config: &ToolCompressionConfig, level: CompressionLevel) -> bool {
-        config.cache_placement
-            && matches!(level, CompressionLevel::High | CompressionLevel::Max)
+        config.cache_placement && matches!(level, CompressionLevel::High | CompressionLevel::Max)
     }
 }
 
@@ -153,7 +148,9 @@ mod tests {
         // Hashes stored for next request
         assert_eq!(ctx.previous_hashes, Some(vec![100, 200, 300]));
         // No strategy applied on first request
-        assert!(!ctx.strategies_applied.contains(&"cache_placement_optimizer".to_string()));
+        assert!(!ctx
+            .strategies_applied
+            .contains(&"cache_placement_optimizer".to_string()));
     }
 
     #[test]
@@ -176,23 +173,24 @@ mod tests {
         assert_eq!(tools[0].name, "a");
         assert_eq!(tools[1].name, "b");
         assert_eq!(tools[2].name, "d");
-        assert!(ctx.strategies_applied.contains(&"cache_placement_optimizer".to_string()));
+        assert!(ctx
+            .strategies_applied
+            .contains(&"cache_placement_optimizer".to_string()));
     }
 
     #[test]
     fn all_stable_no_reordering_marker() {
         // All tools match previous hashes — stable only, no new tools
-        let mut tools = vec![
-            make_tool("a", 100),
-            make_tool("b", 200),
-        ];
+        let mut tools = vec![make_tool("a", 100), make_tool("b", 200)];
         let mut ctx = default_ctx_with_hashes(Some(vec![100, 200]));
 
         let stage = CachePlacementOptimizer;
         stage.apply(&mut tools, &mut ctx);
 
         // All tools are stable, none are new — no "reordering" happened
-        assert!(!ctx.strategies_applied.contains(&"cache_placement_optimizer".to_string()));
+        assert!(!ctx
+            .strategies_applied
+            .contains(&"cache_placement_optimizer".to_string()));
     }
 
     #[test]
@@ -310,11 +308,7 @@ mod property_tests {
 
     /// Generate a vector of (name, hash) pairs representing a "previous" tool set (5-10 tools).
     fn previous_tool_set() -> impl Strategy<Value = Vec<(String, u64)>> {
-        prop::collection::vec(
-            ("[a-z]{2,6}", 1u64..10000),
-            5..=10usize,
-        )
-        .prop_map(|entries| {
+        prop::collection::vec(("[a-z]{2,6}", 1u64..10000), 5..=10usize).prop_map(|entries| {
             // Ensure unique hashes by combining index
             entries
                 .into_iter()
@@ -335,28 +329,28 @@ mod property_tests {
             (1..prev_len).prop_flat_map(move |stable_count| {
                 let prev_inner = prev_clone.clone();
                 // Generate 1-5 new tools
-                prop::collection::vec(
-                    ("[a-z]{2,6}", 50000u64..99999),
-                    1..=5usize,
+                prop::collection::vec(("[a-z]{2,6}", 50000u64..99999), 1..=5usize).prop_map(
+                    move |new_entries| {
+                        // Take `stable_count` tools from previous (keep their hashes)
+                        let stable: Vec<(String, u64)> = prev_inner[..stable_count].to_vec();
+
+                        // Create new tools with unique names/hashes
+                        let new_tools: Vec<(String, u64)> = new_entries
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (name, h))| {
+                                (format!("new_{}_{}", name, i), h * 100 + i as u64)
+                            })
+                            .collect();
+
+                        // Current request: mix of new and stable in arbitrary order
+                        // Interleave: new first, then stable (worst case for cache — optimizer should fix)
+                        let mut current = new_tools.clone();
+                        current.extend(stable);
+
+                        (prev_inner.clone(), current)
+                    },
                 )
-                .prop_map(move |new_entries| {
-                    // Take `stable_count` tools from previous (keep their hashes)
-                    let stable: Vec<(String, u64)> = prev_inner[..stable_count].to_vec();
-
-                    // Create new tools with unique names/hashes
-                    let new_tools: Vec<(String, u64)> = new_entries
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, (name, h))| (format!("new_{}_{}", name, i), h * 100 + i as u64))
-                        .collect();
-
-                    // Current request: mix of new and stable in arbitrary order
-                    // Interleave: new first, then stable (worst case for cache — optimizer should fix)
-                    let mut current = new_tools.clone();
-                    current.extend(stable);
-
-                    (prev_inner.clone(), current)
-                })
             })
         })
     }

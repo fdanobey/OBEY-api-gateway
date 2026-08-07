@@ -86,10 +86,8 @@ pub fn validate_tool_calls_against_originals(
         return true; // No tool calls → valid
     };
 
-    let known_names: std::collections::HashSet<&str> = original_tools
-        .iter()
-        .map(|t| t.name.as_str())
-        .collect();
+    let known_names: std::collections::HashSet<&str> =
+        original_tools.iter().map(|t| t.name.as_str()).collect();
 
     for call in calls {
         let name = call
@@ -245,12 +243,9 @@ mod property_tests {
 
     fn arb_tool_schema() -> impl Strategy<Value = Value> {
         (
-            "[a-z][a-z0-9_]{2,15}",                              // tool name
-            "[A-Za-z ]{5,50}",                                    // description
-            prop::collection::vec(
-                ("[a-z][a-z0-9_]{1,10}", arb_property_type()),
-                1..=5,
-            ),
+            "[a-z][a-z0-9_]{2,15}", // tool name
+            "[A-Za-z ]{5,50}",      // description
+            prop::collection::vec(("[a-z][a-z0-9_]{1,10}", arb_property_type()), 1..=5),
         )
             .prop_map(|(name, desc, props)| {
                 let mut properties = serde_json::Map::new();

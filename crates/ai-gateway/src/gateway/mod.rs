@@ -97,7 +97,9 @@ impl GatewayServer {
         let metrics = Arc::new(Metrics::new());
         let compression_events = Arc::new(crate::dashboard::CompressionEventHub::new());
         let memory_events = Arc::new(crate::dashboard::MemoryEventHub::new());
-        let memory_system = Arc::new(RwLock::new(build_memory_system(&config, config_arc.clone()).await));
+        let memory_system = Arc::new(RwLock::new(
+            build_memory_system(&config, config_arc.clone()).await,
+        ));
         let mut router = RequestRouter::new(config_arc.clone(), metrics.clone());
         router.set_memory_system(memory_system.clone());
         router.set_compression_event_hub(compression_events.clone());
@@ -261,9 +263,9 @@ impl GatewayServer {
                     ))
                 },
             )?),
-            tool_compression_state: Arc::new(
-                crate::tool_compression::ToolCompressionState::new(&config.tool_compression),
-            ),
+            tool_compression_state: Arc::new(crate::tool_compression::ToolCompressionState::new(
+                &config.tool_compression,
+            )),
         };
 
         Ok(Self { state })
@@ -363,13 +365,12 @@ impl GatewayServer {
         // --- Tool definition compression (Req 9.1-9.8) ---
         // Positioned after guardrails/loop-detection (outer) but before provider
         // dispatch (inner handler). When disabled, this is a zero-cost passthrough.
-        let api_routes =
-            api_routes.layer(crate::tool_compression::ToolCompressionLayer::new(
-                self.state.config.clone(),
-                self.state.tool_compression_state.clone(),
-                self.state.metrics.clone(),
-                self.state.compression_events.clone(),
-            ));
+        let api_routes = api_routes.layer(crate::tool_compression::ToolCompressionLayer::new(
+            self.state.config.clone(),
+            self.state.tool_compression_state.clone(),
+            self.state.metrics.clone(),
+            self.state.compression_events.clone(),
+        ));
 
         // --- Virtual key authentication + enforcement (Req 2.1, 2.4, 5.5, 6.4,
         // 11.1-11.5) --- Layer runs BEFORE the routing handlers above. In
@@ -673,13 +674,8 @@ async fn build_memory_system(
     // via hot-reload without requiring a gateway restart.
     let extraction_provider: Arc<dyn MemoryExtractionProvider> =
         Arc::new(GatewayExtractionAdapter::new(config_arc));
-    match MemorySystem::new_with_vector(
-        memory_config,
-        None,
-        Some(extraction_provider),
-        vector_tier,
-    )
-    .await
+    match MemorySystem::new_with_vector(memory_config, None, Some(extraction_provider), vector_tier)
+        .await
     {
         Ok(system) => Some(Arc::new(system)),
         Err(error) => {
@@ -719,6 +715,7 @@ fn build_precompressed_manager(
 pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     let loop_detection = new_config.loop_detection.clone();
     let compression = new_config.compression.clone();
+    let smart_routing = new_config.smart_routing.clone();
     let requested_memory = new_config.memory.clone();
     let current_memory_snapshot = state.memory_system.read().await.clone();
     let current_memory_config = match &current_memory_snapshot {
@@ -746,6 +743,10 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
         state.metrics.structured_output_metrics(),
     )
     .map(Arc::new);
+    if let Err(error) = state.router.reload_smart_router(smart_routing) {
+        tracing::error!(error = %error, "Smart Router hot-reload failed; preserving current configuration and runtime snapshot");
+        return;
+    }
 
     {
         let mut cfg = state.config.write().await;
@@ -814,7 +815,7 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
                     None
                 }
             }
-        },
+        }
     };
     if let Some(replacement) = replacement_memory {
         *state.memory_system.write().await = replacement;
@@ -960,6 +961,9 @@ mod tests {
                     cost_per_million_output_tokens: 0.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -979,6 +983,7 @@ mod tests {
             loop_detection: Default::default(),
             guardrails: None,
             tool_compression: Default::default(),
+            smart_routing: Default::default(),
         }
     }
 
@@ -1451,214 +1456,218 @@ mod tests {
     // information included in metadata.
     // **Validates: Requirements 2.12, 24.2, 24.3, 24.4, 24.5**
     proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 100,
-            .. ProptestConfig::default()
-        })]
+           #![proptest_config(ProptestConfig {
+               cases: 100,
+               .. ProptestConfig::default()
+           })]
 
-        #[test]
-        fn prop_models_endpoint_aggregation(
-            // Generate 1-4 model groups, each with 1-5 models
-            num_groups in 1usize..=4,
-            // Use a seed to deterministically build model/provider combos
-            seed in 0u64..10000,
-        ) {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                // Build providers and model groups with potential duplicates
-                let provider_names: Vec<String> = (0..3)
-                    .map(|i| format!("provider-{}", i))
-                    .collect();
+           #[test]
+           fn prop_models_endpoint_aggregation(
+               // Generate 1-4 model groups, each with 1-5 models
+               num_groups in 1usize..=4,
+               // Use a seed to deterministically build model/provider combos
+               seed in 0u64..10000,
+           ) {
+               let rt = tokio::runtime::Runtime::new().unwrap();
+               rt.block_on(async {
+                   // Build providers and model groups with potential duplicates
+                   let provider_names: Vec<String> = (0..3)
+                       .map(|i| format!("provider-{}", i))
+                       .collect();
 
-                let model_names: Vec<String> = vec![
-                    "gpt-4".to_string(),
-                    "gpt-3.5-turbo".to_string(),
-                    "claude-3".to_string(),
-                    "llama-3".to_string(),
-                    "mistral-7b".to_string(),
-                ];
+                   let model_names: Vec<String> = vec![
+                       "gpt-4".to_string(),
+                       "gpt-3.5-turbo".to_string(),
+                       "claude-3".to_string(),
+                       "llama-3".to_string(),
+                       "mistral-7b".to_string(),
+                   ];
 
-                let providers: Vec<Provider> = provider_names.iter().map(|name| {
-                    Provider {
-                        name: name.clone(),
-                        provider_type: "openai".to_string(),
-                        base_url: Some("http://localhost:1234".to_string()),
-                        api_key_env: None,
-                        api_key_encrypted: None,
-                        api_secret_env: None,
-                        api_secret_encrypted: None,
-                        auth_method: None,
-                        resolved_api_key: None,
-                        resolved_api_secret: None,
-                        region: None,
-                        timeout_seconds: 30,
-                        ttfb_timeout_seconds: None,
-                        total_timeout_seconds: None,
-                        max_connections: 10,
-                        rate_limit_per_minute: 0,
-                        custom_headers: Default::default(),
-                        connection_pool: ProviderConnectionPoolConfig::default(),
-                        memory: None,
-                        budget: None,
-                        manual_models: vec![],
-                        global_inference_profile: false,
-                        cross_region_inference: false,
-                        custom_vpc_endpoint: false,
-                        prompt_caching: false,
-                        compression: None,
-                        reasoning: true,
-                        codex_base_url_override: None,
-                        codex_model_override: None,
-                        instructions_override: None,
-                        max_rate_limit_cooldown_seconds: None,
-                    }
-                }).collect();
+                   let providers: Vec<Provider> = provider_names.iter().map(|name| {
+                       Provider {
+                           name: name.clone(),
+                           provider_type: "openai".to_string(),
+                           base_url: Some("http://localhost:1234".to_string()),
+                           api_key_env: None,
+                           api_key_encrypted: None,
+                           api_secret_env: None,
+                           api_secret_encrypted: None,
+                           auth_method: None,
+                           resolved_api_key: None,
+                           resolved_api_secret: None,
+                           region: None,
+                           timeout_seconds: 30,
+                           ttfb_timeout_seconds: None,
+                           total_timeout_seconds: None,
+                           max_connections: 10,
+                           rate_limit_per_minute: 0,
+                           custom_headers: Default::default(),
+                           connection_pool: ProviderConnectionPoolConfig::default(),
+                           memory: None,
+                           budget: None,
+                           manual_models: vec![],
+                           global_inference_profile: false,
+                           cross_region_inference: false,
+                           custom_vpc_endpoint: false,
+                           prompt_caching: false,
+                           compression: None,
+                           reasoning: true,
+                           codex_base_url_override: None,
+                           codex_model_override: None,
+                           instructions_override: None,
+                           max_rate_limit_cooldown_seconds: None,
+                       }
+                   }).collect();
 
-                // Build model groups using seed for deterministic selection
-                let mut rng_state = seed;
-                let mut model_groups = Vec::new();
-                let mut expected_unique_models = std::collections::HashMap::<String, String>::new();
+                   // Build model groups using seed for deterministic selection
+                   let mut rng_state = seed;
+                   let mut model_groups = Vec::new();
+                   let mut expected_unique_models = std::collections::HashMap::<String, String>::new();
 
-                // list_models also returns group names as model entries (owned_by "gateway")
-                for g in 0..num_groups {
-                    expected_unique_models
-                        .entry(format!("group-{}", g))
-                        .or_insert_with(|| "gateway".to_string());
+                   // list_models also returns group names as model entries (owned_by "gateway")
+                   for g in 0..num_groups {
+                       expected_unique_models
+                           .entry(format!("group-{}", g))
+                           .or_insert_with(|| "gateway".to_string());
 
-                    let num_models = (rng_state % 5) as usize + 1;
-                    rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                       let num_models = (rng_state % 5) as usize + 1;
+                       rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
 
-                    let mut models = Vec::new();
-                    for _ in 0..num_models {
-                        let model_idx = (rng_state % model_names.len() as u64) as usize;
-                        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                        let prov_idx = (rng_state % provider_names.len() as u64) as usize;
-                        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                       let mut models = Vec::new();
+                       for _ in 0..num_models {
+                           let model_idx = (rng_state % model_names.len() as u64) as usize;
+                           rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                           let prov_idx = (rng_state % provider_names.len() as u64) as usize;
+                           rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
 
-                        let model_name = model_names[model_idx].clone();
-                        let prov_name = provider_names[prov_idx].clone();
+                           let model_name = model_names[model_idx].clone();
+                           let prov_name = provider_names[prov_idx].clone();
 
-                        // Track first occurrence for expected owned_by
-                        expected_unique_models
-                            .entry(model_name.clone())
-                            .or_insert_with(|| prov_name.clone());
+                           // Track first occurrence for expected owned_by
+                           expected_unique_models
+                               .entry(model_name.clone())
+                               .or_insert_with(|| prov_name.clone());
 
-                        models.push(ProviderModel {
-                            provider: prov_name,
-                            model: model_name,
-                            cost_per_million_input_tokens: 0.0,
-                            cost_per_million_output_tokens: 0.0,
-                            priority: 100,
-                            structured_output_passthrough: None,
-                        });
-                    }
+                           models.push(ProviderModel {
+                               provider: prov_name,
+                               model: model_name,
+                               cost_per_million_input_tokens: 0.0,
+                               cost_per_million_output_tokens: 0.0,
+                               priority: 100,
+                               structured_output_passthrough: None,
+    tier: None,
+    context_window: 0,
+    specializations: vec![],
+                           });
+                       }
 
-                    model_groups.push(ModelGroup {
-                        name: format!("group-{}", g),
-                        version_fallback_enabled: false,
-                        memory: None,
-                        compression: None,
-                        structured_output: None,
-                        models,
-                    });
-                }
+                       model_groups.push(ModelGroup {
+                           name: format!("group-{}", g),
+                           version_fallback_enabled: false,
+                           memory: None,
+                           compression: None,
+                           structured_output: None,
+                           models,
+                       });
+                   }
 
-                let cfg = Config {
-                    server: ServerConfig {
-                        host: "127.0.0.1".to_string(),
-                        port: 0,
-                        request_timeout_seconds: 30,
-                        max_request_size_mb: 10,
-                    },
-                    tls: None,
-                    admin: AdminConfig::default(),
-                    dashboard: DashboardConfig::default(),
-                    cors: CorsConfig::default(),
-                    memory: None,
-                    providers,
-                    model_groups,
-                    circuit_breaker: CircuitBreakerConfig::default(),
-                    retry: RetryConfig::default(),
-                    logging: LoggingConfig::default(),
-                    semantic_cache: None,
-                    exact_cache: ExactCacheConfig::default(),
-                    prometheus: None,
-                    context: ContextConfig::default(),
-                    compression: Default::default(),
-                    structured_output: None,
-                    first_launch_completed: false,
-                    tray: TrayConfig::default(),
-                    codex_instructions_url: None,
-                    streaming: None,
-                    virtual_keys: Default::default(),
-                    loop_detection: Default::default(),
-                    guardrails: None,
-                    tool_compression: Default::default(),
-                };
+                   let cfg = Config {
+                       server: ServerConfig {
+                           host: "127.0.0.1".to_string(),
+                           port: 0,
+                           request_timeout_seconds: 30,
+                           max_request_size_mb: 10,
+                       },
+                       tls: None,
+                       admin: AdminConfig::default(),
+                       dashboard: DashboardConfig::default(),
+                       cors: CorsConfig::default(),
+                       memory: None,
+                       providers,
+                       model_groups,
+                       circuit_breaker: CircuitBreakerConfig::default(),
+                       retry: RetryConfig::default(),
+                       logging: LoggingConfig::default(),
+                       semantic_cache: None,
+                       exact_cache: ExactCacheConfig::default(),
+                       prometheus: None,
+                       context: ContextConfig::default(),
+                       compression: Default::default(),
+                       structured_output: None,
+                       first_launch_completed: false,
+                       tray: TrayConfig::default(),
+                       codex_instructions_url: None,
+                       streaming: None,
+                       virtual_keys: Default::default(),
+                       loop_detection: Default::default(),
+                       guardrails: None,
+                       tool_compression: Default::default(),
+    smart_routing: Default::default(),
+                   };
 
-                let server = GatewayServer::new(cfg, None).await.unwrap();
-                let app = server.build_router();
+                   let server = GatewayServer::new(cfg, None).await.unwrap();
+                   let app = server.build_router();
 
-                // Hit GET /v1/models
-                let req = Request::builder()
-                    .method("GET")
-                    .uri("/v1/models")
-                    .body(Body::empty())
-                    .unwrap();
+                   // Hit GET /v1/models
+                   let req = Request::builder()
+                       .method("GET")
+                       .uri("/v1/models")
+                       .body(Body::empty())
+                       .unwrap();
 
-                let resp = app.oneshot(req).await.unwrap();
-                prop_assert_eq!(resp.status(), StatusCode::OK);
+                   let resp = app.oneshot(req).await.unwrap();
+                   prop_assert_eq!(resp.status(), StatusCode::OK);
 
-                let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-                    .await
-                    .unwrap();
-                let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+                   let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                       .await
+                       .unwrap();
+                   let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
 
-                // Req 24.5: response is in OpenAI models format
-                prop_assert_eq!(parsed["object"].as_str(), Some("list"));
-                let data = parsed["data"].as_array().unwrap();
+                   // Req 24.5: response is in OpenAI models format
+                   prop_assert_eq!(parsed["object"].as_str(), Some("list"));
+                   let data = parsed["data"].as_array().unwrap();
 
-                // Req 24.3: no duplicate model IDs
-                let mut seen_ids = std::collections::HashSet::new();
-                for model in data {
-                    let id = model["id"].as_str().unwrap().to_string();
-                    prop_assert!(
-                        seen_ids.insert(id.clone()),
-                        "Duplicate model ID found: {}",
-                        id
-                    );
-                }
+                   // Req 24.3: no duplicate model IDs
+                   let mut seen_ids = std::collections::HashSet::new();
+                   for model in data {
+                       let id = model["id"].as_str().unwrap().to_string();
+                       prop_assert!(
+                           seen_ids.insert(id.clone()),
+                           "Duplicate model ID found: {}",
+                           id
+                       );
+                   }
 
-                // Req 24.2: union — every unique model from config must appear
-                for model_id in expected_unique_models.keys() {
-                    prop_assert!(
-                        seen_ids.contains(model_id.as_str()),
-                        "Expected model '{}' missing from response",
-                        model_id
-                    );
-                }
+                   // Req 24.2: union — every unique model from config must appear
+                   for model_id in expected_unique_models.keys() {
+                       prop_assert!(
+                           seen_ids.contains(model_id.as_str()),
+                           "Expected model '{}' missing from response",
+                           model_id
+                       );
+                   }
 
-                // Req 24.4: provider information included in metadata (owned_by)
-                for model in data {
-                    let owned_by = model["owned_by"].as_str().unwrap();
-                    prop_assert!(
-                        !owned_by.is_empty(),
-                        "Model '{}' has empty owned_by",
-                        model["id"].as_str().unwrap()
-                    );
-                }
+                   // Req 24.4: provider information included in metadata (owned_by)
+                   for model in data {
+                       let owned_by = model["owned_by"].as_str().unwrap();
+                       prop_assert!(
+                           !owned_by.is_empty(),
+                           "Model '{}' has empty owned_by",
+                           model["id"].as_str().unwrap()
+                       );
+                   }
 
-                // Count matches: response should have exactly the unique model count
-                prop_assert_eq!(
-                    data.len(),
-                    expected_unique_models.len(),
-                    "Response model count should equal unique model count from config"
-                );
+                   // Count matches: response should have exactly the unique model count
+                   prop_assert_eq!(
+                       data.len(),
+                       expected_unique_models.len(),
+                       "Response model count should equal unique model count from config"
+                   );
 
-                Ok(())
-            })?;
-        }
-    }
+                   Ok(())
+               })?;
+           }
+       }
 
     // Feature: ai-gateway, Property 45: Health Check Status
     // For any operational gateway, the /health endpoint shall return HTTP 200;
@@ -2057,208 +2066,212 @@ mod tests {
     // to future requests and circuit breaker states shall be reset.
     // **Validates: Requirements 26.4, 26.5, 26.6**
     proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 100,
-            .. ProptestConfig::default()
-        })]
+           #![proptest_config(ProptestConfig {
+               cases: 100,
+               .. ProptestConfig::default()
+           })]
 
-        #[test]
-        fn prop_config_hot_reload_application(
-            new_port in 1024u16..65535u16,
-            provider_suffix in "[a-z]{3,8}",
-            new_timeout in 1u64..=300u64,
-        ) {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                // 1. Create initial config and write to temp file
-                let initial_cfg = minimal_config();
-                let initial_provider_name = initial_cfg.providers[0].name.clone();
+           #[test]
+           fn prop_config_hot_reload_application(
+               new_port in 1024u16..65535u16,
+               provider_suffix in "[a-z]{3,8}",
+               new_timeout in 1u64..=300u64,
+           ) {
+               let rt = tokio::runtime::Runtime::new().unwrap();
+               rt.block_on(async {
+                   // 1. Create initial config and write to temp file
+                   let initial_cfg = minimal_config();
+                   let initial_provider_name = initial_cfg.providers[0].name.clone();
 
-                let tmp_dir = tempfile::tempdir().unwrap();
-                let config_path = tmp_dir.path().join("config.yaml");
-                let initial_yaml = serde_yaml::to_string(&initial_cfg).unwrap();
-                std::fs::write(&config_path, &initial_yaml).unwrap();
+                   let tmp_dir = tempfile::tempdir().unwrap();
+                   let config_path = tmp_dir.path().join("config.yaml");
+                   let initial_yaml = serde_yaml::to_string(&initial_cfg).unwrap();
+                   std::fs::write(&config_path, &initial_yaml).unwrap();
 
-                let server = GatewayServer::new(initial_cfg, Some(config_path.clone()))
-                    .await
-                    .unwrap();
+                   let server = GatewayServer::new(initial_cfg, Some(config_path.clone()))
+                       .await
+                       .unwrap();
 
-                // 2. Populate circuit breakers by recording failures on the initial provider
-                let cb = server.state.router.get_circuit_breaker(&initial_provider_name).await;
-                cb.record_failure().await;
-                cb.record_failure().await;
-                cb.record_failure().await;
-                // After 3 failures (default threshold), circuit should be open
-                let was_available_before = cb.is_available().await;
-                prop_assert!(
-                    !was_available_before,
-                    "Circuit breaker should be open after 3 failures"
-                );
+                   // 2. Populate circuit breakers by recording failures on the initial provider
+                   let cb = server.state.router.get_circuit_breaker(&initial_provider_name).await;
+                   cb.record_failure().await;
+                   cb.record_failure().await;
+                   cb.record_failure().await;
+                   // After 3 failures (default threshold), circuit should be open
+                   let was_available_before = cb.is_available().await;
+                   prop_assert!(
+                       !was_available_before,
+                       "Circuit breaker should be open after 3 failures"
+                   );
 
-                let app = server.build_router();
+                   let app = server.build_router();
 
-                // 3. Build a NEW valid config with different settings
-                let new_provider_name = format!("prov-{}", provider_suffix);
-                let new_cfg = Config {
-                    server: ServerConfig {
-                        host: "127.0.0.1".to_string(),
-                        port: new_port,
-                        request_timeout_seconds: new_timeout,
-                        max_request_size_mb: 10,
-                    },
-                    tls: None,
-                    admin: AdminConfig::default(),
-                    dashboard: DashboardConfig::default(),
-                    cors: CorsConfig::default(),
-                    memory: None,
-                    providers: vec![Provider {
-                        name: new_provider_name.clone(),
-                        provider_type: "openai".to_string(),
-                        base_url: Some("http://localhost:5678".to_string()),
-                        api_key_env: None,
-                        api_key_encrypted: None,
-                        api_secret_env: None,
-                        api_secret_encrypted: None,
-                        auth_method: None,
-                        resolved_api_key: None,
-                        resolved_api_secret: None,
-                        region: None,
-                        timeout_seconds: new_timeout,
-                        ttfb_timeout_seconds: None,
-                        total_timeout_seconds: None,
-                        max_connections: 10,
-                        rate_limit_per_minute: 0,
-                        custom_headers: Default::default(),
-                        connection_pool: ProviderConnectionPoolConfig::default(),
-                        memory: None,
-                        budget: None,
-                        manual_models: vec![],
-                        global_inference_profile: false,
-                        cross_region_inference: false,
-                        custom_vpc_endpoint: false,
-                        prompt_caching: false,
-                        compression: None,
-                        reasoning: true,
-                        codex_base_url_override: None,
-                        codex_model_override: None,
-                        instructions_override: None,
-                        max_rate_limit_cooldown_seconds: None,
-                    }],
-                    model_groups: vec![ModelGroup {
-                        name: format!("group-{}", provider_suffix),
-                        version_fallback_enabled: false,
-                        memory: None,
-                        compression: None,
-                        structured_output: None,
-                        models: vec![ProviderModel {
-                            provider: new_provider_name.clone(),
-                            model: "gpt-4".to_string(),
-                            cost_per_million_input_tokens: 0.0,
-                            cost_per_million_output_tokens: 0.0,
-                            priority: 100,
-                            structured_output_passthrough: None,
-                        }],
-                    }],
-                    circuit_breaker: CircuitBreakerConfig::default(),
-                    retry: RetryConfig::default(),
-                    logging: LoggingConfig::default(),
-                    semantic_cache: None,
-                    exact_cache: ExactCacheConfig::default(),
-                    prometheus: None,
-                    context: ContextConfig::default(),
-                    compression: Default::default(),
-                    structured_output: None,
-                    first_launch_completed: false,
-                    tray: TrayConfig::default(),
-                    codex_instructions_url: None,
-                    streaming: None,
-                    virtual_keys: Default::default(),
-                    loop_detection: Default::default(),
-                    guardrails: None,
-                    tool_compression: Default::default(),
-                };
+                   // 3. Build a NEW valid config with different settings
+                   let new_provider_name = format!("prov-{}", provider_suffix);
+                   let new_cfg = Config {
+                       server: ServerConfig {
+                           host: "127.0.0.1".to_string(),
+                           port: new_port,
+                           request_timeout_seconds: new_timeout,
+                           max_request_size_mb: 10,
+                       },
+                       tls: None,
+                       admin: AdminConfig::default(),
+                       dashboard: DashboardConfig::default(),
+                       cors: CorsConfig::default(),
+                       memory: None,
+                       providers: vec![Provider {
+                           name: new_provider_name.clone(),
+                           provider_type: "openai".to_string(),
+                           base_url: Some("http://localhost:5678".to_string()),
+                           api_key_env: None,
+                           api_key_encrypted: None,
+                           api_secret_env: None,
+                           api_secret_encrypted: None,
+                           auth_method: None,
+                           resolved_api_key: None,
+                           resolved_api_secret: None,
+                           region: None,
+                           timeout_seconds: new_timeout,
+                           ttfb_timeout_seconds: None,
+                           total_timeout_seconds: None,
+                           max_connections: 10,
+                           rate_limit_per_minute: 0,
+                           custom_headers: Default::default(),
+                           connection_pool: ProviderConnectionPoolConfig::default(),
+                           memory: None,
+                           budget: None,
+                           manual_models: vec![],
+                           global_inference_profile: false,
+                           cross_region_inference: false,
+                           custom_vpc_endpoint: false,
+                           prompt_caching: false,
+                           compression: None,
+                           reasoning: true,
+                           codex_base_url_override: None,
+                           codex_model_override: None,
+                           instructions_override: None,
+                           max_rate_limit_cooldown_seconds: None,
+                       }],
+                       model_groups: vec![ModelGroup {
+                           name: format!("group-{}", provider_suffix),
+                           version_fallback_enabled: false,
+                           memory: None,
+                           compression: None,
+                           structured_output: None,
+                           models: vec![ProviderModel {
+                               provider: new_provider_name.clone(),
+                               model: "gpt-4".to_string(),
+                               cost_per_million_input_tokens: 0.0,
+                               cost_per_million_output_tokens: 0.0,
+                               priority: 100,
+                               structured_output_passthrough: None,
+    tier: None,
+    context_window: 0,
+    specializations: vec![],
+                           }],
+                       }],
+                       circuit_breaker: CircuitBreakerConfig::default(),
+                       retry: RetryConfig::default(),
+                       logging: LoggingConfig::default(),
+                       semantic_cache: None,
+                       exact_cache: ExactCacheConfig::default(),
+                       prometheus: None,
+                       context: ContextConfig::default(),
+                       compression: Default::default(),
+                       structured_output: None,
+                       first_launch_completed: false,
+                       tray: TrayConfig::default(),
+                       codex_instructions_url: None,
+                       streaming: None,
+                       virtual_keys: Default::default(),
+                       loop_detection: Default::default(),
+                       guardrails: None,
+                       tool_compression: Default::default(),
+    smart_routing: Default::default(),
+                   };
 
-                // Write new config to disk
-                let new_yaml = serde_yaml::to_string(&new_cfg).unwrap();
-                std::fs::write(&config_path, &new_yaml).unwrap();
+                   // Write new config to disk
+                   let new_yaml = serde_yaml::to_string(&new_cfg).unwrap();
+                   std::fs::write(&config_path, &new_yaml).unwrap();
 
-                // 4. Hit POST /admin/config/reload
-                let req = Request::builder()
-                    .method("POST")
-                    .uri("/admin/config/reload")
-                    .body(Body::empty())
-                    .unwrap();
+                   // 4. Hit POST /admin/config/reload
+                   let req = Request::builder()
+                       .method("POST")
+                       .uri("/admin/config/reload")
+                       .body(Body::empty())
+                       .unwrap();
 
-                let resp = app.oneshot(req).await.unwrap();
+                   let resp = app.oneshot(req).await.unwrap();
 
-                // 5. Verify 200 success
-                let status = resp.status();
-                let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
-                    .await
-                    .unwrap();
-                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                   // 5. Verify 200 success
+                   let status = resp.status();
+                   let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+                       .await
+                       .unwrap();
+                   let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-                prop_assert_eq!(
-                    status,
-                    StatusCode::OK,
-                    "Reload should succeed, got {} with body: {:?}",
-                    status,
-                    json
-                );
-                prop_assert_eq!(
-                    json["status"].as_str(),
-                    Some("ok"),
-                    "Response should indicate success"
-                );
+                   prop_assert_eq!(
+                       status,
+                       StatusCode::OK,
+                       "Reload should succeed, got {} with body: {:?}",
+                       status,
+                       json
+                   );
+                   prop_assert_eq!(
+                       json["status"].as_str(),
+                       Some("ok"),
+                       "Response should indicate success"
+                   );
 
-                // 6. Verify new config is now active (Req 26.4)
-                let active_cfg = server.state.config.read().await;
-                prop_assert_eq!(
-                    active_cfg.server.port, new_port,
-                    "New port should be active after reload"
-                );
-                prop_assert_eq!(
-                    active_cfg.server.request_timeout_seconds, new_timeout,
-                    "New timeout should be active after reload"
-                );
-                prop_assert_eq!(
-                    active_cfg.providers.len(), 1,
-                    "Should have exactly 1 provider after reload"
-                );
-                prop_assert_eq!(
-                    &active_cfg.providers[0].name, &new_provider_name,
-                    "New provider name should be active after reload"
-                );
-                prop_assert_eq!(
-                    active_cfg.model_groups.len(), 1,
-                    "Should have exactly 1 model group after reload"
-                );
-                drop(active_cfg);
+                   // 6. Verify new config is now active (Req 26.4)
+                   let active_cfg = server.state.config.read().await;
+                   prop_assert_eq!(
+                       active_cfg.server.port, new_port,
+                       "New port should be active after reload"
+                   );
+                   prop_assert_eq!(
+                       active_cfg.server.request_timeout_seconds, new_timeout,
+                       "New timeout should be active after reload"
+                   );
+                   prop_assert_eq!(
+                       active_cfg.providers.len(), 1,
+                       "Should have exactly 1 provider after reload"
+                   );
+                   prop_assert_eq!(
+                       &active_cfg.providers[0].name, &new_provider_name,
+                       "New provider name should be active after reload"
+                   );
+                   prop_assert_eq!(
+                       active_cfg.model_groups.len(), 1,
+                       "Should have exactly 1 model group after reload"
+                   );
+                   drop(active_cfg);
 
-                // 7. Verify circuit breaker states were reset (Req 26.5)
-                // After reload, getting a circuit breaker for the OLD provider should
-                // return a fresh one (the DashMap was cleared), so it must be available.
-                let cb_after = server.state.router.get_circuit_breaker(&initial_provider_name).await;
-                let is_available_after = cb_after.is_available().await;
-                prop_assert!(
-                    is_available_after,
-                    "Circuit breaker for '{}' should be available (reset) after config reload",
-                    initial_provider_name
-                );
+                   // 7. Verify circuit breaker states were reset (Req 26.5)
+                   // After reload, getting a circuit breaker for the OLD provider should
+                   // return a fresh one (the DashMap was cleared), so it must be available.
+                   let cb_after = server.state.router.get_circuit_breaker(&initial_provider_name).await;
+                   let is_available_after = cb_after.is_available().await;
+                   prop_assert!(
+                       is_available_after,
+                       "Circuit breaker for '{}' should be available (reset) after config reload",
+                       initial_provider_name
+                   );
 
-                // Also verify a CB for the NEW provider is fresh/available
-                let cb_new = server.state.router.get_circuit_breaker(&new_provider_name).await;
-                let new_available = cb_new.is_available().await;
-                prop_assert!(
-                    new_available,
-                    "Circuit breaker for new provider '{}' should be available",
-                    new_provider_name
-                );
+                   // Also verify a CB for the NEW provider is fresh/available
+                   let cb_new = server.state.router.get_circuit_breaker(&new_provider_name).await;
+                   let new_available = cb_new.is_available().await;
+                   prop_assert!(
+                       new_available,
+                       "Circuit breaker for new provider '{}' should be available",
+                       new_provider_name
+                   );
 
-                Ok(())
-            })?;
-        }
-    }
+                   Ok(())
+               })?;
+           }
+       }
 
     // --- Prometheus metrics endpoint test (Req 20.7-20.11) ---
 

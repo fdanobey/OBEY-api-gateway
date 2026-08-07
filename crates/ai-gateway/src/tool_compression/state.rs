@@ -75,10 +75,7 @@ impl ToolCompressionState {
         let mut provider_caps = ProviderCapabilityMap::default();
         provider_caps.merge_overrides(&config.provider_overrides);
 
-        let feedback_loop = Arc::new(FeedbackLoop::new(
-            &config.feedback_loop,
-            config.level,
-        ));
+        let feedback_loop = Arc::new(FeedbackLoop::new(&config.feedback_loop, config.level));
 
         Self {
             disclosure_state: DashMap::new(),

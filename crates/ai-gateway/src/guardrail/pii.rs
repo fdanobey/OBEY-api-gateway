@@ -293,7 +293,10 @@ impl GuardrailContext {
             reinjection_map: Vec::new(),
             next_sequence: HashMap::new(),
             dedup: HashMap::new(),
-            max_entries: max_entries.clamp(MIN_REINJECTION_ENTRIES, MAX_CONFIGURABLE_REINJECTION_ENTRIES),
+            max_entries: max_entries.clamp(
+                MIN_REINJECTION_ENTRIES,
+                MAX_CONFIGURABLE_REINJECTION_ENTRIES,
+            ),
             overflow_count: 0,
         }
     }
@@ -477,8 +480,11 @@ impl GuardrailContext {
         }
 
         if self.overflow_count > 0 {
-            let complete_placeholders: std::collections::HashSet<&str> =
-                self.reinjection_map.iter().map(|(p, _)| p.as_str()).collect();
+            let complete_placeholders: std::collections::HashSet<&str> = self
+                .reinjection_map
+                .iter()
+                .map(|(p, _)| p.as_str())
+                .collect();
 
             out = PLACEHOLDER_RE
                 .replace_all(&out, |caps: &regex::Captures| {

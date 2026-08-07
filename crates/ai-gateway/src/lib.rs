@@ -3,9 +3,9 @@ pub mod cache;
 pub mod codex;
 pub mod compression;
 pub mod config;
-pub mod description_utils;
 pub mod context;
 pub mod dashboard;
+pub mod description_utils;
 pub mod error;
 pub mod gateway;
 pub mod guardrail;
@@ -18,6 +18,7 @@ pub mod oauth;
 pub mod providers;
 pub mod router;
 pub mod secrets;
+pub mod smart_routing;
 pub mod structured_output;
 pub mod tool_compression;
 #[cfg(feature = "tray")]

@@ -400,7 +400,18 @@ mod tests {
     #[test]
     fn default_map_contains_known_providers() {
         let map = ProviderCapabilityMap::default();
-        let known = ["openai", "azure", "anthropic", "google", "groq", "mistral", "cohere", "bedrock", "nvidia_nim", "ollama"];
+        let known = [
+            "openai",
+            "azure",
+            "anthropic",
+            "google",
+            "groq",
+            "mistral",
+            "cohere",
+            "bedrock",
+            "nvidia_nim",
+            "ollama",
+        ];
         for name in &known {
             let caps = map.get(name);
             // Just verify we get a non-conservative result for known providers

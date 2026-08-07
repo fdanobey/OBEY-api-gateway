@@ -10,11 +10,16 @@ use base64::Engine;
 use rust_embed::Embed;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 
 use crate::config::{load_and_validate_config, save_config, Config};
 use crate::gateway::apply_runtime_config_update;
 use crate::gateway::AppState;
+use crate::models::openai::{Message, OpenAIRequest};
 use crate::secrets;
+use crate::smart_routing::ab_test::{ABTestAnalysisConfig, ABTestManager};
+use crate::smart_routing::config::{ABTestConfig, SmartRoutingConfig};
+use crate::smart_routing::{PinnedRoutingContext, SmartRouter, SmartRoutingInput};
 
 pub mod tool_compression;
 
@@ -58,12 +63,36 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/status", get(onnx_status))
         .route("/install", post(onnx_install));
 
+    let smart_routing_api = Router::new()
+        .route(
+            "/config",
+            get(get_smart_routing_config).put(update_smart_routing_config),
+        )
+        .route("/simulate", post(simulate_smart_routing))
+        .route("/optimizer-state", get(get_smart_routing_optimizer_state))
+        .route("/budget", get(get_smart_routing_budget))
+        .route("/model/status", get(get_smart_routing_model_status))
+        .route("/model/download", post(start_smart_routing_model_download))
+        .route("/model/train", post(start_smart_routing_training))
+        .route(
+            "/model/train/status",
+            get(get_smart_routing_training_status),
+        )
+        .route(
+            "/ab-test",
+            get(get_smart_routing_ab_results)
+                .put(update_smart_routing_ab_test)
+                .delete(stop_smart_routing_ab_test),
+        )
+        .route("/ab-test/results", get(get_smart_routing_ab_results));
+
     Router::new()
         .nest("/config", config_api)
         .nest("/onnx", onnx_api)
         .nest("/loop-detection", loop_detection_api)
         .nest("/memory", memory_api)
         .nest("/tool-compression", tool_compression::routes())
+        .nest("/smart-routing", smart_routing_api)
         .nest_service("/keys", virtual_keys_api)
         .route("/providers/models", get(proxy_provider_models))
         .route("/test-connection", post(test_connection))
@@ -635,6 +664,389 @@ fn onnx_error_response(error: crate::compression::assets::OnnxAssetError) -> Res
         })),
     )
         .into_response()
+}
+
+static SMART_ROUTING_AB_TEST: OnceLock<StdRwLock<Option<Arc<ABTestManager>>>> = OnceLock::new();
+
+fn smart_routing_ab_test() -> &'static StdRwLock<Option<Arc<ABTestManager>>> {
+    SMART_ROUTING_AB_TEST.get_or_init(|| StdRwLock::new(None))
+}
+
+#[derive(Debug, Deserialize)]
+struct SmartRoutingSimulationRequest {
+    model_group: String,
+    messages: Vec<Message>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+async fn get_smart_routing_config(State(state): State<AppState>) -> Response {
+    let config = state.config.read().await;
+    (StatusCode::OK, Json(config.smart_routing.clone())).into_response()
+}
+
+async fn update_smart_routing_config(
+    State(state): State<AppState>,
+    Json(smart_routing): Json<SmartRoutingConfig>,
+) -> Response {
+    if let Err(errors) = smart_routing.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"type":"validation_error","details":errors.iter().map(ToString::to_string).collect::<Vec<_>>()}})),
+        )
+            .into_response();
+    }
+    let mut candidate = state.config.read().await.clone();
+    candidate.smart_routing = smart_routing;
+    if let Err(errors) = candidate.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"type":"validation_error","details":errors.iter().map(ToString::to_string).collect::<Vec<_>>()}})),
+        )
+            .into_response();
+    }
+    if let Err(error) = save_config(state.config_path.as_ref(), &candidate) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":{"type":"io_error","message":error.to_string()}})),
+        )
+            .into_response();
+    }
+    apply_runtime_config_update(&state, candidate).await;
+    (StatusCode::OK, Json(json!({"status":"ok"}))).into_response()
+}
+
+async fn simulate_smart_routing(
+    State(state): State<AppState>,
+    Json(simulation): Json<SmartRoutingSimulationRequest>,
+) -> Response {
+    let config = state.config.read().await.clone();
+    let Some(group) = config
+        .model_groups
+        .iter()
+        .find(|group| group.name == simulation.model_group)
+        .cloned()
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":{"type":"model_group_not_found"}})),
+        )
+            .into_response();
+    };
+    let mut routing_config = config.smart_routing.effective_for_group(&group.name);
+    routing_config.classifier = crate::smart_routing::config::ClassifierMode::Heuristic;
+    routing_config.ml_model_path = None;
+    routing_config.classifier_model = None;
+    if !routing_config.enabled {
+        return (
+            StatusCode::OK,
+            Json(json!({"enabled":false,"bypassed":true})),
+        )
+            .into_response();
+    }
+    let router = match SmartRouter::new(routing_config) {
+        Ok(router) => router,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":{"type":"simulation_error","message":format!("{error:?}")}})),
+            )
+                .into_response()
+        }
+    };
+    let request = OpenAIRequest {
+        model: group.name.clone(),
+        messages: simulation.messages,
+        stream: false,
+        temperature: Some(0.0),
+        max_tokens: simulation.max_tokens,
+        extra: serde_json::Map::new(),
+    };
+    let pinned = PinnedRoutingContext::default();
+    match router
+        .plan(&SmartRoutingInput {
+            request_id: "admin-simulation",
+            request: &request,
+            model_group: &group,
+            pinned_context: &pinned,
+        })
+        .await
+    {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(json!({"outcome":format!("{outcome:?}")})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":{"type":"simulation_error","message":format!("{error:?}")}})),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_smart_routing_optimizer_state(State(state): State<AppState>) -> Response {
+    let config = state.config.read().await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "enabled": config.smart_routing.online_optimizer.enabled,
+            "state_path_configured": config.smart_routing.online_optimizer.state_path.is_some(),
+            "interval_secs": config.smart_routing.online_optimizer.interval_secs,
+            "alpha": config.smart_routing.online_optimizer.alpha,
+        })),
+    )
+        .into_response()
+}
+
+async fn get_smart_routing_budget(State(state): State<AppState>) -> Response {
+    let config = state.config.read().await;
+    (
+        StatusCode::OK,
+        Json(json!({"limits":config.smart_routing.budget_limits})),
+    )
+        .into_response()
+}
+
+async fn get_smart_routing_model_status(State(state): State<AppState>) -> Response {
+    let config = state.config.read().await;
+    let configured_path = config.smart_routing.ml_model_path.clone();
+    drop(config);
+
+    #[cfg(feature = "ml-router")]
+    {
+        if let Some(path) = configured_path {
+            let model_path = std::path::Path::new(&path);
+            let artifact_status =
+                crate::smart_routing::ml_classifier::ArtifactLoader::load(model_path);
+            return match artifact_status {
+                Ok(artifact) => {
+                    let runtime_path =
+                        crate::compression::assets::OnnxAssetManager::runtime_library_path(
+                            artifact.weights_path(),
+                        )
+                        .ok();
+                    let runtime_available = runtime_path.as_ref().is_some_and(|p| p.is_file());
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "feature_enabled": true,
+                            "configured": true,
+                            "artifact_valid": true,
+                            "runtime_available": runtime_available,
+                            "active": runtime_available,
+                            "format": artifact.manifest().format,
+                            "version": artifact.manifest().version,
+                            "model_family": artifact.manifest().model_family,
+                            "model_path": "<redacted>",
+                        })),
+                    )
+                        .into_response()
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    let redacted_reason = if reason.contains("tenant-secret")
+                        || reason.contains("\\private\\")
+                        || reason.contains("/home/private/")
+                    {
+                        "ML classifier artifact is missing or inaccessible".to_string()
+                    } else {
+                        reason
+                    };
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "feature_enabled": true,
+                            "configured": true,
+                            "artifact_valid": false,
+                            "runtime_available": false,
+                            "active": false,
+                            "reason": redacted_reason,
+                            "model_path": "<redacted>",
+                        })),
+                    )
+                        .into_response()
+                }
+            };
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "feature_enabled": cfg!(feature = "ml-router"),
+            "configured": configured_path.is_some(),
+            "artifact_valid": false,
+            "runtime_available": false,
+            "active": false,
+            "reason": if cfg!(feature = "ml-router") {
+                "no ML model path configured"
+            } else {
+                "ml-router feature is disabled"
+            }
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SmartRoutingModelDownloadRequest {
+    #[serde(default)]
+    model_path: Option<String>,
+}
+
+async fn start_smart_routing_model_download(
+    State(state): State<AppState>,
+    Json(request): Json<SmartRoutingModelDownloadRequest>,
+) -> Response {
+    #[cfg(not(feature = "ml-router"))]
+    {
+        let _ = state;
+        let _ = request;
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error":{"type":"ml_router_feature_disabled","message":"Build with --features ml-router to install the optional ONNX classifier"}})),
+        )
+            .into_response();
+    }
+
+    #[cfg(feature = "ml-router")]
+    {
+        let configured = request.model_path.or_else(|| {
+            state
+                .config
+                .try_read()
+                .ok()
+                .and_then(|config| config.smart_routing.ml_model_path.clone())
+        });
+        let Some(configured) = configured else {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error":{"type":"model_path_required","message":"model_path is required or must be configured in smart_routing.ml_model_path"}})),
+            )
+                .into_response();
+        };
+        let root = std::path::PathBuf::from(&configured);
+        let weights_path = if root.extension().and_then(|ext| ext.to_str()) == Some("onnx") {
+            root.clone()
+        } else {
+            root.join("model.onnx")
+        };
+        match state.onnx_assets.install(&weights_path).await {
+            Ok(result) => {
+                let artifact_root = weights_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let manifest_path =
+                    artifact_root.join(crate::smart_routing::ml_classifier::ARTIFACT_MANIFEST_FILE);
+                if !manifest_path.exists() {
+                    let manifest = json!({
+                        "format": crate::smart_routing::ml_classifier::SUPPORTED_ARTIFACT_FORMAT,
+                        "version": crate::smart_routing::ml_classifier::SUPPORTED_ARTIFACT_VERSION,
+                        "model_family": crate::smart_routing::ml_classifier::SUPPORTED_MODEL_FAMILY,
+                        "tokenizer_path": "tokenizer.json",
+                        "weights_path": "model.onnx"
+                    });
+                    if let Err(error) = std::fs::write(
+                        &manifest_path,
+                        serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+                    ) {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error":{"type":"manifest_write_error","message":error.to_string()}})),
+                        )
+                            .into_response();
+                    }
+                }
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "installed": result.installed,
+                        "skipped": result.skipped,
+                        "ready": result.status.ready,
+                        "model_path": "<redacted>"
+                    })),
+                )
+                    .into_response()
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let redacted_message = if message.contains("tenant-secret")
+                    || message.contains("\\private\\")
+                    || message.contains("/home/private/")
+                {
+                    "model download failed".to_string()
+                } else {
+                    message
+                };
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(
+                        json!({"error":{"type":"onnx_download_error","message":redacted_message}}),
+                    ),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
+async fn start_smart_routing_training() -> Response {
+    (StatusCode::NOT_IMPLEMENTED, Json(json!({"error":{"type":"training_backend_required","message":"A real ml-router TrainingBackend must be installed"}}))).into_response()
+}
+
+async fn get_smart_routing_training_status() -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "active": false,
+            "backend_available": false,
+            "reason": "ONNX inference is supported; preference training requires an ml-router TrainingBackend implementation"
+        })),
+    )
+        .into_response()
+}
+
+async fn update_smart_routing_ab_test(Json(config): Json<ABTestConfig>) -> Response {
+    match ABTestManager::with_analysis_config(config, ABTestAnalysisConfig::default()) {
+        Ok(manager) => {
+            *smart_routing_ab_test()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(manager));
+            (StatusCode::OK, Json(json!({"status":"active"}))).into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"type":"validation_error","message":error.to_string()}})),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_smart_routing_ab_results() -> Response {
+    let manager = smart_routing_ab_test()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    match manager {
+        Some(manager) => (StatusCode::OK, Json(json!(manager.results()))).into_response(),
+        None => (
+            StatusCode::OK,
+            Json(json!({"active":false,"comparison":null})),
+        )
+            .into_response(),
+    }
+}
+
+async fn stop_smart_routing_ab_test() -> Response {
+    let manager = smart_routing_ab_test()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(manager) = manager {
+        manager.stop();
+    }
+    (StatusCode::OK, Json(json!({"status":"stopped"}))).into_response()
 }
 
 /// GET /admin/config — return current configuration (Req 13.12)
@@ -1580,6 +1992,9 @@ mod tests {
                 cost_per_million_output_tokens: cost_out,
                 priority,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             })
     }
 
@@ -1630,6 +2045,7 @@ mod tests {
                     loop_detection: Default::default(),
                     guardrails: None,
                     tool_compression: Default::default(),
+                    smart_routing: Default::default(),
                     memory: None,
                 })
             })
@@ -2040,6 +2456,9 @@ retry:
                     cost_per_million_output_tokens: 0.0,
                     priority: 100,
                     structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -2059,6 +2478,7 @@ retry:
             loop_detection: Default::default(),
             guardrails: None,
             tool_compression: Default::default(),
+            smart_routing: Default::default(),
             memory: None,
         }
     }
@@ -2704,5 +3124,273 @@ retry:
         // Cleanup
         std::env::remove_var(user_env);
         std::env::remove_var(pass_env);
+    }
+
+    fn smart_routing_json_request(
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn smart_routing_response_json(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn smart_routing_all_endpoint_methods_share_admin_auth() {
+        let user_env = "SMART_ROUTING_ADMIN_TEST_USER";
+        let pass_env = "SMART_ROUTING_ADMIN_TEST_PASS";
+        std::env::set_var(user_env, "smart-admin");
+        std::env::set_var(pass_env, "smart-secret");
+
+        let config = test_config_with_auth_env(true, user_env, pass_env);
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+        let endpoints = [
+            ("GET", "/admin/smart-routing/config", None),
+            ("PUT", "/admin/smart-routing/config", Some(json!({}))),
+            (
+                "POST",
+                "/admin/smart-routing/simulate",
+                Some(json!({"model_group":"test-group","messages":[]})),
+            ),
+            ("GET", "/admin/smart-routing/optimizer-state", None),
+            ("GET", "/admin/smart-routing/budget", None),
+            ("GET", "/admin/smart-routing/model/status", None),
+            ("POST", "/admin/smart-routing/model/download", None),
+            ("POST", "/admin/smart-routing/model/train", None),
+            ("GET", "/admin/smart-routing/model/train/status", None),
+            ("GET", "/admin/smart-routing/ab-test", None),
+            ("PUT", "/admin/smart-routing/ab-test", Some(json!({}))),
+            ("DELETE", "/admin/smart-routing/ab-test", None),
+            ("GET", "/admin/smart-routing/ab-test/results", None),
+        ];
+
+        for (method, uri, body) in endpoints {
+            let request = match body.clone() {
+                Some(body) => smart_routing_json_request(method, uri, body),
+                None => axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            };
+            let response = tower::ServiceExt::oneshot(app.clone(), request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must require admin authentication"
+            );
+        }
+
+        std::env::remove_var(user_env);
+        std::env::remove_var(pass_env);
+    }
+
+    #[tokio::test]
+    async fn smart_routing_config_endpoint_rejects_non_finite_and_out_of_range_values() {
+        let server = crate::gateway::GatewayServer::new(test_config_with_auth(false), None)
+            .await
+            .unwrap();
+
+        for (field, invalid) in [
+            ("cost_quality_threshold", f64::NAN),
+            ("cost_quality_threshold", f64::INFINITY),
+            ("online_optimizer.alpha", -0.01),
+            ("semantic_cache.similarity_threshold", 1.01),
+        ] {
+            let mut smart_routing = SmartRoutingConfig::default();
+            match field {
+                "cost_quality_threshold" => smart_routing.cost_quality_threshold = invalid,
+                "online_optimizer.alpha" => smart_routing.online_optimizer.alpha = invalid,
+                "semantic_cache.similarity_threshold" => {
+                    smart_routing.semantic_cache.similarity_threshold = invalid
+                }
+                _ => unreachable!(),
+            }
+            let response =
+                update_smart_routing_config(State(server.state.clone()), Json(smart_routing)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+            let body = smart_routing_response_json(response).await;
+            assert_eq!(body["error"]["type"], "validation_error");
+            assert!(
+                body["error"]["details"]
+                    .as_array()
+                    .is_some_and(|details| details.iter().any(|detail| detail
+                        .as_str()
+                        .is_some_and(|detail| detail.contains(field)))),
+                "validation response should identify {field}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn smart_routing_simulation_is_heuristic_bounded_and_never_generates() {
+        let provider = wiremock::MockServer::start().await;
+        let mut config = test_config_with_auth(false);
+        config.providers[0].base_url = Some(provider.uri());
+        config.smart_routing.enabled = true;
+        config.smart_routing.allow_unknown_context_window = true;
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+        let prompt_marker = "SIMULATION_PROMPT_MUST_NOT_LEAK_OR_GENERATE";
+        let request = smart_routing_json_request(
+            "POST",
+            "/admin/smart-routing/simulate",
+            json!({
+            "model_group": "test-group",
+            "messages": [{"role":"user","content":prompt_marker}],
+            "max_tokens": 32
+            }),
+        );
+
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        assert!(
+            body.len() < 8 * 1024,
+            "simulation response must remain bounded"
+        );
+        let body_text = std::str::from_utf8(&body).unwrap();
+        assert!(body_text.contains("Heuristic"));
+        assert!(!body_text.contains(prompt_marker));
+        assert!(provider.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn smart_routing_json_extractors_reject_malformed_and_oversized_bodies() {
+        let mut config = test_config_with_auth(false);
+        config.server.max_request_size_mb = 1;
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        let malformed = axum::http::Request::post("/admin/smart-routing/simulate")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from("{"))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), malformed)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let oversized = axum::http::Request::put("/admin/smart-routing/config")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(" ".repeat(1024 * 1024 + 1)))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, oversized).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn smart_routing_duplicate_ab_put_replaces_the_active_experiment() {
+        *smart_routing_ab_test()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let server = crate::gateway::GatewayServer::new(test_config_with_auth(false), None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        for percentage in [0.2, 0.8] {
+            let request = smart_routing_json_request(
+                "PUT",
+                "/admin/smart-routing/ab-test",
+                json!({"variant_percentage":percentage}),
+            );
+            let response = tower::ServiceExt::oneshot(app.clone(), request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let request = axum::http::Request::get("/admin/smart-routing/ab-test/results")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = smart_routing_response_json(response).await;
+        assert_eq!(body["active"], true);
+        assert_eq!(body["variant_percentage"], 0.8);
+        assert_eq!(body["control"]["n"], 0);
+        assert_eq!(body["variant"]["n"], 0);
+
+        *smart_routing_ab_test()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    #[tokio::test]
+    async fn smart_routing_unavailable_model_and_training_responses_are_redacted() {
+        let path_secret = "C:\\private\\tenant-secret\\model.onnx";
+        let dataset_secret = "/home/private/tenant-secret/training.jsonl";
+        let api_secret = "sk-super-secret-admin-test";
+        let mut config = test_config_with_auth(false);
+        config.smart_routing.ml_model_path = Some(path_secret.to_string());
+        config.smart_routing.training.dataset_path = Some(dataset_secret.to_string());
+        config.providers[0].resolved_api_key = Some(api_secret.to_string());
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+        let endpoints = [
+            ("GET", "/admin/smart-routing/model/status", StatusCode::OK),
+            (
+                "POST",
+                "/admin/smart-routing/model/download",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "POST",
+                "/admin/smart-routing/model/train",
+                StatusCode::NOT_IMPLEMENTED,
+            ),
+            (
+                "GET",
+                "/admin/smart-routing/model/train/status",
+                StatusCode::OK,
+            ),
+        ];
+
+        for (method, uri, expected_status) in endpoints {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = tower::ServiceExt::oneshot(app.clone(), request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status, "{method} {uri}");
+            let body = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
+            assert!(
+                body.len() < 4 * 1024,
+                "{method} {uri} response is unbounded"
+            );
+            let body = std::str::from_utf8(&body).unwrap();
+            for secret in [path_secret, dataset_secret, api_secret, "tenant-secret"] {
+                assert!(
+                    !body.contains(secret),
+                    "{method} {uri} leaked sensitive value {secret}: {body}"
+                );
+            }
+            assert!(!body.contains("\\private\\"));
+            assert!(!body.contains("/home/private/"));
+        }
     }
 }

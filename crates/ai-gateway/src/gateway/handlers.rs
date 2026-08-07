@@ -39,6 +39,7 @@ use crate::models::openai::{Choice, OpenAIRequest, OpenAIResponse};
 use crate::providers::Model;
 use crate::router::trace_id::generate_trace_id;
 use crate::router::StreamingResponse;
+use crate::smart_routing::tier::{ClassifierUsed, RoutingDecision, SmartRoutingTier, TaskType};
 use crate::structured_output::validator::{
     ChoiceValidationOutcome, ChoiceValidationResult, SchemaViolation,
 };
@@ -248,12 +249,112 @@ fn strip_gateway_response_metadata(response: &mut OpenAIResponse) {
     response.extra.remove("gateway_responded_model");
     response.extra.remove("gateway_cost");
     response.extra.remove("gateway_compression");
+    response.extra.remove("gateway_smart_routing");
 }
 
 fn prepare_response_for_client(response: &OpenAIResponse) -> OpenAIResponse {
     let mut client_response = response.clone();
     strip_gateway_response_metadata(&mut client_response);
     client_response
+}
+
+const SMART_ROUTE_TIER_HEADER: &str = "x-smart-route-tier";
+const SMART_ROUTE_SCORE_HEADER: &str = "x-smart-route-score";
+const SMART_ROUTE_CLASSIFIER_HEADER: &str = "x-smart-route-classifier";
+const SMART_ROUTE_TASK_TYPE_HEADER: &str = "x-smart-route-task-type";
+const SMART_ROUTE_ESCALATED_HEADER: &str = "x-smart-route-escalated";
+const SMART_ROUTE_CACHE_HIT_HEADER: &str = "x-smart-route-cache-hit";
+const BUDGET_EXCEEDED_HEADER: &str = "x-budget-exceeded";
+const MAX_DYNAMIC_HEADER_VALUE_LEN: usize = 128;
+
+fn ascii_bounded_header_value(value: &str) -> Option<HeaderValue> {
+    if value.is_empty() || value.len() > MAX_DYNAMIC_HEADER_VALUE_LEN || !value.is_ascii() {
+        return None;
+    }
+    HeaderValue::from_str(value).ok()
+}
+
+fn smart_routing_tier_value(tier: SmartRoutingTier) -> &'static str {
+    match tier {
+        SmartRoutingTier::Fast => "fast",
+        SmartRoutingTier::Balanced => "balanced",
+        SmartRoutingTier::Powerful => "powerful",
+    }
+}
+
+fn smart_routing_classifier_value(classifier: ClassifierUsed) -> &'static str {
+    match classifier {
+        ClassifierUsed::Heuristic => "heuristic",
+        ClassifierUsed::Ml => "ml",
+        ClassifierUsed::Llm => "llm",
+        ClassifierUsed::Composite => "composite",
+    }
+}
+
+fn smart_routing_task_type_value(task_type: TaskType) -> &'static str {
+    match task_type {
+        TaskType::CodeGeneration => "code_generation",
+        TaskType::MathReasoning => "math_reasoning",
+        TaskType::CreativeWriting => "creative_writing",
+        TaskType::FactualQA => "factual_qa",
+        TaskType::ToolUse => "tool_use",
+        TaskType::Summarization => "summarization",
+        TaskType::General => "general",
+    }
+}
+
+fn smart_routing_headers(response: &OpenAIResponse) -> HeaderMap {
+    let Some(decision) = response
+        .extra
+        .get("gateway_smart_routing")
+        .and_then(|value| serde_json::from_value::<RoutingDecision>(value.clone()).ok())
+    else {
+        return HeaderMap::new();
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static(SMART_ROUTE_TIER_HEADER),
+        HeaderValue::from_static(smart_routing_tier_value(decision.tier)),
+    );
+    let score = decision.score.value();
+    let score = if score == 0.0 { 0.0 } else { score };
+    if let Ok(score) = HeaderValue::from_str(&format!("{score:.2}")) {
+        headers.insert(HeaderName::from_static(SMART_ROUTE_SCORE_HEADER), score);
+    }
+    headers.insert(
+        HeaderName::from_static(SMART_ROUTE_CLASSIFIER_HEADER),
+        HeaderValue::from_static(smart_routing_classifier_value(decision.classifier)),
+    );
+    headers.insert(
+        HeaderName::from_static(SMART_ROUTE_TASK_TYPE_HEADER),
+        HeaderValue::from_static(smart_routing_task_type_value(decision.task_type)),
+    );
+    if decision.escalated {
+        headers.insert(
+            HeaderName::from_static(SMART_ROUTE_ESCALATED_HEADER),
+            HeaderValue::from_static("true"),
+        );
+    }
+    if decision.cache_hit {
+        headers.insert(
+            HeaderName::from_static(SMART_ROUTE_CACHE_HIT_HEADER),
+            HeaderValue::from_static("true"),
+        );
+    }
+    headers
+}
+
+fn attach_smart_routing_headers(response: &mut Response, routing_headers: HeaderMap) {
+    response.headers_mut().extend(routing_headers);
+}
+
+fn openai_json_response(response: &OpenAIResponse) -> Response {
+    let routing_headers = smart_routing_headers(response);
+    let client_response = prepare_response_for_client(response);
+    let mut http_response = Json(client_response).into_response();
+    attach_smart_routing_headers(&mut http_response, routing_headers);
+    http_response
 }
 
 fn trace_id_from_headers(headers: &HeaderMap) -> String {
@@ -383,11 +484,15 @@ fn eager_sse_response(
     streaming_config: &StreamingConfig,
     trace_id: &str,
     validation_status: Option<ValidationResponseStatus>,
+    routing_headers: Option<HeaderMap>,
 ) -> Response {
     let stream = futures::stream::iter(events.into_iter().map(Ok::<_, Infallible>));
     let mut response = Sse::new(stream)
         .keep_alive(build_keepalive(streaming_config))
         .into_response();
+    if let Some(routing_headers) = routing_headers {
+        attach_smart_routing_headers(&mut response, routing_headers);
+    }
     if let Some(status) = validation_status {
         attach_validation_status_header(&mut response, status, true);
     }
@@ -745,6 +850,30 @@ impl IntoResponse for GatewayError {
                 StatusCode::BAD_REQUEST,
                 serde_json::json!({ "error": { "message": msg, "type": "invalid_request_error" } }),
             ),
+            GatewayError::ContextCapacityExceeded {
+                estimated_requirement,
+                largest_supported_context,
+            } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                serde_json::json!({
+                    "error": {
+                        "message": "No configured model can safely accommodate the request context",
+                        "type": "context_capacity_exceeded",
+                        "estimated_requirement": estimated_requirement,
+                        "largest_supported_context": largest_supported_context,
+                    }
+                }),
+            ),
+            GatewayError::SmartRoutingBudgetExceeded { period } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                serde_json::json!({
+                    "error": {
+                        "message": "Smart-routing budget exhausted",
+                        "type": "smart_routing_budget_exceeded",
+                        "period": period,
+                    }
+                }),
+            ),
             GatewayError::Authentication(msg) => (
                 StatusCode::UNAUTHORIZED,
                 serde_json::json!({ "error": { "message": msg, "type": "authentication_error" } }),
@@ -806,7 +935,15 @@ impl IntoResponse for GatewayError {
             ),
         };
 
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let GatewayError::SmartRoutingBudgetExceeded { period } = self {
+            if let Some(period) = ascii_bounded_header_value(&period) {
+                response
+                    .headers_mut()
+                    .insert(HeaderName::from_static(BUDGET_EXCEEDED_HEADER), period);
+            }
+        }
+        response
     }
 }
 
@@ -926,8 +1063,7 @@ async fn chat_completions_non_stream(
         {
             state.metrics.record_cache_hit();
             request_guard.complete();
-            let client_response = prepare_response_for_client(&resp);
-            let mut http = Json(client_response).into_response();
+            let mut http = openai_json_response(&resp);
             attach_trace_id_header(&mut http, &trace_id);
             return http;
         }
@@ -950,8 +1086,7 @@ async fn chat_completions_non_stream(
                     ) {
                         Ok(resp) => {
                             request_guard.complete();
-                            let client_response = prepare_response_for_client(&resp);
-                            let mut response = Json(client_response).into_response();
+                            let mut response = openai_json_response(&resp);
                             attach_trace_id_header(&mut response, &trace_id);
                             return response;
                         }
@@ -1159,8 +1294,7 @@ async fn chat_completions_non_stream(
                                     None,
                                 );
                                 log_request(&state, &request, &log_context);
-                                let client_response = prepare_response_for_client(&response);
-                                let mut http_response = Json(client_response).into_response();
+                                let mut http_response = openai_json_response(&response);
                                 attach_trace_id_header(&mut http_response, &trace_id);
                                 return http_response;
                             }
@@ -1690,8 +1824,7 @@ async fn chat_completions_non_stream(
                 Some(memory_extraction),
             );
             log_request(&state, &request, &log_context);
-            let client_response = prepare_response_for_client(&response);
-            let mut http_response = Json(client_response).into_response();
+            let mut http_response = openai_json_response(&response);
             attach_validation_status_header(
                 &mut http_response,
                 validation_status,
@@ -2892,6 +3025,7 @@ async fn stream_eager_structured_output(
                             &streaming_config,
                             &trace_id,
                             None,
+                            None,
                         );
                     }
                     Err(error) => {
@@ -2915,6 +3049,7 @@ async fn stream_eager_structured_output(
                             &streaming_config,
                             &trace_id,
                             None,
+                            None,
                         );
                     }
                 }
@@ -2937,6 +3072,7 @@ async fn stream_eager_structured_output(
                         &streaming_config,
                         &trace_id,
                         None,
+                        None,
                     );
                 }
             };
@@ -2955,6 +3091,7 @@ async fn stream_eager_structured_output(
                     emit_sse_error_event("stream_error", message, &trace_id),
                     &streaming_config,
                     &trace_id,
+                    None,
                     None,
                 );
             }
@@ -2986,6 +3123,7 @@ async fn stream_eager_structured_output(
                 &streaming_config,
                 &trace_id,
                 None,
+                None,
             );
         }
     };
@@ -3007,7 +3145,7 @@ async fn stream_eager_structured_output(
             let log_context =
                 RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
             log_request(&state, &request, &log_context);
-            return eager_sse_response(events, &streaming_config, &trace_id, None);
+            return eager_sse_response(events, &streaming_config, &trace_id, None, None);
         }
     };
 
@@ -3029,7 +3167,7 @@ async fn stream_eager_structured_output(
             let log_context =
                 RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
             log_request(&state, &request, &log_context);
-            return eager_sse_response(events, &streaming_config, &trace_id, None);
+            return eager_sse_response(events, &streaming_config, &trace_id, None, None);
         }
         Err(EagerPostCallResult::Response(_)) => unreachable!(),
     };
@@ -3053,6 +3191,7 @@ async fn stream_eager_structured_output(
         }
     }
 
+    let routing_headers = smart_routing_headers(&response);
     let events = rechunk_structured_response(&response);
     let duration_ms = request_guard.complete();
     let log_context =
@@ -3063,6 +3202,7 @@ async fn stream_eager_structured_output(
         &streaming_config,
         &trace_id,
         Some(validation_status),
+        Some(routing_headers),
     )
 }
 
@@ -4355,13 +4495,14 @@ fn reasoning_delta(choice: Option<&Choice>) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_feedback_to_response, attach_validation_status_header, build_keepalive,
-        cache_allowed_for_validation, chunk_carries_content, classify_relay_line,
+        append_feedback_to_response, attach_smart_routing_headers, attach_validation_status_header,
+        build_keepalive, cache_allowed_for_validation, chunk_carries_content, classify_relay_line,
         classify_stream_error, collect_structured_output_failure, eager_sse_response,
         early_event_chunk, emit_sse_error_event, force_eager_structured_stream,
-        memory_feedback_chunk, prepare_response_for_client, rechunk_structured_response,
-        relay_passthrough_stream, requests_structured_output, should_cache_eager_structured,
-        sse_error_payload, streaming_chunks_after_early_event, streaming_chunks_from_response,
+        memory_feedback_chunk, openai_json_response, prepare_response_for_client,
+        rechunk_structured_response, relay_passthrough_stream, requests_structured_output,
+        should_cache_eager_structured, smart_routing_headers, sse_error_payload,
+        streaming_chunks_after_early_event, streaming_chunks_from_response,
         structured_stream_overflow_events, RelayLineAction, RelayOutcome, RequestCompleteGuard,
         RequestLogContext, ValidationResponseStatus,
     };
@@ -4371,6 +4512,9 @@ mod tests {
     use crate::memory::{ContextType, ExtractionCounts, InjectionResult};
     use crate::metrics::Metrics;
     use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
+    use crate::smart_routing::tier::{
+        ClassifierUsed, ComplexityScore, RoutingDecision, SmartRoutingTier, TaskType,
+    };
     use crate::structured_output::validator::{
         ChoiceValidationOutcome, ChoiceValidationResult, SchemaViolation,
     };
@@ -4414,6 +4558,21 @@ mod tests {
                 extra: Default::default(),
             },
             extra: Default::default(),
+        }
+    }
+
+    fn routing_decision(score: f64) -> RoutingDecision {
+        RoutingDecision {
+            score: ComplexityScore::new(score),
+            adjusted_score: ComplexityScore::new(score),
+            tier: SmartRoutingTier::Balanced,
+            task_type: TaskType::CodeGeneration,
+            classifier: ClassifierUsed::Composite,
+            escalated: true,
+            escalation_count: 1,
+            cache_hit: true,
+            budget_downgraded: false,
+            context_filtered: false,
         }
     }
 
@@ -4637,6 +4796,7 @@ mod tests {
             &StreamingConfig::default(),
             "trace-eager",
             Some(ValidationResponseStatus::Passed),
+            None,
         );
         assert_eq!(
             response
@@ -4670,6 +4830,7 @@ mod tests {
             structured_stream_overflow_events("trace-overflow"),
             &StreamingConfig::default(),
             "trace-overflow",
+            None,
             None,
         );
         assert!(response.headers().get("x-obey-validation-status").is_none());
@@ -4796,6 +4957,183 @@ mod tests {
     }
 
     #[test]
+    fn smart_routing_headers_use_contract_names_and_two_decimal_score() {
+        let mut response = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!("ok"),
+            extra: Default::default(),
+        });
+        response.extra.insert(
+            "gateway_smart_routing".to_owned(),
+            serde_json::to_value(routing_decision(0.476)).unwrap(),
+        );
+
+        let headers = smart_routing_headers(&response);
+        assert_eq!(headers.get("x-smart-route-tier").unwrap(), "balanced");
+        assert_eq!(headers.get("x-smart-route-score").unwrap(), "0.48");
+        assert_eq!(
+            headers.get("x-smart-route-classifier").unwrap(),
+            "composite"
+        );
+        assert_eq!(
+            headers.get("x-smart-route-task-type").unwrap(),
+            "code_generation"
+        );
+        assert_eq!(headers.get("x-smart-route-escalated").unwrap(), "true");
+        assert_eq!(headers.get("x-smart-route-cache-hit").unwrap(), "true");
+        assert_eq!(headers.len(), 6);
+
+        let http_response = openai_json_response(&response);
+        assert_eq!(
+            http_response.headers().get("x-smart-route-score").unwrap(),
+            "0.48"
+        );
+    }
+
+    // Feature: smart-routing, Property 21: Exact Score Header Format
+    proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn prop_smart_routing_score_header_has_exact_format_and_normalized_value(score in any::<f64>()) {
+    let normalized_score = ComplexityScore::new(score).value();
+    let mut response = base_response(Message {
+    role: "assistant".to_owned(),
+    content: serde_json::json!("ok"),
+    extra: Default::default(),
+    });
+    response.extra.insert(
+    "gateway_smart_routing".to_owned(),
+    serde_json::to_value(routing_decision(score)).unwrap(),
+    );
+
+    let headers = smart_routing_headers(&response);
+    let score_header = headers
+    .get("x-smart-route-score")
+    .expect("routing metadata must emit a score header")
+    .to_str()
+    .expect("score header must be ASCII");
+    let (integer_digits, fractional_digits) = score_header
+    .split_once('.')
+    .expect("score header must contain a decimal point");
+
+    prop_assert!(!integer_digits.is_empty());
+    prop_assert!(integer_digits.bytes().all(|byte| byte.is_ascii_digit()));
+    prop_assert_eq!(fractional_digits.len(), 2);
+    prop_assert!(fractional_digits.bytes().all(|byte| byte.is_ascii_digit()));
+    prop_assert!(!fractional_digits.contains('.'));
+    let expected_score = if normalized_score == 0.0 {
+    "0.00".to_owned()
+    } else {
+    format!("{normalized_score:.2}")
+    };
+    prop_assert_eq!(score_header, expected_score);
+    let parsed_score = score_header.parse::<f64>().expect("score header must parse");
+    prop_assert!((0.0..=1.0).contains(&parsed_score));
+    }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SmartRoutingHeaderAbsenceScenario {
+        NoInternalMetadata,
+        Bypassed,
+    }
+
+    fn smart_routing_header_absence_scenario_strategy(
+    ) -> impl Strategy<Value = SmartRoutingHeaderAbsenceScenario> {
+        prop_oneof![
+            Just(SmartRoutingHeaderAbsenceScenario::NoInternalMetadata),
+            Just(SmartRoutingHeaderAbsenceScenario::Bypassed),
+        ]
+    }
+
+    // Feature: smart-routing, Property 22: Header Absence Without Routing Metadata
+    proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn prop_smart_routing_headers_are_absent_without_metadata_or_when_bypassed(
+    scenario in smart_routing_header_absence_scenario_strategy(),
+    unrelated_value in json_value_strategy(),
+    ) {
+    let mut response = base_response(Message {
+    role: "assistant".to_owned(),
+    content: serde_json::json!("ok"),
+    extra: Default::default(),
+    });
+    response
+    .extra
+    .insert("unrelated_internal_metadata".to_owned(), unrelated_value);
+
+    let http_response = match scenario {
+    SmartRoutingHeaderAbsenceScenario::NoInternalMetadata => openai_json_response(&response),
+    SmartRoutingHeaderAbsenceScenario::Bypassed => {
+    response.extra.insert(
+    "gateway_smart_routing".to_owned(),
+    serde_json::to_value(routing_decision(0.73)).unwrap(),
+    );
+    ().into_response()
+    }
+    };
+
+    prop_assert!(http_response
+    .headers()
+    .keys()
+    .all(|name| !name.as_str().starts_with("x-smart-route-")));
+    }
+    }
+
+    #[test]
+    fn smart_routing_headers_are_absent_without_internal_metadata() {
+        let response = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!("ok"),
+            extra: Default::default(),
+        });
+        let mut http_response = ().into_response();
+        attach_smart_routing_headers(&mut http_response, smart_routing_headers(&response));
+
+        assert!(http_response
+            .headers()
+            .keys()
+            .all(|name| !name.as_str().starts_with("x-smart-route-")));
+    }
+
+    #[test]
+    fn smart_routing_optional_true_headers_are_omitted_when_false() {
+        let mut decision = routing_decision(0.5);
+        decision.escalated = false;
+        decision.cache_hit = false;
+        let mut response = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!("ok"),
+            extra: Default::default(),
+        });
+        response.extra.insert(
+            "gateway_smart_routing".to_owned(),
+            serde_json::to_value(decision).unwrap(),
+        );
+
+        let headers = smart_routing_headers(&response);
+        assert!(headers.get("x-smart-route-escalated").is_none());
+        assert!(headers.get("x-smart-route-cache-hit").is_none());
+    }
+
+    #[test]
+    fn smart_routing_budget_error_sets_exceeded_period_header() {
+        let response = GatewayError::SmartRoutingBudgetExceeded {
+            period: "monthly".to_owned(),
+        }
+        .into_response();
+
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get("x-budget-exceeded").unwrap(),
+            "monthly"
+        );
+    }
+
+    #[test]
     fn response_metadata_is_logged_but_removed_from_client_payload() {
         let request = OpenAIRequest {
             model: "requested-model".to_owned(),
@@ -4817,6 +5155,10 @@ mod tests {
             "gateway_compression".to_owned(),
             serde_json::to_value(test_compression_stats()).unwrap(),
         );
+        response.extra.insert(
+            "gateway_smart_routing".to_owned(),
+            serde_json::to_value(routing_decision(0.42)).unwrap(),
+        );
 
         let context = RequestLogContext::from_response(&request, "trace".to_owned(), 10, &response);
         assert_eq!(
@@ -4829,6 +5171,7 @@ mod tests {
         let client_response = prepare_response_for_client(&response);
         assert!(!client_response.extra.contains_key("gateway_compression"));
         assert!(!client_response.extra.contains_key("gateway_provider"));
+        assert!(!client_response.extra.contains_key("gateway_smart_routing"));
         assert!(!serde_json::to_string(&client_response)
             .unwrap()
             .contains("gateway_compression"));

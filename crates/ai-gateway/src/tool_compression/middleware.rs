@@ -25,16 +25,10 @@ use super::{
     config::CompressionLevel,
     stage::CompressionStage,
     stages::{
-        auto_tuner::AutoTuner,
-        cache_placement::CachePlacementOptimizer,
-        canonical_rewriter::CanonicalRewriter,
-        deduplicator::SchemaDeduplicator,
-        feedback_loop::FeedbackLoop,
-        minifier::SchemaMinifier,
-        namespace_grouper::NamespaceGrouper,
-        pruner::ToolPruner,
-        semantic_retriever::SemanticRetriever,
-        truncator::DescriptionTruncator,
+        auto_tuner::AutoTuner, cache_placement::CachePlacementOptimizer,
+        canonical_rewriter::CanonicalRewriter, deduplicator::SchemaDeduplicator,
+        feedback_loop::FeedbackLoop, minifier::SchemaMinifier, namespace_grouper::NamespaceGrouper,
+        pruner::ToolPruner, semantic_retriever::SemanticRetriever, truncator::DescriptionTruncator,
     },
     state::ToolCompressionState,
     types::{CompressionContext, ToolDefinition},
@@ -98,9 +92,7 @@ impl<S> Layer<S> for ToolCompressionLayer {
         let auto_tuner = self
             .config
             .try_read()
-            .map(|c| {
-                Arc::new(AutoTuner::new(&c.tool_compression.auto_tuning))
-            })
+            .map(|c| Arc::new(AutoTuner::new(&c.tool_compression.auto_tuning)))
             .unwrap_or_else(|_| {
                 Arc::new(AutoTuner::new(&super::config::AutoTuningConfig::default()))
             });
@@ -202,9 +194,7 @@ where
             let bytes = match to_bytes(body, max_body).await {
                 Ok(b) => b,
                 Err(_) => {
-                    return inner
-                        .call(Request::from_parts(parts, Body::empty()))
-                        .await;
+                    return inner.call(Request::from_parts(parts, Body::empty())).await;
                 }
             };
 
@@ -330,8 +320,7 @@ where
             // Check if compression should be skipped (prompt cache hit).
             if auto_tuner.should_skip_compression(&ctx, has_explicit_header) {
                 // Skip pipeline — passthrough with extension flags set.
-                let mut passthrough_request =
-                    Request::from_parts(parts, Body::from(bytes));
+                let mut passthrough_request = Request::from_parts(parts, Body::from(bytes));
                 passthrough_request
                     .extensions_mut()
                     .insert(OriginalToolsExtension(Arc::new(original_tools)));
@@ -342,9 +331,7 @@ where
             }
 
             // Run pipeline stages in fixed order.
-            let tc_config = config_snapshot
-                .clone()
-                .unwrap_or_default();
+            let tc_config = config_snapshot.clone().unwrap_or_default();
 
             let debug_validation = tc_config.debug_validation;
 
@@ -413,10 +400,13 @@ where
 
             // ─── Emit WebSocket dashboard compression event ───────────────────
             // Determine tools pruned count (original - final after pruning stage).
-            let tools_pruned_count = original_token_estimate_tool_count
-                .saturating_sub(compressed_tools.len());
-            let semantic_retrieval_active = ctx.strategies_applied.contains(&"semantic_retrieval".to_string());
-            let tools_deferred: Vec<String> = ctx.deferred_tools.iter().map(|t| t.name.clone()).collect();
+            let tools_pruned_count =
+                original_token_estimate_tool_count.saturating_sub(compressed_tools.len());
+            let semantic_retrieval_active = ctx
+                .strategies_applied
+                .contains(&"semantic_retrieval".to_string());
+            let tools_deferred: Vec<String> =
+                ctx.deferred_tools.iter().map(|t| t.name.clone()).collect();
             let feedback_adjusted = feedback_loop.get_adjusted_level(&model_group).is_some();
 
             // Generate a request ID for event correlation.
@@ -530,10 +520,8 @@ pub fn detect_tool_call_errors(
     }
 
     // Build set of known tool names
-    let known_names: std::collections::HashSet<&str> = original_tools
-        .iter()
-        .map(|t| t.name.as_str())
-        .collect();
+    let known_names: std::collections::HashSet<&str> =
+        original_tools.iter().map(|t| t.name.as_str()).collect();
 
     for call in calls {
         // Check tool name validity

@@ -176,6 +176,9 @@ fn base_config(provider_uri: &str) -> Config {
                 cost_per_million_output_tokens: 0.0,
                 priority: 100,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -210,6 +213,7 @@ fn base_config(provider_uri: &str) -> Config {
         structured_output: None,
         guardrails: None,
         tool_compression: Default::default(),
+        smart_routing: Default::default(),
     }
 }
 

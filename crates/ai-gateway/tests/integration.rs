@@ -70,6 +70,9 @@ fn test_config() -> Config {
                 cost_per_million_output_tokens: 60.0,
                 priority: 100,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -89,6 +92,7 @@ fn test_config() -> Config {
         loop_detection: Default::default(),
         guardrails: None,
         tool_compression: Default::default(),
+        smart_routing: Default::default(),
         structured_output: None,
     }
 }
@@ -1213,6 +1217,9 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
                 cost_per_million_output_tokens: 60.0,
                 priority: 100,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             },
             ProviderModel {
                 provider: "backup".to_string(),
@@ -1221,6 +1228,9 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
                 cost_per_million_output_tokens: 60.0,
                 priority: 200,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             },
         ],
     }];
@@ -1544,6 +1554,9 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
                 cost_per_million_output_tokens: 60.0,
                 priority: 100,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             },
             ProviderModel {
                 provider: "backup".to_string(),
@@ -1552,6 +1565,9 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
                 cost_per_million_output_tokens: 60.0,
                 priority: 200,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             },
         ],
     }];

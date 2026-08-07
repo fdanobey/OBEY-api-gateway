@@ -78,15 +78,17 @@ async fn list_feedback_states(State(state): State<AppState>) -> Response {
         .group_names()
         .into_iter()
         .filter_map(|group_name| {
-            feedback_loop.get_state(&group_name).map(|fs| FeedbackGroupState {
-                group: group_name,
-                error_rate: fs.current_error_rate(),
-                current_level: fs.current_level,
-                locked: fs.locked,
-                window_size: fs.window.len(),
-                baseline_rate: fs.baseline_rate,
-                recovery_counter: fs.recovery_counter,
-            })
+            feedback_loop
+                .get_state(&group_name)
+                .map(|fs| FeedbackGroupState {
+                    group: group_name,
+                    error_rate: fs.current_error_rate(),
+                    current_level: fs.current_level,
+                    locked: fs.locked,
+                    window_size: fs.window.len(),
+                    baseline_rate: fs.baseline_rate,
+                    recovery_counter: fs.recovery_counter,
+                })
         })
         .collect();
 
@@ -230,9 +232,5 @@ async fn list_descriptions(State(state): State<AppState>) -> Response {
         })
         .collect();
 
-    (
-        StatusCode::OK,
-        Json(json!({ "descriptions": entries })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(json!({ "descriptions": entries }))).into_response()
 }

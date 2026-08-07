@@ -125,7 +125,8 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
   <button class="tab-btn" role="tab" aria-selected="false" data-section="compression" id="tab-compression">Compression</button>
   <button class="tab-btn" role="tab" aria-selected="false" data-section="errors" id="tab-errors">Recent Errors</button>
   <button class="tab-btn" role="tab" aria-selected="false" data-section="memory" id="tab-memory">Memory</button>
-  <button class="tab-btn" role="tab" aria-selected="false" data-section="logs" id="tab-logs">Log Viewer</button>
+  <button class="tab-btn" role="tab" aria-selected="false" data-section="routing" id="tab-routing">Smart Routing</button>
+<button class="tab-btn" role="tab" aria-selected="false" data-section="logs" id="tab-logs">Log Viewer</button>
 </div>
 
 <div class="container">
@@ -365,7 +366,44 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     <div class="empty" id="mem-ns-empty">Waiting for memory events…</div>
   </section>
 
-  <!-- Log Viewer (Req 16.13, 33.6) -->
+  <!-- Smart Routing controls and telemetry -->
+<section class="section" id="sec-routing" role="tabpanel" aria-labelledby="tab-routing">
+<h2 class="section-title">Smart Model Routing</h2>
+<div class="cards">
+<div class="card"><div class="card-label">Status</div><div class="card-value" id="sr-status">Unknown</div></div>
+<div class="card"><div class="card-label">Classifier</div><div class="card-value" id="sr-classifier">—</div></div>
+<div class="card"><div class="card-label">Cascade</div><div class="card-value" id="sr-cascade">—</div></div>
+<div class="card"><div class="card-label">ML Artifact</div><div class="card-value" id="sr-model">—</div></div>
+</div>
+<div class="chart-row">
+<div class="chart-box"><h3>Routing policy</h3>
+<form id="sr-config-form" class="filter-bar">
+<div class="fg"><label for="sr-threshold">Cost / quality threshold</label><input id="sr-threshold" type="number" min="0" max="1" step="0.01"></div>
+<div class="fg"><label for="sr-classifier-mode">Classifier mode</label><select id="sr-classifier-mode"><option value="heuristic">Heuristic</option><option value="llm">LLM</option><option value="ml">ML</option><option value="composite">Composite</option></select></div>
+<div class="fg"><label for="sr-streaming-mode">Streaming mode</label><select id="sr-streaming-mode"><option value="buffer">Buffer</option><option value="early_signal">Early signal</option></select></div>
+<div class="fg"><label><input id="sr-enabled" type="checkbox"> Enabled</label></div>
+<div class="fg"><label><input id="sr-cascade-enabled" type="checkbox"> Cascade</label></div>
+<button type="submit" class="btn btn-primary">Save policy</button>
+</form>
+<div id="sr-save-message" class="empty" aria-live="polite"></div>
+</div>
+<div class="chart-box"><h3>Safe simulation</h3>
+<form id="sr-sim-form" class="filter-bar">
+<div class="fg"><label for="sr-sim-group">Model group</label><input id="sr-sim-group" required></div>
+<div class="fg"><label for="sr-sim-message">Prompt</label><input id="sr-sim-message" required maxlength="10000"></div>
+<button type="submit" class="btn btn-primary">Preview route</button>
+</form>
+<pre id="sr-sim-result" class="failure-reason" aria-live="polite"></pre>
+</div>
+</div>
+<div class="chart-row">
+<div class="chart-box"><h3>Budget limits</h3><pre id="sr-budget" class="failure-reason">—</pre></div>
+<div class="chart-box"><h3>A/B experiment</h3><pre id="sr-ab" class="failure-reason">No active experiment</pre><button id="sr-stop-ab" class="btn btn-secondary" type="button">Stop experiment</button></div>
+</div>
+<p class="empty">Tier assignments, specializations, context windows, group overrides, budgets, semantic cache, evaluator, optimizer, and training settings remain server-validated in the authenticated Admin configuration API. This dashboard never receives raw prompts or responses through telemetry.</p>
+</section>
+
+<!-- Log Viewer (Req 16.13, 33.6) -->
   <section class="section" id="sec-logs" role="tabpanel" aria-labelledby="tab-logs">
     <h2 class="section-title">Log Viewer</h2>
     <form class="filter-bar" id="log-filter-form" aria-label="Log filters">
@@ -1380,7 +1418,53 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 
   function escHtml(s) { var d = document.createElement('span'); d.textContent = s; return d.innerHTML; }
 
-  // --- Init ---
+  // --- Smart Routing ---
+var smartRoutingConfig = null;
+function adminJson(path, options){
+var request = options || {};
+request.headers = Object.assign({'Content-Type':'application/json'}, request.headers || {});
+return fetch(adminBasePath + '/smart-routing' + path, request).then(function(response){
+return response.json().then(function(body){ if(!response.ok) throw new Error((body.error&&body.error.message)||response.statusText); return body; });
+});
+}
+function renderSmartRouting(config){
+smartRoutingConfig = config;
+$('sr-status').textContent = config.enabled ? 'Enabled' : 'Disabled';
+$('sr-classifier').textContent = config.classifier || 'heuristic';
+$('sr-cascade').textContent = config.cascade&&config.cascade.enabled ? 'Enabled' : 'Disabled';
+$('sr-enabled').checked = !!config.enabled;
+$('sr-threshold').value = finiteNumber(config.cost_quality_threshold).toFixed(2);
+$('sr-classifier-mode').value = config.classifier || 'heuristic';
+$('sr-streaming-mode').value = config.streaming_cascade_mode || 'buffer';
+$('sr-cascade-enabled').checked = !!(config.cascade&&config.cascade.enabled);
+}
+function loadSmartRouting(){
+adminJson('/config').then(renderSmartRouting).catch(function(error){ $('sr-status').textContent='Admin auth required'; $('sr-save-message').textContent=error.message; });
+adminJson('/budget').then(function(body){ $('sr-budget').textContent=JSON.stringify(body.limits,null,2); }).catch(function(){});
+adminJson('/model/status').then(function(body){ $('sr-model').textContent=body.active?'Active':(body.configured?'Configured':'Unavailable'); }).catch(function(){});
+adminJson('/ab-test/results').then(function(body){ $('sr-ab').textContent=JSON.stringify(body,null,2); }).catch(function(){});
+}
+$('sr-config-form').addEventListener('submit', function(event){
+event.preventDefault(); if(!smartRoutingConfig) return;
+var prior = JSON.parse(JSON.stringify(smartRoutingConfig));
+var candidate = JSON.parse(JSON.stringify(smartRoutingConfig));
+candidate.enabled = $('sr-enabled').checked;
+candidate.cost_quality_threshold = finiteNumber($('sr-threshold').value);
+candidate.classifier = $('sr-classifier-mode').value;
+candidate.streaming_cascade_mode = $('sr-streaming-mode').value;
+candidate.cascade = candidate.cascade || {}; candidate.cascade.enabled = $('sr-cascade-enabled').checked;
+renderSmartRouting(candidate); $('sr-save-message').textContent='Saving…';
+adminJson('/config',{method:'PUT',body:JSON.stringify(candidate)}).then(function(){ $('sr-save-message').textContent='Saved'; }).catch(function(error){ renderSmartRouting(prior); $('sr-save-message').textContent='Save failed: '+error.message; });
+});
+$('sr-sim-form').addEventListener('submit', function(event){
+event.preventDefault(); $('sr-sim-result').textContent='Simulating…';
+adminJson('/simulate',{method:'POST',body:JSON.stringify({model_group:$('sr-sim-group').value,messages:[{role:'user',content:$('sr-sim-message').value}]})})
+.then(function(body){ $('sr-sim-result').textContent=JSON.stringify(body,null,2); })
+.catch(function(error){ $('sr-sim-result').textContent='Simulation failed: '+error.message; });
+});
+$('sr-stop-ab').addEventListener('click', function(){ adminJson('/ab-test',{method:'DELETE'}).then(loadSmartRouting).catch(function(error){ $('sr-ab').textContent=error.message; }); });
+
+// --- Init ---
   initCharts();
   initTcSavingsChart();
   initMemoryCharts();
@@ -1388,8 +1472,10 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
   wsConnect();
   loadErrors();
   loadToolCompressionActivity();
-  loadTcFeedbackGroups();
-  // Poll as fallback every 5s in case WS is not available
+loadTcFeedbackGroups();
+loadSmartRouting();
+// Poll as fallback every 5s in case WS is not available
+
   setInterval(function(){ if(!ws||ws.readyState!==WebSocket.OPEN) pollMetrics(); }, dashboardPollIntervalMs);
   setInterval(loadErrors, 10000);
   setInterval(loadToolCompressionActivity, 10000);

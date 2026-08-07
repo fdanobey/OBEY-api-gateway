@@ -167,7 +167,10 @@ impl CompressionStage for ProgressiveDisclosureEngine {
         minimal_entries.extend(disclosed_full);
 
         // Replace the tools array with our minimal + disclosed listing
-        let after_tokens: u64 = minimal_entries.iter().map(|t| estimate_tokens(&t.raw)).sum();
+        let after_tokens: u64 = minimal_entries
+            .iter()
+            .map(|t| estimate_tokens(&t.raw))
+            .sum();
         *tools = minimal_entries;
 
         // Record strategy
@@ -383,7 +386,9 @@ mod tests {
         let mut ctx = default_ctx();
 
         engine.apply(&mut tools, &mut ctx);
-        assert!(ctx.strategies_applied.contains(&"progressive_disclosure".to_string()));
+        assert!(ctx
+            .strategies_applied
+            .contains(&"progressive_disclosure".to_string()));
     }
 }
 

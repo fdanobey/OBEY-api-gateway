@@ -88,11 +88,7 @@ impl AutoTuner {
 
         // Compare current tool hashes against previous
         // Caller provides current hashes via original_tools content_hash
-        let current_hashes: Vec<u64> = ctx
-            .original_tools
-            .iter()
-            .map(|t| t.content_hash)
-            .collect();
+        let current_hashes: Vec<u64> = ctx.original_tools.iter().map(|t| t.content_hash).collect();
 
         // All hashes must match (same count and same values)
         if current_hashes.len() != previous.len() {
@@ -109,11 +105,7 @@ impl AutoTuner {
 }
 
 impl CompressionStage for AutoTuner {
-    fn apply(
-        &self,
-        _tools: &mut Vec<ToolDefinition>,
-        _ctx: &mut CompressionContext,
-    ) -> u64 {
+    fn apply(&self, _tools: &mut Vec<ToolDefinition>, _ctx: &mut CompressionContext) -> u64 {
         // No-op: AutoTuner is consulted by the middleware for level resolution,
         // not during pipeline execution.
         0
@@ -132,10 +124,8 @@ mod tests {
     use std::collections::HashMap;
 
     fn config_with_tiers(tiers: Vec<(&str, u8)>) -> AutoTuningConfig {
-        let model_tiers: HashMap<String, u8> = tiers
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect();
+        let model_tiers: HashMap<String, u8> =
+            tiers.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         AutoTuningConfig {
             enabled: true,
             model_tiers,

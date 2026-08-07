@@ -102,8 +102,8 @@ impl TfIdfScorer {
                 let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
 
                 // BM25 TF component
-                let tf_norm = (tf * (K1 + 1.0))
-                    / (tf + K1 * (1.0 - B + B * doc_len / self.avg_doc_len));
+                let tf_norm =
+                    (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * doc_len / self.avg_doc_len));
 
                 score += idf * tf_norm;
             }

@@ -15,6 +15,9 @@ use tower::ServiceExt;
 
 use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
+use ai_gateway::models::openai::{Message, OpenAIRequest};
+use ai_gateway::smart_routing::config::ClassifierMode;
+use ai_gateway::smart_routing::heuristic::HeuristicScorer;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -77,6 +80,9 @@ fn test_config() -> Config {
                 cost_per_million_output_tokens: 60.0,
                 priority: 100,
                 structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -96,6 +102,7 @@ fn test_config() -> Config {
         loop_detection: Default::default(),
         guardrails: None,
         tool_compression: Default::default(),
+        smart_routing: Default::default(),
         structured_output: None,
     }
 }
@@ -113,6 +120,65 @@ where
     tokio::time::timeout(TEST_TIMEOUT, future)
         .await
         .unwrap_or_else(|_| panic!("Test '{name}' exceeded {:?}", TEST_TIMEOUT))
+}
+
+#[test]
+fn smart_routing_disabled_and_enabled_regression_measurement() {
+    let request = OpenAIRequest {
+        model: "test-group".to_string(),
+        messages: (0..50)
+            .map(|index| Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String(format!(
+                    "Analyze item {index}: explain the reasoning and provide a concise implementation. {}",
+                    "x".repeat(1_900)
+                )),
+                extra: serde_json::Map::new(),
+            })
+            .collect(),
+        stream: false,
+        temperature: Some(0.0),
+        max_tokens: Some(512),
+        extra: serde_json::Map::new(),
+    };
+    let iterations = 10u32;
+
+    let baseline_start = Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(&request.model);
+    }
+    let baseline = baseline_start.elapsed();
+
+    let disabled = ai_gateway::smart_routing::config::SmartRoutingConfig::default();
+    let disabled_start = Instant::now();
+    for _ in 0..iterations {
+        if std::hint::black_box(disabled.enabled) {
+            unreachable!();
+        }
+    }
+    let disabled_elapsed = disabled_start.elapsed();
+
+    let scorer = HeuristicScorer::default();
+    let enabled_start = Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(scorer.score(&request.messages));
+    }
+    let enabled_elapsed = enabled_start.elapsed();
+
+    let disabled_per_request = disabled_elapsed / iterations;
+    let enabled_per_request = enabled_elapsed / iterations;
+    eprintln!(
+        "smart routing benchmark: baseline={:?}/op disabled={:?}/op enabled_heuristic={:?}/op",
+        baseline / iterations,
+        disabled_per_request,
+        enabled_per_request
+    );
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.classifier, ClassifierMode::Heuristic);
+    assert!(
+        enabled_per_request < Duration::from_millis(250),
+        "debug-build regression gate exceeded: {enabled_per_request:?} per 50-message/95k-character request"
+    );
 }
 
 // ---------------------------------------------------------------------------

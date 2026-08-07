@@ -21,9 +21,9 @@ pub use config::{
     EffectiveMemoryConfig, MemoryConfig, MemoryConfigError, MemoryQdrantConfig,
     MemoryValidationResult, ModelGroupMemoryOverride, ProviderMemoryOverride,
 };
-pub use extraction_adapter::GatewayExtractionAdapter;
 pub use context_detector::ContextDetector;
 pub use decay::{DecayScheduler, VectorRetryCallback};
+pub use extraction_adapter::GatewayExtractionAdapter;
 pub use extractor::{
     AsyncExtractionOutcome, AsyncExtractionRequest, AsyncExtractionSchedule,
     AsyncExtractionSkipReason, CompressionExtractionInput, CompressionMessageSnapshot,

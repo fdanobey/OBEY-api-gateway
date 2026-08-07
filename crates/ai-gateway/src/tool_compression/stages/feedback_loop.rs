@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use crate::tool_compression::config::{CompressionLevel, FeedbackLoopConfig, ToolCompressionConfig};
+use crate::tool_compression::config::{
+    CompressionLevel, FeedbackLoopConfig, ToolCompressionConfig,
+};
 use crate::tool_compression::stage::CompressionStage;
 use crate::tool_compression::types::{CompressionContext, ToolDefinition};
 
@@ -150,9 +152,10 @@ impl FeedbackLoop {
 
     /// Record an outcome (error or success) and run the state machine.
     pub fn record_outcome(&self, model_group: &str, is_error: bool) {
-        let mut entry = self.states.entry(model_group.to_string()).or_insert_with(|| {
-            FeedbackState::new(self.max_level)
-        });
+        let mut entry = self
+            .states
+            .entry(model_group.to_string())
+            .or_insert_with(|| FeedbackState::new(self.max_level));
         let state = entry.value_mut();
 
         // If locked, record but don't adjust
@@ -192,8 +195,7 @@ impl FeedbackLoop {
             // Error spike detected → reduce level
             state.current_level = step_down(state.current_level);
             state.recovery_counter = 0;
-        } else if current_rate <= baseline
-            && state.recovery_counter >= self.config.recovery_window
+        } else if current_rate <= baseline && state.recovery_counter >= self.config.recovery_window
         {
             // Sustained low error rate → increase level (capped)
             state.current_level = step_up(state.current_level, self.max_level);
@@ -265,11 +267,7 @@ impl FeedbackLoop {
 }
 
 impl CompressionStage for FeedbackLoop {
-    fn apply(
-        &self,
-        _tools: &mut Vec<ToolDefinition>,
-        _ctx: &mut CompressionContext,
-    ) -> u64 {
+    fn apply(&self, _tools: &mut Vec<ToolDefinition>, _ctx: &mut CompressionContext) -> u64 {
         // No-op: FeedbackLoop is consulted by the middleware for level resolution,
         // not during pipeline execution. It doesn't modify the tools array.
         0
@@ -306,7 +304,10 @@ mod tests {
         let fl = FeedbackLoop::new(&default_config(), CompressionLevel::High);
         fl.record_outcome("group_a", false);
         assert!(fl.get_adjusted_level("group_a").is_some());
-        assert_eq!(fl.get_adjusted_level("group_a").unwrap(), CompressionLevel::High);
+        assert_eq!(
+            fl.get_adjusted_level("group_a").unwrap(),
+            CompressionLevel::High
+        );
     }
 
     #[test]
@@ -324,7 +325,10 @@ mod tests {
             fl.record_outcome("group", true);
         }
         // Should still be at High (no adjustments before baseline)
-        assert_eq!(fl.get_adjusted_level("group").unwrap(), CompressionLevel::High);
+        assert_eq!(
+            fl.get_adjusted_level("group").unwrap(),
+            CompressionLevel::High
+        );
     }
 
     #[test]
@@ -366,7 +370,10 @@ mod tests {
         // Push 1 error: window = [s,s,s,s,e] → rate = 0.2 > 0.0 + 0.10 → reduce High→Medium
         fl.record_outcome("group", true);
 
-        assert_eq!(fl.get_adjusted_level("group").unwrap(), CompressionLevel::Medium);
+        assert_eq!(
+            fl.get_adjusted_level("group").unwrap(),
+            CompressionLevel::Medium
+        );
     }
 
     #[test]
@@ -388,7 +395,10 @@ mod tests {
         fl.record_outcome("group", true);
 
         // Should stay at Low (can't go below)
-        assert_eq!(fl.get_adjusted_level("group").unwrap(), CompressionLevel::Low);
+        assert_eq!(
+            fl.get_adjusted_level("group").unwrap(),
+            CompressionLevel::Low
+        );
     }
 
     #[test]
@@ -408,7 +418,10 @@ mod tests {
 
         // Spike: push 1 error → reduces from High to Medium
         fl.record_outcome("group", true);
-        assert_eq!(fl.get_adjusted_level("group").unwrap(), CompressionLevel::Medium);
+        assert_eq!(
+            fl.get_adjusted_level("group").unwrap(),
+            CompressionLevel::Medium
+        );
 
         // Recovery: push successes. Window will shift. After enough successes
         // with rate <= baseline (0.0), recovery_counter increments.
@@ -495,7 +508,10 @@ mod tests {
         }
 
         // Should still be at High (locked)
-        assert_eq!(fl.get_adjusted_level("group").unwrap(), CompressionLevel::High);
+        assert_eq!(
+            fl.get_adjusted_level("group").unwrap(),
+            CompressionLevel::High
+        );
     }
 
     #[test]
@@ -519,7 +535,10 @@ mod tests {
         fl.record_outcome("group", true);
 
         // Should have reduced after unlock
-        assert_eq!(fl.get_adjusted_level("group").unwrap(), CompressionLevel::Medium);
+        assert_eq!(
+            fl.get_adjusted_level("group").unwrap(),
+            CompressionLevel::Medium
+        );
     }
 
     #[test]

@@ -16,13 +16,20 @@ mod tests {
 
     use crate::tool_compression::config::CompressionLevel;
     use crate::tool_compression::types::ToolDefinition;
-    use crate::tool_compression::validation::{validate_compressed_tools, validate_tool_calls_against_originals};
+    use crate::tool_compression::validation::{
+        validate_compressed_tools, validate_tool_calls_against_originals,
+    };
 
     // ─── Helper: build a minimal tools array of specified size ─────────────────
 
     fn generate_realistic_tools(count: usize) -> Vec<Value> {
-        let prefixes = ["github", "slack", "jira", "aws", "gcp", "mcp", "db", "fs", "http", "email"];
-        let actions = ["create", "read", "update", "delete", "list", "search", "sync", "export", "import", "validate"];
+        let prefixes = [
+            "github", "slack", "jira", "aws", "gcp", "mcp", "db", "fs", "http", "email",
+        ];
+        let actions = [
+            "create", "read", "update", "delete", "list", "search", "sync", "export", "import",
+            "validate",
+        ];
 
         (0..count)
             .map(|i| {
@@ -109,8 +116,14 @@ mod tests {
         // Each tool should have type, function.name, function.parameters
         for tool in &tools {
             assert_eq!(tool.get("type").and_then(|v| v.as_str()), Some("function"));
-            assert!(tool.pointer("/function/name").and_then(|v| v.as_str()).is_some());
-            assert!(tool.pointer("/function/parameters").and_then(|v| v.as_object()).is_some());
+            assert!(tool
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+                .is_some());
+            assert!(tool
+                .pointer("/function/parameters")
+                .and_then(|v| v.as_object())
+                .is_some());
         }
     }
 
@@ -128,8 +141,12 @@ mod tests {
         // Populate some state
         state.feedback_state.insert("group_a".to_string(), ());
         state.feedback_state.insert("group_b".to_string(), ());
-        state.description_compressor.insert("tool_1".to_string(), "compressed desc".to_string());
-        state.semantic_state.insert("tool_1".to_string(), vec![0.1, 0.2, 0.3]);
+        state
+            .description_compressor
+            .insert("tool_1".to_string(), "compressed desc".to_string());
+        state
+            .semantic_state
+            .insert("tool_1".to_string(), vec![0.1, 0.2, 0.3]);
 
         assert_eq!(state.feedback_state.len(), 2);
         assert_eq!(state.description_compressor.len(), 1);
@@ -179,19 +196,22 @@ mod tests {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, _)| i)
             .unwrap();
-        assert_eq!(max_idx, 0, "Weather tool should score highest for weather query");
+        assert_eq!(
+            max_idx, 0,
+            "Weather tool should score highest for weather query"
+        );
     }
 
     // ─── 24.4: Canonical rewriting end-to-end ─────────────────────────────────
 
     #[test]
     fn test_canonical_rewriting_end_to_end() {
-        use crate::tool_compression::stages::canonical_rewriter::CanonicalRewriter;
         use crate::tool_compression::config::ToolCompressionConfig;
         use crate::tool_compression::stage::CompressionStage;
+        use crate::tool_compression::stages::canonical_rewriter::CanonicalRewriter;
         use crate::tool_compression::types::CompressionContext;
-        use std::sync::Arc;
         use dashmap::DashMap;
+        use std::sync::Arc;
 
         let allowed_models = vec!["gpt-4*".to_string()];
         let original_schemas = Arc::new(DashMap::new());
@@ -241,8 +261,8 @@ mod tests {
 
     #[test]
     fn test_feedback_loop_end_to_end() {
-        use crate::tool_compression::stages::feedback_loop::FeedbackLoop;
         use crate::tool_compression::config::FeedbackLoopConfig;
+        use crate::tool_compression::stages::feedback_loop::FeedbackLoop;
 
         let config = FeedbackLoopConfig {
             enabled: true,
@@ -291,9 +311,9 @@ mod tests {
 
     #[test]
     fn test_namespace_grouping_end_to_end() {
-        use crate::tool_compression::stages::namespace_grouper::NamespaceGrouper;
         use crate::tool_compression::config::ToolCompressionConfig;
         use crate::tool_compression::stage::CompressionStage;
+        use crate::tool_compression::stages::namespace_grouper::NamespaceGrouper;
         use crate::tool_compression::types::CompressionContext;
 
         let config = ToolCompressionConfig {
@@ -346,16 +366,24 @@ mod tests {
 
     #[test]
     fn test_prompt_cache_skip_behavior() {
-        use crate::tool_compression::stages::auto_tuner::AutoTuner;
         use crate::tool_compression::config::AutoTuningConfig;
+        use crate::tool_compression::stages::auto_tuner::AutoTuner;
         use crate::tool_compression::types::{CompressionContext, ProviderCaps};
 
         let at = AutoTuner::new(&AutoTuningConfig::default());
 
         // Identical hashes + caching support → skip
         let tools = vec![
-            ToolDefinition { raw: json!({}), name: "a".to_string(), content_hash: 111 },
-            ToolDefinition { raw: json!({}), name: "b".to_string(), content_hash: 222 },
+            ToolDefinition {
+                raw: json!({}),
+                name: "a".to_string(),
+                content_hash: 111,
+            },
+            ToolDefinition {
+                raw: json!({}),
+                name: "b".to_string(),
+                content_hash: 222,
+            },
         ];
         let ctx = CompressionContext {
             provider_caps: ProviderCaps {
@@ -415,19 +443,17 @@ mod tests {
 
     #[test]
     fn test_response_validation_detects_hallucinated_tools() {
-        let tools = vec![
-            ToolDefinition {
-                raw: json!({
-                    "type": "function",
-                    "function": {
-                        "name": "get_weather",
-                        "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
-                    }
-                }),
-                name: "get_weather".to_string(),
-                content_hash: 0,
-            },
-        ];
+        let tools = vec![ToolDefinition {
+            raw: json!({
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
+                }
+            }),
+            name: "get_weather".to_string(),
+            content_hash: 0,
+        }];
 
         // Valid tool call
         let valid_response = json!({
@@ -439,7 +465,10 @@ mod tests {
                 }
             }]
         });
-        assert!(validate_tool_calls_against_originals(&valid_response, &tools));
+        assert!(validate_tool_calls_against_originals(
+            &valid_response,
+            &tools
+        ));
 
         // Hallucinated tool name
         let invalid_response = json!({
@@ -451,6 +480,9 @@ mod tests {
                 }
             }]
         });
-        assert!(!validate_tool_calls_against_originals(&invalid_response, &tools));
+        assert!(!validate_tool_calls_against_originals(
+            &invalid_response,
+            &tools
+        ));
     }
 }

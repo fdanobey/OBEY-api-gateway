@@ -14,11 +14,7 @@ use super::types::{CompressionContext, ToolDefinition};
 pub trait CompressionStage: Send + Sync {
     /// Apply this stage's compression to the tools array.
     /// Returns the number of tokens estimated saved by this stage.
-    fn apply(
-        &self,
-        tools: &mut Vec<ToolDefinition>,
-        ctx: &mut CompressionContext,
-    ) -> u64;
+    fn apply(&self, tools: &mut Vec<ToolDefinition>, ctx: &mut CompressionContext) -> u64;
 
     /// Whether this stage is enabled given the current config and level.
     fn is_enabled(&self, config: &ToolCompressionConfig, level: CompressionLevel) -> bool;

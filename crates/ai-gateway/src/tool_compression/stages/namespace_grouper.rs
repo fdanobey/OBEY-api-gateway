@@ -65,10 +65,7 @@ impl NamespaceGrouper {
             let mut matched_config = false;
             for (prefix, _meta) in &self.configured_mappings {
                 if tool.name.starts_with(prefix) {
-                    prefix_groups
-                        .entry(prefix.clone())
-                        .or_default()
-                        .push(i);
+                    prefix_groups.entry(prefix.clone()).or_default().push(i);
                     matched_config = true;
                     break;
                 }
@@ -80,13 +77,13 @@ impl NamespaceGrouper {
 
             // Auto-detect by prefix
             if let Some(prefix) = Self::extract_prefix(&tool.name) {
-                prefix_groups
-                    .entry(prefix.to_string())
-                    .or_default()
-                    .push(i);
+                prefix_groups.entry(prefix.to_string()).or_default().push(i);
             } else {
                 // No separator → "other"
-                prefix_groups.entry("other".to_string()).or_default().push(i);
+                prefix_groups
+                    .entry("other".to_string())
+                    .or_default()
+                    .push(i);
             }
         }
 
@@ -99,7 +96,10 @@ impl NamespaceGrouper {
 
         for key in singletons {
             if let Some(indices) = prefix_groups.remove(&key) {
-                prefix_groups.entry("other".to_string()).or_default().extend(indices);
+                prefix_groups
+                    .entry("other".to_string())
+                    .or_default()
+                    .extend(indices);
             }
         }
 
@@ -126,7 +126,10 @@ impl NamespaceGrouper {
             format!("Tools: {}", names.join(", "))
         };
 
-        format!("namespace: {} ({} tools) - {}", prefix, tool_count, description)
+        format!(
+            "namespace: {} ({} tools) - {}",
+            prefix, tool_count, description
+        )
     }
 
     /// Build the synthetic `get_tools_in_namespace` tool definition.
@@ -213,11 +216,7 @@ impl NamespaceGrouper {
 }
 
 impl CompressionStage for NamespaceGrouper {
-    fn apply(
-        &self,
-        tools: &mut Vec<ToolDefinition>,
-        ctx: &mut CompressionContext,
-    ) -> u64 {
+    fn apply(&self, tools: &mut Vec<ToolDefinition>, ctx: &mut CompressionContext) -> u64 {
         // Activation: enabled AND tool count > min_tools_for_grouping
         if tools.len() <= self.min_tools_for_grouping as usize {
             return 0;
@@ -313,12 +312,18 @@ mod tests {
 
     #[test]
     fn extract_prefix_underscore() {
-        assert_eq!(NamespaceGrouper::extract_prefix("github_list_repos"), Some("github"));
+        assert_eq!(
+            NamespaceGrouper::extract_prefix("github_list_repos"),
+            Some("github")
+        );
     }
 
     #[test]
     fn extract_prefix_dot() {
-        assert_eq!(NamespaceGrouper::extract_prefix("slack.send_message"), Some("slack"));
+        assert_eq!(
+            NamespaceGrouper::extract_prefix("slack.send_message"),
+            Some("slack")
+        );
     }
 
     #[test]
@@ -361,10 +366,13 @@ mod tests {
     #[test]
     fn configured_mappings_take_priority() {
         let mut mappings = HashMap::new();
-        mappings.insert("gh".to_string(), NamespaceMetadata {
-            name: "GitHub".to_string(),
-            description: "GitHub tools".to_string(),
-        });
+        mappings.insert(
+            "gh".to_string(),
+            NamespaceMetadata {
+                name: "GitHub".to_string(),
+                description: "GitHub tools".to_string(),
+            },
+        );
         let config = NamespaceGroupingConfig {
             enabled: true,
             min_tools_for_grouping: 5,

@@ -264,9 +264,7 @@ impl MemoryQdrantConfig {
             if d == 0 || d > 65536 {
                 errors.push(MemoryConfigError::new(
                     "qdrant.vector_dimension",
-                    format!(
-                        "has value {d}; expected a value in 1..=65536"
-                    ),
+                    format!("has value {d}; expected a value in 1..=65536"),
                 ));
             }
         }
