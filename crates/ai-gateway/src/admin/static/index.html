@@ -260,6 +260,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="providers" id="tab-providers" aria-controls="page-providers">Providers</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="model-groups" id="tab-model-groups" aria-controls="page-model-groups">Model Groups</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="routing" id="tab-routing" aria-controls="page-routing">Routing Settings</button></li>
+<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="smart-routing" id="tab-smart-routing" aria-controls="page-smart-routing">Smart Routing</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="circuit-breaker" id="tab-circuit-breaker" aria-controls="page-circuit-breaker">Circuit Breaker</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="logging" id="tab-logging" aria-controls="page-logging">Logging</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="caching" id="tab-caching" aria-controls="page-caching">Caching</button></li>
@@ -763,9 +764,78 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       <button class="btn btn-primary" data-action="save">Save</button>
       <button class="btn btn-secondary" data-action="reset">Reset</button>
     </div>
-  </section>
+</section>
 
-  <!-- Circuit Breaker (Req 13.7) -->
+<!-- Smart Model Routing -->
+<section class="page" id="page-smart-routing" role="tabpanel" aria-labelledby="tab-smart-routing">
+<h2>Smart Model Routing</h2>
+<p class="hint" style="margin-bottom:1rem">Configure complexity-aware tier selection, safety checks, cascade behavior, optional classifiers, budgets, caching, optimization, and experiments. Runtime statistics remain in the Dashboard.</p>
+
+<fieldset><legend>Core Routing Policy</legend>
+<div class="form-check"><input type="checkbox" id="smart-enabled"><label for="smart-enabled">Enable Smart Routing</label></div>
+<div class="form-row">
+<div class="form-group"><label for="smart-classifier">Classifier</label><select id="smart-classifier"><option value="heuristic">Heuristic</option><option value="llm">LLM</option><option value="ml">ONNX ML</option><option value="composite">Composite</option></select><div class="hint">ML and composite modes require the optional <code>ml-router</code> build feature and a valid ONNX artifact.</div></div>
+<div class="form-group"><label for="smart-threshold">Cost / Quality Threshold</label><input type="number" id="smart-threshold" min="0" max="1" step="0.01"><div class="hint">0 favors cost; 1 favors quality.</div></div>
+</div>
+<div class="form-row">
+<div class="form-group"><label for="smart-ml-path">ONNX Artifact Directory</label><input type="text" id="smart-ml-path" placeholder="./models/smart-routing"><div class="hint">Contains manifest.json, model.onnx, tokenizer.json, and .onnxruntime/.</div></div>
+<div class="form-group"><label for="smart-llm-model">LLM Classifier Model</label><input type="text" id="smart-llm-model" placeholder="optional internal classifier model"></div>
+</div>
+</fieldset>
+
+<fieldset><legend>Tier Boundaries and Context Safety</legend>
+<div class="form-row">
+<div class="form-group"><label for="smart-fast-max">Fast Maximum</label><input type="number" id="smart-fast-max" min="0.01" max="0.99" step="0.01"></div>
+<div class="form-group"><label for="smart-balanced-max">Balanced Maximum</label><input type="number" id="smart-balanced-max" min="0.01" max="0.99" step="0.01"></div>
+</div>
+<div class="form-row">
+<div class="form-group"><label for="smart-reserved-output">Reserved Output Tokens</label><input type="number" id="smart-reserved-output" min="0" step="1"></div>
+<div class="form-group"><label for="smart-provider-overhead">Provider Overhead Tokens</label><input type="number" id="smart-provider-overhead" min="0" step="1"></div>
+<div class="form-group"><label for="smart-context-margin">Context Safety Margin</label><input type="number" id="smart-context-margin" min="0" step="1"></div>
+</div>
+<div class="form-check"><input type="checkbox" id="smart-allow-unknown-context"><label for="smart-allow-unknown-context">Allow providers with unknown context windows</label></div>
+</fieldset>
+
+<fieldset><legend>Cascade and Streaming</legend>
+<div class="form-check"><input type="checkbox" id="smart-cascade-enabled"><label for="smart-cascade-enabled">Enable bounded response cascade</label></div>
+<div class="form-row">
+<div class="form-group"><label for="smart-max-escalations">Maximum Escalations</label><input type="number" id="smart-max-escalations" min="1" max="2" step="1"></div>
+<div class="form-group"><label for="smart-streaming-mode">Streaming Cascade Mode</label><select id="smart-streaming-mode"><option value="buffer">Buffer</option><option value="early_signal">Early Signal</option></select></div>
+<div class="form-group"><label for="smart-early-signal-tokens">Early Signal Tokens</label><input type="number" id="smart-early-signal-tokens" min="1" step="1"></div>
+</div>
+</fieldset>
+
+<fieldset><legend>Quality, Semantic Cache, and Optimizer</legend>
+<div class="form-row">
+<div class="form-group"><div class="form-check"><input type="checkbox" id="smart-quality-enabled"><label for="smart-quality-enabled">Quality Evaluator</label></div><label for="smart-quality-threshold">Quality Threshold</label><input type="number" id="smart-quality-threshold" min="0" max="1" step="0.01"></div>
+<div class="form-group"><div class="form-check"><input type="checkbox" id="smart-semcache-enabled"><label for="smart-semcache-enabled">Semantic Response Cache</label></div><label for="smart-semcache-threshold">Similarity Threshold</label><input type="number" id="smart-semcache-threshold" min="0" max="1" step="0.01"></div>
+<div class="form-group"><div class="form-check"><input type="checkbox" id="smart-optimizer-enabled"><label for="smart-optimizer-enabled">Online Optimizer</label></div><label for="smart-optimizer-alpha">EMA Alpha</label><input type="number" id="smart-optimizer-alpha" min="0.001" max="1" step="0.01"></div>
+</div>
+</fieldset>
+
+<fieldset><legend>Budget Limits</legend>
+<p class="hint" style="margin-bottom:.75rem">Configure per-model-group limits as JSON. Keys must match existing model group names.</p>
+<div class="form-group"><label for="smart-budget-limits">Budget Limits JSON</label><textarea id="smart-budget-limits" rows="8" spellcheck="false" placeholder='{"default":{"hourly_limit_usd":10,"daily_limit_usd":100,"monthly_limit_usd":1000}}'></textarea><div class="error" id="smart-budget-error" role="alert"></div></div>
+</fieldset>
+
+<fieldset><legend>ONNX Model Assets</legend>
+<div class="form-row">
+<div class="form-group"><strong>Status</strong><div id="smart-model-status" class="hint">Not checked</div></div>
+<div class="form-group"><button type="button" class="btn btn-secondary" id="smart-model-check">Check Assets</button><button type="button" class="btn btn-primary" id="smart-model-install">Install Approved ONNX Assets</button></div>
+</div>
+</fieldset>
+
+<fieldset><legend>Safe Routing Simulation</legend>
+<div class="form-row"><div class="form-group"><label for="smart-sim-group">Model Group</label><input id="smart-sim-group" type="text"></div><div class="form-group"><label for="smart-sim-prompt">Prompt</label><textarea id="smart-sim-prompt" rows="3" maxlength="10000"></textarea></div></div>
+<button type="button" class="btn btn-secondary" id="smart-simulate">Simulate Without Generation</button>
+<pre id="smart-sim-result" class="hint" aria-live="polite"></pre>
+</fieldset>
+
+<div class="error" id="smart-server-error" role="alert"></div>
+<div class="actions"><button class="btn btn-primary" type="button" id="smart-save">Save Smart Routing</button><button class="btn btn-secondary" type="button" id="smart-reset">Reset Changes</button></div>
+</section>
+
+<!-- Circuit Breaker (Req 13.7) -->
   <section class="page" id="page-circuit-breaker" role="tabpanel" aria-labelledby="tab-circuit-breaker">
     <h2>Circuit Breaker</h2>
     <fieldset><legend>Thresholds</legend>
@@ -1781,8 +1851,9 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     // released provider models (e.g. new Bedrock OpenAI models) appear without
     // a manual refresh.
     if (pageId === 'model-groups') { refreshModelGroupModels(); }
-    if (pageId === 'loop-detection') { populateLoopDetection((config && config.loop_detection) || LOOP_DEFAULTS); }
-    if (pageId === 'virtual-keys') { vkOnOpen(); }
+if (pageId === 'loop-detection') { populateLoopDetection((config && config.loop_detection) || LOOP_DEFAULTS); }
+if (pageId === 'smart-routing') { populateSmartRouting((config && config.smart_routing) || {}); }
+if (pageId === 'virtual-keys') { vkOnOpen(); }
     if (pageId === 'guardrails') { loadGuardrailVirtualKeys(); }
   }
 
@@ -3162,7 +3233,48 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
     populateMemory(cfg.memory);
   }
 
-  // --- Collect Config from UI ---
+  function populateSmartRouting(value){
+var v=value||{};var cascade=v.cascade||{};var boundaries=v.tier_boundaries||{};var quality=v.quality_evaluator||{};var cache=v.semantic_cache||{};var optimizer=v.online_optimizer||{};
+document.getElementById('smart-enabled').checked=!!v.enabled;
+document.getElementById('smart-classifier').value=v.classifier||'heuristic';
+document.getElementById('smart-threshold').value=Number.isFinite(Number(v.cost_quality_threshold))?v.cost_quality_threshold:0.5;
+document.getElementById('smart-ml-path').value=v.ml_model_path||'';
+document.getElementById('smart-llm-model').value=v.classifier_model||'';
+document.getElementById('smart-fast-max').value=Number.isFinite(Number(boundaries.fast_max))?boundaries.fast_max:0.3;
+document.getElementById('smart-balanced-max').value=Number.isFinite(Number(boundaries.balanced_max))?boundaries.balanced_max:0.7;
+document.getElementById('smart-reserved-output').value=v.reserved_output_tokens===undefined?1024:v.reserved_output_tokens;
+document.getElementById('smart-provider-overhead').value=v.provider_overhead_tokens===undefined?64:v.provider_overhead_tokens;
+document.getElementById('smart-context-margin').value=v.context_safety_margin_tokens===undefined?256:v.context_safety_margin_tokens;
+document.getElementById('smart-allow-unknown-context').checked=!!v.allow_unknown_context_window;
+document.getElementById('smart-cascade-enabled').checked=!!cascade.enabled;
+document.getElementById('smart-max-escalations').value=cascade.max_escalations||1;
+document.getElementById('smart-streaming-mode').value=v.streaming_cascade_mode||'buffer';
+document.getElementById('smart-early-signal-tokens').value=cascade.early_signal_tokens||50;
+document.getElementById('smart-quality-enabled').checked=!!quality.enabled;
+document.getElementById('smart-quality-threshold').value=Number.isFinite(Number(quality.threshold))?quality.threshold:0.5;
+document.getElementById('smart-semcache-enabled').checked=!!cache.enabled;
+document.getElementById('smart-semcache-threshold').value=Number.isFinite(Number(cache.similarity_threshold))?cache.similarity_threshold:0.92;
+document.getElementById('smart-optimizer-enabled').checked=!!optimizer.enabled;
+document.getElementById('smart-optimizer-alpha').value=Number.isFinite(Number(optimizer.alpha))?optimizer.alpha:0.1;
+document.getElementById('smart-budget-limits').value=JSON.stringify(v.budget_limits||{},null,2);
+document.getElementById('smart-budget-error').textContent='';
+}
+function collectSmartRouting(){
+var prior=(config&&config.smart_routing)?JSON.parse(JSON.stringify(config.smart_routing)):{};var cascade=prior.cascade||{};var quality=prior.quality_evaluator||{};var cache=prior.semantic_cache||{};var optimizer=prior.online_optimizer||{};
+prior.enabled=document.getElementById('smart-enabled').checked;prior.classifier=document.getElementById('smart-classifier').value;prior.cost_quality_threshold=parseFloat(document.getElementById('smart-threshold').value);prior.ml_model_path=document.getElementById('smart-ml-path').value.trim()||null;prior.classifier_model=document.getElementById('smart-llm-model').value.trim()||null;
+prior.tier_boundaries={fast_max:parseFloat(document.getElementById('smart-fast-max').value),balanced_max:parseFloat(document.getElementById('smart-balanced-max').value)};prior.reserved_output_tokens=parseInt(document.getElementById('smart-reserved-output').value,10);prior.provider_overhead_tokens=parseInt(document.getElementById('smart-provider-overhead').value,10);prior.context_safety_margin_tokens=parseInt(document.getElementById('smart-context-margin').value,10);prior.allow_unknown_context_window=document.getElementById('smart-allow-unknown-context').checked;
+cascade.enabled=document.getElementById('smart-cascade-enabled').checked;cascade.max_escalations=parseInt(document.getElementById('smart-max-escalations').value,10);cascade.early_signal_tokens=parseInt(document.getElementById('smart-early-signal-tokens').value,10);prior.cascade=cascade;prior.streaming_cascade_mode=document.getElementById('smart-streaming-mode').value;
+quality.enabled=document.getElementById('smart-quality-enabled').checked;quality.threshold=parseFloat(document.getElementById('smart-quality-threshold').value);prior.quality_evaluator=quality;cache.enabled=document.getElementById('smart-semcache-enabled').checked;cache.similarity_threshold=parseFloat(document.getElementById('smart-semcache-threshold').value);prior.semantic_cache=cache;optimizer.enabled=document.getElementById('smart-optimizer-enabled').checked;optimizer.alpha=parseFloat(document.getElementById('smart-optimizer-alpha').value);prior.online_optimizer=optimizer;
+try{prior.budget_limits=JSON.parse(document.getElementById('smart-budget-limits').value||'{}');document.getElementById('smart-budget-error').textContent='';}catch(error){document.getElementById('smart-budget-error').textContent='Invalid JSON: '+error.message;throw error;}
+return prior;
+}
+function smartRoutingRequest(path,options){return fetch(apiUrl('smart-routing'+path),options||{}).then(function(response){return response.text().then(function(text){var body={};try{body=text?JSON.parse(text):{};}catch(_){}if(!response.ok)throw new Error((body.error&&body.error.message)||text||('HTTP '+response.status));return body;});});}
+function saveSmartRouting(){var candidate;try{candidate=collectSmartRouting();}catch(_){return;}setStatus('Saving Smart Routing…');smartRoutingRequest('/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(candidate)}).then(function(){config.smart_routing=candidate;setStatus('Smart Routing saved and applied');showToast('Smart Routing saved and applied');}).catch(function(error){document.getElementById('smart-server-error').textContent=error.message;setStatus('Smart Routing save failed');showToast('Smart Routing save failed',true);});}
+function checkSmartModel(){document.getElementById('smart-model-status').textContent='Checking…';smartRoutingRequest('/model/status').then(function(body){document.getElementById('smart-model-status').textContent=body.active?'Ready and active':(body.configured?(body.reason||'Configured but unavailable'):'Not configured');}).catch(function(error){document.getElementById('smart-model-status').textContent=error.message;});}
+function installSmartModel(){var path=document.getElementById('smart-ml-path').value.trim();document.getElementById('smart-model-status').textContent='Installing approved assets…';smartRoutingRequest('/model/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model_path:path||null})}).then(function(body){document.getElementById('smart-model-status').textContent=body.ready?'Assets ready':'Install completed; readiness check required';}).catch(function(error){document.getElementById('smart-model-status').textContent='Install failed: '+error.message;});}
+function simulateSmartRouting(){var group=document.getElementById('smart-sim-group').value.trim();var prompt=document.getElementById('smart-sim-prompt').value;document.getElementById('smart-sim-result').textContent='Simulating…';smartRoutingRequest('/simulate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model_group:group,messages:[{role:'user',content:prompt}]})}).then(function(body){document.getElementById('smart-sim-result').textContent=JSON.stringify(body,null,2);}).catch(function(error){document.getElementById('smart-sim-result').textContent='Simulation failed: '+error.message;});}
+
+// --- Collect Config from UI ---
   function findOriginalByName(items, name, index) {
     var found = null;
     (items || []).some(function(item) { if (item && item.name === name) { found = item; return true; } return false; });
@@ -3229,6 +3341,12 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
   document.getElementById('loop-preset').addEventListener('change',function(){applyLoopPreset(this.value);});
   document.getElementById('loop-save').addEventListener('click',saveLoopDetection);
   document.getElementById('loop-reset-defaults').addEventListener('click',function(){if(window.confirm('Reset all Loop Detection settings to defaults?'))populateLoopDetection(LOOP_DEFAULTS);});
+
+document.getElementById('smart-save').addEventListener('click',saveSmartRouting);
+document.getElementById('smart-reset').addEventListener('click',function(){populateSmartRouting((config&&config.smart_routing)||{});});
+document.getElementById('smart-model-check').addEventListener('click',checkSmartModel);
+document.getElementById('smart-model-install').addEventListener('click',installSmartModel);
+document.getElementById('smart-simulate').addEventListener('click',simulateSmartRouting);
 
   // --- Action Buttons ---
   document.addEventListener('click', function(e) {
