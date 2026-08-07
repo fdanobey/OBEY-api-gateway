@@ -62,6 +62,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Tool definition compression** — 12-stage pipeline for reducing token waste from large `tools` arrays: schema minification, description truncation, deduplication with `$ref`, frequency-based pruning, progressive disclosure with namespace grouping, semantic retrieval (TF-IDF + embeddings), canonical text rewriting, cache-aware placement, and adaptive feedback loop with auto-tuning; provider-aware, per-model-group overrides, zero overhead when disabled (see [Tool Definition Compression](#tool-definition-compression))
 - **Hot config reload** — change settings through the admin UI without restarting
 - **Smart timeouts** — split TTFB / total timeouts with auto-detection of thinking models (o1, o3, DeepSeek-R1, Claude)
+- **Smart model routing** — complexity-aware tier selection (Fast / Balanced / Powerful) with heuristic, ML (ONNX), LLM, or composite classifiers; cascade escalation, online optimization, A/B testing, budget limits, semantic routing cache, and per-model-group overrides (see [Smart Model Routing](#smart-model-routing))
 
 ## Quick Start
 
@@ -963,11 +964,80 @@ This is opt-in and defaults to disabled:
 ```yaml
 structured_output:
   enabled: true
-  max_retries: 2                      # Retry invalid responses up to N times
-  validate_choices: true              # Validate all choices in the response
+  max_retries: 1                      # Corrective retry attempts (0–5)
+  retry_temperature: 0                # Temperature for corrective retries (0.0–2.0)
+  passthrough_providers: [openai]     # Providers with native constrained decoding (skip validation)
 ```
 
-Per-model-group overrides are supported via `structured_output.model_group_overrides`. Prometheus metrics track validation attempts, failures, retry counts, and latency.
+Per-model-group overrides are supported via `model_groups[].structured_output`. Prometheus metrics track validation attempts, failures, retry counts, and latency.
+
+## Smart Model Routing
+
+Smart Model Routing automatically selects the best model within a group based on request complexity. Instead of always routing to the highest-priority provider, the system classifies each request and dispatches it to the cheapest tier that can handle it well.
+
+### Model Tiers
+
+Each model in a group can be assigned a capability tier:
+
+```yaml
+model_groups:
+  - name: "smart-group"
+    models:
+      - provider: "openai"
+        model: "gpt-4.1"
+        tier: powerful
+        context_window: 128000
+        specializations: [code_generation, factual_qa]
+      - provider: "openai"
+        model: "gpt-4o"
+        tier: balanced
+        context_window: 128000
+      - provider: "groq"
+        model: "llama3-8b-8192"
+        tier: fast
+        context_window: 8192
+```
+
+### Classifier Modes
+
+| Mode | Description |
+|------|-------------|
+| `heuristic` (default) | Weighted signal analysis (message count, tokens, code blocks, tool calls, math, reasoning keywords) |
+| `ml` | ONNX model inference (requires `ml-router` build feature) |
+| `llm` | Delegates classification to a configured LLM |
+| `composite` | Weighted blend of heuristic + ML |
+
+### Configuration
+
+```yaml
+smart_routing:
+  enabled: true
+  classifier: heuristic
+  cost_quality_threshold: 0.5       # 0 = favor cost, 1 = favor quality
+  tier_boundaries:
+    fast_max: 0.33                  # Complexity 0–0.33 → Fast
+    balanced_max: 0.66              # Complexity 0.33–0.66 → Balanced
+  cascade:
+    enabled: true
+    max_escalations: 2
+  reserved_output_tokens: 1024
+  provider_overhead_tokens: 64
+  context_safety_margin_tokens: 256
+```
+
+### Key Capabilities
+
+- **Context capacity filtering** — excludes models that can't fit the request (returns HTTP 413 when no model can)
+- **Cascade escalation** — monitors response quality and re-dispatches to a higher tier if insufficient
+- **Online optimizer** — adjusts tier boundaries based on observed quality over time
+- **Budget limits** — per-model-group hourly/daily/monthly USD caps that downgrade tiers when reached
+- **A/B testing** — compare routing policies with traffic splitting
+- **Semantic routing cache** — caches classification decisions for semantically similar requests
+- **Safe simulation** — test routing decisions without sending requests (Admin Panel → Smart Routing → Simulate Without Generation)
+
+Per-model-group overrides allow different classifier modes, thresholds, and cascade settings per group. The Admin Panel provides a dedicated **Smart Routing** tab with full configuration, ONNX asset management, and simulation tooling.
+
+For full details, see the [Smart Routing wiki page](https://github.com/fdanobey/OBEY-api-gateway/wiki/Smart-Routing).
 
 ## API Endpoints
 
@@ -1084,7 +1154,7 @@ context:
 
 Both are embedded SPAs compiled into the binary — no external dependencies.
 
-- **Admin** (`/admin`) — provider configuration, API key management, circuit breaker status, token compression & tool compression settings, persistent memory configuration & entry browser, config hot-reload
+- **Admin** (`/admin`) — provider configuration, API key management, circuit breaker status, smart model routing (classifier, tiers, cascade, simulation), token compression & tool compression settings, persistent memory configuration & entry browser, config hot-reload
 - **Dashboard** (`/dashboard`) — real-time metrics via WebSocket, provider health, compression statistics (token & tool), persistent memory event visualizations (injection/extraction/eviction timeline, namespace activity), error logs, request log viewer
 
 ```yaml
@@ -1142,6 +1212,7 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── compression/          # Token compression engines & pipelines
 │           ├── tool_compression/     # Tool definition compression: 12-stage pipeline, provider-aware middleware
 │           ├── structured_output/    # JSON Schema response validation with retry
+│           ├── smart_routing/       # Smart model routing: complexity classification, tier selection, cascade, A/B testing
 │           ├── memory/               # Persistent memory store: extraction, injection, decay, namespaces, Qdrant
 │           ├── secrets.rs            # API key encryption/decryption
 │           ├── error/                # Error types & HTTP status mapping
