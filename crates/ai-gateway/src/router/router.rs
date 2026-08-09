@@ -3291,6 +3291,58 @@ impl Router {
                         GatewayError::Provider { message, .. } => message.clone(),
                         _ => e.to_string(),
                     };
+
+                    // Apply upstream rate-limit cooldown for 429 responses
+                    // that arrive without a cooldown already set (i.e., from
+                    // the Codex/OAuth dispatch path which bypasses the
+                    // standard HTTP retry loop's cooldown logic).
+                    if attempt_status == Some(429) {
+                        let rate_limiter = self
+                            .get_rate_limiter(&provider_model.provider)
+                            .await;
+                        let already_cooled = rate_limiter.cooldown_remaining().await.is_some();
+                        if !already_cooled {
+                            // Use the OAuth usage tracker's reset window as
+                            // the cooldown source when available; otherwise
+                            // fall back to the configured default.
+                            let cooldown = if let Some(tracker) = &self.oauth_usage_tracker {
+                                let secs = tracker.fallback_cooldown_secs().await;
+                                match secs {
+                                    Some(s) if s > 0 => Duration::from_secs(s),
+                                    _ => self.parse_rate_limit_cooldown(
+                                        &provider_model.provider,
+                                        None,
+                                        &raw_message,
+                                    ).await,
+                                }
+                            } else {
+                                self.parse_rate_limit_cooldown(
+                                    &provider_model.provider,
+                                    None,
+                                    &raw_message,
+                                ).await
+                            };
+                            rate_limiter.apply_cooldown(cooldown).await;
+                            self.metrics
+                                .record_provider_rate_limit_exhausted(&provider_model.provider);
+                            let now_secs = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let deadline = now_secs.saturating_add(cooldown.as_secs());
+                            self.metrics.set_provider_cooldown(
+                                &provider_model.provider,
+                                Self::friendly_failure_reason(Some(429), &raw_message),
+                                deadline,
+                            );
+                            warn!(
+                                provider = %provider_model.provider,
+                                cooldown_secs = cooldown.as_secs(),
+                                "Applied rate-limit cooldown from failover error path (Codex/OAuth 429)"
+                            );
+                        }
+                    }
+
                     // Don't overwrite a fresh "Pausing until …" message
                     // that the rate-limit path just set: when this branch
                     // sees the same 429 the rate-limit code already wrote

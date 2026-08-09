@@ -21,6 +21,11 @@ pub struct RateLimitWindow {
     /// Seconds until this window resets (from `x-ratelimit-reset-*`).
     /// Stored as absolute Unix epoch timestamp so it stays valid over time.
     pub resets_at: Option<u64>,
+    /// When `true`, `limit` and `remaining` represent percentages (0–100)
+    /// derived from `x-codex-*-used-percent` headers, not absolute counts.
+    /// The frontend should render these as "37%" rather than "37 / 100".
+    #[serde(default)]
+    pub is_percentage: bool,
 }
 
 /// Threshold (in seconds) used to distinguish the short (5h) window from the
@@ -187,6 +192,7 @@ fn codex_window(
         limit,
         remaining,
         resets_at: reset_at.filter(|reset| *reset > now),
+        is_percentage: true,
     })
 }
 
@@ -374,6 +380,7 @@ mod tests {
             limit: Some(100),
             remaining: Some(25),
             resets_at: None,
+            is_percentage: false,
         };
         assert_eq!(w.usage_percent(), Some(75.0));
     }
@@ -384,6 +391,7 @@ mod tests {
             limit: Some(100),
             remaining: Some(0),
             resets_at: None,
+            is_percentage: false,
         };
         assert_eq!(w.usage_percent(), Some(100.0));
     }

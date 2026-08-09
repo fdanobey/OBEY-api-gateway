@@ -3430,6 +3430,10 @@ document.getElementById('smart-simulate').addEventListener('click',simulateSmart
 
   function formatUsageWindow(window) {
     if (!window || window.limit == null || window.remaining == null) return '—';
+    if (window.is_percentage) {
+      var used = window.limit - window.remaining;
+      return used + '%';
+    }
     var used = window.limit - window.remaining;
     return used + ' / ' + window.limit;
   }
@@ -3463,18 +3467,33 @@ document.getElementById('smart-simulate').addEventListener('click',simulateSmart
     container.style.display = '';
     var reqVal = container.querySelector('.oauth-usage-req-value');
     var reqReset = container.querySelector('.oauth-usage-req-reset');
+    var reqLabel = container.querySelector('.oauth-usage-req-label');
     var tokVal = container.querySelector('.oauth-usage-tok-value');
     var tokReset = container.querySelector('.oauth-usage-tok-reset');
+    var tokRow = tokVal ? tokVal.parentElement : null;
+
+    // Codex headers report a single aggregate percentage — relabel
+    // accordingly and hide the separate tokens row.
+    var isPercentage = pair.requests && pair.requests.is_percentage;
+    if (reqLabel) {
+      reqLabel.textContent = isPercentage ? 'Usage:' : 'Requests:';
+    }
+    if (tokRow) {
+      tokRow.style.display = isPercentage ? 'none' : '';
+    }
+
     reqVal.textContent = formatUsageWindow(pair.requests);
     reqReset.textContent = formatResetTime(pair.requests && pair.requests.resets_at);
-    tokVal.textContent = formatUsageWindow(pair.tokens);
-    tokReset.textContent = formatResetTime(pair.tokens && pair.tokens.resets_at);
+    if (!isPercentage) {
+      tokVal.textContent = formatUsageWindow(pair.tokens);
+      tokReset.textContent = formatResetTime(pair.tokens && pair.tokens.resets_at);
+    }
     // Color code when usage is high
     if (pair.requests && pair.requests.limit && pair.requests.remaining != null) {
       var pct = ((pair.requests.limit - pair.requests.remaining) / pair.requests.limit) * 100;
       reqVal.style.color = pct >= 90 ? 'var(--danger)' : pct >= 70 ? '#856404' : 'var(--text)';
     }
-    if (pair.tokens && pair.tokens.limit && pair.tokens.remaining != null) {
+    if (!isPercentage && pair.tokens && pair.tokens.limit && pair.tokens.remaining != null) {
       var pct = ((pair.tokens.limit - pair.tokens.remaining) / pair.tokens.limit) * 100;
       tokVal.style.color = pct >= 90 ? 'var(--danger)' : pct >= 70 ? '#856404' : 'var(--text)';
     }
