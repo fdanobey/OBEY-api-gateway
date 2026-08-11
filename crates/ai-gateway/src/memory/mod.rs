@@ -727,13 +727,25 @@ fn warn_sensitive_storage_once(config: &MemoryConfig) {
 /// Format the optional user-visible memory activity suffix.
 ///
 /// Structured-output suppression and `show_feedback` are caller policy; this
-/// helper only suppresses an all-zero result.
+/// helper suppresses feedback when:
+/// - All counters are zero, OR
+/// - Only injection occurred (no storage/rejection) and it is NOT the first
+///   message in the thread. This avoids noisy per-message feedback when the
+///   system is simply re-injecting existing memories without learning anything
+///   new.
 pub fn format_feedback_suffix(
     injected: u32,
     stored: u32,
     sensitive_rejected: u32,
+    is_thread_start: bool,
 ) -> Option<String> {
     if injected == 0 && stored == 0 && sensitive_rejected == 0 {
+        return None;
+    }
+
+    // Only show injection-only feedback at thread start; mid-conversation
+    // messages only get feedback when new memories are stored or rejected.
+    if stored == 0 && sensitive_rejected == 0 && !is_thread_start {
         return None;
     }
 
@@ -1156,17 +1168,42 @@ mod tests {
 
     #[test]
     fn feedback_suffix_formats_activity_and_sensitive_rejections() {
-        assert_eq!(format_feedback_suffix(0, 0, 0), None);
+        // All zeros → always None regardless of thread position
+        assert_eq!(format_feedback_suffix(0, 0, 0, true), None);
+        assert_eq!(format_feedback_suffix(0, 0, 0, false), None);
+
+        // Storage occurred → shown regardless of thread position
         assert_eq!(
-            format_feedback_suffix(2, 1, 0).as_deref(),
+            format_feedback_suffix(2, 1, 0, true).as_deref(),
             Some("\n\n---\n📝 2 memories injected | 1 memories stored")
         );
         assert_eq!(
-            format_feedback_suffix(0, 0, 1).as_deref(),
+            format_feedback_suffix(2, 1, 0, false).as_deref(),
+            Some("\n\n---\n📝 2 memories injected | 1 memories stored")
+        );
+
+        // Sensitive rejection → shown regardless of thread position
+        assert_eq!(
+            format_feedback_suffix(0, 0, 1, true).as_deref(),
             Some(
                 "\n\n---\n📝 0 memories injected | 0 memories stored (1 rejected: sensitive content)"
             )
         );
+        assert_eq!(
+            format_feedback_suffix(0, 0, 1, false).as_deref(),
+            Some(
+                "\n\n---\n📝 0 memories injected | 0 memories stored (1 rejected: sensitive content)"
+            )
+        );
+
+        // Injection only at thread start → shown
+        assert_eq!(
+            format_feedback_suffix(14, 0, 0, true).as_deref(),
+            Some("\n\n---\n📝 14 memories injected | 0 memories stored")
+        );
+
+        // Injection only mid-conversation → suppressed
+        assert_eq!(format_feedback_suffix(14, 0, 0, false), None);
     }
 
     #[test]

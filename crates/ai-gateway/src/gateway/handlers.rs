@@ -748,6 +748,7 @@ async fn finalize_memory_response(
     response: &mut OpenAIResponse,
     memory: Option<&MemoryRequestContext>,
     request_id: Option<uuid::Uuid>,
+    is_thread_start: bool,
 ) -> (Option<String>, ExtractionCounts) {
     let Some(memory) = memory else {
         return (None, ExtractionCounts::default());
@@ -797,6 +798,7 @@ async fn finalize_memory_response(
             memory.injection.memories_injected,
             extraction.stored,
             extraction.sensitive_rejected,
+            is_thread_start,
         )
     };
     (suffix, extraction)
@@ -1799,12 +1801,14 @@ async fn chat_completions_non_stream(
                 }
             }
             let request_uuid = uuid::Uuid::parse_str(&trace_id).ok();
+            let is_thread_start = request.messages.iter().filter(|m| m.role == "user").count() <= 1;
             let (memory_suffix, memory_extraction) = finalize_memory_response(
                 &state,
                 &request,
                 &mut response,
                 memory_context.as_ref(),
                 request_uuid,
+                is_thread_start,
             )
             .await;
             if let Some(suffix) = memory_suffix {
@@ -1888,10 +1892,12 @@ async fn chat_completions_stream(
             return None;
         }
         let extraction = memory_extraction.unwrap_or_default();
+        let is_thread_start = request.messages.iter().filter(|m| m.role == "user").count() <= 1;
         format_feedback_suffix(
             memory.injection.memories_injected,
             extraction.stored,
             extraction.sensitive_rejected,
+            is_thread_start,
         )
     });
 
