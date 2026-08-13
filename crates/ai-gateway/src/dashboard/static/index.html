@@ -63,6 +63,13 @@ tbody tr:hover{background:rgba(59,130,246,.06)}
 .badge-open{background:rgba(239,68,68,.15);color:var(--danger)}
 .badge-halfopen{background:rgba(245,158,11,.15);color:var(--warning)}
 
+/* In-flight request phase badges */
+.inflight-pending{background:rgba(148,163,184,.18);color:var(--text-muted)}
+.inflight-primary{background:rgba(34,197,94,.15);color:var(--success)}
+.inflight-retry{background:rgba(245,158,11,.18);color:var(--warning)}
+.inflight-failover{background:rgba(249,115,22,.18);color:#f97316}
+.inflight-cascade{background:rgba(59,130,246,.18);color:#3b82f6}
+
 /* Last failure reason cell */
 .failure-reason{display:inline-block;max-width:32rem;color:var(--text-muted);font-size:.85rem;line-height:1.3;white-space:normal;word-break:break-word}
 .failure-reason-cooldown{color:var(--warning);font-weight:500}
@@ -93,6 +100,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 
 /* Empty state */
 .empty{text-align:center;padding:2rem;color:var(--text-muted);font-size:.85rem}
+.section-note{color:var(--text-muted);font-size:.78rem;margin:-.5rem 0 1rem}
 
 /* Compression summary */
 .compression-note{color:var(--text-muted);font-size:.78rem;margin:-.5rem 0 1rem}
@@ -146,6 +154,27 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
       <div class="chart-box"><h3>Request Rate (last 60s)</h3><canvas id="chart-req-rate"></canvas></div>
       <div class="chart-box"><h3>Response Time (last 60s)</h3><canvas id="chart-resp-time"></canvas></div>
     </div>
+
+    <h2 class="section-title" style="margin-top:1.5rem">In-Flight Requests</h2>
+    <p class="section-note" id="inflight-note">Currently active requests and why each model is in use (primary attempt, retry after error, failover to another provider, or smart-routing cascade).</p>
+    <div class="table-wrap">
+      <table id="inflight-table" aria-label="In-flight requests">
+        <thead>
+          <tr>
+            <th>Trace ID</th>
+            <th>Requested Model</th>
+            <th>Group</th>
+            <th>Current (Provider:Model)</th>
+            <th>Reason</th>
+            <th>Attempt</th>
+            <th>Elapsed</th>
+            <th>Virtual Key</th>
+          </tr>
+        </thead>
+        <tbody id="inflight-tbody"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="inflight-empty">No active requests</div>
   </section>
 
   <!-- Provider Health (Req 16.6, 16.7, 31.1-31.9) -->
@@ -577,6 +606,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     $('m-active').textContent = m.active_requests||0;
     $('m-cost').textContent = fmtCost(m.cumulative_cost);
     $('m-cache').textContent = m.cache_hit_rate!=null ? fmtPct(m.cache_hit_rate) : 'N/A';
+    renderInFlight(m.active_requests_list);
 
     pushChartPoint(reqRateChart, reqRateData, '', m.request_rate_per_min||0);
     pushChartPoint(respTimeChart, respTimeData, '', m.avg_response_time_ms||0);
@@ -584,6 +614,58 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     var costDelta = (m.cumulative_cost||0) - lastCost;
     lastCost = m.cumulative_cost||0;
     pushChartPoint(costTrendChart, costTrendData, '', costDelta>=0?costDelta:0);
+  }
+
+  // Render the live "In-Flight Requests" table from the snapshot's
+  // active_requests_list (only currently-active requests are present).
+  function renderInFlight(list){
+    var tbody = $('inflight-tbody');
+    var empty = $('inflight-empty');
+    if(!list || !list.length){
+      tbody.innerHTML='';
+      empty.style.display='block';
+      $('inflight-table').style.display='none';
+      return;
+    }
+    $('inflight-table').style.display='';
+    empty.style.display='none';
+
+    var phaseClass = {
+      pending: 'inflight-pending',
+      primary: 'inflight-primary',
+      retry: 'inflight-retry',
+      failover: 'inflight-failover',
+      cascade: 'inflight-cascade'
+    };
+    var html='';
+    list.forEach(function(r){
+      var traceShort = (r.trace_id||'').slice(0,8) || '—';
+      var group = r.model_group || '—';
+      var current = (r.provider && r.model)
+        ? esc(r.provider)+':'+esc(r.model)
+        : '—';
+      var phase = r.phase || 'pending';
+      var reasonTitle = r.last_error ? esc(r.last_error) : '';
+      var reasonHtml = '<span class="badge '+ (phaseClass[phase]||'inflight-pending') +'"'
+        + (reasonTitle ? ' title="'+reasonTitle+'"' : '') +'>'
+        + esc(phase) + (r.last_error ? ' ⚠' : '') + '</span>';
+      var vk = r.virtual_key_id || '—';
+      var elapsedMs = r.started_at_ms ? (Date.now() - r.started_at_ms) : 0;
+      var elapsed = elapsedMs>=1000
+        ? Math.floor(elapsedMs/1000)+'s'
+        : Math.max(0, Math.round(elapsedMs))+'ms';
+      html += '<tr>'
+        + '<td title="'+esc(r.trace_id||'')+'">'+esc(traceShort)+'</td>'
+        + '<td>'+esc(r.requested_model||'—')+'</td>'
+        + '<td>'+esc(group)+'</td>'
+        + '<td>'+current+'</td>'
+        + '<td>'+reasonHtml+'</td>'
+        + '<td>'+(r.attempt||0)+'</td>'
+        + '<td>'+elapsed+'</td>'
+        + '<td>'+esc(vk)+'</td>'
+        + '</tr>';
+    });
+    tbody.innerHTML = html;
   }
 
   function renderProviders(providers){

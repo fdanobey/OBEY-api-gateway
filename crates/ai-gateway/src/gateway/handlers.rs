@@ -957,14 +957,22 @@ struct RequestCompleteGuard {
     metrics: Arc<Metrics>,
     start: std::time::Instant,
     completed: bool,
+    /// Optional in-flight registry handle so the request is removed when the
+    /// guard is dropped (including mid-stream cancellations).
+    active: Option<(Arc<crate::active_requests::ActiveRequestRegistry>, String)>,
 }
 
 impl RequestCompleteGuard {
-    fn new(metrics: Arc<Metrics>, start: std::time::Instant) -> Self {
+    fn new(
+        metrics: Arc<Metrics>,
+        start: std::time::Instant,
+        active: Option<(Arc<crate::active_requests::ActiveRequestRegistry>, String)>,
+    ) -> Self {
         Self {
             metrics,
             start,
             completed: false,
+            active,
         }
     }
 
@@ -992,6 +1000,37 @@ impl Drop for RequestCompleteGuard {
             );
             self.metrics.complete_request(duration_ms);
         }
+        // Remove the entry from the in-flight registry if one was registered.
+        if let Some((registry, trace_id)) = &self.active {
+            registry.deregister(trace_id);
+        }
+    }
+}
+
+/// Build the initial `ActiveRequestInfo` for a freshly-started request so it can
+/// be tracked in the dashboard's in-flight registry.
+fn build_active_request_info(
+    trace_id: &str,
+    requested_model: &str,
+    virtual_key_id: Option<&str>,
+    kind: crate::active_requests::RequestKind,
+) -> crate::active_requests::ActiveRequestInfo {
+    let started_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    crate::active_requests::ActiveRequestInfo {
+        trace_id: trace_id.to_string(),
+        requested_model: requested_model.to_string(),
+        model_group: None,
+        provider: None,
+        model: None,
+        attempt: 0,
+        phase: crate::active_requests::ActivePhase::Pending,
+        last_error: None,
+        virtual_key_id: virtual_key_id.map(|s| s.to_string()),
+        started_at_ms,
+        kind,
     }
 }
 
@@ -1047,7 +1086,17 @@ async fn chat_completions_non_stream(
 ) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
-    let mut request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
+    let active_handle = state.active_requests.register(build_active_request_info(
+        &trace_id,
+        &request.model,
+        virtual_key_id.as_deref(),
+        crate::active_requests::RequestKind::Chat,
+    ));
+    let mut request_guard = RequestCompleteGuard::new(
+        state.metrics.clone(),
+        start,
+        Some((state.active_requests.clone(), trace_id.clone())),
+    );
     tracing::debug!(model = %request.model, "Routing non-stream request");
 
     // Snapshot request-scoped engines once and release both hot-reload locks
@@ -1199,7 +1248,7 @@ async fn chat_completions_non_stream(
     let memory_context =
         preprocess_memory_request(&state, &mut request, virtual_key_id.as_deref()).await;
 
-    match state.router.route_request(&request).await {
+    match state.router.route_request(&request, Some(active_handle.clone())).await {
         Ok(mut response) => {
             // Post-call guardrails run on the freshly routed response BEFORE it
             // is cached or returned, using the SAME ctx so PII re-injection
@@ -1342,7 +1391,7 @@ async fn chat_completions_non_stream(
                             // single target via route_with_failover (Req 12.5).
                             let attempt_result = state
                                 .router
-                                .route_with_failover(&request, vec![target.clone()])
+                                .route_with_failover(&request, vec![target.clone()], None)
                                 .await;
 
                             match attempt_result {
@@ -1589,6 +1638,7 @@ async fn chat_completions_non_stream(
                                             .route_with_failover(
                                                 &retry_request,
                                                 vec![target.clone()],
+                                                None,
                                             )
                                             .await;
                                         match retry_result {
@@ -1857,7 +1907,17 @@ async fn chat_completions_stream(
 ) -> Response {
     state.metrics.start_request();
     let start = Instant::now();
-    let mut request_guard = RequestCompleteGuard::new(state.metrics.clone(), start);
+    let active_handle = state.active_requests.register(build_active_request_info(
+        &trace_id,
+        &request.model,
+        virtual_key_id.as_deref(),
+        crate::active_requests::RequestKind::Stream,
+    ));
+    let mut request_guard = RequestCompleteGuard::new(
+        state.metrics.clone(),
+        start,
+        Some((state.active_requests.clone(), trace_id.clone())),
+    );
     tracing::debug!(
         trace_id = %trace_id,
         model = %request.model,
@@ -1927,7 +1987,8 @@ async fn chat_completions_stream(
         if let Ok(cached_resp) = serde_json::from_str::<OpenAIResponse>(&cached_json) {
             state.metrics.record_cache_hit();
             request_guard.complete();
-            let stream_trace_id = trace_id.clone();
+        let stream_trace_id = trace_id.clone();
+
             let stream = async_stream::stream! {
                 tracing::debug!(trace_id = %stream_trace_id, "Streaming cached response from exact cache");
                 for chunk in streaming_chunks_from_response(&cached_resp) {
@@ -2043,6 +2104,7 @@ async fn chat_completions_stream(
                 selector,
                 guardrail_ctx,
                 request_guard,
+                Some(active_handle.clone()),
             )
             .await;
         }
@@ -2064,6 +2126,7 @@ async fn chat_completions_stream(
             selector,
             guardrail_ctx,
             request_guard,
+            Some(active_handle.clone()),
         )
         .await;
     }
@@ -2084,6 +2147,7 @@ async fn chat_completions_stream(
         let requested_model = request.model.clone();
         let early_chunk = early_event_chunk(&response_id, created, &requested_model);
         let stream_trace_id = trace_id.clone();
+        let active_handle_stream = active_handle.clone();
 
         let streaming_config_relay = streaming_config.clone();
         let stream = async_stream::stream! {
@@ -2098,7 +2162,7 @@ async fn chat_completions_stream(
             // providers stream in real time (PassThrough) while providers that
             // need response transformation fall back to buffer-and-replay
             // (Buffered) — both behind the early event already flushed above.
-            match state.router.route_request_streaming(&request).await {
+            match state.router.route_request_streaming(&request, Some(active_handle_stream.clone())).await {
                 Ok(StreamingResponse::Buffered(response)) => {
                     // Buffer-and-replay: cache the assembled response so a later
                     // identical request replays without hitting the provider.
@@ -2340,7 +2404,7 @@ async fn chat_completions_stream(
 
                                 match state
                                     .router
-                                    .route_request_streaming_excluding(&request, &tried_providers)
+                                    .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
                                     .await
                                 {
                                     // Another eligible provider — relay it,
@@ -2440,7 +2504,7 @@ async fn chat_completions_stream(
     // Route the request first (provider always returns non-streaming JSON).
     // Errors here happen BEFORE any SSE chunks are sent, so we return a
     // normal JSON error response with the proper HTTP status code.
-    let response = match state.router.route_request(&request).await {
+    let response = match state.router.route_request(&request, Some(active_handle.clone())).await {
         Ok(resp) => resp,
         Err(e) => {
             let duration_ms = request_guard.complete();
@@ -2666,7 +2730,7 @@ async fn finalize_eager_post_call(
 
                 let Ok(candidate) = state
                     .router
-                    .route_with_failover(request, vec![target.clone()])
+                    .route_with_failover(request, vec![target.clone()], None)
                     .await
                 else {
                     tracing::debug!(
@@ -2841,7 +2905,7 @@ async fn validate_eager_structured_response(
 
                         match state
                             .router
-                            .route_with_failover(&retry_request, vec![target.clone()])
+                            .route_with_failover(&retry_request, vec![target.clone()], None)
                             .await
                         {
                             Ok(retry_response) => {
@@ -2998,8 +3062,9 @@ async fn stream_eager_structured_output(
     selector: BindingSelector,
     mut guardrail_ctx: GuardrailContext,
     mut request_guard: RequestCompleteGuard,
+    active: Option<crate::active_requests::ActiveRequestHandle>,
 ) -> Response {
-    let mut response = match state.router.route_request_streaming(&request).await {
+    let mut response = match state.router.route_request_streaming(&request, active.clone()).await {
         Ok(StreamingResponse::Buffered(response)) => response,
         Ok(StreamingResponse::PassThrough {
             byte_stream,
@@ -3242,6 +3307,7 @@ async fn stream_buffered_with_post_call(
     selector: BindingSelector,
     mut guardrail_ctx: GuardrailContext,
     request_guard: RequestCompleteGuard,
+    active: Option<crate::active_requests::ActiveRequestHandle>,
 ) -> Response {
     let emit_early = streaming_config.emit_early_event;
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -3256,6 +3322,7 @@ async fn stream_buffered_with_post_call(
         guardrail_stream::disconnect_discards_partial(&engine.resolver().resolve(&selector));
 
     let stream_trace_id = trace_id.clone();
+    let active_stream = active.clone();
 
     let stream = async_stream::stream! {
         let mut _guard = request_guard;
@@ -3274,7 +3341,7 @@ async fn stream_buffered_with_post_call(
         let mut streaming_compression: Option<CompressionStats> = None;
         let mut disconnected = false;
 
-        match state.router.route_request_streaming(&request).await {
+        match state.router.route_request_streaming(&request, active_stream.clone()).await {
             Ok(StreamingResponse::Buffered(response)) => {
                 assembled = Some(response);
             }
@@ -3490,7 +3557,7 @@ async fn stream_buffered_with_post_call(
                     // target (Req 12.5). Buffer the response for detection.
                     let attempt_result = state
                         .router
-                        .route_with_failover(&request, vec![target.clone()])
+                        .route_with_failover(&request, vec![target.clone()], None)
                         .await;
 
                     match attempt_result {
@@ -4538,7 +4605,7 @@ mod tests {
         metrics.start_request();
 
         {
-            let _guard = RequestCompleteGuard::new(metrics.clone(), Instant::now());
+            let _guard = RequestCompleteGuard::new(metrics.clone(), Instant::now(), None);
             assert_eq!(metrics.snapshot().active_requests, 1);
         }
 

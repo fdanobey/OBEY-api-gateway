@@ -425,6 +425,9 @@ pub struct MetricsSnapshot {
     /// and state is "closed", "open", or "half_open".
     #[serde(default)]
     pub circuit_breaker_states: Vec<(String, String)>,
+    /// Live snapshot of currently in-flight requests (dashboard "In-Flight Requests").
+    #[serde(default)]
+    pub active_requests_list: Vec<crate::active_requests::ActiveRequestInfo>,
 }
 
 impl MetricsSnapshot {
@@ -1825,6 +1828,7 @@ Total refusal failover outcomes by pipeline and outcome\n",
             rate_limit_exhaustions_by_provider,
             cache_hit_rate,
             circuit_breaker_states: Vec::new(),
+            active_requests_list: Vec::new(),
         }
     }
 

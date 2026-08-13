@@ -10,6 +10,7 @@ use crate::config::{Config, ContextConfig, ModelGroup, Provider, ProviderModel};
 use crate::context::ContextManager;
 use crate::dashboard::CompressionEventHub;
 use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
+use crate::active_requests::{ActivePhase, ActiveRequestHandle};
 use crate::memory::{
     CompressionExtractionInput, CompressionMessageSnapshot, CompressionRemovalReport,
     ExtractionPolicy, MemorySystem, ResolvedNamespace,
@@ -1904,6 +1905,8 @@ impl Router {
         provider_name: &str,
         request: &OpenAIRequest,
         provider_model: &ProviderModel,
+        active: Option<ActiveRequestHandle>,
+        base_attempt: usize,
     ) -> Result<OpenAIResponse, GatewayError> {
         let config = self.config.read().await;
         let max_retries = config.retry.max_retries_per_provider;
@@ -2262,6 +2265,15 @@ impl Router {
                     Self::calculate_retry_delay(backoff_secs, jitter_enabled, jitter_ratio);
                 self.metrics
                     .record_provider_retry(provider_name, retry_delay.as_millis() as u64);
+                // Report the retry to the in-flight registry: same provider,
+                // retrying after the previous attempt's error.
+                if let Some(handle) = &active {
+                    handle.set_phase(ActivePhase::Retry);
+                    handle.set_attempt(base_attempt + attempt as usize);
+                    if let Some(err) = &last_error {
+                        handle.set_last_error(&err.to_string());
+                    }
+                }
                 tokio::time::sleep(retry_delay).await;
                 debug!(
                     provider = provider_name,
@@ -2931,9 +2943,10 @@ impl Router {
         &self,
         request: &OpenAIRequest,
         providers: Vec<ProviderModel>,
+        active: Option<ActiveRequestHandle>,
     ) -> Result<OpenAIResponse, GatewayError> {
         let model_group = self.find_model_group(&request.model).await?;
-        self.route_with_failover_for_group(request, &model_group, providers)
+        self.route_with_failover_for_group(request, &model_group, providers, active, ActivePhase::Primary)
             .await
     }
 
@@ -2943,8 +2956,13 @@ impl Router {
         request: &OpenAIRequest,
         model_group: &ModelGroup,
         providers: Vec<ProviderModel>,
+        active: Option<ActiveRequestHandle>,
+        initial_phase: ActivePhase,
     ) -> Result<OpenAIResponse, GatewayError> {
         let mut attempts = Vec::new();
+        // Running count of provider attempts across the whole request, surfaced
+        // to the dashboard's in-flight view.
+        let mut attempt_counter: usize = 0;
         // Partial responses kept when a provider truncates (finish_reason=length
         // well below max_tokens). Task 7.2 returns the longest of these instead
         // of an error when every provider truncates (Req 6.2).
@@ -3065,8 +3083,28 @@ impl Router {
                     &request_id,
                 )
                 .await;
+            // Report the current attempt target to the in-flight registry. The
+            // first attempt of the whole request uses the initial phase (Primary,
+            // or Cascade when re-routed by smart routing); subsequent providers
+            // entered after a failure are failovers.
+            if let Some(handle) = &active {
+                attempt_counter += 1;
+                let phase = if attempts.is_empty() {
+                    initial_phase
+                } else {
+                    ActivePhase::Failover
+                };
+                handle.set_target(&provider_model.provider, &provider_model.model, phase);
+                handle.set_attempt(attempt_counter);
+            }
             match self
-                .attempt_with_retry(&provider_model.provider, &prepared_request, &provider_model)
+                .attempt_with_retry(
+                    &provider_model.provider,
+                    &prepared_request,
+                    &provider_model,
+                    active.clone(),
+                    attempt_counter,
+                )
                 .await
             {
                 Ok(mut response) => {
@@ -3281,6 +3319,12 @@ impl Router {
                 Err(e) => {
                     // Record failure
                     cb.record_failure().await;
+
+                    // Surface the failure reason on the in-flight registry so a
+                    // following retry/failover can show why the model changed.
+                    if let Some(handle) = &active {
+                        handle.set_last_error(&e.to_string());
+                    }
 
                     // Extract status code from the error when available
                     let attempt_status = match &e {
@@ -5005,12 +5049,16 @@ impl Router {
     pub async fn route_request(
         &self,
         request: &OpenAIRequest,
+        active: Option<ActiveRequestHandle>,
     ) -> Result<OpenAIResponse, GatewayError> {
         let prepared_request = request.clone();
 
         // Find model group
         let model_group = self.find_model_group(&prepared_request.model).await?;
         debug!(group = %model_group.name, "Found model group");
+        if let Some(handle) = &active {
+            handle.set_group(&model_group.name);
+        }
 
         let (model_group, mut routing_decision, routing_bypassed) = if let Some(plan) = self
             .smart_routing_plan(&prepared_request, &model_group)
@@ -5036,7 +5084,7 @@ impl Router {
         // Route with failover and bounded response-quality cascade.
         let original_request = prepared_request.clone();
         let mut response = self
-            .route_with_failover_for_group(&prepared_request, &model_group, providers)
+            .route_with_failover_for_group(&prepared_request, &model_group, providers, active.clone(), ActivePhase::Primary)
             .await?;
         if let (Some(smart_router), Some(decision)) =
             (self.smart_router_snapshot(), routing_decision.as_mut())
@@ -5053,6 +5101,11 @@ impl Router {
                 let Some(_failure) = failed else {
                     break;
                 };
+                // Re-routing via smart-routing cascade: mark the in-flight entry
+                // so the dashboard shows this is an escalated tier/version attempt.
+                if let Some(handle) = &active {
+                    handle.set_phase(ActivePhase::Cascade);
+                }
                 let Some(next_tier) = crate::smart_routing::cascade::CascadeEvaluator::next_tier(
                     decision.tier,
                     decision.escalation_count,
@@ -5079,6 +5132,8 @@ impl Router {
                         &original_request,
                         &next.model_group,
                         escalated_providers,
+                        active.clone(),
+                        ActivePhase::Cascade,
                     )
                     .await?;
                 self.metrics.record_smart_routing_cascade_transition(
@@ -5173,8 +5228,9 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
     pub async fn route_request_streaming(
         &self,
         request: &OpenAIRequest,
+        active: Option<ActiveRequestHandle>,
     ) -> Result<StreamingResponse, GatewayError> {
-        self.route_request_streaming_excluding(request, &[]).await
+        self.route_request_streaming_excluding(request, &[], active).await
     }
 
     /// Like [`Self::route_request_streaming`], but skips any provider whose name
@@ -5194,6 +5250,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         &self,
         request: &OpenAIRequest,
         exclude: &[String],
+        active: Option<ActiveRequestHandle>,
     ) -> Result<StreamingResponse, GatewayError> {
         let prepared_request = request.clone();
 
@@ -5208,6 +5265,9 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
 
         // Model group + provider order (same selection path as route_request).
         let model_group = self.find_model_group(&prepared_request.model).await?;
+        if let Some(handle) = &active {
+            handle.set_group(&model_group.name);
+        }
         let routing_plan = self
             .smart_routing_plan(&prepared_request, &model_group)
             .await?;
@@ -5231,7 +5291,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         {
             debug!("Streaming pass-through disabled, using buffered path");
             return Ok(StreamingResponse::Buffered(
-                self.route_request(request).await?,
+                self.route_request(request, active.clone()).await?,
             ));
         }
 
@@ -5270,10 +5330,22 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             None => {
                 debug!("No eligible pass-through provider, using buffered path");
                 return Ok(StreamingResponse::Buffered(
-                    self.route_request(request).await?,
+                    self.route_request(request, active.clone()).await?,
                 ));
             }
         };
+
+        // Report the streaming pass-through target to the in-flight registry.
+        // If providers were excluded it means an earlier pass-through failed and
+        // this is a failover; otherwise it is the primary attempt.
+        if let Some(handle) = &active {
+            let phase = if exclude.is_empty() {
+                ActivePhase::Primary
+            } else {
+                ActivePhase::Failover
+            };
+            handle.set_target(&provider_model.provider, &provider_model.model, phase);
+        }
 
         // Compression is provider-specific and completes before model rewrite,
         // sanitization, or the upstream streaming request starts.
@@ -5326,7 +5398,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             drop(config);
             debug!(provider = %provider_model.provider, "Provider needs transformation or is Codex, using buffered path");
             return Ok(StreamingResponse::Buffered(
-                self.route_request(request).await?,
+                self.route_request(request, active.clone()).await?,
             ));
         }
 
@@ -5357,7 +5429,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         if is_oauth_provider && oauth_bearer.is_none() {
             debug!(provider = %provider_model.provider, "OAuth session unusable, using buffered path");
             return Ok(StreamingResponse::Buffered(
-                self.route_request(request).await?,
+                self.route_request(request, active.clone()).await?,
             ));
         }
 
@@ -5416,13 +5488,13 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             Ok(Err(e)) => {
                 warn!(provider = %provider_model.provider, error = %e, "Streaming pass-through send failed, falling back to buffered path with full failover");
                 return Ok(StreamingResponse::Buffered(
-                    self.route_request(request).await?,
+                    self.route_request(request, active.clone()).await?,
                 ));
             }
             Err(_) => {
                 warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — falling back to buffered path with full failover");
                 return Ok(StreamingResponse::Buffered(
-                    self.route_request(request).await?,
+                    self.route_request(request, active.clone()).await?,
                 ));
             }
         };
@@ -5435,7 +5507,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             let _ = response.text().await;
             warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
             return Ok(StreamingResponse::Buffered(
-                self.route_request(request).await?,
+                self.route_request(request, active.clone()).await?,
             ));
         }
 
@@ -5504,6 +5576,8 @@ mod tests {
         token_counter::TokenCounter,
     };
     use crate::config::{CircuitBreakerConfig, ExactCacheConfig, ModelGroup, ProviderModel};
+    use crate::active_requests::{ActivePhase, ActiveRequestHandle};
+    use std::sync::{Arc, Mutex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct ContextThenSuccessClient {
@@ -6255,7 +6329,7 @@ mod tests {
         let replay_before = hub.subscribe().replay.len();
 
         let response = router
-            .route_request(&compression_request(false))
+            .route_request(&compression_request(false), None)
             .await
             .unwrap();
         assert!(response.extra.contains_key("gateway_compression"));
@@ -6292,7 +6366,7 @@ mod tests {
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
         let response = router
-            .route_request_streaming(&compression_request(true))
+            .route_request_streaming(&compression_request(true), None)
             .await
             .unwrap();
         assert!(matches!(response, StreamingResponse::PassThrough { .. }));
@@ -6352,9 +6426,63 @@ mod tests {
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
         router
-            .route_request(&compression_request(false))
+            .route_request(&compression_request(false), None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn in_flight_handle_reflects_failover_to_second_provider() {
+        use crate::active_requests::ActiveRequestInfo;
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&first)
+            .await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&second)
+            .await;
+
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.compression = CompressionConfig::default();
+        let mut first_provider = test_provider("first", first.uri());
+        first_provider.compression = None;
+        let mut second_provider = test_provider("second", second.uri());
+        second_provider.compression = None;
+        config.providers = vec![first_provider, second_provider];
+        config.model_groups = vec![test_group(vec![
+            test_model("first", 1),
+            test_model("second", 2),
+        ])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let handle = ActiveRequestHandle(Arc::new(Mutex::new(ActiveRequestInfo {
+            trace_id: "test-trace".to_string(),
+            requested_model: "test-group".to_string(),
+            model_group: None,
+            provider: None,
+            model: None,
+            attempt: 0,
+            phase: ActivePhase::Pending,
+            last_error: None,
+            virtual_key_id: None,
+            started_at_ms: 0,
+            kind: crate::active_requests::RequestKind::Chat,
+        })));
+        let result = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await;
+        assert!(result.is_ok(), "routing should succeed via the second provider");
+
+        let info = handle.0.lock().unwrap();
+        assert_eq!(info.phase, ActivePhase::Failover, "second provider is a failover");
+        assert_eq!(info.provider.as_deref(), Some("second"));
+        assert!(info.last_error.is_some(), "prior failure should be recorded");
     }
 
     #[tokio::test]
@@ -6850,7 +6978,7 @@ mod tests {
             extra: Default::default(),
         };
 
-        let result = router.route_with_failover(&request, providers).await;
+        let result = router.route_with_failover(&request, providers, None).await;
         assert!(matches!(result, Err(GatewayError::AllProvidersFailed(_))));
 
         let snapshot = router_metrics.snapshot();

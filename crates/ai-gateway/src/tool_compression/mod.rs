@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod middleware;
+pub mod resolver;
 pub mod stage;
 pub mod stages;
 pub mod state;

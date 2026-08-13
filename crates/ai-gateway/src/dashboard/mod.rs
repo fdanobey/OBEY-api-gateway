@@ -357,6 +357,18 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
                 }
             }
             _ = interval.tick() => {
+                // Safety net: drop any in-flight entries that outlived their
+                // request (e.g. after a panic). Normal completion deregisters
+                // via the request guard's Drop.
+                let timeout_secs = state
+                    .config
+                    .try_read()
+                    .map(|c| c.server.request_timeout_seconds)
+                    .unwrap_or(30);
+                state
+                    .active_requests
+                    .sweep_stale(std::time::Duration::from_secs(timeout_secs.saturating_mul(2)));
+
                 let snapshot = build_dashboard_snapshot(&state).await;
                 let msg = serde_json::json!({"type": "metrics", "data": snapshot});
                 if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
@@ -476,6 +488,7 @@ async fn build_dashboard_snapshot(state: &AppState) -> crate::metrics::MetricsSn
     let cb_states = state.router.get_circuit_breaker_states().await;
     snapshot.circuit_breaker_states = cb_states.clone();
     snapshot.enrich_circuit_breaker_states(&cb_states);
+    snapshot.active_requests_list = state.active_requests.snapshot();
     snapshot
 }
 

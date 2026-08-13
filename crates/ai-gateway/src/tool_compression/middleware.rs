@@ -23,10 +23,12 @@ use crate::metrics::Metrics;
 
 use super::{
     config::CompressionLevel,
+    resolver,
     stage::CompressionStage,
     stages::{
         auto_tuner::AutoTuner, cache_placement::CachePlacementOptimizer,
         canonical_rewriter::CanonicalRewriter, deduplicator::SchemaDeduplicator,
+        description_compressor::DescriptionCompressor, disclosure::ProgressiveDisclosureEngine,
         feedback_loop::FeedbackLoop, minifier::SchemaMinifier, namespace_grouper::NamespaceGrouper,
         pruner::ToolPruner, semantic_retriever::SemanticRetriever, truncator::DescriptionTruncator,
     },
@@ -42,6 +44,11 @@ const HEADER_LEVEL_REQUEST: &str = "x-tool-compression-level";
 const HEADER_LEVEL_RESPONSE: &str = "x-tool-compression-level";
 const HEADER_RATIO: &str = "x-tool-compression-ratio";
 const HEADER_TOKENS_SAVED: &str = "x-tool-compression-tokens-saved";
+const HEADER_SESSION_ID: &str = "x-session-id";
+
+/// Maximum number of synthetic drill-down resolution steps per request. Bounds the
+/// internal resolution loop so a misbehaving model cannot trigger runaway re-calls.
+const MAX_SYNTHETIC_RESOLUTION_STEPS: usize = 6;
 
 // ─── Layer ────────────────────────────────────────────────────────────────────
 
@@ -108,10 +115,15 @@ impl<S> Layer<S> for ToolCompressionLayer {
                 let mut stages: Vec<Box<dyn CompressionStage>> = Vec::with_capacity(8);
                 stages.push(Box::new(SchemaMinifier));
                 stages.push(Box::new(DescriptionTruncator::new()));
+                stages.push(Box::new(DescriptionCompressor::new(
+                    &tc.precomputed_descriptions,
+                    &[],
+                )));
                 stages.push(Box::new(SemanticRetriever::new(tc)));
                 stages.push(Box::new(SchemaDeduplicator));
                 stages.push(Box::new(ToolPruner::new(&tc.pruning)));
                 stages.push(Box::new(NamespaceGrouper::new(&tc.namespace_grouping)));
+                stages.push(Box::new(ProgressiveDisclosureEngine::new()));
                 stages.push(Box::new(CachePlacementOptimizer));
                 stages.push(Box::new(CanonicalRewriter::new(
                     &tc.canonical_rewriting.allowed_models,
@@ -175,7 +187,7 @@ where
 
         let mut inner = self.inner.clone();
         let config = Arc::clone(&self.config);
-        let _state = Arc::clone(&self.state);
+        let state = Arc::clone(&self.state);
         let _metrics = Arc::clone(&self.metrics);
         let compression_events = Arc::clone(&self.compression_events);
         let pipeline = Arc::clone(&self.pipeline);
@@ -252,6 +264,13 @@ where
             // Use model name as model_group (simple mapping).
             let model_group = model.clone();
 
+            // Optional stable session id used for multi-turn disclosure tracking.
+            let session_id = parts
+                .headers
+                .get(HEADER_SESSION_ID)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
             let config_snapshot = config.try_read().ok().map(|c| c.tool_compression.clone());
 
             // Resolution order: header > feedback > config override > auto-tune > config global default.
@@ -314,6 +333,7 @@ where
                 model: model.clone(),
                 model_group: model_group.clone(),
                 original_tools: original_tools.clone(),
+                session_id: session_id.clone(),
                 ..Default::default()
             };
 
@@ -352,6 +372,33 @@ where
                 }
             }
 
+            // Re-inject previously disclosed full tool schemas so they remain callable
+            // across turns. Namespace grouping removes individual tools from the listing;
+            // progressive disclosure keeps them (so we skip names already present to avoid
+            // duplicate tool definitions).
+            if let Some(sid) = &session_id {
+                if let Some(disclosed) = state.disclosure_state.get(sid) {
+                    if !disclosed.is_empty() {
+                        let mut added = false;
+                        for tool in original_tools.iter() {
+                            if disclosed.contains(&tool.name)
+                                && !tools.iter().any(|t| t.name == tool.name)
+                            {
+                                tools.push(ToolDefinition {
+                                    raw: tool.raw.clone(),
+                                    name: tool.name.clone(),
+                                    content_hash: 0,
+                                });
+                                added = true;
+                            }
+                        }
+                        if added {
+                            ctx.strategies_applied.push("disclosure_reinject".to_string());
+                        }
+                    }
+                }
+            }
+
             // Replace tools in the JSON body with compressed versions.
             let compressed_tools: Vec<serde_json::Value> =
                 tools.iter().map(|t| t.raw.clone()).collect();
@@ -367,12 +414,13 @@ where
 
             // Rebuild request with modified body.
             let new_body = serde_json::to_vec(&json_body).unwrap_or_else(|_| bytes.to_vec());
+            let parts_clone = parts.clone();
             let mut new_request = Request::from_parts(parts, Body::from(new_body));
 
             // Store original tools in request extensions for downstream resolution.
             new_request
                 .extensions_mut()
-                .insert(OriginalToolsExtension(Arc::new(original_tools)));
+                .insert(OriginalToolsExtension(Arc::new(original_tools.clone())));
 
             // Set extension flag signaling that compression was applied.
             new_request
@@ -380,7 +428,84 @@ where
                 .insert(ToolCompressionApplied(true));
 
             // Forward to inner service.
-            let mut response = inner.call(new_request).await?;
+            let response = inner.call(new_request).await?;
+
+            // ─── Synthetic drill-down resolution loop ─────────────────────────
+            // If the provider calls a synthetic tool emitted by the compression
+            // stages (get_tool_schema / get_tools_in_namespace), resolve it against
+            // the original tools, feed the result back, and re-call so the model can
+            // invoke the real tool. Bounded by MAX_SYNTHETIC_RESOLUTION_STEPS;
+            // streaming responses pass through untouched.
+            let mut final_response = response;
+            let mut req_json = json_body.clone();
+            let mut steps = 0usize;
+            loop {
+                if steps >= MAX_SYNTHETIC_RESOLUTION_STEPS {
+                    break;
+                }
+                if response_is_streaming(&req_json, &final_response) {
+                    break;
+                }
+                let (resp_parts, resp_body) = final_response.into_parts();
+                let resp_bytes = match to_bytes(resp_body, max_body).await {
+                    Ok(b) => b,
+                    Err(_) => {
+                        final_response = Response::from_parts(resp_parts, Body::empty());
+                        break;
+                    }
+                };
+                let resp_json: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        final_response = Response::from_parts(resp_parts, Body::from(resp_bytes));
+                        break;
+                    }
+                };
+
+                match resolver::resolve_synthetic_in_response(&resp_json, &mut req_json, &original_tools) {
+                    Some(disclosed) => {
+                        // Persist disclosed tools for multi-turn re-injection.
+                        if let Some(sid) = &session_id {
+                            let mut entry = state
+                                .disclosure_state
+                                .entry(sid.clone())
+                                .or_default();
+                            for n in &disclosed {
+                                entry.insert(n.clone());
+                            }
+                        }
+                    }
+                    None => {
+                        final_response = Response::from_parts(resp_parts, Body::from(resp_bytes));
+                        break;
+                    }
+                }
+
+                let next_body = match serde_json::to_vec(&req_json) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        final_response = Response::from_parts(resp_parts, Body::from(resp_bytes));
+                        break;
+                    }
+                };
+                let mut next_parts = parts_clone.clone();
+                let len_value = HeaderValue::from_str(&next_body.len().to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("0"));
+                next_parts.headers.insert(axum::http::header::CONTENT_LENGTH, len_value);
+                let mut next_req = Request::from_parts(next_parts, Body::from(next_body));
+                next_req
+                    .extensions_mut()
+                    .insert(OriginalToolsExtension(Arc::new(original_tools.clone())));
+                next_req
+                    .extensions_mut()
+                    .insert(ToolCompressionApplied(true));
+                match inner.call(next_req).await {
+                    Ok(r) => final_response = r,
+                    Err(e) => return Err(e),
+                }
+                steps += 1;
+            }
+            let mut response = final_response;
 
             // ─── Response-path error detection for Feedback Loop ──────────────
             // Inspect the response for tool-call errors and feed results to FeedbackLoop.
@@ -562,5 +687,28 @@ pub fn detect_tool_call_errors(
         }
     }
 
+    false
+}
+
+/// Returns `true` if the provider response should not be parsed for synthetic
+/// drill-down resolution (i.e. it is a streaming/SSE response). We must not consume
+/// a streaming body, so the resolution loop passes such responses through untouched.
+fn response_is_streaming(req_json: &serde_json::Value, resp: &Response<Body>) -> bool {
+    if req_json
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        == Some(true)
+    {
+        return true;
+    }
+    if let Some(ct) = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        if ct.to_ascii_lowercase().contains("text/event-stream") {
+            return true;
+        }
+    }
     false
 }

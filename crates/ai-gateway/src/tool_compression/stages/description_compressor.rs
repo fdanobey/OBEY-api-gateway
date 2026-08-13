@@ -184,6 +184,18 @@ impl DescriptionCompressor {
 
 impl CompressionStage for DescriptionCompressor {
     fn apply(&self, tools: &mut Vec<ToolDefinition>, ctx: &mut CompressionContext) -> u64 {
+        // Lazily compute compressed descriptions for any tool not yet cached.
+        // This keeps the stage functional when constructed without an initial tool
+        // set (e.g. wired into the pipeline at service build time).
+        let missing: Vec<String> = tools
+            .iter()
+            .filter(|t| self.get_compressed(&t.name).is_none())
+            .map(|t| t.name.clone())
+            .collect();
+        if !missing.is_empty() && self.method != DescriptionCompressionMethod::Manual {
+            self.recompute(tools, &missing);
+        }
+
         let mut tokens_saved: u64 = 0;
 
         for tool in tools.iter_mut() {

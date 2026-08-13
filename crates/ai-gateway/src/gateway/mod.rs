@@ -73,6 +73,8 @@ pub struct AppState {
     pub compression_events: Arc<crate::dashboard::CompressionEventHub>,
     /// Shared bounded replay/live stream for content-free memory activity.
     pub memory_events: Arc<crate::dashboard::MemoryEventHub>,
+    /// Live registry of in-flight requests for the dashboard's "In-Flight Requests" view.
+    pub active_requests: Arc<crate::active_requests::ActiveRequestRegistry>,
     /// Shared installer/status service for the optional ONNX compression assets.
     pub onnx_assets: Arc<crate::compression::assets::OnnxAssetManager>,
     /// Shared state for the tool definition compression pipeline.
@@ -256,6 +258,7 @@ impl GatewayServer {
             loop_detector,
             compression_events,
             memory_events,
+            active_requests: Arc::new(crate::active_requests::ActiveRequestRegistry::new()),
             onnx_assets: Arc::new(crate::compression::assets::OnnxAssetManager::new().map_err(
                 |error| {
                     GatewayError::Configuration(format!(

@@ -407,7 +407,7 @@ pub struct NamespaceGroupingConfig {
 impl Default for NamespaceGroupingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             min_tools_for_grouping: 10,
             namespace_mappings: HashMap::new(),
         }
@@ -557,7 +557,9 @@ mod tests {
     #[test]
     fn default_namespace_grouping() {
         let ng = NamespaceGroupingConfig::default();
-        assert!(!ng.enabled);
+        // Enabled by default: namespace grouping is the tool-count-reduction strategy
+        // that keeps the provider-visible tool definitions under provider caps.
+        assert!(ng.enabled);
         assert_eq!(ng.min_tools_for_grouping, 10);
         assert!(ng.namespace_mappings.is_empty());
     }
