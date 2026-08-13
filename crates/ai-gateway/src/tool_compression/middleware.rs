@@ -755,3 +755,128 @@ fn response_bytes_to_json(bytes: &[u8], sse: bool) -> Option<serde_json::Value> 
         serde_json::from_slice(bytes).ok()
     }
 }
+
+// ─── Unit Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            raw: json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "d",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+            name: name.to_string(),
+            content_hash: 0,
+        }
+    }
+
+    /// An SSE body streaming a `get_tools_in_namespace` call must normalise into a
+    /// buffered-shaped JSON value exposing `/choices/0/message/tool_calls`, so the
+    /// resolution loop can see it. Regression: previously SSE bodies were skipped and
+    /// the synthetic call was relayed to the client as an "unavailable tool".
+    #[test]
+    fn sse_body_with_synthetic_tool_call_is_normalised() {
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_tools_in_namespace\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"namespace\\\":\\\"fs\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let value = response_bytes_to_json(body.as_bytes(), true)
+            .expect("SSE body should reassemble into JSON");
+
+        let calls = value
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(|v| v.as_array())
+            .expect("tool_calls must be exposed at the buffered path");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].pointer("/function/name").and_then(|v| v.as_str()),
+            Some("get_tools_in_namespace")
+        );
+        assert_eq!(
+            calls[0]
+                .pointer("/function/arguments")
+                .and_then(|v| v.as_str()),
+            Some(r#"{"namespace":"fs"}"#)
+        );
+    }
+
+    /// End-to-end of the interception contract: a streamed synthetic call is resolved
+    /// against the original tools rather than passed through.
+    #[test]
+    fn streamed_synthetic_call_resolves_and_injects_real_tools() {
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_tools_in_namespace\",\"arguments\":\"{\\\"namespace\\\":\\\"fs\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp_json = response_bytes_to_json(body.as_bytes(), true).expect("reassembles");
+
+        let originals = vec![tool("fs_read"), tool("fs_write"), tool("git_log")];
+        let mut req_json = json!({
+            "tools": [{"type":"function","function":{"name":"get_tools_in_namespace"}}],
+            "messages": [{"role":"user","content":"list files"}]
+        });
+
+        let disclosed = resolver::resolve_synthetic_in_response(
+            &resp_json,
+            &mut req_json,
+            &originals,
+            0,
+        )
+        .expect("synthetic call must be resolved, not relayed");
+
+        assert!(disclosed.contains(&"fs_read".to_string()));
+        assert!(disclosed.contains(&"fs_write".to_string()));
+
+        // A tool result was fed back for the synthetic call id.
+        let messages = req_json["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("tool")
+                && m.get("tool_call_id").and_then(|i| i.as_str()) == Some("call_1")
+        }));
+
+        // The real namespace tools became callable.
+        let tool_names: Vec<&str> = req_json["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(tool_names.contains(&"fs_read"));
+        assert!(tool_names.contains(&"fs_write"));
+    }
+
+    /// A plain JSON (non-SSE) body still parses directly.
+    #[test]
+    fn json_body_parses_without_sse_path() {
+        let body = json!({"choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}]});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let value = response_bytes_to_json(&bytes, false).expect("JSON parses");
+        assert_eq!(
+            value.pointer("/choices/0/message/content").unwrap(),
+            &json!("hi")
+        );
+    }
+
+    /// SSE bodies are detected by payload shape even when the Content-Type was lost.
+    #[test]
+    fn sse_detected_from_body_shape_when_header_missing() {
+        let body = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let value = response_bytes_to_json(body.as_bytes(), false)
+            .expect("body-shape sniffing should still reassemble");
+        assert_eq!(
+            value.pointer("/choices/0/message/content").unwrap(),
+            &json!("hi")
+        );
+    }
+}
