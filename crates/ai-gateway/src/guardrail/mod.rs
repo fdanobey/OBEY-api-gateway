@@ -203,6 +203,7 @@ impl GuardrailEngine {
     /// Returns [`PipelineResolverError`] if a stage references a provider absent
     /// from the registry or the provider config list (configuration validation
     /// is expected to have already rejected such cases).
+    #[allow(dead_code)] // public API; used by tests and external callers
     pub fn new(
         config: &GuardrailConfig,
         registry: &ProviderRegistry,
@@ -238,6 +239,7 @@ impl GuardrailEngine {
     }
 
     /// Build an engine from an already-compiled [`PipelineResolver`].
+    #[allow(dead_code)] // public API; used by tests and external callers
     pub fn with_resolver(resolver: PipelineResolver, metrics: Option<Arc<Metrics>>) -> Self {
         Self {
             resolver,
@@ -250,6 +252,7 @@ impl GuardrailEngine {
     }
 
     /// The configured re-injection entry cap.
+    #[allow(dead_code)] // public API; used by tests and external callers
     pub fn max_reinjection_entries(&self) -> usize {
         self.max_reinjection_entries
     }

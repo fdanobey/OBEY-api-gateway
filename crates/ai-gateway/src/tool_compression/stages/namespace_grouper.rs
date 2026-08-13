@@ -29,8 +29,6 @@ pub struct NamespaceGrouper {
     configured_mappings: HashMap<String, NamespaceMetadata>,
     /// Minimum tool count to activate namespace grouping.
     min_tools_for_grouping: u32,
-    /// Whether the stage is enabled.
-    enabled: bool,
 }
 
 impl NamespaceGrouper {
@@ -39,7 +37,6 @@ impl NamespaceGrouper {
         Self {
             configured_mappings: config.namespace_mappings.clone(),
             min_tools_for_grouping: config.min_tools_for_grouping,
-            enabled: config.enabled,
         }
     }
 
@@ -277,8 +274,12 @@ impl CompressionStage for NamespaceGrouper {
         tokens_saved
     }
 
-    fn is_enabled(&self, _config: &ToolCompressionConfig, _level: CompressionLevel) -> bool {
-        self.enabled
+    fn is_enabled(&self, config: &ToolCompressionConfig, _level: CompressionLevel) -> bool {
+        // Read from the live config snapshot (passed per request) rather than the
+        // flag captured at pipeline construction. The compression pipeline is built
+        // once at startup, so a `config.namespace_grouping.enabled` change applied via
+        // hot-reload would otherwise never take effect on traffic.
+        config.namespace_grouping.enabled
     }
 }
 

@@ -890,6 +890,7 @@ async fn get_smart_routing_model_status(State(state): State<AppState>) -> Respon
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // model_path only read under the `ml-router` feature
 struct SmartRoutingModelDownloadRequest {
     #[serde(default)]
     model_path: Option<String>,

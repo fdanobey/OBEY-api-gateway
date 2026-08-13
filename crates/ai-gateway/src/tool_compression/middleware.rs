@@ -180,7 +180,15 @@ where
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         // Fast path: compression disabled at construction time — zero overhead.
-        if !self.enabled {
+        // Re-check the live config so a `tool_compression.enabled` toggle applied via
+        // hot-reload takes effect without a restart (the layer is built once at startup).
+        let enabled = self.enabled
+            || self
+                .config
+                .try_read()
+                .map(|c| c.tool_compression.enabled)
+                .unwrap_or(self.enabled);
+        if !enabled {
             let mut inner = self.inner.clone();
             return Box::pin(async move { inner.call(request).await });
         }
@@ -354,6 +362,7 @@ where
             let tc_config = config_snapshot.clone().unwrap_or_default();
 
             let debug_validation = tc_config.debug_validation;
+            let disclosure_max_tools = tc_config.disclosure_max_tools;
 
             for stage in pipeline.iter() {
                 if stage.is_enabled(&tc_config, effective_level) {
@@ -380,15 +389,23 @@ where
                 if let Some(disclosed) = state.disclosure_state.get(sid) {
                     if !disclosed.is_empty() {
                         let mut added = false;
+                        let mut reinjected = 0usize;
                         for tool in original_tools.iter() {
                             if disclosed.contains(&tool.name)
                                 && !tools.iter().any(|t| t.name == tool.name)
                             {
+                                // Bound callable-tool count re-injected across turns.
+                                if disclosure_max_tools > 0
+                                    && reinjected >= disclosure_max_tools as usize
+                                {
+                                    break;
+                                }
                                 tools.push(ToolDefinition {
                                     raw: tool.raw.clone(),
                                     name: tool.name.clone(),
                                     content_hash: 0,
                                 });
+                                reinjected += 1;
                                 added = true;
                             }
                         }
@@ -462,7 +479,12 @@ where
                     }
                 };
 
-                match resolver::resolve_synthetic_in_response(&resp_json, &mut req_json, &original_tools) {
+                match resolver::resolve_synthetic_in_response(
+                    &resp_json,
+                    &mut req_json,
+                    &original_tools,
+                    disclosure_max_tools,
+                ) {
                     Some(disclosed) => {
                         // Persist disclosed tools for multi-turn re-injection.
                         if let Some(sid) = &session_id {

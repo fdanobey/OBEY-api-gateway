@@ -150,8 +150,9 @@ impl Router {
         }
         SmartRouter::new(smart_routing_config.clone())
             .map(|router| {
-                let mut router = router;
-                #[cfg(feature = "ml-router")]
+        #[cfg_attr(not(feature = "ml-router"), allow(unused_mut))]
+        let mut router = router;
+        #[cfg(feature = "ml-router")]
                 if matches!(
                     smart_routing_config.classifier,
                     crate::smart_routing::config::ClassifierMode::Ml

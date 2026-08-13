@@ -75,12 +75,19 @@ pub fn resolve_synthetic_tool_call(
 /// full tool schemas into `req_json["tools"]` so the model can call them on the next
 /// model turn.
 ///
+/// `max_reinject` bounds how many tool schemas are re-injected into `req_json["tools"]`
+/// for a single `get_tools_in_namespace` drill-down. This keeps the provider below its
+/// tool-count limit (e.g. "maximum of 100 tools allowed"): when a namespace holds more
+/// tools than `max_reinject` (and `max_reinject > 0`), only the first `max_reinject` are
+/// made callable this turn and the tool result notes the remainder. `0` disables the cap.
+///
 /// Returns `Some(disclosed_tool_names)` when at least one synthetic call was resolved
 /// (the caller should persist these for multi-turn disclosure), or `None` otherwise.
 pub fn resolve_synthetic_in_response(
     resp_json: &Value,
     req_json: &mut Value,
     original_tools: &[ToolDefinition],
+    max_reinject: u32,
 ) -> Option<Vec<String>> {
     let choices = resp_json.get("choices").and_then(|c| c.as_array())?;
     let first = choices.first()?;
@@ -107,7 +114,7 @@ pub fn resolve_synthetic_in_response(
         // Resolve the synthetic call. If resolution fails (e.g. invalid namespace or
         // malformed arguments), produce an error result instead of aborting the entire
         // resolution loop — the model needs a tool response for its tool_call_id.
-        let content = match resolve_synthetic_tool_call(name, args, original_tools) {
+        let mut content = match resolve_synthetic_tool_call(name, args, original_tools) {
             Some(c) => c,
             None => {
                 // Build a helpful error so the model can recover.
@@ -137,6 +144,18 @@ pub fn resolve_synthetic_in_response(
                                 disclosed.push(n.to_string());
                             }
                             injected.push(t);
+                        }
+                        // Cap re-injection so the provider stays under its tool-count limit
+                        // (e.g. "maximum of 100 tools allowed"). The model still sees every
+                        // schema in `content`; only the callable set is bounded this turn.
+                        if max_reinject > 0 && injected.len() > max_reinject as usize {
+                            let excess = injected.len() - max_reinject as usize;
+                            injected.truncate(max_reinject as usize);
+                            disclosed.truncate(max_reinject as usize);
+                            content.push_str(&format!(
+                                "\n\nNote: {} additional tool(s) in namespace '{}' were omitted from the callable tool list to stay within the provider's tool-count limit. Request a specific tool with get_tool_schema to make it callable this turn.",
+                                excess, ns
+                            ));
                         }
                     }
                 }
@@ -257,7 +276,7 @@ mod tests {
             "tools": [{"type":"function","function":{"name":"get_tools_in_namespace"}}],
             "messages": [{"role":"user","content":"list files"}]
         });
-        let disclosed = resolve_synthetic_in_response(&resp, &mut req, &tools).expect("handled");
+        let disclosed = resolve_synthetic_in_response(&resp, &mut req, &tools, 0).expect("handled");
         assert_eq!(disclosed.len(), 2);
 
         let msgs = req["messages"].as_array().unwrap();
@@ -267,6 +286,45 @@ mod tests {
 
         let tools_arr = req["tools"].as_array().unwrap();
         assert!(tools_arr.iter().any(|t| t.pointer("/function/name") == Some(&json!("fs_read"))));
+    }
+
+    #[test]
+    fn resolve_in_response_caps_reinjection_to_max() {
+        // 10 tools in the "fs" namespace; cap re-injection at 3 so a provider with a
+        // small tool-count limit is never exceeded on drill-down.
+        let tools: Vec<ToolDefinition> = (1..=10)
+            .map(|i| make_tool(&format!("fs_t{}", i)))
+            .collect();
+        let resp = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_tools_in_namespace", "arguments": "{\"namespace\":\"fs\"}"}
+                    }]
+                }
+            }]
+        });
+        let mut req = json!({
+            "tools": [{"type":"function","function":{"name":"get_tools_in_namespace"}}],
+            "messages": [{"role":"user","content":"list files"}]
+        });
+        let disclosed = resolve_synthetic_in_response(&resp, &mut req, &tools, 3).expect("handled");
+        assert_eq!(disclosed.len(), 3, "only capped number should be disclosed");
+
+        let tools_arr = req["tools"].as_array().unwrap();
+        let reinjected = tools_arr
+            .iter()
+            .filter(|t| t.pointer("/function/name").map(|n| n.as_str().unwrap_or("")).map(|n| n.starts_with("fs_")).unwrap_or(false))
+            .count();
+        assert_eq!(reinjected, 3, "provider must see at most the cap of callable tools");
+
+        // Full content still lists every tool, with a truncation note.
+        let tool_msg = &req["messages"].as_array().unwrap()[2]["content"];
+        assert!(tool_msg.as_str().unwrap().contains("7 additional tool(s)"));
     }
 
     #[test]
@@ -286,6 +344,6 @@ mod tests {
             }]
         });
         let mut req = json!({"tools":[], "messages":[]});
-        assert!(resolve_synthetic_in_response(&resp, &mut req, &tools).is_none());
+        assert!(resolve_synthetic_in_response(&resp, &mut req, &tools, 0).is_none());
     }
 }

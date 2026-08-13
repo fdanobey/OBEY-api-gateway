@@ -283,6 +283,7 @@ impl PlaceholderResult {
 
 impl GuardrailContext {
     /// Create an empty context with the default 256-entry cap.
+    #[allow(dead_code)] // public API; used by tests
     pub fn new() -> Self {
         Self::default()
     }

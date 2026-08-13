@@ -22,6 +22,13 @@ fn default_min_requests() -> u32 {
     5
 }
 
+/// Max tools re-injected into the outgoing `tools` array per progressive-disclosure
+/// drill-down. Keeps the provider below common tool-count limits (e.g. 100) when a
+/// single namespace contains many tools.
+fn default_disclosure_max_tools() -> u32 {
+    64
+}
+
 fn default_min_preserve_length() -> u32 {
     20
 }
@@ -120,6 +127,15 @@ pub struct ToolCompressionConfig {
     #[serde(default)]
     pub precomputed_descriptions: PrecomputedDescriptionsConfig,
 
+    /// Maximum number of tool schemas re-injected into the outgoing `tools` array on a
+    /// single progressive-disclosure drill-down (`get_tool_schema` / `get_tools_in_namespace`).
+    /// Bounds the count the provider sees so a large namespace cannot exceed provider tool
+    /// limits (e.g. "maximum of 100 tools allowed"). Excess tools are still returned in the
+    /// tool result message but are not made callable this turn; the model can request specific
+    /// ones via `get_tool_schema`. `0` disables the cap (legacy behaviour).
+    #[serde(default = "default_disclosure_max_tools")]
+    pub disclosure_max_tools: u32,
+
     /// Per-model-group overrides. Group name → partial compression settings.
     #[serde(default)]
     pub model_group_overrides: HashMap<String, ToolCompressionOverride>,
@@ -154,6 +170,7 @@ impl Default for ToolCompressionConfig {
             auto_tuning: AutoTuningConfig::default(),
             namespace_grouping: NamespaceGroupingConfig::default(),
             precomputed_descriptions: PrecomputedDescriptionsConfig::default(),
+            disclosure_max_tools: default_disclosure_max_tools(),
             model_group_overrides: HashMap::new(),
             debug_validation: false,
             provider_overrides: HashMap::new(),

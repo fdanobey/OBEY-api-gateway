@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::tier::SmartRoutingTier;
 
+#[allow(dead_code)] // kept for completeness of the validation API
 fn validate_finite(value: f64, field: &str) -> Result<(), EvaluationInputError> {
     if !value.is_finite() {
         return Err(EvaluationInputError::NonFiniteValue {

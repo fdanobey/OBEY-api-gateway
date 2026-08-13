@@ -31,6 +31,7 @@ pub enum ActivePhase {
 
 impl ActivePhase {
     /// Short human label for the dashboard badge.
+    #[allow(dead_code)] // public API; may be used by the dashboard frontend
     pub fn label(&self) -> &'static str {
         match self {
             ActivePhase::Pending => "pending",
@@ -77,6 +78,7 @@ pub struct ActiveRequestInfo {
 }
 
 impl ActiveRequestInfo {
+    #[allow(dead_code)] // public API; may be used by the dashboard frontend
     pub fn elapsed_ms(&self) -> i64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -155,10 +157,12 @@ impl ActiveRequestRegistry {
     }
 
     /// Number of currently in-flight requests.
+    #[allow(dead_code)] // public API; may be used by the dashboard frontend
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[allow(dead_code)] // public API; may be used by the dashboard frontend
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
