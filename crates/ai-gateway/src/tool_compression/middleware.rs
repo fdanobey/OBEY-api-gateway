@@ -421,6 +421,13 @@ where
                 tools.iter().map(|t| t.raw.clone()).collect();
             json_body["tools"] = serde_json::Value::Array(compressed_tools.clone());
 
+            // Did any stage inject a synthetic drill-down tool? Only then must the
+            // response be inspected (and, for SSE, buffered) so the synthetic call is
+            // resolved here instead of leaking to the client.
+            let synthetic_injected = tools.iter().any(|t| {
+                t.name == resolver::GET_TOOLS_IN_NAMESPACE || t.name == resolver::GET_TOOL_SCHEMA
+            });
+
             let compressed_token_estimate = estimate_tokens(&json_body["tools"]);
             let tokens_saved = original_token_estimate.saturating_sub(compressed_token_estimate);
             let ratio = if original_token_estimate > 0 {
@@ -448,21 +455,25 @@ where
             let response = inner.call(new_request).await?;
 
             // ─── Synthetic drill-down resolution loop ─────────────────────────
-            // If the provider calls a synthetic tool emitted by the compression
-            // stages (get_tool_schema / get_tools_in_namespace), resolve it against
-            // the original tools, feed the result back, and re-call so the model can
-            // invoke the real tool. Bounded by MAX_SYNTHETIC_RESOLUTION_STEPS;
-            // streaming responses pass through untouched.
+            // If the model calls a synthetic tool emitted by the compression stages
+            // (get_tool_schema / get_tools_in_namespace), resolve it against the
+            // original tools, feed the result back, and re-call so the model can
+            // invoke the real tool. Bounded by MAX_SYNTHETIC_RESOLUTION_STEPS.
+            //
+            // The gateway returns an SSE response whenever the client requested
+            // streaming, so the loop must buffer and reassemble SSE bodies to see the
+            // assistant's tool_calls — otherwise a synthetic call would be relayed to
+            // the client, which cannot execute it ("unavailable tool"). Buffering only
+            // happens when synthetic tools were actually injected this request, so
+            // ordinary streaming traffic keeps true pass-through behaviour.
             let mut final_response = response;
             let mut req_json = json_body.clone();
             let mut steps = 0usize;
-            loop {
+            while synthetic_injected {
                 if steps >= MAX_SYNTHETIC_RESOLUTION_STEPS {
                     break;
                 }
-                if response_is_streaming(&req_json, &final_response) {
-                    break;
-                }
+                let sse = response_is_sse(&final_response);
                 let (resp_parts, resp_body) = final_response.into_parts();
                 let resp_bytes = match to_bytes(resp_body, max_body).await {
                     Ok(b) => b,
@@ -471,9 +482,9 @@ where
                         break;
                     }
                 };
-                let resp_json: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
-                    Ok(v) => v,
-                    Err(_) => {
+                let resp_json: serde_json::Value = match response_bytes_to_json(&resp_bytes, sse) {
+                    Some(v) => v,
+                    None => {
                         final_response = Response::from_parts(resp_parts, Body::from(resp_bytes));
                         break;
                     }
@@ -712,24 +723,35 @@ pub fn detect_tool_call_errors(
     false
 }
 
-/// Returns `true` if the provider response should not be parsed for synthetic
-/// drill-down resolution (i.e. it is a streaming/SSE response). We must not consume
-/// a streaming body, so the resolution loop passes such responses through untouched.
+/// Returns `true` when the response is an SSE stream (`text/event-stream`).
 ///
-/// NOTE: We only inspect the response Content-Type header, NOT `req_json["stream"]`.
-/// The router's inner service always forces `stream: false` to the upstream provider
-/// and buffers the full response, so the actual response body is always JSON even
-/// when the client originally requested streaming. The middleware sees the buffered
-/// response from the inner service, not the raw provider stream.
-fn response_is_streaming(_req_json: &serde_json::Value, resp: &Response<Body>) -> bool {
-    if let Some(ct) = resp
-        .headers()
+/// The gateway emits SSE whenever the client requested streaming, so a synthetic
+/// drill-down call arrives as streamed `tool_calls` deltas rather than a JSON body.
+fn response_is_sse(resp: &Response<Body>) -> bool {
+    resp.headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-    {
-        if ct.to_ascii_lowercase().contains("text/event-stream") {
-            return true;
-        }
+        .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"))
+}
+
+/// Normalise a response body into a non-streaming chat-completion JSON value so
+/// synthetic tool calls can be inspected.
+///
+/// SSE bodies are reassembled with the same accumulator the router uses for its
+/// buffered/cache path, which merges `tool_calls` deltas by index into complete
+/// tool-call objects. `Message.extra` is `#[serde(flatten)]`, so the reassembled
+/// value exposes `/choices/0/message/tool_calls` exactly like a buffered response.
+fn response_bytes_to_json(bytes: &[u8], sse: bool) -> Option<serde_json::Value> {
+    let looks_like_sse = sse
+        || std::str::from_utf8(bytes)
+            .ok()
+            .is_some_and(|t| t.trim_start().starts_with("data:"));
+
+    if looks_like_sse {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let assembled = crate::router::router::Router::reassemble_sse_response(text).ok()?;
+        serde_json::to_value(assembled).ok()
+    } else {
+        serde_json::from_slice(bytes).ok()
     }
-    false
 }
