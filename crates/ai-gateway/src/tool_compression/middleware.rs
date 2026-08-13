@@ -336,12 +336,17 @@ where
             let original_token_estimate = estimate_tokens(&json_body["tools"]);
 
             // Build compression context.
+            let is_streaming = json_body
+                .get("stream")
+                .and_then(|s| s.as_bool())
+                == Some(true);
             let mut ctx = CompressionContext {
                 level: effective_level,
                 model: model.clone(),
                 model_group: model_group.clone(),
                 original_tools: original_tools.clone(),
                 session_id: session_id.clone(),
+                is_streaming,
                 ..Default::default()
             };
 
