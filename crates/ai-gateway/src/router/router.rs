@@ -1965,9 +1965,9 @@ impl Router {
                     .unwrap_or_else(|| Arc::new(crate::oauth::UsageTracker::new())),
                 provider_cfg.codex_base_url_override.clone(),
                 provider_cfg.codex_model_override.clone(),
-                provider_cfg.instructions_override.clone(),
-                vec![], // xhigh_models_allowlist — TODO: wire from gateway config
-                vec![], // reasoning_models_allowlist — TODO: wire from gateway config
+            provider_cfg.instructions_override.clone(),
+            config.xhigh_models_allowlist.clone(),
+            config.reasoning_models_allowlist.clone(),
             );
 
             let mut codex_request = request.clone();
@@ -2284,9 +2284,9 @@ impl Router {
                 );
             }
 
-            let mut req_builder = http_client
-                .post(&url)
-                .header("Content-Type", "application/json");
+let mut req_builder = http_client
+.post(&url)
+.header("Content-Type", "application/json");
 
             if let Some(ref bearer) = oauth_bearer {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", bearer));
@@ -5464,11 +5464,15 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             outgoing.messages.push(Self::tool_calling_system_hint());
         }
 
-        let http_client = self.get_or_create_http_client(&provider_model.provider, &pool_config)?;
+        let http_client =
+            self.get_or_create_http_client(&provider_model.provider, &pool_config)?;
 
         let mut req_builder = http_client
             .post(&url)
-            .header("Content-Type", "application/json");
+            .header("Content-Type", "application/json")
+            // Request an uncompressed SSE stream so upstream/proxy compression
+            // truncation cannot surface as a mid-stream body decode error.
+            .header("Accept-Encoding", "identity");
         if let Some(ref bearer) = oauth_bearer {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", bearer));
         } else if !api_key.is_empty() {
@@ -5783,11 +5787,13 @@ mod tests {
             virtual_keys: Default::default(),
             loop_detection: Default::default(),
             guardrails: None,
-            tool_compression: Default::default(),
-            smart_routing: Default::default(),
-            memory: None,
-        }
+tool_compression: Default::default(),
+        smart_routing: Default::default(),
+        memory: None,
+        xhigh_models_allowlist: Default::default(),
+        reasoning_models_allowlist: Default::default(),
     }
+}
 
     fn test_provider(name: &str, base_url: String) -> crate::config::Provider {
         crate::config::Provider {
@@ -6340,13 +6346,14 @@ mod tests {
         assert_eq!(replay[0].model, "upstream-model");
     }
 
-    #[tokio::test]
-    async fn streaming_provider_receives_compressed_body_before_response() {
-        use wiremock::matchers::{body_string_contains, method, path};
+#[tokio::test]
+async fn streaming_provider_receives_compressed_body_before_response() {
+use wiremock::matchers::{body_string_contains, header, method, path};
 
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
+let server = MockServer::start().await;
+Mock::given(method("POST"))
+.and(path("/v1/chat/completions"))
+.and(header("accept-encoding", "identity"))
             .and(body_string_contains(
                 "use a small number of checks to finish",
             ))

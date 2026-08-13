@@ -118,6 +118,12 @@ pub struct Config {
     /// Complexity- and task-aware model routing. Disabled by default.
     #[serde(default)]
     pub smart_routing: SmartRoutingConfig,
+    /// Additional model identifiers that accept Codex `xhigh` reasoning effort.
+    #[serde(default)]
+    pub xhigh_models_allowlist: Vec<String>,
+    /// Additional model identifiers that accept Codex reasoning parameters.
+    #[serde(default)]
+    pub reasoning_models_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

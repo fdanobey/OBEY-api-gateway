@@ -14,11 +14,6 @@ pub enum TruncationStrategy {
     /// Keep only the most recent N messages (sliding window)
     /// Preserves system messages and last N user/assistant exchanges
     SlidingWindow { window_size: usize },
-
-    /// Use a cheaper model to summarize older context
-    /// This requires an additional API call and is not yet implemented
-    #[allow(dead_code)]
-    Summarize { summary_model: String },
 }
 
 /// Result of context truncation
@@ -76,11 +71,6 @@ pub fn apply_truncation_strategy(
         }
         TruncationStrategy::SlidingWindow { window_size } => {
             truncate_sliding_window(messages, window_size)
-        }
-        TruncationStrategy::Summarize { .. } => {
-            // TODO: Implement summarization strategy
-            // For now, fall back to RemoveOldest
-            truncate_remove_oldest(messages, max_tokens, &estimate_fn)
         }
     };
 

@@ -564,6 +564,16 @@ impl Config {
             self.validate_guardrails(guardrails, &mut errors);
         }
 
+        // Validate context truncation strategy (F1)
+        let valid_strategies = ["remove_oldest", "sliding_window"];
+        if !valid_strategies.contains(&self.context.truncation_strategy.as_str()) {
+            errors.push(ValidationError::InvalidValue {
+                field: "context.truncation_strategy".to_string(),
+                value: self.context.truncation_strategy.clone(),
+                expected: "one of: remove_oldest, sliding_window".to_string(),
+            });
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -999,10 +1009,12 @@ mod property_tests {
             loop_detection: Default::default(),
             structured_output: None,
             guardrails: None,
-            tool_compression: Default::default(),
-            smart_routing: Default::default(),
-        }
+tool_compression: Default::default(),
+        smart_routing: Default::default(),
+        xhigh_models_allowlist: Default::default(),
+        reasoning_models_allowlist: Default::default(),
     }
+}
 
     #[test]
     fn smart_routing_unknown_group_keys_are_rejected() {

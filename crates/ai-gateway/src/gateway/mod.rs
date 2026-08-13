@@ -984,11 +984,13 @@ mod tests {
             streaming: None,
             virtual_keys: Default::default(),
             loop_detection: Default::default(),
-            guardrails: None,
-            tool_compression: Default::default(),
-            smart_routing: Default::default(),
-        }
+guardrails: None,
+        tool_compression: Default::default(),
+        smart_routing: Default::default(),
+        xhigh_models_allowlist: Default::default(),
+        reasoning_models_allowlist: Default::default(),
     }
+}
 
     #[tokio::test]
     async fn test_gateway_server_new() {
@@ -1603,10 +1605,12 @@ mod tests {
                        streaming: None,
                        virtual_keys: Default::default(),
                        loop_detection: Default::default(),
-                       guardrails: None,
-                       tool_compression: Default::default(),
-    smart_routing: Default::default(),
-                   };
+        guardrails: None,
+        tool_compression: Default::default(),
+        smart_routing: Default::default(),
+        xhigh_models_allowlist: Default::default(),
+        reasoning_models_allowlist: Default::default(),
+    };
 
                    let server = GatewayServer::new(cfg, None).await.unwrap();
                    let app = server.build_router();
@@ -2189,10 +2193,12 @@ mod tests {
                        streaming: None,
                        virtual_keys: Default::default(),
                        loop_detection: Default::default(),
-                       guardrails: None,
-                       tool_compression: Default::default(),
-    smart_routing: Default::default(),
-                   };
+        guardrails: None,
+        tool_compression: Default::default(),
+        smart_routing: Default::default(),
+        xhigh_models_allowlist: Default::default(),
+        reasoning_models_allowlist: Default::default(),
+    };
 
                    // Write new config to disk
                    let new_yaml = serde_yaml::to_string(&new_cfg).unwrap();
