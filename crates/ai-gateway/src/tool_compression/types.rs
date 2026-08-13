@@ -94,11 +94,6 @@ pub struct CompressionContext {
     /// Populated by the middleware from `ToolCompressionState.placement_state`.
     /// Used by `CachePlacementOptimizer` to identify stable vs new/modified tools.
     pub previous_hashes: Option<Vec<u64>>,
-
-    /// Whether the request has `"stream": true`. Stages that inject synthetic
-    /// drill-down tools (namespace grouper, progressive disclosure) must no-op
-    /// because the resolution loop cannot intercept streaming responses.
-    pub is_streaming: bool,
 }
 
 impl Default for CompressionContext {
@@ -120,7 +115,6 @@ impl Default for CompressionContext {
             disclosed_tools: std::collections::HashSet::new(),
             message_content: None,
             previous_hashes: None,
-            is_streaming: false,
         }
     }
 }

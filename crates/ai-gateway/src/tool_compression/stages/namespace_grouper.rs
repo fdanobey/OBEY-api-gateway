@@ -214,12 +214,6 @@ impl NamespaceGrouper {
 
 impl CompressionStage for NamespaceGrouper {
     fn apply(&self, tools: &mut Vec<ToolDefinition>, ctx: &mut CompressionContext) -> u64 {
-        // Streaming requests cannot use the synthetic drill-down resolution loop,
-        // so injecting get_tools_in_namespace would leak to the client unresolved.
-        if ctx.is_streaming {
-            return 0;
-        }
-
         // Activation: enabled AND tool count > min_tools_for_grouping
         if tools.len() <= self.min_tools_for_grouping as usize {
             return 0;

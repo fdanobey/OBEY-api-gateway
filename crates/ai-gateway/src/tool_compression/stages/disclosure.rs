@@ -127,12 +127,6 @@ pub fn resolve_get_tool_schema(
 
 impl CompressionStage for ProgressiveDisclosureEngine {
     fn apply(&self, tools: &mut Vec<ToolDefinition>, ctx: &mut CompressionContext) -> u64 {
-        // Streaming requests cannot use the synthetic drill-down resolution loop,
-        // so injecting get_tool_schema would leak to the client unresolved.
-        if ctx.is_streaming {
-            return 0;
-        }
-
         // Bypass when tool count <= threshold
         if tools.len() <= MIN_TOOLS_FOR_DISCLOSURE {
             return 0;

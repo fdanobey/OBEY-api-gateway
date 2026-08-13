@@ -336,17 +336,12 @@ where
             let original_token_estimate = estimate_tokens(&json_body["tools"]);
 
             // Build compression context.
-            let is_streaming = json_body
-                .get("stream")
-                .and_then(|s| s.as_bool())
-                == Some(true);
             let mut ctx = CompressionContext {
                 level: effective_level,
                 model: model.clone(),
                 model_group: model_group.clone(),
                 original_tools: original_tools.clone(),
                 session_id: session_id.clone(),
-                is_streaming,
                 ..Default::default()
             };
 
@@ -720,14 +715,13 @@ pub fn detect_tool_call_errors(
 /// Returns `true` if the provider response should not be parsed for synthetic
 /// drill-down resolution (i.e. it is a streaming/SSE response). We must not consume
 /// a streaming body, so the resolution loop passes such responses through untouched.
-fn response_is_streaming(req_json: &serde_json::Value, resp: &Response<Body>) -> bool {
-    if req_json
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        == Some(true)
-    {
-        return true;
-    }
+///
+/// NOTE: We only inspect the response Content-Type header, NOT `req_json["stream"]`.
+/// The router's inner service always forces `stream: false` to the upstream provider
+/// and buffers the full response, so the actual response body is always JSON even
+/// when the client originally requested streaming. The middleware sees the buffered
+/// response from the inner service, not the raw provider stream.
+fn response_is_streaming(_req_json: &serde_json::Value, resp: &Response<Body>) -> bool {
     if let Some(ct) = resp
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
