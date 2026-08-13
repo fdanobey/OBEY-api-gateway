@@ -19,6 +19,10 @@ use crate::tool_compression::types::ToolDefinition;
 pub const GET_TOOL_SCHEMA: &str = "get_tool_schema";
 /// Synthetic tool that returns the full schemas for every tool in a namespace.
 pub const GET_TOOLS_IN_NAMESPACE: &str = "get_tools_in_namespace";
+/// Prefix for namespace summary pseudo-tools (`ns_github`, `ns_other`, …).
+/// Models sometimes call these directly; the resolver treats them as an implicit
+/// `get_tools_in_namespace` with the suffix as the namespace argument.
+pub const NS_PREFIX: &str = "ns_";
 
 /// Returns the namespace prefix of a tool name (first segment before `_` or `.`).
 /// Tools without a separator belong to the implicit `"other"` namespace.
@@ -65,6 +69,13 @@ pub fn resolve_synthetic_tool_call(
             let schemas = tools_in_namespace(ns, original_tools);
             Some(serde_json::to_string_pretty(&schemas).unwrap_or_default())
         }
+        _ if name.starts_with(NS_PREFIX) => {
+            // Model called a namespace summary pseudo-tool directly (e.g. `ns_other`).
+            // Treat it as get_tools_in_namespace for the suffix namespace.
+            let ns = &name[NS_PREFIX.len()..];
+            let schemas = tools_in_namespace(ns, original_tools);
+            Some(serde_json::to_string_pretty(&schemas).unwrap_or_default())
+        }
         _ => None,
     }
 }
@@ -105,7 +116,7 @@ pub fn resolve_synthetic_in_response(
         let Some(name) = fn_obj.get("name").and_then(|n| n.as_str()) else {
             continue;
         };
-        if name != GET_TOOL_SCHEMA && name != GET_TOOLS_IN_NAMESPACE {
+        if name != GET_TOOL_SCHEMA && name != GET_TOOLS_IN_NAMESPACE && !name.starts_with(NS_PREFIX) {
             continue;
         }
         let args = fn_obj.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
@@ -158,6 +169,26 @@ pub fn resolve_synthetic_in_response(
                             ));
                         }
                     }
+                }
+            }
+            _ if name.starts_with(NS_PREFIX) => {
+                // Model called ns_<prefix> directly — disclose the same tools as
+                // get_tools_in_namespace for the suffix.
+                let ns = &name[NS_PREFIX.len()..];
+                for t in tools_in_namespace(ns, original_tools) {
+                    if let Some(n) = t.pointer("/function/name").and_then(|v| v.as_str()) {
+                        disclosed.push(n.to_string());
+                    }
+                    injected.push(t);
+                }
+                if max_reinject > 0 && injected.len() > max_reinject as usize {
+                    let excess = injected.len() - max_reinject as usize;
+                    injected.truncate(max_reinject as usize);
+                    disclosed.truncate(max_reinject as usize);
+                    content.push_str(&format!(
+                        "\n\nNote: {} additional tool(s) in namespace '{}' were omitted from the callable tool list to stay within the provider's tool-count limit. Request a specific tool with get_tool_schema to make it callable this turn.",
+                        excess, ns
+                    ));
                 }
             }
             _ => {}

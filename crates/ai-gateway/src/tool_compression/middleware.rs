@@ -425,7 +425,9 @@ where
             // response be inspected (and, for SSE, buffered) so the synthetic call is
             // resolved here instead of leaking to the client.
             let synthetic_injected = tools.iter().any(|t| {
-                t.name == resolver::GET_TOOLS_IN_NAMESPACE || t.name == resolver::GET_TOOL_SCHEMA
+                t.name == resolver::GET_TOOLS_IN_NAMESPACE
+                    || t.name == resolver::GET_TOOL_SCHEMA
+                    || t.name.starts_with(resolver::NS_PREFIX)
             });
 
             let compressed_token_estimate = estimate_tokens(&json_body["tools"]);
