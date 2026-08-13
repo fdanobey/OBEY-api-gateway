@@ -92,15 +92,33 @@ pub fn resolve_synthetic_in_response(
     let mut injected: Vec<Value> = Vec::new();
 
     for tc in tool_calls {
-        let fn_obj = tc.get("function")?;
-        let name = fn_obj.get("name").and_then(|n| n.as_str())?;
+        let Some(fn_obj) = tc.get("function") else {
+            continue;
+        };
+        let Some(name) = fn_obj.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
         if name != GET_TOOL_SCHEMA && name != GET_TOOLS_IN_NAMESPACE {
             continue;
         }
         let args = fn_obj.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
         let call_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
 
-        let content = resolve_synthetic_tool_call(name, args, original_tools)?;
+        // Resolve the synthetic call. If resolution fails (e.g. invalid namespace or
+        // malformed arguments), produce an error result instead of aborting the entire
+        // resolution loop — the model needs a tool response for its tool_call_id.
+        let content = match resolve_synthetic_tool_call(name, args, original_tools) {
+            Some(c) => c,
+            None => {
+                // Build a helpful error so the model can recover.
+                let available: Vec<&str> = original_tools.iter().map(|t| t.name.as_str()).collect();
+                format!(
+                    "Error resolving {}: invalid arguments or unknown target. Available tools: {}",
+                    name,
+                    available.join(", ")
+                )
+            }
+        };
 
         // Record which original tools are now disclosed.
         match name {
