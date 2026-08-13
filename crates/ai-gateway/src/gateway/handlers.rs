@@ -3,8 +3,9 @@
 //! Requirements: 2.1-2.12
 
 use axum::{
+    body::{Body, Bytes},
     extract::{Json, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -12,7 +13,7 @@ use axum::{
     Extension,
 };
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ use crate::memory::{
 use crate::metrics::Metrics;
 use crate::models::openai::{Choice, OpenAIRequest, OpenAIResponse};
 use crate::providers::Model;
+use crate::router::router::{ProviderPassThroughEndpoint, ProviderPassThroughResponse};
 use crate::router::trace_id::generate_trace_id;
 use crate::router::StreamingResponse;
 use crate::smart_routing::tier::{ClassifierUsed, RoutingDecision, SmartRoutingTier, TaskType};
@@ -1248,7 +1250,11 @@ async fn chat_completions_non_stream(
     let memory_context =
         preprocess_memory_request(&state, &mut request, virtual_key_id.as_deref()).await;
 
-    match state.router.route_request(&request, Some(active_handle.clone())).await {
+    match state
+        .router
+        .route_request(&request, Some(active_handle.clone()))
+        .await
+    {
         Ok(mut response) => {
             // Post-call guardrails run on the freshly routed response BEFORE it
             // is cached or returned, using the SAME ctx so PII re-injection
@@ -1987,7 +1993,7 @@ async fn chat_completions_stream(
         if let Ok(cached_resp) = serde_json::from_str::<OpenAIResponse>(&cached_json) {
             state.metrics.record_cache_hit();
             request_guard.complete();
-        let stream_trace_id = trace_id.clone();
+            let stream_trace_id = trace_id.clone();
 
             let stream = async_stream::stream! {
                 tracing::debug!(trace_id = %stream_trace_id, "Streaming cached response from exact cache");
@@ -2504,7 +2510,11 @@ async fn chat_completions_stream(
     // Route the request first (provider always returns non-streaming JSON).
     // Errors here happen BEFORE any SSE chunks are sent, so we return a
     // normal JSON error response with the proper HTTP status code.
-    let response = match state.router.route_request(&request, Some(active_handle.clone())).await {
+    let response = match state
+        .router
+        .route_request(&request, Some(active_handle.clone()))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             let duration_ms = request_guard.complete();
@@ -3064,7 +3074,11 @@ async fn stream_eager_structured_output(
     mut request_guard: RequestCompleteGuard,
     active: Option<crate::active_requests::ActiveRequestHandle>,
 ) -> Response {
-    let mut response = match state.router.route_request_streaming(&request, active.clone()).await {
+    let mut response = match state
+        .router
+        .route_request_streaming(&request, active.clone())
+        .await
+    {
         Ok(StreamingResponse::Buffered(response)) => response,
         Ok(StreamingResponse::PassThrough {
             byte_stream,
@@ -4571,8 +4585,8 @@ mod tests {
         append_feedback_to_response, attach_smart_routing_headers, attach_validation_status_header,
         build_keepalive, cache_allowed_for_validation, chunk_carries_content, classify_relay_line,
         classify_stream_error, collect_structured_output_failure, eager_sse_response,
-        early_event_chunk, emit_sse_error_event, force_eager_structured_stream,
-        memory_feedback_chunk, openai_json_response, prepare_response_for_client,
+        early_event_chunk, emit_sse_error_event, force_eager_structured_stream, json_model,
+        memory_feedback_chunk, multipart_model, openai_json_response, prepare_response_for_client,
         rechunk_structured_response, relay_passthrough_stream, requests_structured_output,
         should_cache_eager_structured, smart_routing_headers, sse_error_payload,
         streaming_chunks_after_early_event, streaming_chunks_from_response,
@@ -4598,6 +4612,26 @@ mod tests {
     use proptest::prelude::*;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn pass_through_extracts_models_without_mutating_bodies() {
+        let json = br#"{"model":"embedding-group","input":["hello"]}"#;
+        assert_eq!(json_model(json).unwrap(), "embedding-group");
+
+        let multipart = b"--raw-boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\naudio-group\r\n--raw-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: application/octet-stream\r\n\r\n\x00\xff\x80raw-audio\r\n--raw-boundary--\r\n";
+        assert_eq!(
+            multipart_model("multipart/form-data; boundary=raw-boundary", multipart).unwrap(),
+            "audio-group"
+        );
+        let binary_offset = multipart
+            .windows(3)
+            .position(|window| window == b"\x00\xff\x80")
+            .expect("binary payload must remain intact");
+        assert_eq!(
+            &multipart[binary_offset..binary_offset + 3],
+            b"\x00\xff\x80"
+        );
+    }
 
     #[test]
     fn request_guard_drop_completes_active_request() {
@@ -6047,91 +6081,209 @@ pub async fn completions(
     let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
     chat_completions_non_stream(state, request, trace_id, virtual_key_id).await
 }
-
 // ---------------------------------------------------------------------------
-// POST /v1/embeddings  (Req 2.3)
+// Provider pass-through endpoints (Req 2.3-2.5)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct EmbeddingRequest {
-    pub model: String,
-    pub input: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub encoding_format: Option<String>,
+fn json_model(body: &[u8]) -> Result<String, GatewayError> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| GatewayError::InvalidRequest(format!("Invalid JSON body: {}", error)))?;
+    value
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| GatewayError::InvalidRequest("Request must include a model".to_string()))
 }
 
-/// Embeddings endpoint — pass-through proxy to configured provider.
-pub async fn embeddings(
-    State(_state): State<AppState>,
-    Json(_request): Json<EmbeddingRequest>,
+fn multipart_model(content_type: &str, body: &[u8]) -> Result<String, GatewayError> {
+    let boundary = content_type
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("boundary="))
+        .map(|boundary| boundary.trim_matches('"'))
+        .filter(|boundary| !boundary.is_empty())
+        .ok_or_else(|| GatewayError::InvalidRequest("Multipart boundary is missing".to_string()))?;
+    let delimiter = format!("--{}", boundary).into_bytes();
+    let field_marker = b"name=\"model\"";
+    let header_separator = b"\r\n\r\n";
+    let line_end = b"\r\n";
+
+    for start in body
+        .windows(delimiter.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == delimiter.as_slice()).then_some(index))
+    {
+        let part = &body[start + delimiter.len()..];
+        let end = part
+            .windows(delimiter.len())
+            .position(|window| window == delimiter.as_slice())
+            .unwrap_or(part.len());
+        let part = &part[..end];
+        if !part
+            .windows(field_marker.len())
+            .any(|window| window == field_marker)
+        {
+            continue;
+        }
+        let Some(header_end) = part
+            .windows(header_separator.len())
+            .position(|window| window == header_separator)
+        else {
+            continue;
+        };
+        let value = &part[header_end + header_separator.len()..];
+        let value_end = value
+            .windows(line_end.len())
+            .position(|window| window == line_end)
+            .unwrap_or(value.len());
+        let model = std::str::from_utf8(&value[..value_end])
+            .map_err(|_| GatewayError::InvalidRequest("Multipart model must be UTF-8".to_string()))?
+            .trim();
+        if !model.is_empty() {
+            return Ok(model.to_string());
+        }
+    }
+    Err(GatewayError::InvalidRequest(
+        "Multipart request must include a model field".to_string(),
+    ))
+}
+
+fn provider_pass_through_response(upstream: ProviderPassThroughResponse) -> Response {
+    let mut response = Response::new(Body::from(upstream.body));
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_LENGTH,
+        header::CONTENT_DISPOSITION,
+        header::CACHE_CONTROL,
+    ] {
+        if let Some(value) = upstream.headers.get(&name) {
+            response.headers_mut().insert(name, value.clone());
+        }
+    }
+    response
+}
+
+async fn provider_pass_through(
+    state: AppState,
+    endpoint: ProviderPassThroughEndpoint,
+    content_type: String,
+    model: String,
+    body: Bytes,
 ) -> Response {
-    // Pass-through proxy placeholder — will forward to the provider that owns the model.
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": { "message": "Embeddings endpoint: pass-through not yet wired to provider client", "type": "not_implemented" }
-        })),
+    match state
+        .router
+        .route_provider_pass_through(endpoint, &model, &content_type, body.to_vec())
+        .await
+    {
+        Ok(response) => provider_pass_through_response(response),
+        Err(error) => error.into_response(),
+    }
+}
+
+pub async fn embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let model = match json_model(&body) {
+        Ok(model) => model,
+        Err(error) => return error.into_response(),
+    };
+    provider_pass_through(
+        state,
+        ProviderPassThroughEndpoint::Embeddings,
+        content_type,
+        model,
+        body,
     )
-        .into_response()
-}
-
-// ---------------------------------------------------------------------------
-// POST /v1/images/generations  (Req 2.4)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct ImageGenerationRequest {
-    pub model: Option<String>,
-    pub prompt: String,
-    #[serde(default = "default_image_count")]
-    pub n: u32,
-    pub size: Option<String>,
-}
-
-fn default_image_count() -> u32 {
-    1
+    .await
 }
 
 pub async fn image_generations(
-    State(_state): State<AppState>,
-    Json(_request): Json<ImageGenerationRequest>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": { "message": "Images endpoint: pass-through not yet wired to provider client", "type": "not_implemented" }
-        })),
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let model = match json_model(&body) {
+        Ok(model) => model,
+        Err(error) => return error.into_response(),
+    };
+    provider_pass_through(
+        state,
+        ProviderPassThroughEndpoint::ImageGenerations,
+        content_type,
+        model,
+        body,
     )
-        .into_response()
+    .await
 }
 
-// ---------------------------------------------------------------------------
-// POST /v1/audio/transcriptions  (Req 2.5)
-// POST /v1/audio/translations    (Req 2.5)
-// ---------------------------------------------------------------------------
-
-pub async fn audio_transcriptions(headers: HeaderMap) -> Response {
-    let _ = headers; // multipart handling deferred to provider pass-through
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": { "message": "Audio transcriptions endpoint: pass-through not yet wired", "type": "not_implemented" }
-        })),
-    )
-        .into_response()
+async fn audio_pass_through(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    endpoint: ProviderPassThroughEndpoint,
+) -> Response {
+    let content_type = match headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            value
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+        }) {
+        Some(value) => value.to_string(),
+        None => {
+            return GatewayError::InvalidRequest(
+                "Audio requests must use multipart/form-data".to_string(),
+            )
+            .into_response()
+        }
+    };
+    let model = match multipart_model(&content_type, &body) {
+        Ok(model) => model,
+        Err(error) => return error.into_response(),
+    };
+    provider_pass_through(state, endpoint, content_type, model, body).await
 }
 
-pub async fn audio_translations(headers: HeaderMap) -> Response {
-    let _ = headers;
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": { "message": "Audio translations endpoint: pass-through not yet wired", "type": "not_implemented" }
-        })),
+pub async fn audio_transcriptions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    audio_pass_through(
+        state,
+        headers,
+        body,
+        ProviderPassThroughEndpoint::AudioTranscriptions,
     )
-        .into_response()
+    .await
+}
+
+pub async fn audio_translations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    audio_pass_through(
+        state,
+        headers,
+        body,
+        ProviderPassThroughEndpoint::AudioTranslations,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

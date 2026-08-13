@@ -1009,12 +1009,12 @@ mod property_tests {
             loop_detection: Default::default(),
             structured_output: None,
             guardrails: None,
-tool_compression: Default::default(),
-        smart_routing: Default::default(),
-        xhigh_models_allowlist: Default::default(),
-        reasoning_models_allowlist: Default::default(),
+            tool_compression: Default::default(),
+            smart_routing: Default::default(),
+            xhigh_models_allowlist: Default::default(),
+            reasoning_models_allowlist: Default::default(),
+        }
     }
-}
 
     #[test]
     fn smart_routing_unknown_group_keys_are_rejected() {

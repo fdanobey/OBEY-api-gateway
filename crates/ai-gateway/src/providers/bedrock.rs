@@ -43,6 +43,31 @@ fn mantle_api_for_model(model_id: &str) -> MantleApi {
 
 pub(crate) fn normalize_mantle_chat_messages(request: &mut OpenAIRequest) -> usize {
     let mut normalized = 0;
+    let mut compaction_triggers_remaining = request
+        .messages
+        .iter()
+        .filter_map(|message| message.content.as_array())
+        .flatten()
+        .filter(|part| {
+            part.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
+        })
+        .count();
+    for message in &mut request.messages {
+        if let serde_json::Value::Array(parts) = &mut message.content {
+            let before = parts.len();
+            parts.retain(|part| {
+                let is_compaction_trigger = part.get("type").and_then(serde_json::Value::as_str)
+                    == Some("compaction_trigger");
+                if is_compaction_trigger && compaction_triggers_remaining > 1 {
+                    compaction_triggers_remaining -= 1;
+                    return false;
+                }
+                true
+            });
+            normalized += before - parts.len();
+        }
+    }
+
     for message in &mut request.messages {
         if message.role == "developer" {
             message.role = "system".to_string();
@@ -2817,6 +2842,45 @@ mod tests {
         // Legacy models are excluded.
         assert!(!ids.contains(&"amazon.nova-premier-v1:0".to_string()));
         assert!(!ids.contains(&"meta.llama3-1-405b-instruct-v1:0".to_string()));
+    }
+
+    #[test]
+    fn test_mantle_message_normalizer_keeps_only_latest_compaction_trigger() {
+        let mut request = create_test_chat_request(false);
+        request.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "first"},
+                    {"type": "compaction_trigger"}
+                ]),
+                extra: Default::default(),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "compaction_trigger", "id": "latest"},
+                    {"type": "text", "text": "second"},
+                    {"type": "compaction_trigger", "id": "duplicate"}
+                ]),
+                extra: Default::default(),
+            },
+        ];
+
+        assert_eq!(normalize_mantle_chat_messages(&mut request), 2);
+        assert!(request.messages[0].content[0].get("text").is_some());
+        assert_eq!(request.messages[0].content.as_array().unwrap().len(), 1);
+        assert_eq!(request.messages[1].content.as_array().unwrap().len(), 2);
+        let retained_trigger = request.messages[1]
+            .content
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|part| {
+                part.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
+            })
+            .unwrap();
+        assert_eq!(retained_trigger["id"], "duplicate");
     }
 
     #[test]

@@ -955,6 +955,8 @@ mod tests {
             tool_compression: Default::default(),
             smart_routing: Default::default(),
             memory: None,
+            xhigh_models_allowlist: Default::default(),
+            reasoning_models_allowlist: Default::default(),
         }
     }
 

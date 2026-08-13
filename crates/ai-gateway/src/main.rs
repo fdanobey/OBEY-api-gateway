@@ -11,8 +11,8 @@ use std::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod admin;
 mod active_requests;
+mod admin;
 mod cache;
 mod codex;
 #[allow(dead_code, unused_imports)]

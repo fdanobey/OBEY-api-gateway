@@ -145,6 +145,8 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
         tool_compression: Default::default(),
         smart_routing: Default::default(),
         structured_output: None,
+        xhigh_models_allowlist: Default::default(),
+        reasoning_models_allowlist: Default::default(),
     }
 }
 

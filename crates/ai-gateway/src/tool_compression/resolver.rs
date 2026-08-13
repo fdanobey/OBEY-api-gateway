@@ -116,10 +116,14 @@ pub fn resolve_synthetic_in_response(
         let Some(name) = fn_obj.get("name").and_then(|n| n.as_str()) else {
             continue;
         };
-        if name != GET_TOOL_SCHEMA && name != GET_TOOLS_IN_NAMESPACE && !name.starts_with(NS_PREFIX) {
+        if name != GET_TOOL_SCHEMA && name != GET_TOOLS_IN_NAMESPACE && !name.starts_with(NS_PREFIX)
+        {
             continue;
         }
-        let args = fn_obj.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+        let args = fn_obj
+            .get("arguments")
+            .and_then(|a| a.as_str())
+            .unwrap_or("{}");
         let call_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
 
         // Resolve the synthetic call. If resolution fails (e.g. invalid namespace or
@@ -254,7 +258,11 @@ mod tests {
 
     #[test]
     fn tools_in_namespace_filters() {
-        let tools = vec![make_tool("fs_read"), make_tool("fs_write"), make_tool("git_log")];
+        let tools = vec![
+            make_tool("fs_read"),
+            make_tool("fs_write"),
+            make_tool("git_log"),
+        ];
         let fs = tools_in_namespace("fs", &tools);
         assert_eq!(fs.len(), 2);
         let other = tools_in_namespace("other", &tools);
@@ -264,24 +272,22 @@ mod tests {
     #[test]
     fn resolves_single_schema() {
         let tools = vec![make_tool("fs_read")];
-        let out = resolve_synthetic_tool_call(
-            "get_tool_schema",
-            r#"{"tool_name":"fs_read"}"#,
-            &tools,
-        )
-        .expect("should resolve");
+        let out =
+            resolve_synthetic_tool_call("get_tool_schema", r#"{"tool_name":"fs_read"}"#, &tools)
+                .expect("should resolve");
         assert!(out.contains("fs_read"));
     }
 
     #[test]
     fn resolves_namespace() {
-        let tools = vec![make_tool("fs_read"), make_tool("fs_write"), make_tool("git_log")];
-        let out = resolve_synthetic_tool_call(
-            "get_tools_in_namespace",
-            r#"{"namespace":"fs"}"#,
-            &tools,
-        )
-        .expect("should resolve");
+        let tools = vec![
+            make_tool("fs_read"),
+            make_tool("fs_write"),
+            make_tool("git_log"),
+        ];
+        let out =
+            resolve_synthetic_tool_call("get_tools_in_namespace", r#"{"namespace":"fs"}"#, &tools)
+                .expect("should resolve");
         assert!(out.contains("fs_read"));
         assert!(out.contains("fs_write"));
         assert!(!out.contains("git_log"));
@@ -316,16 +322,17 @@ mod tests {
         assert_eq!(msgs[2]["tool_call_id"], "call_1");
 
         let tools_arr = req["tools"].as_array().unwrap();
-        assert!(tools_arr.iter().any(|t| t.pointer("/function/name") == Some(&json!("fs_read"))));
+        assert!(tools_arr
+            .iter()
+            .any(|t| t.pointer("/function/name") == Some(&json!("fs_read"))));
     }
 
     #[test]
     fn resolve_in_response_caps_reinjection_to_max() {
         // 10 tools in the "fs" namespace; cap re-injection at 3 so a provider with a
         // small tool-count limit is never exceeded on drill-down.
-        let tools: Vec<ToolDefinition> = (1..=10)
-            .map(|i| make_tool(&format!("fs_t{}", i)))
-            .collect();
+        let tools: Vec<ToolDefinition> =
+            (1..=10).map(|i| make_tool(&format!("fs_t{}", i))).collect();
         let resp = json!({
             "choices": [{
                 "message": {
@@ -349,9 +356,17 @@ mod tests {
         let tools_arr = req["tools"].as_array().unwrap();
         let reinjected = tools_arr
             .iter()
-            .filter(|t| t.pointer("/function/name").map(|n| n.as_str().unwrap_or("")).map(|n| n.starts_with("fs_")).unwrap_or(false))
+            .filter(|t| {
+                t.pointer("/function/name")
+                    .map(|n| n.as_str().unwrap_or(""))
+                    .map(|n| n.starts_with("fs_"))
+                    .unwrap_or(false)
+            })
             .count();
-        assert_eq!(reinjected, 3, "provider must see at most the cap of callable tools");
+        assert_eq!(
+            reinjected, 3,
+            "provider must see at most the cap of callable tools"
+        );
 
         // Full content still lists every tool, with a truncation note.
         let tool_msg = &req["messages"].as_array().unwrap()[2]["content"];
@@ -380,7 +395,11 @@ mod tests {
 
     #[test]
     fn resolves_ns_prefix_direct_call() {
-        let tools = vec![make_tool("fs_read"), make_tool("fs_write"), make_tool("git_log")];
+        let tools = vec![
+            make_tool("fs_read"),
+            make_tool("fs_write"),
+            make_tool("git_log"),
+        ];
         let out = resolve_synthetic_tool_call("ns_fs", "{}", &tools).expect("should resolve");
         assert!(out.contains("fs_read"));
         assert!(out.contains("fs_write"));
@@ -389,7 +408,11 @@ mod tests {
 
     #[test]
     fn resolve_in_response_handles_ns_prefix_call() {
-        let tools = vec![make_tool("fs_read"), make_tool("fs_write"), make_tool("git_log")];
+        let tools = vec![
+            make_tool("fs_read"),
+            make_tool("fs_write"),
+            make_tool("git_log"),
+        ];
         let resp = json!({
             "choices": [{
                 "message": {

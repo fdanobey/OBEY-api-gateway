@@ -428,7 +428,8 @@ where
                             }
                         }
                         if added {
-                            ctx.strategies_applied.push("disclosure_reinject".to_string());
+                            ctx.strategies_applied
+                                .push("disclosure_reinject".to_string());
                         }
                     }
                 }
@@ -546,10 +547,7 @@ where
                     Some(disclosed) => {
                         // Persist disclosed tools for multi-turn re-injection.
                         if let Some(sid) = &session_id {
-                            let mut entry = state
-                                .disclosure_state
-                                .entry(sid.clone())
-                                .or_default();
+                            let mut entry = state.disclosure_state.entry(sid.clone()).or_default();
                             for n in &disclosed {
                                 entry.insert(n.clone());
                             }
@@ -571,7 +569,9 @@ where
                 let mut next_parts = parts_clone.clone();
                 let len_value = HeaderValue::from_str(&next_body.len().to_string())
                     .unwrap_or_else(|_| HeaderValue::from_static("0"));
-                next_parts.headers.insert(axum::http::header::CONTENT_LENGTH, len_value);
+                next_parts
+                    .headers
+                    .insert(axum::http::header::CONTENT_LENGTH, len_value);
                 let mut next_req = Request::from_parts(next_parts, Body::from(next_body));
                 next_req
                     .extensions_mut()
@@ -886,10 +886,7 @@ fn sanitize_synthetic_response(
                 "finish_reason": "stop"
             }]
         });
-        Some(
-            format!("data: {chunk}\n\ndata: [DONE]\n\n")
-                .into_bytes(),
-        )
+        Some(format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes())
     } else {
         let mut out = resp_json.clone();
         out["choices"] = serde_json::json!([{
@@ -994,13 +991,9 @@ mod tests {
             "messages": [{"role":"user","content":"list files"}]
         });
 
-        let disclosed = resolver::resolve_synthetic_in_response(
-            &resp_json,
-            &mut req_json,
-            &originals,
-            0,
-        )
-        .expect("synthetic call must be resolved, not relayed");
+        let disclosed =
+            resolver::resolve_synthetic_in_response(&resp_json, &mut req_json, &originals, 0)
+                .expect("synthetic call must be resolved, not relayed");
 
         assert!(disclosed.contains(&"fs_read".to_string()));
         assert!(disclosed.contains(&"fs_write".to_string()));
@@ -1073,8 +1066,7 @@ mod service_tests {
     impl Service<Request<Body>> for MockInner {
         type Response = Response<Body>;
         type Error = std::convert::Infallible;
-        type Future =
-            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
         fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
@@ -1365,8 +1357,18 @@ mod service_tests {
     async fn many_namespace_exploration_completes_without_leaking() {
         // 12 namespaces × 3 tools — comparable to a real MCP-heavy tool set.
         let namespaces = [
-            "magicuidesign", "agent", "aws", "chrome", "context7", "kilo", "mui",
-            "nanogpt", "searxng", "shadcn", "spec", "misc",
+            "magicuidesign",
+            "agent",
+            "aws",
+            "chrome",
+            "context7",
+            "kilo",
+            "mui",
+            "nanogpt",
+            "searxng",
+            "shadcn",
+            "spec",
+            "misc",
         ];
         let tools: Vec<serde_json::Value> = namespaces
             .iter()

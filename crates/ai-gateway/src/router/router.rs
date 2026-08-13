@@ -1,3 +1,4 @@
+use crate::active_requests::{ActivePhase, ActiveRequestHandle};
 use crate::compression::{
     caveman::apply_caveman_output,
     config::CompressionConfig,
@@ -10,7 +11,6 @@ use crate::config::{Config, ContextConfig, ModelGroup, Provider, ProviderModel};
 use crate::context::ContextManager;
 use crate::dashboard::CompressionEventHub;
 use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
-use crate::active_requests::{ActivePhase, ActiveRequestHandle};
 use crate::memory::{
     CompressionExtractionInput, CompressionMessageSnapshot, CompressionRemovalReport,
     ExtractionPolicy, MemorySystem, ResolvedNamespace,
@@ -139,6 +139,38 @@ pub enum StreamingResponse {
     },
     /// Buffer-and-replay fallback: a complete response the handler re-chunks.
     Buffered(OpenAIResponse),
+}
+
+/// OpenAI-compatible provider endpoint handled without request/response translation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderPassThroughEndpoint {
+    Embeddings,
+    ImageGenerations,
+    AudioTranscriptions,
+    AudioTranslations,
+}
+
+impl ProviderPassThroughEndpoint {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Embeddings => "embeddings",
+            Self::ImageGenerations => "images/generations",
+            Self::AudioTranscriptions => "audio/transcriptions",
+            Self::AudioTranslations => "audio/translations",
+        }
+    }
+}
+
+/// Buffered upstream response for non-chat OpenAI-compatible endpoints.
+pub struct ProviderPassThroughResponse {
+    pub headers: reqwest::header::HeaderMap,
+    pub body: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct ProviderPassThroughTarget {
+    provider: Provider,
+    model: ProviderModel,
 }
 
 impl Router {
@@ -1965,9 +1997,9 @@ impl Router {
                     .unwrap_or_else(|| Arc::new(crate::oauth::UsageTracker::new())),
                 provider_cfg.codex_base_url_override.clone(),
                 provider_cfg.codex_model_override.clone(),
-            provider_cfg.instructions_override.clone(),
-            config.xhigh_models_allowlist.clone(),
-            config.reasoning_models_allowlist.clone(),
+                provider_cfg.instructions_override.clone(),
+                config.xhigh_models_allowlist.clone(),
+                config.reasoning_models_allowlist.clone(),
             );
 
             let mut codex_request = request.clone();
@@ -2284,9 +2316,9 @@ impl Router {
                 );
             }
 
-let mut req_builder = http_client
-.post(&url)
-.header("Content-Type", "application/json");
+            let mut req_builder = http_client
+                .post(&url)
+                .header("Content-Type", "application/json");
 
             if let Some(ref bearer) = oauth_bearer {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", bearer));
@@ -2947,8 +2979,14 @@ let mut req_builder = http_client
         active: Option<ActiveRequestHandle>,
     ) -> Result<OpenAIResponse, GatewayError> {
         let model_group = self.find_model_group(&request.model).await?;
-        self.route_with_failover_for_group(request, &model_group, providers, active, ActivePhase::Primary)
-            .await
+        self.route_with_failover_for_group(
+            request,
+            &model_group,
+            providers,
+            active,
+            ActivePhase::Primary,
+        )
+        .await
     }
 
     /// Model-group-aware failover implementation used after pre-flight truncation.
@@ -3342,9 +3380,7 @@ let mut req_builder = http_client
                     // the Codex/OAuth dispatch path which bypasses the
                     // standard HTTP retry loop's cooldown logic).
                     if attempt_status == Some(429) {
-                        let rate_limiter = self
-                            .get_rate_limiter(&provider_model.provider)
-                            .await;
+                        let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
                         let already_cooled = rate_limiter.cooldown_remaining().await.is_some();
                         if !already_cooled {
                             // Use the OAuth usage tracker's reset window as
@@ -3354,18 +3390,22 @@ let mut req_builder = http_client
                                 let secs = tracker.fallback_cooldown_secs().await;
                                 match secs {
                                     Some(s) if s > 0 => Duration::from_secs(s),
-                                    _ => self.parse_rate_limit_cooldown(
-                                        &provider_model.provider,
-                                        None,
-                                        &raw_message,
-                                    ).await,
+                                    _ => {
+                                        self.parse_rate_limit_cooldown(
+                                            &provider_model.provider,
+                                            None,
+                                            &raw_message,
+                                        )
+                                        .await
+                                    }
                                 }
                             } else {
                                 self.parse_rate_limit_cooldown(
                                     &provider_model.provider,
                                     None,
                                     &raw_message,
-                                ).await
+                                )
+                                .await
                             };
                             rate_limiter.apply_cooldown(cooldown).await;
                             self.metrics
@@ -5085,7 +5125,13 @@ let mut req_builder = http_client
         // Route with failover and bounded response-quality cascade.
         let original_request = prepared_request.clone();
         let mut response = self
-            .route_with_failover_for_group(&prepared_request, &model_group, providers, active.clone(), ActivePhase::Primary)
+            .route_with_failover_for_group(
+                &prepared_request,
+                &model_group,
+                providers,
+                active.clone(),
+                ActivePhase::Primary,
+            )
             .await?;
         if let (Some(smart_router), Some(decision)) =
             (self.smart_router_snapshot(), routing_decision.as_mut())
@@ -5231,7 +5277,8 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         request: &OpenAIRequest,
         active: Option<ActiveRequestHandle>,
     ) -> Result<StreamingResponse, GatewayError> {
-        self.route_request_streaming_excluding(request, &[], active).await
+        self.route_request_streaming_excluding(request, &[], active)
+            .await
     }
 
     /// Like [`Self::route_request_streaming`], but skips any provider whose name
@@ -5464,8 +5511,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             outgoing.messages.push(Self::tool_calling_system_hint());
         }
 
-        let http_client =
-            self.get_or_create_http_client(&provider_model.provider, &pool_config)?;
+        let http_client = self.get_or_create_http_client(&provider_model.provider, &pool_config)?;
 
         let mut req_builder = http_client
             .post(&url)
@@ -5526,6 +5572,242 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         })
     }
 
+    pub async fn route_provider_pass_through(
+        &self,
+        endpoint: ProviderPassThroughEndpoint,
+        requested_model: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<ProviderPassThroughResponse, GatewayError> {
+        let targets = self.pass_through_targets(requested_model).await?;
+        let mut attempts = Vec::new();
+
+        for target in targets {
+            match self
+                .send_provider_pass_through(endpoint, &target, content_type, body.clone())
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let (message, status_code) = match error {
+                        GatewayError::Provider {
+                            message,
+                            status_code,
+                            ..
+                        } => (message, status_code),
+                        other => (other.to_string(), None),
+                    };
+                    attempts.push(ProviderAttempt::new(
+                        target.provider.name.clone(),
+                        target.model.model.clone(),
+                        message,
+                        status_code,
+                    ));
+                }
+            }
+        }
+
+        Err(GatewayError::AllProvidersFailed(AggregatedError::new(
+            attempts,
+        )))
+    }
+
+    async fn pass_through_targets(
+        &self,
+        requested_model: &str,
+    ) -> Result<Vec<ProviderPassThroughTarget>, GatewayError> {
+        let model_group = self.find_model_group(requested_model).await?;
+        let candidates = self.select_provider_order(&model_group).await;
+        if candidates.is_empty() {
+            return Err(GatewayError::AllProvidersFailed(AggregatedError::new(
+                model_group
+                    .models
+                    .iter()
+                    .map(|model| {
+                        ProviderAttempt::new(
+                            model.provider.clone(),
+                            model.model.clone(),
+                            "Provider unavailable due to circuit breaker or rate-limit cooldown"
+                                .to_string(),
+                            Some(503),
+                        )
+                    })
+                    .collect(),
+            )));
+        }
+
+        let config = self.config.read().await;
+        let targets = candidates
+            .into_iter()
+            .filter(|candidate| {
+                requested_model == model_group.name || requested_model == candidate.model
+            })
+            .filter_map(|model| {
+                config
+                    .providers
+                    .iter()
+                    .find(|provider| provider.name == model.provider)
+                    .cloned()
+                    .map(|provider| ProviderPassThroughTarget { provider, model })
+            })
+            .collect::<Vec<_>>();
+
+        if targets.is_empty() {
+            return Err(GatewayError::InvalidRequest(format!(
+                "No configured provider matches model '{}'",
+                requested_model
+            )));
+        }
+        Ok(targets)
+    }
+
+    async fn send_provider_pass_through(
+        &self,
+        endpoint: ProviderPassThroughEndpoint,
+        target: &ProviderPassThroughTarget,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<ProviderPassThroughResponse, GatewayError> {
+        let provider_name = &target.provider.name;
+        let model_name = &target.model.model;
+        let rate_limiter = self.get_rate_limiter(provider_name).await;
+        if !rate_limiter.consume().await {
+            return Err(GatewayError::Provider {
+                provider: provider_name.clone(),
+                message: "Rate limit exhausted".to_string(),
+                status_code: Some(429),
+            });
+        }
+
+        let api_key = target.provider.resolve_api_key().unwrap_or_default();
+        let oauth_bearer = if target.provider.auth_method.as_deref() == Some("oauth") {
+            match &self.oauth_manager {
+                Some(manager) => manager.get_access_token().await,
+                None => None,
+            }
+        } else {
+            None
+        };
+        if target.provider.auth_method.as_deref() == Some("oauth") && oauth_bearer.is_none() {
+            return Err(GatewayError::Provider {
+                provider: provider_name.clone(),
+                message: "OAuth session not authenticated; no usable access token".to_string(),
+                status_code: Some(401),
+            });
+        }
+        if target.provider.provider_type == "bedrock" && api_key.is_empty() {
+            return Err(GatewayError::Provider {
+                provider: provider_name.clone(),
+                message: "Endpoint requires an OpenAI-compatible provider HTTP API".to_string(),
+                status_code: Some(501),
+            });
+        }
+
+        let mut base_url = target.provider.base_url.clone().unwrap_or_default();
+        base_url = base_url.trim_end_matches('/').to_string();
+        if base_url.is_empty() {
+            return Err(GatewayError::Provider {
+                provider: provider_name.clone(),
+                message: "Provider base URL is not configured".to_string(),
+                status_code: Some(500),
+            });
+        }
+        if !base_url.ends_with("/v1") {
+            base_url.push_str("/v1");
+        }
+        let url = format!("{}/{}", base_url, endpoint.path());
+        let client =
+            self.get_or_create_http_client(provider_name, &target.provider.connection_pool)?;
+        let mut request = client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body);
+        if let Some(bearer) = oauth_bearer {
+            request = request.bearer_auth(bearer);
+        } else if !api_key.is_empty() {
+            request = request.bearer_auth(api_key);
+        }
+        for (name, value) in target.provider.resolve_custom_headers() {
+            request = request.header(name, value);
+        }
+
+        let started = std::time::Instant::now();
+        let timeout_seconds = target.provider.effective_total_timeout(model_name);
+        let upstream = tokio::time::timeout(Duration::from_secs(timeout_seconds), request.send())
+            .await
+            .map_err(|_| GatewayError::Provider {
+                provider: provider_name.clone(),
+                message: format!("Request timed out after {}s", timeout_seconds),
+                status_code: Some(504),
+            })?
+            .map_err(|error| GatewayError::Provider {
+                provider: provider_name.clone(),
+                message: error.to_string(),
+                status_code: None,
+            })?;
+        let status_code = upstream.status().as_u16();
+        let headers = upstream.headers().clone();
+        let bytes = upstream
+            .bytes()
+            .await
+            .map_err(|error| GatewayError::Provider {
+                provider: provider_name.clone(),
+                message: format!("Failed to read provider response: {}", error),
+                status_code: Some(status_code),
+            })?;
+
+        let circuit_breaker = self
+            .get_circuit_breaker(&format!("{}:{}", provider_name, model_name))
+            .await;
+        if (200..300).contains(&status_code) {
+            circuit_breaker.record_success().await;
+            rate_limiter.clear_cooldown().await;
+            self.metrics
+                .record_provider_success(provider_name, started.elapsed().as_millis() as u64);
+            return Ok(ProviderPassThroughResponse {
+                headers,
+                body: bytes.to_vec(),
+            });
+        }
+
+        let message = Self::pass_through_error_message(&bytes, status_code);
+        circuit_breaker.record_failure().await;
+        self.metrics.record_provider_failure_with_reason(
+            provider_name,
+            Some(Self::friendly_failure_reason(
+                Some(status_code),
+                &String::from_utf8_lossy(&bytes),
+            )),
+            None,
+        );
+        Err(GatewayError::Provider {
+            provider: provider_name.clone(),
+            message,
+            status_code: Some(status_code),
+        })
+    }
+
+    fn pass_through_error_message(body: &[u8], status_code: u16) -> String {
+        let text = String::from_utf8_lossy(body);
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|json| {
+                json.pointer("/error/message")
+                    .or_else(|| json.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    format!("Provider returned HTTP {}", status_code)
+                } else {
+                    trimmed.to_string()
+                }
+            })
+    }
+
     fn get_or_create_http_client(
         &self,
         provider_name: &str,
@@ -5573,6 +5855,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::active_requests::{ActivePhase, ActiveRequestHandle};
     use crate::compression::{
         caveman::CAVEMAN_OUTPUT_SUFFIX,
         config::{ModelGroupCompressionOverride, PrecompressedEntry, ProviderCompressionOverride},
@@ -5581,7 +5864,6 @@ mod tests {
         token_counter::TokenCounter,
     };
     use crate::config::{CircuitBreakerConfig, ExactCacheConfig, ModelGroup, ProviderModel};
-    use crate::active_requests::{ActivePhase, ActiveRequestHandle};
     use std::sync::{Arc, Mutex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -5634,6 +5916,95 @@ mod tests {
         fn provider_name(&self) -> &str {
             "adapter"
         }
+    }
+
+    #[tokio::test]
+    async fn pass_through_preserves_raw_body_and_fails_over() {
+        use wiremock::matchers::{body_bytes, header, method, path};
+
+        let first = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "error": { "message": "temporarily unavailable" }
+            })))
+            .mount(&first)
+            .await;
+
+        let second = MockServer::start().await;
+        let body = b"--raw\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-group\r\n--raw\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\n\x00\xffaudio\r\n--raw--\r\n".to_vec();
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(header("content-type", "multipart/form-data; boundary=raw"))
+            .and(body_bytes(body.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "text": "ok"
+            })))
+            .mount(&second)
+            .await;
+
+        let mut config = create_test_config();
+        config.providers = vec![
+            test_provider("first", first.uri()),
+            test_provider("second", second.uri()),
+        ];
+        config.model_groups = vec![test_group(vec![
+            test_model("first", 1),
+            test_model("second", 2),
+        ])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let response = router
+            .route_provider_pass_through(
+                ProviderPassThroughEndpoint::AudioTranscriptions,
+                "test-group",
+                "multipart/form-data; boundary=raw",
+                body,
+            )
+            .await
+            .expect("second provider should succeed");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["text"],
+            "ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn pass_through_maps_provider_failures_structurally() {
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": { "message": "bad embedding input" }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = create_test_config();
+        config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let result = router
+            .route_provider_pass_through(
+                ProviderPassThroughEndpoint::Embeddings,
+                "test-group",
+                "application/json",
+                br#"{"model":"test-group","input":"hello"}"#.to_vec(),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("provider error should be aggregated"),
+            Err(error) => error,
+        };
+        let GatewayError::AllProvidersFailed(aggregated) = error else {
+            panic!("expected structured aggregate");
+        };
+        assert_eq!(aggregated.attempts.len(), 1);
+        assert_eq!(aggregated.attempts[0].provider, "provider");
+        assert_eq!(aggregated.attempts[0].model, "upstream-model");
+        assert_eq!(aggregated.attempts[0].status_code, Some(400));
+        assert!(aggregated.attempts[0].error.contains("bad embedding input"));
     }
 
     #[tokio::test]
@@ -5787,13 +6158,13 @@ mod tests {
             virtual_keys: Default::default(),
             loop_detection: Default::default(),
             guardrails: None,
-tool_compression: Default::default(),
-        smart_routing: Default::default(),
-        memory: None,
-        xhigh_models_allowlist: Default::default(),
-        reasoning_models_allowlist: Default::default(),
+            tool_compression: Default::default(),
+            smart_routing: Default::default(),
+            memory: None,
+            xhigh_models_allowlist: Default::default(),
+            reasoning_models_allowlist: Default::default(),
+        }
     }
-}
 
     fn test_provider(name: &str, base_url: String) -> crate::config::Provider {
         crate::config::Provider {
@@ -6346,14 +6717,14 @@ tool_compression: Default::default(),
         assert_eq!(replay[0].model, "upstream-model");
     }
 
-#[tokio::test]
-async fn streaming_provider_receives_compressed_body_before_response() {
-use wiremock::matchers::{body_string_contains, header, method, path};
+    #[tokio::test]
+    async fn streaming_provider_receives_compressed_body_before_response() {
+        use wiremock::matchers::{body_string_contains, header, method, path};
 
-let server = MockServer::start().await;
-Mock::given(method("POST"))
-.and(path("/v1/chat/completions"))
-.and(header("accept-encoding", "identity"))
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("accept-encoding", "identity"))
             .and(body_string_contains(
                 "use a small number of checks to finish",
             ))
@@ -6485,12 +6856,22 @@ Mock::given(method("POST"))
         let result = router
             .route_request(&compression_request(false), Some(handle.clone()))
             .await;
-        assert!(result.is_ok(), "routing should succeed via the second provider");
+        assert!(
+            result.is_ok(),
+            "routing should succeed via the second provider"
+        );
 
         let info = handle.0.lock().unwrap();
-        assert_eq!(info.phase, ActivePhase::Failover, "second provider is a failover");
+        assert_eq!(
+            info.phase,
+            ActivePhase::Failover,
+            "second provider is a failover"
+        );
         assert_eq!(info.provider.as_deref(), Some("second"));
-        assert!(info.last_error.is_some(), "prior failure should be recorded");
+        assert!(
+            info.last_error.is_some(),
+            "prior failure should be recorded"
+        );
     }
 
     #[tokio::test]
