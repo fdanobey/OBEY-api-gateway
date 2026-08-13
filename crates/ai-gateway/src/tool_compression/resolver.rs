@@ -377,4 +377,40 @@ mod tests {
         let mut req = json!({"tools":[], "messages":[]});
         assert!(resolve_synthetic_in_response(&resp, &mut req, &tools, 0).is_none());
     }
+
+    #[test]
+    fn resolves_ns_prefix_direct_call() {
+        let tools = vec![make_tool("fs_read"), make_tool("fs_write"), make_tool("git_log")];
+        let out = resolve_synthetic_tool_call("ns_fs", "{}", &tools).expect("should resolve");
+        assert!(out.contains("fs_read"));
+        assert!(out.contains("fs_write"));
+        assert!(!out.contains("git_log"));
+    }
+
+    #[test]
+    fn resolve_in_response_handles_ns_prefix_call() {
+        let tools = vec![make_tool("fs_read"), make_tool("fs_write"), make_tool("git_log")];
+        let resp = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_ns",
+                        "type": "function",
+                        "function": {"name": "ns_fs", "arguments": "{}"}
+                    }]
+                }
+            }]
+        });
+        let mut req = json!({
+            "tools": [{"type":"function","function":{"name":"ns_fs"}}],
+            "messages": [{"role":"user","content":"list files"}]
+        });
+        let disclosed = resolve_synthetic_in_response(&resp, &mut req, &tools, 0)
+            .expect("ns_fs must be resolved, not relayed");
+        assert!(disclosed.contains(&"fs_read".to_string()));
+        assert!(disclosed.contains(&"fs_write".to_string()));
+        assert!(!disclosed.contains(&"git_log".to_string()));
+    }
 }

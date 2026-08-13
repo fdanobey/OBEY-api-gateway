@@ -46,9 +46,27 @@ const HEADER_RATIO: &str = "x-tool-compression-ratio";
 const HEADER_TOKENS_SAVED: &str = "x-tool-compression-tokens-saved";
 const HEADER_SESSION_ID: &str = "x-session-id";
 
-/// Maximum number of synthetic drill-down resolution steps per request. Bounds the
-/// internal resolution loop so a misbehaving model cannot trigger runaway re-calls.
+/// Baseline number of synthetic drill-down resolution steps per request.
+///
+/// The effective budget scales with the number of namespaces offered (see
+/// [`synthetic_step_budget`]): a model legitimately exploring a large tool set calls
+/// `get_tools_in_namespace` once per namespace, so a fixed budget of 6 was exhausted
+/// by real workloads with a dozen namespaces.
 const MAX_SYNTHETIC_RESOLUTION_STEPS: usize = 6;
+
+/// Hard ceiling on resolution steps, bounding work for a misbehaving model.
+const MAX_SYNTHETIC_RESOLUTION_STEPS_CEILING: usize = 32;
+
+/// Effective resolution budget for a request offering `namespace_count` namespaces.
+///
+/// Allows one drill-down per namespace plus headroom for follow-up `get_tool_schema`
+/// calls, never below the baseline and never above the ceiling.
+fn synthetic_step_budget(namespace_count: usize) -> usize {
+    namespace_count
+        .saturating_add(4)
+        .max(MAX_SYNTHETIC_RESOLUTION_STEPS)
+        .min(MAX_SYNTHETIC_RESOLUTION_STEPS_CEILING)
+}
 
 // ─── Layer ────────────────────────────────────────────────────────────────────
 
@@ -430,6 +448,13 @@ where
                     || t.name.starts_with(resolver::NS_PREFIX)
             });
 
+            // Number of namespaces offered this turn. The model may legitimately drill
+            // into each one, so the resolution budget scales with this count.
+            let namespace_count = tools
+                .iter()
+                .filter(|t| t.name.starts_with(resolver::NS_PREFIX))
+                .count();
+
             let compressed_token_estimate = estimate_tokens(&json_body["tools"]);
             let tokens_saved = original_token_estimate.saturating_sub(compressed_token_estimate);
             let ratio = if original_token_estimate > 0 {
@@ -471,10 +496,8 @@ where
             let mut final_response = response;
             let mut req_json = json_body.clone();
             let mut steps = 0usize;
+            let step_budget = synthetic_step_budget(namespace_count);
             while synthetic_injected {
-                if steps >= MAX_SYNTHETIC_RESOLUTION_STEPS {
-                    break;
-                }
                 let sse = response_is_sse(&final_response);
                 let (resp_parts, resp_body) = final_response.into_parts();
                 let resp_bytes = match to_bytes(resp_body, max_body).await {
@@ -491,6 +514,28 @@ where
                         break;
                     }
                 };
+
+                // Budget exhausted: a synthetic call must still never be relayed, so
+                // answer it locally and terminate the turn instead of forwarding it.
+                if steps >= step_budget {
+                    match sanitize_synthetic_response(&resp_json, &original_tools, sse) {
+                        Some(sanitized) => {
+                            tracing::warn!(
+                                model_group = %model_group,
+                                steps,
+                                "Synthetic drill-down budget exhausted; answering locally instead of relaying the synthetic call to the client"
+                            );
+                            let mut parts = resp_parts;
+                            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                            final_response = Response::from_parts(parts, Body::from(sanitized));
+                        }
+                        None => {
+                            final_response =
+                                Response::from_parts(resp_parts, Body::from(resp_bytes));
+                        }
+                    }
+                    break;
+                }
 
                 match resolver::resolve_synthetic_in_response(
                     &resp_json,
@@ -736,6 +781,126 @@ fn response_is_sse(resp: &Response<Body>) -> bool {
         .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"))
 }
 
+/// Rewrite a response that still carries synthetic drill-down tool calls into one the
+/// client can consume, answering the call locally instead of relaying it.
+///
+/// The client has no `get_tools_in_namespace` / `get_tool_schema` / `ns_*` tool, so
+/// relaying such a call surfaces as "Model tried to call unavailable tool". This is the
+/// last-resort guarantee that never happens: the synthetic calls are replaced with an
+/// assistant message naming the tools the model was asking about, and the turn is
+/// terminated with `finish_reason: "stop"`.
+///
+/// Returns `None` when the response carries no synthetic calls (nothing to rewrite).
+/// `sse` selects the output framing so the client still receives the shape it expects.
+fn sanitize_synthetic_response(
+    resp_json: &serde_json::Value,
+    original_tools: &[ToolDefinition],
+    sse: bool,
+) -> Option<Vec<u8>> {
+    let calls = resp_json
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(|v| v.as_array())?;
+
+    let mut notes: Vec<String> = Vec::new();
+    for call in calls {
+        let name = call
+            .pointer("/function/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let args = call
+            .pointer("/function/arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}");
+
+        let is_synthetic = name == resolver::GET_TOOLS_IN_NAMESPACE
+            || name == resolver::GET_TOOL_SCHEMA
+            || name.starts_with(resolver::NS_PREFIX);
+        if !is_synthetic {
+            continue;
+        }
+
+        // Work out which namespace the model was asking about, if any.
+        let ns = if let Some(stripped) = name.strip_prefix(resolver::NS_PREFIX) {
+            Some(stripped.to_string())
+        } else {
+            serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|v| {
+                    v.get("namespace")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
+        };
+
+        if let Some(ns) = ns {
+            let names: Vec<String> = resolver::tools_in_namespace(&ns, original_tools)
+                .iter()
+                .filter_map(|t| {
+                    t.pointer("/function/name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            if names.is_empty() {
+                notes.push(format!("Namespace '{ns}' contains no tools."));
+            } else {
+                notes.push(format!(
+                    "Tools in namespace '{}': {}.",
+                    ns,
+                    names.join(", ")
+                ));
+            }
+        } else if let Some(tool_name) = serde_json::from_str::<serde_json::Value>(args)
+            .ok()
+            .and_then(|v| {
+                v.get("tool_name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+        {
+            notes.push(format!("Requested schema for tool '{tool_name}'."));
+        } else {
+            notes.push(format!("Unresolved tool-discovery request '{name}'."));
+        }
+    }
+
+    // No synthetic calls present — caller should relay the original bytes untouched.
+    if notes.is_empty() {
+        return None;
+    }
+
+    let content = format!(
+        "Tool discovery limit reached, so this was answered without another model turn. {} Call the listed tools directly by name.",
+        notes.join(" ")
+    );
+
+    if sse {
+        let chunk = serde_json::json!({
+            "id": resp_json.get("id").and_then(|v| v.as_str()).unwrap_or("chatcmpl-tc"),
+            "object": "chat.completion.chunk",
+            "created": resp_json.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
+            "model": resp_json.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }]
+        });
+        Some(
+            format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                .into_bytes(),
+        )
+    } else {
+        let mut out = resp_json.clone();
+        out["choices"] = serde_json::json!([{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }]);
+        serde_json::to_vec(&out).ok()
+    }
+}
+
 /// Normalise a response body into a non-streaming chat-completion JSON value so
 /// synthetic tool calls can be inspected.
 ///
@@ -879,6 +1044,424 @@ mod tests {
         assert_eq!(
             value.pointer("/choices/0/message/content").unwrap(),
             &json!("hi")
+        );
+    }
+}
+
+// ─── End-to-end service tests ─────────────────────────────────────────────────
+//
+// These drive `ToolCompressionService::call` with a mock inner service so the
+// whole path is exercised: pipeline → synthetic injection → response inspection →
+// resolution. Helper-level tests above cannot catch a loop that never runs.
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Mock inner service. Returns a scripted response per call, recording the
+    /// request bodies it saw so we can assert what the provider was actually sent.
+    #[derive(Clone)]
+    struct MockInner {
+        /// Responses returned in order; the last is repeated once exhausted.
+        responses: Arc<Vec<(String, &'static str)>>,
+        calls: Arc<AtomicUsize>,
+        seen_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl Service<Request<Body>> for MockInner {
+        type Response = Response<Body>;
+        type Error = std::convert::Infallible;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<Body>) -> Self::Future {
+            let responses = Arc::clone(&self.responses);
+            let calls = Arc::clone(&self.calls);
+            let seen = Arc::clone(&self.seen_bodies);
+            Box::pin(async move {
+                let body = to_bytes(req.into_body(), 64 * 1024 * 1024)
+                    .await
+                    .unwrap_or_default();
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                    seen.lock().unwrap().push(v);
+                }
+                let idx = calls.fetch_add(1, Ordering::SeqCst);
+                let (body, ctype) = responses
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| responses.last().cloned().unwrap());
+                let resp = Response::builder()
+                    .status(200)
+                    .header(axum::http::header::CONTENT_TYPE, ctype)
+                    .body(Body::from(body))
+                    .unwrap();
+                Ok(resp)
+            })
+        }
+    }
+
+    fn test_config() -> Arc<RwLock<crate::config::Config>> {
+        let cfg: crate::config::Config = serde_json::from_value(json!({
+            "server": {"host": "127.0.0.1", "port": 8080},
+            "providers": [],
+            "model_groups": [],
+            "tool_compression": {
+                "enabled": true,
+                "level": "high",
+                "namespace_grouping": {
+                    "enabled": true,
+                    "min_tools_for_grouping": 5
+                }
+            }
+        }))
+        .expect("minimal test config must deserialize");
+        Arc::new(RwLock::new(cfg))
+    }
+
+    fn build_service(
+        responses: Vec<(String, &'static str)>,
+    ) -> (ToolCompressionService<MockInner>, MockInner) {
+        let config = test_config();
+        let tc = config
+            .try_read()
+            .map(|c| c.tool_compression.clone())
+            .unwrap();
+        let state = Arc::new(ToolCompressionState::new(&tc));
+        let inner = MockInner {
+            responses: Arc::new(responses),
+            calls: Arc::new(AtomicUsize::new(0)),
+            seen_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let layer = ToolCompressionLayer::new(
+            Arc::clone(&config),
+            state,
+            Arc::new(Metrics::new()),
+            Arc::new(CompressionEventHub::new()),
+        );
+        let svc = layer.layer(inner.clone());
+        (svc, inner)
+    }
+
+    /// 20 tools across namespaces so the grouper activates.
+    fn request_with_many_tools(stream: bool) -> Request<Body> {
+        let tools: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("fs_op{}", i),
+                        "description": "a filesystem operation",
+                        "parameters": {"type":"object","properties":{"path":{"type":"string"}}}
+                    }
+                })
+            })
+            .chain((0..10).map(|i| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("git_op{}", i),
+                        "description": "a git operation",
+                        "parameters": {"type":"object","properties":{"ref":{"type":"string"}}}
+                    }
+                })
+            }))
+            .collect();
+
+        let body = json!({
+            "model": "gpt-4o",
+            "stream": stream,
+            "messages": [{"role":"user","content":"do something"}],
+            "tools": tools
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn sse_tool_call(name: &str, args: &str) -> String {
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "id": "c1",
+                "model": "gpt-4o",
+                "created": 1,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": name, "arguments": args}
+                    }]},
+                    "finish_reason": "tool_calls"
+                }]
+            })
+        )
+    }
+
+    fn json_tool_call(name: &str, args: &str) -> String {
+        json!({
+            "id": "c1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": name, "arguments": args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string()
+    }
+
+    fn json_text(text: &str) -> String {
+        json!({
+            "id": "c1",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string()
+    }
+
+    async fn body_string(resp: Response<Body>) -> String {
+        let bytes = to_bytes(resp.into_body(), 64 * 1024 * 1024).await.unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// Sanity: the grouper actually collapses the tools and injects the synthetic
+    /// drill-down tool. If this fails, nothing downstream can be trusted.
+    #[tokio::test]
+    async fn grouper_collapses_tools_and_injects_synthetic() {
+        let (mut svc, inner) = build_service(vec![(json_text("hi"), "application/json")]);
+        let _ = svc.call(request_with_many_tools(false)).await.unwrap();
+
+        let seen = inner.seen_bodies.lock().unwrap();
+        let sent = seen.first().expect("inner must have been called");
+        let names: Vec<String> = sent["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| {
+                t.pointer("/function/name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+
+        assert!(
+            names.len() < 20,
+            "grouper must reduce the 20-tool payload, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == resolver::GET_TOOLS_IN_NAMESPACE),
+            "synthetic drill-down tool must be offered, got {names:?}"
+        );
+    }
+
+    /// THE regression: a non-streaming response calling the synthetic tool must be
+    /// resolved internally and must never reach the client.
+    #[tokio::test]
+    async fn json_synthetic_call_is_not_relayed_to_client() {
+        let (mut svc, _inner) = build_service(vec![
+            (
+                json_tool_call(resolver::GET_TOOLS_IN_NAMESPACE, r#"{"namespace":"fs"}"#),
+                "application/json",
+            ),
+            (json_text("done"), "application/json"),
+        ]);
+
+        let resp = svc.call(request_with_many_tools(false)).await.unwrap();
+        let body = body_string(resp).await;
+
+        assert!(
+            !body.contains(resolver::GET_TOOLS_IN_NAMESPACE),
+            "synthetic call leaked to client: {body}"
+        );
+    }
+
+    /// THE reported failure: client requested streaming, so the gateway replies with
+    /// SSE. The synthetic call must still be intercepted.
+    #[tokio::test]
+    async fn sse_synthetic_call_is_not_relayed_to_client() {
+        let (mut svc, _inner) = build_service(vec![
+            (
+                sse_tool_call(resolver::GET_TOOLS_IN_NAMESPACE, r#"{"namespace":"fs"}"#),
+                "text/event-stream",
+            ),
+            (
+                "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string(),
+                "text/event-stream",
+            ),
+        ]);
+
+        let resp = svc.call(request_with_many_tools(true)).await.unwrap();
+        let body = body_string(resp).await;
+
+        assert!(
+            !body.contains(resolver::GET_TOOLS_IN_NAMESPACE),
+            "synthetic call leaked to client over SSE: {body}"
+        );
+    }
+
+    /// A namespace summary pseudo-tool called directly must also be intercepted.
+    #[tokio::test]
+    async fn ns_prefix_call_is_not_relayed_to_client() {
+        let (mut svc, _inner) = build_service(vec![
+            (sse_tool_call("ns_other", "{}"), "text/event-stream"),
+            (json_text("done"), "application/json"),
+        ]);
+
+        let resp = svc.call(request_with_many_tools(true)).await.unwrap();
+        let body = body_string(resp).await;
+
+        assert!(
+            !body.contains("\"ns_other\""),
+            "ns_other call leaked to client: {body}"
+        );
+    }
+
+    /// A model stuck in a synthetic-call loop must not leave a synthetic call in the
+    /// final response once the step budget is exhausted.
+    #[tokio::test]
+    async fn exhausted_budget_does_not_leak_synthetic_call() {
+        // Always answer with the same synthetic call, far more than the budget.
+        let repeated = (
+            sse_tool_call(resolver::GET_TOOLS_IN_NAMESPACE, r#"{"namespace":"fs"}"#),
+            "text/event-stream",
+        );
+        let (mut svc, _inner) = build_service(vec![repeated]);
+
+        let resp = svc.call(request_with_many_tools(true)).await.unwrap();
+        let body = body_string(resp).await;
+
+        assert!(
+            !body.contains(resolver::GET_TOOLS_IN_NAMESPACE),
+            "synthetic call leaked after budget exhaustion: {body}"
+        );
+    }
+
+    /// Mirrors the reported production shape: a large multi-namespace tool set where
+    /// the model drills into many namespaces in sequence. The scaled budget must absorb
+    /// legitimate exploration, and no synthetic call may reach the client either way.
+    #[tokio::test]
+    async fn many_namespace_exploration_completes_without_leaking() {
+        // 12 namespaces × 3 tools — comparable to a real MCP-heavy tool set.
+        let namespaces = [
+            "magicuidesign", "agent", "aws", "chrome", "context7", "kilo", "mui",
+            "nanogpt", "searxng", "shadcn", "spec", "misc",
+        ];
+        let tools: Vec<serde_json::Value> = namespaces
+            .iter()
+            .flat_map(|ns| {
+                (0..3).map(move |i| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": format!("{ns}_tool{i}"),
+                            "description": "a tool",
+                            "parameters": {"type":"object","properties":{}}
+                        }
+                    })
+                })
+            })
+            .collect();
+
+        let body = json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "messages": [{"role":"user","content":"explore"}],
+            "tools": tools
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        // Model drills into 10 namespaces one per turn, then answers normally.
+        let mut responses: Vec<(String, &'static str)> = namespaces
+            .iter()
+            .take(10)
+            .map(|ns| {
+                (
+                    sse_tool_call(
+                        resolver::GET_TOOLS_IN_NAMESPACE,
+                        &format!(r#"{{"namespace":"{ns}"}}"#),
+                    ),
+                    "text/event-stream",
+                )
+            })
+            .collect();
+        responses.push((
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"all done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string(),
+            "text/event-stream",
+        ));
+
+        let (mut svc, _inner) = build_service(responses);
+        let resp = svc.call(req).await.unwrap();
+        let body = body_string(resp).await;
+
+        assert!(
+            !body.contains(resolver::GET_TOOLS_IN_NAMESPACE),
+            "synthetic call leaked during multi-namespace exploration: {body}"
+        );
+        assert!(
+            body.contains("all done"),
+            "exploration should finish on the model's real answer, got: {body}"
+        );
+    }
+
+    /// The budget must scale with namespace count rather than staying at the old
+    /// fixed 6, which real multi-namespace tool sets exhausted.
+    #[test]
+    fn step_budget_scales_with_namespace_count() {
+        assert_eq!(synthetic_step_budget(0), MAX_SYNTHETIC_RESOLUTION_STEPS);
+        assert_eq!(synthetic_step_budget(1), MAX_SYNTHETIC_RESOLUTION_STEPS);
+        assert!(
+            synthetic_step_budget(12) > MAX_SYNTHETIC_RESOLUTION_STEPS,
+            "12 namespaces must get more than the baseline budget"
+        );
+        assert_eq!(
+            synthetic_step_budget(10_000),
+            MAX_SYNTHETIC_RESOLUTION_STEPS_CEILING,
+            "budget must stay bounded"
+        );
+    }
+
+    /// Ordinary streaming traffic (no synthetic tools involved) must pass through
+    /// untouched — the fix must not buffer or rewrite normal responses.
+    #[tokio::test]
+    async fn real_tool_call_passes_through_unchanged() {
+        let (mut svc, _inner) = build_service(vec![(
+            sse_tool_call("fs_op1", r#"{"path":"a.txt"}"#),
+            "text/event-stream",
+        )]);
+
+        let resp = svc.call(request_with_many_tools(true)).await.unwrap();
+        let body = body_string(resp).await;
+
+        assert!(
+            body.contains("fs_op1"),
+            "real tool call must reach the client: {body}"
         );
     }
 }
