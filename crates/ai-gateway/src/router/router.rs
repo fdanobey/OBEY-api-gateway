@@ -5618,14 +5618,14 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             }
         }
 
-    if let Some(response) = last_http_response {
-        return Ok(response);
-    }
+        if let Some(response) = last_http_response {
+            return Ok(response);
+        }
 
-    Err(GatewayError::AllProvidersFailed(AggregatedError::new(
-        attempts,
-    )))
-}
+        Err(GatewayError::AllProvidersFailed(AggregatedError::new(
+            attempts,
+        )))
+    }
 
     /// Proxy a fine-tuning API request to the first configured OpenAI-compatible
     /// provider. Returns `GatewayError::Provider` with status 501 when no such
@@ -5652,8 +5652,8 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             None => {
                 return Err(GatewayError::Provider {
                     provider: "fine_tuning".to_string(),
-                    message:
-                        "No OpenAI-compatible provider is configured for fine-tuning".to_string(),
+                    message: "No OpenAI-compatible provider is configured for fine-tuning"
+                        .to_string(),
                     status_code: Some(501),
                 })
             }
@@ -5676,8 +5676,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             base_url.push_str("/v1");
         }
         let url = format!("{base_url}/fine_tuning/jobs{path_suffix}");
-        let client =
-            self.get_or_create_http_client(&provider_name, &provider.connection_pool)?;
+        let client = self.get_or_create_http_client(&provider_name, &provider.connection_pool)?;
         let mut request = client.request(method, &url);
         if let Some(body) = body {
             request = request
@@ -5910,10 +5909,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         let body_text = String::from_utf8_lossy(&bytes).to_string();
         self.metrics.record_provider_failure_with_reason(
             provider_name,
-            Some(Self::friendly_failure_reason(
-                Some(status_code),
-                &body_text,
-            )),
+            Some(Self::friendly_failure_reason(Some(status_code), &body_text)),
             None,
         );
 

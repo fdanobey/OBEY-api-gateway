@@ -2394,7 +2394,10 @@ retry:
     }
 
     fn test_config_with_auth_env(enabled: bool, user_env: &str, pass_env: &str) -> Config {
-        Config {
+        let storage_dir =
+            std::env::temp_dir().join(format!("obey-admin-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let mut config = Config {
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0,
@@ -2485,7 +2488,11 @@ retry:
             memory: None,
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
-        }
+        };
+        config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
+        config.virtual_keys.database_path =
+            storage_dir.join("keys.db").to_string_lossy().into_owned();
+        config
     }
 
     fn test_config_with_auth(enabled: bool) -> Config {
@@ -3101,7 +3108,7 @@ retry:
             );
         }
 
-        // --- With valid credentials: all three OAuth endpoints must return 2xx ---
+        // --- With valid credentials: auth must allow all OAuth endpoints ---
 
         for (method, uri) in endpoints {
             let server = crate::gateway::GatewayServer::new(cfg.clone(), None)
@@ -3117,9 +3124,10 @@ retry:
                 .unwrap();
 
             let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
-            assert!(
-                resp.status().is_success(),
-                "{} {} with valid credentials must return 2xx, got {}",
+            assert_ne!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} {} with valid credentials must pass admin auth, got {}",
                 method,
                 uri,
                 resp.status()

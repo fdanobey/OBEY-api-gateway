@@ -6614,10 +6614,12 @@ pub async fn create_run(
         .virtual_key_manager
         .check_model_access(&authenticated_key, &effective_model)
     {
-        if let Err(store_error) = state
-            .assistants_store
-            .fail_run(&owner, &thread_id, &run_id, "model not permitted for this key")
-        {
+        if let Err(store_error) = state.assistants_store.fail_run(
+            &owner,
+            &thread_id,
+            &run_id,
+            "model not permitted for this key",
+        ) {
             tracing::error!(error = %store_error, run_id, "Failed to persist run failure");
         }
         return access_denied_response_run(&err);
@@ -7185,13 +7187,7 @@ async fn fine_tuning_proxy(
 }
 
 pub async fn create_fine_tuning_job(State(state): State<AppState>, body: Bytes) -> Response {
-    fine_tuning_proxy(
-        state,
-        reqwest::Method::POST,
-        "",
-        Some(body.to_vec()),
-    )
-    .await
+    fine_tuning_proxy(state, reqwest::Method::POST, "", Some(body.to_vec())).await
 }
 
 pub async fn list_fine_tuning_jobs(State(state): State<AppState>) -> Response {

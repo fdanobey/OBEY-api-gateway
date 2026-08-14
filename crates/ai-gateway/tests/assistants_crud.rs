@@ -503,8 +503,7 @@ async fn fine_tuning_proxies_to_openai_compatible_provider() {
     let mut config = TestServer::test_config(&temp);
     config.providers[0].base_url = Some(mock.uri());
     config.logging.database_path = temp.path().join("logs.db").to_string_lossy().into_owned();
-    config.virtual_keys.database_path =
-        temp.path().join("keys.db").to_string_lossy().into_owned();
+    config.virtual_keys.database_path = temp.path().join("keys.db").to_string_lossy().into_owned();
     let server = GatewayServer::new(config, None).await.unwrap();
 
     let (status, created) = request(
@@ -536,8 +535,7 @@ async fn fine_tuning_returns_structured_unsupported_feature() {
     // Bedrock providers have no OpenAI-compatible HTTP API for fine-tuning.
     config.providers[0].provider_type = "bedrock".to_string();
     config.logging.database_path = temp.path().join("logs.db").to_string_lossy().into_owned();
-    config.virtual_keys.database_path =
-        temp.path().join("keys.db").to_string_lossy().into_owned();
+    config.virtual_keys.database_path = temp.path().join("keys.db").to_string_lossy().into_owned();
     let server = GatewayServer::new(config, None).await.unwrap();
 
     let (status, error) = request(
@@ -638,10 +636,11 @@ async fn run_cancellation_aborts_inflight_execution() {
     let mut config = TestServer::test_config(&temp);
     config.providers[0].base_url = Some(mock.uri());
     config.logging.database_path = temp.path().join("logs.db").to_string_lossy().into_owned();
-    config.virtual_keys.database_path =
-        temp.path().join("keys.db").to_string_lossy().into_owned();
+    config.virtual_keys.database_path = temp.path().join("keys.db").to_string_lossy().into_owned();
     let server = GatewayServer::new(config, None).await.unwrap();
-    let router = server.build_router().layer(Extension(authenticated_key("key-a")));
+    let router = server
+        .build_router()
+        .layer(Extension(authenticated_key("key-a")));
 
     let (status, assistant) = request(
         router.clone(),
@@ -651,40 +650,40 @@ async fn run_cancellation_aborts_inflight_execution() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-let assistant_id = assistant["id"].as_str().unwrap().to_string();
-let (status, thread) = request(router.clone(), "POST", "/v1/threads", Some(json!({}))).await;
-assert_eq!(status, StatusCode::OK);
-let thread_id = thread["id"].as_str().unwrap();
-let (status, _) = request(
-router.clone(),
-"POST",
-&format!("/v1/threads/{thread_id}/messages"),
-Some(json!({"role": "user", "content": "hello"})),
-)
-.await;
-assert_eq!(status, StatusCode::OK);
+    let assistant_id = assistant["id"].as_str().unwrap().to_string();
+    let (status, thread) = request(router.clone(), "POST", "/v1/threads", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let thread_id = thread["id"].as_str().unwrap();
+    let (status, _) = request(
+        router.clone(),
+        "POST",
+        &format!("/v1/threads/{thread_id}/messages"),
+        Some(json!({"role": "user", "content": "hello"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 
-let run_router = router.clone();
-let run_thread = thread_id.to_string();
-let run_assistant_id = assistant_id.clone();
-let run_handle = tokio::spawn(async move {
-let response = run_router
-.oneshot(
-Request::post(format!("/v1/threads/{run_thread}/runs"))
-.header("content-type", "application/json")
-.body(Body::from(
-json!({"assistant_id": run_assistant_id}).to_string(),
-))
-.unwrap(),
-)
-.await
-.unwrap();
-let status = response.status();
-let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-.await
-.unwrap();
-(status, serde_json::from_slice::<Value>(&bytes).unwrap())
-});
+    let run_router = router.clone();
+    let run_thread = thread_id.to_string();
+    let run_assistant_id = assistant_id.clone();
+    let run_handle = tokio::spawn(async move {
+        let response = run_router
+            .oneshot(
+                Request::post(format!("/v1/threads/{run_thread}/runs"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"assistant_id": run_assistant_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+    });
 
     // Wait for the run to register, then cancel it mid-flight.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;

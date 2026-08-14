@@ -246,14 +246,22 @@ mod property_tests {
         /// 2. When providers have history, unknown provider gets median latency
         /// 3. Median calculation is correct for odd and even number of providers
         /// 4. Median is calculated from current latency values, not initial values
-        #[test]
-        fn prop_initial_latency_assumption(
-            known_providers in prop::collection::vec("[a-z]{3,10}", 1..=10),
-            latencies in prop::collection::vec(10u64..=5000, 1..=10),
-            unknown_provider in "[A-Z]{3,10}"
-        ) {
-            prop_assume!(known_providers.len() == latencies.len());
-            prop_assume!(!known_providers.contains(&unknown_provider.to_lowercase()));
+    #[test]
+    fn prop_initial_latency_assumption(
+        known in prop::collection::hash_set("[a-z]{3,10}", 0..=10)
+            .prop_flat_map(|names| {
+                let count = names.len();
+                (Just(names), prop::collection::vec(10u64..=5000, count))
+            }),
+        unknown_provider in "[A-Z]{3,10}"
+    ) {
+        // Distinct provider names are required: the tracker keys latency by
+        // provider name, so duplicate names would make the expected median
+        // (computed over the raw latencies list) diverge from the tracker's
+        // median over per-provider values.
+        let known_providers: Vec<String> = known.0.into_iter().collect();
+        let latencies = known.1;
+        prop_assume!(!known_providers.contains(&unknown_provider.to_lowercase()));
 
             let tracker = LatencyTracker::new();
 

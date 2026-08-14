@@ -395,13 +395,18 @@ ON assistant_files(owner_id, created_at, id);",
         let conn = self.lock()?;
         ensure_thread_exists(&conn, owner, thread_id)?;
         let mut statement = conn.prepare(
-            "SELECT payload FROM assistant_messages
-             WHERE owner_id = ?1 AND thread_id = ?2
-             ORDER BY created_at ASC, rowid ASC
-             LIMIT ?3",
+            "SELECT payload FROM (
+                SELECT payload, created_at, rowid FROM assistant_messages
+                WHERE owner_id = ?1 AND thread_id = ?2
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?3
+            ) ORDER BY created_at ASC, rowid ASC",
         )?;
         let records = statement
-            .query_map(params![owner, thread_id, MAX_RUN_CONTEXT_MESSAGES as i64], |row| row.get::<_, String>(0))?
+            .query_map(
+                params![owner, thread_id, MAX_RUN_CONTEXT_MESSAGES as i64],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         records
             .into_iter()
@@ -1460,8 +1465,18 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(execution.request.messages.len(), 106);
+        // The run context is bounded to the most recent MAX_RUN_CONTEXT_MESSAGES
+        // thread messages (105 exist; messages 5..=104 are kept) plus one system
+        // message up front.
+        assert_eq!(
+            execution.request.messages.len(),
+            MAX_RUN_CONTEXT_MESSAGES + 1
+        );
         assert_eq!(execution.request.messages[0].content, "base\n\nextra");
+        assert_eq!(
+            execution.request.messages[1].content,
+            format!("message-{}", 105 - MAX_RUN_CONTEXT_MESSAGES)
+        );
         assert_eq!(
             execution.request.messages.last().unwrap().content,
             "message-104"
