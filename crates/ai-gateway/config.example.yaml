@@ -99,6 +99,11 @@ model_groups:
         model: "llama3"
         priority: 100
 
+# Additional Codex model IDs that support advanced reasoning parameters.
+# Leave empty unless your Codex-compatible backend exposes custom models.
+xhigh_models_allowlist: []
+reasoning_models_allowlist: []
+
 circuit_breaker:
   failure_threshold: 3
   backoff_sequence_seconds: [5, 10, 20, 40, 300]

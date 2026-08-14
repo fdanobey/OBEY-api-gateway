@@ -4,7 +4,7 @@
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Json, State},
+    extract::{FromRequestParts, Json, Path, Query, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -48,7 +48,29 @@ use crate::structured_output::validator::{
 use crate::structured_output::{
     StructuredOutputEngine, StructuredOutputOutcome, ValidationDecision, ValidationSkipReason,
 };
+use crate::virtual_keys::access::AccessError;
 use crate::virtual_keys::models::AuthenticatedKey;
+
+pub struct AssistantsIdentity(AuthenticatedKey);
+
+impl<S> FromRequestParts<S> for AssistantsIdentity
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<AuthenticatedKey>()
+            .cloned()
+            .map(Self)
+            .ok_or_else(assistants_authentication_required)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct RequestLogContext {
@@ -4587,9 +4609,9 @@ mod tests {
         classify_stream_error, collect_structured_output_failure, eager_sse_response,
         early_event_chunk, emit_sse_error_event, force_eager_structured_stream, json_model,
         memory_feedback_chunk, multipart_model, openai_json_response, prepare_response_for_client,
-        rechunk_structured_response, relay_passthrough_stream, requests_structured_output,
-        should_cache_eager_structured, smart_routing_headers, sse_error_payload,
-        streaming_chunks_after_early_event, streaming_chunks_from_response,
+        provider_pass_through_response, rechunk_structured_response, relay_passthrough_stream,
+        requests_structured_output, should_cache_eager_structured, smart_routing_headers,
+        sse_error_payload, streaming_chunks_after_early_event, streaming_chunks_from_response,
         structured_stream_overflow_events, RelayLineAction, RelayOutcome, RequestCompleteGuard,
         RequestLogContext, ValidationResponseStatus,
     };
@@ -4599,6 +4621,7 @@ mod tests {
     use crate::memory::{ContextType, ExtractionCounts, InjectionResult};
     use crate::metrics::Metrics;
     use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
+    use crate::router::router::ProviderPassThroughResponse;
     use crate::smart_routing::tier::{
         ClassifierUsed, ComplexityScore, RoutingDecision, SmartRoutingTier, TaskType,
     };
@@ -4631,6 +4654,20 @@ mod tests {
             &multipart[binary_offset..binary_offset + 3],
             b"\x00\xff\x80"
         );
+    }
+
+    #[test]
+    fn provider_pass_through_response_applies_upstream_status_and_body() {
+        let response = provider_pass_through_response(ProviderPassThroughResponse {
+            status: 202,
+            headers: reqwest::header::HeaderMap::new(),
+            body: br#"{"queued":true}"#.to_vec(),
+        });
+
+        assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+        let body = futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024))
+            .expect("response body should be readable");
+        assert_eq!(body.as_ref(), br#"{"queued":true}"#);
     }
 
     #[test]
@@ -6096,7 +6133,7 @@ fn json_model(body: &[u8]) -> Result<String, GatewayError> {
         .ok_or_else(|| GatewayError::InvalidRequest("Request must include a model".to_string()))
 }
 
-fn multipart_model(content_type: &str, body: &[u8]) -> Result<String, GatewayError> {
+pub fn multipart_model(content_type: &str, body: &[u8]) -> Result<String, GatewayError> {
     let boundary = content_type
         .split(';')
         .map(str::trim)
@@ -6150,12 +6187,15 @@ fn multipart_model(content_type: &str, body: &[u8]) -> Result<String, GatewayErr
 }
 
 fn provider_pass_through_response(upstream: ProviderPassThroughResponse) -> Response {
+    let status = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = Response::new(Body::from(upstream.body));
+    *response.status_mut() = status;
     for name in [
         header::CONTENT_TYPE,
         header::CONTENT_LENGTH,
         header::CONTENT_DISPOSITION,
         header::CACHE_CONTROL,
+        header::RETRY_AFTER,
     ] {
         if let Some(value) = upstream.headers.get(&name) {
             response.headers_mut().insert(name, value.clone());
@@ -6171,13 +6211,42 @@ async fn provider_pass_through(
     model: String,
     body: Bytes,
 ) -> Response {
-    match state
+    let started = Instant::now();
+    let trace_id = generate_trace_id(None);
+    let endpoint_label = match endpoint {
+        ProviderPassThroughEndpoint::Embeddings => "embeddings",
+        ProviderPassThroughEndpoint::ImageGenerations => "images/generations",
+        ProviderPassThroughEndpoint::AudioTranscriptions => "audio/transcriptions",
+        ProviderPassThroughEndpoint::AudioTranslations => "audio/translations",
+    };
+    let result = state
         .router
         .route_provider_pass_through(endpoint, &model, &content_type, body.to_vec())
-        .await
-    {
-        Ok(response) => provider_pass_through_response(response),
-        Err(error) => error.into_response(),
+        .await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(response) => {
+            tracing::info!(
+                trace_id = %trace_id,
+                endpoint = endpoint_label,
+                model = %model,
+                status = response.status,
+                duration_ms,
+                "Provider pass-through request completed"
+            );
+            provider_pass_through_response(response)
+        }
+        Err(error) => {
+            tracing::warn!(
+                trace_id = %trace_id,
+                endpoint = endpoint_label,
+                model = %model,
+                duration_ms,
+                error = %error,
+                "Provider pass-through request failed"
+            );
+            error.into_response()
+        }
     }
 }
 
@@ -6400,117 +6469,772 @@ pub async fn list_models(
 }
 
 // ---------------------------------------------------------------------------
-// Assistants / Threads / Runs / Files / Fine-tuning  (Req 2.7-2.11)
-// Pass-through stubs — these forward to the upstream provider once wired.
+// Assistants / Threads / Runs / Files / Fine-tuning (Req 2.7-2.11)
 // ---------------------------------------------------------------------------
 
-/// Generic pass-through stub returning 501 for unimplemented endpoints.
-async fn not_implemented_stub(endpoint: &str) -> Response {
+// --- Assistants (Req 2.7) ---
+pub async fn create_assistant(
+    State(state): State<AppState>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    assistants_result(
+        state
+            .assistants_store
+            .create_assistant(authenticated_key.id.as_str(), body),
+    )
+}
+
+pub async fn list_assistants(
+    State(state): State<AppState>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Query(params): Query<crate::assistants::ListParams>,
+) -> Response {
+    assistants_list_result(
+        state
+            .assistants_store
+            .list_assistants(authenticated_key.id.as_str(), &params),
+    )
+}
+
+pub async fn get_assistant(
+    State(state): State<AppState>,
+    Path(assistant_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    assistants_result(
+        state
+            .assistants_store
+            .get_assistant(authenticated_key.id.as_str(), &assistant_id),
+    )
+}
+
+pub async fn modify_assistant(
+    State(state): State<AppState>,
+    Path(assistant_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    assistants_result(state.assistants_store.modify_assistant(
+        authenticated_key.id.as_str(),
+        &assistant_id,
+        body,
+    ))
+}
+
+pub async fn delete_assistant(
+    State(state): State<AppState>,
+    Path(assistant_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    assistants_result(
+        state
+            .assistants_store
+            .delete_assistant(authenticated_key.id.as_str(), &assistant_id),
+    )
+}
+
+// --- Threads (Req 2.8) ---
+pub async fn create_thread(
+    State(state): State<AppState>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    assistants_result(
+        state
+            .assistants_store
+            .create_thread(authenticated_key.id.as_str(), body),
+    )
+}
+
+pub async fn list_threads(
+    State(state): State<AppState>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Query(params): Query<crate::assistants::ListParams>,
+) -> Response {
+    assistants_list_result(
+        state
+            .assistants_store
+            .list_threads(authenticated_key.id.as_str(), &params),
+    )
+}
+
+pub async fn get_thread(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    assistants_result(
+        state
+            .assistants_store
+            .get_thread(authenticated_key.id.as_str(), &thread_id),
+    )
+}
+
+pub async fn modify_thread(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    assistants_result(state.assistants_store.modify_thread(
+        authenticated_key.id.as_str(),
+        &thread_id,
+        body,
+    ))
+}
+
+pub async fn delete_thread(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    assistants_result(
+        state
+            .assistants_store
+            .delete_thread(authenticated_key.id.as_str(), &thread_id),
+    )
+}
+
+// --- Runs (Req 2.9) ---
+pub async fn create_run(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let owner = authenticated_key.id.as_str().to_string();
+    let execution = match state.assistants_store.start_run(&owner, &thread_id, body) {
+        Ok(execution) => execution,
+        Err(error) => return assistants_error_response(error),
+    };
+    let run_id = execution.run["id"].as_str().unwrap_or_default().to_string();
+    let effective_model = execution.request.model.clone();
+    if let Err(err) = state
+        .virtual_key_manager
+        .check_model_access(&authenticated_key, &effective_model)
+    {
+        if let Err(store_error) = state
+            .assistants_store
+            .fail_run(&owner, &thread_id, &run_id, "model not permitted for this key")
+        {
+            tracing::error!(error = %store_error, run_id, "Failed to persist run failure");
+        }
+        return access_denied_response_run(&err);
+    }
+
+    let (abort_tx, mut abort_rx) = tokio::sync::watch::channel(false);
+    state.active_runs.insert(run_id.clone(), abort_tx);
+
+    let router = Arc::clone(&state.router);
+    let request = execution.request.clone();
+    let route_future = router.route_request(&request, None);
+
+    tokio::pin!(route_future);
+
+    let route_outcome = tokio::select! {
+        _ = abort_rx.changed() => {
+            let cancel_msg = "run was cancelled by the client";
+            if let Err(store_error) = state
+                .assistants_store
+                .cancel_run(&owner, &thread_id, &run_id)
+            {
+                tracing::error!(error = %store_error, run_id, "Failed to persist run cancellation");
+            }
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": run_id,
+                    "object": "thread.run",
+                    "status": "cancelled",
+                    "message": cancel_msg
+                })),
+            )
+                .into_response();
+        }
+        result = &mut route_future => result,
+    };
+
+    state.active_runs.remove(&run_id);
+
+    match route_outcome {
+        Ok(response) => {
+            let completion_result = state
+                .assistants_store
+                .complete_run(&owner, &thread_id, &run_id, &response);
+            match &completion_result {
+                Ok(_) => {
+                    extract_run_usage_and_record(
+                        &state,
+                        &authenticated_key,
+                        &effective_model,
+                        &response,
+                    )
+                    .await;
+                }
+                Err(store_err) => {
+                    let err_msg = store_err.to_string();
+                    if let Err(fail_err) = state
+                        .assistants_store
+                        .fail_run(&owner, &thread_id, &run_id, &err_msg)
+                    {
+                        tracing::error!(error = %fail_err, run_id, "Failed to persist run failure after completion error");
+                    }
+                }
+            }
+            assistants_result(completion_result)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if let Err(store_error) = state
+                .assistants_store
+                .fail_run(&owner, &thread_id, &run_id, &message)
+            {
+                tracing::error!(error = %store_error, run_id, "Failed to persist run failure");
+            }
+            error.into_response()
+        }
+    }
+}
+
+pub async fn list_runs(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Query(params): Query<crate::assistants::ListParams>,
+) -> Response {
+    assistants_list_result(state.assistants_store.list_runs(
+        authenticated_key.id.as_str(),
+        &thread_id,
+        &params,
+    ))
+}
+
+pub async fn get_run(
+    State(state): State<AppState>,
+    Path((thread_id, run_id)): Path<(String, String)>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    assistants_result(state.assistants_store.get_run(
+        authenticated_key.id.as_str(),
+        &thread_id,
+        &run_id,
+    ))
+}
+
+pub async fn cancel_run(
+    State(state): State<AppState>,
+    Path((thread_id, run_id)): Path<(String, String)>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    if let Some(entry) = state.active_runs.remove(&run_id) {
+        let _ = entry.1.send(true);
+    }
+    assistants_result(state.assistants_store.cancel_run(
+        authenticated_key.id.as_str(),
+        &thread_id,
+        &run_id,
+    ))
+}
+
+pub async fn list_run_steps(
+    State(state): State<AppState>,
+    Path((thread_id, run_id)): Path<(String, String)>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Query(params): Query<crate::assistants::ListParams>,
+) -> Response {
+    assistants_list_result(state.assistants_store.list_run_steps(
+        authenticated_key.id.as_str(),
+        &thread_id,
+        &run_id,
+        &params,
+    ))
+}
+
+// --- Messages on threads ---
+pub async fn create_message(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    assistants_result(state.assistants_store.create_message(
+        authenticated_key.id.as_str(),
+        &thread_id,
+        body,
+    ))
+}
+
+pub async fn list_messages(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Query(params): Query<crate::assistants::ListParams>,
+) -> Response {
+    assistants_list_result(state.assistants_store.list_messages(
+        authenticated_key.id.as_str(),
+        &thread_id,
+        &params,
+    ))
+}
+
+pub async fn get_message(
+    State(state): State<AppState>,
+    Path((thread_id, message_id)): Path<(String, String)>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    assistants_result(state.assistants_store.get_message(
+        authenticated_key.id.as_str(),
+        &thread_id,
+        &message_id,
+    ))
+}
+
+pub async fn modify_message(
+    State(state): State<AppState>,
+    Path((thread_id, message_id)): Path<(String, String)>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    assistants_result(state.assistants_store.modify_message(
+        authenticated_key.id.as_str(),
+        &thread_id,
+        &message_id,
+        body,
+    ))
+}
+
+pub async fn delete_message(
+    State(state): State<AppState>,
+    Path((thread_id, message_id)): Path<(String, String)>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    assistants_result(state.assistants_store.delete_message(
+        authenticated_key.id.as_str(),
+        &thread_id,
+        &message_id,
+    ))
+}
+
+fn assistants_authentication_required() -> Response {
     (
-        StatusCode::NOT_IMPLEMENTED,
+        StatusCode::UNAUTHORIZED,
         Json(serde_json::json!({
             "error": {
-                "message": format!("{} endpoint: pass-through not yet wired to provider client", endpoint),
-                "type": "not_implemented"
+                "message": "Authentication is required for Assistants API state",
+                "type": "authentication_error",
+                "code": "authentication_required"
             }
         })),
     )
         .into_response()
 }
 
-// --- Assistants (Req 2.7) ---
-pub async fn create_assistant(State(_s): State<AppState>, body: String) -> Response {
-    let _ = body;
-    not_implemented_stub("Assistants").await
-}
-pub async fn list_assistants(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Assistants").await
-}
-pub async fn get_assistant(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Assistants").await
-}
-pub async fn modify_assistant(State(_s): State<AppState>, body: String) -> Response {
-    let _ = body;
-    not_implemented_stub("Assistants").await
-}
-pub async fn delete_assistant(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Assistants").await
+fn access_denied_response_run(err: &AccessError) -> Response {
+    let AccessError::ModelDenied { model, allowed } = err;
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": {
+                "message": "Model not permitted for this virtual key",
+                "type": "invalid_request_error",
+                "code": "model_access_denied",
+                "model": model,
+                "allowed": allowed,
+            }
+        })),
+    )
+        .into_response()
 }
 
-// --- Threads (Req 2.8) ---
-pub async fn create_thread(State(_s): State<AppState>, body: String) -> Response {
-    let _ = body;
-    not_implemented_stub("Threads").await
-}
-pub async fn get_thread(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Threads").await
-}
-pub async fn modify_thread(State(_s): State<AppState>, body: String) -> Response {
-    let _ = body;
-    not_implemented_stub("Threads").await
-}
-pub async fn delete_thread(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Threads").await
+async fn extract_run_usage_and_record(
+    state: &AppState,
+    authenticated_key: &AuthenticatedKey,
+    model_group: &str,
+    response: &OpenAIResponse,
+) -> Option<String> {
+    let input_tokens = response.usage.prompt_tokens as u64;
+    let output_tokens = response.usage.completion_tokens as u64;
+    if input_tokens == 0 && output_tokens == 0 {
+        tracing::warn!(
+            key_id = %authenticated_key.id,
+            "run usage not recorded: response has zero token usage"
+        );
+        return None;
+    }
+
+    let cost_usd = {
+        let cfg = state.config.read().await;
+        crate::virtual_keys::auth::lookup_model_rates(&cfg, model_group, &response.model)
+            .map(|(input_rate, output_rate)| {
+                crate::virtual_keys::compute_cost(
+                    input_tokens,
+                    output_tokens,
+                    input_rate,
+                    output_rate,
+                )
+            })
+            .unwrap_or(0.0)
+    };
+
+    let record = crate::virtual_keys::models::UsageRecord {
+        key_id: authenticated_key.id.clone(),
+        model_group: model_group.to_string(),
+        model: response.model.clone(),
+        input_tokens,
+        output_tokens,
+        cost_usd,
+        timestamp: chrono::Utc::now(),
+    };
+
+    let tpm_tokens = input_tokens + output_tokens;
+    let manager = Arc::clone(&state.virtual_key_manager);
+    manager.record_tpm_usage(&record.key_id, tpm_tokens);
+    let record_clone = record.clone();
+    let manager_clone = Arc::clone(&manager);
+    tokio::spawn(async move {
+        if let Err(e) = manager_clone.record_usage(record_clone).await {
+            tracing::warn!(error = %e, "failed to record virtual key run usage");
+        }
+    });
+
+    Some(record.key_id)
 }
 
-// --- Runs (Req 2.9) ---
-pub async fn create_run(State(_s): State<AppState>, body: String) -> Response {
-    let _ = body;
-    not_implemented_stub("Runs").await
-}
-pub async fn list_runs(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Runs").await
-}
-pub async fn get_run(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Runs").await
-}
-pub async fn cancel_run(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Runs").await
+fn assistants_list_result(
+    result: Result<crate::assistants::ListPage, crate::assistants::StoreError>,
+) -> Response {
+    match result {
+        Ok(page) => Json(page.into_openai_response()).into_response(),
+        Err(error) => assistants_error_response(error),
+    }
 }
 
-// --- Messages on threads ---
-pub async fn create_message(State(_s): State<AppState>, body: String) -> Response {
-    let _ = body;
-    not_implemented_stub("Messages").await
+fn assistants_result(result: Result<serde_json::Value, crate::assistants::StoreError>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => assistants_error_response(error),
+    }
 }
-pub async fn list_messages(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Messages").await
+
+fn assistants_error_response(error: crate::assistants::StoreError) -> Response {
+    use crate::assistants::StoreError;
+    let (status, error_type, message) = match error {
+        StoreError::NotFound { object, id } => (
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            format!("No {object} found with id '{id}'"),
+        ),
+        StoreError::InvalidRequest(message) => {
+            (StatusCode::BAD_REQUEST, "invalid_request_error", message)
+        }
+        StoreError::TooLarge { object, max_bytes } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            format!("{object} exceeds the {max_bytes} byte storage limit"),
+        ),
+        StoreError::Database(_)
+        | StoreError::Serialization(_)
+        | StoreError::Io(_)
+        | StoreError::Lock => {
+            tracing::error!(error = %error, "Assistants store operation failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "The assistants store could not complete the request".to_string(),
+            )
+        }
+    };
+    (
+        status,
+        Json(serde_json::json!({
+        "error": {
+        "message": message,
+        "type": error_type
+        }
+        })),
+    )
+        .into_response()
 }
 
 // --- Files (Req 2.10) ---
-pub async fn upload_file(headers: HeaderMap) -> Response {
-    let _ = headers;
-    not_implemented_stub("Files").await
+pub async fn upload_file(
+    State(state): State<AppState>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_type = match headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(content_type) => content_type,
+        None => {
+            return GatewayError::InvalidRequest("Content-Type is required".into()).into_response()
+        }
+    };
+    let parts = match parse_multipart_fields(content_type, &body) {
+        Ok(parts) => parts,
+        Err(error) => return error.into_response(),
+    };
+    let file = match parts.iter().find(|part| part.name == "file") {
+        Some(file) => file,
+        None => {
+            return GatewayError::InvalidRequest(
+                "Multipart request must include a file field".into(),
+            )
+            .into_response()
+        }
+    };
+    let purpose = parts
+        .iter()
+        .find(|part| part.name == "purpose")
+        .and_then(|part| std::str::from_utf8(&part.data).ok())
+        .unwrap_or("assistants")
+        .trim()
+        .to_string();
+    assistants_result(state.assistants_store.create_file(
+        authenticated_key.id.as_str(),
+        file.filename.clone().unwrap_or_else(|| "upload".into()),
+        purpose,
+        file.data.clone(),
+    ))
 }
-pub async fn list_files(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Files").await
+
+pub async fn list_files(
+    State(state): State<AppState>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Query(params): Query<crate::assistants::ListParams>,
+) -> Response {
+    assistants_list_result(
+        state
+            .assistants_store
+            .list_files(authenticated_key.id.as_str(), &params),
+    )
 }
-pub async fn get_file(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Files").await
+
+pub async fn get_file(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    assistants_result(
+        state
+            .assistants_store
+            .get_file(authenticated_key.id.as_str(), &file_id),
+    )
 }
-pub async fn delete_file(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Files").await
+
+pub async fn delete_file(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    assistants_result(
+        state
+            .assistants_store
+            .delete_file(authenticated_key.id.as_str(), &file_id),
+    )
 }
-pub async fn get_file_content(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Files").await
+
+pub async fn get_file_content(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    match state
+        .assistants_store
+        .get_file_content(authenticated_key.id.as_str(), &file_id)
+    {
+        Ok(file) => {
+            let mut response = Response::new(Body::from(file.content));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            if let Ok(value) = HeaderValue::from_str(&format!(
+                "attachment; filename=\"{}\"",
+                file.filename.replace(['\\', '"'], "_")
+            )) {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_DISPOSITION, value);
+            }
+            response
+        }
+        Err(error) => assistants_error_response(error),
+    }
+}
+
+#[derive(Debug)]
+struct MultipartField {
+    name: String,
+    filename: Option<String>,
+    data: Vec<u8>,
+}
+
+fn parse_multipart_fields(
+    content_type: &str,
+    body: &[u8],
+) -> Result<Vec<MultipartField>, GatewayError> {
+    let boundary = content_type
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("boundary="))
+        .map(|boundary| boundary.trim_matches('"'))
+        .filter(|boundary| !boundary.is_empty())
+        .ok_or_else(|| GatewayError::InvalidRequest("Multipart boundary is missing".into()))?;
+    let delimiter = format!("--{boundary}").into_bytes();
+    let mut fields = Vec::new();
+    for part in body.split(|byte| *byte == b'\n') {
+        let _ = part;
+    }
+    let mut cursor = 0;
+    while let Some(relative_start) = body[cursor..]
+        .windows(delimiter.len())
+        .position(|window| window == delimiter.as_slice())
+    {
+        let start = cursor + relative_start + delimiter.len();
+        let Some(relative_end) = body[start..]
+            .windows(delimiter.len())
+            .position(|window| window == delimiter.as_slice())
+        else {
+            break;
+        };
+        let mut part = &body[start..start + relative_end];
+        if part.starts_with(b"\r\n") {
+            part = &part[2..];
+        }
+        if part.ends_with(b"\r\n") {
+            part = &part[..part.len() - 2];
+        }
+        let Some(header_end) = part.windows(4).position(|window| window == b"\r\n\r\n") else {
+            cursor = start + relative_end;
+            continue;
+        };
+        let headers = std::str::from_utf8(&part[..header_end])
+            .map_err(|_| GatewayError::InvalidRequest("Multipart headers must be UTF-8".into()))?;
+        let disposition = headers
+            .lines()
+            .find(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("content-disposition:")
+            })
+            .ok_or_else(|| {
+                GatewayError::InvalidRequest(
+                    "Multipart field is missing Content-Disposition".into(),
+                )
+            })?;
+        let name = disposition_parameter(disposition, "name").ok_or_else(|| {
+            GatewayError::InvalidRequest("Multipart field name is missing".into())
+        })?;
+        let filename = disposition_parameter(disposition, "filename");
+        fields.push(MultipartField {
+            name,
+            filename,
+            data: part[header_end + 4..].to_vec(),
+        });
+        cursor = start + relative_end;
+    }
+    Ok(fields)
+}
+
+fn disposition_parameter(disposition: &str, parameter: &str) -> Option<String> {
+    disposition.split(';').map(str::trim).find_map(|part| {
+        let value = part.strip_prefix(&format!("{parameter}="))?;
+        Some(value.trim_matches('"').to_string())
+    })
 }
 
 // --- Fine-tuning (Req 2.11) ---
-pub async fn create_fine_tuning_job(State(_s): State<AppState>, body: String) -> Response {
-    let _ = body;
-    not_implemented_stub("Fine-tuning").await
+fn fine_tuning_unsupported() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+        "error": {
+        "message": "Fine-tuning is not supported by the gateway's configured provider routing",
+        "type": "unsupported_feature",
+        "code": "unsupported_feature"
+        }
+        })),
+    )
+        .into_response()
 }
-pub async fn list_fine_tuning_jobs(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Fine-tuning").await
+
+/// Proxy a fine-tuning request to the OpenAI-compatible provider. Returns the
+/// structured unsupported-feature response only when capability selection
+/// fails (no OpenAI-compatible provider configured).
+async fn fine_tuning_proxy(
+    state: AppState,
+    method: reqwest::Method,
+    path_suffix: &str,
+    body: Option<Vec<u8>>,
+) -> Response {
+    match state
+        .router
+        .route_fine_tuning_pass_through(method, path_suffix, body)
+        .await
+    {
+        Ok(response) => provider_pass_through_response(response),
+        Err(GatewayError::Provider {
+            status_code: Some(501),
+            ..
+        }) => fine_tuning_unsupported(),
+        Err(error) => error.into_response(),
+    }
 }
-pub async fn get_fine_tuning_job(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Fine-tuning").await
+
+pub async fn create_fine_tuning_job(State(state): State<AppState>, body: Bytes) -> Response {
+    fine_tuning_proxy(
+        state,
+        reqwest::Method::POST,
+        "",
+        Some(body.to_vec()),
+    )
+    .await
 }
-pub async fn cancel_fine_tuning_job(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Fine-tuning").await
+
+pub async fn list_fine_tuning_jobs(State(state): State<AppState>) -> Response {
+    fine_tuning_proxy(state, reqwest::Method::GET, "", None).await
 }
-pub async fn list_fine_tuning_events(State(_s): State<AppState>) -> Response {
-    not_implemented_stub("Fine-tuning").await
+
+pub async fn get_fine_tuning_job(
+    State(state): State<AppState>,
+    Path(fine_tuning_id): Path<String>,
+) -> Response {
+    fine_tuning_proxy(
+        state,
+        reqwest::Method::GET,
+        &format!("/{fine_tuning_id}"),
+        None,
+    )
+    .await
+}
+
+pub async fn cancel_fine_tuning_job(
+    State(state): State<AppState>,
+    Path(fine_tuning_id): Path<String>,
+) -> Response {
+    fine_tuning_proxy(
+        state,
+        reqwest::Method::POST,
+        &format!("/{fine_tuning_id}/cancel"),
+        None,
+    )
+    .await
+}
+
+pub async fn list_fine_tuning_events(
+    State(state): State<AppState>,
+    Path(fine_tuning_id): Path<String>,
+) -> Response {
+    fine_tuning_proxy(
+        state,
+        reqwest::Method::GET,
+        &format!("/{fine_tuning_id}/events"),
+        None,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

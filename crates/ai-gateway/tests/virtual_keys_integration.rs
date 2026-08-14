@@ -34,7 +34,8 @@ use ai_gateway::virtual_keys::VirtualKeyManager;
 const TEST_MODEL: &str = "gpt-4";
 
 /// Start a mock OpenAI-compatible provider that returns a static chat
-/// completion including a `usage` object (so usage recording fires).
+/// completion including a `usage` object (so usage recording fires), plus an
+/// embeddings endpoint whose usage omits `completion_tokens` (embedding-shaped).
 async fn start_mock_provider() -> MockServer {
     let server = MockServer::start().await;
     let body = serde_json::json!({
@@ -54,6 +55,19 @@ async fn start_mock_provider() -> MockServer {
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(&server)
         .await;
+
+    let embedding_body = serde_json::json!({
+        "object": "list",
+        "model": TEST_MODEL,
+        "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3] }],
+        "usage": { "prompt_tokens": 7, "total_tokens": 7 }
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(embedding_body))
+        .mount(&server)
+        .await;
+
     server
 }
 
@@ -143,6 +157,8 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
         guardrails: None,
         tool_compression: Default::default(),
         smart_routing: Default::default(),
+        xhigh_models_allowlist: Default::default(),
+        reasoning_models_allowlist: Default::default(),
         structured_output: None,
         memory: None,
     }
@@ -535,5 +551,70 @@ async fn model_access_denial_returns_403() {
         status,
         StatusCode::FORBIDDEN,
         "requesting a model outside the access list must be denied with 403"
+    );
+}
+
+/// Req 6.2 (multipart): a key whose model access list does not include the
+/// model declared inside a multipart audio body is rejected with 403 — the
+/// multipart `model` field must be authorized just like JSON bodies.
+#[tokio::test]
+async fn multipart_audio_model_access_denial_returns_403() {
+    let ts = TestServer::new(EnforcementMode::Required).await;
+    let created = ts
+        .manager()
+        .create_key(CreateKeyParams {
+            model_access: Some(vec!["allowed-group".to_string()]),
+            ..create_defaults()
+        })
+        .await
+        .unwrap();
+
+    let boundary = "vk-test-boundary";
+    let multipart_body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nother-group\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: application/octet-stream\r\n\r\n\x00\x01\x02audio\r\n--{boundary}--\r\n"
+    );
+    let req = Request::post("/v1/audio/transcriptions")
+        .header("authorization", format!("Bearer {}", created.key))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(multipart_body))
+        .unwrap();
+    let resp = ts.router().oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "multipart audio with a denied model must be rejected with 403"
+    );
+}
+
+/// Req 3.5/3.6 (embeddings): embedding responses commonly omit
+/// `completion_tokens`; usage with input-only token counts must still be
+/// recorded against the virtual key's budget.
+#[tokio::test]
+async fn embedding_usage_with_input_only_tokens_is_recorded() {
+    let ts = TestServer::new(EnforcementMode::Required).await;
+    let created = ts.manager().create_key(create_defaults()).await.unwrap();
+
+    let req = Request::post("/v1/embeddings")
+        .header("authorization", format!("Bearer {}", created.key))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "model": TEST_MODEL, "input": "hello" }).to_string(),
+        ))
+        .unwrap();
+    let resp = ts.router().oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_success(),
+        "embeddings pass-through should succeed, got {}",
+        resp.status()
+    );
+
+    let requests = wait_for_request_count(ts.manager(), &created.id, 1).await;
+    assert!(
+        requests >= 1,
+        "embedding usage with zero output tokens must be recorded"
     );
 }

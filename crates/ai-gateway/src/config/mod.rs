@@ -1331,6 +1331,49 @@ model_groups:
     }
 
     #[test]
+    fn codex_model_allowlists_deserialize_and_default() {
+        let absent: Config = serde_yaml::from_str(
+            r#"
+server:
+  host: 127.0.0.1
+  port: 8080
+providers:
+  - name: openai
+    type: openai
+model_groups:
+  - name: default
+    models:
+      - provider: openai
+        model: gpt-4o
+"#,
+        )
+        .unwrap();
+        assert!(absent.xhigh_models_allowlist.is_empty());
+        assert!(absent.reasoning_models_allowlist.is_empty());
+
+        let configured: Config = serde_yaml::from_str(
+            r#"
+server:
+  host: 127.0.0.1
+  port: 8080
+providers:
+  - name: openai
+    type: openai
+model_groups:
+  - name: default
+    models:
+      - provider: openai
+        model: gpt-4o
+xhigh_models_allowlist: [custom-xhigh]
+reasoning_models_allowlist: [custom-reasoning]
+"#,
+        )
+        .unwrap();
+        assert_eq!(configured.xhigh_models_allowlist, ["custom-xhigh"]);
+        assert_eq!(configured.reasoning_models_allowlist, ["custom-reasoning"]);
+    }
+
+    #[test]
     fn test_config_missing_streaming_section_defaults_to_none() {
         // A config document with no top-level `streaming` key deserializes to
         // `None`; callers fall back to `StreamingConfig::default()` at use time.

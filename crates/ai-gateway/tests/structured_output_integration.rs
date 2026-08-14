@@ -214,6 +214,8 @@ fn base_config(provider_uri: &str) -> Config {
         guardrails: None,
         tool_compression: Default::default(),
         smart_routing: Default::default(),
+        xhigh_models_allowlist: Default::default(),
+        reasoning_models_allowlist: Default::default(),
     }
 }
 

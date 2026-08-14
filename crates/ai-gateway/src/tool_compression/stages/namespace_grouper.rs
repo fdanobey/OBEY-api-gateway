@@ -139,8 +139,8 @@ impl NamespaceGrouper {
         let raw = serde_json::json!({
             "type": "function",
             "function": {
-                "name": "get_tools_in_namespace",
-                "description": "Retrieve all tools in a specific namespace. Returns tool names and descriptions.",
+"name": "get_tools_in_namespace",
+"description": "Retrieve all tools in a specific namespace. Returns tool names and descriptions. IMPORTANT: Call this at most ONCE per namespace per session - the disclosed schemas remain valid for the whole session, so cache and reuse them instead of calling this again for the same namespace.",
                 "parameters": {
                     "type": "object",
                     "properties": {

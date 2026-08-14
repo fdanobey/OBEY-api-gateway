@@ -23,6 +23,10 @@ pub const GET_TOOLS_IN_NAMESPACE: &str = "get_tools_in_namespace";
 /// Models sometimes call these directly; the resolver treats them as an implicit
 /// `get_tools_in_namespace` with the suffix as the namespace argument.
 pub const NS_PREFIX: &str = "ns_";
+/// Suffix appended to namespace drill-down tool results so the model reuses the
+/// disclosed schemas instead of re-calling `get_tools_in_namespace` for the same
+/// namespace later in the same session — eliminating redundant discovery round-trips.
+pub const SESSION_CACHE_HINT: &str = "\n\nSession cache: these schemas remain valid for the rest of the session. Reuse them for all subsequent calls to these tools and do not call get_tools_in_namespace for this namespace again.";
 
 /// Returns the namespace prefix of a tool name (first segment before `_` or `.`).
 /// Tools without a separator belong to the implicit `"other"` namespace.
@@ -196,6 +200,12 @@ pub fn resolve_synthetic_in_response(
                 }
             }
             _ => {}
+        }
+
+        // Namespace drill-downs disclose every tool in the namespace at once;
+        // hint the model to reuse them instead of re-drilling the same namespace.
+        if name == GET_TOOLS_IN_NAMESPACE || name.starts_with(NS_PREFIX) {
+            content.push_str(SESSION_CACHE_HINT);
         }
 
         tool_results.push(json!({

@@ -1449,8 +1449,8 @@ async fn test_connection(
         provider_cfg.codex_base_url_override.clone(),
         provider_cfg.codex_model_override.clone(),
         provider_cfg.instructions_override.clone(),
-        vec![],
-        vec![],
+        state.config.read().await.xhigh_models_allowlist.clone(),
+        state.config.read().await.reasoning_models_allowlist.clone(),
     );
 
     let start = std::time::Instant::now();

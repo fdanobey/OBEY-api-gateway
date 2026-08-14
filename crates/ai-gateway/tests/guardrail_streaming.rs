@@ -135,6 +135,8 @@ fn base_config(base_url: &str) -> Config {
         guardrails: None,
         tool_compression: Default::default(),
         smart_routing: Default::default(),
+        xhigh_models_allowlist: Default::default(),
+        reasoning_models_allowlist: Default::default(),
         structured_output: None,
         memory: None,
     }

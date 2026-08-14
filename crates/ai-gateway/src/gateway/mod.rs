@@ -10,11 +10,13 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use dashmap::DashMap;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::admin;
+use crate::assistants::AssistantsStore;
 use crate::cache::{ExactCache, SemanticCache};
 use crate::config::Config;
 use crate::error::GatewayError;
@@ -34,6 +36,7 @@ pub struct AppState {
     pub config_path: Arc<std::path::PathBuf>,
     pub router: Arc<RequestRouter>,
     pub logger: Arc<RequestLogger>,
+    pub assistants_store: Arc<AssistantsStore>,
     pub cache: Option<Arc<SemanticCache>>,
     /// Tier-1 in-memory exact-match response cache (always present;
     /// disabled internally when `config.exact_cache.enabled = false`).
@@ -47,6 +50,9 @@ pub struct AppState {
     /// Always present; enforcement is gated by `config.virtual_keys.enforcement`
     /// (default `disabled`), so an unconfigured deployment is unaffected.
     pub virtual_key_manager: Arc<VirtualKeyManager>,
+    /// Active assistant runs keyed by run_id for cancellation support.
+    /// The watch sender emits `true` to signal abort.
+    pub active_runs: Arc<DashMap<String, tokio::sync::watch::Sender<bool>>>,
     /// Guardrail engine snapshot (Req 1.8, 8.5).
     ///
     /// `None` (inner) when no `guardrails` section is configured. Wrapped in an
@@ -93,6 +99,9 @@ impl GatewayServer {
         config_path: Option<std::path::PathBuf>,
     ) -> Result<Self, GatewayError> {
         let logger = RequestLogger::new(config.logging.clone())
+            .map_err(|e| GatewayError::Database(e.to_string()))?;
+        let assistants_path = AssistantsStore::sibling_database_path(&config.logging.database_path);
+        let assistants_store = AssistantsStore::new(&assistants_path)
             .map_err(|e| GatewayError::Database(e.to_string()))?;
 
         let config_arc = Arc::new(RwLock::new(config.clone()));
@@ -244,6 +253,7 @@ impl GatewayServer {
             ),
             router: Arc::new(router),
             logger: Arc::new(logger),
+            assistants_store: Arc::new(assistants_store),
             cache,
             exact_cache: Arc::new(ExactCache::new(&config.exact_cache)),
             metrics,
@@ -252,6 +262,7 @@ impl GatewayServer {
             oauth_usage_tracker,
             codex_models_discovery: Arc::new(crate::codex::models_discovery::ModelsDiscovery::new()),
             virtual_key_manager,
+            active_runs: Arc::new(DashMap::new()),
             guardrail_engine: Arc::new(RwLock::new(guardrail_engine)),
             structured_output_engine: Arc::new(RwLock::new(structured_output_engine)),
             memory_system,
@@ -318,7 +329,7 @@ impl GatewayServer {
                     .delete(delete_assistant),
             )
             // Threads (Req 2.8)
-            .route("/v1/threads", post(create_thread))
+            .route("/v1/threads", post(create_thread).get(list_threads))
             .route(
                 "/v1/threads/{thread_id}",
                 get(get_thread).post(modify_thread).delete(delete_thread),
@@ -328,12 +339,20 @@ impl GatewayServer {
                 "/v1/threads/{thread_id}/messages",
                 post(create_message).get(list_messages),
             )
+            .route(
+                "/v1/threads/{thread_id}/messages/{message_id}",
+                get(get_message).post(modify_message).delete(delete_message),
+            )
             // Runs (Req 2.9)
             .route(
                 "/v1/threads/{thread_id}/runs",
                 post(create_run).get(list_runs),
             )
             .route("/v1/threads/{thread_id}/runs/{run_id}", get(get_run))
+            .route(
+                "/v1/threads/{thread_id}/runs/{run_id}/steps",
+                get(list_run_steps),
+            )
             .route(
                 "/v1/threads/{thread_id}/runs/{run_id}/cancel",
                 post(cancel_run),

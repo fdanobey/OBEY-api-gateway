@@ -163,6 +163,7 @@ impl ProviderPassThroughEndpoint {
 
 /// Buffered upstream response for non-chat OpenAI-compatible endpoints.
 pub struct ProviderPassThroughResponse {
+    pub status: u16,
     pub headers: reqwest::header::HeaderMap,
     pub body: Vec<u8>,
 }
@@ -5579,15 +5580,25 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         content_type: &str,
         body: Vec<u8>,
     ) -> Result<ProviderPassThroughResponse, GatewayError> {
-        let targets = self.pass_through_targets(requested_model).await?;
+        let targets = self.pass_through_targets(endpoint, requested_model).await?;
         let mut attempts = Vec::new();
+        let mut last_http_response = None;
 
         for target in targets {
             match self
                 .send_provider_pass_through(endpoint, &target, content_type, body.clone())
                 .await
             {
-                Ok(response) => return Ok(response),
+                Ok(response) if (200..300).contains(&response.status) => return Ok(response),
+                Ok(response) => {
+                    attempts.push(ProviderAttempt::new(
+                        target.provider.name.clone(),
+                        target.model.model.clone(),
+                        Self::pass_through_error_message(&response.body, response.status),
+                        Some(response.status),
+                    ));
+                    last_http_response = Some(response);
+                }
                 Err(error) => {
                     let (message, status_code) = match error {
                         GatewayError::Provider {
@@ -5607,13 +5618,113 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             }
         }
 
-        Err(GatewayError::AllProvidersFailed(AggregatedError::new(
-            attempts,
-        )))
+    if let Some(response) = last_http_response {
+        return Ok(response);
+    }
+
+    Err(GatewayError::AllProvidersFailed(AggregatedError::new(
+        attempts,
+    )))
+}
+
+    /// Proxy a fine-tuning API request to the first configured OpenAI-compatible
+    /// provider. Returns `GatewayError::Provider` with status 501 when no such
+    /// provider exists, letting the handler emit the structured unsupported
+    /// feature response after capability selection fails.
+    pub async fn route_fine_tuning_pass_through(
+        &self,
+        method: reqwest::Method,
+        path_suffix: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<ProviderPassThroughResponse, GatewayError> {
+        let config = self.config.read().await;
+        let provider = config
+            .providers
+            .iter()
+            .find(|p| {
+                p.provider_type == "openai" && p.base_url.as_deref().is_some_and(|u| !u.is_empty())
+            })
+            .cloned();
+        drop(config);
+
+        let provider = match provider {
+            Some(provider) => provider,
+            None => {
+                return Err(GatewayError::Provider {
+                    provider: "fine_tuning".to_string(),
+                    message:
+                        "No OpenAI-compatible provider is configured for fine-tuning".to_string(),
+                    status_code: Some(501),
+                })
+            }
+        };
+
+        let provider_name = provider.name.clone();
+        let rate_limiter = self.get_rate_limiter(&provider_name).await;
+        if !rate_limiter.consume().await {
+            return Err(GatewayError::Provider {
+                provider: provider_name,
+                message: "Rate limit exhausted".to_string(),
+                status_code: Some(429),
+            });
+        }
+
+        let api_key = provider.resolve_api_key().unwrap_or_default();
+        let mut base_url = provider.base_url.clone().unwrap_or_default();
+        base_url = base_url.trim_end_matches('/').to_string();
+        if !base_url.ends_with("/v1") {
+            base_url.push_str("/v1");
+        }
+        let url = format!("{base_url}/fine_tuning/jobs{path_suffix}");
+        let client =
+            self.get_or_create_http_client(&provider_name, &provider.connection_pool)?;
+        let mut request = client.request(method, &url);
+        if let Some(body) = body {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body);
+        }
+        if !api_key.is_empty() {
+            request = request.bearer_auth(api_key);
+        }
+        for (name, value) in provider.resolve_custom_headers() {
+            request = request.header(name, value);
+        }
+
+        let timeout_seconds = provider.effective_total_timeout("");
+        let upstream = tokio::time::timeout(Duration::from_secs(timeout_seconds), request.send())
+            .await
+            .map_err(|_| GatewayError::Provider {
+                provider: provider_name.clone(),
+                message: format!("Request timed out after {timeout_seconds}s"),
+                status_code: Some(504),
+            })?
+            .map_err(|error| GatewayError::Provider {
+                provider: provider_name.clone(),
+                message: error.to_string(),
+                status_code: None,
+            })?;
+        let status_code = upstream.status().as_u16();
+        let headers = upstream.headers().clone();
+        let bytes = upstream
+            .bytes()
+            .await
+            .map_err(|error| GatewayError::Provider {
+                provider: provider_name,
+                message: format!("Failed to read provider response: {error}"),
+                status_code: Some(status_code),
+            })?;
+
+        Ok(ProviderPassThroughResponse {
+            status: status_code,
+            headers,
+            body: bytes.to_vec(),
+        })
     }
 
     async fn pass_through_targets(
         &self,
+        endpoint: ProviderPassThroughEndpoint,
         requested_model: &str,
     ) -> Result<Vec<ProviderPassThroughTarget>, GatewayError> {
         let model_group = self.find_model_group(requested_model).await?;
@@ -5650,15 +5761,38 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                     .cloned()
                     .map(|provider| ProviderPassThroughTarget { provider, model })
             })
+            .filter(|target| {
+                Self::provider_supports_endpoint(&target.provider.provider_type, endpoint)
+            })
             .collect::<Vec<_>>();
 
         if targets.is_empty() {
             return Err(GatewayError::InvalidRequest(format!(
-                "No configured provider matches model '{}'",
+                "No configured provider supports '{}' for model '{}'",
+                endpoint.path(),
                 requested_model
             )));
         }
         Ok(targets)
+    }
+
+    fn provider_supports_endpoint(
+        provider_type: &str,
+        endpoint: ProviderPassThroughEndpoint,
+    ) -> bool {
+        match provider_type {
+            // Bedrock uses AWS SigV4 request signing rather than an
+            // OpenAI-compatible HTTP API, so it cannot serve pass-through.
+            "bedrock" => false,
+            "nvidia_nim" => matches!(
+                endpoint,
+                ProviderPassThroughEndpoint::Embeddings
+                    | ProviderPassThroughEndpoint::AudioTranscriptions
+            ),
+            // Other OpenAI-compatible HTTP providers serve all four
+            // pass-through endpoints.
+            _ => true,
+        }
     }
 
     async fn send_provider_pass_through(
@@ -5716,12 +5850,13 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             base_url.push_str("/v1");
         }
         let url = format!("{}/{}", base_url, endpoint.path());
+        let outgoing_body = Self::rewrite_pass_through_model(content_type, body, model_name)?;
         let client =
             self.get_or_create_http_client(provider_name, &target.provider.connection_pool)?;
         let mut request = client
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, content_type)
-            .body(body);
+            .body(outgoing_body);
         if let Some(bearer) = oauth_bearer {
             request = request.bearer_auth(bearer);
         } else if !api_key.is_empty() {
@@ -5765,26 +5900,161 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             self.metrics
                 .record_provider_success(provider_name, started.elapsed().as_millis() as u64);
             return Ok(ProviderPassThroughResponse {
+                status: status_code,
                 headers,
                 body: bytes.to_vec(),
             });
         }
 
-        let message = Self::pass_through_error_message(&bytes, status_code);
         circuit_breaker.record_failure().await;
+        let body_text = String::from_utf8_lossy(&bytes).to_string();
         self.metrics.record_provider_failure_with_reason(
             provider_name,
             Some(Self::friendly_failure_reason(
                 Some(status_code),
-                &String::from_utf8_lossy(&bytes),
+                &body_text,
             )),
             None,
         );
-        Err(GatewayError::Provider {
-            provider: provider_name.clone(),
-            message,
-            status_code: Some(status_code),
+
+        // Mirror chat routing's 429 semantics: parse Retry-After /
+        // retry_after_ms and place the provider in a bounded cooldown window
+        // so subsequent requests skip it via select_provider_order.
+        if Self::is_rate_limited(status_code, &body_text) {
+            let cooldown = self
+                .parse_rate_limit_cooldown(provider_name, Some(&headers), &body_text)
+                .await;
+            rate_limiter.apply_cooldown(cooldown).await;
+            self.metrics
+                .record_provider_rate_limit_exhausted(provider_name);
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let deadline = now_secs.saturating_add(cooldown.as_secs());
+            self.metrics.set_provider_cooldown(
+                provider_name,
+                Self::friendly_failure_reason(Some(status_code), &body_text),
+                deadline,
+            );
+            tracing::warn!(
+                provider = provider_name,
+                status = status_code,
+                cooldown_ms = cooldown.as_millis() as u64,
+                "Rate limited on pass-through, cooling down provider"
+            );
+        }
+
+        Ok(ProviderPassThroughResponse {
+            status: status_code,
+            headers,
+            body: bytes.to_vec(),
         })
+    }
+
+    fn rewrite_pass_through_model(
+        content_type: &str,
+        body: Vec<u8>,
+        target_model: &str,
+    ) -> Result<Vec<u8>, GatewayError> {
+        if content_type
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        {
+            let mut json: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+                GatewayError::InvalidRequest(format!("Invalid JSON body: {}", error))
+            })?;
+            let object = json.as_object_mut().ok_or_else(|| {
+                GatewayError::InvalidRequest("JSON request body must be an object".to_string())
+            })?;
+            object.insert(
+                "model".to_string(),
+                serde_json::Value::String(target_model.to_string()),
+            );
+            return serde_json::to_vec(&json).map_err(|error| {
+                GatewayError::InvalidRequest(format!("Failed to rewrite JSON model: {}", error))
+            });
+        }
+
+        if content_type
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("multipart/form-data"))
+        {
+            return Self::rewrite_multipart_model(content_type, body, target_model);
+        }
+
+        Err(GatewayError::InvalidRequest(format!(
+            "Unsupported pass-through content type '{}'",
+            content_type
+        )))
+    }
+
+    fn rewrite_multipart_model(
+        content_type: &str,
+        mut body: Vec<u8>,
+        target_model: &str,
+    ) -> Result<Vec<u8>, GatewayError> {
+        let boundary = content_type
+            .split(';')
+            .map(str::trim)
+            .find_map(|part| part.strip_prefix("boundary="))
+            .map(|boundary| boundary.trim_matches('"'))
+            .filter(|boundary| !boundary.is_empty())
+            .ok_or_else(|| {
+                GatewayError::InvalidRequest("Multipart boundary is missing".to_string())
+            })?;
+        let delimiter = format!("--{}", boundary).into_bytes();
+        let header_separator = b"\r\n\r\n";
+        let line_end = b"\r\n";
+        let mut search_start = 0;
+
+        while let Some(relative_start) = body[search_start..]
+            .windows(delimiter.len())
+            .position(|window| window == delimiter.as_slice())
+        {
+            let part_start = search_start + relative_start + delimiter.len();
+            let part_end = body[part_start..]
+                .windows(delimiter.len())
+                .position(|window| window == delimiter.as_slice())
+                .map(|offset| part_start + offset)
+                .unwrap_or(body.len());
+            let Some(relative_header_end) = body[part_start..part_end]
+                .windows(header_separator.len())
+                .position(|window| window == header_separator)
+            else {
+                search_start = part_end;
+                continue;
+            };
+            let header_end = part_start + relative_header_end;
+            let headers = String::from_utf8_lossy(&body[part_start..header_end]);
+            let is_model_field = headers.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.trim().eq_ignore_ascii_case("content-disposition")
+                        && value.split(';').map(str::trim).any(|parameter| {
+                            parameter
+                                .strip_prefix("name=")
+                                .is_some_and(|name| name.trim_matches('"') == "model")
+                        })
+                })
+            });
+            if is_model_field {
+                let value_start = header_end + header_separator.len();
+                let value_end = body[value_start..part_end]
+                    .windows(line_end.len())
+                    .position(|window| window == line_end)
+                    .map(|offset| value_start + offset)
+                    .unwrap_or(part_end);
+                body.splice(value_start..value_end, target_model.bytes());
+                return Ok(body);
+            }
+            search_start = part_end;
+        }
+
+        Err(GatewayError::InvalidRequest(
+            "Multipart request must include a model field".to_string(),
+        ))
     }
 
     fn pass_through_error_message(body: &[u8], status_code: u16) -> String {
@@ -5919,26 +6189,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pass_through_preserves_raw_body_and_fails_over() {
+    async fn pass_through_rewrites_multipart_model_preserves_binary_and_fails_over() {
         use wiremock::matchers::{body_bytes, header, method, path};
 
         let first = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
+            .and(body_bytes(
+                b"--raw\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nfirst-upstream-model\r\n--raw\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\n\x00\xffaudio\r\n--raw--\r\n"
+                    .to_vec(),
+            ))
             .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
-            "error": { "message": "temporarily unavailable" }
+                "error": { "message": "temporarily unavailable" }
             })))
             .mount(&first)
             .await;
 
         let second = MockServer::start().await;
         let body = b"--raw\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-group\r\n--raw\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\n\x00\xffaudio\r\n--raw--\r\n".to_vec();
+        let rewritten_body = b"--raw\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nupstream-model\r\n--raw\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\n\x00\xffaudio\r\n--raw--\r\n".to_vec();
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
             .and(header("content-type", "multipart/form-data; boundary=raw"))
-            .and(body_bytes(body.clone()))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "text": "ok"
+            .and(body_bytes(rewritten_body))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "text": "ok"
             })))
             .mount(&second)
             .await;
@@ -5949,7 +6224,7 @@ mod tests {
             test_provider("second", second.uri()),
         ];
         config.model_groups = vec![test_group(vec![
-            test_model("first", 1),
+            test_model_named("first", "first-upstream-model", 1),
             test_model("second", 2),
         ])];
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
@@ -5962,6 +6237,7 @@ mod tests {
             )
             .await
             .expect("second provider should succeed");
+        assert_eq!(response.status, 202);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["text"],
             "ok"
@@ -5969,20 +6245,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pass_through_maps_provider_failures_structurally() {
-        use wiremock::matchers::{method, path};
+    async fn pass_through_rewrites_json_model_and_propagates_success_status() {
+        use wiremock::matchers::{body_json, method, path};
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/embeddings"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
-            "error": { "message": "bad embedding input" }
+            .and(path("/v1/images/generations"))
+            .and(body_json(serde_json::json!({
+                "model": "upstream-model",
+                "prompt": "draw a lighthouse"
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "created": 123
             })))
             .mount(&server)
             .await;
 
         let mut config = create_test_config();
         config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let response = router
+            .route_provider_pass_through(
+                ProviderPassThroughEndpoint::ImageGenerations,
+                "test-group",
+                "application/json",
+                br#"{"model":"test-group","prompt":"draw a lighthouse"}"#.to_vec(),
+            )
+            .await
+            .expect("provider should succeed");
+
+        assert_eq!(response.status, 201);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["created"],
+            123
+        );
+    }
+
+    #[tokio::test]
+    async fn pass_through_returns_terminal_provider_status_and_body() {
+        use wiremock::matchers::{body_json, method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_json(serde_json::json!({
+                "model": "upstream-model",
+                "input": "hello"
+            })))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "error": { "message": "invalid embedding input" }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = create_test_config();
+        config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let response = router
+            .route_provider_pass_through(
+                ProviderPassThroughEndpoint::Embeddings,
+                "test-group",
+                "application/json",
+                br#"{"model":"test-group","input":"hello"}"#.to_vec(),
+            )
+            .await
+            .expect("terminal HTTP response should be preserved");
+
+        assert_eq!(response.status, 422);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["error"]
+                ["message"],
+            "invalid embedding input"
+        );
+    }
+
+    #[tokio::test]
+    async fn pass_through_maps_transport_failures_structurally() {
+        let mut config = create_test_config();
+        config.providers = vec![test_provider("provider", "http://127.0.0.1:9".to_string())];
         config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
         let result = router
@@ -5994,7 +6336,7 @@ mod tests {
             )
             .await;
         let error = match result {
-            Ok(_) => panic!("provider error should be aggregated"),
+            Ok(_) => panic!("transport error should be aggregated"),
             Err(error) => error,
         };
         let GatewayError::AllProvidersFailed(aggregated) = error else {
@@ -6003,8 +6345,7 @@ mod tests {
         assert_eq!(aggregated.attempts.len(), 1);
         assert_eq!(aggregated.attempts[0].provider, "provider");
         assert_eq!(aggregated.attempts[0].model, "upstream-model");
-        assert_eq!(aggregated.attempts[0].status_code, Some(400));
-        assert!(aggregated.attempts[0].error.contains("bad embedding input"));
+        assert_eq!(aggregated.attempts[0].status_code, None);
     }
 
     #[tokio::test]
@@ -6203,9 +6544,13 @@ mod tests {
     }
 
     fn test_model(provider: &str, priority: u32) -> ProviderModel {
+        test_model_named(provider, "upstream-model", priority)
+    }
+
+    fn test_model_named(provider: &str, model: &str, priority: u32) -> ProviderModel {
         ProviderModel {
             provider: provider.to_string(),
-            model: "upstream-model".to_string(),
+            model: model.to_string(),
             cost_per_million_input_tokens: 0.0,
             cost_per_million_output_tokens: 0.0,
             priority,

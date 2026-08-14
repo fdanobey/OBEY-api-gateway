@@ -13,6 +13,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod active_requests;
 mod admin;
+mod assistants;
 mod cache;
 mod codex;
 #[allow(dead_code, unused_imports)]

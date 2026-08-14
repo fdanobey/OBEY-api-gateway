@@ -33,6 +33,7 @@ use chrono::Utc;
 use serde_json::json;
 
 use crate::config::{Config, EnforcementMode};
+use crate::gateway::handlers::multipart_model;
 use crate::gateway::AppState;
 
 use super::models::{AuthenticatedKey, CachedKey, KeyStatus, UsageRecord};
@@ -289,10 +290,17 @@ async fn enforce_authenticated(
     request: Request,
     next: Next,
 ) -> Response {
-    let json_body = is_json_content_type(request.headers());
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let json_body = content_type.contains("application/json");
+    let multipart_body = content_type.starts_with("multipart/form-data");
 
-    // Buffer + inspect JSON bodies to extract the requested model group.
-    let (request, requested_model) = if json_body {
+    // Buffer + inspect request bodies to extract the requested model group.
+    let (request, requested_model) = if json_body || multipart_body {
         let max_body_bytes = {
             let cfg = state.config.read().await;
             (cfg.server.max_request_size_mb as usize).saturating_mul(1024 * 1024)
@@ -308,9 +316,18 @@ async fn enforce_authenticated(
                     .into_response();
             }
         };
-        let model = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
+        let model = if json_body {
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+        } else {
+            let ct = parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            multipart_model(ct, &bytes).ok()
+        };
 
         // Req 6.4: model access is checked BEFORE budget / rate limit so denied
         // requests consume no budget or rate-limit capacity.
@@ -458,8 +475,11 @@ async fn build_usage_record(
         .and_then(serde_json::Value::as_u64);
 
     // Req 3.6: a response without usage counts is not recorded.
+    // Embedding responses commonly omit completion_tokens; accept input-only usage.
     let (input_tokens, output_tokens) = match (input_tokens, output_tokens) {
         (Some(i), Some(o)) if i.saturating_add(o) > 0 => (i, o),
+        (Some(i), None) if i > 0 => (i, 0),
+        (Some(i), Some(0)) if i > 0 => (i, 0),
         _ => {
             tracing::warn!(
                 key_id = %key_id,
@@ -508,7 +528,7 @@ async fn build_usage_record(
 /// Resolve `(input_rate, output_rate)` per-million-token cost rates for the
 /// responded model within a model group, falling back to the group's first
 /// model when the exact model is not found.
-fn lookup_model_rates(
+pub fn lookup_model_rates(
     config: &Config,
     model_group: &str,
     responded_model: &str,
