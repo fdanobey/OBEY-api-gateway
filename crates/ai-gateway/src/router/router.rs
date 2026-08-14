@@ -5516,10 +5516,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
 
         let mut req_builder = http_client
             .post(&url)
-            .header("Content-Type", "application/json")
-            // Request an uncompressed SSE stream so upstream/proxy compression
-            // truncation cannot surface as a mid-stream body decode error.
-            .header("Accept-Encoding", "identity");
+            .header("Content-Type", "application/json");
         if let Some(ref bearer) = oauth_bearer {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", bearer));
         } else if !api_key.is_empty() {
@@ -5528,6 +5525,10 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         for (k, v) in &custom_headers {
             req_builder = req_builder.header(k.as_str(), v.as_str());
         }
+        // Keep this after custom headers. A provider-level Accept-Encoding value
+        // must not re-enable compressed SSE, where a truncated compressed frame is
+        // reported by reqwest as `error decoding response body` mid-stream.
+        req_builder = req_builder.header("Accept-Encoding", "identity");
 
         tracing::info!(provider = %provider_model.provider, %url, model = %provider_model.model, ttfb_timeout_secs, "Calling provider (streaming pass-through)");
 
@@ -7081,7 +7082,11 @@ mod tests {
         let mut config = create_test_config();
         config.compression = compression_config(CompressionLevel::Standard, 0);
         let provider_model = test_model("provider", 1);
-        config.providers = vec![test_provider("provider", server.uri())];
+        let mut provider = test_provider("provider", server.uri());
+        provider
+            .custom_headers
+            .insert("Accept-Encoding".to_string(), "gzip".to_string());
+        config.providers = vec![provider];
         config.model_groups = vec![test_group(vec![provider_model])];
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 

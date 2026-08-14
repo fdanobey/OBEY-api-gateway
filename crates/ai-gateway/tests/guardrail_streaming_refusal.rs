@@ -30,6 +30,8 @@ use ai_gateway::guardrail::{
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Config builders
 // ---------------------------------------------------------------------------
@@ -210,7 +212,8 @@ fn refusal_failover_guardrails_fail_open() -> GuardrailConfig {
 }
 
 /// Build a router from `config` without binding to a port.
-async fn build_app(config: Config) -> axum::Router {
+async fn build_app(mut config: Config) -> axum::Router {
+    common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
     server.build_router()
 }

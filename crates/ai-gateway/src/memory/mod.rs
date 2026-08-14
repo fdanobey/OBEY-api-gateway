@@ -21,8 +21,8 @@ pub use config::{
     EffectiveMemoryConfig, MemoryConfig, MemoryConfigError, MemoryQdrantConfig,
     MemoryValidationResult, ModelGroupMemoryOverride, ProviderMemoryOverride,
 };
-pub use context_detector::ContextDetector;
-pub use decay::{DecayScheduler, VectorRetryCallback};
+pub use context_detector::{sanitize_label, ContextDetector, DetectedContext};
+pub use decay::{DecayScheduler, EvictionEventPublisher, VectorRetryCallback};
 pub use extraction_adapter::GatewayExtractionAdapter;
 pub use extractor::{
     AsyncExtractionOutcome, AsyncExtractionRequest, AsyncExtractionSchedule,
@@ -44,7 +44,7 @@ pub use sensitive::{
     SensitiveScanError, SensitiveScanOptions, SensitiveScanResult,
 };
 pub use store::{
-    MemoryEntryInput, MemoryEntryPage, MemoryStats, MemoryStore, NewMemoryEntry, ProjectNamespace,
+    MemoryEntryInput, MemoryEntryPage, MemoryNamespace, MemoryStats, MemoryStore, NewMemoryEntry,
 };
 pub use vector::{MemoryVectorTier, QdrantMemoryVectorTier, VectorMatch};
 
@@ -412,6 +412,19 @@ impl MemorySystem {
         Ok(entry)
     }
 
+    pub fn set_eviction_publisher(
+        &self,
+        publisher: Arc<dyn EvictionEventPublisher>,
+    ) -> Result<(), MemoryError> {
+        self.decay_scheduler
+            .lock()
+            .map_err(|_| {
+                MemoryError::Config("memory decay scheduler mutex was poisoned".to_owned())
+            })?
+            .set_eviction_publisher(publisher);
+        Ok(())
+    }
+
     /// Detects context, resolves the virtual-key namespace, and injects memories.
     #[allow(clippy::too_many_arguments)]
     pub async fn process_request(
@@ -423,10 +436,25 @@ impl MemorySystem {
         effective_config: EffectiveMemoryConfig,
         vk_id: Option<&str>,
     ) -> Result<MemoryRequestResult, MemoryError> {
-        let context = self.context_detector.detect(request);
+        let detected = self.context_detector.detect_with_label(request);
+        let context = detected.context;
         self.metrics
             .record_project_detection(context_namespace_type(&context));
         let namespace = ResolvedNamespace::resolve(vk_id, &context);
+        let context_kind = match &context {
+            ContextType::Project(_) => "project",
+            ContextType::Agent(_) => "agent",
+            ContextType::User => "user",
+        };
+        self.store.upsert_namespace_labels(
+            namespace
+                .context_scope
+                .as_deref()
+                .unwrap_or(&namespace.user_scope),
+            context_kind,
+            detected.display_name.as_deref(),
+            None,
+        )?;
         let injection = if effective_config.enabled {
             let lexical = self.injector.retrieve_lexical(&namespace, query, None)?;
             let candidates = if let (Some(tier), Some(qdrant)) = (

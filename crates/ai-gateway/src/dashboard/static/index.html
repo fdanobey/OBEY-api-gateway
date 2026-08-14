@@ -941,9 +941,12 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 
     try{ ws = new WebSocket(url); } catch(e){ scheduleReconnect(); return; }
 
-    ws.onopen = function(){
-      wsRetryCount=0;
-      $('conn-dot').classList.add('connected');
+ws.onopen = function(){
+wsRetryCount=0;
+memEvents = [];
+memTimelineNamespaces = {};
+renderMemoryMetrics();
+$('conn-dot').classList.add('connected');
       $('conn-dot').title='WebSocket connected';
       $('conn-label').textContent='Connected';
     };
@@ -959,7 +962,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
         }
         if(msg.type==='errors'&&msg.data){ renderErrors(msg.data); }
         if(msg.type==='compression'&&msg.data){ handleCompressionEvent(msg.data); handleToolCompressionEvent(msg.data); }
-        if(msg.type==='memory'&&msg.data){ handleMemoryEvent(msg.data); }
+        if((msg.type==='memory_event'||msg.type==='memory')&&msg.data){ handleMemoryEvent(msg.data); }
       }catch(e){/* ignore parse errors */}
     };
 
@@ -1350,8 +1353,9 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
   var memTotalExtractions = 0;
   var memTotalEvictions = 0;
   var memTotalCount = 0;
-  var memNamespaces = {};
-  var memTimelineChart = null;
+var memNamespaces = {};
+var memTimelineNamespaces = {};
+var memTimelineChart = null;
   var memTypesChart = null;
 
   function initMemoryCharts() {
@@ -1381,31 +1385,63 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     });
   }
 
-  function handleMemoryEvent(data) {
-    var eventType = data.event_type;
-    var count = data.count || 1;
-    var ns = data.namespace || 'unknown';
-    var ts = data.timestamp || new Date().toISOString();
+function handleMemoryEvent(data) {
+data = data || {};
+var eventType = data.event_type || data.kind || data.action || data.type;
+var count = Math.max(0, finiteNumber(data.count != null ? data.count : data.affected_count || 1));
+var ns = data.namespace || data.namespace_id || data.scope || 'unknown';
+var ts = data.timestamp || data.created_at || data.occurred_at || data.time || new Date().toISOString();
+var normalizedType = eventType === 'inject' ? 'injection' : eventType === 'extract' ? 'extraction' : eventType === 'evict' ? 'eviction' : eventType;
+var now = new Date(ts);
+if (isNaN(now.getTime())) now = new Date();
+var label = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0') + ':' + String(now.getSeconds()).padStart(2, '0');
+memEvents.push({ type: normalizedType, count: count, namespace: ns, time: label, ts: now.getTime() });
+if (memEvents.length > MEM_MAX_EVENTS) memEvents.shift();
 
-    memTotalCount += count;
-    if (eventType === 'injection') memTotalInjections += count;
-    else if (eventType === 'extraction') memTotalExtractions += count;
-    else if (eventType === 'eviction') memTotalEvictions += count;
+if (!memTimelineNamespaces[ns]) memTimelineNamespaces[ns] = { injections: 0, extractions: 0, evictions: 0, lastEvent: ts };
+if (normalizedType === 'injection') memTimelineNamespaces[ns].injections += count;
+else if (normalizedType === 'extraction') memTimelineNamespaces[ns].extractions += count;
+else if (normalizedType === 'eviction') memTimelineNamespaces[ns].evictions += count;
+memTimelineNamespaces[ns].lastEvent = ts;
+renderMemoryMetrics();
+}
 
-    var now = new Date(ts);
-    var label = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0') + ':' + String(now.getSeconds()).padStart(2, '0');
-    memEvents.push({ type: eventType, count: count, namespace: ns, time: label, ts: now.getTime() });
-    if (memEvents.length > MEM_MAX_EVENTS) memEvents.shift();
+function normalizeNamespaceCounts(namespaces) {
+var normalized = {};
+if (!namespaces || typeof namespaces !== 'object') return normalized;
+(Array.isArray(namespaces) ? namespaces : Object.keys(namespaces).map(function(name){
+var value = namespaces[name];
+return typeof value === 'object' ? Object.assign({ namespace: name }, value) : { namespace: name, count: value };
+})).forEach(function(item){
+var name = item.namespace || item.name || item.id;
+if (!name) return;
+normalized[name] = {
+count: finiteNumber(item.count != null ? item.count : item.entry_count),
+injections: finiteNumber(item.injections),
+extractions: finiteNumber(item.extractions),
+evictions: finiteNumber(item.evictions),
+lastEvent: item.last_event || item.last_activity || item.updated_at
+};
+});
+return normalized;
+}
 
-    // Track namespace activity
-    if (!memNamespaces[ns]) memNamespaces[ns] = { injections: 0, extractions: 0, evictions: 0, lastEvent: ts };
-    if (eventType === 'injection') memNamespaces[ns].injections += count;
-    else if (eventType === 'extraction') memNamespaces[ns].extractions += count;
-    else if (eventType === 'eviction') memNamespaces[ns].evictions += count;
-    memNamespaces[ns].lastEvent = ts;
-
-    renderMemoryMetrics();
-  }
+function loadMemorySnapshot() {
+return fetch(dashboardBasePath + '/memory/snapshot')
+.then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+.then(function(body){
+var snapshot = body.memory || body;
+var stats = snapshot.stats || snapshot;
+var counters = snapshot.events && !Array.isArray(snapshot.events) ? snapshot.events : (stats.event_counts || stats.events || {});
+memTotalInjections = finiteNumber(counters.injections != null ? counters.injections : counters.injection_count);
+memTotalExtractions = finiteNumber(counters.extractions != null ? counters.extractions : counters.extraction_count);
+memTotalEvictions = finiteNumber(counters.evictions != null ? counters.evictions : counters.eviction_count);
+memTotalCount = finiteNumber(stats.total_count != null ? stats.total_count : stats.total_memories);
+memNamespaces = normalizeNamespaceCounts(snapshot.namespace_counts || snapshot.namespaces || stats.namespace_counts || stats.namespaces || stats.memories_per_namespace);
+renderMemoryMetrics();
+})
+.catch(function(){ renderMemoryMetrics(); });
+}
 
   function renderMemoryMetrics() {
     var total = memTotalInjections + memTotalExtractions + memTotalEvictions;
@@ -1504,9 +1540,9 @@ adminJson('/ab-test/results').then(function(body){ $('sr-ab').textContent=JSON.s
 // --- Init ---
   initCharts();
   initTcSavingsChart();
-  initMemoryCharts();
-  renderCompression();
-  wsConnect();
+initMemoryCharts();
+renderCompression();
+loadMemorySnapshot().then(wsConnect);
   loadErrors();
   loadToolCompressionActivity();
 loadTcFeedbackGroups();

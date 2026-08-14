@@ -1739,20 +1739,23 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       <span id="mem-create-status" style="font-size:.8rem;margin-left:.75rem"></span>
     </fieldset>
 
-    <fieldset><legend>Detected Projects</legend>
+    <fieldset><legend>Detected Contexts</legend>
       <div id="mem-projects-wrap" style="display:none">
         <div style="overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)">
-          <table style="width:100%;border-collapse:collapse;font-size:.8rem" aria-label="Detected project namespaces">
+          <table style="width:100%;border-collapse:collapse;font-size:.8rem" aria-label="Detected memory contexts">
             <thead><tr>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Context</th>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Client Label</th>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Kind</th>
               <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Namespace</th>
-              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Entries</th>
-              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Last Activity</th>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Count</th>
+              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Activity</th>
             </tr></thead>
             <tbody id="mem-projects-tbody"></tbody>
           </table>
         </div>
       </div>
-      <div id="mem-projects-empty" style="text-align:center;padding:1rem;color:var(--text-muted);font-size:.85rem">Loading projects…</div>
+      <div id="mem-projects-empty" style="text-align:center;padding:1rem;color:var(--text-muted);font-size:.85rem">Loading contexts…</div>
       <button class="btn btn-secondary btn-sm" id="mem-refresh-projects" style="margin-top:.75rem">Refresh</button>
     </fieldset>
 
@@ -5501,28 +5504,41 @@ mem.qdrant.vector_dimension = parseInt(vdVal, 10) || null;
   function memLoadProjects() {
     fetch(memApiUrl('projects'))
       .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(function(projects) {
+      .then(function(response) {
+        var contexts = Array.isArray(response) ? response : (response.contexts || response.namespaces || response.projects || []);
+        if (!Array.isArray(contexts) && contexts && typeof contexts === 'object') {
+          contexts = Object.keys(contexts).map(function(namespace) { var value = contexts[namespace]; return typeof value === 'object' ? Object.assign({ namespace: namespace }, value) : { namespace: namespace, entry_count: value }; });
+        }
         var tbody = document.getElementById('mem-projects-tbody');
         tbody.innerHTML = '';
-        if (!projects || !projects.length) {
+        if (!contexts || !contexts.length) {
           document.getElementById('mem-projects-wrap').style.display = 'none';
-          document.getElementById('mem-projects-empty').textContent = 'No detected projects';
+          document.getElementById('mem-projects-empty').textContent = 'No detected contexts';
           document.getElementById('mem-projects-empty').style.display = 'block';
           return;
         }
         document.getElementById('mem-projects-wrap').style.display = 'block';
         document.getElementById('mem-projects-empty').style.display = 'none';
-        projects.forEach(function(p) {
+        contexts.forEach(function(item) {
+          var namespace = String(item.namespace || item.namespace_id || item.name || item.id || '');
+          var kind = item.kind || item.context_kind || item.scope_type || item.type || (namespace.split('::')[0] || 'unknown');
+          var context = item.context || item.context_id || item.project || item.agent || item.user || item.identifier || namespace.split('::').slice(-1)[0] || '—';
+          var client = item.client_label || item.client || item.label || item.display_name || '—';
+          var count = item.entry_count != null ? item.entry_count : (item.count != null ? item.count : item.total_count);
+          var activity = item.last_activity || item.last_event || item.updated_at || item.last_accessed_at;
           var row = document.createElement('tr');
-          var td1 = document.createElement('td'); td1.textContent = p.namespace; td1.style.padding = '.4rem .5rem'; td1.style.fontFamily = 'monospace'; td1.style.fontSize = '.75rem'; row.appendChild(td1);
-          var td2 = document.createElement('td'); td2.textContent = p.entry_count; td2.style.padding = '.4rem .5rem'; row.appendChild(td2);
-          var td3 = document.createElement('td'); td3.textContent = p.last_activity ? new Date(p.last_activity).toLocaleString() : '—'; td3.style.padding = '.4rem .5rem'; row.appendChild(td3);
+          function cell(value) { var td=document.createElement('td'); td.textContent=value == null ? '—' : value; td.style.padding='.4rem .5rem'; row.appendChild(td); return td; }
+          var contextCell=cell(context); contextCell.title=String(context); contextCell.style.cssText+='max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;font-size:.75rem';
+          cell(client); cell(kind);
+          var nsCell=cell(''); var link=document.createElement('button'); link.type='button'; link.className='btn btn-secondary btn-sm'; link.textContent=namespace.length>48?namespace.slice(0,20)+'…'+namespace.slice(-16):namespace; link.title=namespace; link.style.cssText='max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;text-align:left'; link.addEventListener('click',function(){ document.getElementById('mem-browse-ns').value=namespace; document.getElementById('mem-create-ns').value=namespace; memBrowseEntries(); }); nsCell.appendChild(link);
+          cell(count != null ? count : '—'); cell(activity ? new Date(activity).toLocaleString() : '—');
           tbody.appendChild(row);
         });
       })
       .catch(function() {
         document.getElementById('mem-projects-wrap').style.display = 'none';
-        document.getElementById('mem-projects-empty').textContent = 'Failed to load projects';
+        document.getElementById('mem-projects-empty').textContent = 'Failed to load contexts';
+        document.getElementById('mem-projects-empty').style.display = 'block';
       });
   }
 

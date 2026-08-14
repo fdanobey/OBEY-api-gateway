@@ -54,6 +54,7 @@ where
             axum::routing::delete(clear_namespace),
         )
         .route("/stats", get(stats))
+        .route("/namespaces", get(namespaces))
         .route("/projects", get(projects))
         .route(
             "/qdrant/collection",
@@ -207,20 +208,49 @@ async fn stats(State(state): State<MemoryAdminState>) -> Response {
     }
 }
 
+async fn namespaces(State(state): State<MemoryAdminState>) -> Response {
+    let system = match resolve_system(&state).await {
+        Ok(system) => system,
+        Err(response) => return response,
+    };
+    match system.store.list_namespaces() {
+        Ok(namespaces) => Json(
+            namespaces
+                .into_iter()
+                .map(|item| {
+                    json!({
+                        "namespace": item.namespace,
+                        "context_kind": item.context_kind,
+                        "display_name": item.display_name,
+                        "client_name": item.client_name,
+                        "entry_count": item.entry_count,
+                        "last_activity": item.last_activity,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => memory_error(error),
+    }
+}
+
 async fn projects(State(state): State<MemoryAdminState>) -> Response {
     let system = match resolve_system(&state).await {
         Ok(system) => system,
         Err(response) => return response,
     };
-    match system.store.list_project_namespaces() {
+    match system.store.list_namespaces() {
         Ok(projects) => Json(Value::Array(
             projects
                 .into_iter()
                 .map(|project| {
                     json!({
-                    "namespace": project.namespace,
-                    "entry_count": project.entry_count,
-                    "last_activity": project.last_activity,
+                        "namespace": project.namespace,
+                        "context_kind": project.context_kind,
+                        "display_name": project.display_name,
+                        "client_name": project.client_name,
+                        "entry_count": project.entry_count,
+                        "last_activity": project.last_activity,
                     })
                 })
                 .collect(),

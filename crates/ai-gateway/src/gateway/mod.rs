@@ -109,7 +109,7 @@ impl GatewayServer {
         let compression_events = Arc::new(crate::dashboard::CompressionEventHub::new());
         let memory_events = Arc::new(crate::dashboard::MemoryEventHub::new());
         let memory_system = Arc::new(RwLock::new(
-            build_memory_system(&config, config_arc.clone()).await,
+            build_memory_system(&config, config_arc.clone(), memory_events.clone()).await,
         ));
         let mut router = RequestRouter::new(config_arc.clone(), metrics.clone());
         router.set_memory_system(memory_system.clone());
@@ -686,6 +686,7 @@ async fn build_memory_vector_tier(
 async fn build_memory_system(
     config: &Config,
     config_arc: Arc<RwLock<Config>>,
+    memory_events: Arc<crate::dashboard::MemoryEventHub>,
 ) -> Option<Arc<MemorySystem>> {
     let memory_config = config.memory.as_ref()?.clone();
     if !memory_config.enabled {
@@ -699,7 +700,12 @@ async fn build_memory_system(
     match MemorySystem::new_with_vector(memory_config, None, Some(extraction_provider), vector_tier)
         .await
     {
-        Ok(system) => Some(Arc::new(system)),
+        Ok(system) => {
+            if let Err(error) = system.set_eviction_publisher(memory_events) {
+                tracing::warn!(error = %error, "Memory eviction event publisher unavailable");
+            }
+            Some(Arc::new(system))
+        }
         Err(error) => {
             tracing::error!(error = %error, "Memory system initialization failed; gateway will continue without memory");
             None

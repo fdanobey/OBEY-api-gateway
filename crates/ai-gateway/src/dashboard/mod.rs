@@ -106,6 +106,16 @@ impl Default for MemoryEventHub {
     }
 }
 
+impl crate::memory::EvictionEventPublisher for MemoryEventHub {
+    fn publish_eviction(&self, namespace: &str, count: u64) {
+        self.publish(MemoryDashboardEvent::new(
+            MemoryEventType::Eviction,
+            namespace,
+            u32::try_from(count).unwrap_or(u32::MAX),
+        ));
+    }
+}
+
 pub struct MemoryEventSubscription {
     pub replay: Vec<MemoryDashboardEvent>,
     pub receiver: broadcast::Receiver<MemoryDashboardEvent>,
@@ -265,6 +275,8 @@ pub fn dashboard_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/ws", get(ws_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/memory", get(memory_snapshot_handler))
+        .route("/memory/snapshot", get(memory_snapshot_handler))
         .route("/errors", get(errors_handler))
         .route("/logs", get(logs_handler))
         .route(
@@ -407,6 +419,85 @@ async fn send_memory_event(
 
 fn memory_message(event: MemoryDashboardEvent) -> serde_json::Value {
     serde_json::json!({"type": "memory_event", "data": event})
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryDashboardSnapshot {
+    enabled: bool,
+    total_count: u64,
+    namespace_counts: std::collections::BTreeMap<String, u64>,
+    average_relevance_score: f64,
+    storage_size_bytes: Option<u64>,
+    last_decay_cycle: Option<DateTime<Utc>>,
+    events: MemoryEventAggregates,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct MemoryEventAggregates {
+    injections: u64,
+    extractions: u64,
+    evictions: u64,
+}
+
+async fn memory_snapshot_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let events = state.memory_events.subscribe().replay.into_iter().fold(
+        MemoryEventAggregates::default(),
+        |mut totals, event| {
+            match event.event_type {
+                MemoryEventType::Injection => totals.injections += u64::from(event.count),
+                MemoryEventType::Extraction => totals.extractions += u64::from(event.count),
+                MemoryEventType::Eviction => totals.evictions += u64::from(event.count),
+            }
+            totals
+        },
+    );
+    let Some(system) = state.memory_system.read().await.clone() else {
+        return Json(MemoryDashboardSnapshot {
+            enabled: false,
+            total_count: 0,
+            namespace_counts: Default::default(),
+            average_relevance_score: 0.0,
+            storage_size_bytes: None,
+            last_decay_cycle: None,
+            events,
+        });
+    };
+    match system.store.stats() {
+        Ok(stats) => {
+            let mut namespace_counts = std::collections::BTreeMap::new();
+            for (namespace, count) in stats.memories_per_namespace {
+                let kind = if namespace.contains("::project::") {
+                    "project"
+                } else if namespace.contains("::agent::") {
+                    "agent"
+                } else {
+                    "user"
+                };
+                *namespace_counts.entry(kind.to_owned()).or_default() += count;
+            }
+            Json(MemoryDashboardSnapshot {
+                enabled: true,
+                total_count: stats.total_count,
+                namespace_counts,
+                average_relevance_score: stats.average_relevance_score,
+                storage_size_bytes: stats.storage_size_bytes,
+                last_decay_cycle: stats.last_decay_cycle,
+                events,
+            })
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "Failed to build memory dashboard snapshot");
+            Json(MemoryDashboardSnapshot {
+                enabled: true,
+                total_count: 0,
+                namespace_counts: Default::default(),
+                average_relevance_score: 0.0,
+                storage_size_bytes: None,
+                last_decay_cycle: None,
+                events,
+            })
+        }
+    }
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {

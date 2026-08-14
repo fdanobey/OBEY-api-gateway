@@ -30,6 +30,8 @@ use ai_gateway::virtual_keys::models::{AuthenticatedKey, KeyStatus};
 use wiremock::matchers::{method as wm_method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -122,7 +124,8 @@ guardrails:
     )
 }
 
-async fn build_app(config: Config) -> axum::Router {
+async fn build_app(mut config: Config) -> axum::Router {
+    common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
     server.build_router()
 }
@@ -300,10 +303,11 @@ async fn hot_reload_new_requests_see_new_config_inflight_keeps_old_snapshot() {
     let mock = start_mock_provider().await;
 
     // Config A: pre-call block on BLOCKME_TOKEN, bound as global default.
-    let cfg_a = config_with_guardrails(
+    let mut cfg_a = config_with_guardrails(
         &mock.uri(),
         &guardrails_yaml("BLOCKME_TOKEN", "pre_call", "block"),
     );
+    common::isolate_databases(&mut cfg_a);
     let server = GatewayServer::new(cfg_a, None).await.unwrap();
 
     // (a) Under config A a matching request is blocked (403).

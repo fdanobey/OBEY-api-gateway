@@ -11,6 +11,8 @@ use tower::ServiceExt;
 use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
 
+mod common;
+
 /// Build a minimal valid Config for integration tests.
 fn test_config() -> Config {
     Config {
@@ -100,7 +102,8 @@ fn test_config() -> Config {
 }
 
 /// Helper: build a router from a config without binding to a port.
-async fn build_app(config: Config) -> axum::Router {
+async fn build_app(mut config: Config) -> axum::Router {
+    common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
     server.build_router()
 }
@@ -449,6 +452,7 @@ async fn test_prometheus_exposes_guardrail_metrics_with_prefix() {
 
     // Build the server directly (not via `build_app`) so we can record a
     // guardrail stage on the same `Metrics` instance the endpoint reads.
+    common::isolate_databases(&mut cfg);
     let server = GatewayServer::new(cfg, None).await.unwrap();
     server.state.metrics.record_guardrail_stage(
         "pii_pipeline",

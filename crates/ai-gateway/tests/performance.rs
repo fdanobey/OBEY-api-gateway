@@ -19,6 +19,8 @@ use ai_gateway::models::openai::{Message, OpenAIRequest};
 use ai_gateway::smart_routing::config::ClassifierMode;
 use ai_gateway::smart_routing::heuristic::HeuristicScorer;
 
+mod common;
+
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Build a minimal valid Config for performance tests.
@@ -110,7 +112,8 @@ fn test_config() -> Config {
 }
 
 /// Helper: build a router from a config without binding to a port.
-async fn build_app(config: Config) -> axum::Router {
+async fn build_app(mut config: Config) -> axum::Router {
+    common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
     server.build_router()
 }
@@ -188,10 +191,13 @@ fn smart_routing_disabled_and_enabled_regression_measurement() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "wall-clock startup budget (Req 17.1): run perf suite with --ignored"]
 async fn test_startup_time() {
     with_test_timeout("test_startup_time", async {
         let start = Instant::now();
-        let server = GatewayServer::new(test_config(), None).await.unwrap();
+        let mut config = test_config();
+        common::isolate_databases(&mut config);
+        let server = GatewayServer::new(config, None).await.unwrap();
         let _router = server.build_router();
         let elapsed = start.elapsed();
 
@@ -209,6 +215,7 @@ async fn test_startup_time() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "wall-clock forwarding budget (Req 17.2): run perf suite with --ignored"]
 async fn test_forwarding_overhead() {
     with_test_timeout("test_forwarding_overhead", async {
         let app = build_app(test_config()).await;
@@ -261,6 +268,7 @@ async fn test_forwarding_overhead() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "concurrency stress budget (Req 17.4): run perf suite with --ignored"]
 async fn test_concurrent_requests() {
     with_test_timeout("test_concurrent_requests", async {
         let app = build_app(test_config()).await;

@@ -12,6 +12,8 @@ use tower::ServiceExt;
 use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
 
+mod common;
+
 /// Build a minimal valid Config with a Codex-style provider (oauth + openai).
 fn codex_test_config() -> Config {
     Config {
@@ -100,7 +102,8 @@ fn codex_test_config() -> Config {
     }
 }
 
-async fn build_app(config: Config) -> axum::Router {
+async fn build_app(mut config: Config) -> axum::Router {
+    common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
     server.build_router()
 }

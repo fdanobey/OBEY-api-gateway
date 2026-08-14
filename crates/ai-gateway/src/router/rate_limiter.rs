@@ -1,6 +1,7 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 /// Hard upper bound that any cooldown is clamped to before being applied.
 ///
@@ -189,10 +190,8 @@ mod tests {
     use super::*;
     use tokio::time::sleep;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_cooldown_blocks_unlimited_bucket() {
-        // Even providers with no per-minute limit must honor an
-        // upstream-driven cooldown window.
         let limiter = RateLimiter::new(0);
         assert!(limiter.consume().await);
 
@@ -201,13 +200,13 @@ mod tests {
         assert!(!limiter.consume().await);
         assert!(limiter.cooldown_remaining().await.is_some());
 
-        sleep(Duration::from_millis(120)).await;
+        tokio::time::advance(Duration::from_millis(120)).await;
         assert!(limiter.cooldown_remaining().await.is_none());
         assert!(limiter.check_available().await);
         assert!(limiter.consume().await);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_cooldown_blocks_token_bucket() {
         let limiter = RateLimiter::new(60);
         assert!(limiter.consume().await);
@@ -215,7 +214,7 @@ mod tests {
         limiter.apply_cooldown(Duration::from_millis(80)).await;
         assert!(!limiter.consume().await);
 
-        sleep(Duration::from_millis(120)).await;
+        tokio::time::advance(Duration::from_millis(120)).await;
         assert!(limiter.consume().await);
     }
 
@@ -280,7 +279,7 @@ mod tests {
         assert!(!limiter.consume().await);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_token_refill() {
         let limiter = RateLimiter::new(60); // 60 requests per minute = 1 per second
 
@@ -291,7 +290,7 @@ mod tests {
 
         assert!(!limiter.check_available().await);
 
-        // Wait for 1 second to refill 1 token
+        // Wait for 1 second to refill 1 token (fast-forwarded: paused clock)
         sleep(Duration::from_millis(1100)).await;
 
         assert!(limiter.check_available().await);
@@ -322,7 +321,7 @@ mod tests {
         assert!(!limiter.check_available().await);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_token_refill_caps_at_capacity() {
         let limiter = RateLimiter::new(10);
 
@@ -331,7 +330,7 @@ mod tests {
             assert!(limiter.consume().await);
         }
 
-        // Wait long enough to refill more than capacity
+        // Wait long enough to refill more than capacity (fast-forwarded)
         sleep(Duration::from_secs(2)).await;
 
         // Should have capacity tokens, not more
@@ -343,7 +342,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_fractional_token_accumulation() {
         let limiter = RateLimiter::new(60); // 1 token per second
 
@@ -381,8 +380,15 @@ mod tests {
                 rate_limit in 10u32..100u32,
                 burst_size in 1usize..20usize,
             ) {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
+        // Paused clock: the 1s wait fast-forwards instantly while the
+        // limiter still observes a full second of virtual elapsed time
+        // (tokio::time::Instant), keeping the refill math deterministic.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        rt.block_on(async {
                     let limiter = RateLimiter::new(rate_limit);
                     let start = std::time::Instant::now();
                     let mut successful_requests = 0u32;

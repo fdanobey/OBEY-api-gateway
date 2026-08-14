@@ -21,12 +21,17 @@ pub trait VectorRetryCallback: Send + Sync {
     async fn retry_pending(&self) -> Result<u64, MemoryError>;
 }
 
+pub trait EvictionEventPublisher: Send + Sync {
+    fn publish_eviction(&self, namespace: &str, count: u64);
+}
+
 /// Owns exactly one decay task and cancels it when replaced or dropped.
 pub struct DecayScheduler {
     store: MemoryStore,
     metrics: Arc<MemoryMetrics>,
     max_memories_per_namespace: usize,
     vector_retry: Option<Arc<dyn VectorRetryCallback>>,
+    eviction_publisher: Option<Arc<dyn EvictionEventPublisher>>,
     cancel: Option<watch::Sender<bool>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -57,6 +62,7 @@ impl DecayScheduler {
             metrics,
             max_memories_per_namespace,
             vector_retry: None,
+            eviction_publisher: None,
             cancel: None,
             handle: None,
         };
@@ -66,6 +72,10 @@ impl DecayScheduler {
 
     pub fn set_vector_retry_callback(&mut self, callback: Arc<dyn VectorRetryCallback>) {
         self.vector_retry = Some(callback);
+    }
+
+    pub fn set_eviction_publisher(&mut self, publisher: Arc<dyn EvictionEventPublisher>) {
+        self.eviction_publisher = Some(publisher);
     }
 
     pub fn restart_decay_scheduler(
@@ -85,6 +95,7 @@ impl DecayScheduler {
             period,
             max_memories_per_namespace,
             self.vector_retry.clone(),
+            self.eviction_publisher.clone(),
             vector_retry_receiver,
         ));
 
@@ -98,6 +109,7 @@ impl DecayScheduler {
     pub async fn run_once(&self) -> Result<DecayCycleResult, MemoryError> {
         let result = run_cycle(self.store.clone(), self.max_memories_per_namespace).await?;
         self.metrics.record_decay_evictions(result.evicted_count);
+        publish_evictions(self.eviction_publisher.as_deref(), &result);
         Ok(result)
     }
 
@@ -132,6 +144,7 @@ fn spawn_scheduler(
     period: Duration,
     max_memories_per_namespace: usize,
     vector_retry: Option<Arc<dyn VectorRetryCallback>>,
+    eviction_publisher: Option<Arc<dyn EvictionEventPublisher>>,
     mut cancel: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -153,8 +166,9 @@ fn spawn_scheduler(
             error!(error = %error, "memory vector retry cycle failed");
             }
             }
-            for eviction in &result.namespace_evictions {
-            info!(
+                    publish_evictions(eviction_publisher.as_deref(), &result);
+                    for eviction in &result.namespace_evictions {
+                        info!(
             namespace = %eviction.namespace,
             evicted_count = eviction.evicted_count,
             lowest_evicted_score = eviction.lowest_evicted_score,
@@ -168,6 +182,15 @@ fn spawn_scheduler(
             }
         }
     })
+}
+
+fn publish_evictions(publisher: Option<&dyn EvictionEventPublisher>, result: &DecayCycleResult) {
+    let Some(publisher) = publisher else {
+        return;
+    };
+    for eviction in &result.namespace_evictions {
+        publisher.publish_eviction(&eviction.namespace, eviction.evicted_count);
+    }
 }
 
 async fn run_cycle(
@@ -195,6 +218,7 @@ mod tests {
             metrics: Arc::new(MemoryMetrics::new()),
             max_memories_per_namespace: 10,
             vector_retry: None,
+            eviction_publisher: None,
             cancel: None,
             handle: None,
         };

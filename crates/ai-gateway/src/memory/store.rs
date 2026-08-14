@@ -18,7 +18,7 @@ use super::metrics::{MemoryMetrics, NamespaceType};
 use super::namespace::validate_namespace as is_valid_namespace;
 use super::{MemoryEntry, MemoryError, MemoryType, ScoredMemory};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 pub const DEFAULT_MAX_MEMORIES_PER_NAMESPACE: usize = 1_000;
 const MAX_LIST_LIMIT: usize = 200;
 const MAX_RETRIEVAL_CANDIDATES: usize = 50;
@@ -70,8 +70,11 @@ pub struct MemoryStats {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ProjectNamespace {
+pub struct MemoryNamespace {
     pub namespace: String,
+    pub context_kind: String,
+    pub display_name: Option<String>,
+    pub client_name: Option<String>,
     pub entry_count: u64,
     pub last_activity: DateTime<Utc>,
 }
@@ -563,25 +566,55 @@ WHERE vector_index_status = 'not_configured'",
         })
     }
 
-    pub fn list_project_namespaces(&self) -> Result<Vec<ProjectNamespace>, MemoryError> {
+    pub fn list_namespaces(&self) -> Result<Vec<MemoryNamespace>, MemoryError> {
         let conn = self.connection()?;
         let mut statement = conn.prepare(
-            "SELECT namespace, count(*), max(last_accessed_at)
-             FROM memories
-             WHERE instr(namespace, '::project::') > 0
-             GROUP BY namespace
-             ORDER BY namespace ASC",
+            "SELECT m.namespace,
+                    CASE WHEN instr(m.namespace, '::project::') > 0 THEN 'project'
+                         WHEN instr(m.namespace, '::agent::') > 0 THEN 'agent'
+                         ELSE 'user' END,
+                    n.display_name, n.client_name, count(*), max(m.last_accessed_at)
+             FROM memories m
+             LEFT JOIN memory_namespaces n ON n.namespace = m.namespace
+             GROUP BY m.namespace, n.display_name, n.client_name
+             ORDER BY m.namespace ASC",
         )?;
-        let projects = statement
+        let namespaces = statement
             .query_map([], |row| {
-                Ok(ProjectNamespace {
+                Ok(MemoryNamespace {
                     namespace: row.get(0)?,
-                    entry_count: checked_db_u64(row.get(1)?, 1)?,
-                    last_activity: timestamp_from_db(row.get(2)?, 2)?,
+                    context_kind: row.get(1)?,
+                    display_name: row.get(2)?,
+                    client_name: row.get(3)?,
+                    entry_count: checked_db_u64(row.get(4)?, 4)?,
+                    last_activity: timestamp_from_db(row.get(5)?, 5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(projects)
+        Ok(namespaces)
+    }
+
+    pub fn upsert_namespace_labels(
+        &self,
+        namespace: &str,
+        context_kind: &str,
+        display_name: Option<&str>,
+        client_name: Option<&str>,
+    ) -> Result<(), MemoryError> {
+        validate_namespace(namespace)?;
+        if !matches!(context_kind, "project" | "agent" | "user") {
+            return Err(MemoryError::Config("invalid context kind".to_owned()));
+        }
+        self.connection()?.execute(
+            "INSERT INTO memory_namespaces(namespace, context_kind, display_name, client_name)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(namespace) DO UPDATE SET
+               context_kind = excluded.context_kind,
+               display_name = coalesce(excluded.display_name, memory_namespaces.display_name),
+               client_name = coalesce(excluded.client_name, memory_namespaces.client_name)",
+            params![namespace, context_kind, display_name, client_name],
+        )?;
+        Ok(())
     }
 
     pub fn run_decay_cycle(
@@ -745,10 +778,16 @@ ORDER BY coalesce(vector_next_retry_at, 0) ASC, id ASC",
                 vector_next_retry_at INTEGER,
                 vector_last_error TEXT
             );
-            CREATE TABLE IF NOT EXISTS memory_metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );",
+        CREATE TABLE IF NOT EXISTS memory_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS memory_namespaces (
+            namespace TEXT PRIMARY KEY,
+            context_kind TEXT NOT NULL CHECK(context_kind IN ('project', 'agent', 'user')),
+            display_name TEXT CHECK(display_name IS NULL OR length(display_name) BETWEEN 1 AND 64),
+            client_name TEXT CHECK(client_name IS NULL OR length(client_name) BETWEEN 1 AND 64)
+        );",
         )?;
         Self::migrate_schema(&transaction)?;
         transaction.execute_batch(
@@ -1326,14 +1365,12 @@ WHERE id = ?1",
         assert_eq!(stats.average_relevance_score, 0.5);
         assert!(stats.storage_size_bytes.unwrap() > 0);
         assert_eq!(stats.last_decay_cycle, Some(decay));
-        assert_eq!(
-            store.list_project_namespaces().unwrap(),
-            vec![ProjectNamespace {
-                namespace: "user::a::project::hash".to_string(),
-                entry_count: 1,
-                last_activity: at(1_700_000_101),
-            }]
-        );
+        let namespaces = store.list_namespaces().unwrap();
+        assert_eq!(namespaces.len(), 2);
+        assert_eq!(namespaces[0].context_kind, "agent");
+        assert_eq!(namespaces[1].context_kind, "project");
+        assert_eq!(namespaces[1].entry_count, 1);
+        assert_eq!(namespaces[1].last_activity, at(1_700_000_101));
     }
 
     #[test]

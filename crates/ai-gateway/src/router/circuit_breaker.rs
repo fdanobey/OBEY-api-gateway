@@ -159,13 +159,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_circuit_breaker_transitions_to_half_open() {
-        let cb = CircuitBreaker::new(1);
+        // Short backoff keeps the wall-clock wait tiny; the default 5 s first
+        // backoff value is asserted in test_circuit_breaker_opens_after_threshold.
+        let cb = CircuitBreaker::with_backoff_sequence(1, vec![Duration::from_millis(50)]);
 
         cb.record_failure().await;
         assert!(!cb.is_available().await);
 
         // Wait for backoff period
-        sleep(Duration::from_millis(5100)).await;
+        sleep(Duration::from_millis(60)).await;
 
         assert!(cb.is_available().await);
         assert_eq!(cb.get_state().await, CircuitState::HalfOpen);
@@ -173,12 +175,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_circuit_breaker_closes_on_success() {
-        let cb = CircuitBreaker::new(1);
+        let cb = CircuitBreaker::with_backoff_sequence(1, vec![Duration::from_millis(50)]);
 
         cb.record_failure().await;
         assert!(!cb.is_available().await);
 
-        sleep(Duration::from_millis(5100)).await;
+        sleep(Duration::from_millis(60)).await;
 
         // is_available transitions to half-open
         assert!(cb.is_available().await);

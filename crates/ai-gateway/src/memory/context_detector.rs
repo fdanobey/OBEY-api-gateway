@@ -11,6 +11,13 @@ use super::ContextType;
 
 const MIN_SYSTEM_PROMPT_CHARS: usize = 200;
 const MAX_FINGERPRINT_CHARS: usize = 500;
+pub const MAX_CONTEXT_LABEL_CHARS: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedContext {
+    pub context: ContextType,
+    pub display_name: Option<String>,
+}
 
 static WINDOWS_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(?:^|[^A-Za-z0-9_])([A-Z]:\\[^\s\x00-\x1f<>|?*"]+)"#)
@@ -46,18 +53,32 @@ impl ContextDetector {
 
     /// Detects context from an OpenAI request.
     pub fn detect(&self, request: &OpenAIRequest) -> ContextType {
-        self.detect_messages(&request.messages)
+        self.detect_with_label(request).context
+    }
+
+    pub fn detect_with_label(&self, request: &OpenAIRequest) -> DetectedContext {
+        self.detect_messages_with_label(&request.messages)
     }
 
     /// Detects context from a message slice.
     pub fn detect_messages(&self, messages: &[Message]) -> ContextType {
+        self.detect_messages_with_label(messages).context
+    }
+
+    pub fn detect_messages_with_label(&self, messages: &[Message]) -> DetectedContext {
         let message_texts: Vec<String> = messages.iter().map(Message::content_as_text).collect();
 
-        if let Some(project_hash) = detect_project(&message_texts) {
-            return ContextType::Project(project_hash);
+        if let Some((project_hash, display_name)) = detect_project(&message_texts) {
+            return DetectedContext {
+                context: ContextType::Project(project_hash),
+                display_name,
+            };
         }
 
-        self.detect_agent(messages).unwrap_or(ContextType::User)
+        DetectedContext {
+            context: self.detect_agent(messages).unwrap_or(ContextType::User),
+            display_name: None,
+        }
     }
 
     fn detect_agent(&self, messages: &[Message]) -> Option<ContextType> {
@@ -89,7 +110,7 @@ impl Default for ContextDetector {
     }
 }
 
-fn detect_project(message_texts: &[String]) -> Option<String> {
+fn detect_project(message_texts: &[String]) -> Option<(String, Option<String>)> {
     let mut windows_paths = Vec::new();
     let mut unix_paths = Vec::new();
 
@@ -101,7 +122,30 @@ fn detect_project(message_texts: &[String]) -> Option<String> {
 
     project_prefix(&windows_paths, PathStyle::Windows)
         .or_else(|| project_prefix(&unix_paths, PathStyle::Unix))
-        .map(|prefix| short_hash(&prefix))
+        .map(|prefix| {
+            let display_name = project_basename(&prefix);
+            (short_hash(&prefix), display_name)
+        })
+}
+
+fn project_basename(prefix: &str) -> Option<String> {
+    let candidate = prefix
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()?;
+    sanitize_label(candidate)
+}
+
+pub fn sanitize_label(value: &str) -> Option<String> {
+    let sanitized: String = value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, ' ' | '_' | '-')
+        })
+        .take(MAX_CONTEXT_LABEL_CHARS)
+        .collect();
+    let sanitized = sanitized.trim().to_owned();
+    (!sanitized.is_empty()).then_some(sanitized)
 }
 
 #[derive(Clone, Copy)]
@@ -238,6 +282,19 @@ mod tests {
             ContextType::Project(hash) => hash,
             other => panic!("expected project context, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn labels_use_only_bounded_project_basename() {
+        let detector = ContextDetector::default();
+        let detected = detector.detect_messages_with_label(&[
+            message("user", r"C:\\Users\\secret\\Safe Project!\\src\\main.rs"),
+            message("user", r"C:\\Users\\secret\\Safe Project!\\tests\\api.rs"),
+        ]);
+        assert!(matches!(detected.context, ContextType::Project(_)));
+        assert_eq!(detected.display_name.as_deref(), Some("Safe Project"));
+        assert!(!detected.display_name.unwrap().contains("secret"));
+        assert!(sanitize_label(&"x".repeat(100)).unwrap().len() <= MAX_CONTEXT_LABEL_CHARS);
     }
 
     #[test]
