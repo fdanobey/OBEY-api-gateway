@@ -15,6 +15,7 @@ fn request(tool_fingerprint: Option<u64>) -> RequestRecord {
         cost: 0.01,
         has_tool_calls: tool_fingerprint.is_some(),
         tool_names: Vec::new(),
+        discovery_keys: Vec::new(),
         timestamp: Instant::now(),
     }
 }
@@ -145,4 +146,59 @@ fn all_signal_values_are_bounded() {
     for (_, value) in signals.iter() {
         assert!((0.0..=1.0).contains(&value));
     }
+}
+
+#[test]
+fn discovery_loop_raises_tool_call_repetition() {
+    let mut session = SessionState::new(Some("vk".into()), 8);
+
+    // Seed two ordinary requests so the signal computer is out of its warm-up gate.
+    session.record_request(&request(None));
+    session.record_request(&request(None));
+
+    // Mirror the middleware order: compute runs BEFORE record_request, so the signal
+    // never sees the current request's own discovery keys in the history yet.
+    // First disclosure of namespace `fs`: history is still empty, so no repeat yet.
+    let mut first = request(None);
+    first.discovery_keys = vec!["ns:fs".into()];
+    let first_signals = SignalComputer::compute(
+        &session,
+        &first,
+        None,
+        &LoopDetectionConfig::default(),
+        None,
+    );
+    assert_eq!(first_signals.tool_call_repetition, 0.0);
+    session.record_request(&first);
+
+    // An unrelated request in between (so the re-drill is NOT consecutive).
+    session.record_request(&request(None));
+
+    // Re-drill of `ns:fs`: the non-consecutive discovery repeat must be detected.
+    let mut redrill = request(None);
+    redrill.discovery_keys = vec!["ns:fs".into()];
+    let signals = SignalComputer::compute(
+        &session,
+        &redrill,
+        None,
+        &LoopDetectionConfig::default(),
+        None,
+    );
+    assert!(
+        signals.tool_call_repetition > 0.0,
+        "non-consecutive synthetic discovery re-drill should be monitored"
+    );
+    session.record_request(&redrill);
+
+    // A genuine (non-discovery) tool call must not be flagged by this mechanism.
+    let mut real = request(None);
+    real.discovery_keys = vec![];
+    let real_signals = SignalComputer::compute(
+        &session,
+        &real,
+        None,
+        &LoopDetectionConfig::default(),
+        None,
+    );
+    assert_eq!(real_signals.tool_call_repetition, 0.0);
 }

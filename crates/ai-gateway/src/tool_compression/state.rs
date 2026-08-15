@@ -27,6 +27,13 @@ pub struct ToolCompressionState {
     /// their full schemas revealed in a given session.
     pub disclosure_state: DashMap<String, HashSet<String>>,
 
+    /// Per-session disclosed discovery targets (session_id → HashSet<canonical key>),
+    /// where keys are `ns:<namespace>` or `tool:<tool_name>`. Tracks which synthetic
+    /// drill-downs (`get_tools_in_namespace` / `get_tool_schema` / `ns_*`) have already
+    /// been revealed this session so re-drills can be reminded from session cache
+    /// instead of silently re-resolved, strengthening multi-turn memory.
+    pub disclosure_targets: DashMap<String, HashSet<String>>,
+
     /// Per-session tool usage tracking (session_id → HashMap<tool_name, count>).
     /// Used by Tool_Pruner to identify unused tools for removal.
     pub session_usage: DashMap<String, HashMap<String, u64>>,
@@ -79,6 +86,7 @@ impl ToolCompressionState {
 
         Self {
             disclosure_state: DashMap::new(),
+            disclosure_targets: DashMap::new(),
             session_usage: DashMap::new(),
             session_request_count: DashMap::new(),
             key_usage: DashMap::new(),
@@ -133,6 +141,7 @@ mod tests {
         let state = ToolCompressionState::new(&config);
 
         assert!(state.disclosure_state.is_empty());
+        assert!(state.disclosure_targets.is_empty());
         assert!(state.session_usage.is_empty());
         assert!(state.session_request_count.is_empty());
         assert!(state.key_usage.is_empty());

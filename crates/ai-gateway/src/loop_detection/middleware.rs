@@ -385,8 +385,56 @@ fn request_record(request: &OpenAIRequest) -> RequestRecord {
             })
             .map(str::to_string)
             .collect(),
+        discovery_keys: synthetic_discovery_keys(&tool_calls),
         timestamp: Instant::now(),
     }
+}
+
+/// Map synthetic tool-compression drill-down tool calls to canonical discovery keys
+/// so the loop detector can monitor re-discovery of the same namespace/tool even when
+/// it is not the immediately consecutive request. Returns deduped keys such as
+/// `ns:fs`, `tool:fs_read`. Ordinary tool calls produce no keys.
+fn synthetic_discovery_keys(tool_calls: &[serde_json::Value]) -> Vec<String> {
+    use crate::tool_compression::resolver::{GET_TOOL_SCHEMA, GET_TOOLS_IN_NAMESPACE, NS_PREFIX};
+    let mut keys: Vec<String> = Vec::new();
+    for call in tool_calls {
+        let Some(function) = call.get("function").or(Some(call)) else {
+            continue;
+        };
+        let Some(name) = function.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let args = function.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+        let key = if name == GET_TOOLS_IN_NAMESPACE {
+            serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|parsed| {
+                    parsed
+                        .get("namespace")
+                        .and_then(|n| n.as_str())
+                        .map(|ns| format!("ns:{ns}"))
+                })
+        } else if name == GET_TOOL_SCHEMA {
+            serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|parsed| {
+                    parsed
+                        .get("tool_name")
+                        .and_then(|n| n.as_str())
+                        .map(|tn| format!("tool:{tn}"))
+                })
+        } else if name.starts_with(NS_PREFIX) {
+            Some(format!("ns:{}", &name[NS_PREFIX.len()..]))
+        } else {
+            None
+        };
+        if let Some(key) = key {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
 }
 
 fn estimate_new_information_tokens(request: &OpenAIRequest) -> u32 {

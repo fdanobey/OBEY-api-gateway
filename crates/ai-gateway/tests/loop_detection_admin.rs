@@ -35,6 +35,7 @@ proptest! {
             cost: 1.0,
             has_tool_calls: true,
             tool_names: vec!["tool".into()],
+            discovery_keys: vec![],
             timestamp: Instant::now(),
         });
 

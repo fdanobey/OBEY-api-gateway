@@ -68,6 +68,11 @@ pub struct RequestRecord {
     pub cost: f64,
     pub has_tool_calls: bool,
     pub tool_names: Vec<String>,
+    /// Canonical identifiers of synthetic drill-down tool calls in this request
+    /// (`get_tools_in_namespace`, `get_tool_schema`, `ns_*`); e.g. `ns:fs`,
+    /// `tool:fs_read`. Empty for ordinary requests. Consumed by the loop
+    /// detector so tool-compression discovery loops are monitored.
+    pub discovery_keys: Vec<String>,
     pub timestamp: Instant,
 }
 
@@ -85,6 +90,14 @@ pub struct SessionState {
     pub total_cost: f64,
     pub error_count: u32,
     pub error_retry_cycles: u32,
+    /// Canonical identifiers of synthetic drill-down tool calls seen this session
+    /// (e.g. `ns:fs`), bounded by `history_depth`. Used to monitor tool-compression
+    /// discovery loops even when the same namespace is re-drilled non-consecutively.
+    pub discovery_history: VecDeque<String>,
+    /// Cumulative count of re-observations of an already-disclosed namespace/tool
+    /// within the session. Drives the `discovery_loop` contribution folded into the
+    /// `tool_call_repetition` signal.
+    pub discovery_repeat: u32,
     pub consecutive_tool_fingerprint_count: u32,
     pub enforcement_level: EnforcementLevel,
     pub consecutive_high: u32,
@@ -116,6 +129,8 @@ impl SessionState {
             total_cost: 0.0,
             error_count: 0,
             error_retry_cycles: 0,
+            discovery_history: VecDeque::with_capacity(history_depth),
+            discovery_repeat: 0,
             consecutive_tool_fingerprint_count: 0,
             enforcement_level: EnforcementLevel::None,
             consecutive_high: 0,
@@ -144,6 +159,16 @@ impl SessionState {
         );
         if let Some(fingerprint) = request.tool_call_fingerprint {
             push_bounded(&mut self.tool_fingerprints, fingerprint, self.history_depth);
+        }
+        if !request.discovery_keys.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            for key in &request.discovery_keys {
+                let is_new = seen.insert(key.clone());
+                if is_new && self.discovery_history.contains(key) {
+                    self.discovery_repeat = self.discovery_repeat.saturating_add(1);
+                }
+                push_bounded(&mut self.discovery_history, key.clone(), self.history_depth);
+            }
         }
         push_bounded(&mut self.timestamps, request.timestamp, self.history_depth);
         push_bounded(

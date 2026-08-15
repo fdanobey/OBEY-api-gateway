@@ -46,9 +46,11 @@ impl SignalComputer {
         }
 
         let content_similarity = content_similarity(session, request.content_simhash);
+        let tool_call_repetition_value =
+            tool_call_repetition(session, request).max(discovery_repetition(session, request));
         SignalValues {
             content_similarity,
-            tool_call_repetition: tool_call_repetition(session, request),
+            tool_call_repetition: tool_call_repetition_value,
             response_stagnation: response_stagnation(session, response),
             token_velocity: token_velocity(session, request, config.token_velocity_threshold),
             error_cycling: error_cycling(session, response, content_similarity),
@@ -80,6 +82,31 @@ fn tool_call_repetition(session: &SessionState, request: &RequestRecord) -> f32 
         .take_while(|fingerprint| **fingerprint == current)
         .count() as u32;
     repetition_score(consecutive_previous.saturating_add(1))
+}
+
+/// Monitors tool-compression discovery loops: repeated `get_tools_in_namespace`,
+/// `get_tool_schema`, or `ns_*` drill-downs into a namespace/tool already revealed
+/// earlier in the session. Unlike `tool_call_repetition` (consecutive only), this
+/// counts re-observations anywhere in the session history so a slow, non-consecutive
+/// discovery loop is still detected. Returns a value in `[0, 1]`.
+fn discovery_repetition(session: &SessionState, request: &RequestRecord) -> f32 {
+    if request.discovery_keys.is_empty() {
+        return 0.0;
+    }
+    let mut re_observations = 0u32;
+    let mut seen = std::collections::HashSet::new();
+    for key in &request.discovery_keys {
+        if seen.insert(key.clone()) && session.discovery_history.contains(key) {
+            re_observations = re_observations.saturating_add(1);
+        }
+    }
+    if re_observations == 0 {
+        return 0.0;
+    }
+    // `discovery_repeat` holds the cumulative count prior to this request; add the
+    // re-observations seen now. Map to the same 0/0.4/0.7/1.0 ladder as repetition.
+    let total = session.discovery_repeat.saturating_add(re_observations);
+    repetition_score(total.saturating_add(1))
 }
 
 fn response_stagnation(session: &SessionState, response: Option<&ResponseDescriptor>) -> f32 {

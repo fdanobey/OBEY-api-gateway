@@ -15,6 +15,7 @@ fn record(sequence: u32, timestamp: Instant) -> RequestRecord {
         cost: f64::from(sequence),
         has_tool_calls: true,
         tool_names: vec![],
+        discovery_keys: vec![],
         timestamp,
     }
 }

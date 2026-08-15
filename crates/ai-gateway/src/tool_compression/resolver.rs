@@ -11,6 +11,7 @@
 //! tool names that were disclosed (so the caller can persist them for multi-turn use).
 
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 use crate::tool_compression::stages::disclosure::resolve_get_tool_schema;
 use crate::tool_compression::types::ToolDefinition;
@@ -27,6 +28,36 @@ pub const NS_PREFIX: &str = "ns_";
 /// disclosed schemas instead of re-calling `get_tools_in_namespace` for the same
 /// namespace later in the same session — eliminating redundant discovery round-trips.
 pub const SESSION_CACHE_HINT: &str = "\n\nSession cache: these schemas remain valid for the rest of the session. Reuse them for all subsequent calls to these tools and do not call get_tools_in_namespace for this namespace again.";
+
+/// Stronger suffix used when the model re-drills a namespace/tool that was already
+/// disclosed earlier in the session (`already_disclosed`). The first hint is only
+/// visible server-side (it never reaches the client's transcript), so a re-drill must
+/// be met with a sharper reminder that the schemas are already known and callable.
+pub const REDRILL_HINT: &str = "\n\nSession cache: you already retrieved these schemas earlier in this session; they remain valid and callable. Do NOT call the discovery tool for this target again — reuse the schemas already provided.";
+
+/// Canonical discovery key for a synthetic drill-down tool call, or `None` when the
+/// call is not a synthetic tool (`get_tool_schema` / `get_tools_in_namespace` / `ns_*`).
+/// Keys are `ns:<namespace>` or `tool:<tool_name>` and are matched against the
+/// per-session `disclosure_targets` set to detect re-drills.
+pub fn discovery_key(name: &str, arguments: &str) -> Option<String> {
+    if name == GET_TOOLS_IN_NAMESPACE {
+        let parsed: Value = serde_json::from_str(arguments).ok()?;
+        parsed
+            .get("namespace")
+            .and_then(|n| n.as_str())
+            .map(|ns| format!("ns:{ns}"))
+    } else if name == GET_TOOL_SCHEMA {
+        let parsed: Value = serde_json::from_str(arguments).ok()?;
+        parsed
+            .get("tool_name")
+            .and_then(|n| n.as_str())
+            .map(|tn| format!("tool:{tn}"))
+    } else if name.starts_with(NS_PREFIX) {
+        Some(format!("ns:{}", &name[NS_PREFIX.len()..]))
+    } else {
+        None
+    }
+}
 
 /// Returns the namespace prefix of a tool name (first segment before `_` or `.`).
 /// Tools without a separator belong to the implicit `"other"` namespace.
@@ -89,12 +120,16 @@ pub fn resolve_synthetic_tool_call(
 /// back (as `tool` messages) into `req_json["messages"]`, and re-inject the disclosed
 /// full tool schemas into `req_json["tools"]` so the model can call them on the next
 /// model turn.
-///
 /// `max_reinject` bounds how many tool schemas are re-injected into `req_json["tools"]`
 /// for a single `get_tools_in_namespace` drill-down. This keeps the provider below its
 /// tool-count limit (e.g. "maximum of 100 tools allowed"): when a namespace holds more
 /// tools than `max_reinject` (and `max_reinject > 0`), only the first `max_reinject` are
 /// made callable this turn and the tool result notes the remainder. `0` disables the cap.
+///
+/// `already_disclosed` is the set of canonical discovery keys (`ns:<namespace>` /
+/// `tool:<tool_name>`) already revealed in this session. When a drill-down targets an
+/// already-disclosed key, a stronger reminder ([`REDRILL_HINT`]) is appended so the model
+/// stops re-discovering schemas it already has.
 ///
 /// Returns `Some(disclosed_tool_names)` when at least one synthetic call was resolved
 /// (the caller should persist these for multi-turn disclosure), or `None` otherwise.
@@ -103,6 +138,7 @@ pub fn resolve_synthetic_in_response(
     req_json: &mut Value,
     original_tools: &[ToolDefinition],
     max_reinject: u32,
+    already_disclosed: &HashSet<String>,
 ) -> Option<Vec<String>> {
     let choices = resp_json.get("choices").and_then(|c| c.as_array())?;
     let first = choices.first()?;
@@ -204,8 +240,19 @@ pub fn resolve_synthetic_in_response(
 
         // Namespace drill-downs disclose every tool in the namespace at once;
         // hint the model to reuse them instead of re-drilling the same namespace.
+        // A re-drill of an already-disclosed target gets a sharper reminder.
         if name == GET_TOOLS_IN_NAMESPACE || name.starts_with(NS_PREFIX) {
-            content.push_str(SESSION_CACHE_HINT);
+            let key = discovery_key(name, args).unwrap_or_default();
+            if already_disclosed.contains(&key) {
+                content.push_str(REDRILL_HINT);
+            } else {
+                content.push_str(SESSION_CACHE_HINT);
+            }
+        } else if name == GET_TOOL_SCHEMA {
+            let key = discovery_key(name, args).unwrap_or_default();
+            if already_disclosed.contains(&key) {
+                content.push_str(REDRILL_HINT);
+            }
         }
 
         tool_results.push(json!({
@@ -323,7 +370,8 @@ mod tests {
             "tools": [{"type":"function","function":{"name":"get_tools_in_namespace"}}],
             "messages": [{"role":"user","content":"list files"}]
         });
-        let disclosed = resolve_synthetic_in_response(&resp, &mut req, &tools, 0).expect("handled");
+        let disclosed =
+            resolve_synthetic_in_response(&resp, &mut req, &tools, 0, &HashSet::new()).expect("handled");
         assert_eq!(disclosed.len(), 2);
 
         let msgs = req["messages"].as_array().unwrap();
@@ -360,7 +408,8 @@ mod tests {
             "tools": [{"type":"function","function":{"name":"get_tools_in_namespace"}}],
             "messages": [{"role":"user","content":"list files"}]
         });
-        let disclosed = resolve_synthetic_in_response(&resp, &mut req, &tools, 3).expect("handled");
+        let disclosed =
+            resolve_synthetic_in_response(&resp, &mut req, &tools, 3, &HashSet::new()).expect("handled");
         assert_eq!(disclosed.len(), 3, "only capped number should be disclosed");
 
         let tools_arr = req["tools"].as_array().unwrap();
@@ -400,7 +449,7 @@ mod tests {
             }]
         });
         let mut req = json!({"tools":[], "messages":[]});
-        assert!(resolve_synthetic_in_response(&resp, &mut req, &tools, 0).is_none());
+        assert!(resolve_synthetic_in_response(&resp, &mut req, &tools, 0, &HashSet::new()).is_none());
     }
 
     #[test]
@@ -440,10 +489,76 @@ mod tests {
             "tools": [{"type":"function","function":{"name":"ns_fs"}}],
             "messages": [{"role":"user","content":"list files"}]
         });
-        let disclosed = resolve_synthetic_in_response(&resp, &mut req, &tools, 0)
+        let disclosed = resolve_synthetic_in_response(&resp, &mut req, &tools, 0, &HashSet::new())
             .expect("ns_fs must be resolved, not relayed");
         assert!(disclosed.contains(&"fs_read".to_string()));
         assert!(disclosed.contains(&"fs_write".to_string()));
         assert!(!disclosed.contains(&"git_log".to_string()));
+    }
+
+    #[test]
+    fn resolve_in_response_uses_redrill_hint_when_already_disclosed() {
+        let tools = vec![make_tool("fs_read"), make_tool("fs_write")];
+        let resp = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_tools_in_namespace", "arguments": "{\"namespace\":\"fs\"}"}
+                    }]
+                }
+            }]
+        });
+        let mut req = json!({
+            "tools": [{"type":"function","function":{"name":"get_tools_in_namespace"}}],
+            "messages": [{"role":"user","content":"list files"}]
+        });
+        // First disclosure uses the gentle session-cache hint.
+        resolve_synthetic_in_response(&resp, &mut req, &tools, 0, &HashSet::new())
+            .expect("first disclosure resolves");
+        let first_content = req["messages"].as_array().unwrap()[2]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(first_content.contains(SESSION_CACHE_HINT));
+        assert!(!first_content.contains(REDRILL_HINT));
+
+        // Re-drill of the same namespace must switch to the stronger reminder and not
+        // repeat the gentle hint.
+        let mut req2 = json!({
+            "tools": [{"type":"function","function":{"name":"get_tools_in_namespace"}}],
+            "messages": [{"role":"user","content":"list files again"}]
+        });
+        resolve_synthetic_in_response(
+            &resp,
+            &mut req2,
+            &tools,
+            0,
+            &HashSet::from(["ns:fs".to_string()]),
+        )
+        .expect("re-drill resolves");
+        let re_content = req2["messages"].as_array().unwrap()[2]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(re_content.contains(REDRILL_HINT));
+        assert!(!re_content.contains(SESSION_CACHE_HINT));
+    }
+
+    #[test]
+    fn discovery_key_canonicalises_synthetic_calls() {
+        assert_eq!(
+            discovery_key("get_tools_in_namespace", r#"{"namespace":"fs"}"#),
+            Some("ns:fs".to_string())
+        );
+        assert_eq!(
+            discovery_key("get_tool_schema", r#"{"tool_name":"fs_read"}"#),
+            Some("tool:fs_read".to_string())
+        );
+        assert_eq!(discovery_key("ns_git", "{}"), Some("ns:git".to_string()));
+        assert_eq!(discovery_key("fs_read", "{}"), None);
     }
 }

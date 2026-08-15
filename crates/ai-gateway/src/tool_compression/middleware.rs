@@ -5,6 +5,7 @@
 //! passthrough — no allocations, no JSON parsing, no body reads on the hot path.
 
 use std::{
+    collections::HashSet,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -498,6 +499,13 @@ where
             let mut req_json = json_body.clone();
             let mut steps = 0usize;
             let step_budget = synthetic_step_budget(namespace_count);
+            // Canonical discovery keys already revealed this session (namespace/grouping
+            // only). Used so re-drills are reminded from session cache instead of being
+            // silently re-resolved, strengthening multi-turn memory of disclosed tools.
+            let already_disclosed: HashSet<String> = session_id
+                .as_ref()
+                .and_then(|sid| state.disclosure_targets.get(sid).map(|set| set.clone()))
+                .unwrap_or_default();
             while synthetic_injected {
                 let sse = response_is_sse(&final_response);
                 let (resp_parts, resp_body) = final_response.into_parts();
@@ -543,6 +551,7 @@ where
                     &mut req_json,
                     &original_tools,
                     disclosure_max_tools,
+                    &already_disclosed,
                 ) {
                     Some(disclosed) => {
                         // Persist disclosed tools for multi-turn re-injection.
@@ -550,6 +559,32 @@ where
                             let mut entry = state.disclosure_state.entry(sid.clone()).or_default();
                             for n in &disclosed {
                                 entry.insert(n.clone());
+                            }
+                            // Record the discovery targets this turn so a later re-drill
+                            // is met with the stronger REDRILL_HINT reminder.
+                            let mut targets =
+                                state.disclosure_targets.entry(sid.clone()).or_default();
+                            if let Some(calls) = resp_json
+                                .pointer("/choices/0/message/tool_calls")
+                                .and_then(|v| v.as_array())
+                            {
+                                for call in calls {
+                                    let Some(fn_obj) = call.get("function").or(Some(call)) else {
+                                        continue;
+                                    };
+                                    let Some(name) =
+                                        fn_obj.get("name").and_then(|n| n.as_str())
+                                    else {
+                                        continue;
+                                    };
+                                    let args = fn_obj
+                                        .get("arguments")
+                                        .and_then(|a| a.as_str())
+                                        .unwrap_or("{}");
+                                    if let Some(key) = resolver::discovery_key(name, args) {
+                                        targets.insert(key);
+                                    }
+                                }
                             }
                         }
                     }
@@ -992,7 +1027,7 @@ mod tests {
         });
 
         let disclosed =
-            resolver::resolve_synthetic_in_response(&resp_json, &mut req_json, &originals, 0)
+            resolver::resolve_synthetic_in_response(&resp_json, &mut req_json, &originals, 0, &HashSet::new())
                 .expect("synthetic call must be resolved, not relayed");
 
         assert!(disclosed.contains(&"fs_read".to_string()));
