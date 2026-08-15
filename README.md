@@ -51,7 +51,9 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Agent loop detection** — multi-signal confidence scorer detects repetitive agent behavior (tool-call repetition, content similarity, error cycling, response stagnation, token/cost velocity, context growth) and escalates through Warn → Throttle → Inject → Hard-Stop enforcement levels; per-virtual-key overrides, session admin API, and Prometheus histograms (see [Agent Loop Detection](#agent-loop-detection))
 - **Virtual key management** — issue per-caller API keys (`vk_…`) with independent USD/token budgets, rate limits, model-access restrictions, and expiry; authenticate callers without sharing real provider keys (see [Virtual Key Management](#virtual-key-management))
 - **Encrypted API key storage** — provider keys encrypted at rest with a machine-local master key
-- **Admin panel & dashboard** — embedded web UIs for configuration, metrics, and log viewing
+- **Assistants API** — full local OpenAI-compatible Assistants implementation (assistants, threads, messages, runs, run steps, files) backed by SQLite; multi-tenant with per-virtual-key isolation, resource quotas, and run execution through gateway routing (see [Assistants API](#assistants-api))
+- **Active request tracking** — live in-flight request registry surfaces per-request phase (primary / retry / failover / cascade), target provider, elapsed time, and virtual key to the dashboard in real time
+- **Admin panel & dashboard** — embedded web UIs for configuration, metrics, in-flight request view, and log viewing
 - **Prometheus metrics** — `/metrics` endpoint for existing monitoring infrastructure
 - **Request logging** — SQLite-based structured logging with configurable retention
 - **TLS support** — optional HTTPS with certificate configuration
@@ -1155,7 +1157,7 @@ context:
 Both are embedded SPAs compiled into the binary — no external dependencies.
 
 - **Admin** (`/admin`) — provider configuration, API key management, circuit breaker status, smart model routing (classifier, tiers, cascade, simulation), token compression & tool compression settings, persistent memory configuration & entry browser, config hot-reload
-- **Dashboard** (`/dashboard`) — real-time metrics via WebSocket, provider health, compression statistics (token & tool), persistent memory event visualizations (injection/extraction/eviction timeline, namespace activity), error logs, request log viewer
+- **Dashboard** (`/dashboard`) — real-time metrics via WebSocket, provider health, in-flight request tracking (per-request phase, target provider, elapsed time), compression statistics (token & tool), persistent memory event visualizations (injection/extraction/eviction timeline, namespace activity), error logs, request log viewer
 
 ```yaml
 admin:
@@ -1170,6 +1172,58 @@ dashboard:
   enabled: true
   path: "/dashboard"
 ```
+
+## Assistants API
+
+The gateway includes a full local implementation of the OpenAI Assistants API — no upstream proxy required. All data is stored in a dedicated SQLite database (`assistants.db`, created automatically alongside your logging database).
+
+### Supported Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/v1/assistants` | Create an assistant |
+| `GET` | `/v1/assistants` | List assistants |
+| `GET` | `/v1/assistants/{id}` | Retrieve an assistant |
+| `POST` | `/v1/assistants/{id}` | Modify an assistant |
+| `DELETE` | `/v1/assistants/{id}` | Delete an assistant |
+| `POST` | `/v1/threads` | Create a thread (optional initial messages) |
+| `GET` | `/v1/threads` | List threads |
+| `GET` | `/v1/threads/{id}` | Retrieve a thread |
+| `POST` | `/v1/threads/{id}` | Modify a thread |
+| `DELETE` | `/v1/threads/{id}` | Delete a thread (cascades) |
+| `POST` | `/v1/threads/{id}/messages` | Create a message |
+| `GET` | `/v1/threads/{id}/messages` | List messages |
+| `GET` | `/v1/threads/{id}/messages/{msg_id}` | Retrieve a message |
+| `POST` | `/v1/threads/{id}/messages/{msg_id}` | Modify a message |
+| `DELETE` | `/v1/threads/{id}/messages/{msg_id}` | Delete a message |
+| `POST` | `/v1/threads/{id}/runs` | Start a run |
+| `GET` | `/v1/threads/{id}/runs` | List runs |
+| `GET` | `/v1/threads/{id}/runs/{run_id}` | Get run status |
+| `POST` | `/v1/threads/{id}/runs/{run_id}/cancel` | Cancel a run |
+| `GET` | `/v1/threads/{id}/runs/{run_id}/steps` | List run steps |
+| `POST` | `/v1/files` | Upload a file |
+| `GET` | `/v1/files` | List files |
+| `GET` | `/v1/files/{file_id}` | Get file metadata |
+| `GET` | `/v1/files/{file_id}/content` | Download file content |
+| `DELETE` | `/v1/files/{file_id}` | Delete a file |
+
+### Multi-Tenant Isolation
+
+When virtual keys are enabled, each `vk_` key gets its own isolated namespace. Assistants, threads, messages, and files created by one key are invisible to another. Resource quotas are enforced per-owner:
+
+| Resource | Limit |
+|----------|-------|
+| Threads per owner | 1,000 |
+| Messages per thread | 10,000 |
+| Files per owner | 1,000 |
+| File storage per owner | 256 MB |
+| Single file size | 4 MB |
+
+### Run Execution
+
+When a run is started, the gateway builds a chat completion request from the thread's messages plus the assistant's instructions, then routes it through the normal model group routing (with failover, circuit breakers, etc.). The assistant's `model` field maps to a configured model group name.
+
+> **Note:** Tool action execution (model calling tools mid-run and returning results iteratively) is not yet supported. Runs that require tool outputs will complete with `requires_action` status.
 
 ## Desktop / System Tray Mode
 
@@ -1213,6 +1267,8 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── tool_compression/     # Tool definition compression: 12-stage pipeline, provider-aware middleware
 │           ├── structured_output/    # JSON Schema response validation with retry
 │           ├── smart_routing/       # Smart model routing: complexity classification, tier selection, cascade, A/B testing
+│           ├── assistants/          # OpenAI Assistants API: local SQLite-backed CRUD for assistants, threads, messages, runs, files
+│           ├── active_requests.rs   # Live in-flight request registry for dashboard phase tracking
 │           ├── memory/               # Persistent memory store: extraction, injection, decay, namespaces, Qdrant
 │           ├── secrets.rs            # API key encryption/decryption
 │           ├── error/                # Error types & HTTP status mapping
