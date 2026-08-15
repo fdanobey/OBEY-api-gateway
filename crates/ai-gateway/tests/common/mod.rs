@@ -27,7 +27,9 @@ use ai_gateway::config::Config;
 /// before those handles close causes Windows delete-failures. The OS temp
 /// cleaner reclaims the (tiny) files eventually.
 pub fn isolate_databases(config: &mut Config) {
-    let dir = tempfile::tempdir().expect("create temp dir for isolated test databases").into_path();
+    let dir = tempfile::tempdir()
+        .expect("create temp dir for isolated test databases")
+        .keep();
     config.logging.database_path = dir.join("logs.db").to_string_lossy().into_owned();
     config.virtual_keys.database_path = dir.join("keys.db").to_string_lossy().into_owned();
 }

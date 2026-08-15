@@ -76,7 +76,16 @@ fn test_config() -> Config {
         }],
         circuit_breaker: Default::default(),
         retry: RetryConfig::default(),
-        logging: LoggingConfig::default(),
+        logging: {
+            let mut lc = LoggingConfig::default();
+            lc.database_path = tempfile::tempdir()
+                .expect("temp dir for tray test logs")
+                .keep()
+                .join("logs.db")
+                .to_string_lossy()
+                .into_owned();
+            lc
+        },
         semantic_cache: None,
         exact_cache: ExactCacheConfig::default(),
         prometheus: None,

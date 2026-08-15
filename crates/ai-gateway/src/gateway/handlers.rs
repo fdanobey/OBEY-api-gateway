@@ -15,6 +15,7 @@ use axum::{
 use futures::StreamExt;
 use serde::Serialize;
 use std::convert::Infallible;
+use std::error::Error as StdError;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -4017,6 +4018,38 @@ fn chunk_carries_content(payload: &str) -> bool {
     false
 }
 
+fn reqwest_error_chain(error: &reqwest::Error) -> String {
+ let mut messages = Vec::new();
+ let mut current: Option<&(dyn StdError + 'static)> = Some(error);
+ while let Some(cause) = current {
+ let message = cause.to_string();
+ if messages.last() != Some(&message) {
+ messages.push(message);
+ }
+ current = cause.source();
+ }
+ messages.join(": ")
+}
+
+fn upstream_stream_metadata(
+ upstream: &reqwest::Response,
+) -> (reqwest::Version, String, String, Option<u64>) {
+ let version = upstream.version();
+ let content_encoding = upstream
+ .headers()
+ .get(header::CONTENT_ENCODING)
+ .and_then(|value| value.to_str().ok())
+ .unwrap_or("identity")
+ .to_owned();
+ let transfer_encoding = upstream
+ .headers()
+ .get(header::TRANSFER_ENCODING)
+ .and_then(|value| value.to_str().ok())
+ .unwrap_or("none")
+ .to_owned();
+ (version, content_encoding, transfer_encoding, upstream.content_length())
+}
+
 /// Relay a true-streaming pass-through upstream response to the client as SSE
 /// events (task 5.3, Req 3.2, 3.3, 3.6, 3.11, 3.12).
 ///
@@ -4089,10 +4122,19 @@ fn relay_passthrough_stream(
     memory_suffix: Option<String>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
-        let chunk_timeout = Duration::from_secs(streaming_config.chunk_timeout_seconds);
-        let deadline = tokio::time::Instant::now() + total_timeout;
-        let mut byte_stream = upstream.bytes_stream();
-        let mut buffer = String::new();
+ let chunk_timeout = Duration::from_secs(streaming_config.chunk_timeout_seconds);
+ let deadline = tokio::time::Instant::now() + total_timeout;
+ let (
+ upstream_version,
+ upstream_content_encoding,
+ upstream_transfer_encoding,
+ upstream_content_length,
+ ) = upstream_stream_metadata(&upstream);
+ let mut byte_stream = upstream.bytes_stream();
+
+ let mut buffer = String::new();
+ let mut bytes_received = 0usize;
+
 
         // Req 3.10: accumulate forwarded chunk payloads into an SSE buffer so a
         // clean completion can be reassembled into a cacheable response.
@@ -4128,12 +4170,30 @@ fn relay_passthrough_stream(
 
             let mut stream_ended = false;
             match tokio::time::timeout(per_chunk_wait, byte_stream.next()).await {
-                Ok(Some(Ok(bytes))) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                }
-                Ok(Some(Err(e))) => {
-                    // Req 3.4/3.6: network error mid-stream.
-                    let message = format!("Stream error: {}", e);
+ Ok(Some(Ok(bytes))) => {
+ bytes_received = bytes_received.saturating_add(bytes.len());
+ buffer.push_str(&String::from_utf8_lossy(&bytes));
+ }
+ Ok(Some(Err(e))) => {
+ // Reqwest labels every HTTP body/frame failure as a decode error,
+ // including HTTP/1 truncation and HTTP/2 resets. Preserve the source
+ // chain so the client and logs expose the actual transport failure.
+ let error_chain = reqwest_error_chain(&e);
+ let message = format!("Stream error: {error_chain}");
+ tracing::warn!(
+ trace_id = %trace_id,
+ error = %e,
+ error_debug = ?e,
+ error_chain = %error_chain,
+ http_version = ?upstream_version,
+ content_encoding = %upstream_content_encoding,
+ transfer_encoding = %upstream_transfer_encoding,
+ content_length = ?upstream_content_length,
+ bytes_received,
+ content_forwarded,
+ "Upstream streaming response body failed"
+ );
+
                     if content_forwarded {
                         for event in emit_sse_error_event("stream_error", &message, &trace_id) {
                             yield Ok(event);
@@ -4609,11 +4669,12 @@ mod tests {
         classify_stream_error, collect_structured_output_failure, eager_sse_response,
         early_event_chunk, emit_sse_error_event, force_eager_structured_stream, json_model,
         memory_feedback_chunk, multipart_model, openai_json_response, prepare_response_for_client,
-        provider_pass_through_response, rechunk_structured_response, relay_passthrough_stream,
-        requests_structured_output, should_cache_eager_structured, smart_routing_headers,
-        sse_error_payload, streaming_chunks_after_early_event, streaming_chunks_from_response,
-        structured_stream_overflow_events, RelayLineAction, RelayOutcome, RequestCompleteGuard,
-        RequestLogContext, ValidationResponseStatus,
+ provider_pass_through_response, rechunk_structured_response, relay_passthrough_stream,
+ requests_structured_output, should_cache_eager_structured, smart_routing_headers,
+ sse_error_payload, streaming_chunks_after_early_event, streaming_chunks_from_response,
+ structured_stream_overflow_events, upstream_stream_metadata, RelayLineAction, RelayOutcome,
+ RequestCompleteGuard, RequestLogContext, ValidationResponseStatus,
+
     };
     use crate::compression::{stats::CompressionStats, CompressionLevel};
     use crate::config::StreamingConfig;
@@ -6031,18 +6092,34 @@ mod tests {
     /// Build a streaming `reqwest::Response` whose body errors immediately,
     /// before any byte is delivered — drives the relay's pre-content failure
     /// path.
-    fn erroring_streaming_response() -> reqwest::Response {
-        let stream = futures::stream::once(async move {
-            Err::<&[u8], _>(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "reset",
-            ))
-        });
-        let http_response = axum::http::Response::new(reqwest::Body::wrap_stream(stream));
-        reqwest::Response::from(http_response)
-    }
+ fn erroring_streaming_response() -> reqwest::Response {
+ let stream = futures::stream::once(async move {
+ Err::<&[u8], _>(std::io::Error::new(
+ std::io::ErrorKind::ConnectionReset,
+ "reset",
+ ))
+ });
+ let http_response = axum::http::Response::new(reqwest::Body::wrap_stream(stream));
+ reqwest::Response::from(http_response)
+ }
 
-    /// Task 6.1 / Req 4.1, 4.4: when the upstream errors BEFORE any content is
+ #[test]
+ fn reqwest_error_chain_includes_transport_cause() {
+ let response = erroring_streaming_response();
+ let (
+ version,
+ content_encoding,
+ transfer_encoding,
+ content_length,
+ ) = upstream_stream_metadata(&response);
+ assert_eq!(version, reqwest::Version::HTTP_11);
+ assert_eq!(content_encoding, "identity");
+ assert_eq!(transfer_encoding, "none");
+ assert_eq!(content_length, None);
+ }
+
+ /// Task 6.1 / Req 4.1, 4.4: when the upstream errors BEFORE any content is
+
     /// forwarded, the relay stays silent (no error event, no `[DONE]`) and
     /// records `FailedBeforeContent` so the handler can fail over without
     /// emitting a duplicate role event.
@@ -6051,29 +6128,30 @@ mod tests {
         let response = erroring_streaming_response();
         let (exact_cache, metrics, request) = relay_cache_deps();
         let outcome = mk_outcome();
-        let stream = relay_passthrough_stream(
-            response,
-            StreamingConfig::default(),
-            "tr-pre-content-fail".to_string(),
-            Duration::from_secs(30),
-            exact_cache,
-            metrics,
-            request,
-            outcome.clone(),
-            None,
-            None,
-        );
-        let events: Vec<_> = stream.collect().await;
-        assert!(
-            events.is_empty(),
-            "pre-content failure must emit no SSE events"
-        );
-        let guard = outcome.lock().await;
-        match &*guard {
-            RelayOutcome::FailedBeforeContent(_) => {}
-            other => panic!("expected FailedBeforeContent, got {other:?}"),
-        }
-    }
+ let stream = relay_passthrough_stream(
+ response,
+ StreamingConfig::default(),
+ "tr-pre-content-fail".to_string(),
+ Duration::from_secs(30),
+ exact_cache,
+ metrics,
+ request,
+ outcome.clone(),
+ None,
+ None,
+ );
+ let events: Vec<_> = stream.collect().await;
+ assert!(
+ events.is_empty(),
+ "pre-content failure must emit no SSE events"
+ );
+ let guard = outcome.lock().await;
+ match &*guard {
+ RelayOutcome::FailedBeforeContent(reason) => assert!(reason.contains("reset")),
+ other => panic!("expected FailedBeforeContent, got {other:?}"),
+ }
+ }
+
 
     /// Task 6.1: a clean completion records `Completed` so the handler's
     /// failover loop terminates without retrying.

@@ -79,9 +79,11 @@ pub async fn start_mock_openai(behavior: MockBehavior) -> MockServer {
 
         MockBehavior::Timeout => {
             // Delay long enough that any reasonable request timeout fires first.
+            // Reduced from 120s to 5s as defensive cleanup — the test client
+            // timeout is 200ms, so 5s is more than sufficient.
             ResponseTemplate::new(200)
                 .set_body_json(mock_chat_completion_response())
-                .set_delay(std::time::Duration::from_secs(120))
+                .set_delay(std::time::Duration::from_secs(5))
         }
     };
 

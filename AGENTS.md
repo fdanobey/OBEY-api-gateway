@@ -17,6 +17,22 @@ cargo test -p ai-gateway <test_name>   # Single test
 cargo test -p ai-gateway -- --nocapture  # With output
 ```
 
+### Test Profiles
+
+- **Fast (default)**: `cargo test -p ai-gateway` — unit and integration tests with isolated temp databases.
+- **Full coverage**: `cargo test -p ai-gateway -- --ignored` — includes wall-clock latency assertions.
+- **Property tests budget**: `PROPTEST_CASES=64 cargo test -p ai-gateway` — lower case count for faster runs.
+
+### Performance / Latency Budget Tests
+
+Wall-clock budget tests are marked `#[ignore]` and run with `--ignored`:
+- `performance.rs`: startup < 2s, forwarding overhead < 10ms, concurrent requests
+- `guardrail_timing.rs`: pre-call < 100ms/500ms, streaming assembly < 500ms
+
+### Test Database Isolation
+
+Every `GatewayServer::new` opens SQLite databases. Tests use `common::isolate_databases` to redirect these into unique temp directories, avoiding lock contention across parallel tests.
+
 ## Non-Obvious Patterns
 
 - **API key resolution**: `api_key_env` in config is tried as env var name first, falls back to literal value if env var not found ([`router.rs:286-291`](crates/ai-gateway/src/router/router.rs:286))

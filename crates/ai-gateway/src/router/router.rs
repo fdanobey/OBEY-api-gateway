@@ -2327,9 +2327,17 @@ impl Router {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
             }
 
-            for (k, v) in &custom_headers {
-                req_builder = req_builder.header(k.as_str(), v.as_str());
-            }
+ for (k, v) in &custom_headers {
+ if k.eq_ignore_ascii_case(reqwest::header::ACCEPT_ENCODING.as_str()) {
+ continue;
+ }
+ req_builder = req_builder.header(k.as_str(), v.as_str());
+ }
+ // RequestBuilder::header appends rather than replaces existing values, so
+ // filter any provider-level Accept-Encoding above and add identity exactly
+ // once. Compressed SSE is vulnerable to truncated decoder frames.
+ req_builder = req_builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
+
 
             let request_start = std::time::Instant::now();
             let result =
@@ -5522,13 +5530,17 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         } else if !api_key.is_empty() {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
         }
-        for (k, v) in &custom_headers {
-            req_builder = req_builder.header(k.as_str(), v.as_str());
-        }
-        // Keep this after custom headers. A provider-level Accept-Encoding value
-        // must not re-enable compressed SSE, where a truncated compressed frame is
-        // reported by reqwest as `error decoding response body` mid-stream.
-        req_builder = req_builder.header("Accept-Encoding", "identity");
+ for (k, v) in &custom_headers {
+ if k.eq_ignore_ascii_case(reqwest::header::ACCEPT_ENCODING.as_str()) {
+ continue;
+ }
+ req_builder = req_builder.header(k.as_str(), v.as_str());
+ }
+ // RequestBuilder::header appends rather than replaces existing values, so
+ // filter any provider-level Accept-Encoding above and add identity exactly
+ // once. Compressed SSE is vulnerable to truncated decoder frames.
+ req_builder = req_builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
+
 
         tracing::info!(provider = %provider_model.provider, %url, model = %provider_model.model, ttfb_timeout_secs, "Calling provider (streaming pass-through)");
 
@@ -7060,14 +7072,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_provider_receives_compressed_body_before_response() {
-        use wiremock::matchers::{body_string_contains, header, method, path};
+ async fn streaming_provider_receives_compressed_body_before_response() {
+ use wiremock::matchers::{body_string_contains, method, path};
+
 
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .and(header("accept-encoding", "identity"))
-            .and(body_string_contains(
+ Mock::given(method("POST"))
+ .and(path("/v1/chat/completions"))
+ .and(body_string_contains(
+
                 "use a small number of checks to finish",
             ))
             .and(body_string_contains("\"stream\":true"))
@@ -7098,9 +7111,21 @@ mod tests {
         let StreamingResponse::PassThrough { compression, .. } = response else {
             unreachable!()
         };
-        assert_eq!(compression.provider, "provider");
-        assert_eq!(compression.model, "upstream-model");
-    }
+ assert_eq!(compression.provider, "provider");
+ assert_eq!(compression.model, "upstream-model");
+
+ let requests = server.received_requests().await.unwrap();
+ assert_eq!(requests.len(), 1);
+ let accept_encoding = requests[0]
+ .headers
+ .get_all(reqwest::header::ACCEPT_ENCODING)
+ .iter()
+ .flat_map(|value| value.to_str().unwrap().split(','))
+ .map(str::trim)
+ .collect::<Vec<_>>();
+ assert_eq!(accept_encoding, vec!["identity"]);
+ }
+
 
     #[tokio::test]
     async fn failover_prepares_each_provider_from_original_request() {

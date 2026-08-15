@@ -152,6 +152,7 @@ fn moderate_sse_body() -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "wall-clock latency budget smoke test (Req 2.8): run with --ignored"]
 async fn pre_call_scan_of_50kb_body_completes_well_under_100ms() {
     let engine = build_regex_engine();
     let selector = BindingSelector::default();
@@ -182,6 +183,7 @@ async fn pre_call_scan_of_50kb_body_completes_well_under_100ms() {
 }
 
 #[tokio::test]
+#[ignore = "wall-clock latency budget smoke test (Req 2.8): run with --ignored"]
 async fn pre_call_scan_of_large_body_completes_well_under_500ms() {
     let engine = build_regex_engine();
     let selector = BindingSelector::default();
@@ -214,6 +216,7 @@ async fn pre_call_scan_of_large_body_completes_well_under_500ms() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "wall-clock latency budget smoke test (Req 10.6): run with --ignored"]
 async fn stream_assemble_analyze_and_rechunk_completes_well_under_500ms() {
     let engine = build_regex_engine();
     let selector = BindingSelector::default();

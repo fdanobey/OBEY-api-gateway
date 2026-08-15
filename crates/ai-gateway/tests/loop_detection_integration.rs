@@ -21,9 +21,12 @@ use std::{
 use tokio::sync::RwLock;
 use tower::{service_fn, Layer, ServiceExt};
 
+mod common;
+
 fn config(loop_config: LoopDetectionConfig) -> Config {
     let mut config: Config = serde_yaml::from_str("server:\n  host: 127.0.0.1\n  port: 8080\nproviders:\n  - name: p\n    type: openai\n    base_url: http://localhost\n    timeout_seconds: 30\nmodel_groups:\n  - name: g\n    models:\n      - provider: p\n        model: gpt-4\n").unwrap();
     config.loop_detection = loop_config;
+    common::isolate_databases(&mut config);
     config
 }
 

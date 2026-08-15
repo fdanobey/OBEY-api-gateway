@@ -41,6 +41,28 @@ fn mantle_api_for_model(model_id: &str) -> MantleApi {
     }
 }
 
+fn is_compaction_trigger(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
+}
+
+fn normalize_mantle_responses_input(input: &mut Vec<serde_json::Value>) -> usize {
+    let trigger_count = input
+        .iter()
+        .filter(|item| is_compaction_trigger(item))
+        .count();
+    let terminal_trigger = input
+        .last()
+        .filter(|item| is_compaction_trigger(item))
+        .cloned();
+
+    input.retain(|item| !is_compaction_trigger(item));
+    if let Some(trigger) = terminal_trigger {
+        input.push(trigger);
+    }
+
+    trigger_count.saturating_sub(usize::from(input.last().is_some_and(is_compaction_trigger)))
+}
+
 pub(crate) fn normalize_mantle_chat_messages(request: &mut OpenAIRequest) -> usize {
     let mut normalized = 0;
     let mut compaction_triggers_remaining = request
@@ -1552,6 +1574,53 @@ impl BedrockProvider {
         })
     }
 
+    fn mantle_responses_input(
+        request: OpenAIRequest,
+    ) -> (
+        String,
+        Option<f32>,
+        u32,
+        serde_json::Map<String, serde_json::Value>,
+        serde_json::Value,
+        usize,
+    ) {
+        let OpenAIRequest {
+            model,
+            messages,
+            temperature,
+            max_tokens,
+            mut extra,
+            ..
+        } = request;
+        let mut normalized = 0;
+        let input = match extra.remove("input") {
+            Some(serde_json::Value::Array(mut input)) => {
+                normalized = normalize_mantle_responses_input(&mut input);
+                serde_json::Value::Array(input)
+            }
+            Some(input) => input,
+            None => serde_json::Value::Array(
+                messages
+                    .iter()
+                    .map(|message| {
+                        serde_json::json!({
+                            "role": message.role,
+                            "content": message.content_as_text()
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        (
+            model,
+            temperature,
+            max_tokens.unwrap_or(2048),
+            extra,
+            input,
+            normalized,
+        )
+    }
+
     async fn chat_completion_responses_api(
         &self,
         request: OpenAIRequest,
@@ -1563,27 +1632,20 @@ impl BedrockProvider {
         let start = Instant::now();
         let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
         let url = format!("{}/openai/v1/responses", root);
-        let OpenAIRequest {
-            model,
-            messages,
-            temperature,
-            max_tokens,
-            extra,
-            ..
-        } = request;
-        let input = messages
-            .iter()
-            .map(|message| {
-                serde_json::json!({
-                    "role": message.role,
-                    "content": message.content_as_text()
-                })
-            })
-            .collect::<Vec<_>>();
+        let (model, temperature, max_output_tokens, extra, input, normalized) =
+            Self::mantle_responses_input(request);
+        if normalized > 0 {
+            tracing::debug!(
+                provider = %self.name,
+                model = %model,
+                compaction_triggers_removed = normalized,
+                "Normalized Bedrock Mantle Responses compaction triggers"
+            );
+        }
         let mut body = serde_json::json!({
             "model": model.clone(),
             "input": input,
-            "max_output_tokens": max_tokens.unwrap_or(2048),
+            "max_output_tokens": max_output_tokens,
             "stream": false
         });
         if let Some(temperature) = temperature {
@@ -2881,6 +2943,77 @@ mod tests {
             })
             .unwrap();
         assert_eq!(retained_trigger["id"], "duplicate");
+    }
+
+    #[test]
+    fn test_mantle_responses_input_keeps_single_terminal_compaction_trigger() {
+        let mut input = serde_json::json!([
+            {"type": "message", "role": "user", "content": "continue"},
+            {"type": "compaction_trigger"}
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
+
+        assert_eq!(normalize_mantle_responses_input(&mut input), 0);
+        assert_eq!(input.last().unwrap()["type"], "compaction_trigger");
+    }
+
+    #[test]
+    fn test_mantle_responses_input_removes_duplicate_compaction_triggers() {
+        let mut input = serde_json::json!([
+            {"type": "compaction_trigger", "id": "old"},
+            {"type": "message", "role": "user", "content": "before"},
+            {"type": "compaction_trigger", "id": "latest"}
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
+
+        assert_eq!(normalize_mantle_responses_input(&mut input), 1);
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[1]["type"], "compaction_trigger");
+        assert_eq!(input[1]["id"], "latest");
+    }
+
+    #[test]
+    fn test_mantle_responses_input_drops_stale_nonterminal_compaction_trigger() {
+        let mut input = serde_json::json!([
+            {"type": "compaction_trigger"},
+            {"type": "message", "role": "user", "content": "continue"}
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
+
+        assert_eq!(normalize_mantle_responses_input(&mut input), 1);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+    }
+
+    #[test]
+    fn test_mantle_responses_input_builder_preserves_native_string_input() {
+        let mut request = create_test_chat_request(false);
+        request
+            .extra
+            .insert("input".to_string(), serde_json::json!("native input"));
+
+        let (_, _, _, _, input, normalized) = BedrockProvider::mantle_responses_input(request);
+
+        assert_eq!(normalized, 0);
+        assert_eq!(input, serde_json::json!("native input"));
+    }
+
+    #[test]
+    fn test_mantle_responses_input_builder_uses_messages_when_input_missing() {
+        let request = create_test_chat_request(false);
+
+        let (_, _, _, _, input, normalized) = BedrockProvider::mantle_responses_input(request);
+
+        assert_eq!(normalized, 0);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "hello");
     }
 
     #[test]

@@ -76,6 +76,7 @@ winrt-notification = { version = "0.5.1", optional = true }
 winres = "0.1.12"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
 tempfile = "3.14"
 rcgen = { workspace = true }

@@ -20,6 +20,8 @@ use ai_gateway::gateway::GatewayServer;
 use wiremock::matchers::{method as wm_method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -207,7 +209,8 @@ guardrails:
     serde_yaml::from_str::<Config>(&yaml).expect("test config YAML should deserialize")
 }
 
-async fn build_app(config: Config) -> (axum::Router, ai_gateway::gateway::AppState) {
+async fn build_app(mut config: Config) -> (axum::Router, ai_gateway::gateway::AppState) {
+    common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
     let state = server.state.clone();
     (server.build_router(), state)

@@ -139,7 +139,16 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
         retry: RetryConfig::default(),
-        logging: LoggingConfig::default(),
+        logging: {
+            let mut lc = LoggingConfig::default();
+            lc.database_path = tempfile::tempdir()
+                .expect("temp dir for virtual-keys test logs")
+                .keep()
+                .join("logs.db")
+                .to_string_lossy()
+                .into_owned();
+            lc
+        },
         semantic_cache: None,
         exact_cache: ExactCacheConfig::default(),
         prometheus: None,
