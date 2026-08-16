@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ba008f56ba965fb5ac4491b61b0110c726106c2f7e294b608bc979cad1db062f # shrinks to known_providers = [("aaa", 1761), ("aaa", 10), ("aaa", 10)], unknown_providers = ["aaa"]

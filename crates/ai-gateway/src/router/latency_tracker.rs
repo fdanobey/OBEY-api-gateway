@@ -1,6 +1,42 @@
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Immutable routing-time latency snapshot.
+/// Captures all known provider latencies and one fallback median in a single DashMap traversal.
+#[derive(Debug, Clone)]
+pub struct LatencySnapshot {
+    known: HashMap<String, f64>,
+    fallback_ms: f64,
+}
+
+impl LatencySnapshot {
+    /// Get latency for a provider from the snapshot.
+    /// Returns the fallback median if the provider was not in the known set.
+    #[inline]
+    pub fn get_latency(&self, provider: &str) -> f64 {
+        self.known.get(provider).copied().unwrap_or(self.fallback_ms)
+    }
+
+    /// Check if a provider has known latency in this snapshot.
+    #[inline]
+    pub fn has_latency(&self, provider: &str) -> bool {
+        self.known.contains_key(provider)
+    }
+
+    /// Get the fallback latency value used for unknown providers.
+    #[inline]
+    pub fn fallback(&self) -> f64 {
+        self.fallback_ms
+    }
+
+    /// Get the number of providers with known latency.
+    #[inline]
+    pub fn known_count(&self) -> usize {
+        self.known.len()
+    }
+}
 
 /// Tracks per-provider latency using exponential moving average
 #[derive(Debug, Clone)]
@@ -39,6 +75,34 @@ impl LatencyTracker {
                 *current = self.alpha * latency_ms + (1.0 - self.alpha) * *current;
             })
             .or_insert(latency_ms);
+    }
+
+    /// Create an immutable snapshot for provider selection.
+    /// Traverses the DashMap once, collecting all known latencies and computing
+    /// the fallback median in a single pass.
+    pub fn snapshot(&self) -> LatencySnapshot {
+        let mut values: Vec<f64> = Vec::new();
+        let mut known: HashMap<String, f64> = HashMap::new();
+
+        for entry in self.latencies.iter() {
+            let latency = *entry.value();
+            known.insert(entry.key().clone(), latency);
+            values.push(latency);
+        }
+
+        let fallback_ms = if values.is_empty() {
+            100.0 // Default 100ms if no providers tracked
+        } else {
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let len = values.len();
+            if len % 2 == 0 {
+                (values[len / 2 - 1] + values[len / 2]) / 2.0
+            } else {
+                values[len / 2]
+            }
+        };
+
+        LatencySnapshot { known, fallback_ms }
     }
 
     /// Calculate median latency of all tracked providers
@@ -119,6 +183,92 @@ mod tests {
 
         // Median of [100, 300] = (100 + 300) / 2 = 200
         assert_eq!(tracker.get_latency("unknown"), 200.0);
+    }
+
+    #[test]
+    fn test_snapshot_empty_history_default_fallback() {
+        let tracker = LatencyTracker::new();
+        let snap = tracker.snapshot();
+        assert_eq!(snap.known_count(), 0);
+        assert_eq!(snap.get_latency("any-provider"), 100.0);
+        assert_eq!(snap.fallback(), 100.0);
+        assert!(!snap.has_latency("any-provider"));
+    }
+
+    #[test]
+    fn test_snapshot_complete_history() {
+        let tracker = LatencyTracker::new();
+        tracker.update_latency("provider1", Duration::from_millis(100));
+        tracker.update_latency("provider2", Duration::from_millis(200));
+        tracker.update_latency("provider3", Duration::from_millis(300));
+
+        let snap = tracker.snapshot();
+        assert_eq!(snap.known_count(), 3);
+        assert!(snap.has_latency("provider1"));
+        assert_eq!(snap.get_latency("provider1"), 100.0);
+        assert_eq!(snap.get_latency("provider2"), 200.0);
+        assert_eq!(snap.get_latency("provider3"), 300.0);
+        // Fallback median of [100, 200, 300] = 200
+        assert_eq!(snap.fallback(), 200.0);
+        assert_eq!(snap.get_latency("unknown"), 200.0);
+    }
+
+    #[test]
+    fn test_snapshot_partial_history_uses_fallback_for_unknown() {
+        let tracker = LatencyTracker::new();
+        tracker.update_latency("provider1", Duration::from_millis(100));
+        tracker.update_latency("provider2", Duration::from_millis(300));
+
+        let snap = tracker.snapshot();
+        assert_eq!(snap.known_count(), 2);
+        // Known provider uses tracked value
+        assert_eq!(snap.get_latency("provider1"), 100.0);
+        // Unknown provider uses fallback median (100+300)/2 = 200
+        assert!(!snap.has_latency("unknown"));
+        assert_eq!(snap.get_latency("unknown"), 200.0);
+    }
+
+    #[test]
+    fn test_snapshot_isolated_from_subsequent_updates() {
+        let tracker = LatencyTracker::new();
+        tracker.update_latency("provider1", Duration::from_millis(100));
+        let snap = tracker.snapshot();
+
+        // Update after snapshot — snapshot must be unchanged (immutability)
+        tracker.update_latency("provider1", Duration::from_millis(500));
+        assert_eq!(snap.get_latency("provider1"), 100.0);
+
+        // A fresh snapshot reflects the update.
+        // EMA applies on the second update: 0.2*500 + 0.8*100 = 180.0
+        let snap2 = tracker.snapshot();
+        assert_eq!(snap2.get_latency("provider1"), 180.0);
+    }
+
+    #[test]
+    fn test_snapshot_equivalent_to_get_latency() {
+        let tracker = LatencyTracker::new();
+        tracker.update_latency("p1", Duration::from_millis(50));
+        tracker.update_latency("p2", Duration::from_millis(150));
+        tracker.update_latency("p3", Duration::from_millis(250));
+        tracker.update_latency("p4", Duration::from_millis(400));
+
+        let snap = tracker.snapshot();
+        for provider in ["p1", "p2", "p3", "p4", "unknown-a", "unknown-b"] {
+            assert_eq!(
+                snap.get_latency(provider),
+                tracker.get_latency(provider),
+                "snapshot and live lookup must agree for {provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_snapshot_single_provider_fallback() {
+        let tracker = LatencyTracker::new();
+        tracker.update_latency("only", Duration::from_millis(150));
+        let snap = tracker.snapshot();
+        assert_eq!(snap.fallback(), 150.0);
+        assert_eq!(snap.get_latency("unknown"), 150.0);
     }
 }
 
@@ -295,13 +445,87 @@ mod property_tests {
                 "Unknown provider should get median latency: expected {}, got {}",
                 expected_median, actual_latency);
 
-            // Case 3: Verify known providers still have their own latencies
-            for (provider, &latency_ms) in known_providers.iter().zip(latencies.iter()) {
-                let actual = tracker.get_latency(provider);
-                assert!((actual - latency_ms as f64).abs() < 0.01,
-                    "Known provider {} should retain its latency: expected {}, got {}",
-                    provider, latency_ms, actual);
+        // Case 3: Verify known providers still have their own latencies
+        for (provider, &latency_ms) in known_providers.iter().zip(latencies.iter()) {
+            let actual = tracker.get_latency(provider);
+            assert!((actual - latency_ms as f64).abs() < 0.01,
+                "Known provider {} should retain its latency: expected {}, got {}",
+                provider, latency_ms, actual);
+        }
+        }
+
+        /// Property: Snapshot equivalence with live lookup.
+        ///
+        /// **Validates: Requirements 2.2, 2.4, 2.6 (spec router-responsiveness-optimization)**
+        ///
+        /// For any set of known providers with latencies and any unknown provider,
+        /// the immutable snapshot shall return exactly the same effective latency
+        /// as the live `get_latency` path (known value, or one coherent fallback
+        /// median / 100.0ms default when empty), and all unknown providers in one
+        /// snapshot shall share the same fallback value.
+        #[test]
+        fn prop_snapshot_equivalent_to_live_lookup(
+            known_providers in prop::collection::vec(("[a-z]{3,10}", 10u64..=5000), 0..=12),
+            unknown_providers in prop::collection::vec("[a-z]{3,10}", 1..=4)
+        ) {
+            // Deduplicate by provider name BEFORE updating: a duplicate would
+            // apply EMA in the tracker, so populate unique names only (first
+            // update sets the value directly -> exact expected values).
+            let unique: std::collections::BTreeMap<&str, u64> =
+                known_providers.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+
+            let tracker = LatencyTracker::new();
+            for (name, latency_ms) in &unique {
+                tracker.update_latency(name, Duration::from_millis(*latency_ms));
+            }
+
+            let snap = tracker.snapshot();
+
+            // Known providers: snapshot returns the exact tracked value.
+            for (name, latency_ms) in &unique {
+                assert!(
+                    (snap.get_latency(name) - *latency_ms as f64).abs() < 0.01,
+                    "snapshot mismatch for known provider {name}"
+                );
+                assert!(snap.has_latency(name));
+            }
+            assert_eq!(snap.known_count(), unique.len());
+
+            // Unknown providers: snapshot fallback equals live get_latency fallback.
+            // Values use the tracker's own conversion (as_secs_f64()*1000.0) so the
+            // expected median matches the stored f64 exactly.
+            let mut sorted: Vec<f64> = unique
+                .values()
+                .map(|v| Duration::from_millis(*v).as_secs_f64() * 1000.0)
+                .collect();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let expected_fallback = if sorted.is_empty() {
+                100.0
+            } else {
+                let len = sorted.len();
+                if len % 2 == 0 {
+                    (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
+                } else {
+                    sorted[len / 2]
+                }
+            };
+            assert_eq!(snap.fallback(), expected_fallback);
+
+            for unknown in &unknown_providers {
+                prop_assume!(!known_providers.iter().any(|(k, _)| k == unknown));
+                assert_eq!(
+                    snap.get_latency(unknown),
+                    tracker.get_latency(unknown),
+                    "snapshot and live lookup disagree for unknown provider {unknown}"
+                );
+                assert!(!snap.has_latency(unknown));
+            }
+
+            // All unknown providers in one selection share the same fallback (Req 2.4).
+            let first = snap.get_latency(&unknown_providers[0]);
+            for unknown in &unknown_providers {
+                assert_eq!(snap.get_latency(unknown), first);
             }
         }
-    }
+}
 }

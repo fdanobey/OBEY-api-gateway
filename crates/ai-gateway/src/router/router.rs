@@ -1011,10 +1011,17 @@ impl Router {
     pub async fn select_provider_order(&self, model_group: &ModelGroup) -> Vec<ProviderModel> {
         let mut filtered = Vec::with_capacity(model_group.models.len());
         for m in &model_group.models {
-            // CB keys are "provider:model" (per-model circuit breakers)
+            // CB keys are "provider:model" (per-model circuit breakers).
+            // Clone the Arc out of the DashMap guard and drop the guard
+            // before awaiting — holding a shard guard across `.await`
+            // blocks every other operation on the same shard (spec task 4).
             let cb_key = format!("{}:{}", m.provider, m.model);
-            let cb_ok = match self.circuit_breakers.get(&cb_key) {
-                Some(cb) => cb.value().is_available().await,
+            let cb = self
+                .circuit_breakers
+                .get(&cb_key)
+                .map(|entry| entry.value().clone());
+            let cb_ok = match cb {
+                Some(cb) => cb.is_available().await,
                 None => true,
             };
 
@@ -1038,8 +1045,14 @@ impl Router {
             // config save re-opens routing to providers the operator is
             // still seeing rendered as "Pausing for ~Nh (rate limited)"
             // in the UI, producing a fresh 429 within seconds.
-            let cooldown_ok = match self.rate_limiters.get(&m.provider) {
-                Some(rl) => rl.value().cooldown_remaining().await.is_none(),
+            // Same guard discipline as the CB check above: clone the Arc out
+            // of the DashMap and drop the shard guard before awaiting.
+            let rl = self
+                .rate_limiters
+                .get(&m.provider)
+                .map(|entry| entry.value().clone());
+            let cooldown_ok = match rl {
+                Some(rl) => rl.cooldown_remaining().await.is_none(),
                 None => true,
             } && self
                 .metrics
@@ -1051,6 +1064,10 @@ impl Router {
             }
         }
         let mut candidates = filtered;
+
+        // Capture latency snapshot once before sorting.
+        // Eliminates repeated DashMap traversal and median calculation in the comparator.
+        let latency_snapshot = self.latency_tracker.snapshot();
 
         // Stage 3: Sort by priority, cost, and latency
         candidates.sort_by(|a, b| {
@@ -1067,8 +1084,9 @@ impl Router {
 
                     if cost_diff <= cost_threshold {
                         // Costs are similar, sort by latency
-                        let latency_a = self.latency_tracker.get_latency(&a.provider);
-                        let latency_b = self.latency_tracker.get_latency(&b.provider);
+                        // Use immutable snapshot instead of querying mutable tracker
+                        let latency_a = latency_snapshot.get_latency(&a.provider);
+                        let latency_b = latency_snapshot.get_latency(&b.provider);
                         latency_a
                             .partial_cmp(&latency_b)
                             .unwrap_or(std::cmp::Ordering::Equal)

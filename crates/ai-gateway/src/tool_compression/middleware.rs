@@ -506,6 +506,11 @@ where
                 .as_ref()
                 .and_then(|sid| state.disclosure_targets.get(sid).map(|set| set.clone()))
                 .unwrap_or_default();
+            // Tools/namespaces disclosed by synthetic drill-downs this turn. Used to append
+            // a benign "extracted compressed tools" note to the client response so the
+            // model's own chat history records the discovery and stops re-drilling.
+            let mut disclosed_tools_this_turn: Vec<String> = Vec::new();
+            let mut disclosed_ns_this_turn: Vec<String> = Vec::new();
             while synthetic_injected {
                 let sse = response_is_sse(&final_response);
                 let (resp_parts, resp_body) = final_response.into_parts();
@@ -555,6 +560,7 @@ where
                 ) {
                     Some(disclosed) => {
                         // Persist disclosed tools for multi-turn re-injection.
+                        disclosed_tools_this_turn.extend(disclosed.iter().cloned());
                         if let Some(sid) = &session_id {
                             let mut entry = state.disclosure_state.entry(sid.clone()).or_default();
                             for n in &disclosed {
@@ -582,7 +588,15 @@ where
                                         .and_then(|a| a.as_str())
                                         .unwrap_or("{}");
                                     if let Some(key) = resolver::discovery_key(name, args) {
-                                        targets.insert(key);
+                                        targets.insert(key.clone());
+                                        if let Some(ns) = key.strip_prefix("ns:") {
+                                            if !disclosed_ns_this_turn
+                                                .iter()
+                                                .any(|n| n == ns)
+                                            {
+                                                disclosed_ns_this_turn.push(ns.to_string());
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -620,7 +634,20 @@ where
                 }
                 steps += 1;
             }
+
+            // ─── Benign discovery note for the client transcript ──────────────────
+            // Surface the tool-compression discovery in the model's own chat history as a
+            // friendly note (no synthetic tool names / raw schemas). This lets the model
+            // remember it already extracted these tools and call them directly instead of
+            // re-drilling the same namespace. The synthetic tool name never reaches the
+            // client (existing contract), so a router consumer never sees internal plumbing.
             let mut response = final_response;
+            if !disclosed_tools_this_turn.is_empty() {
+                let note = benign_extraction_note(&disclosed_ns_this_turn, &disclosed_tools_this_turn);
+                if !note.is_empty() {
+                    response = append_content_to_response(response, &note).await;
+                }
+            }
 
             // ─── Response-path error detection for Feedback Loop ──────────────
             // Inspect the response for tool-call errors and feed results to FeedbackLoop.
@@ -955,6 +982,105 @@ fn response_bytes_to_json(bytes: &[u8], sse: bool) -> Option<serde_json::Value> 
     }
 }
 
+/// Build a benign, consumer-friendly note recording that tool-compression just revealed
+/// some tools, without ever naming the synthetic drill-down tool or dumping raw schemas.
+/// The note lists the actual (now-callable) tool names so the model's transcript reminds
+/// it to call them directly instead of re-discovering the namespace.
+fn benign_extraction_note(namespaces: &[String], tools: &[String]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let listed: Vec<&String> = tools.iter().take(16).collect();
+    let mut note = String::new();
+    if !namespaces.is_empty() {
+        note.push_str(&format!(
+            "Compressed tools for namespace(s) {} were extracted",
+            namespaces.join(", ")
+        ));
+    } else {
+        note.push_str("A compressed tool schema was extracted");
+    }
+    note.push_str(&format!(
+        " and are now available: {}",
+        listed
+            .iter()
+            .map(|t| t.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    if tools.len() > listed.len() {
+        note.push_str(&format!(" (and {} more)", tools.len() - listed.len()));
+    }
+    note.push_str(". Call them directly by name rather than re-discovering the namespace.");
+    note
+}
+
+/// Append `addition` to the textual content of a chat-completion response, handling both
+/// JSON and SSE shapings, so the note reaches the client's stored transcript.
+async fn append_content_to_response(response: Response<Body>, addition: &str) -> Response<Body> {
+    let (parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, 64 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Response::from_parts(parts, Body::empty()),
+    };
+    let is_sse = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    let new_bytes = if is_sse {
+        append_to_sse(&bytes, addition)
+    } else {
+        append_to_json(&bytes, addition)
+    };
+    let mut parts = parts;
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(new_bytes))
+}
+
+fn append_to_json(bytes: &[u8], addition: &str) -> Vec<u8> {
+    let mut value: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
+        Err(_) => return bytes.to_vec(),
+    };
+    if let Some(choices) = value.get_mut("choices").and_then(|choices| choices.as_array_mut()) {
+        for choice in choices.iter_mut() {
+            if let Some(message) = choice.get_mut("message") {
+                match message.get_mut("content") {
+                    Some(serde_json::Value::String(existing)) => {
+                        existing.push('\n');
+                        existing.push_str(addition);
+                    }
+                    Some(null) if null.is_null() => {
+                        *null = serde_json::Value::String(addition.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
+}
+
+fn append_to_sse(bytes: &[u8], addition: &str) -> Vec<u8> {
+    let text = String::from_utf8_lossy(bytes);
+    let escaped = addition.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+    let chunk = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{escaped}\"}}}}]}}\n\n"
+    );
+    if let Some(pos) = text.rfind("data: [DONE]") {
+        let mut out = String::with_capacity(text.len() + chunk.len());
+        out.push_str(&text[..pos]);
+        out.push_str(&chunk);
+        out.push_str(&text[pos..]);
+        out.into_bytes()
+    } else {
+        let mut out = text.to_string();
+        out.push_str(&chunk);
+        out.into_bytes()
+    }
+}
+
 // ─── Unit Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1061,6 +1187,38 @@ mod tests {
             value.pointer("/choices/0/message/content").unwrap(),
             &json!("hi")
         );
+    }
+
+    #[test]
+    fn benign_extraction_note_lists_tools_and_hides_synthetic() {
+        let note = benign_extraction_note(&["fs".to_string()], &["fs_read".to_string(), "fs_write".to_string()]);
+        assert!(note.contains("fs_read"));
+        assert!(note.contains("fs_write"));
+        assert!(note.contains("fs"));
+        assert!(!note.contains("get_tools_in_namespace"));
+        assert!(note.contains("Call them directly"));
+    }
+
+    #[test]
+    fn append_to_json_adds_content() {
+        let body = json!({"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]});
+        let out = append_to_json(&serde_json::to_vec(&body).unwrap(), "EXTRA");
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            value.pointer("/choices/0/message/content").unwrap(),
+            &json!("done\nEXTRA")
+        );
+    }
+
+    #[test]
+    fn append_to_sse_inserts_before_done() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let out = append_to_sse(body.as_bytes(), "EXTRA");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("EXTRA"));
+        assert!(text.contains("data: [DONE]"));
+        // The EXTRA delta must come before [DONE].
+        assert!(text.find("EXTRA").unwrap() < text.find("data: [DONE]").unwrap());
     }
 
     /// SSE bodies are detected by payload shape even when the Content-Type was lost.
@@ -1321,6 +1479,43 @@ mod service_tests {
         assert!(
             !body.contains(resolver::GET_TOOLS_IN_NAMESPACE),
             "synthetic call leaked to client: {body}"
+        );
+    }
+
+    /// The discovery must surface in the client's transcript as a benign note (so the
+    /// model remembers it already extracted the tools) WITHOUT leaking the synthetic tool
+    /// name or raw schemas — a router consumer should never see internal plumbing.
+    #[tokio::test]
+    async fn benign_extraction_note_injected_without_synthetic_leak() {
+        let (mut svc, _inner) = build_service(vec![
+            (
+                sse_tool_call(resolver::GET_TOOLS_IN_NAMESPACE, r#"{"namespace":"fs"}"#),
+                "text/event-stream",
+            ),
+            (
+                "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"all done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string(),
+                "text/event-stream",
+            ),
+        ]);
+
+        let resp = svc.call(request_with_many_tools(true)).await.unwrap();
+        let body = body_string(resp).await;
+
+        assert!(
+            !body.contains(resolver::GET_TOOLS_IN_NAMESPACE),
+            "synthetic call leaked to client: {body}"
+        );
+        assert!(
+            body.contains("extracted"),
+            "benign extraction note missing from client transcript: {body}"
+        );
+        assert!(
+            body.contains("fs_op0"),
+            "extracted tool name should be listed in the note: {body}"
+        );
+        assert!(
+            body.contains("all done"),
+            "model's real answer must still be present: {body}"
         );
     }
 
