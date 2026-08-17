@@ -274,16 +274,33 @@ pub fn resolve_synthetic_in_response(
         }
     }
 
-    // Re-inject disclosed full tool schemas into the tools array so they are callable.
-    if !injected.is_empty() {
-        if let Some(tools) = req_json.get_mut("tools").and_then(|t| t.as_array_mut()) {
-            for t in injected {
-                tools.push(t);
-            }
-        }
-    }
+// Re-inject disclosed full tool schemas into the tools array so they are callable.
+// Reinjection is idempotent by function name: the internal resolution loop can revisit
+// a namespace, and providers reject duplicate names even when the schemas are identical.
+if !injected.is_empty() {
+if let Some(tools) = req_json.get_mut("tools").and_then(|t| t.as_array_mut()) {
+let mut existing_names: HashSet<String> = tools
+.iter()
+.filter_map(tool_function_name)
+.map(str::to_string)
+.collect();
+for tool in injected {
+let should_insert = tool_function_name(&tool)
+.map(|name| existing_names.insert(name.to_string()))
+.unwrap_or(true);
+if should_insert {
+tools.push(tool);
+}
+}
+}
+}
 
-    Some(disclosed)
+Some(disclosed)
+}
+
+/// Return the provider-visible function name from an OpenAI-compatible tool definition.
+fn tool_function_name(tool: &Value) -> Option<&str> {
+tool.pointer("/function/name").and_then(Value::as_str)
 }
 
 #[cfg(test)]
@@ -494,6 +511,86 @@ mod tests {
         assert!(disclosed.contains(&"fs_read".to_string()));
         assert!(disclosed.contains(&"fs_write".to_string()));
         assert!(!disclosed.contains(&"git_log".to_string()));
+    }
+
+    #[test]
+    fn resolve_in_response_deduplicates_reinjected_tool_names() {
+        let tools = vec![make_tool("edit"), make_tool("read")];
+        let resp = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_tools_in_namespace", "arguments": "{\"namespace\":\"other\"}"}
+                    }]
+                }
+            }]
+        });
+        // `edit` is already present (e.g. persisted disclosure); re-drilling `other`
+        // must not append a second function with the same provider-visible name.
+        let mut req = json!({
+            "tools": [
+                {"type":"function","function":{"name":"get_tools_in_namespace"}},
+                tools[0].raw.clone()
+            ],
+            "messages": [{"role":"user","content":"edit a file"}]
+        });
+
+        resolve_synthetic_in_response(&resp, &mut req, &tools, 0, &HashSet::new())
+            .expect("synthetic call resolves");
+
+        let names: Vec<&str> = req["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(tool_function_name)
+            .collect();
+        assert_eq!(names.iter().filter(|name| **name == "edit").count(), 1);
+        assert_eq!(names.iter().filter(|name| **name == "read").count(), 1);
+    }
+
+    #[test]
+    fn resolve_in_response_deduplicates_across_multiple_synthetic_calls() {
+        let tools = vec![make_tool("edit"), make_tool("read")];
+        let resp = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_tools_in_namespace", "arguments": "{\"namespace\":\"other\"}"}
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "ns_other", "arguments": "{}"}
+                        }
+                    ]
+                }
+            }]
+        });
+        let mut req = json!({
+            "tools": [{"type":"function","function":{"name":"get_tools_in_namespace"}}],
+            "messages": [{"role":"user","content":"edit a file"}]
+        });
+
+        resolve_synthetic_in_response(&resp, &mut req, &tools, 0, &HashSet::new())
+            .expect("synthetic calls resolve");
+
+        let names: Vec<&str> = req["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(tool_function_name)
+            .collect();
+        assert_eq!(names.iter().filter(|name| **name == "edit").count(), 1);
+        assert_eq!(names.iter().filter(|name| **name == "read").count(), 1);
     }
 
     #[test]
