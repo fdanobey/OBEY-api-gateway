@@ -978,11 +978,16 @@ fn annotate_synthetic_descriptions(tools: &mut [ToolDefinition], disclosed: &Has
     if disclosed.is_empty() {
         return;
     }
-    let mut by_ns: HashMap<String, Vec<String>> = HashMap::new();
-    for name in disclosed {
-        let ns = resolver::namespace_of(name).unwrap_or_else(|| "other".to_string());
-        by_ns.entry(ns).or_default().push(name.clone());
-    }
+let mut by_ns: HashMap<String, Vec<String>> = HashMap::new();
+for name in disclosed {
+let ns = resolver::namespace_of(name).unwrap_or_else(|| "other".to_string());
+by_ns.entry(ns).or_default().push(name.clone());
+}
+for names in by_ns.values_mut() {
+names.sort();
+names.dedup();
+}
+
 
     for tool in tools.iter_mut() {
         if tool.name == resolver::GET_TOOLS_IN_NAMESPACE {
