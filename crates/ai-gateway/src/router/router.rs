@@ -28,14 +28,104 @@ use crate::smart_routing::{
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::error::Error as StdError;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
 const PRECOMPRESSED_CACHE_MARKER_KEY: &str = "cache_control";
 const PRECOMPRESSED_CACHE_MARKER_TYPE: &str = "obey_precompressed_context";
+
+#[derive(Debug)]
+struct ProviderConcurrencyState {
+    limit: usize,
+    in_flight: usize,
+}
+
+#[derive(Debug)]
+struct ProviderConcurrencyLimiter {
+    state: Mutex<ProviderConcurrencyState>,
+    notify: Notify,
+}
+
+impl ProviderConcurrencyLimiter {
+    fn new(limit: u32) -> Self {
+        Self {
+            state: Mutex::new(ProviderConcurrencyState {
+                limit: limit as usize,
+                in_flight: 0,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    fn update_limit(&self, limit: u32) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let limit = limit.max(1) as usize;
+        let increased = limit > state.limit;
+        state.limit = limit;
+        drop(state);
+        if increased {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ProviderConcurrencyPermit> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.in_flight >= state.limit {
+            return None;
+        }
+        state.in_flight += 1;
+        Some(ProviderConcurrencyPermit {
+            limiter: Arc::clone(self),
+        })
+    }
+
+    async fn acquire(self: &Arc<Self>) -> ProviderConcurrencyPermit {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.in_flight < state.limit {
+                    state.in_flight += 1;
+                    return ProviderConcurrencyPermit {
+                        limiter: Arc::clone(self),
+                    };
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+pub struct ProviderConcurrencyPermit {
+    limiter: Arc<ProviderConcurrencyLimiter>,
+}
+
+impl Drop for ProviderConcurrencyPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .limiter
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        drop(state);
+        self.limiter.notify.notify_waiters();
+    }
+}
 
 struct CompressionRuntime {
     pipeline: Arc<CompressionPipeline>,
@@ -81,6 +171,7 @@ pub struct Router {
     circuit_breakers: Arc<DashMap<String, Arc<CircuitBreaker>>>,
     latency_tracker: Arc<LatencyTracker>,
     rate_limiters: Arc<DashMap<String, Arc<RateLimiter>>>,
+    provider_concurrency_limiters: Arc<DashMap<String, Arc<ProviderConcurrencyLimiter>>>,
     http_clients: Arc<DashMap<String, reqwest::Client>>,
     /// Context manager for automatic context window handling
     context_manager: Arc<ContextManager>,
@@ -136,6 +227,7 @@ pub enum StreamingResponse {
         provider: String,
         model: String,
         compression: CompressionStats,
+        concurrency_permit: ProviderConcurrencyPermit,
     },
     /// Buffer-and-replay fallback: a complete response the handler re-chunks.
     Buffered(OpenAIResponse),
@@ -281,6 +373,7 @@ impl Router {
             circuit_breakers: Arc::new(DashMap::new()),
             latency_tracker: Arc::new(LatencyTracker::new()),
             rate_limiters: Arc::new(DashMap::new()),
+            provider_concurrency_limiters: Arc::new(DashMap::new()),
             http_clients: Arc::new(DashMap::new()),
             context_manager: Arc::new(ContextManager::with_config(context_config)),
             compression_runtime: Arc::new(std::sync::RwLock::new(CompressionRuntime {
@@ -318,6 +411,7 @@ impl Router {
             circuit_breakers: Arc::new(DashMap::new()),
             latency_tracker: Arc::new(LatencyTracker::new()),
             rate_limiters: Arc::new(DashMap::new()),
+            provider_concurrency_limiters: Arc::new(DashMap::new()),
             http_clients: Arc::new(DashMap::new()),
             context_manager: Arc::new(ContextManager::with_config(context_config)),
             compression_runtime: Arc::new(std::sync::RwLock::new(CompressionRuntime {
@@ -1307,6 +1401,49 @@ impl Router {
         self.rate_limiters.clear();
     }
 
+    fn provider_concurrency_limiter(
+        &self,
+        provider_name: &str,
+        limit: u32,
+    ) -> Arc<ProviderConcurrencyLimiter> {
+        use dashmap::mapref::entry::Entry;
+
+        let limiter = match self
+            .provider_concurrency_limiters
+            .entry(provider_name.to_string())
+        {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => {
+                let limiter = Arc::new(ProviderConcurrencyLimiter::new(limit.max(1)));
+                entry.insert(Arc::clone(&limiter));
+                limiter
+            }
+        };
+        limiter.update_limit(limit);
+        limiter
+    }
+
+    /// Acquire one provider-wide in-flight request slot. The permit is released
+    /// automatically when it is dropped, including cancellation and error paths.
+    async fn acquire_provider_concurrency(
+        &self,
+        provider_name: &str,
+        limit: u32,
+    ) -> ProviderConcurrencyPermit {
+        self.provider_concurrency_limiter(provider_name, limit)
+            .acquire()
+            .await
+    }
+
+    fn try_acquire_provider_concurrency(
+        &self,
+        provider_name: &str,
+        limit: u32,
+    ) -> Option<ProviderConcurrencyPermit> {
+        self.provider_concurrency_limiter(provider_name, limit)
+            .try_acquire()
+    }
+
     pub fn clear_http_clients(&self) {
         self.http_clients.clear();
     }
@@ -1960,21 +2097,70 @@ impl Router {
         active: Option<ActiveRequestHandle>,
         base_attempt: usize,
     ) -> Result<OpenAIResponse, GatewayError> {
+        self.attempt_with_retry_with_permit(
+            provider_name,
+            request,
+            provider_model,
+            active,
+            base_attempt,
+            None,
+        )
+        .await
+    }
+
+    async fn attempt_with_retry_with_permit(
+        &self,
+        provider_name: &str,
+        request: &OpenAIRequest,
+        provider_model: &ProviderModel,
+        active: Option<ActiveRequestHandle>,
+        base_attempt: usize,
+        concurrency_permit: Option<ProviderConcurrencyPermit>,
+    ) -> Result<OpenAIResponse, GatewayError> {
+        let provider_cfg = {
+            let config = self.config.read().await;
+            config
+                .providers
+                .iter()
+                .find(|p| p.name == provider_name)
+                .cloned()
+                .ok_or_else(|| {
+                    GatewayError::Configuration(format!(
+                        "Provider '{}' not found in config",
+                        provider_name
+                    ))
+                })?
+        };
+        let _concurrency_permit = match concurrency_permit {
+            Some(permit) => permit,
+            None => {
+                self.acquire_provider_concurrency(provider_name, provider_cfg.max_connections)
+                    .await
+            }
+        };
+        self.dispatch_attempts_under_permit(
+            provider_name,
+            request,
+            provider_model,
+            active,
+            base_attempt,
+            provider_cfg,
+        )
+        .await
+    }
+
+    async fn dispatch_attempts_under_permit(
+        &self,
+        provider_name: &str,
+        request: &OpenAIRequest,
+        provider_model: &ProviderModel,
+        active: Option<ActiveRequestHandle>,
+        base_attempt: usize,
+        provider_cfg: Provider,
+    ) -> Result<OpenAIResponse, GatewayError> {
         let config = self.config.read().await;
         let max_retries = config.retry.max_retries_per_provider;
         let backoff_sequence = config.retry.backoff_sequence_seconds.clone();
-
-        // Find provider config
-        let provider_cfg = config
-            .providers
-            .iter()
-            .find(|p| p.name == provider_name)
-            .ok_or_else(|| {
-                GatewayError::Configuration(format!(
-                    "Provider '{}' not found in config",
-                    provider_name
-                ))
-            })?;
 
         // ─── Codex dispatch (Req 10.1, 10.2) ────────────────────────────────
         let is_codex = provider_cfg.auth_method.as_deref() == Some("oauth")
@@ -2345,17 +2531,16 @@ impl Router {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
             }
 
- for (k, v) in &custom_headers {
- if k.eq_ignore_ascii_case(reqwest::header::ACCEPT_ENCODING.as_str()) {
- continue;
- }
- req_builder = req_builder.header(k.as_str(), v.as_str());
- }
- // RequestBuilder::header appends rather than replaces existing values, so
- // filter any provider-level Accept-Encoding above and add identity exactly
- // once. Compressed SSE is vulnerable to truncated decoder frames.
- req_builder = req_builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
-
+            for (k, v) in &custom_headers {
+                if k.eq_ignore_ascii_case(reqwest::header::ACCEPT_ENCODING.as_str()) {
+                    continue;
+                }
+                req_builder = req_builder.header(k.as_str(), v.as_str());
+            }
+            // RequestBuilder::header appends rather than replaces existing values, so
+            // filter any provider-level Accept-Encoding above and add identity exactly
+            // once. Compressed SSE is vulnerable to truncated decoder frames.
+            req_builder = req_builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
 
             let request_start = std::time::Instant::now();
             let result =
@@ -5374,7 +5559,8 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         // not in an upstream rate-limit cooldown). Mirrors the gating in
         // `route_with_failover` but stops at the first candidate; failover for
         // the streaming relay is handled by task 5.6.
-        let mut chosen: Option<ProviderModel> = None;
+        let mut chosen_without_capacity: Option<(ProviderModel, Provider)> = None;
+        let mut chosen: Option<(ProviderModel, ProviderConcurrencyPermit)> = None;
         for provider_model in &providers {
             // Req 4.1: skip providers already tried in the failover loop.
             if exclude.iter().any(|p| p == &provider_model.provider) {
@@ -5394,16 +5580,44 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                 debug!(provider = %provider_model.provider, cooldown_remaining_secs = remaining, "Upstream cooldown active, skipping (streaming)");
                 continue;
             }
-            chosen = Some(provider_model.clone());
+            let provider_cfg = {
+                let config = self.config.read().await;
+                config
+                    .providers
+                    .iter()
+                    .find(|provider| provider.name == provider_model.provider)
+                    .cloned()
+            };
+            let Some(provider_cfg) = provider_cfg else {
+                continue;
+            };
+            let Some(concurrency_permit) = self.try_acquire_provider_concurrency(
+                &provider_model.provider,
+                provider_cfg.max_connections,
+            ) else {
+                debug!(provider = %provider_model.provider, model = %provider_model.model, "Provider concurrency limit reached, checking next pass-through candidate");
+                chosen_without_capacity
+                    .get_or_insert_with(|| (provider_model.clone(), provider_cfg));
+                continue;
+            };
+            chosen = Some((provider_model.clone(), concurrency_permit));
             break;
         }
 
-        // No eligible provider for pass-through → buffered path performs its own
-        // gating, retry, and failover.
-        let provider_model = match chosen {
-            Some(pm) => pm,
+        // No pass-through slot is immediately available. Preserve provider
+        // order by waiting for the first saturated candidate, then use the
+        // normal buffered route so cross-provider failover remains intact.
+        let (provider_model, concurrency_permit) = match chosen {
+            Some(chosen) => chosen,
             None => {
-                debug!("No eligible pass-through provider, using buffered path");
+                let Some((provider_model, provider_cfg)) = chosen_without_capacity else {
+                    debug!("No eligible pass-through provider, using buffered path");
+                    return Ok(StreamingResponse::Buffered(
+                        self.route_request(request, active.clone()).await?,
+                    ));
+                };
+                debug!(provider = %provider_model.provider, model = %provider_model.model, "Waiting for provider concurrency before buffered dispatch");
+                drop(provider_cfg);
                 return Ok(StreamingResponse::Buffered(
                     self.route_request(request, active.clone()).await?,
                 ));
@@ -5437,20 +5651,19 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         // Inspect the chosen provider config. Clone every field needed for the
         // outgoing request before dropping the config guard — the guard must
         // not be held across the network `.await`.
-        let config = self.config.read().await;
-        let provider_cfg = match config
-            .providers
-            .iter()
-            .find(|p| p.name == provider_model.provider)
-        {
-            Some(p) => p,
-            None => {
-                drop(config);
-                return Err(GatewayError::Configuration(format!(
-                    "Provider '{}' not found in config",
-                    provider_model.provider
-                )));
-            }
+        let provider_cfg = {
+            let config = self.config.read().await;
+            config
+                .providers
+                .iter()
+                .find(|p| p.name == provider_model.provider)
+                .cloned()
+        };
+        let Some(provider_cfg) = provider_cfg else {
+            return Err(GatewayError::Configuration(format!(
+                "Provider '{}' not found in config",
+                provider_model.provider
+            )));
         };
 
         // Codex (oauth + openai) is handled end-to-end by CodexProviderClient
@@ -5467,13 +5680,20 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         let known_xml_combo = tools_present
             && self.is_xml_tool_combo(&provider_model.provider, &provider_model.model);
         if is_codex
-            || self.provider_needs_transformation(provider_cfg, &prepared_request)
+            || self.provider_needs_transformation(&provider_cfg, &prepared_request)
             || known_xml_combo
         {
-            drop(config);
             debug!(provider = %provider_model.provider, "Provider needs transformation or is Codex, using buffered path");
             return Ok(StreamingResponse::Buffered(
-                self.route_request(request, active.clone()).await?,
+                self.attempt_with_retry_with_permit(
+                    &provider_model.provider,
+                    request,
+                    &provider_model,
+                    active.clone(),
+                    0,
+                    Some(concurrency_permit),
+                )
+                .await?,
             ));
         }
 
@@ -5488,7 +5708,6 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         let pool_config = provider_cfg.connection_pool.clone();
         let ttfb_timeout_secs = provider_cfg.effective_ttfb_timeout(&provider_model.model);
         let ttfb_timeout = Duration::from_secs(ttfb_timeout_secs);
-        drop(config);
 
         // OAuth bearer resolution (after dropping the config guard).
         let oauth_bearer: Option<String> = if is_oauth_provider {
@@ -5503,6 +5722,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         // path so the auth failure surfaces consistently via failover.
         if is_oauth_provider && oauth_bearer.is_none() {
             debug!(provider = %provider_model.provider, "OAuth session unusable, using buffered path");
+            drop(concurrency_permit);
             return Ok(StreamingResponse::Buffered(
                 self.route_request(request, active.clone()).await?,
             ));
@@ -5548,35 +5768,38 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         } else if !api_key.is_empty() {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
         }
- for (k, v) in &custom_headers {
- if k.eq_ignore_ascii_case(reqwest::header::ACCEPT_ENCODING.as_str()) {
- continue;
- }
- req_builder = req_builder.header(k.as_str(), v.as_str());
- }
- // RequestBuilder::header appends rather than replaces existing values, so
- // filter any provider-level Accept-Encoding above and add identity exactly
- // once. Compressed SSE is vulnerable to truncated decoder frames.
- req_builder = req_builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
-
+        for (k, v) in &custom_headers {
+            if k.eq_ignore_ascii_case(reqwest::header::ACCEPT_ENCODING.as_str()) {
+                continue;
+            }
+            req_builder = req_builder.header(k.as_str(), v.as_str());
+        }
+        // RequestBuilder::header appends rather than replaces existing values, so
+        // filter any provider-level Accept-Encoding above and add identity exactly
+        // once. Compressed SSE is vulnerable to truncated decoder frames.
+        req_builder = req_builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
 
         tracing::info!(provider = %provider_model.provider, %url, model = %provider_model.model, ttfb_timeout_secs, "Calling provider (streaming pass-through)");
 
         // Apply the TTFB timeout to the initial response headers only. The
         // inter-chunk timeout is applied to the body by the relay loop (5.3).
+        // The permit acquired during candidate selection moves with the live
+        // response so it remains held until the downstream relay finishes.
         let send_result =
             tokio::time::timeout(ttfb_timeout, req_builder.json(&outgoing).send()).await;
         let response = match send_result {
             Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                warn!(provider = %provider_model.provider, error = %e, "Streaming pass-through send failed, falling back to buffered path with full failover");
-                return Ok(StreamingResponse::Buffered(
+        Ok(Err(e)) => {
+            warn!(provider = %provider_model.provider, error = %e, "Streaming pass-through send failed, falling back to buffered path with full failover");
+            drop(concurrency_permit);
+            return Ok(StreamingResponse::Buffered(
                     self.route_request(request, active.clone()).await?,
                 ));
             }
-            Err(_) => {
-                warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — falling back to buffered path with full failover");
-                return Ok(StreamingResponse::Buffered(
+        Err(_) => {
+            warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — falling back to buffered path with full failover");
+            drop(concurrency_permit);
+            return Ok(StreamingResponse::Buffered(
                     self.route_request(request, active.clone()).await?,
                 ));
             }
@@ -5589,18 +5812,20 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             // back to the buffered path which has full multi-provider failover.
             let _ = response.text().await;
             warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
+            drop(concurrency_permit);
             return Ok(StreamingResponse::Buffered(
                 self.route_request(request, active.clone()).await?,
             ));
         }
 
-        // Success — hand the live streaming body to the caller without
-        // consuming it. The handler (5.3) relays chunks and accumulates.
+        // Success — hand the live streaming body and permit to the caller.
+        // The handler keeps both alive until the relay finishes or is dropped.
         Ok(StreamingResponse::PassThrough {
             byte_stream: response,
             provider: provider_model.provider.clone(),
             model: provider_model.model.clone(),
             compression,
+            concurrency_permit,
         })
     }
 
@@ -5691,6 +5916,9 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         };
 
         let provider_name = provider.name.clone();
+        let _concurrency_permit = self
+            .acquire_provider_concurrency(&provider_name, provider.max_connections)
+            .await;
         let rate_limiter = self.get_rate_limiter(&provider_name).await;
         if !rate_limiter.consume().await {
             return Err(GatewayError::Provider {
@@ -5834,6 +6062,9 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
     ) -> Result<ProviderPassThroughResponse, GatewayError> {
         let provider_name = &target.provider.name;
         let model_name = &target.model.model;
+        let _concurrency_permit = self
+            .acquire_provider_concurrency(provider_name, target.provider.max_connections)
+            .await;
         let rate_limiter = self.get_rate_limiter(provider_name).await;
         if !rate_limiter.consume().await {
             return Err(GatewayError::Provider {
@@ -6162,7 +6393,113 @@ mod tests {
     };
     use crate::config::{CircuitBreakerConfig, ExactCacheConfig, ModelGroup, ProviderModel};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration as StdDuration;
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn provider_concurrency_limit_serializes_and_releases_waiters() {
+        let router = Arc::new(Router::new(
+            Arc::new(RwLock::new(create_test_config())),
+            test_metrics(),
+        ));
+
+        let first = router.acquire_provider_concurrency("electron", 1).await;
+        let waiting_router = Arc::clone(&router);
+        let mut second = tokio::spawn(async move {
+            waiting_router
+                .acquire_provider_concurrency("electron", 1)
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), &mut second)
+                .await
+                .is_err()
+        );
+        drop(first);
+        let second_permit = tokio::time::timeout(StdDuration::from_secs(1), second)
+            .await
+            .expect("waiting request should acquire after release")
+            .expect("waiting task should complete");
+        drop(second_permit);
+    }
+
+    #[tokio::test]
+    async fn provider_concurrency_limits_are_independent_per_provider() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+
+        let _electron = router.acquire_provider_concurrency("electron", 1).await;
+        tokio::time::timeout(
+            StdDuration::from_millis(50),
+            router.acquire_provider_concurrency("other", 1),
+        )
+        .await
+        .expect("one provider must not block a different provider");
+    }
+
+    #[tokio::test]
+    async fn provider_concurrency_limit_increase_wakes_waiters() {
+        let router = Arc::new(Router::new(
+            Arc::new(RwLock::new(create_test_config())),
+            test_metrics(),
+        ));
+
+        let _first = router.acquire_provider_concurrency("electron", 1).await;
+        let waiting_router = Arc::clone(&router);
+        let mut second = tokio::spawn(async move {
+            waiting_router
+                .acquire_provider_concurrency("electron", 1)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), &mut second)
+                .await
+                .is_err()
+        );
+
+        let limiter = router.provider_concurrency_limiter("electron", 2);
+        let second_permit = tokio::time::timeout(StdDuration::from_secs(1), second)
+            .await
+            .expect("increased limit should wake a waiting request")
+            .expect("waiting task should complete");
+        assert_eq!(limiter.state.lock().unwrap().limit, 2);
+        drop(second_permit);
+    }
+
+    #[tokio::test]
+    async fn provider_concurrency_limit_decrease_applies_after_in_flight_drains() {
+        let router = Arc::new(Router::new(
+            Arc::new(RwLock::new(create_test_config())),
+            test_metrics(),
+        ));
+
+        let first = router.acquire_provider_concurrency("electron", 2).await;
+        let second = router.acquire_provider_concurrency("electron", 2).await;
+        let waiting_router = Arc::clone(&router);
+        let mut third = tokio::spawn(async move {
+            waiting_router
+                .acquire_provider_concurrency("electron", 1)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), &mut third)
+                .await
+                .is_err()
+        );
+
+        drop(first);
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), &mut third)
+                .await
+                .is_err()
+        );
+        drop(second);
+        let third_permit = tokio::time::timeout(StdDuration::from_secs(1), third)
+            .await
+            .expect("lower limit should apply once old requests drain")
+            .expect("waiting task should complete");
+        drop(third_permit);
+    }
 
     struct ContextThenSuccessClient {
         calls: std::sync::atomic::AtomicUsize,
@@ -7090,15 +7427,13 @@ mod tests {
     }
 
     #[tokio::test]
- async fn streaming_provider_receives_compressed_body_before_response() {
- use wiremock::matchers::{body_string_contains, method, path};
-
+    async fn streaming_provider_receives_compressed_body_before_response() {
+        use wiremock::matchers::{body_string_contains, method, path};
 
         let server = MockServer::start().await;
- Mock::given(method("POST"))
- .and(path("/v1/chat/completions"))
- .and(body_string_contains(
-
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(
                 "use a small number of checks to finish",
             ))
             .and(body_string_contains("\"stream\":true"))
@@ -7129,21 +7464,20 @@ mod tests {
         let StreamingResponse::PassThrough { compression, .. } = response else {
             unreachable!()
         };
- assert_eq!(compression.provider, "provider");
- assert_eq!(compression.model, "upstream-model");
+        assert_eq!(compression.provider, "provider");
+        assert_eq!(compression.model, "upstream-model");
 
- let requests = server.received_requests().await.unwrap();
- assert_eq!(requests.len(), 1);
- let accept_encoding = requests[0]
- .headers
- .get_all(reqwest::header::ACCEPT_ENCODING)
- .iter()
- .flat_map(|value| value.to_str().unwrap().split(','))
- .map(str::trim)
- .collect::<Vec<_>>();
- assert_eq!(accept_encoding, vec!["identity"]);
- }
-
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let accept_encoding = requests[0]
+            .headers
+            .get_all(reqwest::header::ACCEPT_ENCODING)
+            .iter()
+            .flat_map(|value| value.to_str().unwrap().split(','))
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        assert_eq!(accept_encoding, vec!["identity"]);
+    }
 
     #[tokio::test]
     async fn failover_prepares_each_provider_from_original_request() {

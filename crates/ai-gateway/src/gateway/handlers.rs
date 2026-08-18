@@ -2216,7 +2216,7 @@ async fn chat_completions_stream(
                     }
                     yield Ok(Event::default().data("[DONE]"));
                 }
-                Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression }) => {
+                Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit }) => {
                     // True streaming pass-through (Req 3.1, 3.2). The early event
                     // above already reset the client idle timer; now relay the
                     // upstream chunks verbatim.
@@ -2276,7 +2276,8 @@ async fn chat_completions_stream(
                     // total failure surfaces every provider, not just the last.
                     let mut streaming_attempts: Vec<ProviderAttempt> = Vec::new();
                     let mut failover_attempts: usize = 0;
-                    let mut current_stream = byte_stream;
+                        let mut _current_concurrency_permit = Some(concurrency_permit);
+                        let mut current_stream = byte_stream;
                     let mut current_provider = provider;
                     let mut current_model = model;
                     let mut current_compression = compression;
@@ -2426,12 +2427,13 @@ async fn chat_completions_stream(
                                 // aggregated error in case every provider fails.
                                 streaming_attempts.push(ProviderAttempt::new(
                                     current_provider.clone(),
-                                    current_model.clone(),
-                                    reason.clone(),
-                                    None,
-                                ));
+current_model.clone(),
+reason.clone(),
+None,
+));
+drop(_current_concurrency_permit.take());
 
-                                match state
+match state
                                     .router
                                     .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
                                     .await
@@ -2439,8 +2441,9 @@ async fn chat_completions_stream(
                                     // Another eligible provider — relay it,
                                     // reusing the SAME early-event id (Req 4.4:
                                     // do NOT emit a second role event).
-                                    Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression }) => {
-                                        current_stream = byte_stream;
+Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit }) => {
+_current_concurrency_permit = Some(concurrency_permit);
+current_stream = byte_stream;
                                         current_provider = provider;
                                         current_model = model;
                                         current_compression = compression;
@@ -3108,7 +3111,9 @@ async fn stream_eager_structured_output(
             provider,
             model,
             compression,
+            concurrency_permit,
         }) => {
+            let _concurrency_permit = concurrency_permit;
             let mut buffer = guardrail_stream::SseBuffer::with_default_cap();
             let mut bytes = byte_stream.bytes_stream();
             while let Some(chunk) = bytes.next().await {
@@ -3382,8 +3387,9 @@ async fn stream_buffered_with_post_call(
             Ok(StreamingResponse::Buffered(response)) => {
                 assembled = Some(response);
             }
-            Ok(StreamingResponse::PassThrough { byte_stream, compression, .. }) => {
-                streaming_compression = Some(compression.clone());
+Ok(StreamingResponse::PassThrough { byte_stream, compression, concurrency_permit, .. }) => {
+let _concurrency_permit = concurrency_permit;
+streaming_compression = Some(compression.clone());
                 // Buffer the live SSE body under the 10 MB cap while emitting
                 // keep-alive comments during idle gaps (Req 10.1, 10.2).
                 let mut buf = guardrail_stream::SseBuffer::with_default_cap();
