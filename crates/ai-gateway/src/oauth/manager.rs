@@ -63,6 +63,11 @@ pub(crate) fn backoff_delay_secs(attempt: u32) -> u64 {
 pub struct OAuthManager {
     store: Arc<OAuthTokenStore>,
     session_state: Arc<RwLock<OAuthSessionState>>,
+    /// In-memory cache of the decrypted access token. Avoids per-request
+    /// blocking disk I/O (two `fs::read_to_string` calls) + AES-256-GCM
+    /// decryption + JSON parse on the tokio worker thread. Updated whenever
+    /// tokens are written; cleared on logout.
+    token_cache: Arc<RwLock<Option<StoredTokens>>>,
     http_client: reqwest::Client,
     #[allow(dead_code)] // consumed by admin login handler (task 7.2)
     flow: Arc<Mutex<OAuthFlow>>,
@@ -80,6 +85,7 @@ impl OAuthManager {
         Self {
             store: Arc::new(store),
             session_state: Arc::new(RwLock::new(OAuthSessionState::Unauthenticated)),
+            token_cache: Arc::new(RwLock::new(None)),
             http_client,
             flow: Arc::new(Mutex::new(flow)),
             refresh_task: Mutex::new(None),
@@ -94,6 +100,9 @@ impl OAuthManager {
     /// * Present and still valid → `Authenticated { expires_at, scopes }`.
     pub async fn load_existing_session(&self) -> Result<(), OAuthError> {
         let tokens = self.store.load()?;
+        // Prime the in-memory token cache at the same time so the first
+        // request after startup doesn't need a second disk round-trip.
+        *self.token_cache.write().await = tokens.clone();
         let mut state = self.session_state.write().await;
         *state = match tokens {
             None => OAuthSessionState::Unauthenticated,
@@ -120,6 +129,10 @@ impl OAuthManager {
     #[tracing::instrument(skip(self, tokens), fields(expires_at = tokens.expires_at))]
     pub(crate) async fn store_tokens(&self, tokens: StoredTokens) -> Result<(), OAuthError> {
         self.store.save(&tokens)?;
+        // Update the in-memory cache before flipping the session state so
+        // requests racing with this write never observe an Authenticated
+        // state with an empty cache.
+        *self.token_cache.write().await = Some(tokens.clone());
         let mut state = self.session_state.write().await;
         *state = OAuthSessionState::Authenticated {
             expires_at: tokens.expires_at,
@@ -143,8 +156,28 @@ impl OAuthManager {
             _ => return None,
         }
 
+        // Hot path: serve from the in-memory cache. This is the case for
+        // every request between login/refresh events, and avoids two
+        // blocking `fs::read_to_string` calls plus AES-256-GCM decryption
+        // on the tokio worker thread per request.
+        {
+            let cache = self.token_cache.read().await;
+            if let Some(tokens) = cache.as_ref() {
+                if !tokens.is_expired(now_unix_secs()) {
+                    return Some(tokens.access_token.clone());
+                }
+                // Expired cache entry: fall through to disk to see if
+                // another process/refresh wrote newer tokens.
+            }
+        }
+
+        // Cold path: populate from disk. Only one request pays this cost,
+        // and it happens immediately after startup or a cache invalidation.
         match self.store.load() {
-            Ok(Some(t)) if !t.is_expired(now_unix_secs()) => Some(t.access_token),
+            Ok(Some(t)) if !t.is_expired(now_unix_secs()) => {
+                *self.token_cache.write().await = Some(t.clone());
+                Some(t.access_token)
+            }
             _ => None,
         }
     }
@@ -246,6 +279,7 @@ impl OAuthManager {
         // endpoint can return immediately.
         let store = self.store.clone();
         let session_state = self.session_state.clone();
+        let token_cache = self.token_cache.clone();
         let http_client = self.http_client.clone();
 
         tokio::spawn(async move {
@@ -276,13 +310,14 @@ impl OAuthManager {
                         expires_at,
                         scopes: scopes.clone(),
                     };
-                    if let Err(e) = store.save(&tokens) {
-                        tracing::error!(error = %e, "Failed to persist OAuth tokens");
-                        return;
-                    }
-                    let mut state = session_state.write().await;
-                    *state = OAuthSessionState::Authenticated { expires_at, scopes };
-                    tracing::info!("OAuth login completed successfully");
+                if let Err(e) = store.save(&tokens) {
+                    tracing::error!(error = %e, "Failed to persist OAuth tokens");
+                    return;
+                }
+                *token_cache.write().await = Some(tokens);
+                let mut state = session_state.write().await;
+                *state = OAuthSessionState::Authenticated { expires_at, scopes };
+                tracing::info!("OAuth login completed successfully");
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "OAuth token exchange failed");
@@ -365,6 +400,7 @@ impl OAuthManager {
             scopes: scopes.clone(),
         };
         self.store.save(&tokens)?;
+        *self.token_cache.write().await = Some(tokens);
         let mut state = self.session_state.write().await;
         *state = OAuthSessionState::Authenticated { expires_at, scopes };
         tracing::info!("OAuth login completed successfully via manual code entry");
@@ -374,6 +410,7 @@ impl OAuthManager {
     /// Idempotent: callable when no tokens are present.
     pub async fn logout(&self) -> Result<(), OAuthError> {
         self.store.delete()?;
+        *self.token_cache.write().await = None;
         let mut state = self.session_state.write().await;
         *state = OAuthSessionState::Unauthenticated;
         Ok(())

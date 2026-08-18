@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::{
-    extract::DefaultBodyLimit,
     http::{HeaderValue, Method},
     response::Redirect,
     routing::{get, post},
@@ -286,14 +285,11 @@ impl GatewayServer {
     }
 
     /// Build the Axum router with all middleware layers.
-    pub fn build_router(&self) -> Router {
-        let config = self.state.config.try_read().expect("config lock poisoned");
+pub fn build_router(&self) -> Router {
+let config = self.state.config.try_read().expect("config lock poisoned");
 
-        // --- Request size limit (Req 45.1-45.5) ---
-        let max_body_bytes = config.server.max_request_size_mb as usize * 1024 * 1024;
-
-        // --- CORS layer (Req 43.1-43.7) ---
-        let cors = self.build_cors_layer(&config);
+// --- CORS layer (Req 43.1-43.7) ---
+let cors = self.build_cors_layer(&config);
 
         // --- Tracing layer (Req 17.5, 20.4) ---
         let trace_layer = TraceLayer::new_for_http();
@@ -478,11 +474,18 @@ impl GatewayServer {
                     ))
                     .unwrap()
             })
-            .layer(DefaultBodyLimit::max(max_body_bytes))
-            .layer(cors)
-            .layer(trace_layer)
-            .with_state(self.state.clone())
-    }
+// --- Request size limit (Req 45.1-45.5) ---
+// Dynamic middleware reads `server.max_request_size_mb` from live config on
+// every request so the limit applies hot-reload changes (admin UI / config
+// reload) without a process restart.
+.layer(axum::middleware::from_fn_with_state(
+self.state.clone(),
+crate::request_body_limit::request_body_limit_middleware,
+))
+.layer(cors)
+.layer(trace_layer)
+.with_state(self.state.clone())
+}
 
     /// Validate TLS configuration on startup (Req 36.2-36.5).
     /// Returns the RustlsConfig if TLS is enabled, or None if disabled.
@@ -1454,31 +1457,34 @@ mod tests {
         cfg
     }
 
-    /// Build a minimal router with a body-consuming endpoint so DefaultBodyLimit is exercised.
-    fn build_test_router(server: &GatewayServer) -> Router {
-        use axum::body::Bytes;
+/// Build a minimal router with a body-consuming endpoint so the dynamic
+/// request body limit middleware is exercised.
+fn build_test_router(server: &GatewayServer) -> Router {
+use axum::body::Bytes;
 
-        let config = server.state.config.try_read().expect("config lock");
-        let max_body_bytes = config.server.max_request_size_mb as usize * 1024 * 1024;
-        let cors = server.build_cors_layer(&config);
-        let trace_layer = TraceLayer::new_for_http();
-        drop(config);
+let config = server.state.config.try_read().expect("config lock");
+let cors = server.build_cors_layer(&config);
+let trace_layer = TraceLayer::new_for_http();
+drop(config);
 
-        // A trivial handler that consumes the full body — triggers DefaultBodyLimit check
-        async fn echo_handler(body: Bytes) -> String {
-            format!("{}", body.len())
-        }
+// A trivial handler that consumes the full body — triggers limit check
+async fn echo_handler(body: Bytes) -> String {
+format!("{}", body.len())
+}
 
-        let api_routes =
-            axum::Router::new().route("/v1/chat/completions", axum::routing::post(echo_handler));
+let api_routes =
+axum::Router::new().route("/v1/chat/completions", axum::routing::post(echo_handler));
 
-        Router::new()
-            .merge(api_routes)
-            .layer(DefaultBodyLimit::max(max_body_bytes))
-            .layer(cors)
-            .layer(trace_layer)
-            .with_state(server.state.clone())
-    }
+Router::new()
+.merge(api_routes)
+.layer(axum::middleware::from_fn_with_state(
+server.state.clone(),
+crate::request_body_limit::request_body_limit_middleware,
+))
+.layer(cors)
+.layer(trace_layer)
+.with_state(server.state.clone())
+}
 
     // Feature: ai-gateway, Property 28: Models Endpoint Aggregation
     // For any request to /v1/models, the response shall contain the union of all

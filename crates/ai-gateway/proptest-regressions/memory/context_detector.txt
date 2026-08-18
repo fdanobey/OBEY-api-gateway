@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc facb69260ea0f5fa6e72e7e53a6d1b14c49f9aac4f45209779441fc10f788e83 # shrinks to pair = Windows { drive: 'A', workspace: "a", project: "a", first_file: "a", second_file: "a" }, system_prompt = "HvBSicxcl8hn6t9a6g4U3hZ0pT1f5pRbolxvopTf3pmAcqi2aS8D4Cm2l7C4545W3FCmOPqYrJc41n4pU5OE1PqS75HiZ7WO3Rb0KGjfyasV1jmYdq0eP820uvtaHUGC6gA7NxAqP485FaUoo6JhBM4F5pd3uO6qsjY5K4wTVoTWSwaih2SPBw4lUOEgLZ704KHr1oJipGV5XRpVml5btn5LC24H2k71rfqqk72B01xECydT8rCxNiok2JMGHE460ex2e0PixgZhmV2FXV2X66G11iB47v7uHJSIHVlfP8zfgk1Uzx3QJ0uC38EHsvcGW2sHUA6iFCZJ0gVKJ7JUu16SalBSKyF3YN92TjU6gh9AtmzsOE1Z", split_paths = true

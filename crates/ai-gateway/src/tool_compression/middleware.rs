@@ -291,12 +291,24 @@ where
             // Use model name as model_group (simple mapping).
             let model_group = model.clone();
 
-            // Optional stable session id used for multi-turn disclosure tracking.
-            let session_id = parts
-                .headers
-                .get(HEADER_SESSION_ID)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
+        // Optional stable session id used for multi-turn disclosure tracking.
+        // Fallback: clients that omit x-session-id (common for anonymous API-key
+        // traffic) would otherwise get zero multi-turn disclosure memory and
+        // re-drill every namespace on every request. Derive a stable,
+        // non-reversible bucket from the Authorization header so disclosure
+        // state persists per key, mirroring loop_detection's vk-id fallback.
+        let session_id = parts
+            .headers
+            .get(HEADER_SESSION_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                parts
+                    .headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|auth| format!("vk-{:016x}", hash_auth_value(auth)))
+            });
 
             let config_snapshot = config.try_read().ok().map(|c| c.tool_compression.clone());
 
@@ -513,10 +525,10 @@ where
             // Canonical discovery keys already revealed this session (namespace/grouping
             // only). Used so re-drills are reminded from session cache instead of being
             // silently re-resolved, strengthening multi-turn memory of disclosed tools.
-            let already_disclosed: HashSet<String> = session_id
-                .as_ref()
-                .and_then(|sid| state.disclosure_targets.get(sid).map(|set| set.clone()))
-                .unwrap_or_default();
+        let mut already_disclosed: HashSet<String> = session_id
+            .as_ref()
+            .and_then(|sid| state.disclosure_targets.get(sid).map(|set| set.clone()))
+            .unwrap_or_default();
             while synthetic_injected {
                 let sse = response_is_sse(&final_response);
                 let (resp_parts, resp_body) = final_response.into_parts();
@@ -538,26 +550,46 @@ where
                 // Budget exhausted: a synthetic call must still never be relayed, so
                 // answer it locally and terminate the turn instead of forwarding it.
                 if steps >= step_budget {
-                    match sanitize_synthetic_response(&resp_json, &original_tools, sse) {
-                        Some(sanitized) => {
-                            tracing::warn!(
-                                model_group = %model_group,
-                                steps,
-                                "Synthetic drill-down budget exhausted; answering locally instead of relaying the synthetic call to the client"
-                            );
-                            let mut parts = resp_parts;
-                            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-                            final_response = Response::from_parts(parts, Body::from(sanitized));
-                        }
-                        None => {
-                            final_response =
-                                Response::from_parts(resp_parts, Body::from(resp_bytes));
-                        }
-                    }
-                    break;
-                }
+match sanitize_synthetic_response(&resp_json, &original_tools, sse) {
+            Some(sanitized) => {
+                tracing::warn!(
+                    model_group = %model_group,
+                    steps,
+                    "Synthetic drill-down budget exhausted; answering locally instead of relaying the synthetic call to the client"
+                );
+                let mut parts = resp_parts;
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                final_response = Response::from_parts(parts, Body::from(sanitized));
+            }
+            None => {
+                final_response =
+                    Response::from_parts(resp_parts, Body::from(resp_bytes));
+            }
+        }
+        break;
+    }
 
-                match resolver::resolve_synthetic_in_response(
+    // ─── Pre-resolution short-circuit for re-drills ───────────
+    // If all synthetic calls target namespaces/tools already disclosed
+    // AND callable this turn, answer locally and terminate instead of
+    // making another provider round-trip. This eliminates the residual
+    // cost of model re-drills even when the hint is ignored.
+    if let Some(redrill_resp) = check_redrill_short_circuit(
+        &resp_json,
+        &req_json,
+        &original_tools,
+        &already_disclosed,
+        sse,
+        &model_group,
+        &feedback_loop,
+    ) {
+        let mut parts = resp_parts;
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        final_response = Response::from_parts(parts, Body::from(redrill_resp));
+        break;
+    }
+
+    match resolver::resolve_synthetic_in_response(
                     &resp_json,
                     &mut req_json,
                     &original_tools,
@@ -592,9 +624,10 @@ where
                                         .get("arguments")
                                         .and_then(|a| a.as_str())
                                         .unwrap_or("{}");
-                                    if let Some(key) = resolver::discovery_key(name, args) {
-                                        targets.insert(key);
-                                    }
+                if let Some(key) = resolver::discovery_key(name, args) {
+                    already_disclosed.insert(key.clone());
+                    targets.insert(key);
+                }
                                 }
                             }
                         }
@@ -740,6 +773,16 @@ fn compute_tool_hash(value: &serde_json::Value) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Hash an Authorization header value into a stable, non-reversible session
+/// bucket key. The raw credential is never stored or logged — only this digest
+/// is used as the fallback disclosure-session identifier.
+fn hash_auth_value(auth: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    auth.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -921,6 +964,159 @@ fn sanitize_synthetic_response(
         notes.join(" ")
     );
 
+    if sse {
+        let chunk = serde_json::json!({
+            "id": resp_json.get("id").and_then(|v| v.as_str()).unwrap_or("chatcmpl-tc"),
+            "object": "chat.completion.chunk",
+            "created": resp_json.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
+            "model": resp_json.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }]
+        });
+        Some(format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes())
+    } else {
+        let mut out = resp_json.clone();
+        out["choices"] = serde_json::json!([{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }]);
+        serde_json::to_vec(&out).ok()
+    }
+}
+
+/// Check whether every synthetic call in the response is a pure re-drill:
+/// a discovery target already disclosed this session whose underlying tools
+/// are already callable in the current request's tool list. In that case a
+/// provider round-trip would return information the model already has, so
+/// the turn is answered locally and terminated instead — saving one full
+/// provider call per repeat.
+///
+/// Re-drills are also recorded into the `FeedbackLoop` as error outcomes so
+/// chronic re-drillers get their compression level stepped down (fewer
+/// synthetic tools offered → fewer opportunities to re-drill).
+///
+/// Returns the locally framed response body when the short-circuit applies,
+/// or `None` when the response carries no synthetic calls or any call needs
+/// a real resolution step.
+fn check_redrill_short_circuit(
+    resp_json: &serde_json::Value,
+    req_json: &serde_json::Value,
+    original_tools: &[ToolDefinition],
+    already_disclosed: &HashSet<String>,
+    sse: bool,
+    model_group: &str,
+    feedback_loop: &FeedbackLoop,
+) -> Option<Vec<u8>> {
+    let calls = resp_json
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(|v| v.as_array())?;
+
+    // Names callable in the current (possibly re-injected) outbound request.
+    let callable_names: HashSet<String> = req_json
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    t.pointer("/function/name")
+                        .and_then(|n| n.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut notes: Vec<String> = Vec::new();
+    let mut saw_synthetic = false;
+    let mut all_redrills = true;
+
+    for call in calls {
+        let name = call
+            .pointer("/function/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let args = call
+            .pointer("/function/arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}");
+
+        let is_synthetic = name == resolver::GET_TOOLS_IN_NAMESPACE
+            || name == resolver::GET_TOOL_SCHEMA
+            || name.starts_with(resolver::NS_PREFIX);
+        if !is_synthetic {
+            // A real tool call mixed in: the provider turn is doing useful work.
+            all_redrills = false;
+            continue;
+        }
+        saw_synthetic = true;
+
+        let Some(key) = resolver::discovery_key(name, args) else {
+            all_redrills = false;
+            continue;
+        };
+        if !already_disclosed.contains(&key) {
+            // First drill for this target — resolve normally.
+            all_redrills = false;
+            continue;
+        }
+
+        // Target was disclosed; the short-circuit only applies when every
+        // underlying tool is already callable this turn. Otherwise the normal
+        // resolution path must run to re-inject the missing schemas.
+        let members: Vec<String> = if let Some(ns) = key.strip_prefix("ns:") {
+            resolver::tools_in_namespace(ns, original_tools)
+                .iter()
+                .filter_map(|t| {
+                    t.pointer("/function/name")
+                        .and_then(|n| n.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        } else if let Some(tool_name) = key.strip_prefix("tool:") {
+            vec![tool_name.to_string()]
+        } else {
+            Vec::new()
+        };
+        if members.is_empty() || !members.iter().all(|m| callable_names.contains(m)) {
+            all_redrills = false;
+            continue;
+        }
+
+        notes.push(format!("{}: {}.", key, members.join(", ")));
+    }
+
+    if !saw_synthetic || !all_redrills {
+        return None;
+    }
+
+    // Chronic re-drills waste provider turns; feed the FeedbackLoop so the
+    // compression level for this model group trends down over time.
+    feedback_loop.record_outcome(model_group, true);
+    tracing::debug!(
+        model_group = %model_group,
+        "Answered synthetic re-drill locally (tools already disclosed and callable)"
+    );
+
+    let content = format!(
+        "Session cache hit: you already retrieved these schemas earlier in this session and they remain valid and callable. {} Do NOT call the discovery tool for these targets again — call the listed tools directly by name.",
+        notes.join(" ")
+    );
+
+    frame_local_assistant_response(resp_json, &content, sse)
+}
+
+/// Frame a locally generated assistant message in the response shape the client
+/// expects (SSE chunk stream or plain JSON), terminating the turn with
+/// `finish_reason: "stop"`.
+fn frame_local_assistant_response(
+    resp_json: &serde_json::Value,
+    content: &str,
+    sse: bool,
+) -> Option<Vec<u8>> {
     if sse {
         let chunk = serde_json::json!({
             "id": resp_json.get("id").and_then(|v| v.as_str()).unwrap_or("chatcmpl-tc"),
@@ -1637,9 +1833,112 @@ mod service_tests {
         let resp = svc.call(request_with_many_tools(true)).await.unwrap();
         let body = body_string(resp).await;
 
-        assert!(
-            body.contains("fs_op1"),
-            "real tool call must reach the client: {body}"
-        );
-    }
+    assert!(
+        body.contains("fs_op1"),
+        "real tool call must reach the client: {body}"
+    );
+}
+
+/// THE redrill regression: drilling the same namespace again on a later request
+/// in the same session must be answered locally from session memory — no extra
+/// provider follow-up turn, and the synthetic call must never reach the client.
+#[tokio::test]
+async fn redrill_is_answered_locally_without_provider_followup() {
+    let config = test_config();
+    let tc = config
+        .try_read()
+        .map(|c| c.tool_compression.clone())
+        .unwrap();
+    let state = Arc::new(ToolCompressionState::new(&tc));
+    let inner = MockInner {
+        responses: Arc::new(vec![
+            (
+                json_tool_call(resolver::GET_TOOLS_IN_NAMESPACE, r#"{"namespace":"fs"}"#),
+                "application/json",
+            ),
+            (json_text("ok"), "application/json"),
+            (
+                json_tool_call(resolver::GET_TOOLS_IN_NAMESPACE, r#"{"namespace":"fs"}"#),
+                "application/json",
+            ),
+        ]),
+        calls: Arc::new(AtomicUsize::new(0)),
+        seen_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let layer = ToolCompressionLayer::new(
+        Arc::clone(&config),
+        Arc::clone(&state),
+        Arc::new(Metrics::new()),
+        Arc::new(CompressionEventHub::new()),
+    );
+
+    let req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(HEADER_SESSION_ID, "sess-redrill")
+            .body(Body::from(
+                serde_json::to_vec(&many_tools_body(false)).unwrap(),
+            ))
+            .unwrap()
+    };
+
+    // Request 1: drill fs → resolved → one follow-up turn finishing on "ok".
+    let mut svc1 = layer.layer(inner.clone());
+    let _ = svc1.call(req()).await.unwrap();
+
+    // Request 2: model re-drills fs. The provider emits the synthetic call
+    // (inner call #3), but the middleware must answer it locally instead of
+    // making another provider round-trip (which would be call #4).
+    let mut svc2 = layer.layer(inner.clone());
+    let resp = svc2.call(req()).await.unwrap();
+    let body = body_string(resp).await;
+
+    assert!(
+        body.contains("Session cache hit"),
+        "re-drill must be answered from session cache, got: {body}"
+    );
+    assert!(
+        !body.contains(resolver::GET_TOOLS_IN_NAMESPACE),
+        "synthetic re-drill leaked to client: {body}"
+    );
+    assert_eq!(
+        inner.calls.load(Ordering::SeqCst),
+        3,
+        "re-drill must not trigger a follow-up provider round-trip"
+    );
+}
+
+/// Request body with 20 tools across two namespaces so the grouper activates.
+fn many_tools_body(stream: bool) -> serde_json::Value {
+    let tools: Vec<serde_json::Value> = (0..10)
+        .map(|i| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": format!("fs_op{}", i),
+                    "description": "a filesystem operation",
+                    "parameters": {"type":"object","properties":{"path":{"type":"string"}}}
+                }
+            })
+        })
+        .chain((0..10).map(|i| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": format!("git_op{}", i),
+                    "description": "a git operation",
+                    "parameters": {"type":"object","properties":{"ref":{"type":"string"}}}
+                }
+            })
+        }))
+        .collect();
+    json!({
+        "model": "gpt-4o",
+        "stream": stream,
+        "messages": [{"role":"user","content":"do something"}],
+        "tools": tools
+    })
+}
 }

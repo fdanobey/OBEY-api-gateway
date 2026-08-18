@@ -20,8 +20,17 @@ pub struct DetectedContext {
 }
 
 static WINDOWS_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:^|[^A-Za-z0-9_])([A-Z]:\\[^\s\x00-\x1f<>|?*"]+)"#)
+    Regex::new(r#"(?i)(?:^|[^A-Za-z0-9_])([A-Z]:\\[^\x00-\x1f<>|?*"]+)"#)
         .expect("Windows path regex must compile")
+});
+
+/// Matches drive-letter starts (`C:\`) so greedy Windows matches that span
+/// several drive-letter paths listed in one message (e.g. `...main.rs and
+/// C:\work\...`) can be sliced into individual paths. Implemented with
+/// position collection instead of a lookahead split because the `regex`
+/// crate does not support lookaround.
+static WINDOWS_DRIVE_START_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[A-Za-z]:\\").expect("Windows drive start regex must compile")
 });
 
 static UNIX_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -122,18 +131,7 @@ fn detect_project(message_texts: &[String]) -> Option<(String, Option<String>)> 
 
     project_prefix(&windows_paths, PathStyle::Windows)
         .or_else(|| project_prefix(&unix_paths, PathStyle::Unix))
-        .map(|prefix| {
-            let display_name = project_basename(&prefix);
-            (short_hash(&prefix), display_name)
-        })
-}
-
-fn project_basename(prefix: &str) -> Option<String> {
-    let candidate = prefix
-        .trim_end_matches(['/', '\\'])
-        .rsplit(['/', '\\'])
-        .next()?;
-    sanitize_label(candidate)
+        .map(|(prefix, display_name)| (short_hash(&prefix), display_name))
 }
 
 pub fn sanitize_label(value: &str) -> Option<String> {
@@ -154,11 +152,48 @@ enum PathStyle {
     Unix,
 }
 
+/// Slices a greedy Windows match into individual paths at embedded
+/// drive-letter starts. Everything between the separator run and the next
+/// drive letter (natural-language words like "and compare with") is
+/// stripped; interior spaces stay part of directory names like
+/// `Safe Project!`.
+fn split_windows_match(matched: &str) -> Vec<&str> {
+    let mut starts: Vec<usize> = WINDOWS_DRIVE_START_RE
+        .find_iter(matched)
+        .map(|found| found.start())
+        .collect();
+    starts.dedup();
+    if starts.is_empty() {
+        return vec![matched];
+    }
+
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, &start)| {
+            let end = starts
+                .get(index + 1)
+                .copied()
+                .unwrap_or(matched.len());
+            matched[start..end].trim_end()
+        })
+        .filter(|candidate| !candidate.is_empty())
+        .collect()
+}
+
 fn extract_paths(text: &str, regex: &Regex, style: PathStyle) -> Vec<Vec<String>> {
     regex
         .captures_iter(text)
         .filter_map(|captures| captures.get(1))
-        .filter_map(|matched| path_directory_components(matched.as_str(), style))
+        .flat_map(|matched| {
+            let matched = matched.as_str();
+            if matches!(style, PathStyle::Windows) {
+                split_windows_match(matched)
+            } else {
+                vec![matched]
+            }
+        })
+        .filter_map(|matched| path_directory_components(matched, style))
         .collect()
 }
 
@@ -175,6 +210,15 @@ fn path_directory_components(path: &str, style: PathStyle) -> Option<Vec<String>
         .filter(|component| !component.is_empty())
         .map(str::to_owned)
         .collect();
+
+    if let Some(last) = components.last_mut() {
+        *last = last
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+    }
+    components.retain(|component| !component.is_empty());
 
     match style {
         PathStyle::Windows => {
@@ -195,7 +239,9 @@ fn path_directory_components(path: &str, style: PathStyle) -> Option<Vec<String>
     Some(components)
 }
 
-fn project_prefix(paths: &[Vec<String>], style: PathStyle) -> Option<String> {
+/// Returns the normalized common prefix used for hashing plus a sanitized
+/// display label built from the original-cased components.
+fn project_prefix(paths: &[Vec<String>], style: PathStyle) -> Option<(String, Option<String>)> {
     if paths.len() < 2 {
         return None;
     }
@@ -219,7 +265,8 @@ fn project_prefix(paths: &[Vec<String>], style: PathStyle) -> Option<String> {
     }
 
     let common = &paths[0][..common_length];
-    Some(match style {
+    let display_name = sanitize_label(common.last()?);
+    let prefix = match style {
         PathStyle::Windows => {
             let normalized = common
                 .iter()
@@ -229,7 +276,8 @@ fn project_prefix(paths: &[Vec<String>], style: PathStyle) -> Option<String> {
             format!("{normalized}/")
         }
         PathStyle::Unix => format!("/{}/", common.join("/")),
-    })
+    };
+    Some((prefix, display_name))
 }
 
 fn components_equal(left: &str, right: &str, style: PathStyle) -> bool {

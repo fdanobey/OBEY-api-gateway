@@ -2207,13 +2207,20 @@ impl Router {
                 config.reasoning_models_allowlist.clone(),
             );
 
-            let mut codex_request = request.clone();
-            // Rewrite the model from the group name to the actual provider model ID
-            codex_request.model = provider_model.model.clone();
-            let result = self
-                .dispatch_buffered_with_context_retry(&codex_client, codex_request)
-                .await?;
-            return Ok(result.response);
+		let mut codex_request = request.clone();
+		// Rewrite the model from the group name to the actual provider model ID
+		codex_request.model = provider_model.model.clone();
+		// Drop config lock before making HTTP calls. The dispatch below
+		// awaits the full upstream round-trip; holding the write-preferring
+		// read guard across it lets any queued config writer (hot-reload,
+		// tray, memory settings) stall every subsequent request gateway-wide
+		// for the duration of the slowest in-flight Codex call. All config
+		// values needed here were cloned above.
+		drop(config);
+		let result = self
+			.dispatch_buffered_with_context_retry(&codex_client, codex_request)
+			.await?;
+		return Ok(result.response);
         }
         // ─── End Codex dispatch ──────────────────────────────────────────────
 
