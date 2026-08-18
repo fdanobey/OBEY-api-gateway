@@ -34,6 +34,7 @@ mod metrics;
 mod models;
 mod oauth;
 mod providers;
+mod request_body_limit;
 mod router;
 mod secrets;
 #[allow(dead_code, unused_imports)]
