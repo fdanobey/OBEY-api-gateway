@@ -102,11 +102,21 @@ streaming:
 
 Some models emit XML-style tool calls instead of native `tool_calls` JSON. The gateway learns which `provider::model` combinations do this at runtime:
 
-1. First streaming request detects XML tool syntax in pass-through mode
+1. First request detects XML tool syntax (streaming relay or buffered-response diagnostic)
 2. Combination is recorded in an in-memory set
 3. Subsequent tool requests for that combo use buffer-and-replay to rewrite XML into native `tool_calls`
 
 This set resets on process restart — it's a runtime optimization only.
+
+### Conditional Tool-Calling Hint
+
+The same learned signal drives a compact tool-calling system hint that is injected **only** where it is needed:
+
+- **Learned combos** — models observed emitting XML tool use — get the hint automatically
+- **Built-in XML-prone families** (`kimi`, `glm`, `qwen`, `deepseek` model-name substrings) get it from first contact
+- **Everything else never sees it** — capable models pay zero prompt overhead and keep parallel tool calling unconstrained
+
+Recovery is automatic and requires no configuration: after three consecutive native-`tool_calls` responses, a learned combo is forgiven and both the hint and buffer-and-replay stand down; the next XML regression re-arms them immediately. Buffered responses report whether the hint was used via the `gateway_tool_hint_injected` response field.
 
 ---
 

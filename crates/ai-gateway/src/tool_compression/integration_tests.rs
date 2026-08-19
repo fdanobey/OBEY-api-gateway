@@ -5,16 +5,9 @@
 
 #[cfg(test)]
 mod tests {
-    use axum::{
-        body::Body,
-        http::{header, Request, Response, StatusCode},
-        routing::post,
-        Router,
-    };
-    use serde_json::{json, Value};
-    use tower::ServiceExt;
+use serde_json::{json, Value};
 
-    use crate::tool_compression::config::CompressionLevel;
+use crate::tool_compression::config::CompressionLevel;
     use crate::tool_compression::types::ToolDefinition;
     use crate::tool_compression::validation::{
         validate_compressed_tools, validate_tool_calls_against_originals,
@@ -204,10 +197,9 @@ mod tests {
 
     // ─── 24.4: Canonical rewriting end-to-end ─────────────────────────────────
 
-    #[test]
-    fn test_canonical_rewriting_end_to_end() {
-        use crate::tool_compression::config::ToolCompressionConfig;
-        use crate::tool_compression::stage::CompressionStage;
+#[test]
+fn test_canonical_rewriting_end_to_end() {
+use crate::tool_compression::stage::CompressionStage;
         use crate::tool_compression::stages::canonical_rewriter::CanonicalRewriter;
         use crate::tool_compression::types::CompressionContext;
         use dashmap::DashMap;

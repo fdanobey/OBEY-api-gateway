@@ -4396,17 +4396,24 @@ fn relay_passthrough_stream(
                             let content_text = choice
                                 .map(|c| c.message.content_as_text())
                                 .unwrap_or_default();
-                            if !has_native_tc
-                                && crate::router::router::Router::looks_like_xml_tool_use(&content_text)
-                            {
-                                det.router.mark_xml_tool_combo(&det.provider, &det.model);
-                                tracing::warn!(
-                                    trace_id = %trace_id,
-                                    provider = %det.provider,
-                                    model = %det.model,
-                                    "Detected XML-style tool use in streamed response; future tool requests for this provider/model will use the buffered translate path"
-                                );
-                            }
+                if !has_native_tc
+                    && crate::router::router::Router::looks_like_xml_tool_use(&content_text)
+                {
+                    det.router.mark_xml_tool_combo(&det.provider, &det.model);
+                    tracing::warn!(
+                        trace_id = %trace_id,
+                        provider = %det.provider,
+                        model = %det.model,
+                        "Detected XML-style tool use in streamed response; future tool requests for this provider/model will use the buffered translate path"
+                    );
+                } else if has_native_tc {
+                    // Mirror of the buffered-path diagnostic: native
+                    // tool_calls count toward forgiving a learned XML
+                    // combo (hint injection + buffer-and-translate stand
+                    // down after TOOL_HINT_RECOVERY_SUCCESSES).
+                    det.router
+                        .record_native_tool_success(&det.provider, &det.model);
+                }
                         }
                         // Req 3.7: surface usage from the final chunk in logs.
                         tracing::info!(

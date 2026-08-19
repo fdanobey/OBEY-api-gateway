@@ -19,19 +19,21 @@ impl LatencySnapshot {
         self.known.get(provider).copied().unwrap_or(self.fallback_ms)
     }
 
-    /// Check if a provider has known latency in this snapshot.
+    // Test-only accessors for asserting snapshot contents. Compiled out of
+    // normal builds so the dual bin/lib targets stay warning-clean.
+    #[cfg(test)]
     #[inline]
     pub fn has_latency(&self, provider: &str) -> bool {
         self.known.contains_key(provider)
     }
 
-    /// Get the fallback latency value used for unknown providers.
+    #[cfg(test)]
     #[inline]
     pub fn fallback(&self) -> f64 {
         self.fallback_ms
     }
 
-    /// Get the number of providers with known latency.
+    #[cfg(test)]
     #[inline]
     pub fn known_count(&self) -> usize {
         self.known.len()
@@ -56,6 +58,13 @@ impl LatencyTracker {
 
     /// Get latency for a provider in milliseconds
     /// Returns median of all providers if no history exists for this provider
+    ///
+    /// Production routing reads the immutable snapshot (`snapshot()` +
+    /// `LatencySnapshot::get_latency`) instead of this live query, so the
+    /// bin target considers it dead code. It remains part of the lib API:
+    /// integration tests use it as the reference implementation when
+    /// verifying snapshot equivalence.
+    #[allow(dead_code)]
     #[inline]
     pub fn get_latency(&self, provider: &str) -> f64 {
         if let Some(latency) = self.latencies.get(provider) {
@@ -106,6 +115,8 @@ impl LatencyTracker {
     }
 
     /// Calculate median latency of all tracked providers
+    /// (only reachable via `get_latency`; see its note on the bin target)
+    #[allow(dead_code)]
     fn calculate_median(&self) -> f64 {
         let mut values: Vec<f64> = self.latencies.iter().map(|entry| *entry.value()).collect();
 

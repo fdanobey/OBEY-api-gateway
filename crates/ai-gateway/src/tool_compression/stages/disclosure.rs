@@ -197,10 +197,9 @@ fn estimate_tokens(value: &Value) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::collections::HashSet;
+use super::*;
 
-    fn make_tool(name: &str, description: &str) -> ToolDefinition {
+fn make_tool(name: &str, description: &str) -> ToolDefinition {
         let raw = json!({
             "type": "function",
             "function": {

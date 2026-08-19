@@ -210,11 +210,10 @@ fn estimate_tokens(value: &serde_json::Value) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::json;
-    use std::collections::HashMap;
+use super::*;
+use serde_json::json;
 
-    fn make_tool(name: &str, description: &str) -> ToolDefinition {
+fn make_tool(name: &str, description: &str) -> ToolDefinition {
         ToolDefinition {
             raw: json!({
                 "type": "function",

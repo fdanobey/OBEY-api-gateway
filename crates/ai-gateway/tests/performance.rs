@@ -20,7 +20,6 @@ use axum::http::{Request, StatusCode};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
-use ai_gateway::compression::config::EffectiveCompressionConfig;
 use ai_gateway::compression::pipeline::{CompressionPipeline, CompressionRequestMetadata};
 use ai_gateway::compression::token_counter::TokenCounter;
 use ai_gateway::compression::{CompressiblePayload, CompressionContext, CompressionLevel};

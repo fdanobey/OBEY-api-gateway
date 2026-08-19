@@ -9,6 +9,10 @@ cargo build --release -p ai-gateway    # Release binary at target/release/ai-gat
 cargo run -p ai-gateway -- --config ./config.yaml
 ```
 
+### Clean-Build Requirement
+
+Builds must be clean — zero errors, zero warnings. After any major change, run `cargo check -p ai-gateway --all-targets` and fix every warning (unused imports, dead code, etc.) before considering the work done. Do not silence warnings with blanket `#[allow]` attributes; remove the dead code or gate genuinely test-only helpers with `#[cfg(test)]` instead.
+
 ## Test
 
 ```bash
