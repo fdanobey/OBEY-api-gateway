@@ -63,6 +63,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Token compression** — 9 multi-engine compression strategies (lite, standard, aggressive, ultra, RTK, stacked, tool_def, language_pack, perplexity) with hierarchical configuration, protection rules, cache-aware downgrades, and Prometheus observability (see [Token Compression](#token-compression))
 - **Tool definition compression** — 12-stage pipeline for reducing token waste from large `tools` arrays: schema minification, description truncation, deduplication with `$ref`, frequency-based pruning, progressive disclosure with namespace grouping, semantic retrieval (TF-IDF + embeddings), canonical text rewriting, cache-aware placement, and adaptive feedback loop with auto-tuning; provider-aware, per-model-group overrides, zero overhead when disabled (see [Tool Definition Compression](#tool-definition-compression))
 - **Hot config reload** — change settings through the admin UI without restarting
+- **Dynamic request body limit** — configurable `max_request_size_mb` (default 10 MB) enforced per-request; adjustable via admin UI or hot-reload without restart, rejects oversized payloads with HTTP 413 before forwarding
 - **Smart timeouts** — split TTFB / total timeouts with auto-detection of thinking models (o1, o3, DeepSeek-R1, Claude)
 - **Smart model routing** — complexity-aware tier selection (Fast / Balanced / Powerful) with heuristic, ML (ONNX), LLM, or composite classifiers; cascade escalation, online optimization, A/B testing, budget limits, semantic routing cache, and per-model-group overrides (see [Smart Model Routing](#smart-model-routing))
 
@@ -198,6 +199,7 @@ server:
   host: "0.0.0.0"
   port: 8080
   request_timeout_seconds: 30
+  max_request_size_mb: 10             # Dynamic body limit (hot-reloadable)
 
 providers:
   - name: "openai"
@@ -1269,6 +1271,7 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── smart_routing/       # Smart model routing: complexity classification, tier selection, cascade, A/B testing
 │           ├── assistants/          # OpenAI Assistants API: local SQLite-backed CRUD for assistants, threads, messages, runs, files
 │           ├── active_requests.rs   # Live in-flight request registry for dashboard phase tracking
+│           ├── request_body_limit.rs # Dynamic per-request body size enforcement (hot-reloadable)
 │           ├── memory/               # Persistent memory store: extraction, injection, decay, namespaces, Qdrant
 │           ├── secrets.rs            # API key encryption/decryption
 │           ├── error/                # Error types & HTTP status mapping
