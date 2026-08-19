@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ca524de1808b6b98f5665d753d504e4a426138ac11b53a085fee658962ddb183 # shrinks to deny = {4, 3, 1, 0}, allow = {0}, input = "r.. .@of @73a @fq5 2... v .w @16@98x f.78x.@.4@ "

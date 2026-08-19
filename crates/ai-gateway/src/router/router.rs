@@ -5690,17 +5690,10 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             || self.provider_needs_transformation(&provider_cfg, &prepared_request)
             || known_xml_combo
         {
-            debug!(provider = %provider_model.provider, "Provider needs transformation or is Codex, using buffered path");
+            debug!(provider = %provider_model.provider, "Provider needs transformation or is Codex, using buffered path with full failover");
+            drop(concurrency_permit);
             return Ok(StreamingResponse::Buffered(
-                self.attempt_with_retry_with_permit(
-                    &provider_model.provider,
-                    request,
-                    &provider_model,
-                    active.clone(),
-                    0,
-                    Some(concurrency_permit),
-                )
-                .await?,
+                self.route_request(request, active.clone()).await?,
             ));
         }
 
