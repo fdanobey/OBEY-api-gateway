@@ -3,7 +3,8 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{LazyLock, Mutex};
 use thiserror::Error;
 
 use crate::{
@@ -24,6 +25,9 @@ pub enum LoggerError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Failed to enqueue log command: {0}")]
+    Enqueue(String),
 }
 
 pub type Result<T> = std::result::Result<T, LoggerError>;
@@ -191,10 +195,46 @@ pub struct LogFilter {
     pub limit: Option<usize>,
 }
 
-/// Request logger with SQLite backend
+/// Depth of the bounded queue feeding the writer thread. Request handlers
+/// never block on log writes: when the queue is full because the disk
+/// cannot keep up, commands are dropped with a warning instead of
+/// stalling the hot path.
+const LOG_QUEUE_CAPACITY: usize = 4096;
+
+/// Maximum number of entries committed per transaction on the writer
+/// thread. Batched transactions amortize fsync cost across concurrent
+/// requests instead of paying one autocommit fsync per entry.
+const MAX_WRITE_BATCH: usize = 64;
+
+/// Command processed by the dedicated writer thread. The command channel
+/// is FIFO, so a `Query` always observes every `Write` enqueued before it.
+enum LoggerCommand {
+    Write(LogEntry),
+    Query {
+        filter: Box<LogFilter>,
+        responder: mpsc::Sender<Result<Vec<LogEntry>>>,
+    },
+    Cleanup {
+        responder: mpsc::Sender<Result<usize>>,
+    },
+    Checkpoint {
+        responder: mpsc::Sender<()>,
+    },
+}
+
+/// Request logger with a SQLite backend driven by a dedicated writer
+/// thread.
+///
+/// `log` enqueues onto a bounded channel and returns immediately, so
+/// request handlers never block on disk I/O and never contend on a
+/// connection mutex. The writer thread owns the only `Connection`, batches
+/// consecutive writes into a single transaction, and services queries and
+/// maintenance commands in FIFO order.
 pub struct RequestLogger {
-    conn: Arc<Mutex<Connection>>,
-    config: LoggingConfig,
+    sender: Option<SyncSender<LoggerCommand>>,
+    /// `JoinHandle` is `Send` but not `Sync`; the `Mutex` keeps the logger
+    /// shareable via `Arc<AppState>` across axum handlers.
+    writer: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl RequestLogger {
@@ -212,10 +252,44 @@ impl RequestLogger {
         // Create schema
         Self::create_schema(&conn)?;
 
+        let (sender, receiver) = mpsc::sync_channel(LOG_QUEUE_CAPACITY);
+        let writer = std::thread::Builder::new()
+            .name("request-log-writer".to_owned())
+            .spawn(move || writer_loop(conn, config, receiver))
+            .map_err(LoggerError::from)?;
+
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            config,
+            sender: Some(sender),
+            writer: Mutex::new(Some(writer)),
         })
+    }
+
+    /// Enqueue a command without ever blocking the caller.
+    fn send_command(&self, command: LoggerCommand) -> Result<()> {
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(LoggerError::Enqueue(
+                "request log writer is shut down".to_owned(),
+            ));
+        };
+        match sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!("Request log queue full; dropping command");
+                Err(LoggerError::Enqueue("request log queue full".to_owned()))
+            }
+            Err(TrySendError::Disconnected(_)) => Err(LoggerError::Enqueue(
+                "request log writer stopped".to_owned(),
+            )),
+        }
+    }
+
+    /// Log a request entry.
+    ///
+    /// The entry is persisted asynchronously by the writer thread; this
+    /// call only fails when the bounded queue is full or the writer is
+    /// gone, so callers can warn without stalling the response path.
+    pub fn log(&self, entry: LogEntry) -> Result<()> {
+        self.send_command(LoggerCommand::Write(entry))
     }
 
     /// Create database schema with indexes
@@ -303,70 +377,72 @@ impl RequestLogger {
         Ok(())
     }
 
-    /// Log a request entry
-    pub fn log(&self, entry: LogEntry) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+    /// Query log entries with optional filtering.
+    ///
+    /// Blocks on a round-trip to the writer thread; the FIFO command
+    /// channel guarantees every entry logged before this call is visible
+    /// to the query.
+    pub fn query(&self, filter: LogFilter) -> Result<Vec<LogEntry>> {
+        let (responder, response) = mpsc::channel();
+        self.send_command(LoggerCommand::Query {
+            filter: Box::new(filter),
+            responder,
+        })?;
+        response.recv().map_err(|_| {
+            LoggerError::Enqueue("request log writer stopped during query".to_owned())
+        })?
+    }
 
-        // Process request body if logging is enabled
-        let request_body = if self.config.request_body_logging {
-            entry.request_body.map(|body| self.process_body(&body))
-        } else {
-            None
-        };
+    /// Clean up old log entries based on retention policy
+    pub fn cleanup_old_logs(&self) -> Result<usize> {
+        let (responder, response) = mpsc::channel();
+        self.send_command(LoggerCommand::Cleanup { responder })?;
+        response.recv().map_err(|_| {
+            LoggerError::Enqueue("request log writer stopped during cleanup".to_owned())
+        })?
+    }
 
-        // Process response body if logging is enabled
-        let response_body = if self.config.response_body_logging {
-            entry.response_body.map(|body| self.process_body(&body))
-        } else {
-            None
-        };
+    /// Flush pending writes and checkpoint the WAL (Req 18.3).
+    /// Called during graceful shutdown to ensure all data is persisted.
+    pub fn flush(&self) {
+        let (responder, response) = mpsc::channel();
+        if self
+            .send_command(LoggerCommand::Checkpoint { responder })
+            .is_ok()
+        {
+            let _ = response.recv();
+            tracing::info!("RequestLogger flushed and WAL checkpointed");
+        }
+    }
+}
 
-        let compression = entry
-            .compression
-            .as_ref()
-            .map(CompressionLogMetadata::sanitized);
-        let compression_level = compression
-            .as_ref()
-            .map(|metadata| metadata.compression_level.clone());
-        let compression_metadata = compression
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
+impl Drop for RequestLogger {
+    fn drop(&mut self) {
+        // Close the command channel first so the writer drains every
+        // queued entry, then join it so pending writes are durable before
+        // the logger goes away (callers may re-open the same database).
+        self.sender = None;
+        let writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(writer) = writer {
+            let _ = writer.join();
+        }
+    }
+}
 
-        conn.execute(
-            "INSERT INTO requests (
-                trace_id, timestamp, method, path, model, provider,
-                status_code, duration_ms, cost, request_body, response_body,
-                requested_model, responded_model, compression_metadata, compression_level,
-                memories_injected, memories_stored, injection_tokens, detected_project
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19
-            )",
-            params![
-                entry.trace_id,
-                entry.timestamp.timestamp(),
-                entry.method,
-                entry.path,
-                entry.model,
-                entry.provider,
-                entry.status_code,
-                entry.duration_ms,
-                entry.cost,
-                request_body,
-                response_body,
-                entry.requested_model,
-                entry.responded_model,
-                compression_metadata,
-                compression_level,
-                entry.memories_injected,
-                entry.memories_stored,
-                entry.injection_tokens,
-                entry.detected_project,
-            ],
-        )?;
+/// Applies the logging config's redaction, exclusion, and size-limit rules
+/// to request/response bodies. Owned by the writer thread so regex and
+/// JSON processing never runs on request handlers.
+struct BodySanitizer {
+    config: LoggingConfig,
+}
 
-        Ok(())
+impl BodySanitizer {
+    fn new(config: LoggingConfig) -> Self {
+        Self { config }
     }
 
     /// Process body for logging: apply size limits, field exclusion, and API key redaction
@@ -383,33 +459,9 @@ impl RequestLogger {
 
     /// Redact API keys and authorization tokens from text
     fn redact_api_keys(&self, text: &str) -> String {
-        let patterns = [
-            // OpenAI keys: sk-... with 20+ chars (covers sk-proj-..., sk-svcacct-..., etc.)
-            (
-                regex::Regex::new(r"sk-[a-zA-Z0-9_\-]{20,}").unwrap(),
-                "[REDACTED]",
-            ),
-            (
-                regex::Regex::new(r"Bearer\s+[a-zA-Z0-9\-_.]+").unwrap(),
-                "Bearer [REDACTED]",
-            ),
-            (
-                regex::Regex::new(
-                    r#"(?i)(api[_-]?key|authorization)["']?\s*[:=]\s*["']?[a-zA-Z0-9\-_.]+"#,
-                )
-                .unwrap(),
-                "$1: [REDACTED]",
-            ),
-            // AWS access keys: AKIA...
-            (
-                regex::Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
-                "[REDACTED]",
-            ),
-        ];
-
         let mut result = text.to_string();
-        for (re, replacement) in &patterns {
-            result = re.replace_all(&result, *replacement).to_string();
+        for (pattern, replacement) in REDACTION_RULES.iter() {
+            result = pattern.replace_all(&result, *replacement).to_string();
         }
         result
     }
@@ -471,119 +523,312 @@ impl RequestLogger {
         }
     }
 
-    /// Query log entries with optional filtering
-    pub fn query(&self, filter: LogFilter) -> Result<Vec<LogEntry>> {
-        let conn = self.conn.lock().unwrap();
+}
 
-        let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project FROM requests WHERE 1=1");
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+/// Precompiled redaction rules; compiling these per call dominated the old
+/// synchronous write path.
+static REDACTION_RULES: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::new(|| {
+    use regex::Regex;
+    vec![
+        // OpenAI keys: sk-... with 20+ chars (covers sk-proj-..., sk-svcacct-..., etc.)
+        (
+            Regex::new(r"sk-[a-zA-Z0-9_\-]{20,}").unwrap(),
+            "[REDACTED]",
+        ),
+        (
+            Regex::new(r"Bearer\s+[a-zA-Z0-9\-_.]+").unwrap(),
+            "Bearer [REDACTED]",
+        ),
+        (
+            Regex::new(
+                r#"(?i)(api[_-]?key|authorization)["']?\s*[:=]\s*["']?[a-zA-Z0-9\-_.]+"#,
+            )
+            .unwrap(),
+            "$1: [REDACTED]",
+        ),
+        // AWS access keys: AKIA...
+        (
+            Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
+            "[REDACTED]",
+        ),
+    ]
+});
 
-        if let Some(ref trace_id) = filter.trace_id {
-            query.push_str(" AND trace_id = ?");
-            params.push(Box::new(trace_id.clone()));
+/// Writer thread body: owns the only SQLite connection and processes
+/// commands in FIFO order, batching consecutive writes into a single
+/// transaction.
+fn writer_loop(mut conn: Connection, config: LoggingConfig, receiver: Receiver<LoggerCommand>) {
+    let sanitizer = BodySanitizer::new(config.clone());
+    // WAL + NORMAL synchronous keeps batched commits cheap; flush()
+    // checkpoints the WAL for durability on graceful shutdown.
+    let _ = conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+    );
+
+    while let Ok(command) = receiver.recv() {
+        match command {
+            LoggerCommand::Write(entry) => {
+                let mut batch = Vec::with_capacity(MAX_WRITE_BATCH);
+                batch.push(entry);
+                loop {
+                    match receiver.try_recv() {
+                        Ok(LoggerCommand::Write(entry)) => {
+                            batch.push(entry);
+                            if batch.len() >= MAX_WRITE_BATCH {
+                                break;
+                            }
+                        }
+                        Ok(other) => {
+                            write_batch(&mut conn, &sanitizer, &config, &batch);
+                            handle_command(&mut conn, &sanitizer, &config, other);
+                            batch.clear();
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            write_batch(&mut conn, &sanitizer, &config, &batch);
+                            return;
+                        }
+                    }
+                }
+                write_batch(&mut conn, &sanitizer, &config, &batch);
+            }
+            other => handle_command(&mut conn, &sanitizer, &config, other),
         }
-
-        if let Some(start_time) = filter.start_time {
-            query.push_str(" AND timestamp >= ?");
-            params.push(Box::new(start_time.timestamp()));
-        }
-
-        if let Some(end_time) = filter.end_time {
-            query.push_str(" AND timestamp <= ?");
-            params.push(Box::new(end_time.timestamp()));
-        }
-
-        if let Some(ref model) = filter.model {
-            query.push_str(" AND model = ?");
-            params.push(Box::new(model.clone()));
-        }
-
-        if let Some(ref provider) = filter.provider {
-            query.push_str(" AND provider = ?");
-            params.push(Box::new(provider.clone()));
-        }
-
-        if let Some(status_code) = filter.status_code {
-            query.push_str(" AND status_code = ?");
-            params.push(Box::new(status_code));
-        }
-
-        if let Some(ref compression_level) = filter.compression_level {
-            query.push_str(" AND compression_level = ? COLLATE NOCASE");
-            params.push(Box::new(compression_level.clone()));
-        }
-
-        query.push_str(" ORDER BY timestamp DESC");
-
-        if let Some(limit) = filter.limit {
-            query.push_str(" LIMIT ?");
-            params.push(Box::new(limit as i64));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&query)?;
-        let entries = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let compression_json: Option<String> = row.get(13)?;
-                let compression = compression_json
-                    .as_deref()
-                    .and_then(compression_log_metadata_from_json);
-
-                Ok(LogEntry {
-                    trace_id: row.get(0)?,
-                    timestamp: DateTime::from_timestamp(row.get(1)?, 0).unwrap(),
-                    method: row.get(2)?,
-                    path: row.get(3)?,
-                    model: row.get(4)?,
-                    provider: row.get(5)?,
-                    status_code: row.get(6)?,
-                    duration_ms: row.get(7)?,
-                    cost: row.get(8)?,
-                    request_body: row.get(9)?,
-                    response_body: row.get(10)?,
-                    requested_model: row.get(11)?,
-                    responded_model: row.get(12)?,
-                    compression,
-                    memories_injected: row.get(14)?,
-                    memories_stored: row.get(15)?,
-                    injection_tokens: row.get(16)?,
-                    detected_project: row.get(17)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        Ok(entries)
     }
+}
 
-    /// Flush pending writes and checkpoint the WAL (Req 18.3).
-    /// Called during graceful shutdown to ensure all data is persisted.
-    pub fn flush(&self) {
-        if let Ok(conn) = self.conn.lock() {
+fn handle_command(
+    conn: &mut Connection,
+    sanitizer: &BodySanitizer,
+    config: &LoggingConfig,
+    command: LoggerCommand,
+) {
+    match command {
+        LoggerCommand::Write(entry) => {
+            write_batch(conn, sanitizer, config, std::slice::from_ref(&entry))
+        }
+        LoggerCommand::Query { filter, responder } => {
+            let _ = responder.send(run_query(conn, &filter));
+        }
+        LoggerCommand::Cleanup { responder } => {
+            let _ = responder.send(run_cleanup(conn, config));
+        }
+        LoggerCommand::Checkpoint { responder } => {
             // Checkpoint WAL to ensure all data is written to the main database file
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-            tracing::info!("RequestLogger flushed and WAL checkpointed");
+            let _ = responder.send(());
         }
     }
+}
 
-    /// Clean up old log entries based on retention policy
-    pub fn cleanup_old_logs(&self) -> Result<usize> {
-        if self.config.retention_days == 0 {
-            // Retention disabled
-            return Ok(0);
-        }
-
-        let conn = self.conn.lock().unwrap();
-        let cutoff_timestamp =
-            Utc::now().timestamp() - (self.config.retention_days as i64 * 24 * 60 * 60);
-
-        let deleted = conn.execute(
-            "DELETE FROM requests WHERE timestamp < ?1",
-            params![cutoff_timestamp],
-        )?;
-
-        Ok(deleted)
+/// Commit a batch of entries in a single transaction. On failure the
+/// entries are retried individually so one malformed entry does not
+/// discard the rest of the batch.
+fn write_batch(
+    conn: &mut Connection,
+    sanitizer: &BodySanitizer,
+    config: &LoggingConfig,
+    entries: &[LogEntry],
+) {
+    if entries.is_empty() {
+        return;
     }
+
+    let batch = (|| -> Result<()> {
+        let tx = conn.transaction()?;
+        for entry in entries {
+            insert_entry(&tx, sanitizer, config, entry)?;
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+
+    if let Err(error) = batch {
+        tracing::error!(%error, count = entries.len(), "Failed to commit request log batch");
+        for entry in entries {
+            if let Err(error) = insert_entry(conn, sanitizer, config, entry) {
+                tracing::error!(%error, trace_id = %entry.trace_id, "Failed to write request log entry");
+            }
+        }
+    }
+}
+
+/// Persist a single entry. Runs on the writer thread only.
+fn insert_entry(
+    conn: &Connection,
+    sanitizer: &BodySanitizer,
+    config: &LoggingConfig,
+    entry: &LogEntry,
+) -> Result<()> {
+    // Process request body if logging is enabled
+    let request_body = if config.request_body_logging {
+        entry
+            .request_body
+            .as_deref()
+            .map(|body| sanitizer.process_body(body))
+    } else {
+        None
+    };
+
+    // Process response body if logging is enabled
+    let response_body = if config.response_body_logging {
+        entry
+            .response_body
+            .as_deref()
+            .map(|body| sanitizer.process_body(body))
+    } else {
+        None
+    };
+
+    let compression = entry
+        .compression
+        .as_ref()
+        .map(CompressionLogMetadata::sanitized);
+    let compression_level = compression
+        .as_ref()
+        .map(|metadata| metadata.compression_level.clone());
+    let compression_metadata = compression
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
+    conn.execute(
+        "INSERT INTO requests (
+            trace_id, timestamp, method, path, model, provider,
+            status_code, duration_ms, cost, request_body, response_body,
+            requested_model, responded_model, compression_metadata, compression_level,
+            memories_injected, memories_stored, injection_tokens, detected_project
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18, ?19
+        )",
+        params![
+            entry.trace_id,
+            entry.timestamp.timestamp(),
+            entry.method,
+            entry.path,
+            entry.model,
+            entry.provider,
+            entry.status_code,
+            entry.duration_ms,
+            entry.cost,
+            request_body,
+            response_body,
+            entry.requested_model,
+            entry.responded_model,
+            compression_metadata,
+            compression_level,
+            entry.memories_injected,
+            entry.memories_stored,
+            entry.injection_tokens,
+            entry.detected_project,
+        ],
+    )?;
+
+    Ok(())
+}
+
+/// Query log entries with optional filtering. Runs on the writer thread.
+fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
+    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project FROM requests WHERE 1=1");
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(ref trace_id) = filter.trace_id {
+        query.push_str(" AND trace_id = ?");
+        params.push(Box::new(trace_id.clone()));
+    }
+
+    if let Some(start_time) = filter.start_time {
+        query.push_str(" AND timestamp >= ?");
+        params.push(Box::new(start_time.timestamp()));
+    }
+
+    if let Some(end_time) = filter.end_time {
+        query.push_str(" AND timestamp <= ?");
+        params.push(Box::new(end_time.timestamp()));
+    }
+
+    if let Some(ref model) = filter.model {
+        query.push_str(" AND model = ?");
+        params.push(Box::new(model.clone()));
+    }
+
+    if let Some(ref provider) = filter.provider {
+        query.push_str(" AND provider = ?");
+        params.push(Box::new(provider.clone()));
+    }
+
+    if let Some(status_code) = filter.status_code {
+        query.push_str(" AND status_code = ?");
+        params.push(Box::new(status_code));
+    }
+
+    if let Some(ref compression_level) = filter.compression_level {
+        query.push_str(" AND compression_level = ? COLLATE NOCASE");
+        params.push(Box::new(compression_level.clone()));
+    }
+
+    query.push_str(" ORDER BY timestamp DESC");
+
+    if let Some(limit) = filter.limit {
+        query.push_str(" LIMIT ?");
+        params.push(Box::new(limit as i64));
+    }
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let mut stmt = conn.prepare(&query)?;
+    let entries = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            let compression_json: Option<String> = row.get(13)?;
+            let compression = compression_json
+                .as_deref()
+                .and_then(compression_log_metadata_from_json);
+
+            Ok(LogEntry {
+                trace_id: row.get(0)?,
+                timestamp: DateTime::from_timestamp(row.get(1)?, 0).unwrap(),
+                method: row.get(2)?,
+                path: row.get(3)?,
+                model: row.get(4)?,
+                provider: row.get(5)?,
+                status_code: row.get(6)?,
+                duration_ms: row.get(7)?,
+                cost: row.get(8)?,
+                request_body: row.get(9)?,
+                response_body: row.get(10)?,
+                requested_model: row.get(11)?,
+                responded_model: row.get(12)?,
+                compression,
+                memories_injected: row.get(14)?,
+                memories_stored: row.get(15)?,
+                injection_tokens: row.get(16)?,
+                detected_project: row.get(17)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(entries)
+}
+
+/// Clean up old log entries based on retention policy. Runs on the writer
+/// thread.
+fn run_cleanup(conn: &Connection, config: &LoggingConfig) -> Result<usize> {
+    if config.retention_days == 0 {
+        // Retention disabled
+        return Ok(0);
+    }
+
+    let cutoff_timestamp =
+        Utc::now().timestamp() - (config.retention_days as i64 * 24 * 60 * 60);
+
+    let deleted = conn.execute(
+        "DELETE FROM requests WHERE timestamp < ?1",
+        params![cutoff_timestamp],
+    )?;
+
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -604,11 +849,24 @@ mod tests {
             cleanup_schedule_hours: 24,
         };
 
-        let logger = RequestLogger::new(config).unwrap();
-        (logger, temp_file)
-    }
+    let logger = RequestLogger::new(config).unwrap();
+    (logger, temp_file)
+}
 
-    fn sample_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> LogEntry {
+fn test_sanitizer() -> BodySanitizer {
+    BodySanitizer::new(LoggingConfig {
+        level: "info".to_string(),
+        database_path: String::new(),
+        request_body_logging: true,
+        response_body_logging: true,
+        max_body_size_bytes: 1000,
+        excluded_fields: vec!["api_key".to_string(), "password".to_string()],
+        retention_days: 30,
+        cleanup_schedule_hours: 24,
+    })
+}
+
+fn sample_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> LogEntry {
         LogEntry {
             trace_id: trace_id.to_owned(),
             timestamp: Utc::now(),
@@ -765,17 +1023,18 @@ mod tests {
 
     #[test]
     fn malformed_compression_metadata_is_ignored() {
-        let (logger, _temp) = create_test_logger();
-        logger.log(sample_entry("malformed", None)).unwrap();
-        logger
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE requests SET compression_metadata = ?1 WHERE trace_id = ?2",
-                params!["{not valid json", "malformed"],
-            )
-            .unwrap();
+    let (logger, temp) = create_test_logger();
+    logger.log(sample_entry("malformed", None)).unwrap();
+    // Round-trip the writer thread so the INSERT has committed before the
+    // direct SQL corruption below executes.
+    logger.flush();
+    Connection::open(temp.path())
+        .unwrap()
+        .execute(
+            "UPDATE requests SET compression_metadata = ?1 WHERE trace_id = ?2",
+            params!["{not valid json", "malformed"],
+        )
+        .unwrap();
 
         let results = logger
             .query(LogFilter {
@@ -789,18 +1048,19 @@ mod tests {
 
     #[test]
     fn compression_serialization_is_bounded_and_secret_free() {
-        let (logger, _temp) = create_test_logger();
-        let mut metadata = sample_compression(CompressionLevel::Ultra);
+    let (logger, temp) = create_test_logger();
+    let mut metadata = sample_compression(CompressionLevel::Ultra);
         metadata.engines_applied = vec![
             "semantic sk-super-secret-token-1234567890".repeat(10),
             "Bearer another-secret".to_owned(),
         ];
         metadata.savings_percent = f64::NAN;
-        logger
-            .log(sample_entry("safe-metadata", Some(metadata)))
-            .unwrap();
+    logger
+        .log(sample_entry("safe-metadata", Some(metadata)))
+        .unwrap();
+    logger.flush();
 
-        let conn = logger.conn.lock().unwrap();
+    let conn = Connection::open(temp.path()).unwrap();
         let json: String = conn
             .query_row(
                 "SELECT compression_metadata FROM requests WHERE trace_id = ?1",
@@ -920,36 +1180,36 @@ mod tests {
     }
 
     #[test]
-    fn test_api_key_redaction() {
-        let (logger, _temp) = create_test_logger();
+fn test_api_key_redaction() {
+    let sanitizer = test_sanitizer();
 
         // Standard 48-char key
         let body =
             r#"{"api_key":"sk-1234567890abcdefghijklmnopqrstuvwxyz1234567890ab","message":"test"}"#;
-        let redacted = logger.redact_api_keys(body);
+        let redacted = sanitizer.redact_api_keys(body);
         assert!(!redacted.contains("sk-1234567890"));
         assert!(redacted.contains("[REDACTED]"));
 
         // Longer project-scoped key (sk-proj-...)
         let body2 =
             r#"{"key":"sk-proj-abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrstuvwxyz"}"#;
-        let redacted2 = logger.redact_api_keys(body2);
+        let redacted2 = sanitizer.redact_api_keys(body2);
         assert!(!redacted2.contains("sk-proj-"));
         assert!(redacted2.contains("[REDACTED]"));
 
         // AWS access key
         let body3 = r#"{"aws_key":"AKIAIOSFODNN7EXAMPLE"}"#;
-        let redacted3 = logger.redact_api_keys(body3);
+        let redacted3 = sanitizer.redact_api_keys(body3);
         assert!(!redacted3.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(redacted3.contains("[REDACTED]"));
     }
 
     #[test]
-    fn test_field_exclusion() {
-        let (logger, _temp) = create_test_logger();
+fn test_field_exclusion() {
+    let sanitizer = test_sanitizer();
 
         let body = r#"{"api_key":"secret","password":"pass123","message":"test"}"#;
-        let excluded = logger.exclude_fields(body);
+        let excluded = sanitizer.exclude_fields(body);
 
         let json: serde_json::Value = serde_json::from_str(&excluded).unwrap();
         assert_eq!(json["api_key"], "[REDACTED]");
@@ -958,11 +1218,11 @@ mod tests {
     }
 
     #[test]
-    fn test_size_limit() {
-        let (logger, _temp) = create_test_logger();
+fn test_size_limit() {
+    let sanitizer = test_sanitizer();
 
         let large_body = "x".repeat(2000);
-        let limited = logger.apply_size_limit(&large_body);
+        let limited = sanitizer.apply_size_limit(&large_body);
 
         assert!(limited.len() < 2000);
         assert!(limited.contains("[TRUNCATED"));
