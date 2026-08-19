@@ -41,3 +41,13 @@ Every `GatewayServer::new` opens SQLite databases. Tests use `common::isolate_da
 - **Circuit breaker reset**: All circuit breakers clear on config hot-reload via `/admin/config/reload`
 - **Tests use `tower::ServiceExt::oneshot()`**: Integration tests don't bind ports; they call router directly
 - **Property tests with proptest**: Many tests use `proptest!` macro for randomized input validation
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as local markdown files under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: root `CONTEXT.md` + `docs/adr/` (created lazily by `/domain-modeling`). See `docs/agents/domain.md`.

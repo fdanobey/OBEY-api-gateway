@@ -1634,9 +1634,42 @@ impl Router {
                     "Provider request failed (network error)".to_string()
                 }
             }
-            Some(code) => format!("Provider returned an unexpected response (HTTP {})", code),
+        Some(code) if (200..300).contains(&code) => {
+            // A 2xx status here means the provider returned an error
+            // payload (or an unparseable body) inside a success
+            // envelope. The caller-supplied text carries the detail —
+            // "Error in 200 response: <provider message>" from the
+            // error-in-200 detection, or "Failed to parse response:
+            // <reason>" from SSE/JSON parse failures. Surface that
+            // detail so the dashboard shows the real cause instead of
+            // a confusing "unexpected response (HTTP 200)".
+            const ERR_IN_200: &str = "Error in 200 response: ";
+            const PARSE_FAIL: &str = "Failed to parse response: ";
+            let trimmed = body_or_message.trim();
+            if let Some(detail) = trimmed.strip_prefix(ERR_IN_200) {
+                format!(
+                    "Provider error (in HTTP {}): {}",
+                    code,
+                    Self::truncate_for_display(detail)
+                )
+            } else if let Some(detail) = trimmed.strip_prefix(PARSE_FAIL) {
+                format!(
+                    "Provider sent an unparseable response (HTTP {}): {}",
+                    code,
+                    Self::truncate_for_display(detail)
+                )
+            } else if !snippet.is_empty() {
+                format!("Provider error (in HTTP {}): {}", code, snippet)
+            } else {
+                format!(
+                    "Provider returned an error inside a HTTP {} response",
+                    code
+                )
+            }
         }
+        Some(code) => format!("Provider returned an unexpected response (HTTP {})", code),
     }
+}
 
     /// Trim provider-supplied error text to a single short line so the
     /// dashboard cell stays readable.
@@ -6788,14 +6821,46 @@ mod tests {
         assert!(Router::response_has_content(&response));
     }
 
-    #[test]
-    fn friendly_failure_reason_extracts_json_from_provider_prefix() {
-        let message = r#"HTTP 400: {"error":{"message":"Invalid content part"}}"#;
-        assert_eq!(
-            Router::friendly_failure_reason(Some(400), message),
-            "Provider rejected the request: Invalid content part"
-        );
-    }
+#[test]
+fn friendly_failure_reason_extracts_json_from_provider_prefix() {
+    let message = r#"HTTP 400: {"error":{"message":"Invalid content part"}}"#;
+    assert_eq!(
+        Router::friendly_failure_reason(Some(400), message),
+        "Provider rejected the request: Invalid content part"
+    );
+}
+
+#[test]
+fn friendly_failure_reason_surfaces_error_in_200_detail() {
+    let message = "Error in 200 response: Model overloaded, please retry";
+    assert_eq!(
+        Router::friendly_failure_reason(Some(200), message),
+        "Provider error (in HTTP 200): Model overloaded, please retry"
+    );
+}
+
+#[test]
+fn friendly_failure_reason_surfaces_parse_failure_in_200() {
+    let message = "Failed to parse response: not JSON or SSE";
+    assert_eq!(
+        Router::friendly_failure_reason(Some(200), message),
+        "Provider sent an unparseable response (HTTP 200): not JSON or SSE"
+    );
+}
+
+#[test]
+fn friendly_failure_reason_generic_2xx_without_detail() {
+    assert_eq!(
+        Router::friendly_failure_reason(Some(204), "gateway dropped body"),
+        "Provider returned an error inside a HTTP 204 response"
+    );
+    // A JSON error envelope embedded in the text still wins for 2xx.
+    let message = r#"HTTP 200: {"error":{"message":"insufficient credits"}}"#;
+    assert_eq!(
+        Router::friendly_failure_reason(Some(200), message),
+        "Provider error (in HTTP 200): insufficient credits"
+    );
+}
 
     #[test]
     fn bedrock_sanitizer_keeps_reasoning_effort_and_drops_unknown_fields() {
