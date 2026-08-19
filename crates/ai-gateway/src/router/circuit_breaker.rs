@@ -95,27 +95,36 @@ impl CircuitBreaker {
             let retry_after =
                 self.backoff_sequence[backoff_index.min(self.backoff_sequence.len() - 1)];
 
-            let mut state = self.state.write().await;
-            match *state {
-                CircuitState::HalfOpen => {
-                    // Failed in half-open, increase backoff
-                    let next_index = (backoff_index + 1).min(self.backoff_sequence.len() - 1);
-                    self.current_backoff_index
-                        .store(next_index, Ordering::SeqCst);
-                    let new_retry_after = self.backoff_sequence[next_index];
-                    *state = CircuitState::Open {
-                        opened_at: Instant::now(),
-                        retry_after: new_retry_after,
-                    };
+                let mut state = self.state.write().await;
+                match *state {
+                    CircuitState::HalfOpen => {
+                        // Failed in half-open, increase backoff
+                        let next_index = (backoff_index + 1).min(self.backoff_sequence.len() - 1);
+                        self.current_backoff_index
+                            .store(next_index, Ordering::SeqCst);
+                        let new_retry_after = self.backoff_sequence[next_index];
+                        *state = CircuitState::Open {
+                            opened_at: Instant::now(),
+                            retry_after: new_retry_after,
+                        };
+                    }
+                    CircuitState::Open { .. } => {
+                        // Late failure from a request that already passed the
+                        // availability check: leave the existing window
+                        // untouched. Resetting `opened_at` here would slide
+                        // the open window under sustained concurrent failures
+                        // (recovery would only begin backoff-after-last-failure,
+                        // potentially never), so the half-open probe must stay
+                        // anchored to the moment the breaker originally opened.
+                    }
+                    CircuitState::Closed => {
+                        // Transition to open
+                        *state = CircuitState::Open {
+                            opened_at: Instant::now(),
+                            retry_after,
+                        };
+                    }
                 }
-                _ => {
-                    // Transition to open
-                    *state = CircuitState::Open {
-                        opened_at: Instant::now(),
-                        retry_after,
-                    };
-                }
-            }
         }
     }
 
@@ -312,20 +321,50 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_default_backoff_sequence() {
-        let cb = CircuitBreaker::new(1);
-        assert_eq!(
-            cb.backoff_sequence,
-            vec![
-                Duration::from_secs(5),
-                Duration::from_secs(10),
-                Duration::from_secs(20),
-                Duration::from_secs(40),
-                Duration::from_secs(300),
-            ]
-        );
+#[tokio::test]
+async fn test_default_backoff_sequence() {
+    let cb = CircuitBreaker::new(1);
+    assert_eq!(
+        cb.backoff_sequence,
+        vec![
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+            Duration::from_secs(40),
+            Duration::from_secs(300),
+        ]
+    );
+}
+
+/// Late failures recorded while the breaker is already open must not
+/// restart the open window: the half-open probe fires backoff after the
+/// breaker originally opened, not backoff after the last in-flight
+/// failure.
+#[tokio::test]
+async fn test_open_window_does_not_slide_on_late_failures() {
+    let cb = CircuitBreaker::with_backoff_sequence(1, vec![Duration::from_millis(200)]);
+
+    cb.record_failure().await;
+    let opened_at = match cb.get_state().await {
+        CircuitState::Open { opened_at, .. } => opened_at,
+        _ => panic!("Expected Open state"),
+    };
+
+    // Simulate concurrent in-flight requests that already passed the
+    // availability check and then failed while the breaker was open.
+    cb.record_failure().await;
+    cb.record_failure().await;
+
+    match cb.get_state().await {
+        CircuitState::Open { opened_at: after, .. } => {
+            assert!(
+                after == opened_at,
+                "opened_at must not slide on late failures"
+            );
+        }
+        _ => panic!("Expected Open state"),
     }
+}
 }
 
 #[cfg(test)]

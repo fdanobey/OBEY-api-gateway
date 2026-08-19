@@ -70,7 +70,7 @@ client.chat.completions.create(model="gpt-4-group", ...)
 
 ### Version Fallback
 
-When `version_fallback_enabled: true`, the gateway tries older model versions before moving to different providers. Useful for models that frequently update.
+When `version_fallback_enabled: true`, the gateway sorts the whole group by version date (newest first) — the newest dated model is preferred even over lower-priority or cheaper models, undated models keep their normal priority/cost/latency order after all dated ones, and failover walks older versions before undated fallbacks. Useful for models that frequently update.
 
 ---
 
@@ -124,7 +124,7 @@ The gateway detects rate limiting across multiple signal types and instantly fai
 | Anthropic ISO reset headers | Parsed for exact reset time |
 | Weekly-quota providers | Per-provider cooldown overrides for providers like Nano-GPT |
 
-When rate-limited, the provider is temporarily skipped (not circuit-broken) and requests route to the next provider immediately.
+When rate-limited, the provider is temporarily skipped (not circuit-broken — rate-limit failures do not count toward the circuit-breaker threshold) and requests route to the next provider immediately. The cooldown also applies to streaming pass-through attempts, which consume the provider's `rate_limit_per_minute` tokens just like non-streaming requests.
 
 ---
 

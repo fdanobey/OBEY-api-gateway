@@ -37,7 +37,7 @@ use crate::memory::{
     ExtractionMessage, ExtractionRole, InjectionResult, MemoryRequestResult, ResolvedNamespace,
 };
 use crate::metrics::Metrics;
-use crate::models::openai::{Choice, OpenAIRequest, OpenAIResponse};
+use crate::models::openai::{Choice, OpenAIRequest, OpenAIResponse, Usage};
 use crate::providers::Model;
 use crate::router::router::{ProviderPassThroughEndpoint, ProviderPassThroughResponse};
 use crate::router::trace_id::generate_trace_id;
@@ -2239,12 +2239,14 @@ async fn chat_completions_stream(
                     // provider, so `route_request_streaming_excluding` eventually
                     // returns `Buffered`/`Err` (no eligible pass-through left).
                     //
-                    // Task 6.3 — RETRY/FAILOVER LIMITS + AGGREGATED ERROR (Req 4.3):
-                    // - Provider ordering: `route_request_streaming_excluding`
-                    //   picks from the SAME `select_provider_order()` list as the
-                    //   non-streaming path, skipping `tried_providers`. That list
-                    //   is the natural bound — each provider is tried for
-                    //   pass-through at most once.
+            // Task 6.3 — RETRY/FAILOVER LIMITS + AGGREGATED ERROR (Req 4.3):
+            // - Provider ordering: `route_request_streaming_excluding`
+            //   picks from the SAME `select_provider_order()` list as the
+            //   non-streaming path, skipping `tried_providers` (keyed per
+            //   `provider:model`, matching the circuit-breaker key, so a
+            //   provider offering several models stays eligible via its
+            //   other models). That list is the natural bound — each
+            //   provider:model entry is tried for pass-through at most once.
                     // - `max_retries_per_provider` mapping: the non-streaming
                     //   path applies it INSIDE `attempt_with_retry` (inline
                     //   same-provider retries). A live SSE relay cannot be safely
@@ -2260,10 +2262,13 @@ async fn chat_completions_stream(
                     // - Aggregated error: each pre-content failure is recorded as
                     //   a `ProviderAttempt`; if every provider fails they are
                     //   merged into a single `AllProvidersFailed` error.
-                    let (max_retries_per_provider, max_failover_attempts) = {
-                        let cfg = state.config.read().await;
-                        (cfg.retry.max_retries_per_provider, cfg.providers.len() + 1)
-                    };
+        let (max_retries_per_provider, max_failover_attempts) = {
+            let cfg = state.config.read().await;
+            // Exclusion is per provider:model, so the natural loop bound is
+            // the number of distinct model entries across all groups.
+            let model_entries: usize = cfg.model_groups.iter().map(|g| g.models.len()).sum();
+            (cfg.retry.max_retries_per_provider, cfg.providers.len() + model_entries + 1)
+        };
                     tracing::debug!(
                         trace_id = %stream_trace_id,
                         max_retries_per_provider,
@@ -2317,8 +2322,10 @@ async fn chat_completions_stream(
                             Duration::from_secs(secs)
                         };
 
-                        // Shared handle the relay writes its terminal outcome to.
-                        let outcome = Arc::new(tokio::sync::Mutex::new(RelayOutcome::Completed));
+        // Shared handle the relay writes its terminal outcome to.
+        let outcome = Arc::new(tokio::sync::Mutex::new(RelayOutcome::Completed {
+            usage: Usage::default(),
+        }));
                         // Enable adaptive XML-tool detection only when the
                         // request carries `tools` (XML tool use is irrelevant
                         // otherwise). A learned combo would already have been
@@ -2356,22 +2363,37 @@ async fn chat_completions_stream(
                         }
                         drop(relay);
 
-                        let final_outcome = { outcome.lock().await.clone() };
-                        match final_outcome {
-                            // Clean finish — relay already emitted `[DONE]`.
-                            RelayOutcome::Completed => {
-                                let duration_ms = start.elapsed().as_millis() as u64;
-                                let log_context = RequestLogContext::from_streaming_success(
-                                    &request,
-                                    stream_trace_id.clone(),
-                                    duration_ms,
-                                    current_provider.clone(),
-                                    current_model.clone(),
-                                    current_compression.clone(),
-                                );
-                                log_request(&state, &request, &log_context);
-                                break 'failover;
-                            }
+        let final_outcome = { outcome.lock().await.clone() };
+        match final_outcome {
+            // Clean finish — relay already emitted `[DONE]`.
+            RelayOutcome::Completed { usage } => {
+                let duration = start.elapsed();
+                // Success accounting for pass-through streams (mirror of the
+                // buffered path): close/record circuit-breaker success, feed
+                // the latency tracker, accrue cost from the relay's
+                // reassembled usage, and clear any upstream-driven cooldown
+                // so a recovered provider is reselected immediately.
+                state
+                    .router
+                    .record_streaming_success(
+                        &current_provider,
+                        &current_model,
+                        duration,
+                        &usage,
+                    )
+                    .await;
+                let duration_ms = duration.as_millis() as u64;
+                let log_context = RequestLogContext::from_streaming_success(
+                    &request,
+                    stream_trace_id.clone(),
+                    duration_ms,
+                    current_provider.clone(),
+                    current_model.clone(),
+                    current_compression.clone(),
+                );
+                log_request(&state, &request, &log_context);
+                break 'failover;
+            }
                             // Post-content failure (Req 4.2): the relay already
                             // emitted the graceful error event + `[DONE]`. We
                             // cannot transparently fail over mid-content, so
@@ -2422,7 +2444,7 @@ async fn chat_completions_stream(
                                     reason = %reason,
                                     "Streaming provider failed before any content; attempting pre-content failover"
                                 );
-                                tried_providers.push(current_provider.clone());
+                                tried_providers.push(format!("{}:{}", current_provider, current_model));
                                 // Req 4.3: record this pre-content failure for the
                                 // aggregated error in case every provider fails.
                                 streaming_attempts.push(ProviderAttempt::new(
@@ -3967,7 +3989,13 @@ fn classify_relay_line(payload: &str) -> RelayLineAction {
 ///   4.5).
 #[derive(Debug, Clone)]
 enum RelayOutcome {
-    Completed,
+    /// Clean finish. Carries the reassembled usage from the streamed chunks
+    /// (zeros when the provider omitted usage frames) so the handler can
+    /// feed success accounting — circuit-breaker recovery, latency, and
+    /// cost accrual — via `Router::record_streaming_success`.
+    Completed {
+        usage: Usage,
+    },
     FailedBeforeContent(String),
     /// The provider failed AFTER content was already forwarded. The relay
     /// emitted a graceful error event + `[DONE]`; the handler records the
@@ -4342,14 +4370,17 @@ fn relay_passthrough_stream(
                 return;
             }
 
-            // Task 6.1: a clean finish — record the outcome so the handler's
-            // failover loop stops here (no retry).
-            *outcome.lock().await = RelayOutcome::Completed;
             // Req 3.7 / 3.10: clean completion — reassemble the accumulated chunks
-            // into a full response, cache it if eligible, and record usage.
+            // into a full response, cache it if eligible, and capture the
+            // reported usage for success accounting.
+            let mut completed_usage = Usage::default();
             if !sse_accumulator.is_empty() {
                 match crate::router::router::Router::reassemble_sse_response(&sse_accumulator) {
                     Ok(assembled) => {
+                        // Capture the reassembled usage (zeros when the
+                        // provider omitted usage frames) so the handler can
+                        // run cost accrual via record_streaming_success.
+                        completed_usage = assembled.usage.clone();
                         // Adaptive XML-tool detection (only when the request
                         // carried `tools`): if this provider/model streamed
                         // XML-style tool calls in plain text instead of native
@@ -4415,6 +4446,13 @@ fn relay_passthrough_stream(
                     }
                 }
             }
+            // Task 6.1: a clean finish — record the outcome (carrying the
+            // reassembled usage, zeros when unavailable) so the handler's
+            // failover loop stops here (no retry) and can run success
+            // accounting via `record_streaming_success`.
+            *outcome.lock().await = RelayOutcome::Completed {
+                usage: completed_usage,
+            };
             if let Some(suffix) = memory_suffix.as_deref() {
                 yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
             }
@@ -5822,10 +5860,12 @@ mod tests {
         (exact_cache, metrics, request)
     }
 
-    /// Throwaway outcome handle for relay tests that don't assert the signal.
-    fn mk_outcome() -> std::sync::Arc<tokio::sync::Mutex<RelayOutcome>> {
-        std::sync::Arc::new(tokio::sync::Mutex::new(RelayOutcome::Completed))
-    }
+/// Throwaway outcome handle for relay tests that don't assert the signal.
+fn mk_outcome() -> std::sync::Arc<tokio::sync::Mutex<RelayOutcome>> {
+    std::sync::Arc::new(tokio::sync::Mutex::new(RelayOutcome::Completed {
+        usage: Usage::default(),
+    }))
+}
 
     /// Req 3.2 / 3.6: forwarded chunks reach the client and the relay always
     /// terminates with exactly one `[DONE]` on a clean finish. Malformed and
@@ -6180,9 +6220,9 @@ mod tests {
             None,
             None,
         );
-        let _events: Vec<_> = stream.collect().await;
-        assert!(matches!(&*outcome.lock().await, RelayOutcome::Completed));
-    }
+    let _events: Vec<_> = stream.collect().await;
+    assert!(matches!(&*outcome.lock().await, RelayOutcome::Completed { .. }));
+}
 }
 
 // ---------------------------------------------------------------------------

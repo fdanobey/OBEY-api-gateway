@@ -1101,7 +1101,12 @@ impl Router {
     /// 3. Sort by priority (ascending - lower priority value = higher priority)
     /// 4. Within same priority, sort by cost (ascending - lower cost first)
     /// 5. Within similar costs (±10%), sort by latency (ascending - lower latency first)
-    /// 6. If version_fallback_enabled, sort by version date (descending - newer first)
+    /// 6. If version_fallback_enabled, re-sort the whole candidate list by
+    ///    version date (descending - newer first). This is intentionally the
+    ///    DOMINANT key, overriding priority/cost/latency: the newest dated
+    ///    model is preferred even over a lower-priority (or cheaper) undated
+    ///    model, and undated models keep their relative order after all
+    ///    dated ones. See `test_version_fallback_sorting`.
     pub async fn select_provider_order(&self, model_group: &ModelGroup) -> Vec<ProviderModel> {
         let mut filtered = Vec::with_capacity(model_group.models.len());
         for m in &model_group.models {
@@ -1251,6 +1256,51 @@ impl Router {
         (0, 0, 0) // No version found
     }
 
+    /// True when a dispatch error is rate-limit-class: an HTTP 429, or an
+    /// error-in-200 envelope promoted to 429, or any 200/4xx body carrying a
+    /// recognizable rate-limit/quota marker.
+    ///
+    /// Rate-limit-class failures are governed exclusively by the dedicated
+    /// upstream cooldown (`RateLimiter::apply_cooldown` plus the durable
+    /// metrics cooldown store, both enforced as routing gates by
+    /// `select_provider_order` / `route_with_failover_for_group`): a
+    /// rate-limited provider is *paused*, not unhealthy, so these errors must
+    /// not count toward the circuit-breaker failure threshold.
+    fn is_rate_limit_class_error(e: &GatewayError) -> bool {
+        match e {
+            GatewayError::Provider { status_code, message, .. } => {
+                Self::is_rate_limited(status_code.unwrap_or(0), message)
+            }
+            _ => false,
+        }
+    }
+
+    /// Suspicious truncation detector (Req 6.1, 6.3, 6.4).
+    ///
+    /// A `finish_reason: "length"` response is only treated as a suspicious
+    /// truncation when the provider actually reported token usage AND the
+    /// completion stopped well short (more than 50 tokens below) of the
+    /// client's requested `max_tokens`. Providers that omit `usage` default
+    /// to `completion_tokens == 0`; reading that as "stopped short" would
+    /// trigger false failover (duplicate token spend, doubled latency) and
+    /// spurious circuit-breaker failures on legitimate length-capped
+    /// responses.
+    fn is_suspicious_truncation(response: &OpenAIResponse, max_tokens: Option<u32>) -> bool {
+        if response
+            .choices
+            .first()
+            .and_then(|choice| choice.finish_reason.as_deref())
+            != Some("length")
+        {
+            return false;
+        }
+        let Some(max_tokens) = max_tokens else {
+            return false;
+        };
+        let completion_tokens = response.usage.completion_tokens;
+        completion_tokens > 0 && completion_tokens < max_tokens.saturating_sub(50)
+    }
+
     /// Get or create circuit breaker for a provider
     pub async fn get_circuit_breaker(&self, provider: &str) -> Arc<CircuitBreaker> {
         if let Some(cb) = self.circuit_breakers.get(provider) {
@@ -1302,6 +1352,69 @@ impl Router {
         cb.record_failure().await;
         self.metrics
             .record_provider_failure_with_reason(provider, reason, None);
+    }
+
+    /// Record a successful true-streaming pass-through relay — the mirror of
+    /// [`Self::record_streaming_failure`] for the success path.
+    ///
+    /// The buffered success path (`route_with_failover_for_group`) closes the
+    /// circuit breaker, updates latency, accrues cost, and clears any
+    /// upstream-driven cooldown. Pass-through streams finish inside the
+    /// handler's relay, so without this hook a streaming-only provider would
+    /// never reset its breaker (one isolated failure after recovery would
+    /// re-open it at escalated backoff), never feed the latency tracker that
+    /// backs cost-band tiebreaks, and never clear a stale rate-limit cooldown.
+    ///
+    /// The handler passes the relay's reassembled `usage` (zeros when the
+    /// provider omitted usage frames); cost is accrued from the configured
+    /// per-model rates only when token usage is actually known, mirroring the
+    /// buffered path's `usage_known` handling.
+pub async fn record_streaming_success(
+    &self,
+    provider: &str,
+    model: &str,
+    duration: std::time::Duration,
+    usage: &Usage,
+) {
+        let cb_key = format!("{}:{}", provider, model);
+        let cb = self.get_circuit_breaker(&cb_key).await;
+        cb.record_success().await;
+
+        let duration_ms = duration.as_millis() as u64;
+        self.latency_tracker.update_latency(provider, duration);
+        self.metrics.record_provider_success(provider, duration_ms);
+
+        // Provider recovered — clear the upstream-driven cooldown in both
+        // stores so it stops being filtered out (mirrors the buffered
+        // success path).
+        let rate_limiter = self.get_rate_limiter(provider).await;
+        rate_limiter.clear_cooldown().await;
+        self.metrics.clear_provider_cooldown(provider);
+
+        let usage_known =
+            usage.total_tokens > 0 || usage.prompt_tokens > 0 || usage.completion_tokens > 0;
+        if !usage_known {
+            self.metrics.record_provider_unknown_cost(provider);
+            return;
+        }
+        let rates = {
+            let config = self.config.read().await;
+            config.model_groups.iter().find_map(|group| {
+                group
+                    .models
+                    .iter()
+                    .find(|m| m.provider == provider && m.model == model)
+                    .map(|m| (m.cost_per_million_input_tokens, m.cost_per_million_output_tokens))
+            })
+        };
+        match rates {
+            Some((input_rate, output_rate)) => {
+                let input_cost = usage.prompt_tokens as f64 * input_rate / 1_000_000.0;
+                let output_cost = usage.completion_tokens as f64 * output_rate / 1_000_000.0;
+                self.metrics.add_cost(provider, input_cost + output_cost);
+            }
+            None => self.metrics.record_provider_unknown_cost(provider),
+        }
     }
 
     /// Detect and strip image content parts from messages when the target
@@ -3444,22 +3557,8 @@ impl Router {
                     // partial response as a fallback candidate (consumed by task
                     // 7.2). When `retry_on_truncation` is false we skip detection
                     // entirely and return the response as-is (prior behavior).
-                    let is_truncated = retry_on_truncation
-                        && response
-                            .choices
-                            .first()
-                            .and_then(|choice| choice.finish_reason.as_deref())
-                            == Some("length")
-                        && match request.max_tokens {
-                            // Req 6.3: only suspicious when the response stopped
-                            // well short of the requested limit. If
-                            // completion_tokens reached (within 50 of) max_tokens,
-                            // the response legitimately hit the requested limit.
-                            Some(max_tokens) => {
-                                response.usage.completion_tokens < max_tokens.saturating_sub(50)
-                            }
-                            None => false,
-                        };
+            let is_truncated =
+                retry_on_truncation && Self::is_suspicious_truncation(&response, request.max_tokens);
 
                     if is_truncated {
                         let max_tokens = request.max_tokens.unwrap_or(0);
@@ -3607,9 +3706,18 @@ impl Router {
 
                     return Ok(response);
                 }
-                Err(e) => {
-                    // Record failure
+            Err(e) => {
+                // Record failure — except rate-limit-class errors (HTTP 429
+                // and rate-limit-shaped error-in-200 envelopes). Those are
+                // governed exclusively by the dedicated upstream cooldown
+                // applied below (and enforced as a routing gate by
+                // `select_provider_order` / the defense-in-depth check
+                // above), so a rate-limited provider is paused without its
+                // circuit-breaker health also being eroded: three 429s must
+                // not open the breaker on top of the cooldown.
+                if !Self::is_rate_limit_class_error(&e) {
                     cb.record_failure().await;
+                }
 
                     // Surface the failure reason on the in-flight registry so a
                     // following retry/failover can show why the model changed.
@@ -5344,6 +5452,23 @@ impl Router {
         request: &OpenAIRequest,
         active: Option<ActiveRequestHandle>,
     ) -> Result<OpenAIResponse, GatewayError> {
+        self.route_request_with_exclusions(request, active, &[]).await
+    }
+
+    /// Like [`Self::route_request`], but removes any `provider:model` entry
+    /// listed in `exclude` from the initial failover chain. Used by the
+    /// streaming pass-through path so a provider that just returned a
+    /// rate-limit response is not immediately retried by the buffered
+    /// fallback: the applied cooldown also gates selection, but the explicit
+    /// exclusion makes the guarantee airtight even when the parsed cooldown
+    /// window is near zero. Smart-routing cascade escalation re-derives its
+    /// own candidates and is not filtered.
+    pub(crate) async fn route_request_with_exclusions(
+        &self,
+        request: &OpenAIRequest,
+        active: Option<ActiveRequestHandle>,
+        exclude: &[String],
+    ) -> Result<OpenAIResponse, GatewayError> {
         let prepared_request = request.clone();
 
         // Find model group
@@ -5366,6 +5491,19 @@ impl Router {
 
         // Select provider order
         let providers = self.select_provider_order(&model_group).await;
+        // Drop explicitly excluded provider:model entries (streaming 429
+        // fallback — see `route_request_streaming_excluding`).
+        let providers = if exclude.is_empty() {
+            providers
+        } else {
+            providers
+                .into_iter()
+                .filter(|pm| {
+                    let key = format!("{}:{}", pm.provider, pm.model);
+                    !exclude.iter().any(|k| k == &key)
+                })
+                .collect()
+        };
         debug!(count = providers.len(), "Selected providers");
 
         if providers.is_empty() {
@@ -5533,11 +5671,14 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             .await
     }
 
-    /// Like [`Self::route_request_streaming`], but skips any provider whose name
-    /// appears in `exclude` when picking the first eligible pass-through
+    /// Like [`Self::route_request_streaming`], but skips any `provider:model`
+    /// entry listed in `exclude` when picking the first eligible pass-through
     /// provider. Used by the streaming handler's pre-content failover loop
     /// (task 6.1, Req 4.1) to retry the next provider after one disconnects or
-    /// errors before any content was forwarded.
+    /// errors before any content was forwarded. Exclusion is keyed per
+    /// `provider:model` — matching the circuit-breaker key — so a provider
+    /// that offers several models in the group remains eligible via its other
+    /// models after one of them failed.
     ///
     /// The buffered fallbacks are intentionally left intact: when no eligible
     /// pass-through provider remains (all excluded / circuit-open / cooled
@@ -5602,9 +5743,12 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         let mut chosen_without_capacity: Option<(ProviderModel, Provider)> = None;
         let mut chosen: Option<(ProviderModel, ProviderConcurrencyPermit)> = None;
         for provider_model in &providers {
-            // Req 4.1: skip providers already tried in the failover loop.
-            if exclude.iter().any(|p| p == &provider_model.provider) {
-                debug!(provider = %provider_model.provider, "Excluded by failover, skipping (streaming)");
+            // Req 4.1: skip provider:model entries already tried in the
+            // failover loop. Keyed per provider:model (same as the circuit
+            // breaker) so other models from the same provider stay eligible.
+            let candidate_key = format!("{}:{}", provider_model.provider, provider_model.model);
+            if exclude.iter().any(|p| p == &candidate_key) {
+                debug!(provider = %provider_model.provider, model = %provider_model.model, "Excluded by failover, skipping (streaming)");
                 continue;
             }
             let cb_key = format!("{}:{}", provider_model.provider, provider_model.model);
@@ -5761,6 +5905,26 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             ));
         }
 
+        // Consume an internal rate-limit token for this streaming dispatch,
+        // mirroring the buffered path (`route_with_failover_for_group`):
+        // streaming traffic must not bypass `rate_limit_per_minute`, or a
+        // streaming-heavy workload would never be throttled locally and the
+        // provider would answer with real 429s. On exhaustion, drop to the
+        // buffered path — its own consume() gate then skips this provider
+        // with proper attempt logging and fails over to the next candidate.
+        // (The token is consumed here, after the transformation checks, so
+        // requests that end up buffered anyway are not double-charged.)
+        let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
+        if !rate_limiter.consume().await {
+            warn!(provider = %provider_model.provider, "Rate limit exhausted before streaming dispatch, using buffered path");
+            self.metrics
+                .record_provider_rate_limit_exhausted(&provider_model.provider);
+            drop(concurrency_permit);
+            return Ok(StreamingResponse::Buffered(
+                self.route_request(request, active.clone()).await?,
+            ));
+        }
+
         // Base URL normalization — strip trailing '/', ensure '/v1'; Bedrock
         // Mantle special-case kept for parity (Bedrock never reaches here).
         let mut base_url =
@@ -5841,9 +6005,60 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
         let status = response.status();
         if !status.is_success() {
             let status_code = status.as_u16();
-            // Drain the error body so the connection can be reused, then fall
-            // back to the buffered path which has full multi-provider failover.
-            let _ = response.text().await;
+            // Capture headers before draining so Retry-After style signals
+            // can feed the cooldown parser.
+            let response_headers = response.headers().clone();
+            let body_text = response.text().await.unwrap_or_default();
+            if Self::is_rate_limited(status_code, &body_text) {
+                // Rate-limit response on the streaming pass-through: apply
+                // the dedicated upstream cooldown (RateLimiter + durable
+                // metrics store, both consulted by the routing gates) and
+                // exclude this provider:model from the buffered fallback so
+                // it is not immediately retried while the cooldown is
+                // active. No circuit-breaker failure is recorded — a
+                // rate-limited provider is paused, not unhealthy.
+                let cooldown = self
+                    .parse_rate_limit_cooldown(
+                        &provider_model.provider,
+                        Some(&response_headers),
+                        &body_text,
+                    )
+                    .await;
+                let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
+                rate_limiter.apply_cooldown(cooldown).await;
+                self.metrics
+                    .record_provider_rate_limit_exhausted(&provider_model.provider);
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let deadline = now_secs.saturating_add(cooldown.as_secs());
+                self.metrics.set_provider_cooldown(
+                    &provider_model.provider,
+                    Self::friendly_failure_reason(Some(status_code), &body_text),
+                    deadline,
+                );
+                warn!(
+                    provider = %provider_model.provider,
+                    status = status_code,
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    "Rate-limit response on streaming pass-through; cooldown applied, failing over via buffered path"
+                );
+                drop(concurrency_permit);
+                let mut excluded = exclude.to_vec();
+                let failed_key =
+                    format!("{}:{}", provider_model.provider, provider_model.model);
+                if !excluded.contains(&failed_key) {
+                    excluded.push(failed_key);
+                }
+                return Ok(StreamingResponse::Buffered(
+                    self.route_request_with_exclusions(request, active.clone(), &excluded)
+                        .await?,
+                ));
+            }
+            // Non-rate-limit failure: the body was drained above so the
+            // connection can be reused; fall back to the buffered path
+            // which has full multi-provider failover.
             warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
             drop(concurrency_permit);
             return Ok(StreamingResponse::Buffered(
@@ -7975,65 +8190,69 @@ fn friendly_failure_reason_generic_2xx_without_detail() {
         assert_eq!(Router::extract_version_date("model-name"), (0, 0, 0));
     }
 
-    #[tokio::test]
-    async fn test_version_fallback_sorting() {
-        let mut config = create_test_config();
-        config.model_groups = vec![ModelGroup {
-            name: "test-group".to_string(),
-            version_fallback_enabled: true,
-            compression: None,
-            structured_output: None,
-            memory: None,
-            models: vec![
-                ProviderModel {
-                    provider: "provider-1".to_string(),
-                    model: "gpt-4-turbo-2024-01-25".to_string(),
-                    cost_per_million_input_tokens: 10.0,
-                    cost_per_million_output_tokens: 30.0,
-                    priority: 100,
-                    structured_output_passthrough: None,
-                    tier: None,
-                    context_window: 0,
-                    specializations: vec![],
-                },
-                ProviderModel {
-                    provider: "provider-2".to_string(),
-                    model: "gpt-4-turbo-2024-04-09".to_string(),
-                    cost_per_million_input_tokens: 10.0,
-                    cost_per_million_output_tokens: 30.0,
-                    priority: 100,
-                    structured_output_passthrough: None,
-                    tier: None,
-                    context_window: 0,
-                    specializations: vec![],
-                },
-                ProviderModel {
-                    provider: "provider-3".to_string(),
-                    model: "gpt-4-turbo".to_string(),
-                    cost_per_million_input_tokens: 10.0,
-                    cost_per_million_output_tokens: 30.0,
-                    priority: 100,
-                    structured_output_passthrough: None,
-                    tier: None,
-                    context_window: 0,
-                    specializations: vec![],
-                },
-            ],
-        }];
+#[tokio::test]
+async fn test_version_fallback_sorting() {
+    let mut config = create_test_config();
+    config.model_groups = vec![ModelGroup {
+        name: "test-group".to_string(),
+        version_fallback_enabled: true,
+        compression: None,
+        structured_output: None,
+        memory: None,
+        models: vec![
+            ProviderModel {
+                provider: "provider-1".to_string(),
+                model: "gpt-4-turbo-2024-01-25".to_string(),
+                cost_per_million_input_tokens: 10.0,
+                cost_per_million_output_tokens: 30.0,
+                priority: 100,
+                structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
+            },
+            ProviderModel {
+                provider: "provider-2".to_string(),
+                model: "gpt-4-turbo-2024-04-09".to_string(),
+                cost_per_million_input_tokens: 10.0,
+                cost_per_million_output_tokens: 30.0,
+                priority: 100,
+                structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
+            },
+            ProviderModel {
+                provider: "provider-3".to_string(),
+                model: "gpt-4-turbo".to_string(),
+                cost_per_million_input_tokens: 10.0,
+                cost_per_million_output_tokens: 30.0,
+                // Best (lowest) priority — the dated models must still
+                // outrank it: version date is the DOMINANT ordering key
+                // when version_fallback_enabled (decided behavior).
+                priority: 1,
+                structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
+            },
+        ],
+    }];
 
-        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
-        let model_group = router
-            .find_model_group("gpt-4-turbo-2024-01-25")
-            .await
-            .unwrap();
-        let order = router.select_provider_order(&model_group).await;
+    let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+    let model_group = router
+        .find_model_group("gpt-4-turbo-2024-01-25")
+        .await
+        .unwrap();
+    let order = router.select_provider_order(&model_group).await;
 
-        assert_eq!(order.len(), 3);
-        // Should be sorted by version date descending (newest first)
-        assert_eq!(order[0].model, "gpt-4-turbo-2024-04-09");
-        assert_eq!(order[1].model, "gpt-4-turbo-2024-01-25");
-        assert_eq!(order[2].model, "gpt-4-turbo"); // No version = oldest
-    }
+    assert_eq!(order.len(), 3);
+    // Should be sorted by version date descending (newest first), even
+    // over a lower-priority undated model.
+    assert_eq!(order[0].model, "gpt-4-turbo-2024-04-09");
+    assert_eq!(order[1].model, "gpt-4-turbo-2024-01-25");
+    assert_eq!(order[2].model, "gpt-4-turbo"); // No version = oldest
+}
 
     #[test]
     fn test_http_client_reused_per_provider() {
@@ -8312,13 +8531,17 @@ mod property_tests {
             })?;
         }
 
-        /// **Property 2: Provider Selection Ordering**
-        /// **Validates: Requirements 6.2, 6.3, 7.2, 28.2-28.4, 5.2**
-        ///
-        /// For any model group with multiple providers, the router shall order providers by:
-        /// (1) priority ascending, (2) cost ascending within same priority,
-        /// (3) latency ascending within similar costs (±10%),
-        /// (4) version date descending if version fallback is enabled.
+    /// **Property 2: Provider Selection Ordering**
+    /// **Validates: Requirements 6.2, 6.3, 7.2, 28.2-28.4, 5.2**
+    ///
+    /// For any model group with multiple providers, the router shall order providers by:
+    /// (1) priority ascending, (2) cost ascending within same priority,
+    /// (3) latency ascending within similar costs (±10%),
+    /// (4) version date descending when version fallback is enabled — a
+    ///     DOMINANT re-sort that overrides (1)-(3) (see
+    ///     `test_version_fallback_sorting`). The generated model names carry
+    ///     no `YYYY-MM-DD` suffix, so for the generated groups the priority /
+    ///     cost invariants below hold unconditionally.
         #[test]
         fn prop_provider_selection_ordering(model_group in model_group_strategy()) {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -8512,11 +8735,125 @@ mod property_tests {
         assert!(Router::is_rate_limited(200, body));
     }
 
-    #[test]
-    fn test_is_rate_limited_200_with_numeric_429_code() {
-        let body = r#"{"error":{"code":429,"message":"Too Many Requests"}}"#;
-        assert!(Router::is_rate_limited(200, body));
+#[test]
+fn test_is_rate_limited_200_with_numeric_429_code() {
+    let body = r#"{"error":{"code":429,"message":"Too Many Requests"}}"#;
+    assert!(Router::is_rate_limited(200, body));
+}
+
+#[test]
+fn test_is_rate_limit_class_error_429() {
+    let err = GatewayError::Provider {
+        provider: "p".to_string(),
+        message: "Too Many Requests".to_string(),
+        status_code: Some(429),
+    };
+    assert!(Router::is_rate_limit_class_error(&err));
+}
+
+#[test]
+fn test_is_rate_limit_class_error_promoted_200_envelope() {
+    // Error-in-200 envelopes are promoted to status 429 by the dispatch
+    // loop; the promoted error must be recognized as rate-limit-class.
+    let err = GatewayError::Provider {
+        provider: "p".to_string(),
+        message: "Rate limited (HTTP 200 envelope): slow down".to_string(),
+        status_code: Some(429),
+    };
+    assert!(Router::is_rate_limit_class_error(&err));
+}
+
+#[test]
+fn test_is_rate_limit_class_error_non_rate_limit() {
+    for status in [400u16, 401, 404, 500, 503] {
+        let err = GatewayError::Provider {
+            provider: "p".to_string(),
+            message: format!("HTTP {} failure", status),
+            status_code: Some(status),
+        };
+        assert!(
+            !Router::is_rate_limit_class_error(&err),
+            "status {} must not be rate-limit-class",
+            status
+        );
     }
+    // 5xx with rate-limit wording stays non-rate-limit-class (5xx are
+    // health failures, not pause signals).
+    let err = GatewayError::Provider {
+        provider: "p".to_string(),
+        message: "rate limit hit while overloaded".to_string(),
+        status_code: Some(503),
+    };
+    assert!(!Router::is_rate_limit_class_error(&err));
+}
+
+#[test]
+fn test_is_rate_limit_class_error_non_provider_error() {
+    let err = GatewayError::TtfbTimeout(30);
+    assert!(!Router::is_rate_limit_class_error(&err));
+}
+
+fn truncation_test_response(finish_reason: Option<&str>, completion_tokens: u32) -> OpenAIResponse {
+    OpenAIResponse {
+        id: "test".to_string(),
+        object: "chat.completion".to_string(),
+        created: 0,
+        model: "test-model".to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String("partial".to_string()),
+                extra: serde_json::Map::new(),
+            },
+            finish_reason: finish_reason.map(|s| s.to_string()),
+            extra: serde_json::Map::new(),
+        }],
+        usage: Usage {
+            prompt_tokens: 10,
+            completion_tokens,
+            total_tokens: 10 + completion_tokens,
+            extra: serde_json::Map::new(),
+        },
+        extra: serde_json::Map::new(),
+    }
+}
+
+#[test]
+fn test_is_suspicious_truncation_detected() {
+    let response = truncation_test_response(Some("length"), 100);
+    assert!(Router::is_suspicious_truncation(&response, Some(4096)));
+}
+
+#[test]
+fn test_is_suspicious_truncation_near_limit_not_suspicious() {
+    // completion_tokens within 50 of max_tokens is a legitimate stop.
+    let response = truncation_test_response(Some("length"), 4060);
+    assert!(!Router::is_suspicious_truncation(&response, Some(4096)));
+}
+
+#[test]
+fn test_is_suspicious_truncation_finish_reason_stop() {
+    let response = truncation_test_response(Some("stop"), 100);
+    assert!(!Router::is_suspicious_truncation(&response, Some(4096)));
+}
+
+#[test]
+fn test_is_suspicious_truncation_no_max_tokens() {
+    let response = truncation_test_response(Some("length"), 100);
+    assert!(!Router::is_suspicious_truncation(&response, None));
+}
+
+#[test]
+fn test_is_suspicious_truncation_missing_usage_not_suspicious() {
+    // Providers that omit `usage` default to completion_tokens == 0; that
+    // must NOT be read as "stopped far short" (false failover + spurious
+    // circuit-breaker failure on a legitimate length-capped response).
+    let mut response = truncation_test_response(Some("length"), 0);
+    response.usage = Usage::default();
+    assert!(!Router::is_suspicious_truncation(&response, Some(4096)));
+}
+
 
     #[test]
     fn test_is_rate_limited_200_normal_response_not_flagged() {
