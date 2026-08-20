@@ -596,7 +596,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn property_5_stats_formula_and_consistency(

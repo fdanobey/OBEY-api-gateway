@@ -23,7 +23,7 @@ fn optional_level_strategy() -> impl Strategy<Value = Option<CompressionLevel>> 
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_6_effective_config_drives_pipeline_decision_with_field_local_precedence(

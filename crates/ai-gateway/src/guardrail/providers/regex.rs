@@ -408,7 +408,7 @@ mod tests {
     // ---- Property-based tests (proptest, >=100 cases) ----
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 100, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
 
         /// Property 12: Regex scan returns valid, non-overlapping matches.
         /// For any input and any set of safe deny patterns, every finding

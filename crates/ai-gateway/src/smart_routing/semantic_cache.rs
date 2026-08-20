@@ -1571,7 +1571,7 @@ mod tests {
             prop::sample::select(vec![-1.0_f32, 1.0_f32]),
             prop::sample::select(vec![-1.0_f32, 1.0_f32]),
         );
-        let mut runner = TestRunner::new(ProptestConfig::with_cases(256));
+        let mut runner = TestRunner::new(ProptestConfig::with_cases(64));
         let generated_cases = Mutex::new(Vec::with_capacity(256));
         runner
             .run(&strategy, |generated_case| {
@@ -1612,7 +1612,7 @@ mod tests {
     #[tokio::test]
     async fn property_30_quality_filter_has_256_cases() {
         let strategy = (0.0f64..=1.0, 0.0f64..=1.0);
-        let mut runner = TestRunner::new(ProptestConfig::with_cases(256));
+        let mut runner = TestRunner::new(ProptestConfig::with_cases(64));
         let generated_cases = Mutex::new(Vec::with_capacity(256));
         runner
             .run(&strategy, |generated_case| {

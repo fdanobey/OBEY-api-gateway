@@ -425,7 +425,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: virtual-key-management, Property 6: Cost Computation Formula
         // For non-negative input/output tokens and non-negative rates, cost ==

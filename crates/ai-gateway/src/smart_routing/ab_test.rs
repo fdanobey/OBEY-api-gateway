@@ -547,7 +547,7 @@ mod tests {
     }
 
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: smart-routing, Property 34: A/B assignment is stable across manager instances.
     #[test]

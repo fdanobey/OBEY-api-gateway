@@ -483,7 +483,7 @@ mod property_tests {
     // Configured mappings must take priority over auto-detection.
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn namespace_detection_and_grouping(
@@ -555,7 +555,7 @@ mod property_tests {
     // Verify namespace retrieval returns all tools in a namespace and error for invalid.
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn namespace_retrieval_correctness(

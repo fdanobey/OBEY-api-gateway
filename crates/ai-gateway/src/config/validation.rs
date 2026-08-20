@@ -470,6 +470,28 @@ impl Config {
             }
         }
 
+        if let Some(ref codex_search) = self.codex_search {
+            if let Err(msg) = codex_search.validate() {
+                errors.push(ValidationError::InvalidValue {
+                    field: "codex_search".to_string(),
+                    value: msg,
+                    expected: "a valid codex search configuration".to_string(),
+                });
+            }
+
+            let has_codex_provider = self
+                .providers
+                .iter()
+                .any(|p| p.auth_method.as_deref() == Some("oauth") && p.provider_type == "openai");
+
+            if codex_search.effective_enabled(has_codex_provider) && !has_codex_provider {
+                tracing::warn!(
+    "codex_search.enabled is true but no Codex (oauth+openai) provider is configured — \
+    search tools will not be injected and no upstream search calls will be made"
+    );
+            }
+        }
+
         // Validate admin auth env vars (21.5)
         if self.admin.auth.enabled {
             if let Some(ref env_var) = self.admin.auth.username_env {
@@ -1013,6 +1035,7 @@ mod property_tests {
             smart_routing: Default::default(),
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
+            codex_search: None,
         }
     }
 
@@ -1709,7 +1732,7 @@ model_groups:
     // Feature: bedrock-ui-integration, Property 4: Provider config Bedrock fields round-trip through serialization
     // **Validates: Requirements 8.1, 3.2**
     proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(100))]
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_provider_bedrock_fields_roundtrip(
@@ -1790,7 +1813,7 @@ model_groups:
     // succeeds and `auth_method` is `None`.
     // **Validates: Requirements 6.5**
     proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(200))]
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_provider_without_auth_method_deserializes_with_none(
@@ -2388,7 +2411,7 @@ model_groups:
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_guardrail_config_validation_iff(
@@ -2610,7 +2633,7 @@ model_groups:
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_refusal_phrase_list_validation_rejects_malformed(

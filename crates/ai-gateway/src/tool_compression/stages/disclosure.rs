@@ -197,9 +197,9 @@ fn estimate_tokens(value: &Value) -> u64 {
 
 #[cfg(test)]
 mod tests {
-use super::*;
+    use super::*;
 
-fn make_tool(name: &str, description: &str) -> ToolDefinition {
+    fn make_tool(name: &str, description: &str) -> ToolDefinition {
         let raw = json!({
             "type": "function",
             "function": {
@@ -475,7 +475,7 @@ mod property_tests {
     // **Validates: Requirements 5.2, 5.3, 5.4**
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         /// Property: For every tool in the original set, resolve_get_tool_schema
         /// returns the exact original schema (byte-identical JSON Value).

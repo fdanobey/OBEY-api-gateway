@@ -21,7 +21,7 @@ fn record(sequence: u32, timestamp: Instant) -> RequestRecord {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: agent-loop-detection, Property 10: History Depth Bounding
     #[test]

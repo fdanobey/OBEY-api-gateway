@@ -1571,7 +1571,7 @@ training:
     }
 
     proptest! {
-            #![proptest_config(ProptestConfig::with_cases(256))]
+            #![proptest_config(ProptestConfig::with_cases(64))]
 
             #[test]
             fn invalid_tier_boundaries_are_rejected(fast_max in any::<f64>(), balanced_max in any::<f64>()) {

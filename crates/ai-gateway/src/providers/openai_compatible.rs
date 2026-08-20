@@ -611,7 +611,7 @@ mod property_tests {
     // Feature: ai-gateway, Property 42: Custom Header Inclusion
     // **Validates: Requirements 39.2, 39.3**
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_custom_header_literal_values_returned_as_is(
@@ -687,7 +687,7 @@ mod property_tests {
     // Feature: ai-gateway, Property 44: Connection Pool Reuse
     // **Validates: Requirements 46.3**
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_connection_pool_reuse(

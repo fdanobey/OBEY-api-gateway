@@ -249,7 +249,7 @@ async fn timeout_surfaces_error_and_applies_policy() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!([]))
-                .set_delay(Duration::from_secs(2)),
+                .set_delay(Duration::from_millis(1500)),
         )
         .mount(&server)
         .await;

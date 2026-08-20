@@ -168,6 +168,7 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
         smart_routing: Default::default(),
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
+        codex_search: None,
         structured_output: None,
         memory: None,
     }
@@ -341,7 +342,7 @@ async fn disabled_with_key_is_ignored_and_not_tracked() {
     );
 
     // Give any (erroneous) spawned recording a chance to run, then assert none.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let agg = ts
         .manager()
         .query_usage(&created.id, full_window())

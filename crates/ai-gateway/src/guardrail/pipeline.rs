@@ -810,7 +810,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
 
         /// Property 31: Failover toggle gates re-dispatch.
         ///

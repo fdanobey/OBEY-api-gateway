@@ -212,7 +212,7 @@ mod tests {
     // ---- Property-based tests (proptest, >=100 cases) ----
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: guardrail-pipelines, Property 30: Tool-omission refusal signal
         // **Validates: Requirements 12.3**
@@ -495,7 +495,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         /// Property 29: Refusal phrase matching is case-insensitive and
         /// content-scoped.

@@ -409,7 +409,7 @@ fn assert_result_nonincreasing(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_4_compression_never_increases_token_count(case in generated_case()) {

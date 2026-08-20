@@ -522,7 +522,6 @@ impl BodySanitizer {
             )
         }
     }
-
 }
 
 /// Precompiled redaction rules; compiling these per call dominated the old
@@ -531,26 +530,18 @@ static REDACTION_RULES: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::
     use regex::Regex;
     vec![
         // OpenAI keys: sk-... with 20+ chars (covers sk-proj-..., sk-svcacct-..., etc.)
-        (
-            Regex::new(r"sk-[a-zA-Z0-9_\-]{20,}").unwrap(),
-            "[REDACTED]",
-        ),
+        (Regex::new(r"sk-[a-zA-Z0-9_\-]{20,}").unwrap(), "[REDACTED]"),
         (
             Regex::new(r"Bearer\s+[a-zA-Z0-9\-_.]+").unwrap(),
             "Bearer [REDACTED]",
         ),
         (
-            Regex::new(
-                r#"(?i)(api[_-]?key|authorization)["']?\s*[:=]\s*["']?[a-zA-Z0-9\-_.]+"#,
-            )
-            .unwrap(),
+            Regex::new(r#"(?i)(api[_-]?key|authorization)["']?\s*[:=]\s*["']?[a-zA-Z0-9\-_.]+"#)
+                .unwrap(),
             "$1: [REDACTED]",
         ),
         // AWS access keys: AKIA...
-        (
-            Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
-            "[REDACTED]",
-        ),
+        (Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(), "[REDACTED]"),
     ]
 });
 
@@ -820,8 +811,7 @@ fn run_cleanup(conn: &Connection, config: &LoggingConfig) -> Result<usize> {
         return Ok(0);
     }
 
-    let cutoff_timestamp =
-        Utc::now().timestamp() - (config.retention_days as i64 * 24 * 60 * 60);
+    let cutoff_timestamp = Utc::now().timestamp() - (config.retention_days as i64 * 24 * 60 * 60);
 
     let deleted = conn.execute(
         "DELETE FROM requests WHERE timestamp < ?1",
@@ -849,24 +839,24 @@ mod tests {
             cleanup_schedule_hours: 24,
         };
 
-    let logger = RequestLogger::new(config).unwrap();
-    (logger, temp_file)
-}
+        let logger = RequestLogger::new(config).unwrap();
+        (logger, temp_file)
+    }
 
-fn test_sanitizer() -> BodySanitizer {
-    BodySanitizer::new(LoggingConfig {
-        level: "info".to_string(),
-        database_path: String::new(),
-        request_body_logging: true,
-        response_body_logging: true,
-        max_body_size_bytes: 1000,
-        excluded_fields: vec!["api_key".to_string(), "password".to_string()],
-        retention_days: 30,
-        cleanup_schedule_hours: 24,
-    })
-}
+    fn test_sanitizer() -> BodySanitizer {
+        BodySanitizer::new(LoggingConfig {
+            level: "info".to_string(),
+            database_path: String::new(),
+            request_body_logging: true,
+            response_body_logging: true,
+            max_body_size_bytes: 1000,
+            excluded_fields: vec!["api_key".to_string(), "password".to_string()],
+            retention_days: 30,
+            cleanup_schedule_hours: 24,
+        })
+    }
 
-fn sample_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> LogEntry {
+    fn sample_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> LogEntry {
         LogEntry {
             trace_id: trace_id.to_owned(),
             timestamp: Utc::now(),
@@ -1023,18 +1013,18 @@ fn sample_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> 
 
     #[test]
     fn malformed_compression_metadata_is_ignored() {
-    let (logger, temp) = create_test_logger();
-    logger.log(sample_entry("malformed", None)).unwrap();
-    // Round-trip the writer thread so the INSERT has committed before the
-    // direct SQL corruption below executes.
-    logger.flush();
-    Connection::open(temp.path())
-        .unwrap()
-        .execute(
-            "UPDATE requests SET compression_metadata = ?1 WHERE trace_id = ?2",
-            params!["{not valid json", "malformed"],
-        )
-        .unwrap();
+        let (logger, temp) = create_test_logger();
+        logger.log(sample_entry("malformed", None)).unwrap();
+        // Round-trip the writer thread so the INSERT has committed before the
+        // direct SQL corruption below executes.
+        logger.flush();
+        Connection::open(temp.path())
+            .unwrap()
+            .execute(
+                "UPDATE requests SET compression_metadata = ?1 WHERE trace_id = ?2",
+                params!["{not valid json", "malformed"],
+            )
+            .unwrap();
 
         let results = logger
             .query(LogFilter {
@@ -1048,19 +1038,19 @@ fn sample_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> 
 
     #[test]
     fn compression_serialization_is_bounded_and_secret_free() {
-    let (logger, temp) = create_test_logger();
-    let mut metadata = sample_compression(CompressionLevel::Ultra);
+        let (logger, temp) = create_test_logger();
+        let mut metadata = sample_compression(CompressionLevel::Ultra);
         metadata.engines_applied = vec![
             "semantic sk-super-secret-token-1234567890".repeat(10),
             "Bearer another-secret".to_owned(),
         ];
         metadata.savings_percent = f64::NAN;
-    logger
-        .log(sample_entry("safe-metadata", Some(metadata)))
-        .unwrap();
-    logger.flush();
+        logger
+            .log(sample_entry("safe-metadata", Some(metadata)))
+            .unwrap();
+        logger.flush();
 
-    let conn = Connection::open(temp.path()).unwrap();
+        let conn = Connection::open(temp.path()).unwrap();
         let json: String = conn
             .query_row(
                 "SELECT compression_metadata FROM requests WHERE trace_id = ?1",
@@ -1180,8 +1170,8 @@ fn sample_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> 
     }
 
     #[test]
-fn test_api_key_redaction() {
-    let sanitizer = test_sanitizer();
+    fn test_api_key_redaction() {
+        let sanitizer = test_sanitizer();
 
         // Standard 48-char key
         let body =
@@ -1205,8 +1195,8 @@ fn test_api_key_redaction() {
     }
 
     #[test]
-fn test_field_exclusion() {
-    let sanitizer = test_sanitizer();
+    fn test_field_exclusion() {
+        let sanitizer = test_sanitizer();
 
         let body = r#"{"api_key":"secret","password":"pass123","message":"test"}"#;
         let excluded = sanitizer.exclude_fields(body);
@@ -1218,8 +1208,8 @@ fn test_field_exclusion() {
     }
 
     #[test]
-fn test_size_limit() {
-    let sanitizer = test_sanitizer();
+    fn test_size_limit() {
+        let sanitizer = test_sanitizer();
 
         let large_body = "x".repeat(2000);
         let limited = sanitizer.apply_size_limit(&large_body);

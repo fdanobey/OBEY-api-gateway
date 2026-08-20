@@ -211,6 +211,8 @@ pub struct Router {
     /// Used to display usage in admin UI and as fallback cooldown when
     /// no Retry-After header is present on 429 responses.
     oauth_usage_tracker: Option<Arc<crate::oauth::UsageTracker>>,
+    /// Codex Search Prometheus metrics (tool executions + latency).
+    search_metrics: Arc<crate::codex::search::metrics::SearchMetrics>,
     /// Adaptively learned set of `provider::model` combinations whose model
     /// emits XML-style tool calls (instead of native `tool_calls`). Populated
     /// at runtime when a streaming pass-through response is detected to contain
@@ -401,17 +403,18 @@ impl Router {
             })),
             compression_events: None,
             metrics,
-        smart_router: Arc::new(std::sync::RwLock::new(smart_router)),
-        memory_system: None,
-        oauth_manager: None,
-        instructions_store: None,
-        oauth_usage_tracker: None,
-        xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-        tool_hint_tallies: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            smart_router: Arc::new(std::sync::RwLock::new(smart_router)),
+            memory_system: None,
+            oauth_manager: None,
+            instructions_store: None,
+            oauth_usage_tracker: None,
+            search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
+            xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            tool_hint_tallies: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        }
     }
-}
 
-/// Create a new Router with explicit context configuration
+    /// Create a new Router with explicit context configuration
     #[allow(dead_code)]
     pub fn with_context_config(
         config: Arc<RwLock<Config>>,
@@ -440,17 +443,18 @@ impl Router {
             })),
             compression_events: None,
             metrics,
-        smart_router: Arc::new(std::sync::RwLock::new(smart_router)),
-        memory_system: None,
-        oauth_manager: None,
-        instructions_store: None,
-        oauth_usage_tracker: None,
-        xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-        tool_hint_tallies: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            smart_router: Arc::new(std::sync::RwLock::new(smart_router)),
+            memory_system: None,
+            oauth_manager: None,
+            instructions_store: None,
+            oauth_usage_tracker: None,
+            search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
+            xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            tool_hint_tallies: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        }
     }
-}
 
-/// Attach an [`OAuthManager`](crate::oauth::OAuthManager) so providers
+    /// Attach an [`OAuthManager`](crate::oauth::OAuthManager) so providers
     /// configured with `auth_method: oauth` can resolve a Bearer access token
     /// per request. Called once during gateway startup (task 14.1).
     pub fn set_oauth_manager(&mut self, manager: Arc<crate::oauth::OAuthManager>) {
@@ -467,6 +471,11 @@ impl Router {
     /// Codex providers. Called once during gateway startup.
     pub fn set_instructions_store(&mut self, store: Arc<crate::codex::InstructionsStore>) {
         self.instructions_store = Some(store);
+    }
+
+    /// Get the Codex Search metrics handle for Prometheus exposition.
+    pub fn search_metrics(&self) -> Arc<crate::codex::search::metrics::SearchMetrics> {
+        self.search_metrics.clone()
     }
 
     /// Get the context manager
@@ -1289,9 +1298,11 @@ impl Router {
     /// not count toward the circuit-breaker failure threshold.
     fn is_rate_limit_class_error(e: &GatewayError) -> bool {
         match e {
-            GatewayError::Provider { status_code, message, .. } => {
-                Self::is_rate_limited(status_code.unwrap_or(0), message)
-            }
+            GatewayError::Provider {
+                status_code,
+                message,
+                ..
+            } => Self::is_rate_limited(status_code.unwrap_or(0), message),
             _ => false,
         }
     }
@@ -1390,13 +1401,13 @@ impl Router {
     /// provider omitted usage frames); cost is accrued from the configured
     /// per-model rates only when token usage is actually known, mirroring the
     /// buffered path's `usage_known` handling.
-pub async fn record_streaming_success(
-    &self,
-    provider: &str,
-    model: &str,
-    duration: std::time::Duration,
-    usage: &Usage,
-) {
+    pub async fn record_streaming_success(
+        &self,
+        provider: &str,
+        model: &str,
+        duration: std::time::Duration,
+        usage: &Usage,
+    ) {
         let cb_key = format!("{}:{}", provider, model);
         let cb = self.get_circuit_breaker(&cb_key).await;
         cb.record_success().await;
@@ -1425,7 +1436,12 @@ pub async fn record_streaming_success(
                     .models
                     .iter()
                     .find(|m| m.provider == provider && m.model == model)
-                    .map(|m| (m.cost_per_million_input_tokens, m.cost_per_million_output_tokens))
+                    .map(|m| {
+                        (
+                            m.cost_per_million_input_tokens,
+                            m.cost_per_million_output_tokens,
+                        )
+                    })
             })
         };
         match rates {
@@ -1768,42 +1784,39 @@ pub async fn record_streaming_success(
                     "Provider request failed (network error)".to_string()
                 }
             }
-        Some(code) if (200..300).contains(&code) => {
-            // A 2xx status here means the provider returned an error
-            // payload (or an unparseable body) inside a success
-            // envelope. The caller-supplied text carries the detail —
-            // "Error in 200 response: <provider message>" from the
-            // error-in-200 detection, or "Failed to parse response:
-            // <reason>" from SSE/JSON parse failures. Surface that
-            // detail so the dashboard shows the real cause instead of
-            // a confusing "unexpected response (HTTP 200)".
-            const ERR_IN_200: &str = "Error in 200 response: ";
-            const PARSE_FAIL: &str = "Failed to parse response: ";
-            let trimmed = body_or_message.trim();
-            if let Some(detail) = trimmed.strip_prefix(ERR_IN_200) {
-                format!(
-                    "Provider error (in HTTP {}): {}",
-                    code,
-                    Self::truncate_for_display(detail)
-                )
-            } else if let Some(detail) = trimmed.strip_prefix(PARSE_FAIL) {
-                format!(
-                    "Provider sent an unparseable response (HTTP {}): {}",
-                    code,
-                    Self::truncate_for_display(detail)
-                )
-            } else if !snippet.is_empty() {
-                format!("Provider error (in HTTP {}): {}", code, snippet)
-            } else {
-                format!(
-                    "Provider returned an error inside a HTTP {} response",
-                    code
-                )
+            Some(code) if (200..300).contains(&code) => {
+                // A 2xx status here means the provider returned an error
+                // payload (or an unparseable body) inside a success
+                // envelope. The caller-supplied text carries the detail —
+                // "Error in 200 response: <provider message>" from the
+                // error-in-200 detection, or "Failed to parse response:
+                // <reason>" from SSE/JSON parse failures. Surface that
+                // detail so the dashboard shows the real cause instead of
+                // a confusing "unexpected response (HTTP 200)".
+                const ERR_IN_200: &str = "Error in 200 response: ";
+                const PARSE_FAIL: &str = "Failed to parse response: ";
+                let trimmed = body_or_message.trim();
+                if let Some(detail) = trimmed.strip_prefix(ERR_IN_200) {
+                    format!(
+                        "Provider error (in HTTP {}): {}",
+                        code,
+                        Self::truncate_for_display(detail)
+                    )
+                } else if let Some(detail) = trimmed.strip_prefix(PARSE_FAIL) {
+                    format!(
+                        "Provider sent an unparseable response (HTTP {}): {}",
+                        code,
+                        Self::truncate_for_display(detail)
+                    )
+                } else if !snippet.is_empty() {
+                    format!("Provider error (in HTTP {}): {}", code, snippet)
+                } else {
+                    format!("Provider returned an error inside a HTTP {} response", code)
+                }
             }
+            Some(code) => format!("Provider returned an unexpected response (HTTP {})", code),
         }
-        Some(code) => format!("Provider returned an unexpected response (HTTP {})", code),
     }
-}
 
     /// Trim provider-supplied error text to a single short line so the
     /// dashboard cell stays readable.
@@ -2360,9 +2373,9 @@ pub async fn record_streaming_success(
 
             let codex_client = crate::codex::client::CodexProviderClient::new(
                 provider_name.to_string(),
-                oauth,
+                oauth.clone(),
                 instructions,
-                http,
+                http.clone(),
                 self.metrics.clone(),
                 self.oauth_usage_tracker
                     .clone()
@@ -2374,20 +2387,55 @@ pub async fn record_streaming_success(
                 config.reasoning_models_allowlist.clone(),
             );
 
-		let mut codex_request = request.clone();
-		// Rewrite the model from the group name to the actual provider model ID
-		codex_request.model = provider_model.model.clone();
-		// Drop config lock before making HTTP calls. The dispatch below
-		// awaits the full upstream round-trip; holding the write-preferring
-		// read guard across it lets any queued config writer (hot-reload,
-		// tray, memory settings) stall every subsequent request gateway-wide
-		// for the duration of the slowest in-flight Codex call. All config
-		// values needed here were cloned above.
-		drop(config);
-		let result = self
-			.dispatch_buffered_with_context_retry(&codex_client, codex_request)
-			.await?;
-		return Ok(result.response);
+            let codex_search_config = config.codex_search.clone().unwrap_or_default();
+            // Drop config lock before making HTTP calls. The dispatch below
+            // awaits the full upstream round-trip; holding the write-preferring
+            // read guard across it lets any queued config writer (hot-reload,
+            // tray, memory settings) stall every subsequent request gateway-wide
+            // for the duration of the slowest in-flight Codex call. All config
+            // values needed here were cloned above.
+            drop(config);
+
+            let mut codex_request = request.clone();
+            // Rewrite the model from the group name to the actual provider model ID
+            codex_request.model = provider_model.model.clone();
+
+            let search_enabled = codex_search_config.effective_enabled(true);
+            let oauth_active = oauth.get_access_token().await.is_some();
+            crate::codex::search::injector::ToolInjector::inject(
+                &mut codex_request,
+                oauth_active,
+                search_enabled,
+            );
+
+            let result = self
+                .dispatch_buffered_with_context_retry(&codex_client, codex_request.clone())
+                .await?;
+
+            if search_enabled && oauth_active {
+                let usage_tracker = self
+                    .oauth_usage_tracker
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(crate::oauth::UsageTracker::new()));
+                let executor = Arc::new(crate::codex::search::executor::SearchExecutor::new(
+                    http,
+                    oauth,
+                    usage_tracker,
+                    self.search_metrics.clone(),
+                    codex_search_config.effective_base_url(),
+                    codex_search_config.effective_timeout(),
+                ));
+                let interceptor = crate::codex::search::interceptor::ToolInterceptor::new(
+                    executor,
+                    codex_search_config.effective_max_iterations(),
+                );
+                let intercepted = interceptor
+                    .intercept(&codex_client, codex_request, result.response)
+                    .await?;
+                return Ok(intercepted.response);
+            }
+
+            return Ok(result.response);
         }
         // ─── End Codex dispatch ──────────────────────────────────────────────
 
@@ -2645,8 +2693,8 @@ pub async fn record_streaming_success(
         // the diagnostic below and `record_native_tool_success`. Appended as
         // the last system message so it doesn't override the client's system
         // prompt.
-        let inject_tool_hint = has_tools
-            && self.should_inject_tool_hint(provider_name, &provider_model.model);
+        let inject_tool_hint =
+            has_tools && self.should_inject_tool_hint(provider_name, &provider_model.model);
         if inject_tool_hint {
             debug!(
                 provider = provider_name,
@@ -2871,53 +2919,59 @@ pub async fn record_streaming_success(
                             }
                         }
 
-        // Try parsing as a normal JSON response first
-        if let Ok(mut openai_response) =
-            serde_json::from_str::<OpenAIResponse>(&body_text)
-        {
-            // Diagnostic: detect whether the model used native tool_calls
-            // or fell back to XML-style tool use in plain text content.
-            // This is the buffered-path feed of the same adaptive signal the
-            // streaming relay uses: XML output (re)marks the combo (hint +
-            // buffer-and-translate), native tool_calls count toward
-            // recovery (see `record_native_tool_success`).
-            if let Some(choice) = openai_response.choices.first() {
-                let has_native_tc = choice.message.extra.contains_key("tool_calls");
-                let content_text = choice.message.content_as_text();
-                let has_xml_tool_use = Self::looks_like_xml_tool_use(&content_text);
-                if has_native_tc {
-                    debug!(
-                        provider = provider_name,
-                        model = %provider_model.model,
-                        finish_reason = ?choice.finish_reason,
-                        "Provider returned native tool_calls"
-                    );
-                }
-                if has_xml_tool_use {
-                    warn!(
-                        provider = provider_name,
-                        model = %provider_model.model,
-                        content_preview = %content_text.chars().take(200).collect::<String>(),
-                        has_tools_in_request = has_tools,
-                        "Model output XML-style tool use as plain text instead of native tool_calls"
-                    );
-                }
-                if has_tools {
-                    if has_xml_tool_use {
-                        self.mark_xml_tool_combo(provider_name, &provider_model.model);
-                    } else if has_native_tc {
-                        self.record_native_tool_success(provider_name, &provider_model.model);
-                    }
-                }
-            }
-            if has_tools {
-                openai_response.extra.insert(
-                    "gateway_tool_hint_injected".to_string(),
-                    serde_json::json!(inject_tool_hint),
-                );
-            }
-            return Ok(openai_response);
-        }
+                        // Try parsing as a normal JSON response first
+                        if let Ok(mut openai_response) =
+                            serde_json::from_str::<OpenAIResponse>(&body_text)
+                        {
+                            // Diagnostic: detect whether the model used native tool_calls
+                            // or fell back to XML-style tool use in plain text content.
+                            // This is the buffered-path feed of the same adaptive signal the
+                            // streaming relay uses: XML output (re)marks the combo (hint +
+                            // buffer-and-translate), native tool_calls count toward
+                            // recovery (see `record_native_tool_success`).
+                            if let Some(choice) = openai_response.choices.first() {
+                                let has_native_tc = choice.message.extra.contains_key("tool_calls");
+                                let content_text = choice.message.content_as_text();
+                                let has_xml_tool_use = Self::looks_like_xml_tool_use(&content_text);
+                                if has_native_tc {
+                                    debug!(
+                                        provider = provider_name,
+                                        model = %provider_model.model,
+                                        finish_reason = ?choice.finish_reason,
+                                        "Provider returned native tool_calls"
+                                    );
+                                }
+                                if has_xml_tool_use {
+                                    warn!(
+                                        provider = provider_name,
+                                        model = %provider_model.model,
+                                        content_preview = %content_text.chars().take(200).collect::<String>(),
+                                        has_tools_in_request = has_tools,
+                                        "Model output XML-style tool use as plain text instead of native tool_calls"
+                                    );
+                                }
+                                if has_tools {
+                                    if has_xml_tool_use {
+                                        self.mark_xml_tool_combo(
+                                            provider_name,
+                                            &provider_model.model,
+                                        );
+                                    } else if has_native_tc {
+                                        self.record_native_tool_success(
+                                            provider_name,
+                                            &provider_model.model,
+                                        );
+                                    }
+                                }
+                            }
+                            if has_tools {
+                                openai_response.extra.insert(
+                                    "gateway_tool_hint_injected".to_string(),
+                                    serde_json::json!(inject_tool_hint),
+                                );
+                            }
+                            return Ok(openai_response);
+                        }
 
                         // Provider may have ignored stream:false and returned SSE chunks.
                         // Parse the SSE stream and reconstruct a single OpenAIResponse.
@@ -2926,17 +2980,17 @@ pub async fn record_streaming_success(
                                 provider = provider_name,
                                 "Provider returned SSE despite stream:false, reassembling"
                             );
-            match Self::reassemble_sse_response(&body_text) {
-                Ok(mut response) => {
-                    if has_tools {
-                        response.extra.insert(
-                            "gateway_tool_hint_injected".to_string(),
-                            serde_json::json!(inject_tool_hint),
-                        );
-                    }
-                    return Ok(response);
-                }
-                Err(e) => {
+                            match Self::reassemble_sse_response(&body_text) {
+                                Ok(mut response) => {
+                                    if has_tools {
+                                        response.extra.insert(
+                                            "gateway_tool_hint_injected".to_string(),
+                                            serde_json::json!(inject_tool_hint),
+                                        );
+                                    }
+                                    return Ok(response);
+                                }
+                                Err(e) => {
                                     tracing::error!(provider = provider_name, error = %e, body = %body_text.chars().take(500).collect::<String>(), "Failed to reassemble SSE response");
                                     return Err(GatewayError::Provider {
                                         provider: provider_name.to_string(),
@@ -3609,8 +3663,8 @@ pub async fn record_streaming_success(
                     // partial response as a fallback candidate (consumed by task
                     // 7.2). When `retry_on_truncation` is false we skip detection
                     // entirely and return the response as-is (prior behavior).
-            let is_truncated =
-                retry_on_truncation && Self::is_suspicious_truncation(&response, request.max_tokens);
+                    let is_truncated = retry_on_truncation
+                        && Self::is_suspicious_truncation(&response, request.max_tokens);
 
                     if is_truncated {
                         let max_tokens = request.max_tokens.unwrap_or(0);
@@ -3758,18 +3812,18 @@ pub async fn record_streaming_success(
 
                     return Ok(response);
                 }
-            Err(e) => {
-                // Record failure — except rate-limit-class errors (HTTP 429
-                // and rate-limit-shaped error-in-200 envelopes). Those are
-                // governed exclusively by the dedicated upstream cooldown
-                // applied below (and enforced as a routing gate by
-                // `select_provider_order` / the defense-in-depth check
-                // above), so a rate-limited provider is paused without its
-                // circuit-breaker health also being eroded: three 429s must
-                // not open the breaker on top of the cooldown.
-                if !Self::is_rate_limit_class_error(&e) {
-                    cb.record_failure().await;
-                }
+                Err(e) => {
+                    // Record failure — except rate-limit-class errors (HTTP 429
+                    // and rate-limit-shaped error-in-200 envelopes). Those are
+                    // governed exclusively by the dedicated upstream cooldown
+                    // applied below (and enforced as a routing gate by
+                    // `select_provider_order` / the defense-in-depth check
+                    // above), so a rate-limited provider is paused without its
+                    // circuit-breaker health also being eroded: three 429s must
+                    // not open the breaker on top of the cooldown.
+                    if !Self::is_rate_limit_class_error(&e) {
+                        cb.record_failure().await;
+                    }
 
                     // Surface the failure reason on the in-flight registry so a
                     // following retry/failover can show why the model changed.
@@ -5571,7 +5625,8 @@ pub async fn record_streaming_success(
         request: &OpenAIRequest,
         active: Option<ActiveRequestHandle>,
     ) -> Result<OpenAIResponse, GatewayError> {
-        self.route_request_with_exclusions(request, active, &[]).await
+        self.route_request_with_exclusions(request, active, &[])
+            .await
     }
 
     /// Like [`Self::route_request`], but removes any `provider:model` entry
@@ -6117,17 +6172,17 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             tokio::time::timeout(ttfb_timeout, req_builder.json(&outgoing).send()).await;
         let response = match send_result {
             Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
-            warn!(provider = %provider_model.provider, error = %e, "Streaming pass-through send failed, falling back to buffered path with full failover");
-            drop(concurrency_permit);
-            return Ok(StreamingResponse::Buffered(
+            Ok(Err(e)) => {
+                warn!(provider = %provider_model.provider, error = %e, "Streaming pass-through send failed, falling back to buffered path with full failover");
+                drop(concurrency_permit);
+                return Ok(StreamingResponse::Buffered(
                     self.route_request(request, active.clone()).await?,
                 ));
             }
-        Err(_) => {
-            warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — falling back to buffered path with full failover");
-            drop(concurrency_permit);
-            return Ok(StreamingResponse::Buffered(
+            Err(_) => {
+                warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — falling back to buffered path with full failover");
+                drop(concurrency_permit);
+                return Ok(StreamingResponse::Buffered(
                     self.route_request(request, active.clone()).await?,
                 ));
             }
@@ -6177,8 +6232,7 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                 );
                 drop(concurrency_permit);
                 let mut excluded = exclude.to_vec();
-                let failed_key =
-                    format!("{}:{}", provider_model.provider, provider_model.model);
+                let failed_key = format!("{}:{}", provider_model.provider, provider_model.model);
                 if !excluded.contains(&failed_key) {
                     excluded.push(failed_key);
                 }
@@ -7167,46 +7221,46 @@ mod tests {
         assert!(Router::response_has_content(&response));
     }
 
-#[test]
-fn friendly_failure_reason_extracts_json_from_provider_prefix() {
-    let message = r#"HTTP 400: {"error":{"message":"Invalid content part"}}"#;
-    assert_eq!(
-        Router::friendly_failure_reason(Some(400), message),
-        "Provider rejected the request: Invalid content part"
-    );
-}
+    #[test]
+    fn friendly_failure_reason_extracts_json_from_provider_prefix() {
+        let message = r#"HTTP 400: {"error":{"message":"Invalid content part"}}"#;
+        assert_eq!(
+            Router::friendly_failure_reason(Some(400), message),
+            "Provider rejected the request: Invalid content part"
+        );
+    }
 
-#[test]
-fn friendly_failure_reason_surfaces_error_in_200_detail() {
-    let message = "Error in 200 response: Model overloaded, please retry";
-    assert_eq!(
-        Router::friendly_failure_reason(Some(200), message),
-        "Provider error (in HTTP 200): Model overloaded, please retry"
-    );
-}
+    #[test]
+    fn friendly_failure_reason_surfaces_error_in_200_detail() {
+        let message = "Error in 200 response: Model overloaded, please retry";
+        assert_eq!(
+            Router::friendly_failure_reason(Some(200), message),
+            "Provider error (in HTTP 200): Model overloaded, please retry"
+        );
+    }
 
-#[test]
-fn friendly_failure_reason_surfaces_parse_failure_in_200() {
-    let message = "Failed to parse response: not JSON or SSE";
-    assert_eq!(
-        Router::friendly_failure_reason(Some(200), message),
-        "Provider sent an unparseable response (HTTP 200): not JSON or SSE"
-    );
-}
+    #[test]
+    fn friendly_failure_reason_surfaces_parse_failure_in_200() {
+        let message = "Failed to parse response: not JSON or SSE";
+        assert_eq!(
+            Router::friendly_failure_reason(Some(200), message),
+            "Provider sent an unparseable response (HTTP 200): not JSON or SSE"
+        );
+    }
 
-#[test]
-fn friendly_failure_reason_generic_2xx_without_detail() {
-    assert_eq!(
-        Router::friendly_failure_reason(Some(204), "gateway dropped body"),
-        "Provider returned an error inside a HTTP 204 response"
-    );
-    // A JSON error envelope embedded in the text still wins for 2xx.
-    let message = r#"HTTP 200: {"error":{"message":"insufficient credits"}}"#;
-    assert_eq!(
-        Router::friendly_failure_reason(Some(200), message),
-        "Provider error (in HTTP 200): insufficient credits"
-    );
-}
+    #[test]
+    fn friendly_failure_reason_generic_2xx_without_detail() {
+        assert_eq!(
+            Router::friendly_failure_reason(Some(204), "gateway dropped body"),
+            "Provider returned an error inside a HTTP 204 response"
+        );
+        // A JSON error envelope embedded in the text still wins for 2xx.
+        let message = r#"HTTP 200: {"error":{"message":"insufficient credits"}}"#;
+        assert_eq!(
+            Router::friendly_failure_reason(Some(200), message),
+            "Provider error (in HTTP 200): insufficient credits"
+        );
+    }
 
     #[test]
     fn bedrock_sanitizer_keeps_reasoning_effort_and_drops_unknown_fields() {
@@ -7279,6 +7333,7 @@ fn friendly_failure_reason_generic_2xx_without_detail() {
             memory: None,
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
+            codex_search: None,
         }
     }
 
@@ -8321,69 +8376,69 @@ fn friendly_failure_reason_generic_2xx_without_detail() {
         assert_eq!(Router::extract_version_date("model-name"), (0, 0, 0));
     }
 
-#[tokio::test]
-async fn test_version_fallback_sorting() {
-    let mut config = create_test_config();
-    config.model_groups = vec![ModelGroup {
-        name: "test-group".to_string(),
-        version_fallback_enabled: true,
-        compression: None,
-        structured_output: None,
-        memory: None,
-        models: vec![
-            ProviderModel {
-                provider: "provider-1".to_string(),
-                model: "gpt-4-turbo-2024-01-25".to_string(),
-                cost_per_million_input_tokens: 10.0,
-                cost_per_million_output_tokens: 30.0,
-                priority: 100,
-                structured_output_passthrough: None,
-                tier: None,
-                context_window: 0,
-                specializations: vec![],
-            },
-            ProviderModel {
-                provider: "provider-2".to_string(),
-                model: "gpt-4-turbo-2024-04-09".to_string(),
-                cost_per_million_input_tokens: 10.0,
-                cost_per_million_output_tokens: 30.0,
-                priority: 100,
-                structured_output_passthrough: None,
-                tier: None,
-                context_window: 0,
-                specializations: vec![],
-            },
-            ProviderModel {
-                provider: "provider-3".to_string(),
-                model: "gpt-4-turbo".to_string(),
-                cost_per_million_input_tokens: 10.0,
-                cost_per_million_output_tokens: 30.0,
-                // Best (lowest) priority — the dated models must still
-                // outrank it: version date is the DOMINANT ordering key
-                // when version_fallback_enabled (decided behavior).
-                priority: 1,
-                structured_output_passthrough: None,
-                tier: None,
-                context_window: 0,
-                specializations: vec![],
-            },
-        ],
-    }];
+    #[tokio::test]
+    async fn test_version_fallback_sorting() {
+        let mut config = create_test_config();
+        config.model_groups = vec![ModelGroup {
+            name: "test-group".to_string(),
+            version_fallback_enabled: true,
+            compression: None,
+            structured_output: None,
+            memory: None,
+            models: vec![
+                ProviderModel {
+                    provider: "provider-1".to_string(),
+                    model: "gpt-4-turbo-2024-01-25".to_string(),
+                    cost_per_million_input_tokens: 10.0,
+                    cost_per_million_output_tokens: 30.0,
+                    priority: 100,
+                    structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
+                },
+                ProviderModel {
+                    provider: "provider-2".to_string(),
+                    model: "gpt-4-turbo-2024-04-09".to_string(),
+                    cost_per_million_input_tokens: 10.0,
+                    cost_per_million_output_tokens: 30.0,
+                    priority: 100,
+                    structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
+                },
+                ProviderModel {
+                    provider: "provider-3".to_string(),
+                    model: "gpt-4-turbo".to_string(),
+                    cost_per_million_input_tokens: 10.0,
+                    cost_per_million_output_tokens: 30.0,
+                    // Best (lowest) priority — the dated models must still
+                    // outrank it: version date is the DOMINANT ordering key
+                    // when version_fallback_enabled (decided behavior).
+                    priority: 1,
+                    structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
+                },
+            ],
+        }];
 
-    let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
-    let model_group = router
-        .find_model_group("gpt-4-turbo-2024-01-25")
-        .await
-        .unwrap();
-    let order = router.select_provider_order(&model_group).await;
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let model_group = router
+            .find_model_group("gpt-4-turbo-2024-01-25")
+            .await
+            .unwrap();
+        let order = router.select_provider_order(&model_group).await;
 
-    assert_eq!(order.len(), 3);
-    // Should be sorted by version date descending (newest first), even
-    // over a lower-priority undated model.
-    assert_eq!(order[0].model, "gpt-4-turbo-2024-04-09");
-    assert_eq!(order[1].model, "gpt-4-turbo-2024-01-25");
-    assert_eq!(order[2].model, "gpt-4-turbo"); // No version = oldest
-}
+        assert_eq!(order.len(), 3);
+        // Should be sorted by version date descending (newest first), even
+        // over a lower-priority undated model.
+        assert_eq!(order[0].model, "gpt-4-turbo-2024-04-09");
+        assert_eq!(order[1].model, "gpt-4-turbo-2024-01-25");
+        assert_eq!(order[2].model, "gpt-4-turbo"); // No version = oldest
+    }
 
     #[test]
     fn test_http_client_reused_per_provider() {
@@ -8866,125 +8921,127 @@ mod property_tests {
         assert!(Router::is_rate_limited(200, body));
     }
 
-#[test]
-fn test_is_rate_limited_200_with_numeric_429_code() {
-    let body = r#"{"error":{"code":429,"message":"Too Many Requests"}}"#;
-    assert!(Router::is_rate_limited(200, body));
-}
+    #[test]
+    fn test_is_rate_limited_200_with_numeric_429_code() {
+        let body = r#"{"error":{"code":429,"message":"Too Many Requests"}}"#;
+        assert!(Router::is_rate_limited(200, body));
+    }
 
-#[test]
-fn test_is_rate_limit_class_error_429() {
-    let err = GatewayError::Provider {
-        provider: "p".to_string(),
-        message: "Too Many Requests".to_string(),
-        status_code: Some(429),
-    };
-    assert!(Router::is_rate_limit_class_error(&err));
-}
-
-#[test]
-fn test_is_rate_limit_class_error_promoted_200_envelope() {
-    // Error-in-200 envelopes are promoted to status 429 by the dispatch
-    // loop; the promoted error must be recognized as rate-limit-class.
-    let err = GatewayError::Provider {
-        provider: "p".to_string(),
-        message: "Rate limited (HTTP 200 envelope): slow down".to_string(),
-        status_code: Some(429),
-    };
-    assert!(Router::is_rate_limit_class_error(&err));
-}
-
-#[test]
-fn test_is_rate_limit_class_error_non_rate_limit() {
-    for status in [400u16, 401, 404, 500, 503] {
+    #[test]
+    fn test_is_rate_limit_class_error_429() {
         let err = GatewayError::Provider {
             provider: "p".to_string(),
-            message: format!("HTTP {} failure", status),
-            status_code: Some(status),
+            message: "Too Many Requests".to_string(),
+            status_code: Some(429),
         };
-        assert!(
-            !Router::is_rate_limit_class_error(&err),
-            "status {} must not be rate-limit-class",
-            status
-        );
+        assert!(Router::is_rate_limit_class_error(&err));
     }
-    // 5xx with rate-limit wording stays non-rate-limit-class (5xx are
-    // health failures, not pause signals).
-    let err = GatewayError::Provider {
-        provider: "p".to_string(),
-        message: "rate limit hit while overloaded".to_string(),
-        status_code: Some(503),
-    };
-    assert!(!Router::is_rate_limit_class_error(&err));
-}
 
-#[test]
-fn test_is_rate_limit_class_error_non_provider_error() {
-    let err = GatewayError::TtfbTimeout(30);
-    assert!(!Router::is_rate_limit_class_error(&err));
-}
+    #[test]
+    fn test_is_rate_limit_class_error_promoted_200_envelope() {
+        // Error-in-200 envelopes are promoted to status 429 by the dispatch
+        // loop; the promoted error must be recognized as rate-limit-class.
+        let err = GatewayError::Provider {
+            provider: "p".to_string(),
+            message: "Rate limited (HTTP 200 envelope): slow down".to_string(),
+            status_code: Some(429),
+        };
+        assert!(Router::is_rate_limit_class_error(&err));
+    }
 
-fn truncation_test_response(finish_reason: Option<&str>, completion_tokens: u32) -> OpenAIResponse {
-    OpenAIResponse {
-        id: "test".to_string(),
-        object: "chat.completion".to_string(),
-        created: 0,
-        model: "test-model".to_string(),
-        choices: vec![Choice {
-            index: 0,
-            message: Message {
-                role: "assistant".to_string(),
-                content: serde_json::Value::String("partial".to_string()),
+    #[test]
+    fn test_is_rate_limit_class_error_non_rate_limit() {
+        for status in [400u16, 401, 404, 500, 503] {
+            let err = GatewayError::Provider {
+                provider: "p".to_string(),
+                message: format!("HTTP {} failure", status),
+                status_code: Some(status),
+            };
+            assert!(
+                !Router::is_rate_limit_class_error(&err),
+                "status {} must not be rate-limit-class",
+                status
+            );
+        }
+        // 5xx with rate-limit wording stays non-rate-limit-class (5xx are
+        // health failures, not pause signals).
+        let err = GatewayError::Provider {
+            provider: "p".to_string(),
+            message: "rate limit hit while overloaded".to_string(),
+            status_code: Some(503),
+        };
+        assert!(!Router::is_rate_limit_class_error(&err));
+    }
+
+    #[test]
+    fn test_is_rate_limit_class_error_non_provider_error() {
+        let err = GatewayError::TtfbTimeout(30);
+        assert!(!Router::is_rate_limit_class_error(&err));
+    }
+
+    fn truncation_test_response(
+        finish_reason: Option<&str>,
+        completion_tokens: u32,
+    ) -> OpenAIResponse {
+        OpenAIResponse {
+            id: "test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "test-model".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String("partial".to_string()),
+                    extra: serde_json::Map::new(),
+                },
+                finish_reason: finish_reason.map(|s| s.to_string()),
+                extra: serde_json::Map::new(),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens,
+                total_tokens: 10 + completion_tokens,
                 extra: serde_json::Map::new(),
             },
-            finish_reason: finish_reason.map(|s| s.to_string()),
             extra: serde_json::Map::new(),
-        }],
-        usage: Usage {
-            prompt_tokens: 10,
-            completion_tokens,
-            total_tokens: 10 + completion_tokens,
-            extra: serde_json::Map::new(),
-        },
-        extra: serde_json::Map::new(),
+        }
     }
-}
 
-#[test]
-fn test_is_suspicious_truncation_detected() {
-    let response = truncation_test_response(Some("length"), 100);
-    assert!(Router::is_suspicious_truncation(&response, Some(4096)));
-}
+    #[test]
+    fn test_is_suspicious_truncation_detected() {
+        let response = truncation_test_response(Some("length"), 100);
+        assert!(Router::is_suspicious_truncation(&response, Some(4096)));
+    }
 
-#[test]
-fn test_is_suspicious_truncation_near_limit_not_suspicious() {
-    // completion_tokens within 50 of max_tokens is a legitimate stop.
-    let response = truncation_test_response(Some("length"), 4060);
-    assert!(!Router::is_suspicious_truncation(&response, Some(4096)));
-}
+    #[test]
+    fn test_is_suspicious_truncation_near_limit_not_suspicious() {
+        // completion_tokens within 50 of max_tokens is a legitimate stop.
+        let response = truncation_test_response(Some("length"), 4060);
+        assert!(!Router::is_suspicious_truncation(&response, Some(4096)));
+    }
 
-#[test]
-fn test_is_suspicious_truncation_finish_reason_stop() {
-    let response = truncation_test_response(Some("stop"), 100);
-    assert!(!Router::is_suspicious_truncation(&response, Some(4096)));
-}
+    #[test]
+    fn test_is_suspicious_truncation_finish_reason_stop() {
+        let response = truncation_test_response(Some("stop"), 100);
+        assert!(!Router::is_suspicious_truncation(&response, Some(4096)));
+    }
 
-#[test]
-fn test_is_suspicious_truncation_no_max_tokens() {
-    let response = truncation_test_response(Some("length"), 100);
-    assert!(!Router::is_suspicious_truncation(&response, None));
-}
+    #[test]
+    fn test_is_suspicious_truncation_no_max_tokens() {
+        let response = truncation_test_response(Some("length"), 100);
+        assert!(!Router::is_suspicious_truncation(&response, None));
+    }
 
-#[test]
-fn test_is_suspicious_truncation_missing_usage_not_suspicious() {
-    // Providers that omit `usage` default to completion_tokens == 0; that
-    // must NOT be read as "stopped far short" (false failover + spurious
-    // circuit-breaker failure on a legitimate length-capped response).
-    let mut response = truncation_test_response(Some("length"), 0);
-    response.usage = Usage::default();
-    assert!(!Router::is_suspicious_truncation(&response, Some(4096)));
-}
-
+    #[test]
+    fn test_is_suspicious_truncation_missing_usage_not_suspicious() {
+        // Providers that omit `usage` default to completion_tokens == 0; that
+        // must NOT be read as "stopped far short" (false failover + spurious
+        // circuit-breaker failure on a legitimate length-capped response).
+        let mut response = truncation_test_response(Some("length"), 0);
+        response.usage = Usage::default();
+        assert!(!Router::is_suspicious_truncation(&response, Some(4096)));
+    }
 
     #[test]
     fn test_is_rate_limited_200_normal_response_not_flagged() {
@@ -9526,92 +9583,92 @@ fn test_is_suspicious_truncation_missing_usage_not_suspicious() {
         assert!(router.is_xml_tool_combo("glm-provider", "glm-5.2"));
     }
 
-#[test]
-fn test_looks_like_xml_tool_use_detects_common_markers() {
-    assert!(Router::looks_like_xml_tool_use(
-        "sure<tool_call>{\"name\":\"read_file\"}</tool_call>"
-    ));
-    assert!(Router::looks_like_xml_tool_use(
-        "<use_tool name=\"execute_command\">{}</use_tool>"
-    ));
-    assert!(Router::looks_like_xml_tool_use(
-        "<tool_calls><invoke name=\"x\"></invoke></tool_calls>"
-    ));
-    assert!(!Router::looks_like_xml_tool_use(
-        "Here is a normal answer with no tool use."
-    ));
-}
-
-#[test]
-fn test_tool_hint_injection_is_conditional() {
-    let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
-
-    // Capable unknown models never see the hint: zero prompt overhead and
-    // no guidance conflicting with parallel tool calling.
-    assert!(!router.should_inject_tool_hint("openai-main", "gpt-4o"));
-    assert!(!router.should_inject_tool_hint("lite", "claude-sonnet-4-5"));
-    assert!(!router.should_inject_tool_hint("local", "llama3.1-8b"));
-
-    // Built-in XML-prone families get it from first contact
-    // (case-insensitive substring match on the model name).
-    assert!(router.should_inject_tool_hint("x", "Kimi-K2-Instruct"));
-    assert!(router.should_inject_tool_hint("x", "qwen2.5-72b-instruct"));
-    assert!(router.should_inject_tool_hint("x", "glm-4.6"));
-    assert!(router.should_inject_tool_hint("x", "deepseek-v3"));
-
-    // Learned combos get it regardless of family.
-    router.mark_xml_tool_combo("weird-provider", "some-model");
-    assert!(router.should_inject_tool_hint("weird-provider", "some-model"));
-}
-
-#[test]
-fn test_tool_hint_recovers_after_consecutive_native_successes() {
-    let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
-
-    router.mark_xml_tool_combo("p", "m");
-    assert!(router.should_inject_tool_hint("p", "m"));
-
-    // Below the recovery threshold: still injecting.
-    router.record_native_tool_success("p", "m");
-    router.record_native_tool_success("p", "m");
-    assert!(router.should_inject_tool_hint("p", "m"));
-
-    // Third consecutive native success forgives the combo — hint AND
-    // buffer-and-translate both stand down.
-    router.record_native_tool_success("p", "m");
-    assert!(!router.should_inject_tool_hint("p", "m"));
-    assert!(!router.is_xml_tool_combo("p", "m"));
-
-    // Regression re-arms immediately and resets recovery progress:
-    // the re-mark below wipes the tally, so two later successes are
-    // not enough to forgive again.
-    router.mark_xml_tool_combo("p", "m");
-    assert!(router.should_inject_tool_hint("p", "m"));
-    router.record_native_tool_success("p", "m");
-    router.mark_xml_tool_combo("p", "m");
-    router.record_native_tool_success("p", "m");
-    router.record_native_tool_success("p", "m");
-    assert!(router.should_inject_tool_hint("p", "m"));
-}
-
-#[test]
-fn test_builtin_xml_prone_families_do_not_recover() {
-    let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
-
-    // Built-in family match keeps the hint enabled even after many native
-    // successes — only a code change to the marker list disables it.
-    for _ in 0..10 {
-        router.record_native_tool_success("x", "kimi-k2");
+    #[test]
+    fn test_looks_like_xml_tool_use_detects_common_markers() {
+        assert!(Router::looks_like_xml_tool_use(
+            "sure<tool_call>{\"name\":\"read_file\"}</tool_call>"
+        ));
+        assert!(Router::looks_like_xml_tool_use(
+            "<use_tool name=\"execute_command\">{}</use_tool>"
+        ));
+        assert!(Router::looks_like_xml_tool_use(
+            "<tool_calls><invoke name=\"x\"></invoke></tool_calls>"
+        ));
+        assert!(!Router::looks_like_xml_tool_use(
+            "Here is a normal answer with no tool use."
+        ));
     }
-    assert!(router.should_inject_tool_hint("x", "kimi-k2"));
-}
 
-#[test]
-fn test_model_family_is_xml_prone_is_case_insensitive_substring() {
-    assert!(Router::model_family_is_xml_prone("Qwen2.5-72B"));
-    assert!(Router::model_family_is_xml_prone("GLM-4.6"));
-    assert!(!Router::model_family_is_xml_prone("gpt-4o"));
-    assert!(!Router::model_family_is_xml_prone("claude-sonnet"));
-    assert!(!Router::model_family_is_xml_prone("llama3.1"));
-}
+    #[test]
+    fn test_tool_hint_injection_is_conditional() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+
+        // Capable unknown models never see the hint: zero prompt overhead and
+        // no guidance conflicting with parallel tool calling.
+        assert!(!router.should_inject_tool_hint("openai-main", "gpt-4o"));
+        assert!(!router.should_inject_tool_hint("lite", "claude-sonnet-4-5"));
+        assert!(!router.should_inject_tool_hint("local", "llama3.1-8b"));
+
+        // Built-in XML-prone families get it from first contact
+        // (case-insensitive substring match on the model name).
+        assert!(router.should_inject_tool_hint("x", "Kimi-K2-Instruct"));
+        assert!(router.should_inject_tool_hint("x", "qwen2.5-72b-instruct"));
+        assert!(router.should_inject_tool_hint("x", "glm-4.6"));
+        assert!(router.should_inject_tool_hint("x", "deepseek-v3"));
+
+        // Learned combos get it regardless of family.
+        router.mark_xml_tool_combo("weird-provider", "some-model");
+        assert!(router.should_inject_tool_hint("weird-provider", "some-model"));
+    }
+
+    #[test]
+    fn test_tool_hint_recovers_after_consecutive_native_successes() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+
+        router.mark_xml_tool_combo("p", "m");
+        assert!(router.should_inject_tool_hint("p", "m"));
+
+        // Below the recovery threshold: still injecting.
+        router.record_native_tool_success("p", "m");
+        router.record_native_tool_success("p", "m");
+        assert!(router.should_inject_tool_hint("p", "m"));
+
+        // Third consecutive native success forgives the combo — hint AND
+        // buffer-and-translate both stand down.
+        router.record_native_tool_success("p", "m");
+        assert!(!router.should_inject_tool_hint("p", "m"));
+        assert!(!router.is_xml_tool_combo("p", "m"));
+
+        // Regression re-arms immediately and resets recovery progress:
+        // the re-mark below wipes the tally, so two later successes are
+        // not enough to forgive again.
+        router.mark_xml_tool_combo("p", "m");
+        assert!(router.should_inject_tool_hint("p", "m"));
+        router.record_native_tool_success("p", "m");
+        router.mark_xml_tool_combo("p", "m");
+        router.record_native_tool_success("p", "m");
+        router.record_native_tool_success("p", "m");
+        assert!(router.should_inject_tool_hint("p", "m"));
+    }
+
+    #[test]
+    fn test_builtin_xml_prone_families_do_not_recover() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+
+        // Built-in family match keeps the hint enabled even after many native
+        // successes — only a code change to the marker list disables it.
+        for _ in 0..10 {
+            router.record_native_tool_success("x", "kimi-k2");
+        }
+        assert!(router.should_inject_tool_hint("x", "kimi-k2"));
+    }
+
+    #[test]
+    fn test_model_family_is_xml_prone_is_case_insensitive_substring() {
+        assert!(Router::model_family_is_xml_prone("Qwen2.5-72B"));
+        assert!(Router::model_family_is_xml_prone("GLM-4.6"));
+        assert!(!Router::model_family_is_xml_prone("gpt-4o"));
+        assert!(!Router::model_family_is_xml_prone("claude-sonnet"));
+        assert!(!Router::model_family_is_xml_prone("llama3.1"));
+    }
 }

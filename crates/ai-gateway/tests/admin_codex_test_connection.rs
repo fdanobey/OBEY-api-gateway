@@ -97,6 +97,7 @@ fn codex_test_config() -> Config {
         smart_routing: Default::default(),
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
+        codex_search: None,
         structured_output: None,
         memory: None,
     }

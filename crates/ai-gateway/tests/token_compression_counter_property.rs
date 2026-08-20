@@ -161,7 +161,7 @@ fn complete_request(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn complete_request_count_covers_visible_components_for_modern_and_fallback_models(

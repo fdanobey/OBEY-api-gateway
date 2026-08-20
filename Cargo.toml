@@ -46,3 +46,7 @@ lto = true
 strip = true
 codegen-units = 1
 panic = "abort"
+
+[profile.test]
+opt-level = 2
+incremental = true

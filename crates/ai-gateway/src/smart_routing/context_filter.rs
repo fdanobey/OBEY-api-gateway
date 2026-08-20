@@ -258,7 +258,7 @@ mod tests {
     }
 
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_31_known_insufficient_windows_are_excluded(

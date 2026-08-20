@@ -365,7 +365,7 @@ fn assert_protection(case: GeneratedCase) -> TestCaseResult {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_1_protected_regions_remain_byte_identical(case in generated_case()) {

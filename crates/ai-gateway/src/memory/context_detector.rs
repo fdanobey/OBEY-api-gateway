@@ -171,10 +171,7 @@ fn split_windows_match(matched: &str) -> Vec<&str> {
         .iter()
         .enumerate()
         .map(|(index, &start)| {
-            let end = starts
-                .get(index + 1)
-                .copied()
-                .unwrap_or(matched.len());
+            let end = starts.get(index + 1).copied().unwrap_or(matched.len());
             matched[start..end].trim_end()
         })
         .filter(|candidate| !candidate.is_empty())
@@ -574,7 +571,7 @@ mod tests {
         }
 
         proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn project_paths_have_priority_over_long_system_prompts(

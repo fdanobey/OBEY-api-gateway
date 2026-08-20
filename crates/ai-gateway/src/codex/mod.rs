@@ -15,6 +15,7 @@ pub mod instructions;
 pub mod jwt;
 pub mod model_map;
 pub mod models_discovery;
+pub mod search;
 pub mod sse;
 pub mod translate_request;
 pub mod translate_response;

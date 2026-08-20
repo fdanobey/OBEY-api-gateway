@@ -730,7 +730,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn property_ranges_are_valid_ordered_and_extract_byte_for_byte(

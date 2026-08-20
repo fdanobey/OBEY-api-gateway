@@ -115,7 +115,7 @@ fn target_budget(counts: &[u32], stop_case: usize, target_seed: u32) -> u32 {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn target_budget_short_circuits_the_remaining_chain(

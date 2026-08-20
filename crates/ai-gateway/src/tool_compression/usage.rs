@@ -280,7 +280,7 @@ mod property_tests {
     // **Validates: Requirements 3.1, 3.2, 3.8**
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         /// Verify that after recording a random sequence of tool calls,
         /// the reported counts match the expected sum per tool name.

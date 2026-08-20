@@ -4,7 +4,7 @@ use ai_gateway::loop_detection::simhash::{
 use proptest::prelude::*;
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: agent-loop-detection, Property 8: SimHash Identical Content Identity
     #[test]

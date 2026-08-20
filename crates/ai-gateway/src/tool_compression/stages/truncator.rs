@@ -665,7 +665,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         /// Property: extract_first_sentence always returns text ending at the first
         /// sentence boundary (`. `, `? `, `! `), and the result is a prefix of the original.

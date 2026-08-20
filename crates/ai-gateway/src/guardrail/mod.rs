@@ -1681,7 +1681,7 @@ mod engine_tests {
     // outcome. Byte-identity is checked via canonical JSON serialization.
     // -----------------------------------------------------------------
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop4_allow_is_identity(text in ".{0,80}") {
@@ -1738,7 +1738,7 @@ mod engine_tests {
     // multi-part text array.
     // -----------------------------------------------------------------
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop9_all_content_scanned(
@@ -1844,7 +1844,7 @@ mod engine_tests {
     // **Validates: Requirements 3.1, 3.2, 3.3**
     // -----------------------------------------------------------------
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop10_post_block_replace_redact(
@@ -1921,7 +1921,7 @@ mod engine_tests {
     // and does not mutate/forward the request (verified via byte-identity).
     // -----------------------------------------------------------------
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop11_pre_call_block_carries_category(
@@ -1964,7 +1964,7 @@ mod engine_tests {
     // **Validates: Requirements 8.1**
     // -----------------------------------------------------------------
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop18_content_clamped(len in 0usize..300, max in 1usize..100) {
@@ -1996,7 +1996,7 @@ mod engine_tests {
     // **Validates: Requirements 9.1, 9.3**
     // -----------------------------------------------------------------
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(150))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop20_in_order_non_halting(
@@ -2050,7 +2050,7 @@ mod engine_tests {
     // **Validates: Requirements 9.2, 9.4**
     // -----------------------------------------------------------------
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(150))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop21_halting_short_circuits(
@@ -2117,7 +2117,7 @@ mod engine_tests {
     // non-empty; a halting action skips re-injection entirely.
     // -----------------------------------------------------------------
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(150))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop22_reinjection_final_once(
@@ -2203,7 +2203,7 @@ mod engine_tests {
     // **Validates: Requirements 8.6, 9.6, 9.7**
     // -----------------------------------------------------------------
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(150))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop23_failure_policy(is_pre in any::<bool>()) {

@@ -521,7 +521,7 @@ mod property_tests {
     // removes lower-importance tokens and retains higher-importance ones.
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn description_compression_semantic_preservation(

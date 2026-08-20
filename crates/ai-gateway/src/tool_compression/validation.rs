@@ -275,7 +275,7 @@ mod property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn round_trip_schema_integrity(

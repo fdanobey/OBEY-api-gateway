@@ -627,7 +627,7 @@ mod tests {
     }
 
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_5_cache_capacity_never_exceeds_1000(

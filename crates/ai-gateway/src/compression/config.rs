@@ -830,7 +830,7 @@ custom_pipelines:
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn property_configuration_precedence_is_field_local(

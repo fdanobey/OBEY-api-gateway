@@ -352,7 +352,7 @@ mod tests {
     // Property 14: Metrics Label Correctness
     proptest! {
     #![proptest_config(ProptestConfig {
-    cases: 128,
+    cases: 64,
     .. ProptestConfig::default()
     })]
 

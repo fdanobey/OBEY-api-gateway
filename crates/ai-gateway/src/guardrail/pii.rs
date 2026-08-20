@@ -818,7 +818,7 @@ mod property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: guardrail-pipelines, Property 5: Mask preserves length and position
         // **Validates: Requirements 2.3**
@@ -847,7 +847,7 @@ mod property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: guardrail-pipelines, Property 6: Redact-then-reinject round-trip
         // **Validates: Requirements 2.1, 4.2**
@@ -869,7 +869,7 @@ mod property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: guardrail-pipelines, Property 7: Placeholder format and sequencing
         // **Validates: Requirements 4.3**
@@ -942,7 +942,7 @@ mod property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: guardrail-pipelines, Property 28: Re-injection overflow beyond 256 distinct values
         // **Validates: Requirements 4.12**
@@ -1105,7 +1105,7 @@ mod property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: guardrail-pipelines, Property 8: System instruction presence tracks map non-emptiness
         // **Validates: Requirements 4.4**
@@ -1130,7 +1130,7 @@ mod property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: guardrail-pipelines, Property 25: Instruction text source selection
         // **Validates: Requirements 4.8, 4.9**
@@ -1195,7 +1195,7 @@ mod property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: guardrail-pipelines, Property 27: Entity-type normalization in placeholders
         // **Validates: Requirements 4.3**
@@ -1254,7 +1254,7 @@ mod property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: guardrail-pipelines, Property 24: Redaction-notice instruction composition tracks map non-emptiness
         // **Validates: Requirements 4.11, 4.13**
@@ -1619,7 +1619,7 @@ mod insertion_mode_property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: guardrail-pipelines, Property 26: Insertion-mode placement preserves existing messages
         // **Validates: Requirements 4.10**

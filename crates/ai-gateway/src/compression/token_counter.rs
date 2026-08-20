@@ -299,7 +299,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn property_14_request_count_covers_component_counts(

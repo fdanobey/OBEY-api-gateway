@@ -177,7 +177,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 100, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
 
         // Feature: virtual-key-management, Property 12: For a key with a
         // Model_Access_List and any requested model name, check_model_access

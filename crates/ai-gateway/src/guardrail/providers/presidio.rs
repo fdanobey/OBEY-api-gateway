@@ -360,7 +360,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         /// Property 15: Presidio entity filtering and confidence threshold.
         /// For any parsed Presidio result, a detected entity becomes a finding

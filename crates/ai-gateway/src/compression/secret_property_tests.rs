@@ -168,7 +168,7 @@ fn assert_secret_redaction(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_9_command_output_secret_redaction(

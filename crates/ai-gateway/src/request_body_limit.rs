@@ -199,6 +199,7 @@ mod tests {
             smart_routing: Default::default(),
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
+            codex_search: None,
         }
     }
 
@@ -292,7 +293,11 @@ mod tests {
         let app = build_test_router(&server);
 
         let oversized = vec![b'x'; 1024 * 1024 + 1];
-        let resp = app.clone().oneshot(post_body(oversized.clone())).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(post_body(oversized.clone()))
+            .await
+            .unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::PAYLOAD_TOO_LARGE,

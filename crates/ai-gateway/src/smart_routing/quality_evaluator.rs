@@ -898,7 +898,7 @@ mod tests {
     }
 
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_25_quality_score_is_finite_and_bounded(

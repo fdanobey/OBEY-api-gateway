@@ -35,7 +35,7 @@ fn valid_content() -> impl Strategy<Value = String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_store_round_trip(

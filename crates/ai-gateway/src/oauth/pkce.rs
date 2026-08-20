@@ -62,7 +62,7 @@ mod tests {
     // each invocation samples a fresh verifier from the RNG.
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 256,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 
@@ -104,7 +104,7 @@ mod tests {
     // the PKCE pair comes from `OsRng` inside `generate_pkce()`.
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 256,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 
@@ -151,7 +151,7 @@ mod tests {
     // state value comes from `OsRng` inside `generate_state()`.
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 256,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 

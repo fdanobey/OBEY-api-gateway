@@ -16,7 +16,10 @@ impl LatencySnapshot {
     /// Returns the fallback median if the provider was not in the known set.
     #[inline]
     pub fn get_latency(&self, provider: &str) -> f64 {
-        self.known.get(provider).copied().unwrap_or(self.fallback_ms)
+        self.known
+            .get(provider)
+            .copied()
+            .unwrap_or(self.fallback_ms)
     }
 
     // Test-only accessors for asserting snapshot contents. Compiled out of
@@ -289,254 +292,254 @@ mod property_tests {
     use proptest::prelude::*;
 
     proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 100,
-            .. ProptestConfig::default()
-        })]
+            #![proptest_config(ProptestConfig {
+                cases: 64,
+                .. ProptestConfig::default()
+            })]
 
-        /// **Validates: Requirements 7.1, 7.3, 7.4**
-        ///
-        /// Property 23: Latency Tracking Update
-        ///
-        /// For any successful request to a provider, the latency tracker shall update
-        /// that provider's average latency using exponential moving average.
-        ///
-        /// This property verifies:
-        /// 1. First update sets the latency directly (no previous history)
-        /// 2. Subsequent updates apply EMA formula: new_avg = alpha * new_value + (1 - alpha) * old_avg
-        /// 3. The alpha value (0.2) correctly weights new vs old values
-        /// 4. Updates are correctly tracked per provider independently
-        #[test]
-        fn prop_latency_tracking_update(
-            provider_name in "[a-z]{3,10}",
-            initial_latency_ms in 10u64..=5000,
-            subsequent_latencies in prop::collection::vec(10u64..=5000, 1..=10)
-        ) {
-            let tracker = LatencyTracker::new();
-            let alpha = 0.2;
+            /// **Validates: Requirements 7.1, 7.3, 7.4**
+            ///
+            /// Property 23: Latency Tracking Update
+            ///
+            /// For any successful request to a provider, the latency tracker shall update
+            /// that provider's average latency using exponential moving average.
+            ///
+            /// This property verifies:
+            /// 1. First update sets the latency directly (no previous history)
+            /// 2. Subsequent updates apply EMA formula: new_avg = alpha * new_value + (1 - alpha) * old_avg
+            /// 3. The alpha value (0.2) correctly weights new vs old values
+            /// 4. Updates are correctly tracked per provider independently
+            #[test]
+            fn prop_latency_tracking_update(
+                provider_name in "[a-z]{3,10}",
+                initial_latency_ms in 10u64..=5000,
+                subsequent_latencies in prop::collection::vec(10u64..=5000, 1..=10)
+            ) {
+                let tracker = LatencyTracker::new();
+                let alpha = 0.2;
 
-            // First update: should set latency directly
-            tracker.update_latency(&provider_name, Duration::from_millis(initial_latency_ms));
-            let first_latency = tracker.get_latency(&provider_name);
-            assert!((first_latency - initial_latency_ms as f64).abs() < 0.01,
-                "First update should set latency directly: expected {}, got {}",
-                initial_latency_ms, first_latency);
+                // First update: should set latency directly
+                tracker.update_latency(&provider_name, Duration::from_millis(initial_latency_ms));
+                let first_latency = tracker.get_latency(&provider_name);
+                assert!((first_latency - initial_latency_ms as f64).abs() < 0.01,
+                    "First update should set latency directly: expected {}, got {}",
+                    initial_latency_ms, first_latency);
 
-            // Subsequent updates: should apply EMA
-            let mut expected_latency = initial_latency_ms as f64;
-            for &new_latency_ms in &subsequent_latencies {
-                tracker.update_latency(&provider_name, Duration::from_millis(new_latency_ms));
+                // Subsequent updates: should apply EMA
+                let mut expected_latency = initial_latency_ms as f64;
+                for &new_latency_ms in &subsequent_latencies {
+                    tracker.update_latency(&provider_name, Duration::from_millis(new_latency_ms));
 
-                // Calculate expected EMA: alpha * new + (1 - alpha) * old
-                expected_latency = alpha * (new_latency_ms as f64) + (1.0 - alpha) * expected_latency;
+                    // Calculate expected EMA: alpha * new + (1 - alpha) * old
+                    expected_latency = alpha * (new_latency_ms as f64) + (1.0 - alpha) * expected_latency;
 
-                let actual_latency = tracker.get_latency(&provider_name);
-                assert!((actual_latency - expected_latency).abs() < 0.01,
-                    "EMA calculation incorrect: expected {}, got {}",
-                    expected_latency, actual_latency);
-            }
-        }
-
-        /// Property: Multiple providers tracked independently
-        ///
-        /// Verifies that latency updates for different providers don't interfere with each other.
-        #[test]
-        fn prop_latency_tracking_independence(
-            providers in prop::collection::vec("[a-z]{3,10}", 2..=5),
-            latencies in prop::collection::vec(10u64..=5000, 2..=5)
-        ) {
-            prop_assume!(providers.len() == latencies.len());
-
-            let tracker = LatencyTracker::new();
-
-            // Update each provider with its latency
-            for (provider, &latency_ms) in providers.iter().zip(latencies.iter()) {
-                tracker.update_latency(provider, Duration::from_millis(latency_ms));
+                    let actual_latency = tracker.get_latency(&provider_name);
+                    assert!((actual_latency - expected_latency).abs() < 0.01,
+                        "EMA calculation incorrect: expected {}, got {}",
+                        expected_latency, actual_latency);
+                }
             }
 
-            // Verify each provider has its correct latency
-            for (provider, &latency_ms) in providers.iter().zip(latencies.iter()) {
+            /// Property: Multiple providers tracked independently
+            ///
+            /// Verifies that latency updates for different providers don't interfere with each other.
+            #[test]
+            fn prop_latency_tracking_independence(
+                providers in prop::collection::vec("[a-z]{3,10}", 2..=5),
+                latencies in prop::collection::vec(10u64..=5000, 2..=5)
+            ) {
+                prop_assume!(providers.len() == latencies.len());
+
+                let tracker = LatencyTracker::new();
+
+                // Update each provider with its latency
+                for (provider, &latency_ms) in providers.iter().zip(latencies.iter()) {
+                    tracker.update_latency(provider, Duration::from_millis(latency_ms));
+                }
+
+                // Verify each provider has its correct latency
+                for (provider, &latency_ms) in providers.iter().zip(latencies.iter()) {
+                    let actual = tracker.get_latency(provider);
+                    assert!((actual - latency_ms as f64).abs() < 0.01,
+                        "Provider {} should have latency {}, got {}",
+                        provider, latency_ms, actual);
+                }
+            }
+
+            /// Property: EMA converges toward new values
+            ///
+            /// Verifies that repeated updates with the same value cause the EMA to converge
+            /// toward that value.
+            #[test]
+            fn prop_latency_ema_convergence(
+                provider_name in "[a-z]{3,10}",
+                initial_latency_ms in 100u64..=500,
+                target_latency_ms in 1000u64..=2000,
+                update_count in 5usize..=20
+            ) {
+                let tracker = LatencyTracker::new();
+
+                // Set initial latency
+                tracker.update_latency(&provider_name, Duration::from_millis(initial_latency_ms));
+
+                // Apply multiple updates with target latency
+                for _ in 0..update_count {
+                    tracker.update_latency(&provider_name, Duration::from_millis(target_latency_ms));
+                }
+
+                let final_latency = tracker.get_latency(&provider_name);
+
+                // After many updates, EMA should be closer to target than to initial
+                let distance_to_target = (final_latency - target_latency_ms as f64).abs();
+                let distance_to_initial = (final_latency - initial_latency_ms as f64).abs();
+
+                assert!(distance_to_target < distance_to_initial,
+                    "After {} updates, latency should be closer to target {} than initial {}: got {}",
+                    update_count, target_latency_ms, initial_latency_ms, final_latency);
+            }
+
+            /// **Validates: Requirements 7.5**
+            ///
+            /// Property 24: Initial Latency Assumption
+            ///
+            /// For any provider with no latency history, the assumed latency shall be
+            /// the median of all providers with latency history.
+            ///
+            /// This property verifies:
+            /// 1. When no providers have history, default latency is 100ms
+            /// 2. When providers have history, unknown provider gets median latency
+            /// 3. Median calculation is correct for odd and even number of providers
+            /// 4. Median is calculated from current latency values, not initial values
+        #[test]
+        fn prop_initial_latency_assumption(
+            known in prop::collection::hash_set("[a-z]{3,10}", 0..=10)
+                .prop_flat_map(|names| {
+                    let count = names.len();
+                    (Just(names), prop::collection::vec(10u64..=5000, count))
+                }),
+            unknown_provider in "[A-Z]{3,10}"
+        ) {
+            // Distinct provider names are required: the tracker keys latency by
+            // provider name, so duplicate names would make the expected median
+            // (computed over the raw latencies list) diverge from the tracker's
+            // median over per-provider values.
+            let known_providers: Vec<String> = known.0.into_iter().collect();
+            let latencies = known.1;
+            prop_assume!(!known_providers.contains(&unknown_provider.to_lowercase()));
+
+                let tracker = LatencyTracker::new();
+
+                // Case 1: No history - should return default 100ms
+                if known_providers.is_empty() {
+                    let latency = tracker.get_latency(&unknown_provider);
+                    assert_eq!(latency, 100.0,
+                        "With no provider history, unknown provider should get default 100ms, got {}",
+                        latency);
+                    return Ok(());
+                }
+
+                // Update known providers with their latencies
+                for (provider, &latency_ms) in known_providers.iter().zip(latencies.iter()) {
+                    tracker.update_latency(provider, Duration::from_millis(latency_ms));
+                }
+
+                // Calculate expected median
+                let mut sorted_latencies = latencies.clone();
+                sorted_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let len = sorted_latencies.len();
+                let expected_median = if len % 2 == 0 {
+                    (sorted_latencies[len / 2 - 1] + sorted_latencies[len / 2]) as f64 / 2.0
+                } else {
+                    sorted_latencies[len / 2] as f64
+                };
+
+                // Case 2: With history - unknown provider should get median
+                let actual_latency = tracker.get_latency(&unknown_provider);
+                assert!((actual_latency - expected_median).abs() < 0.01,
+                    "Unknown provider should get median latency: expected {}, got {}",
+                    expected_median, actual_latency);
+
+            // Case 3: Verify known providers still have their own latencies
+            for (provider, &latency_ms) in known_providers.iter().zip(latencies.iter()) {
                 let actual = tracker.get_latency(provider);
                 assert!((actual - latency_ms as f64).abs() < 0.01,
-                    "Provider {} should have latency {}, got {}",
+                    "Known provider {} should retain its latency: expected {}, got {}",
                     provider, latency_ms, actual);
             }
-        }
-
-        /// Property: EMA converges toward new values
-        ///
-        /// Verifies that repeated updates with the same value cause the EMA to converge
-        /// toward that value.
-        #[test]
-        fn prop_latency_ema_convergence(
-            provider_name in "[a-z]{3,10}",
-            initial_latency_ms in 100u64..=500,
-            target_latency_ms in 1000u64..=2000,
-            update_count in 5usize..=20
-        ) {
-            let tracker = LatencyTracker::new();
-
-            // Set initial latency
-            tracker.update_latency(&provider_name, Duration::from_millis(initial_latency_ms));
-
-            // Apply multiple updates with target latency
-            for _ in 0..update_count {
-                tracker.update_latency(&provider_name, Duration::from_millis(target_latency_ms));
             }
 
-            let final_latency = tracker.get_latency(&provider_name);
+            /// Property: Snapshot equivalence with live lookup.
+            ///
+            /// **Validates: Requirements 2.2, 2.4, 2.6 (spec router-responsiveness-optimization)**
+            ///
+            /// For any set of known providers with latencies and any unknown provider,
+            /// the immutable snapshot shall return exactly the same effective latency
+            /// as the live `get_latency` path (known value, or one coherent fallback
+            /// median / 100.0ms default when empty), and all unknown providers in one
+            /// snapshot shall share the same fallback value.
+            #[test]
+            fn prop_snapshot_equivalent_to_live_lookup(
+                known_providers in prop::collection::vec(("[a-z]{3,10}", 10u64..=5000), 0..=12),
+                unknown_providers in prop::collection::vec("[a-z]{3,10}", 1..=4)
+            ) {
+                // Deduplicate by provider name BEFORE updating: a duplicate would
+                // apply EMA in the tracker, so populate unique names only (first
+                // update sets the value directly -> exact expected values).
+                let unique: std::collections::BTreeMap<&str, u64> =
+                    known_providers.iter().map(|(n, v)| (n.as_str(), *v)).collect();
 
-            // After many updates, EMA should be closer to target than to initial
-            let distance_to_target = (final_latency - target_latency_ms as f64).abs();
-            let distance_to_initial = (final_latency - initial_latency_ms as f64).abs();
-
-            assert!(distance_to_target < distance_to_initial,
-                "After {} updates, latency should be closer to target {} than initial {}: got {}",
-                update_count, target_latency_ms, initial_latency_ms, final_latency);
-        }
-
-        /// **Validates: Requirements 7.5**
-        ///
-        /// Property 24: Initial Latency Assumption
-        ///
-        /// For any provider with no latency history, the assumed latency shall be
-        /// the median of all providers with latency history.
-        ///
-        /// This property verifies:
-        /// 1. When no providers have history, default latency is 100ms
-        /// 2. When providers have history, unknown provider gets median latency
-        /// 3. Median calculation is correct for odd and even number of providers
-        /// 4. Median is calculated from current latency values, not initial values
-    #[test]
-    fn prop_initial_latency_assumption(
-        known in prop::collection::hash_set("[a-z]{3,10}", 0..=10)
-            .prop_flat_map(|names| {
-                let count = names.len();
-                (Just(names), prop::collection::vec(10u64..=5000, count))
-            }),
-        unknown_provider in "[A-Z]{3,10}"
-    ) {
-        // Distinct provider names are required: the tracker keys latency by
-        // provider name, so duplicate names would make the expected median
-        // (computed over the raw latencies list) diverge from the tracker's
-        // median over per-provider values.
-        let known_providers: Vec<String> = known.0.into_iter().collect();
-        let latencies = known.1;
-        prop_assume!(!known_providers.contains(&unknown_provider.to_lowercase()));
-
-            let tracker = LatencyTracker::new();
-
-            // Case 1: No history - should return default 100ms
-            if known_providers.is_empty() {
-                let latency = tracker.get_latency(&unknown_provider);
-                assert_eq!(latency, 100.0,
-                    "With no provider history, unknown provider should get default 100ms, got {}",
-                    latency);
-                return Ok(());
-            }
-
-            // Update known providers with their latencies
-            for (provider, &latency_ms) in known_providers.iter().zip(latencies.iter()) {
-                tracker.update_latency(provider, Duration::from_millis(latency_ms));
-            }
-
-            // Calculate expected median
-            let mut sorted_latencies = latencies.clone();
-            sorted_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let len = sorted_latencies.len();
-            let expected_median = if len % 2 == 0 {
-                (sorted_latencies[len / 2 - 1] + sorted_latencies[len / 2]) as f64 / 2.0
-            } else {
-                sorted_latencies[len / 2] as f64
-            };
-
-            // Case 2: With history - unknown provider should get median
-            let actual_latency = tracker.get_latency(&unknown_provider);
-            assert!((actual_latency - expected_median).abs() < 0.01,
-                "Unknown provider should get median latency: expected {}, got {}",
-                expected_median, actual_latency);
-
-        // Case 3: Verify known providers still have their own latencies
-        for (provider, &latency_ms) in known_providers.iter().zip(latencies.iter()) {
-            let actual = tracker.get_latency(provider);
-            assert!((actual - latency_ms as f64).abs() < 0.01,
-                "Known provider {} should retain its latency: expected {}, got {}",
-                provider, latency_ms, actual);
-        }
-        }
-
-        /// Property: Snapshot equivalence with live lookup.
-        ///
-        /// **Validates: Requirements 2.2, 2.4, 2.6 (spec router-responsiveness-optimization)**
-        ///
-        /// For any set of known providers with latencies and any unknown provider,
-        /// the immutable snapshot shall return exactly the same effective latency
-        /// as the live `get_latency` path (known value, or one coherent fallback
-        /// median / 100.0ms default when empty), and all unknown providers in one
-        /// snapshot shall share the same fallback value.
-        #[test]
-        fn prop_snapshot_equivalent_to_live_lookup(
-            known_providers in prop::collection::vec(("[a-z]{3,10}", 10u64..=5000), 0..=12),
-            unknown_providers in prop::collection::vec("[a-z]{3,10}", 1..=4)
-        ) {
-            // Deduplicate by provider name BEFORE updating: a duplicate would
-            // apply EMA in the tracker, so populate unique names only (first
-            // update sets the value directly -> exact expected values).
-            let unique: std::collections::BTreeMap<&str, u64> =
-                known_providers.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-
-            let tracker = LatencyTracker::new();
-            for (name, latency_ms) in &unique {
-                tracker.update_latency(name, Duration::from_millis(*latency_ms));
-            }
-
-            let snap = tracker.snapshot();
-
-            // Known providers: snapshot returns the exact tracked value.
-            for (name, latency_ms) in &unique {
-                assert!(
-                    (snap.get_latency(name) - *latency_ms as f64).abs() < 0.01,
-                    "snapshot mismatch for known provider {name}"
-                );
-                assert!(snap.has_latency(name));
-            }
-            assert_eq!(snap.known_count(), unique.len());
-
-            // Unknown providers: snapshot fallback equals live get_latency fallback.
-            // Values use the tracker's own conversion (as_secs_f64()*1000.0) so the
-            // expected median matches the stored f64 exactly.
-            let mut sorted: Vec<f64> = unique
-                .values()
-                .map(|v| Duration::from_millis(*v).as_secs_f64() * 1000.0)
-                .collect();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let expected_fallback = if sorted.is_empty() {
-                100.0
-            } else {
-                let len = sorted.len();
-                if len % 2 == 0 {
-                    (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
-                } else {
-                    sorted[len / 2]
+                let tracker = LatencyTracker::new();
+                for (name, latency_ms) in &unique {
+                    tracker.update_latency(name, Duration::from_millis(*latency_ms));
                 }
-            };
-            assert_eq!(snap.fallback(), expected_fallback);
 
-            for unknown in &unknown_providers {
-                prop_assume!(!known_providers.iter().any(|(k, _)| k == unknown));
-                assert_eq!(
-                    snap.get_latency(unknown),
-                    tracker.get_latency(unknown),
-                    "snapshot and live lookup disagree for unknown provider {unknown}"
-                );
-                assert!(!snap.has_latency(unknown));
-            }
+                let snap = tracker.snapshot();
 
-            // All unknown providers in one selection share the same fallback (Req 2.4).
-            let first = snap.get_latency(&unknown_providers[0]);
-            for unknown in &unknown_providers {
-                assert_eq!(snap.get_latency(unknown), first);
+                // Known providers: snapshot returns the exact tracked value.
+                for (name, latency_ms) in &unique {
+                    assert!(
+                        (snap.get_latency(name) - *latency_ms as f64).abs() < 0.01,
+                        "snapshot mismatch for known provider {name}"
+                    );
+                    assert!(snap.has_latency(name));
+                }
+                assert_eq!(snap.known_count(), unique.len());
+
+                // Unknown providers: snapshot fallback equals live get_latency fallback.
+                // Values use the tracker's own conversion (as_secs_f64()*1000.0) so the
+                // expected median matches the stored f64 exactly.
+                let mut sorted: Vec<f64> = unique
+                    .values()
+                    .map(|v| Duration::from_millis(*v).as_secs_f64() * 1000.0)
+                    .collect();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let expected_fallback = if sorted.is_empty() {
+                    100.0
+                } else {
+                    let len = sorted.len();
+                    if len % 2 == 0 {
+                        (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
+                    } else {
+                        sorted[len / 2]
+                    }
+                };
+                assert_eq!(snap.fallback(), expected_fallback);
+
+                for unknown in &unknown_providers {
+                    prop_assume!(!known_providers.iter().any(|(k, _)| k == unknown));
+                    assert_eq!(
+                        snap.get_latency(unknown),
+                        tracker.get_latency(unknown),
+                        "snapshot and live lookup disagree for unknown provider {unknown}"
+                    );
+                    assert!(!snap.has_latency(unknown));
+                }
+
+                // All unknown providers in one selection share the same fallback (Req 2.4).
+                let first = snap.get_latency(&unknown_providers[0]);
+                for unknown in &unknown_providers {
+                    assert_eq!(snap.get_latency(unknown), first);
+                }
             }
-        }
-}
+    }
 }

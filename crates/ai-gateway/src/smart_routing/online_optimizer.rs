@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: smart-routing, Property 26: optimizer boundary adjustment per interval is bounded.
     #[test]

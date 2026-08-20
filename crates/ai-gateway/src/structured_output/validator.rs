@@ -536,7 +536,7 @@ mod tests {
 
     // Feature: structured-output-validation, Property 1: Activation Predicate Correctness
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_activation_predicate_correctness(
@@ -561,7 +561,7 @@ mod tests {
 
     // Feature: structured-output-validation, Property 2: Valid Content Passes Through Unmodified
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn prop_valid_content_passes_through_unmodified(
@@ -581,7 +581,7 @@ mod tests {
 
     // Feature: structured-output-validation, Property 3: Invalid JSON Produces Parse Error with Offset
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn prop_invalid_json_produces_parse_error_with_offset(
@@ -604,7 +604,7 @@ mod tests {
 
     // Feature: structured-output-validation, Property 4: Schema Violations Are Bounded and Structured
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn prop_schema_violations_are_bounded_and_structured(

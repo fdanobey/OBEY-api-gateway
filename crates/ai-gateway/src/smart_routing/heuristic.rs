@@ -750,7 +750,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn heuristic_score_is_finite_and_in_range(

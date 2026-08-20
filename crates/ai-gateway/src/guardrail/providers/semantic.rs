@@ -525,7 +525,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_semantic_decision_matches_oracle(

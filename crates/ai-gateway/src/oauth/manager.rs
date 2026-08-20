@@ -310,14 +310,14 @@ impl OAuthManager {
                         expires_at,
                         scopes: scopes.clone(),
                     };
-                if let Err(e) = store.save(&tokens) {
-                    tracing::error!(error = %e, "Failed to persist OAuth tokens");
-                    return;
-                }
-                *token_cache.write().await = Some(tokens);
-                let mut state = session_state.write().await;
-                *state = OAuthSessionState::Authenticated { expires_at, scopes };
-                tracing::info!("OAuth login completed successfully");
+                    if let Err(e) = store.save(&tokens) {
+                        tracing::error!(error = %e, "Failed to persist OAuth tokens");
+                        return;
+                    }
+                    *token_cache.write().await = Some(tokens);
+                    let mut state = session_state.write().await;
+                    *state = OAuthSessionState::Authenticated { expires_at, scopes };
+                    tracing::info!("OAuth login completed successfully");
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "OAuth token exchange failed");

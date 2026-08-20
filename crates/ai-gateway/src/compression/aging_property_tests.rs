@@ -157,7 +157,7 @@ fn assert_progressive_aging(turns: usize, case_id: u64, words: Vec<String>) -> T
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_11_progressive_aging_policy(

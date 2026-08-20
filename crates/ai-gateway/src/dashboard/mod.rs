@@ -1048,6 +1048,7 @@ mod tests {
             memory: None,
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
+            codex_search: None,
         }
     }
 

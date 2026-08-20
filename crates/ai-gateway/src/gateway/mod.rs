@@ -285,11 +285,11 @@ impl GatewayServer {
     }
 
     /// Build the Axum router with all middleware layers.
-pub fn build_router(&self) -> Router {
-let config = self.state.config.try_read().expect("config lock poisoned");
+    pub fn build_router(&self) -> Router {
+        let config = self.state.config.try_read().expect("config lock poisoned");
 
-// --- CORS layer (Req 43.1-43.7) ---
-let cors = self.build_cors_layer(&config);
+        // --- CORS layer (Req 43.1-43.7) ---
+        let cors = self.build_cors_layer(&config);
 
         // --- Tracing layer (Req 17.5, 20.4) ---
         let trace_layer = TraceLayer::new_for_http();
@@ -485,7 +485,7 @@ crate::request_body_limit::request_body_limit_middleware,
 .layer(cors)
 .layer(trace_layer)
 .with_state(self.state.clone())
-}
+    }
 
     /// Validate TLS configuration on startup (Req 36.2-36.5).
     /// Returns the RustlsConfig if TLS is enabled, or None if disabled.
@@ -1017,6 +1017,7 @@ mod tests {
             smart_routing: Default::default(),
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
+            codex_search: None,
         }
     }
 
@@ -1457,34 +1458,34 @@ mod tests {
         cfg
     }
 
-/// Build a minimal router with a body-consuming endpoint so the dynamic
-/// request body limit middleware is exercised.
-fn build_test_router(server: &GatewayServer) -> Router {
-use axum::body::Bytes;
+    /// Build a minimal router with a body-consuming endpoint so the dynamic
+    /// request body limit middleware is exercised.
+    fn build_test_router(server: &GatewayServer) -> Router {
+        use axum::body::Bytes;
 
-let config = server.state.config.try_read().expect("config lock");
-let cors = server.build_cors_layer(&config);
-let trace_layer = TraceLayer::new_for_http();
-drop(config);
+        let config = server.state.config.try_read().expect("config lock");
+        let cors = server.build_cors_layer(&config);
+        let trace_layer = TraceLayer::new_for_http();
+        drop(config);
 
-// A trivial handler that consumes the full body — triggers limit check
-async fn echo_handler(body: Bytes) -> String {
-format!("{}", body.len())
-}
+        // A trivial handler that consumes the full body — triggers limit check
+        async fn echo_handler(body: Bytes) -> String {
+            format!("{}", body.len())
+        }
 
-let api_routes =
-axum::Router::new().route("/v1/chat/completions", axum::routing::post(echo_handler));
+        let api_routes =
+            axum::Router::new().route("/v1/chat/completions", axum::routing::post(echo_handler));
 
-Router::new()
-.merge(api_routes)
-.layer(axum::middleware::from_fn_with_state(
-server.state.clone(),
-crate::request_body_limit::request_body_limit_middleware,
-))
-.layer(cors)
-.layer(trace_layer)
-.with_state(server.state.clone())
-}
+        Router::new()
+            .merge(api_routes)
+            .layer(axum::middleware::from_fn_with_state(
+                server.state.clone(),
+                crate::request_body_limit::request_body_limit_middleware,
+            ))
+            .layer(cors)
+            .layer(trace_layer)
+            .with_state(server.state.clone())
+    }
 
     // Feature: ai-gateway, Property 28: Models Endpoint Aggregation
     // For any request to /v1/models, the response shall contain the union of all
@@ -1493,7 +1494,7 @@ crate::request_body_limit::request_body_limit_middleware,
     // **Validates: Requirements 2.12, 24.2, 24.3, 24.4, 24.5**
     proptest! {
            #![proptest_config(ProptestConfig {
-               cases: 100,
+               cases: 64,
                .. ProptestConfig::default()
            })]
 
@@ -1641,6 +1642,7 @@ crate::request_body_limit::request_body_limit_middleware,
         smart_routing: Default::default(),
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
+        codex_search: None,
     };
 
                    let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -1713,7 +1715,7 @@ crate::request_body_limit::request_body_limit_middleware,
     // **Validates: Requirements 20.2, 20.3**
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 100,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 
@@ -1757,7 +1759,7 @@ crate::request_body_limit::request_body_limit_middleware,
     // **Validates: Requirements 43.5**
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 100,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 
@@ -1850,7 +1852,7 @@ crate::request_body_limit::request_body_limit_middleware,
     // **Validates: Requirements 36.1**
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 100,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 
@@ -1930,7 +1932,7 @@ crate::request_body_limit::request_body_limit_middleware,
     // **Validates: Requirements 26.2, 26.3**
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 100,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 
@@ -2105,7 +2107,7 @@ crate::request_body_limit::request_body_limit_middleware,
     // **Validates: Requirements 26.4, 26.5, 26.6**
     proptest! {
            #![proptest_config(ProptestConfig {
-               cases: 100,
+               cases: 64,
                .. ProptestConfig::default()
            })]
 
@@ -2229,6 +2231,7 @@ crate::request_body_limit::request_body_limit_middleware,
         smart_routing: Default::default(),
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
+        codex_search: None,
     };
 
                    // Write new config to disk

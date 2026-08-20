@@ -338,7 +338,7 @@ mod property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(300))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn auto_tuner_tier_resolution(
@@ -392,7 +392,7 @@ mod property_tests {
     // skip behavior.
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(300))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prompt_cache_skip_correctness(

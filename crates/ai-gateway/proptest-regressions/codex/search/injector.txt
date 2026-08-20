@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 52c7d50b8fd5994e88b826142d8e99bd6e27e5506321d4a1220bd1f82c7a7bce # shrinks to existing = [Object {"function": Object {"name": String("codex_search"), "parameters": Object {"type": String("object")}}, "type": String("function")}, Object {"function": Object {"name": String("codex_search"), "parameters": Object {"type": String("object")}}, "type": String("function")}]

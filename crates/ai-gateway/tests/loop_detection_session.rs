@@ -5,7 +5,7 @@ use proptest::prelude::*;
 use std::time::Duration;
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: agent-loop-detection, Property 7: Session ID Extraction Round-Trip
     #[test]

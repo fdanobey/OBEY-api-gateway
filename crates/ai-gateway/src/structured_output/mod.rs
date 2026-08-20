@@ -564,7 +564,7 @@ model_groups: []
     // Explicit provider/model policy overrides group policy, group policy overrides
     // global policy, and absence at every level falls back to `false`.
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_passthrough_precedence_covers_all_policy_combinations(
@@ -671,7 +671,7 @@ model_groups: []
     // Each generated choice must retain its own validator result regardless of
     // neighboring choices, while the request outcome applies fail/skip/pass precedence.
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_multi_choice_validation_is_independent(

@@ -274,33 +274,33 @@ pub fn resolve_synthetic_in_response(
         }
     }
 
-// Re-inject disclosed full tool schemas into the tools array so they are callable.
-// Reinjection is idempotent by function name: the internal resolution loop can revisit
-// a namespace, and providers reject duplicate names even when the schemas are identical.
-if !injected.is_empty() {
-if let Some(tools) = req_json.get_mut("tools").and_then(|t| t.as_array_mut()) {
-let mut existing_names: HashSet<String> = tools
-.iter()
-.filter_map(tool_function_name)
-.map(str::to_string)
-.collect();
-for tool in injected {
-let should_insert = tool_function_name(&tool)
-.map(|name| existing_names.insert(name.to_string()))
-.unwrap_or(true);
-if should_insert {
-tools.push(tool);
-}
-}
-}
-}
+    // Re-inject disclosed full tool schemas into the tools array so they are callable.
+    // Reinjection is idempotent by function name: the internal resolution loop can revisit
+    // a namespace, and providers reject duplicate names even when the schemas are identical.
+    if !injected.is_empty() {
+        if let Some(tools) = req_json.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            let mut existing_names: HashSet<String> = tools
+                .iter()
+                .filter_map(tool_function_name)
+                .map(str::to_string)
+                .collect();
+            for tool in injected {
+                let should_insert = tool_function_name(&tool)
+                    .map(|name| existing_names.insert(name.to_string()))
+                    .unwrap_or(true);
+                if should_insert {
+                    tools.push(tool);
+                }
+            }
+        }
+    }
 
-Some(disclosed)
+    Some(disclosed)
 }
 
 /// Return the provider-visible function name from an OpenAI-compatible tool definition.
 fn tool_function_name(tool: &Value) -> Option<&str> {
-tool.pointer("/function/name").and_then(Value::as_str)
+    tool.pointer("/function/name").and_then(Value::as_str)
 }
 
 #[cfg(test)]
@@ -387,8 +387,8 @@ mod tests {
             "tools": [{"type":"function","function":{"name":"get_tools_in_namespace"}}],
             "messages": [{"role":"user","content":"list files"}]
         });
-        let disclosed =
-            resolve_synthetic_in_response(&resp, &mut req, &tools, 0, &HashSet::new()).expect("handled");
+        let disclosed = resolve_synthetic_in_response(&resp, &mut req, &tools, 0, &HashSet::new())
+            .expect("handled");
         assert_eq!(disclosed.len(), 2);
 
         let msgs = req["messages"].as_array().unwrap();
@@ -425,8 +425,8 @@ mod tests {
             "tools": [{"type":"function","function":{"name":"get_tools_in_namespace"}}],
             "messages": [{"role":"user","content":"list files"}]
         });
-        let disclosed =
-            resolve_synthetic_in_response(&resp, &mut req, &tools, 3, &HashSet::new()).expect("handled");
+        let disclosed = resolve_synthetic_in_response(&resp, &mut req, &tools, 3, &HashSet::new())
+            .expect("handled");
         assert_eq!(disclosed.len(), 3, "only capped number should be disclosed");
 
         let tools_arr = req["tools"].as_array().unwrap();
@@ -466,7 +466,9 @@ mod tests {
             }]
         });
         let mut req = json!({"tools":[], "messages":[]});
-        assert!(resolve_synthetic_in_response(&resp, &mut req, &tools, 0, &HashSet::new()).is_none());
+        assert!(
+            resolve_synthetic_in_response(&resp, &mut req, &tools, 0, &HashSet::new()).is_none()
+        );
     }
 
     #[test]

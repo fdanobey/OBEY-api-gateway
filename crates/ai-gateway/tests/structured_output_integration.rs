@@ -216,6 +216,7 @@ fn base_config(provider_uri: &str) -> Config {
         smart_routing: Default::default(),
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
+        codex_search: None,
     }
 }
 

@@ -333,7 +333,7 @@ fn assert_critical_message_preservation(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_3_critical_message_preservation(

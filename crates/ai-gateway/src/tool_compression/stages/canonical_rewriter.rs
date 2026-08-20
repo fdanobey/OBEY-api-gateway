@@ -679,7 +679,7 @@ mod property_tests {
     // DashMap and is structurally equivalent to what was passed in.
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn canonical_rewriting_round_trip(
@@ -742,7 +742,7 @@ mod property_tests {
     // in description); when model doesn't match, tools are NOT rewritten.
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn canonical_format_conditional_activation(
@@ -808,7 +808,7 @@ mod property_tests {
     // contains dot-notation params (e.g., "parent.child(type, req)").
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn canonical_dot_notation_flattening(

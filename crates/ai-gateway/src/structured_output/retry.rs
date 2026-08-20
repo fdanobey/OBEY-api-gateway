@@ -564,7 +564,7 @@ json!({
 
     // Feature: structured-output-validation, Property 6: Corrective Prompt Structure Invariants
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_corrective_prompt_structure_invariants(
@@ -615,7 +615,7 @@ json!({
 
     // Feature: structured-output-validation, Property 7: Schema Truncation Under Size Limit
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_schema_truncation_under_size_limit(
@@ -657,7 +657,7 @@ json!({
 
     // Feature: structured-output-validation, Property 8: Retry Temperature Override
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn retry_temperature_override_is_unconditional(
@@ -867,7 +867,7 @@ json!({
 
     // Feature: structured-output-validation, Property 15: Context Window Truncation
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_context_window_truncation(

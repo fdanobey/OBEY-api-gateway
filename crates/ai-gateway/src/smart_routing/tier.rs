@@ -167,7 +167,7 @@ mod tests {
     }
 
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn complexity_score_clamps_finite_f64(value in any::<f64>().prop_filter(

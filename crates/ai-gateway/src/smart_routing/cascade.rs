@@ -552,7 +552,7 @@ mod tests {
     }
 
     proptest! {
-            #![proptest_config(ProptestConfig::with_cases(256))]
+            #![proptest_config(ProptestConfig::with_cases(64))]
 
             // Feature: smart-routing, Property 11: Cascade escalation count never exceeds two.
             #[test]

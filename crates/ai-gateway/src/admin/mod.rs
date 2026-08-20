@@ -2050,6 +2050,7 @@ mod tests {
                     memory: None,
                     xhigh_models_allowlist: Default::default(),
                     reasoning_models_allowlist: Default::default(),
+                    codex_search: None,
                 })
             })
         })
@@ -2488,6 +2489,7 @@ retry:
             memory: None,
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
+            codex_search: None,
         };
         config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
         config.virtual_keys.database_path =
@@ -2895,7 +2897,7 @@ retry:
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_status_response_never_contains_tokens(

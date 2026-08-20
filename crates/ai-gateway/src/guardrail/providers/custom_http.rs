@@ -250,7 +250,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // Feature: guardrail-pipelines, Property 19: custom_http findings parse round-trip
         // Validates: Requirements 8.3

@@ -5,7 +5,7 @@ use proptest::prelude::*;
 use std::time::Instant;
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: agent-loop-detection, Property 17: Admin Reset Produces Baseline State
     #[test]

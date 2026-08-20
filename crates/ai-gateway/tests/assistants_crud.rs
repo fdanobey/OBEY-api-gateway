@@ -686,7 +686,7 @@ async fn run_cancellation_aborts_inflight_execution() {
     });
 
     // Wait for the run to register, then cancel it mid-flight.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let (status, runs) = request(
         router.clone(),
         "GET",

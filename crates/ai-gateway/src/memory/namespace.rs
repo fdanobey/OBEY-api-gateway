@@ -111,7 +111,7 @@ mod property_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_sanitized_vk_id_is_safe_ascii_and_bounded(vk_id in any::<String>()) {

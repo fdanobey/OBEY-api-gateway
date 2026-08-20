@@ -44,7 +44,9 @@ pub struct ResponsivenessSampleSet {
 
 impl ResponsivenessSampleSet {
     pub fn new() -> Self {
-        Self { samples: Vec::new() }
+        Self {
+            samples: Vec::new(),
+        }
     }
 
     pub fn record(&mut self, duration: Duration) {
@@ -259,6 +261,7 @@ fn build_router_from_fixture(fixture: &ProviderSelectionFixture) -> Router {
         smart_routing: Default::default(),
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
+        codex_search: None,
         structured_output: None,
     };
     common::isolate_databases(&mut config);
@@ -307,8 +310,12 @@ async fn provider_selection_responsiveness_baseline() {
                 candidate_count, history_coverage, report
             );
 
-            assert!(report.median < Duration::from_millis(10),
-                "provider selection median too high for {} candidates: {:?}", candidate_count, report.median);
+            assert!(
+                report.median < Duration::from_millis(10),
+                "provider selection median too high for {} candidates: {:?}",
+                candidate_count,
+                report.median
+            );
         }
     }
 }
@@ -530,11 +537,8 @@ async fn provider_order_matches_reference_policy_fixed_scenarios() {
         };
 
         let actual = router.select_provider_order(&model_group).await;
-        let expected = reference_provider_order(
-            &scenario.models,
-            &tracker,
-            scenario.version_fallback,
-        );
+        let expected =
+            reference_provider_order(&scenario.models, &tracker, scenario.version_fallback);
 
         assert_eq!(
             names(&actual),
@@ -587,10 +591,9 @@ async fn provider_order_matches_reference_policy_generated_scenarios() {
         // Mix of coverage: known, unknown, and repeated providers.
         for (i, m) in models.iter().enumerate() {
             match i % 3 {
-                0 | 1 => tracker.update_latency(
-                    &m.provider,
-                    Duration::from_millis(10 + next() % 1000),
-                ),
+                0 | 1 => {
+                    tracker.update_latency(&m.provider, Duration::from_millis(10 + next() % 1000))
+                }
                 _ => {}
             }
         }
@@ -606,8 +609,7 @@ async fn provider_order_matches_reference_policy_generated_scenarios() {
         };
 
         let actual = router.select_provider_order(&model_group).await;
-        let expected =
-            reference_provider_order(&models, &tracker, version_fallback);
+        let expected = reference_provider_order(&models, &tracker, version_fallback);
 
         assert_eq!(
             names(&actual),
@@ -701,6 +703,7 @@ fn test_config() -> Config {
         smart_routing: Default::default(),
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
+        codex_search: None,
         structured_output: None,
     }
 }
@@ -1266,7 +1269,11 @@ async fn compression_preparation_failover_profile() {
     let lite_report = pipeline_lite.report();
     let engine_wall_sum: u64 = engine_wall_ms_total.iter().sum();
 
-    eprintln!("compression_preparation[{} attempts x {} iters]:", attempts.len(), iterations);
+    eprintln!(
+        "compression_preparation[{} attempts x {} iters]:",
+        attempts.len(),
+        iterations
+    );
     eprintln!("  token_count_only : {}", count_report);
     eprintln!("  pipeline_disabled: {}", disabled_report);
     eprintln!("  pipeline_lite    : {}", lite_report);
@@ -1279,16 +1286,15 @@ async fn compression_preparation_failover_profile() {
     // Failover duplication factor: work repeated when all attempts in the
     // matrix fail over, versus a hypothetical single shared preparation.
     let failover_attempts = attempts.len() as u64;
-    let repeat_ms =
-        failover_attempts * (lite_report.median.as_micros() as u64) / 1_000;
+    let repeat_ms = failover_attempts * (lite_report.median.as_micros() as u64) / 1_000;
     eprintln!(
         "  failover_repetition: ~{}ms median re-spent per full {}-attempt failover chain",
         repeat_ms, failover_attempts
     );
 
     // Evidence decision: count-only floor vs full Lite pipeline.
-    let floor_ratio = lite_report.median.as_secs_f64()
-        / count_report.median.as_secs_f64().max(f64::EPSILON);
+    let floor_ratio =
+        lite_report.median.as_secs_f64() / count_report.median.as_secs_f64().max(f64::EPSILON);
     eprintln!(
         "  evidence: pipeline_lite/token_count median ratio = {:.1}x; counting is {} of full preparation",
         floor_ratio,
@@ -1323,9 +1329,7 @@ struct CardinalityScenario {
 /// and `providers` providers (every even-indexed provider carries a budget),
 /// plus the Router over that config. No ports are bound; Router construction
 /// is in-process with isolated temp databases.
-fn build_cardinality_scenario(
-    scenario: &CardinalityScenario,
-) -> (Arc<RwLock<Config>>, Router) {
+fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Config>>, Router) {
     let providers = (0..scenario.providers)
         .map(|i| Provider {
             name: format!("provider-{}", i),
@@ -1427,6 +1431,7 @@ fn build_cardinality_scenario(
         smart_routing: Default::default(),
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
+        codex_search: None,
         structured_output: None,
     };
     common::isolate_databases(&mut config);

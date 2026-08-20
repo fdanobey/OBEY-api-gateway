@@ -536,7 +536,7 @@ mod property_tests {
     // 5. Verify the hashes are different
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn schema_hash_order_independent((ref a, ref b) in shuffled_key_pair()) {

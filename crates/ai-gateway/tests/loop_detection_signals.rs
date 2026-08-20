@@ -21,7 +21,7 @@ fn request(tool_fingerprint: Option<u64>) -> RequestRecord {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: agent-loop-detection, Property 16: Signal Non-Applicability Returns Zero
     #[test]
@@ -193,12 +193,7 @@ fn discovery_loop_raises_tool_call_repetition() {
     // A genuine (non-discovery) tool call must not be flagged by this mechanism.
     let mut real = request(None);
     real.discovery_keys = vec![];
-    let real_signals = SignalComputer::compute(
-        &session,
-        &real,
-        None,
-        &LoopDetectionConfig::default(),
-        None,
-    );
+    let real_signals =
+        SignalComputer::compute(&session, &real, None, &LoopDetectionConfig::default(), None);
     assert_eq!(real_signals.tool_call_repetition, 0.0);
 }

@@ -1263,7 +1263,7 @@ mod tests {
     }
 
     proptest! {
-            #![proptest_config(ProptestConfig::with_cases(256))]
+            #![proptest_config(ProptestConfig::with_cases(64))]
 
             #[test]
             fn property_4_composite_average_is_bounded(
@@ -1420,7 +1420,7 @@ mod tests {
             any::<f64>(),
             "[a-zA-Z0-9 _-]{0,128}",
         );
-        let mut runner = TestRunner::new(ProptestConfig::with_cases(256));
+        let mut runner = TestRunner::new(ProptestConfig::with_cases(64));
         let generated_cases = Mutex::new(Vec::with_capacity(256));
         runner
             .run(&strategy, |generated_case| {

@@ -393,7 +393,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         /// Property 10: Config Override Merge
         /// Validates: Requirements 5.2

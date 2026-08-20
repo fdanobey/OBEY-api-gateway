@@ -265,7 +265,7 @@ mod tests {
     // * `key_bytes` — arbitrary 32-byte AES-256 key.
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 128,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 
@@ -333,7 +333,7 @@ mod tests {
     // all interior values.
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 512,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 

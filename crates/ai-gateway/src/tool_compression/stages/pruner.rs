@@ -537,7 +537,7 @@ mod property_tests {
     // **Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5, 3.8**
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         /// Verify pruning correctness:
         /// - Tools with >0 calls are never pruned

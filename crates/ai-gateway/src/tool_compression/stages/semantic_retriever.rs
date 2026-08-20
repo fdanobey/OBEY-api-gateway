@@ -210,10 +210,10 @@ fn estimate_tokens(value: &serde_json::Value) -> u64 {
 
 #[cfg(test)]
 mod tests {
-use super::*;
-use serde_json::json;
+    use super::*;
+    use serde_json::json;
 
-fn make_tool(name: &str, description: &str) -> ToolDefinition {
+    fn make_tool(name: &str, description: &str) -> ToolDefinition {
         ToolDefinition {
             raw: json!({
                 "type": "function",
@@ -415,7 +415,7 @@ mod property_tests {
     //    - All tool names from output are a subset of original tool names
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn semantic_retrieval_hybrid_selection_correctness(

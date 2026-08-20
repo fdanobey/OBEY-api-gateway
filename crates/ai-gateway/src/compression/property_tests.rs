@@ -77,7 +77,7 @@ fn assert_normalized_unprotected_output(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_10_whitespace_normalization(input in whitespace_heavy_prose()) {

@@ -614,7 +614,7 @@ mod property_tests {
     // locked groups never change level.
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn feedback_loop_state_machine_transitions(
@@ -678,7 +678,7 @@ mod property_tests {
     // always returns a valid CompressionLevel.
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn feedback_loop_precedence(

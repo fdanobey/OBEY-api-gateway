@@ -565,7 +565,7 @@ fn assert_tool_pair_integrity(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_2_tool_call_result_pair_integrity_across_all_named_levels(

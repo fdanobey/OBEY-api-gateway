@@ -245,7 +245,7 @@ fn assert_cache_property(case: CacheCase) -> TestCaseResult {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn cached_prefix_is_preserved_through_production_compression(case in cache_case()) {

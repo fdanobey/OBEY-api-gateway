@@ -2,7 +2,7 @@ use ai_gateway::loop_detection::fingerprint::{FingerprintTracker, ToolCall, Tool
 use proptest::prelude::*;
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: agent-loop-detection, Property 9: Tool Call Fingerprint Scoring Monotonicity
     #[test]

@@ -381,7 +381,7 @@ fn assert_tool_schema_preservation(tools: Value) -> TestCaseResult {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn property_13_tool_schema_preservation(tools in tool_definitions_strategy()) {

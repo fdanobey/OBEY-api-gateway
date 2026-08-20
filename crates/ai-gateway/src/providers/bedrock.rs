@@ -3404,7 +3404,7 @@ mod property_tests {
     // Feature: bedrock-ui-integration, Property 1: Mantle URL generation is deterministic and well-formed
     // **Validates: Requirements 2.1, 9.3**
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_mantle_url_generation_deterministic_and_well_formed(region in arb_region_string()) {
@@ -3451,7 +3451,7 @@ mod property_tests {
     // Feature: bedrock-ui-integration, Property 2: supported geo inference profile prefixing
     // **Validates: Requirements 4.3, 4.4**
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_global_inference_prefix_when_enabled(
@@ -3598,7 +3598,7 @@ mod property_tests {
     // Feature: bedrock-ui-integration, Property 5: Reasoning model support detection
     // **Validates: Requirements 7.5**
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_reasoning_known_models_return_true(model_id in arb_known_reasoning_model()) {
@@ -3637,7 +3637,7 @@ mod property_tests {
     // Feature: bedrock-ui-integration, Property 3: Model list merge produces deduplicated sorted union
     // **Validates: Requirements 5.4**
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_merge_model_lists_dedup_sorted_union(

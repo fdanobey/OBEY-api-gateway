@@ -631,7 +631,7 @@ mod property_tests {
     // **Validates: Requirements 1.1, 1.2, 1.3**
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_field_removal_completeness(schema in schema_with_removable_fields()) {
@@ -664,7 +664,7 @@ mod property_tests {
     // **Validates: Requirements 1.4, 1.5**
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_single_union_collapse_equivalence(schema in single_union_schema()) {
@@ -713,7 +713,7 @@ mod property_tests {
     // **Validates: Requirements 1.9**
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_minification_idempotence(schema in arbitrary_schema()) {

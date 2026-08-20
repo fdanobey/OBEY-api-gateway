@@ -124,6 +124,11 @@ pub struct Config {
     /// Additional model identifiers that accept Codex reasoning parameters.
     #[serde(default)]
     pub reasoning_models_allowlist: Vec<String>,
+    /// Codex Search feature configuration. Absent section defaults to
+    /// enabled-when-codex-provider-exists with default timeout/iterations.
+    /// See [`crate::codex::search::config::CodexSearchConfig`].
+    #[serde(default)]
+    pub codex_search: Option<crate::codex::search::config::CodexSearchConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

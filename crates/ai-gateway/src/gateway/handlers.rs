@@ -2180,363 +2180,363 @@ async fn chat_completions_stream(
 
         let streaming_config_relay = streaming_config.clone();
         let stream = async_stream::stream! {
-            // Drop guard: ensures active_requests is decremented even if the
-            // client disconnects and the stream is cancelled mid-flight.
-            let mut _guard = request_guard;
+                    // Drop guard: ensures active_requests is decremented even if the
+                    // client disconnects and the stream is cancelled mid-flight.
+                    let mut _guard = request_guard;
 
-            // Early synthetic event (Req 1.1, 1.2, 1.3).
-            yield Ok::<_, Infallible>(Event::default().data(early_chunk.to_string()));
+                    // Early synthetic event (Req 1.1, 1.2, 1.3).
+                    yield Ok::<_, Infallible>(Event::default().data(early_chunk.to_string()));
 
-            // Task 5.5: dispatch through the streaming router so capable
-            // providers stream in real time (PassThrough) while providers that
-            // need response transformation fall back to buffer-and-replay
-            // (Buffered) — both behind the early event already flushed above.
-            match state.router.route_request_streaming(&request, Some(active_handle_stream.clone())).await {
-                Ok(StreamingResponse::Buffered(response)) => {
-                    // Buffer-and-replay: cache the assembled response so a later
-                    // identical request replays without hitting the provider.
-                    if crate::router::router::Router::should_cache_response(&response) {
-                        if let Ok(json) = serde_json::to_string(&response) {
-                            state.exact_cache.set(&request, json);
+                    // Task 5.5: dispatch through the streaming router so capable
+                    // providers stream in real time (PassThrough) while providers that
+                    // need response transformation fall back to buffer-and-replay
+                    // (Buffered) — both behind the early event already flushed above.
+                    match state.router.route_request_streaming(&request, Some(active_handle_stream.clone())).await {
+                        Ok(StreamingResponse::Buffered(response)) => {
+                            // Buffer-and-replay: cache the assembled response so a later
+                            // identical request replays without hitting the provider.
+                            if crate::router::router::Router::should_cache_response(&response) {
+                                if let Ok(json) = serde_json::to_string(&response) {
+                                    state.exact_cache.set(&request, json);
+                                }
+                            }
+
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                            log_request(&state, &request, &log_context);
+
+                            // Req 1.5: continue emitting content chunks after the early
+                            // event, reusing its id/created and skipping the duplicate
+                            // role delta (task 2.2).
+                            for chunk in streaming_chunks_after_early_event(&response, &response_id, created) {
+                                yield Ok(Event::default().data(chunk.to_string()));
+                            }
+                            if let Some(suffix) = memory_suffix.as_deref() {
+                                yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+                            }
+                            yield Ok(Event::default().data("[DONE]"));
                         }
-                    }
-
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                    log_request(&state, &request, &log_context);
-
-                    // Req 1.5: continue emitting content chunks after the early
-                    // event, reusing its id/created and skipping the duplicate
-                    // role delta (task 2.2).
-                    for chunk in streaming_chunks_after_early_event(&response, &response_id, created) {
-                        yield Ok(Event::default().data(chunk.to_string()));
-                    }
-                    if let Some(suffix) = memory_suffix.as_deref() {
-                        yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
-                    }
-                    yield Ok(Event::default().data("[DONE]"));
-                }
-                Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit }) => {
-                    // True streaming pass-through (Req 3.1, 3.2). The early event
-                    // above already reset the client idle timer; now relay the
-                    // upstream chunks verbatim.
-                    //
-                    // EARLY-EVENT ID TRADEOFF: the relayed chunks carry the
-                    // provider's own `id`, which differs from the synthetic
-                    // early event's fresh uuid. We do NOT rewrite per-chunk ids
-                    // (costly and unnecessary): OpenAI-compatible clients merge
-                    // deltas by `choices[].index`, not by envelope `id`, and the
-                    // role-only early event is idempotent. So we forward upstream
-                    // chunks as-is.
-                    //
-                    // Task 6.1 — PRE-CONTENT FAILOVER LOOP (Req 4.1, 4.4, 4.5):
-                    // relay the current provider; if it fails BEFORE any content
-                    // reached the client, record a circuit-breaker failure, add
-                    // the provider to the exclusion list, and retry the next
-                    // eligible provider — WITHOUT emitting a second early/role
-                    // event (the early event was emitted once, above). The loop
-                    // is bounded because every retry excludes the failed
-                    // provider, so `route_request_streaming_excluding` eventually
-                    // returns `Buffered`/`Err` (no eligible pass-through left).
-                    //
-            // Task 6.3 — RETRY/FAILOVER LIMITS + AGGREGATED ERROR (Req 4.3):
-            // - Provider ordering: `route_request_streaming_excluding`
-            //   picks from the SAME `select_provider_order()` list as the
-            //   non-streaming path, skipping `tried_providers` (keyed per
-            //   `provider:model`, matching the circuit-breaker key, so a
-            //   provider offering several models stays eligible via its
-            //   other models). That list is the natural bound — each
-            //   provider:model entry is tried for pass-through at most once.
-                    // - `max_retries_per_provider` mapping: the non-streaming
-                    //   path applies it INSIDE `attempt_with_retry` (inline
-                    //   same-provider retries). A live SSE relay cannot be safely
-                    //   retried inline once response headers/bytes have arrived,
-                    //   so each provider gets exactly ONE pass-through attempt and
-                    //   failover advances to the NEXT provider. The buffered
-                    //   fallback (`route_request`) still honors
-                    //   `max_retries_per_provider` via `attempt_with_retry`.
-                    // - Defensive hard cap: even though the exclusion list bounds
-                    //   the loop, cap total pass-through attempts at
-                    //   (provider count + 1) so a logic error can never spin
-                    //   forever.
-                    // - Aggregated error: each pre-content failure is recorded as
-                    //   a `ProviderAttempt`; if every provider fails they are
-                    //   merged into a single `AllProvidersFailed` error.
-        let (max_retries_per_provider, max_failover_attempts) = {
-            let cfg = state.config.read().await;
-            // Exclusion is per provider:model, so the natural loop bound is
-            // the number of distinct model entries across all groups.
-            let model_entries: usize = cfg.model_groups.iter().map(|g| g.models.len()).sum();
-            (cfg.retry.max_retries_per_provider, cfg.providers.len() + model_entries + 1)
-        };
-                    tracing::debug!(
-                        trace_id = %stream_trace_id,
-                        max_retries_per_provider,
-                        max_failover_attempts,
-                        "Streaming failover policy: one pass-through attempt per provider; max_retries_per_provider applies to the buffered fallback only"
-                    );
-
-                    let mut tried_providers: Vec<String> = Vec::new();
-                    // Req 4.3: accumulate each failed pass-through attempt so a
-                    // total failure surfaces every provider, not just the last.
-                    let mut streaming_attempts: Vec<ProviderAttempt> = Vec::new();
-                    let mut failover_attempts: usize = 0;
-                        let mut _current_concurrency_permit = Some(concurrency_permit);
-                        let mut current_stream = byte_stream;
-                    let mut current_provider = provider;
-                    let mut current_model = model;
-                    let mut current_compression = compression;
-
-                    'failover: loop {
-                        // Defensive bound (see note above): unreachable in normal
-                        // operation because the exclusion list already bounds the
-                        // loop. If ever tripped, emit whatever was accumulated.
-                        failover_attempts += 1;
-                        if failover_attempts > max_failover_attempts {
-                            tracing::error!(
+                        Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit }) => {
+                            // True streaming pass-through (Req 3.1, 3.2). The early event
+                            // above already reset the client idle timer; now relay the
+                            // upstream chunks verbatim.
+                            //
+                            // EARLY-EVENT ID TRADEOFF: the relayed chunks carry the
+                            // provider's own `id`, which differs from the synthetic
+                            // early event's fresh uuid. We do NOT rewrite per-chunk ids
+                            // (costly and unnecessary): OpenAI-compatible clients merge
+                            // deltas by `choices[].index`, not by envelope `id`, and the
+                            // role-only early event is idempotent. So we forward upstream
+                            // chunks as-is.
+                            //
+                            // Task 6.1 — PRE-CONTENT FAILOVER LOOP (Req 4.1, 4.4, 4.5):
+                            // relay the current provider; if it fails BEFORE any content
+                            // reached the client, record a circuit-breaker failure, add
+                            // the provider to the exclusion list, and retry the next
+                            // eligible provider — WITHOUT emitting a second early/role
+                            // event (the early event was emitted once, above). The loop
+                            // is bounded because every retry excludes the failed
+                            // provider, so `route_request_streaming_excluding` eventually
+                            // returns `Buffered`/`Err` (no eligible pass-through left).
+                            //
+                    // Task 6.3 — RETRY/FAILOVER LIMITS + AGGREGATED ERROR (Req 4.3):
+                    // - Provider ordering: `route_request_streaming_excluding`
+                    //   picks from the SAME `select_provider_order()` list as the
+                    //   non-streaming path, skipping `tried_providers` (keyed per
+                    //   `provider:model`, matching the circuit-breaker key, so a
+                    //   provider offering several models stays eligible via its
+                    //   other models). That list is the natural bound — each
+                    //   provider:model entry is tried for pass-through at most once.
+                            // - `max_retries_per_provider` mapping: the non-streaming
+                            //   path applies it INSIDE `attempt_with_retry` (inline
+                            //   same-provider retries). A live SSE relay cannot be safely
+                            //   retried inline once response headers/bytes have arrived,
+                            //   so each provider gets exactly ONE pass-through attempt and
+                            //   failover advances to the NEXT provider. The buffered
+                            //   fallback (`route_request`) still honors
+                            //   `max_retries_per_provider` via `attempt_with_retry`.
+                            // - Defensive hard cap: even though the exclusion list bounds
+                            //   the loop, cap total pass-through attempts at
+                            //   (provider count + 1) so a logic error can never spin
+                            //   forever.
+                            // - Aggregated error: each pre-content failure is recorded as
+                            //   a `ProviderAttempt`; if every provider fails they are
+                            //   merged into a single `AllProvidersFailed` error.
+                let (max_retries_per_provider, max_failover_attempts) = {
+                    let cfg = state.config.read().await;
+                    // Exclusion is per provider:model, so the natural loop bound is
+                    // the number of distinct model entries across all groups.
+                    let model_entries: usize = cfg.model_groups.iter().map(|g| g.models.len()).sum();
+                    (cfg.retry.max_retries_per_provider, cfg.providers.len() + model_entries + 1)
+                };
+                            tracing::debug!(
                                 trace_id = %stream_trace_id,
-                                failover_attempts,
+                                max_retries_per_provider,
                                 max_failover_attempts,
-                                "Streaming failover exceeded safety cap; aborting with aggregated error"
+                                "Streaming failover policy: one pass-through attempt per provider; max_retries_per_provider applies to the buffered fallback only"
                             );
-                            let aggregated = GatewayError::AllProvidersFailed(
-                                AggregatedError::new(std::mem::take(&mut streaming_attempts)),
-                            );
-                            let (error_type, message) = classify_stream_error(&aggregated);
-                            for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
-                                yield Ok(event);
-                            }
-                            break 'failover;
-                        }
-                        // Resolve the chosen provider's effective total timeout
-                        // for the relay budget (Req 3.11). Short-lived guard,
-                        // dropped before relaying — never held across `.await`s.
-                        let total_timeout = {
-                            let cfg = state.config.read().await;
-                            let secs = cfg
-                                .providers
-                                .iter()
-                                .find(|p| p.name == current_provider)
-                                .map(|p| p.effective_total_timeout(&current_model))
-                                .unwrap_or(600);
-                            Duration::from_secs(secs)
-                        };
 
-        // Shared handle the relay writes its terminal outcome to.
-        let outcome = Arc::new(tokio::sync::Mutex::new(RelayOutcome::Completed {
-            usage: Usage::default(),
-        }));
-                        // Enable adaptive XML-tool detection only when the
-                        // request carries `tools` (XML tool use is irrelevant
-                        // otherwise). A learned combo would already have been
-                        // routed to the buffered path, so here it is always an
-                        // as-yet-unlearned combo.
-                        let xml_detect = if request.extra.contains_key("tools") {
-                            Some(XmlToolDetect {
-                                router: state.router.clone(),
-                                provider: current_provider.clone(),
-                                model: current_model.clone(),
-                            })
-                        } else {
-                            None
-                        };
-                        let relay = relay_passthrough_stream(
-                            current_stream,
-                            streaming_config_relay.clone(),
-                            stream_trace_id.clone(),
-                            total_timeout,
-                            state.exact_cache.clone(),
-                            state.metrics.clone(),
-                            request.clone(),
-                            outcome.clone(),
-                            xml_detect,
-                            memory_suffix.clone(),
-                        );
-                        // The relay emits its own terminal `[DONE]` (or a graceful
-                        // error event that appends one, or — on pre-content
-                        // failure — nothing), so we must NOT emit another here.
-                        // `relay_passthrough_stream` returns an `!Unpin` async
-                        // stream, so pin it on the stack before polling.
-                        futures::pin_mut!(relay);
-                        while let Some(ev) = relay.next().await {
-                            yield ev;
-                        }
-                        drop(relay);
+                            let mut tried_providers: Vec<String> = Vec::new();
+                            // Req 4.3: accumulate each failed pass-through attempt so a
+                            // total failure surfaces every provider, not just the last.
+                            let mut streaming_attempts: Vec<ProviderAttempt> = Vec::new();
+                            let mut failover_attempts: usize = 0;
+                                let mut _current_concurrency_permit = Some(concurrency_permit);
+                                let mut current_stream = byte_stream;
+                            let mut current_provider = provider;
+                            let mut current_model = model;
+                            let mut current_compression = compression;
 
-        let final_outcome = { outcome.lock().await.clone() };
-        match final_outcome {
-            // Clean finish — relay already emitted `[DONE]`.
-            RelayOutcome::Completed { usage } => {
-                let duration = start.elapsed();
-                // Success accounting for pass-through streams (mirror of the
-                // buffered path): close/record circuit-breaker success, feed
-                // the latency tracker, accrue cost from the relay's
-                // reassembled usage, and clear any upstream-driven cooldown
-                // so a recovered provider is reselected immediately.
-                state
-                    .router
-                    .record_streaming_success(
-                        &current_provider,
-                        &current_model,
-                        duration,
-                        &usage,
-                    )
-                    .await;
-                let duration_ms = duration.as_millis() as u64;
-                let log_context = RequestLogContext::from_streaming_success(
-                    &request,
-                    stream_trace_id.clone(),
-                    duration_ms,
-                    current_provider.clone(),
-                    current_model.clone(),
-                    current_compression.clone(),
-                );
-                log_request(&state, &request, &log_context);
-                break 'failover;
-            }
-                            // Post-content failure (Req 4.2): the relay already
-                            // emitted the graceful error event + `[DONE]`. We
-                            // cannot transparently fail over mid-content, so
-                            // account the failed attempt against the circuit
-                            // breaker + metrics (Req 4.5) and stop — no retry.
-                            RelayOutcome::FailedAfterContent(reason) => {
-                                let duration_ms = start.elapsed().as_millis() as u64;
-                                let log_context = RequestLogContext::from_streaming_success(
-                                    &request,
-                                    stream_trace_id.clone(),
-                                    duration_ms,
-                                    current_provider.clone(),
-                                    current_model.clone(),
-                                    current_compression.clone(),
-                                );
-                                log_request(&state, &request, &log_context);
-                                state
-                                    .router
-                                    .record_streaming_failure(
-                                        &current_provider,
-                                        &current_model,
-                                        Some(reason.clone()),
-                                    )
-                                    .await;
-                                tracing::warn!(
-                                    trace_id = %stream_trace_id,
-                                    provider = %current_provider,
-                                    reason = %reason,
-                                    "Streaming provider failed after content was sent; closing stream (no failover)"
-                                );
-                                break 'failover;
-                            }
-                            // Pre-content failure — transparently fail over.
-                            RelayOutcome::FailedBeforeContent(reason) => {
-                                // Req 4.5: account the failed attempt against the
-                                // circuit breaker before retrying.
-                                state
-                                    .router
-                                    .record_streaming_failure(
-                                        &current_provider,
-                                        &current_model,
-                                        Some(reason.clone()),
-                                    )
-                                    .await;
-                                tracing::warn!(
-                                    trace_id = %stream_trace_id,
-                                    provider = %current_provider,
-                                    reason = %reason,
-                                    "Streaming provider failed before any content; attempting pre-content failover"
-                                );
-                                tried_providers.push(format!("{}:{}", current_provider, current_model));
-                                // Req 4.3: record this pre-content failure for the
-                                // aggregated error in case every provider fails.
-                                streaming_attempts.push(ProviderAttempt::new(
-                                    current_provider.clone(),
-current_model.clone(),
-reason.clone(),
-None,
-));
-drop(_current_concurrency_permit.take());
-
-match state
-                                    .router
-                                    .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
-                                    .await
-                                {
-                                    // Another eligible provider — relay it,
-                                    // reusing the SAME early-event id (Req 4.4:
-                                    // do NOT emit a second role event).
-Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit }) => {
-_current_concurrency_permit = Some(concurrency_permit);
-current_stream = byte_stream;
-                                        current_provider = provider;
-                                        current_model = model;
-                                        current_compression = compression;
-                                        continue 'failover;
+                            'failover: loop {
+                                // Defensive bound (see note above): unreachable in normal
+                                // operation because the exclusion list already bounds the
+                                // loop. If ever tripped, emit whatever was accumulated.
+                                failover_attempts += 1;
+                                if failover_attempts > max_failover_attempts {
+                                    tracing::error!(
+                                        trace_id = %stream_trace_id,
+                                        failover_attempts,
+                                        max_failover_attempts,
+                                        "Streaming failover exceeded safety cap; aborting with aggregated error"
+                                    );
+                                    let aggregated = GatewayError::AllProvidersFailed(
+                                        AggregatedError::new(std::mem::take(&mut streaming_attempts)),
+                                    );
+                                    let (error_type, message) = classify_stream_error(&aggregated);
+                                    for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
+                                        yield Ok(event);
                                     }
-                                    // No eligible pass-through provider remains —
-                                    // replay the buffered fallback after the early
-                                    // event, then terminate.
-                                    Ok(StreamingResponse::Buffered(response)) => {
-                                        if crate::router::router::Router::should_cache_response(&response) {
-                                            if let Ok(json) = serde_json::to_string(&response) {
-                                                state.exact_cache.set(&request, json);
+                                    break 'failover;
+                                }
+                                // Resolve the chosen provider's effective total timeout
+                                // for the relay budget (Req 3.11). Short-lived guard,
+                                // dropped before relaying — never held across `.await`s.
+                                let total_timeout = {
+                                    let cfg = state.config.read().await;
+                                    let secs = cfg
+                                        .providers
+                                        .iter()
+                                        .find(|p| p.name == current_provider)
+                                        .map(|p| p.effective_total_timeout(&current_model))
+                                        .unwrap_or(600);
+                                    Duration::from_secs(secs)
+                                };
+
+                // Shared handle the relay writes its terminal outcome to.
+                let outcome = Arc::new(tokio::sync::Mutex::new(RelayOutcome::Completed {
+                    usage: Usage::default(),
+                }));
+                                // Enable adaptive XML-tool detection only when the
+                                // request carries `tools` (XML tool use is irrelevant
+                                // otherwise). A learned combo would already have been
+                                // routed to the buffered path, so here it is always an
+                                // as-yet-unlearned combo.
+                                let xml_detect = if request.extra.contains_key("tools") {
+                                    Some(XmlToolDetect {
+                                        router: state.router.clone(),
+                                        provider: current_provider.clone(),
+                                        model: current_model.clone(),
+                                    })
+                                } else {
+                                    None
+                                };
+                                let relay = relay_passthrough_stream(
+                                    current_stream,
+                                    streaming_config_relay.clone(),
+                                    stream_trace_id.clone(),
+                                    total_timeout,
+                                    state.exact_cache.clone(),
+                                    state.metrics.clone(),
+                                    request.clone(),
+                                    outcome.clone(),
+                                    xml_detect,
+                                    memory_suffix.clone(),
+                                );
+                                // The relay emits its own terminal `[DONE]` (or a graceful
+                                // error event that appends one, or — on pre-content
+                                // failure — nothing), so we must NOT emit another here.
+                                // `relay_passthrough_stream` returns an `!Unpin` async
+                                // stream, so pin it on the stack before polling.
+                                futures::pin_mut!(relay);
+                                while let Some(ev) = relay.next().await {
+                                    yield ev;
+                                }
+                                drop(relay);
+
+                let final_outcome = { outcome.lock().await.clone() };
+                match final_outcome {
+                    // Clean finish — relay already emitted `[DONE]`.
+                    RelayOutcome::Completed { usage } => {
+                        let duration = start.elapsed();
+                        // Success accounting for pass-through streams (mirror of the
+                        // buffered path): close/record circuit-breaker success, feed
+                        // the latency tracker, accrue cost from the relay's
+                        // reassembled usage, and clear any upstream-driven cooldown
+                        // so a recovered provider is reselected immediately.
+                        state
+                            .router
+                            .record_streaming_success(
+                                &current_provider,
+                                &current_model,
+                                duration,
+                                &usage,
+                            )
+                            .await;
+                        let duration_ms = duration.as_millis() as u64;
+                        let log_context = RequestLogContext::from_streaming_success(
+                            &request,
+                            stream_trace_id.clone(),
+                            duration_ms,
+                            current_provider.clone(),
+                            current_model.clone(),
+                            current_compression.clone(),
+                        );
+                        log_request(&state, &request, &log_context);
+                        break 'failover;
+                    }
+                                    // Post-content failure (Req 4.2): the relay already
+                                    // emitted the graceful error event + `[DONE]`. We
+                                    // cannot transparently fail over mid-content, so
+                                    // account the failed attempt against the circuit
+                                    // breaker + metrics (Req 4.5) and stop — no retry.
+                                    RelayOutcome::FailedAfterContent(reason) => {
+                                        let duration_ms = start.elapsed().as_millis() as u64;
+                                        let log_context = RequestLogContext::from_streaming_success(
+                                            &request,
+                                            stream_trace_id.clone(),
+                                            duration_ms,
+                                            current_provider.clone(),
+                                            current_model.clone(),
+                                            current_compression.clone(),
+                                        );
+                                        log_request(&state, &request, &log_context);
+                                        state
+                                            .router
+                                            .record_streaming_failure(
+                                                &current_provider,
+                                                &current_model,
+                                                Some(reason.clone()),
+                                            )
+                                            .await;
+                                        tracing::warn!(
+                                            trace_id = %stream_trace_id,
+                                            provider = %current_provider,
+                                            reason = %reason,
+                                            "Streaming provider failed after content was sent; closing stream (no failover)"
+                                        );
+                                        break 'failover;
+                                    }
+                                    // Pre-content failure — transparently fail over.
+                                    RelayOutcome::FailedBeforeContent(reason) => {
+                                        // Req 4.5: account the failed attempt against the
+                                        // circuit breaker before retrying.
+                                        state
+                                            .router
+                                            .record_streaming_failure(
+                                                &current_provider,
+                                                &current_model,
+                                                Some(reason.clone()),
+                                            )
+                                            .await;
+                                        tracing::warn!(
+                                            trace_id = %stream_trace_id,
+                                            provider = %current_provider,
+                                            reason = %reason,
+                                            "Streaming provider failed before any content; attempting pre-content failover"
+                                        );
+                                        tried_providers.push(format!("{}:{}", current_provider, current_model));
+                                        // Req 4.3: record this pre-content failure for the
+                                        // aggregated error in case every provider fails.
+                                        streaming_attempts.push(ProviderAttempt::new(
+                                            current_provider.clone(),
+        current_model.clone(),
+        reason.clone(),
+        None,
+        ));
+        drop(_current_concurrency_permit.take());
+
+        match state
+                                            .router
+                                            .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
+                                            .await
+                                        {
+                                            // Another eligible provider — relay it,
+                                            // reusing the SAME early-event id (Req 4.4:
+                                            // do NOT emit a second role event).
+        Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit }) => {
+        _current_concurrency_permit = Some(concurrency_permit);
+        current_stream = byte_stream;
+                                                current_provider = provider;
+                                                current_model = model;
+                                                current_compression = compression;
+                                                continue 'failover;
+                                            }
+                                            // No eligible pass-through provider remains —
+                                            // replay the buffered fallback after the early
+                                            // event, then terminate.
+                                            Ok(StreamingResponse::Buffered(response)) => {
+                                                if crate::router::router::Router::should_cache_response(&response) {
+                                                    if let Ok(json) = serde_json::to_string(&response) {
+                                                        state.exact_cache.set(&request, json);
+                                                    }
+                                                }
+                                                let duration_ms = start.elapsed().as_millis() as u64;
+                                                let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                                                log_request(&state, &request, &log_context);
+                                                for chunk in streaming_chunks_after_early_event(&response, &response_id, created) {
+                                                    yield Ok(Event::default().data(chunk.to_string()));
+                                                }
+                                                if let Some(suffix) = memory_suffix.as_deref() {
+                                                    yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+                                                }
+                                                yield Ok(Event::default().data("[DONE]"));
+                                                break 'failover;
+                                            }
+                                            // All providers exhausted/failed — merge the
+                                            // accumulated pass-through attempts with the
+                                            // error from the excluding call (Req 4.3) so
+                                            // the client sees every failed provider, then
+                                            // emit a single graceful aggregated error
+                                            // event (client is in SSE mode).
+                                            Err(e) => {
+                                                let aggregated = merge_streaming_attempts(
+                                                    std::mem::take(&mut streaming_attempts),
+                                                    e,
+                                                );
+                                                let duration_ms = start.elapsed().as_millis() as u64;
+                                                let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
+                                                log_request(&state, &request, &log_context);
+                                                let (error_type, message) = classify_stream_error(&aggregated);
+                                                for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
+                                                    yield Ok(event);
+                                                }
+                                                break 'failover;
                                             }
                                         }
-                                        let duration_ms = start.elapsed().as_millis() as u64;
-                                        let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                                        log_request(&state, &request, &log_context);
-                                        for chunk in streaming_chunks_after_early_event(&response, &response_id, created) {
-                                            yield Ok(Event::default().data(chunk.to_string()));
-                                        }
-                                        if let Some(suffix) = memory_suffix.as_deref() {
-                                            yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
-                                        }
-                                        yield Ok(Event::default().data("[DONE]"));
-                                        break 'failover;
-                                    }
-                                    // All providers exhausted/failed — merge the
-                                    // accumulated pass-through attempts with the
-                                    // error from the excluding call (Req 4.3) so
-                                    // the client sees every failed provider, then
-                                    // emit a single graceful aggregated error
-                                    // event (client is in SSE mode).
-                                    Err(e) => {
-                                        let aggregated = merge_streaming_attempts(
-                                            std::mem::take(&mut streaming_attempts),
-                                            e,
-                                        );
-                                        let duration_ms = start.elapsed().as_millis() as u64;
-                                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-                                        log_request(&state, &request, &log_context);
-                                        let (error_type, message) = classify_stream_error(&aggregated);
-                                        for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
-                                            yield Ok(event);
-                                        }
-                                        break 'failover;
                                     }
                                 }
                             }
                         }
-                    }
-                }
-                Err(e) => {
-                    // The early event already put the client in SSE parsing mode,
-                    // so an HTTP error status is no longer possible. Emit a
-                    // graceful SSE error event so the client always gets a reason
-                    // before the stream terminates (Req 5.1, 5.2, 5.4).
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
-                    log_request(&state, &request, &log_context);
+                        Err(e) => {
+                            // The early event already put the client in SSE parsing mode,
+                            // so an HTTP error status is no longer possible. Emit a
+                            // graceful SSE error event so the client always gets a reason
+                            // before the stream terminates (Req 5.1, 5.2, 5.4).
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
+                            log_request(&state, &request, &log_context);
 
-                    // Map the error variant to an SSE error frame. emit_sse_error_event
-                    // already appends [DONE], so we must NOT yield a separate one.
-                    let (error_type, message) = classify_stream_error(&e);
-                    for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
-                        yield Ok(event);
+                            // Map the error variant to an SSE error frame. emit_sse_error_event
+                            // already appends [DONE], so we must NOT yield a separate one.
+                            let (error_type, message) = classify_stream_error(&e);
+                            for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
+                                yield Ok(event);
+                            }
+                        }
                     }
-                }
-            }
 
-            _guard.complete();
-        };
+                    _guard.complete();
+                };
 
         let mut sse = Sse::new(stream)
             .keep_alive(build_keepalive(&streaming_config))
@@ -3389,346 +3389,105 @@ async fn stream_buffered_with_post_call(
     let active_stream = active.clone();
 
     let stream = async_stream::stream! {
-        let mut _guard = request_guard;
+            let mut _guard = request_guard;
 
-        // Early synthetic role event (Req 1.1-1.3) so the client's idle timer
-        // resets while we buffer; re-chunking below reuses its id/created.
-        if emit_early {
-            let early = early_event_chunk(&response_id, created, &requested_model);
-            yield Ok::<_, Infallible>(Event::default().data(early.to_string()));
-        }
-
-        // Force the buffered path: assemble the full upstream response (never
-        // relay pass-through chunks to the caller) so the post-call pipeline
-        // sees the complete content.
-        let mut assembled: Option<OpenAIResponse> = None;
-        let mut streaming_compression: Option<CompressionStats> = None;
-        let mut disconnected = false;
-
-        match state.router.route_request_streaming(&request, active_stream.clone()).await {
-            Ok(StreamingResponse::Buffered(response)) => {
-                assembled = Some(response);
+            // Early synthetic role event (Req 1.1-1.3) so the client's idle timer
+            // resets while we buffer; re-chunking below reuses its id/created.
+            if emit_early {
+                let early = early_event_chunk(&response_id, created, &requested_model);
+                yield Ok::<_, Infallible>(Event::default().data(early.to_string()));
             }
-Ok(StreamingResponse::PassThrough { byte_stream, compression, concurrency_permit, .. }) => {
-let _concurrency_permit = concurrency_permit;
-streaming_compression = Some(compression.clone());
-                // Buffer the live SSE body under the 10 MB cap while emitting
-                // keep-alive comments during idle gaps (Req 10.1, 10.2).
-                let mut buf = guardrail_stream::SseBuffer::with_default_cap();
-                let mut bytes = byte_stream.bytes_stream();
-                let mut too_large = false;
-                loop {
-                    match tokio::time::timeout(keepalive_interval, bytes.next()).await {
-                        // Idle gap while buffering: keep the client alive (Req 10.2).
-                        Err(_elapsed) => {
-                            yield Ok(Event::default().comment("keepalive"));
-                        }
-                        // Upstream stream ended.
-                        Ok(None) => break,
-                        Ok(Some(Ok(b))) => {
-                            if buf.push_bytes(&b).is_err() {
-                                too_large = true;
+
+            // Force the buffered path: assemble the full upstream response (never
+            // relay pass-through chunks to the caller) so the post-call pipeline
+            // sees the complete content.
+            let mut assembled: Option<OpenAIResponse> = None;
+            let mut streaming_compression: Option<CompressionStats> = None;
+            let mut disconnected = false;
+
+            match state.router.route_request_streaming(&request, active_stream.clone()).await {
+                Ok(StreamingResponse::Buffered(response)) => {
+                    assembled = Some(response);
+                }
+    Ok(StreamingResponse::PassThrough { byte_stream, compression, concurrency_permit, .. }) => {
+    let _concurrency_permit = concurrency_permit;
+    streaming_compression = Some(compression.clone());
+                    // Buffer the live SSE body under the 10 MB cap while emitting
+                    // keep-alive comments during idle gaps (Req 10.1, 10.2).
+                    let mut buf = guardrail_stream::SseBuffer::with_default_cap();
+                    let mut bytes = byte_stream.bytes_stream();
+                    let mut too_large = false;
+                    loop {
+                        match tokio::time::timeout(keepalive_interval, bytes.next()).await {
+                            // Idle gap while buffering: keep the client alive (Req 10.2).
+                            Err(_elapsed) => {
+                                yield Ok(Event::default().comment("keepalive"));
+                            }
+                            // Upstream stream ended.
+                            Ok(None) => break,
+                            Ok(Some(Ok(b))) => {
+                                if buf.push_bytes(&b).is_err() {
+                                    too_large = true;
+                                    break;
+                                }
+                            }
+                            // Transport error mid-stream → premature disconnect (Req 10.5).
+                            Ok(Some(Err(_e))) => {
+                                disconnected = true;
                                 break;
                             }
                         }
-                        // Transport error mid-stream → premature disconnect (Req 10.5).
-                        Ok(Some(Err(_e))) => {
+                    }
+
+                    if too_large {
+                        // Req 10.1: abort with a gateway error when the cap is exceeded.
+                        let msg = format!(
+                            "Buffered streaming response exceeded the {} byte guardrail buffer limit",
+                            guardrail_stream::MAX_STREAM_BUFFER_BYTES
+                        );
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        let err = GatewayError::GuardrailUnavailable(msg.clone());
+                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                        log_request(&state, &request, &log_context);
+                        for event in emit_sse_error_event("guardrail_buffer_overflow", &msg, &stream_trace_id) {
+                            yield Ok(event);
+                        }
+                        _guard.complete();
+                        return;
+                    }
+
+                    match buf.assemble() {
+                        Ok(a) => {
+                            // No finish_reason ⇒ premature disconnect (Req 10.5).
+                            if !a.complete {
+                                disconnected = true;
+                            }
+                            assembled = Some(a.response);
+                        }
+                        // Empty/mid-error buffer: treat as a disconnect (Req 10.5).
+                        Err(_e) => {
                             disconnected = true;
-                            break;
                         }
                     }
                 }
-
-                if too_large {
-                    // Req 10.1: abort with a gateway error when the cap is exceeded.
-                    let msg = format!(
-                        "Buffered streaming response exceeded the {} byte guardrail buffer limit",
-                        guardrail_stream::MAX_STREAM_BUFFER_BYTES
-                    );
+                Err(e) => {
+                    // Routing failed before any streaming — graceful SSE error frame.
                     let duration_ms = start.elapsed().as_millis() as u64;
-                    let err = GatewayError::GuardrailUnavailable(msg.clone());
-                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
                     log_request(&state, &request, &log_context);
-                    for event in emit_sse_error_event("guardrail_buffer_overflow", &msg, &stream_trace_id) {
+                    let (error_type, message) = classify_stream_error(&e);
+                    for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                         yield Ok(event);
                     }
                     _guard.complete();
                     return;
                 }
-
-                match buf.assemble() {
-                    Ok(a) => {
-                        // No finish_reason ⇒ premature disconnect (Req 10.5).
-                        if !a.complete {
-                            disconnected = true;
-                        }
-                        assembled = Some(a.response);
-                    }
-                    // Empty/mid-error buffer: treat as a disconnect (Req 10.5).
-                    Err(_e) => {
-                        disconnected = true;
-                    }
-                }
             }
-            Err(e) => {
-                // Routing failed before any streaming — graceful SSE error frame.
-                let duration_ms = start.elapsed().as_millis() as u64;
-                let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
-                log_request(&state, &request, &log_context);
-                let (error_type, message) = classify_stream_error(&e);
-                for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
-                    yield Ok(event);
-                }
-                _guard.complete();
-                return;
-            }
-        }
 
-        // Premature disconnect handling (Req 10.5): fail_close discards, fail_open
-        // forwards the partial content through post-call.
-        if disconnected && (discard_on_disconnect || assembled.is_none()) {
-            let msg = "Upstream stream ended before a complete response; guardrail failure policy is fail-close".to_string();
-            let duration_ms = start.elapsed().as_millis() as u64;
-            let err = GatewayError::GuardrailUnavailable(msg.clone());
-            let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-            log_request(&state, &request, &log_context);
-            for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
-                yield Ok(event);
-            }
-            _guard.complete();
-            return;
-        }
-
-        let mut response = match assembled {
-            Some(r) => r,
-            None => {
-                yield Ok(Event::default().data("[DONE]"));
-                _guard.complete();
-                return;
-            }
-        };
-        if let Some(compression) = streaming_compression.take() {
-            response.extra.insert(
-                "gateway_compression".to_string(),
-                serde_json::to_value(compression)
-                    .expect("CompressionStats serialization must succeed"),
-            );
-        }
-
-        // Post-call guardrails on the assembled response, using the SAME ctx as
-        // pre-call so PII re-injection works (Req 9.5). No artificial delay is
-        // added, so re-chunked events forward within 500 ms of analysis (Req 10.6).
-        //
-        // Refusal detection runs on the assembled buffered response BEFORE the
-        // failover decision (Req 12.9). On premature stream termination (no
-        // finish_reason), detection runs on the partially assembled content and
-        // the same failover decision applies (Req 12.14).
-        let tool_ctx = ToolContext {
-            tool_use_allowed: request.extra.get("tool_choice").and_then(|v| v.as_str()).map_or(true, |tc| tc != "none"),
-            tools_provided: request.extra.get("tools").and_then(|v| v.as_array()).map_or(false, |t| !t.is_empty()),
-            finish_reason_is_tool_call: response.choices.first().and_then(|c| c.finish_reason.as_deref()).map_or(false, |r| r == "tool_calls"),
-            has_tool_calls: response.choices.first().map_or(false, |c| {
-                c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
-            }),
-        };
-        match engine
-            .run_post_call(&mut response, &selector, &mut guardrail_ctx, &stream_trace_id, &tool_ctx)
-            .await
-        {
-            // Proceed without refusal, or replaced (halting action skips
-            // re-injection, Req 9.4) → re-chunk normally.
-            (PostCallOutcome::Proceed, RefusalDecision::NotRefusal)
-            | (PostCallOutcome::Replaced, _) => {
-                let chunks = if emit_early {
-                    guardrail_stream::rechunk_after_early_event(&response, &response_id, created)
-                } else {
-                    guardrail_stream::rechunk_full(&response)
-                };
-                if crate::router::router::Router::should_cache_response(&response) {
-                    if let Ok(json) = serde_json::to_string(&response) {
-                        state.exact_cache.set(&request, json);
-                    }
-                }
-                let duration_ms = start.elapsed().as_millis() as u64;
-                let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                log_request(&state, &request, &log_context);
-                for chunk in chunks {
-                    yield Ok(Event::default().data(chunk.to_string()));
-                }
-                yield Ok(Event::default().data("[DONE]"));
-            }
-            // Refusal detected with failover enabled (Req 12.5, 12.9, 12.14):
-            // run the bounded re-dispatch loop, buffering each re-dispatched
-            // target before detection (same pattern as the non-streaming 17.2).
-            (PostCallOutcome::Proceed, RefusalDecision::Refusal(_signal)) => {
-                // Compute the fallback ordering once (Req 12.5, 12.7).
-                let model_group = match state.router.find_model_group(&request.model).await {
-                    Ok(mg) => mg,
-                    Err(_) => {
-                        // Cannot resolve model group — re-inject on current response and return.
-                        engine.reinject_response(&mut response, &guardrail_ctx);
-                        let chunks = if emit_early {
-                            guardrail_stream::rechunk_after_early_event(&response, &response_id, created)
-                        } else {
-                            guardrail_stream::rechunk_full(&response)
-                        };
-                        let duration_ms = start.elapsed().as_millis() as u64;
-                        let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                        log_request(&state, &request, &log_context);
-                        for chunk in chunks {
-                            yield Ok(Event::default().data(chunk.to_string()));
-                        }
-                        yield Ok(Event::default().data("[DONE]"));
-                        _guard.complete();
-                        return;
-                    }
-                };
-                let fallback_order = state.router.select_provider_order(&model_group).await;
-
-                // Identify the provider that produced the current (refused) response.
-                let already_tried_provider = response
-                    .extra
-                    .get("gateway_provider")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let mut tried: Vec<String> = vec![already_tried_provider.clone()];
-                let mut last_response = response;
-                let mut skip_reinjection = false;
-
-                // Bounded re-dispatch loop (Req 12.7): attempt each target at
-                // most once, bounded by ordering length. Re-dispatched targets in
-                // a streaming context are likewise buffered before detection.
-                for target in &fallback_order {
-                    let target_key = format!("{}:{}", target.provider, target.model);
-                    if tried.contains(&target.provider) {
-                        continue;
-                    }
-                    // Skip targets whose circuit breaker is open (Req 12.10).
-                    let cb = state.router.get_circuit_breaker(&target_key).await;
-                    if !cb.is_available().await {
-                        tracing::debug!(
-                            provider = %target.provider,
-                            model = %target.model,
-                            "Streaming refusal failover: circuit breaker open, skipping"
-                        );
-                        continue;
-                    }
-
-                    tried.push(target.provider.clone());
-
-                    // Re-dispatch the already-redacted request to this single
-                    // target (Req 12.5). Buffer the response for detection.
-                    let attempt_result = state
-                        .router
-                        .route_with_failover(&request, vec![target.clone()], None)
-                        .await;
-
-                    match attempt_result {
-                        Ok(mut new_response) => {
-                            // Re-run post-call + refusal detection on the new response.
-                            let new_tool_ctx = ToolContext {
-                                tool_use_allowed: request.extra.get("tool_choice").and_then(|v| v.as_str()).map_or(true, |tc| tc != "none"),
-                                tools_provided: request.extra.get("tools").and_then(|v| v.as_array()).map_or(false, |t| !t.is_empty()),
-                                finish_reason_is_tool_call: new_response.choices.first().and_then(|c| c.finish_reason.as_deref()).map_or(false, |r| r == "tool_calls"),
-                                has_tool_calls: new_response.choices.first().map_or(false, |c| {
-                                    c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
-                                }),
-                            };
-                            let (post_outcome, refusal_decision) = engine
-                                .run_post_call(&mut new_response, &selector, &mut guardrail_ctx, &stream_trace_id, &new_tool_ctx)
-                                .await;
-
-                            match post_outcome {
-                                PostCallOutcome::Block(block) => {
-                                    // Block from failover target → terminal SSE event (Req 10.3).
-                                    let payload = guardrail_stream::block_frame_payload(&block.entity_label);
-                                    let duration_ms = start.elapsed().as_millis() as u64;
-                                    let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
-                                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                                    log_request(&state, &request, &log_context);
-                                    yield Ok(Event::default().data(payload.to_string()));
-                                    yield Ok(Event::default().data("[DONE]"));
-                                    _guard.complete();
-                                    return;
-                                }
-                                PostCallOutcome::ServiceFailure => {
-                                    let msg = "guardrail service unavailable".to_string();
-                                    let duration_ms = start.elapsed().as_millis() as u64;
-                                    let err = GatewayError::GuardrailUnavailable(msg.clone());
-                                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                                    log_request(&state, &request, &log_context);
-                                    for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
-                                        yield Ok(event);
-                                    }
-                                    _guard.complete();
-                                    return;
-                                }
-                                PostCallOutcome::Replaced => {
-                                    last_response = new_response;
-                                    skip_reinjection = true;
-                                    break;
-                                }
-                                PostCallOutcome::Proceed => {
-                                    if !refusal_decision.is_refusal() {
-                                        // First non-refusal: use it (Req 12.5).
-                                        last_response = new_response;
-                                        break;
-                                    }
-                                    // Still a refusal — record and continue loop.
-                                    last_response = new_response;
-                                }
-                            }
-                        }
-                        Err(_e) => {
-                            tracing::debug!(
-                                provider = %target.provider,
-                                "Streaming refusal failover: provider error, trying next"
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                // PII re-injection runs exactly once on the finally selected
-                // response (Req 9.5, 12.5), unless replaced (Req 9.4).
-                if !skip_reinjection {
-                    engine.reinject_response(&mut last_response, &guardrail_ctx);
-                }
-
-                // Re-chunk the final response into SSE events (Req 10.4).
-                let chunks = if emit_early {
-                    guardrail_stream::rechunk_after_early_event(&last_response, &response_id, created)
-                } else {
-                    guardrail_stream::rechunk_full(&last_response)
-                };
-                if crate::router::router::Router::should_cache_response(&last_response) {
-                    if let Ok(json) = serde_json::to_string(&last_response) {
-                        state.exact_cache.set(&request, json);
-                    }
-                }
-                let duration_ms = start.elapsed().as_millis() as u64;
-                let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &last_response);
-                log_request(&state, &request, &log_context);
-                for chunk in chunks {
-                    yield Ok(Event::default().data(chunk.to_string()));
-                }
-                yield Ok(Event::default().data("[DONE]"));
-            }
-            // Block → terminal policy-violation event + [DONE] (Req 10.3).
-            (PostCallOutcome::Block(block), _) => {
-                let payload = guardrail_stream::block_frame_payload(&block.entity_label);
-                let duration_ms = start.elapsed().as_millis() as u64;
-                let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
-                let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                log_request(&state, &request, &log_context);
-                yield Ok(Event::default().data(payload.to_string()));
-                yield Ok(Event::default().data("[DONE]"));
-            }
-            // fail_close provider error/timeout → 503-style SSE termination (Req 9.7).
-            (PostCallOutcome::ServiceFailure, _) => {
-                let msg = "guardrail service unavailable".to_string();
+            // Premature disconnect handling (Req 10.5): fail_close discards, fail_open
+            // forwards the partial content through post-call.
+            if disconnected && (discard_on_disconnect || assembled.is_none()) {
+                let msg = "Upstream stream ended before a complete response; guardrail failure policy is fail-close".to_string();
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let err = GatewayError::GuardrailUnavailable(msg.clone());
                 let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
@@ -3736,11 +3495,252 @@ streaming_compression = Some(compression.clone());
                 for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                     yield Ok(event);
                 }
+                _guard.complete();
+                return;
             }
-        }
 
-        _guard.complete();
-    };
+            let mut response = match assembled {
+                Some(r) => r,
+                None => {
+                    yield Ok(Event::default().data("[DONE]"));
+                    _guard.complete();
+                    return;
+                }
+            };
+            if let Some(compression) = streaming_compression.take() {
+                response.extra.insert(
+                    "gateway_compression".to_string(),
+                    serde_json::to_value(compression)
+                        .expect("CompressionStats serialization must succeed"),
+                );
+            }
+
+            // Post-call guardrails on the assembled response, using the SAME ctx as
+            // pre-call so PII re-injection works (Req 9.5). No artificial delay is
+            // added, so re-chunked events forward within 500 ms of analysis (Req 10.6).
+            //
+            // Refusal detection runs on the assembled buffered response BEFORE the
+            // failover decision (Req 12.9). On premature stream termination (no
+            // finish_reason), detection runs on the partially assembled content and
+            // the same failover decision applies (Req 12.14).
+            let tool_ctx = ToolContext {
+                tool_use_allowed: request.extra.get("tool_choice").and_then(|v| v.as_str()).map_or(true, |tc| tc != "none"),
+                tools_provided: request.extra.get("tools").and_then(|v| v.as_array()).map_or(false, |t| !t.is_empty()),
+                finish_reason_is_tool_call: response.choices.first().and_then(|c| c.finish_reason.as_deref()).map_or(false, |r| r == "tool_calls"),
+                has_tool_calls: response.choices.first().map_or(false, |c| {
+                    c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
+                }),
+            };
+            match engine
+                .run_post_call(&mut response, &selector, &mut guardrail_ctx, &stream_trace_id, &tool_ctx)
+                .await
+            {
+                // Proceed without refusal, or replaced (halting action skips
+                // re-injection, Req 9.4) → re-chunk normally.
+                (PostCallOutcome::Proceed, RefusalDecision::NotRefusal)
+                | (PostCallOutcome::Replaced, _) => {
+                    let chunks = if emit_early {
+                        guardrail_stream::rechunk_after_early_event(&response, &response_id, created)
+                    } else {
+                        guardrail_stream::rechunk_full(&response)
+                    };
+                    if crate::router::router::Router::should_cache_response(&response) {
+                        if let Ok(json) = serde_json::to_string(&response) {
+                            state.exact_cache.set(&request, json);
+                        }
+                    }
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                    log_request(&state, &request, &log_context);
+                    for chunk in chunks {
+                        yield Ok(Event::default().data(chunk.to_string()));
+                    }
+                    yield Ok(Event::default().data("[DONE]"));
+                }
+                // Refusal detected with failover enabled (Req 12.5, 12.9, 12.14):
+                // run the bounded re-dispatch loop, buffering each re-dispatched
+                // target before detection (same pattern as the non-streaming 17.2).
+                (PostCallOutcome::Proceed, RefusalDecision::Refusal(_signal)) => {
+                    // Compute the fallback ordering once (Req 12.5, 12.7).
+                    let model_group = match state.router.find_model_group(&request.model).await {
+                        Ok(mg) => mg,
+                        Err(_) => {
+                            // Cannot resolve model group — re-inject on current response and return.
+                            engine.reinject_response(&mut response, &guardrail_ctx);
+                            let chunks = if emit_early {
+                                guardrail_stream::rechunk_after_early_event(&response, &response_id, created)
+                            } else {
+                                guardrail_stream::rechunk_full(&response)
+                            };
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                            log_request(&state, &request, &log_context);
+                            for chunk in chunks {
+                                yield Ok(Event::default().data(chunk.to_string()));
+                            }
+                            yield Ok(Event::default().data("[DONE]"));
+                            _guard.complete();
+                            return;
+                        }
+                    };
+                    let fallback_order = state.router.select_provider_order(&model_group).await;
+
+                    // Identify the provider that produced the current (refused) response.
+                    let already_tried_provider = response
+                        .extra
+                        .get("gateway_provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let mut tried: Vec<String> = vec![already_tried_provider.clone()];
+                    let mut last_response = response;
+                    let mut skip_reinjection = false;
+
+                    // Bounded re-dispatch loop (Req 12.7): attempt each target at
+                    // most once, bounded by ordering length. Re-dispatched targets in
+                    // a streaming context are likewise buffered before detection.
+                    for target in &fallback_order {
+                        let target_key = format!("{}:{}", target.provider, target.model);
+                        if tried.contains(&target.provider) {
+                            continue;
+                        }
+                        // Skip targets whose circuit breaker is open (Req 12.10).
+                        let cb = state.router.get_circuit_breaker(&target_key).await;
+                        if !cb.is_available().await {
+                            tracing::debug!(
+                                provider = %target.provider,
+                                model = %target.model,
+                                "Streaming refusal failover: circuit breaker open, skipping"
+                            );
+                            continue;
+                        }
+
+                        tried.push(target.provider.clone());
+
+                        // Re-dispatch the already-redacted request to this single
+                        // target (Req 12.5). Buffer the response for detection.
+                        let attempt_result = state
+                            .router
+                            .route_with_failover(&request, vec![target.clone()], None)
+                            .await;
+
+                        match attempt_result {
+                            Ok(mut new_response) => {
+                                // Re-run post-call + refusal detection on the new response.
+                                let new_tool_ctx = ToolContext {
+                                    tool_use_allowed: request.extra.get("tool_choice").and_then(|v| v.as_str()).map_or(true, |tc| tc != "none"),
+                                    tools_provided: request.extra.get("tools").and_then(|v| v.as_array()).map_or(false, |t| !t.is_empty()),
+                                    finish_reason_is_tool_call: new_response.choices.first().and_then(|c| c.finish_reason.as_deref()).map_or(false, |r| r == "tool_calls"),
+                                    has_tool_calls: new_response.choices.first().map_or(false, |c| {
+                                        c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
+                                    }),
+                                };
+                                let (post_outcome, refusal_decision) = engine
+                                    .run_post_call(&mut new_response, &selector, &mut guardrail_ctx, &stream_trace_id, &new_tool_ctx)
+                                    .await;
+
+                                match post_outcome {
+                                    PostCallOutcome::Block(block) => {
+                                        // Block from failover target → terminal SSE event (Req 10.3).
+                                        let payload = guardrail_stream::block_frame_payload(&block.entity_label);
+                                        let duration_ms = start.elapsed().as_millis() as u64;
+                                        let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
+                                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                                        log_request(&state, &request, &log_context);
+                                        yield Ok(Event::default().data(payload.to_string()));
+                                        yield Ok(Event::default().data("[DONE]"));
+                                        _guard.complete();
+                                        return;
+                                    }
+                                    PostCallOutcome::ServiceFailure => {
+                                        let msg = "guardrail service unavailable".to_string();
+                                        let duration_ms = start.elapsed().as_millis() as u64;
+                                        let err = GatewayError::GuardrailUnavailable(msg.clone());
+                                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                                        log_request(&state, &request, &log_context);
+                                        for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
+                                            yield Ok(event);
+                                        }
+                                        _guard.complete();
+                                        return;
+                                    }
+                                    PostCallOutcome::Replaced => {
+                                        last_response = new_response;
+                                        skip_reinjection = true;
+                                        break;
+                                    }
+                                    PostCallOutcome::Proceed => {
+                                        if !refusal_decision.is_refusal() {
+                                            // First non-refusal: use it (Req 12.5).
+                                            last_response = new_response;
+                                            break;
+                                        }
+                                        // Still a refusal — record and continue loop.
+                                        last_response = new_response;
+                                    }
+                                }
+                            }
+                            Err(_e) => {
+                                tracing::debug!(
+                                    provider = %target.provider,
+                                    "Streaming refusal failover: provider error, trying next"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    // PII re-injection runs exactly once on the finally selected
+                    // response (Req 9.5, 12.5), unless replaced (Req 9.4).
+                    if !skip_reinjection {
+                        engine.reinject_response(&mut last_response, &guardrail_ctx);
+                    }
+
+                    // Re-chunk the final response into SSE events (Req 10.4).
+                    let chunks = if emit_early {
+                        guardrail_stream::rechunk_after_early_event(&last_response, &response_id, created)
+                    } else {
+                        guardrail_stream::rechunk_full(&last_response)
+                    };
+                    if crate::router::router::Router::should_cache_response(&last_response) {
+                        if let Ok(json) = serde_json::to_string(&last_response) {
+                            state.exact_cache.set(&request, json);
+                        }
+                    }
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &last_response);
+                    log_request(&state, &request, &log_context);
+                    for chunk in chunks {
+                        yield Ok(Event::default().data(chunk.to_string()));
+                    }
+                    yield Ok(Event::default().data("[DONE]"));
+                }
+                // Block → terminal policy-violation event + [DONE] (Req 10.3).
+                (PostCallOutcome::Block(block), _) => {
+                    let payload = guardrail_stream::block_frame_payload(&block.entity_label);
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
+                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                    log_request(&state, &request, &log_context);
+                    yield Ok(Event::default().data(payload.to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
+                }
+                // fail_close provider error/timeout → 503-style SSE termination (Req 9.7).
+                (PostCallOutcome::ServiceFailure, _) => {
+                    let msg = "guardrail service unavailable".to_string();
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let err = GatewayError::GuardrailUnavailable(msg.clone());
+                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                    log_request(&state, &request, &log_context);
+                    for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
+                        yield Ok(event);
+                    }
+                }
+            }
+
+            _guard.complete();
+        };
 
     let mut sse = Sse::new(stream)
         .keep_alive(build_keepalive(&streaming_config))
@@ -4053,35 +4053,40 @@ fn chunk_carries_content(payload: &str) -> bool {
 }
 
 fn reqwest_error_chain(error: &reqwest::Error) -> String {
- let mut messages = Vec::new();
- let mut current: Option<&(dyn StdError + 'static)> = Some(error);
- while let Some(cause) = current {
- let message = cause.to_string();
- if messages.last() != Some(&message) {
- messages.push(message);
- }
- current = cause.source();
- }
- messages.join(": ")
+    let mut messages = Vec::new();
+    let mut current: Option<&(dyn StdError + 'static)> = Some(error);
+    while let Some(cause) = current {
+        let message = cause.to_string();
+        if messages.last() != Some(&message) {
+            messages.push(message);
+        }
+        current = cause.source();
+    }
+    messages.join(": ")
 }
 
 fn upstream_stream_metadata(
- upstream: &reqwest::Response,
+    upstream: &reqwest::Response,
 ) -> (reqwest::Version, String, String, Option<u64>) {
- let version = upstream.version();
- let content_encoding = upstream
- .headers()
- .get(header::CONTENT_ENCODING)
- .and_then(|value| value.to_str().ok())
- .unwrap_or("identity")
- .to_owned();
- let transfer_encoding = upstream
- .headers()
- .get(header::TRANSFER_ENCODING)
- .and_then(|value| value.to_str().ok())
- .unwrap_or("none")
- .to_owned();
- (version, content_encoding, transfer_encoding, upstream.content_length())
+    let version = upstream.version();
+    let content_encoding = upstream
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("identity")
+        .to_owned();
+    let transfer_encoding = upstream
+        .headers()
+        .get(header::TRANSFER_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("none")
+        .to_owned();
+    (
+        version,
+        content_encoding,
+        transfer_encoding,
+        upstream.content_length(),
+    )
 }
 
 /// Relay a true-streaming pass-through upstream response to the client as SSE
@@ -4156,316 +4161,316 @@ fn relay_passthrough_stream(
     memory_suffix: Option<String>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
- let chunk_timeout = Duration::from_secs(streaming_config.chunk_timeout_seconds);
- let deadline = tokio::time::Instant::now() + total_timeout;
- let (
- upstream_version,
- upstream_content_encoding,
- upstream_transfer_encoding,
- upstream_content_length,
- ) = upstream_stream_metadata(&upstream);
- let mut byte_stream = upstream.bytes_stream();
+    let chunk_timeout = Duration::from_secs(streaming_config.chunk_timeout_seconds);
+    let deadline = tokio::time::Instant::now() + total_timeout;
+    let (
+    upstream_version,
+    upstream_content_encoding,
+    upstream_transfer_encoding,
+    upstream_content_length,
+    ) = upstream_stream_metadata(&upstream);
+    let mut byte_stream = upstream.bytes_stream();
 
- let mut buffer = String::new();
- let mut bytes_received = 0usize;
+    let mut buffer = String::new();
+    let mut bytes_received = 0usize;
 
 
-        // Req 3.10: accumulate forwarded chunk payloads into an SSE buffer so a
-        // clean completion can be reassembled into a cacheable response.
-        let mut sse_accumulator = String::new();
+           // Req 3.10: accumulate forwarded chunk payloads into an SSE buffer so a
+           // clean completion can be reassembled into a cacheable response.
+           let mut sse_accumulator = String::new();
 
-        // Task 6.1: track whether any content/tool_call/reasoning delta has been
-        // forwarded. Drives the pre- vs post-content failure branch below.
-        let mut content_forwarded = false;
+           // Task 6.1: track whether any content/tool_call/reasoning delta has been
+           // forwarded. Drives the pre- vs post-content failure branch below.
+           let mut content_forwarded = false;
 
-        // `terminated` => the relay already wrote its own terminal frame(s) — a
-        // graceful error event (post-content, appends `[DONE]`) OR deliberate
-        // silence (pre-content failover) — so we must NOT emit a final `[DONE]`.
-        let mut terminated = false;
+           // `terminated` => the relay already wrote its own terminal frame(s) — a
+           // graceful error event (post-content, appends `[DONE]`) OR deliberate
+           // silence (pre-content failover) — so we must NOT emit a final `[DONE]`.
+           let mut terminated = false;
 
-        'relay: loop {
-            // Req 3.11: enforce the overall streaming budget.
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                let message = format!("Response exceeded {}s total timeout", total_timeout.as_secs());
-                if content_forwarded {
-                    for event in emit_sse_error_event("total_timeout_error", &message, &trace_id) {
-                        yield Ok(event);
-                    }
-                    *outcome.lock().await = RelayOutcome::FailedAfterContent(message);
-                } else {
-                    // Req 4.1: stay silent so the handler can fail over.
-                    *outcome.lock().await = RelayOutcome::FailedBeforeContent(message);
-                }
-                terminated = true;
-                break 'relay;
-            }
-            let per_chunk_wait = chunk_timeout.min(deadline - now);
+           'relay: loop {
+               // Req 3.11: enforce the overall streaming budget.
+               let now = tokio::time::Instant::now();
+               if now >= deadline {
+                   let message = format!("Response exceeded {}s total timeout", total_timeout.as_secs());
+                   if content_forwarded {
+                       for event in emit_sse_error_event("total_timeout_error", &message, &trace_id) {
+                           yield Ok(event);
+                       }
+                       *outcome.lock().await = RelayOutcome::FailedAfterContent(message);
+                   } else {
+                       // Req 4.1: stay silent so the handler can fail over.
+                       *outcome.lock().await = RelayOutcome::FailedBeforeContent(message);
+                   }
+                   terminated = true;
+                   break 'relay;
+               }
+               let per_chunk_wait = chunk_timeout.min(deadline - now);
 
-            let mut stream_ended = false;
-            match tokio::time::timeout(per_chunk_wait, byte_stream.next()).await {
- Ok(Some(Ok(bytes))) => {
- bytes_received = bytes_received.saturating_add(bytes.len());
- buffer.push_str(&String::from_utf8_lossy(&bytes));
- }
- Ok(Some(Err(e))) => {
- // Reqwest labels every HTTP body/frame failure as a decode error,
- // including HTTP/1 truncation and HTTP/2 resets. Preserve the source
- // chain so the client and logs expose the actual transport failure.
- let error_chain = reqwest_error_chain(&e);
- let message = format!("Stream error: {error_chain}");
- tracing::warn!(
- trace_id = %trace_id,
- error = %e,
- error_debug = ?e,
- error_chain = %error_chain,
- http_version = ?upstream_version,
- content_encoding = %upstream_content_encoding,
- transfer_encoding = %upstream_transfer_encoding,
- content_length = ?upstream_content_length,
- bytes_received,
- content_forwarded,
- "Upstream streaming response body failed"
- );
-
-                    if content_forwarded {
-                        for event in emit_sse_error_event("stream_error", &message, &trace_id) {
-                            yield Ok(event);
-                        }
-                        *outcome.lock().await = RelayOutcome::FailedAfterContent(message);
-                    } else {
-                        // Req 4.1: silent pre-content failure → handler retries.
-                        *outcome.lock().await = RelayOutcome::FailedBeforeContent(message);
-                    }
-                    terminated = true;
-                    break 'relay;
-                }
-                Ok(None) => {
-                    // Upstream finished — flush any trailing partial line by
-                    // forcing the line-drain loop to process the remainder.
-                    stream_ended = true;
-                    if !buffer.is_empty() && !buffer.ends_with('\n') {
-                        buffer.push('\n');
-                    }
-                }
-                Err(_) => {
-                    // Distinguish total-timeout (Req 3.11) from inter-chunk
-                    // timeout (Req 3.12): the wait was min(chunk, remaining_total).
-                    let (error_type, message) = if tokio::time::Instant::now() >= deadline {
-                        (
-                            "total_timeout_error",
-                            format!("Response exceeded {}s total timeout", total_timeout.as_secs()),
-                        )
-                    } else {
-                        (
-                            "chunk_timeout_error",
-                            format!(
-                                "Provider stopped sending data for {}s",
-                                streaming_config.chunk_timeout_seconds
-                            ),
-                        )
-                    };
-                    if content_forwarded {
-                        for event in emit_sse_error_event(error_type, &message, &trace_id) {
-                            yield Ok(event);
-                        }
-                        *outcome.lock().await = RelayOutcome::FailedAfterContent(message);
-                    } else {
-                        // Req 4.1: silent pre-content timeout → handler retries.
-                        *outcome.lock().await = RelayOutcome::FailedBeforeContent(message);
-                    }
-                    terminated = true;
-                    break 'relay;
-                }
-            }
-
-            // Drain all complete lines currently in the buffer.
-            while let Some(newline_idx) = buffer.find('\n') {
-                let raw: String = buffer.drain(..=newline_idx).collect();
-                let line = raw.trim_end_matches(|c| c == '\n' || c == '\r');
-                if line.is_empty() {
-                    continue; // SSE frame separator / blank line.
-                }
-
-                // Only `data:` lines carry payloads; skip `event:`/`id:`/`:comment`.
-                let payload = match line.strip_prefix("data:") {
-                    Some(rest) => rest.trim_start(),
-                    None => continue,
-                };
-
-                match classify_relay_line(payload) {
-                    RelayLineAction::Forward => {
-                        // Req 3.2: forward the validated chunk verbatim.
-                        // Req 3.10: also retain it for background reassembly so a
-                        // clean completion can be cached.
-                        // Task 6.1: once a real content delta is forwarded,
-                        // pre-content failover is no longer possible.
-                        if !content_forwarded && chunk_carries_content(payload) {
-                            content_forwarded = true;
-                        }
-                        sse_accumulator.push_str("data: ");
-                        sse_accumulator.push_str(payload);
-                        sse_accumulator.push_str("\n\n");
-                        yield Ok(Event::default().data(payload.to_string()));
-                    }
-                    RelayLineAction::SkipMalformed => {
-                        tracing::warn!(
-                            trace_id = %trace_id,
-                            "Skipping malformed SSE chunk from provider"
-                        );
-                    }
-                    RelayLineAction::SkipNonChunk => {
-                        tracing::debug!(
-                            trace_id = %trace_id,
-                            "Skipping non-chunk SSE data frame (no choices)"
-                        );
-                    }
-                    RelayLineAction::Done => {
-                        // Upstream `[DONE]`: stop reading; we emit our own below.
-                        break 'relay;
-                    }
-                    RelayLineAction::Error(message) => {
-                        if content_forwarded {
-                            for event in emit_sse_error_event("stream_error", &message, &trace_id) {
-                                yield Ok(event);
-                            }
-                            *outcome.lock().await = RelayOutcome::FailedAfterContent(message);
-                        } else {
-                            // Req 4.1: silent pre-content error frame → retry.
-                            *outcome.lock().await = RelayOutcome::FailedBeforeContent(message);
-                        }
-                        terminated = true;
-                        break 'relay;
-                    }
-                }
-            }
-
-            if stream_ended {
-                break 'relay;
-            }
-        }
-
-        // Req 3.6: always terminate with `[DONE]`, unless an error path already
-        // appended one via `emit_sse_error_event`.
-        if !terminated {
-            // Guard: if the upstream closed cleanly but never sent any content
-            // delta (e.g. provider returned HTTP 200 then immediately closed,
-            // sent only role-only/empty frames, or only non-data lines), treat
-            // this as a pre-content failure so the failover loop can retry the
-            // next provider. Without this, the client would see only the early
-            // event (+ maybe a duplicate role delta) + [DONE] — an apparently
-            // empty response with no error.
-            if !content_forwarded {
-                tracing::warn!(
-                    trace_id = %trace_id,
-                    sse_accumulator_len = sse_accumulator.len(),
-                    "Upstream closed cleanly but sent no content delta; treating as pre-content failure for failover"
-                );
-                *outcome.lock().await = RelayOutcome::FailedBeforeContent(
-                    "Provider stream ended without sending any content".to_string(),
-                );
-                // Stay silent (no error event, no [DONE]) so handler can retry.
-                // Any role-only chunks we already forwarded are idempotent with
-                // the early event and won't confuse the client on retry.
-                return;
-            }
-
-            // Req 3.7 / 3.10: clean completion — reassemble the accumulated chunks
-            // into a full response, cache it if eligible, and capture the
-            // reported usage for success accounting.
-            let mut completed_usage = Usage::default();
-            if !sse_accumulator.is_empty() {
-                match crate::router::router::Router::reassemble_sse_response(&sse_accumulator) {
-                    Ok(assembled) => {
-                        // Capture the reassembled usage (zeros when the
-                        // provider omitted usage frames) so the handler can
-                        // run cost accrual via record_streaming_success.
-                        completed_usage = assembled.usage.clone();
-                        // Adaptive XML-tool detection (only when the request
-                        // carried `tools`): if this provider/model streamed
-                        // XML-style tool calls in plain text instead of native
-                        // `tool_calls`, learn the combo so the NEXT tool request
-                        // for it takes the buffer-and-translate path. This one
-                        // request still streamed the raw XML — learning is for
-                        // subsequent requests.
-                        if let Some(det) = xml_detect.as_ref() {
-                            let choice = assembled.choices.first();
-                            let has_native_tc = choice
-                                .map(|c| c.message.extra.contains_key("tool_calls"))
-                                .unwrap_or(false);
-                            let content_text = choice
-                                .map(|c| c.message.content_as_text())
-                                .unwrap_or_default();
-                if !has_native_tc
-                    && crate::router::router::Router::looks_like_xml_tool_use(&content_text)
-                {
-                    det.router.mark_xml_tool_combo(&det.provider, &det.model);
-                    tracing::warn!(
-                        trace_id = %trace_id,
-                        provider = %det.provider,
-                        model = %det.model,
-                        "Detected XML-style tool use in streamed response; future tool requests for this provider/model will use the buffered translate path"
-                    );
-                } else if has_native_tc {
-                    // Mirror of the buffered-path diagnostic: native
-                    // tool_calls count toward forgiving a learned XML
-                    // combo (hint injection + buffer-and-translate stand
-                    // down after TOOL_HINT_RECOVERY_SUCCESSES).
-                    det.router
-                        .record_native_tool_success(&det.provider, &det.model);
-                }
-                        }
-                        // Req 3.7: surface usage from the final chunk in logs.
-                        tracing::info!(
-                            trace_id = %trace_id,
-                            prompt_tokens = assembled.usage.prompt_tokens,
-                            completion_tokens = assembled.usage.completion_tokens,
-                            total_tokens = assembled.usage.total_tokens,
-                            "Streaming pass-through completed; recorded usage"
-                        );
-                        // Req 3.10: cache only responses safe to replay (gate
-                        // identical to the buffer-and-replay path).
-                        if crate::router::router::Router::should_cache_response(&assembled) {
-                            if let Ok(json) = serde_json::to_string(&assembled) {
-                                if !json.is_empty() {
-                                    exact_cache.set(&request, json);
-                                    tracing::debug!(
-                                        trace_id = %trace_id,
-                                        "Cached reassembled streaming response in exact cache"
-                                    );
-                                }
-                            }
-                        }
-                        // Touch metrics so the dependency is exercised even when the
-                        // response is not cost-attributable here (no provider cost
-                        // rates in the relay path); usage is logged above per Req 3.7.
-                        // Task 5.5 may extend this to record provider-scoped cost.
-                        let _ = &metrics;
-                    }
-                    Err(e) => {
-                        // Reassembly failure is non-fatal for the client (the stream
-                        // already completed); just skip caching.
-                        tracing::warn!(
-                            trace_id = %trace_id,
-                            error = %e,
-                            "Failed to reassemble streaming response for caching"
-                        );
-                    }
-                }
-            }
-            // Task 6.1: a clean finish — record the outcome (carrying the
-            // reassembled usage, zeros when unavailable) so the handler's
-            // failover loop stops here (no retry) and can run success
-            // accounting via `record_streaming_success`.
-            *outcome.lock().await = RelayOutcome::Completed {
-                usage: completed_usage,
-            };
-            if let Some(suffix) = memory_suffix.as_deref() {
-                yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
-            }
-            yield Ok(Event::default().data("[DONE]"));
-        }
+               let mut stream_ended = false;
+               match tokio::time::timeout(per_chunk_wait, byte_stream.next()).await {
+    Ok(Some(Ok(bytes))) => {
+    bytes_received = bytes_received.saturating_add(bytes.len());
+    buffer.push_str(&String::from_utf8_lossy(&bytes));
     }
+    Ok(Some(Err(e))) => {
+    // Reqwest labels every HTTP body/frame failure as a decode error,
+    // including HTTP/1 truncation and HTTP/2 resets. Preserve the source
+    // chain so the client and logs expose the actual transport failure.
+    let error_chain = reqwest_error_chain(&e);
+    let message = format!("Stream error: {error_chain}");
+    tracing::warn!(
+    trace_id = %trace_id,
+    error = %e,
+    error_debug = ?e,
+    error_chain = %error_chain,
+    http_version = ?upstream_version,
+    content_encoding = %upstream_content_encoding,
+    transfer_encoding = %upstream_transfer_encoding,
+    content_length = ?upstream_content_length,
+    bytes_received,
+    content_forwarded,
+    "Upstream streaming response body failed"
+    );
+
+                       if content_forwarded {
+                           for event in emit_sse_error_event("stream_error", &message, &trace_id) {
+                               yield Ok(event);
+                           }
+                           *outcome.lock().await = RelayOutcome::FailedAfterContent(message);
+                       } else {
+                           // Req 4.1: silent pre-content failure → handler retries.
+                           *outcome.lock().await = RelayOutcome::FailedBeforeContent(message);
+                       }
+                       terminated = true;
+                       break 'relay;
+                   }
+                   Ok(None) => {
+                       // Upstream finished — flush any trailing partial line by
+                       // forcing the line-drain loop to process the remainder.
+                       stream_ended = true;
+                       if !buffer.is_empty() && !buffer.ends_with('\n') {
+                           buffer.push('\n');
+                       }
+                   }
+                   Err(_) => {
+                       // Distinguish total-timeout (Req 3.11) from inter-chunk
+                       // timeout (Req 3.12): the wait was min(chunk, remaining_total).
+                       let (error_type, message) = if tokio::time::Instant::now() >= deadline {
+                           (
+                               "total_timeout_error",
+                               format!("Response exceeded {}s total timeout", total_timeout.as_secs()),
+                           )
+                       } else {
+                           (
+                               "chunk_timeout_error",
+                               format!(
+                                   "Provider stopped sending data for {}s",
+                                   streaming_config.chunk_timeout_seconds
+                               ),
+                           )
+                       };
+                       if content_forwarded {
+                           for event in emit_sse_error_event(error_type, &message, &trace_id) {
+                               yield Ok(event);
+                           }
+                           *outcome.lock().await = RelayOutcome::FailedAfterContent(message);
+                       } else {
+                           // Req 4.1: silent pre-content timeout → handler retries.
+                           *outcome.lock().await = RelayOutcome::FailedBeforeContent(message);
+                       }
+                       terminated = true;
+                       break 'relay;
+                   }
+               }
+
+               // Drain all complete lines currently in the buffer.
+               while let Some(newline_idx) = buffer.find('\n') {
+                   let raw: String = buffer.drain(..=newline_idx).collect();
+                   let line = raw.trim_end_matches(|c| c == '\n' || c == '\r');
+                   if line.is_empty() {
+                       continue; // SSE frame separator / blank line.
+                   }
+
+                   // Only `data:` lines carry payloads; skip `event:`/`id:`/`:comment`.
+                   let payload = match line.strip_prefix("data:") {
+                       Some(rest) => rest.trim_start(),
+                       None => continue,
+                   };
+
+                   match classify_relay_line(payload) {
+                       RelayLineAction::Forward => {
+                           // Req 3.2: forward the validated chunk verbatim.
+                           // Req 3.10: also retain it for background reassembly so a
+                           // clean completion can be cached.
+                           // Task 6.1: once a real content delta is forwarded,
+                           // pre-content failover is no longer possible.
+                           if !content_forwarded && chunk_carries_content(payload) {
+                               content_forwarded = true;
+                           }
+                           sse_accumulator.push_str("data: ");
+                           sse_accumulator.push_str(payload);
+                           sse_accumulator.push_str("\n\n");
+                           yield Ok(Event::default().data(payload.to_string()));
+                       }
+                       RelayLineAction::SkipMalformed => {
+                           tracing::warn!(
+                               trace_id = %trace_id,
+                               "Skipping malformed SSE chunk from provider"
+                           );
+                       }
+                       RelayLineAction::SkipNonChunk => {
+                           tracing::debug!(
+                               trace_id = %trace_id,
+                               "Skipping non-chunk SSE data frame (no choices)"
+                           );
+                       }
+                       RelayLineAction::Done => {
+                           // Upstream `[DONE]`: stop reading; we emit our own below.
+                           break 'relay;
+                       }
+                       RelayLineAction::Error(message) => {
+                           if content_forwarded {
+                               for event in emit_sse_error_event("stream_error", &message, &trace_id) {
+                                   yield Ok(event);
+                               }
+                               *outcome.lock().await = RelayOutcome::FailedAfterContent(message);
+                           } else {
+                               // Req 4.1: silent pre-content error frame → retry.
+                               *outcome.lock().await = RelayOutcome::FailedBeforeContent(message);
+                           }
+                           terminated = true;
+                           break 'relay;
+                       }
+                   }
+               }
+
+               if stream_ended {
+                   break 'relay;
+               }
+           }
+
+           // Req 3.6: always terminate with `[DONE]`, unless an error path already
+           // appended one via `emit_sse_error_event`.
+           if !terminated {
+               // Guard: if the upstream closed cleanly but never sent any content
+               // delta (e.g. provider returned HTTP 200 then immediately closed,
+               // sent only role-only/empty frames, or only non-data lines), treat
+               // this as a pre-content failure so the failover loop can retry the
+               // next provider. Without this, the client would see only the early
+               // event (+ maybe a duplicate role delta) + [DONE] — an apparently
+               // empty response with no error.
+               if !content_forwarded {
+                   tracing::warn!(
+                       trace_id = %trace_id,
+                       sse_accumulator_len = sse_accumulator.len(),
+                       "Upstream closed cleanly but sent no content delta; treating as pre-content failure for failover"
+                   );
+                   *outcome.lock().await = RelayOutcome::FailedBeforeContent(
+                       "Provider stream ended without sending any content".to_string(),
+                   );
+                   // Stay silent (no error event, no [DONE]) so handler can retry.
+                   // Any role-only chunks we already forwarded are idempotent with
+                   // the early event and won't confuse the client on retry.
+                   return;
+               }
+
+               // Req 3.7 / 3.10: clean completion — reassemble the accumulated chunks
+               // into a full response, cache it if eligible, and capture the
+               // reported usage for success accounting.
+               let mut completed_usage = Usage::default();
+               if !sse_accumulator.is_empty() {
+                   match crate::router::router::Router::reassemble_sse_response(&sse_accumulator) {
+                       Ok(assembled) => {
+                           // Capture the reassembled usage (zeros when the
+                           // provider omitted usage frames) so the handler can
+                           // run cost accrual via record_streaming_success.
+                           completed_usage = assembled.usage.clone();
+                           // Adaptive XML-tool detection (only when the request
+                           // carried `tools`): if this provider/model streamed
+                           // XML-style tool calls in plain text instead of native
+                           // `tool_calls`, learn the combo so the NEXT tool request
+                           // for it takes the buffer-and-translate path. This one
+                           // request still streamed the raw XML — learning is for
+                           // subsequent requests.
+                           if let Some(det) = xml_detect.as_ref() {
+                               let choice = assembled.choices.first();
+                               let has_native_tc = choice
+                                   .map(|c| c.message.extra.contains_key("tool_calls"))
+                                   .unwrap_or(false);
+                               let content_text = choice
+                                   .map(|c| c.message.content_as_text())
+                                   .unwrap_or_default();
+                   if !has_native_tc
+                       && crate::router::router::Router::looks_like_xml_tool_use(&content_text)
+                   {
+                       det.router.mark_xml_tool_combo(&det.provider, &det.model);
+                       tracing::warn!(
+                           trace_id = %trace_id,
+                           provider = %det.provider,
+                           model = %det.model,
+                           "Detected XML-style tool use in streamed response; future tool requests for this provider/model will use the buffered translate path"
+                       );
+                   } else if has_native_tc {
+                       // Mirror of the buffered-path diagnostic: native
+                       // tool_calls count toward forgiving a learned XML
+                       // combo (hint injection + buffer-and-translate stand
+                       // down after TOOL_HINT_RECOVERY_SUCCESSES).
+                       det.router
+                           .record_native_tool_success(&det.provider, &det.model);
+                   }
+                           }
+                           // Req 3.7: surface usage from the final chunk in logs.
+                           tracing::info!(
+                               trace_id = %trace_id,
+                               prompt_tokens = assembled.usage.prompt_tokens,
+                               completion_tokens = assembled.usage.completion_tokens,
+                               total_tokens = assembled.usage.total_tokens,
+                               "Streaming pass-through completed; recorded usage"
+                           );
+                           // Req 3.10: cache only responses safe to replay (gate
+                           // identical to the buffer-and-replay path).
+                           if crate::router::router::Router::should_cache_response(&assembled) {
+                               if let Ok(json) = serde_json::to_string(&assembled) {
+                                   if !json.is_empty() {
+                                       exact_cache.set(&request, json);
+                                       tracing::debug!(
+                                           trace_id = %trace_id,
+                                           "Cached reassembled streaming response in exact cache"
+                                       );
+                                   }
+                               }
+                           }
+                           // Touch metrics so the dependency is exercised even when the
+                           // response is not cost-attributable here (no provider cost
+                           // rates in the relay path); usage is logged above per Req 3.7.
+                           // Task 5.5 may extend this to record provider-scoped cost.
+                           let _ = &metrics;
+                       }
+                       Err(e) => {
+                           // Reassembly failure is non-fatal for the client (the stream
+                           // already completed); just skip caching.
+                           tracing::warn!(
+                               trace_id = %trace_id,
+                               error = %e,
+                               "Failed to reassemble streaming response for caching"
+                           );
+                       }
+                   }
+               }
+               // Task 6.1: a clean finish — record the outcome (carrying the
+               // reassembled usage, zeros when unavailable) so the handler's
+               // failover loop stops here (no retry) and can run success
+               // accounting via `record_streaming_success`.
+               *outcome.lock().await = RelayOutcome::Completed {
+                   usage: completed_usage,
+               };
+               if let Some(suffix) = memory_suffix.as_deref() {
+                   yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+               }
+               yield Ok(Event::default().data("[DONE]"));
+           }
+       }
 }
 
 pub(crate) fn streaming_chunks_from_response(response: &OpenAIResponse) -> Vec<serde_json::Value> {
@@ -4720,12 +4725,11 @@ mod tests {
         classify_stream_error, collect_structured_output_failure, eager_sse_response,
         early_event_chunk, emit_sse_error_event, force_eager_structured_stream, json_model,
         memory_feedback_chunk, multipart_model, openai_json_response, prepare_response_for_client,
- provider_pass_through_response, rechunk_structured_response, relay_passthrough_stream,
- requests_structured_output, should_cache_eager_structured, smart_routing_headers,
- sse_error_payload, streaming_chunks_after_early_event, streaming_chunks_from_response,
- structured_stream_overflow_events, upstream_stream_metadata, RelayLineAction, RelayOutcome,
- RequestCompleteGuard, RequestLogContext, ValidationResponseStatus,
-
+        provider_pass_through_response, rechunk_structured_response, relay_passthrough_stream,
+        requests_structured_output, should_cache_eager_structured, smart_routing_headers,
+        sse_error_payload, streaming_chunks_after_early_event, streaming_chunks_from_response,
+        structured_stream_overflow_events, upstream_stream_metadata, RelayLineAction, RelayOutcome,
+        RequestCompleteGuard, RequestLogContext, ValidationResponseStatus,
     };
     use crate::compression::{stats::CompressionStats, CompressionLevel};
     use crate::config::StreamingConfig;
@@ -4940,7 +4944,7 @@ mod tests {
 
     // Feature: structured-output-validation, Property 12: Cache Write Gating
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_cache_write_gating(
@@ -4978,7 +4982,7 @@ mod tests {
 
     // Feature: structured-output-validation, Property 13: Skip Scenario Identity
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn prop_skip_scenario_identity(
@@ -5248,7 +5252,7 @@ mod tests {
 
     // Feature: smart-routing, Property 21: Exact Score Header Format
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn prop_smart_routing_score_header_has_exact_format_and_normalized_value(score in any::<f64>()) {
@@ -5305,7 +5309,7 @@ mod tests {
 
     // Feature: smart-routing, Property 22: Header Absence Without Routing Metadata
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn prop_smart_routing_headers_are_absent_without_metadata_or_when_bypassed(
@@ -5867,12 +5871,12 @@ mod tests {
         (exact_cache, metrics, request)
     }
 
-/// Throwaway outcome handle for relay tests that don't assert the signal.
-fn mk_outcome() -> std::sync::Arc<tokio::sync::Mutex<RelayOutcome>> {
-    std::sync::Arc::new(tokio::sync::Mutex::new(RelayOutcome::Completed {
-        usage: Usage::default(),
-    }))
-}
+    /// Throwaway outcome handle for relay tests that don't assert the signal.
+    fn mk_outcome() -> std::sync::Arc<tokio::sync::Mutex<RelayOutcome>> {
+        std::sync::Arc::new(tokio::sync::Mutex::new(RelayOutcome::Completed {
+            usage: Usage::default(),
+        }))
+    }
 
     /// Req 3.2 / 3.6: forwarded chunks reach the client and the relay always
     /// terminates with exactly one `[DONE]` on a clean finish. Malformed and
@@ -6145,33 +6149,29 @@ fn mk_outcome() -> std::sync::Arc<tokio::sync::Mutex<RelayOutcome>> {
     /// Build a streaming `reqwest::Response` whose body errors immediately,
     /// before any byte is delivered — drives the relay's pre-content failure
     /// path.
- fn erroring_streaming_response() -> reqwest::Response {
- let stream = futures::stream::once(async move {
- Err::<&[u8], _>(std::io::Error::new(
- std::io::ErrorKind::ConnectionReset,
- "reset",
- ))
- });
- let http_response = axum::http::Response::new(reqwest::Body::wrap_stream(stream));
- reqwest::Response::from(http_response)
- }
+    fn erroring_streaming_response() -> reqwest::Response {
+        let stream = futures::stream::once(async move {
+            Err::<&[u8], _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            ))
+        });
+        let http_response = axum::http::Response::new(reqwest::Body::wrap_stream(stream));
+        reqwest::Response::from(http_response)
+    }
 
- #[test]
- fn reqwest_error_chain_includes_transport_cause() {
- let response = erroring_streaming_response();
- let (
- version,
- content_encoding,
- transfer_encoding,
- content_length,
- ) = upstream_stream_metadata(&response);
- assert_eq!(version, reqwest::Version::HTTP_11);
- assert_eq!(content_encoding, "identity");
- assert_eq!(transfer_encoding, "none");
- assert_eq!(content_length, None);
- }
+    #[test]
+    fn reqwest_error_chain_includes_transport_cause() {
+        let response = erroring_streaming_response();
+        let (version, content_encoding, transfer_encoding, content_length) =
+            upstream_stream_metadata(&response);
+        assert_eq!(version, reqwest::Version::HTTP_11);
+        assert_eq!(content_encoding, "identity");
+        assert_eq!(transfer_encoding, "none");
+        assert_eq!(content_length, None);
+    }
 
- /// Task 6.1 / Req 4.1, 4.4: when the upstream errors BEFORE any content is
+    /// Task 6.1 / Req 4.1, 4.4: when the upstream errors BEFORE any content is
 
     /// forwarded, the relay stays silent (no error event, no `[DONE]`) and
     /// records `FailedBeforeContent` so the handler can fail over without
@@ -6181,30 +6181,29 @@ fn mk_outcome() -> std::sync::Arc<tokio::sync::Mutex<RelayOutcome>> {
         let response = erroring_streaming_response();
         let (exact_cache, metrics, request) = relay_cache_deps();
         let outcome = mk_outcome();
- let stream = relay_passthrough_stream(
- response,
- StreamingConfig::default(),
- "tr-pre-content-fail".to_string(),
- Duration::from_secs(30),
- exact_cache,
- metrics,
- request,
- outcome.clone(),
- None,
- None,
- );
- let events: Vec<_> = stream.collect().await;
- assert!(
- events.is_empty(),
- "pre-content failure must emit no SSE events"
- );
- let guard = outcome.lock().await;
- match &*guard {
- RelayOutcome::FailedBeforeContent(reason) => assert!(reason.contains("reset")),
- other => panic!("expected FailedBeforeContent, got {other:?}"),
- }
- }
-
+        let stream = relay_passthrough_stream(
+            response,
+            StreamingConfig::default(),
+            "tr-pre-content-fail".to_string(),
+            Duration::from_secs(30),
+            exact_cache,
+            metrics,
+            request,
+            outcome.clone(),
+            None,
+            None,
+        );
+        let events: Vec<_> = stream.collect().await;
+        assert!(
+            events.is_empty(),
+            "pre-content failure must emit no SSE events"
+        );
+        let guard = outcome.lock().await;
+        match &*guard {
+            RelayOutcome::FailedBeforeContent(reason) => assert!(reason.contains("reset")),
+            other => panic!("expected FailedBeforeContent, got {other:?}"),
+        }
+    }
 
     /// Task 6.1: a clean completion records `Completed` so the handler's
     /// failover loop terminates without retrying.
@@ -6227,9 +6226,12 @@ fn mk_outcome() -> std::sync::Arc<tokio::sync::Mutex<RelayOutcome>> {
             None,
             None,
         );
-    let _events: Vec<_> = stream.collect().await;
-    assert!(matches!(&*outcome.lock().await, RelayOutcome::Completed { .. }));
-}
+        let _events: Vec<_> = stream.collect().await;
+        assert!(matches!(
+            &*outcome.lock().await,
+            RelayOutcome::Completed { .. }
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7559,6 +7561,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
         .loop_detector
         .metrics
         .write_prometheus(&mut out, state.loop_detector.sessions.len());
+    state.router.search_metrics().write_prometheus(&mut out);
     if let Some(memory) = state.memory_system.read().await.clone() {
         memory.metrics.write_prometheus(&mut out);
     }

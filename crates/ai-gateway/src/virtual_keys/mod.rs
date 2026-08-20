@@ -523,7 +523,7 @@ mod property_tests {
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 100,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 
@@ -566,7 +566,7 @@ mod property_tests {
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 100,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 

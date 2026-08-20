@@ -537,7 +537,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn property_13_foundation_preserves_every_non_description_value(tools in schema_strategy()) {

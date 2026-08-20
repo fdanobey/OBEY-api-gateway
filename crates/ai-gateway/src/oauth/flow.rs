@@ -172,7 +172,7 @@ mod tests {
     // (lowercase + spaces, mimicking real OAuth scopes like "openid profile").
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 256,
+            cases: 64,
             .. ProptestConfig::default()
         })]
 

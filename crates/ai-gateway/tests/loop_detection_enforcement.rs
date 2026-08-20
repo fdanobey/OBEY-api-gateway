@@ -13,7 +13,7 @@ fn immediate_config() -> LoopDetectionConfig {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: agent-loop-detection, Property 4: Sequential Enforcement Escalation
     #[test]

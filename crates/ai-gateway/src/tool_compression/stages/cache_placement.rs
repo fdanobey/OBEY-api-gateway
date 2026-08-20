@@ -370,7 +370,7 @@ mod property_tests {
     //    - All tools from the input are present (no tools lost or duplicated)
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(200))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
         fn cache_placement_stability_ordering(

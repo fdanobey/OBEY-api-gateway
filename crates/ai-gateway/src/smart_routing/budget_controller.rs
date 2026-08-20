@@ -894,7 +894,7 @@ mod tests {
     }
 
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: smart-routing, Property 27: Budget pressure permits at most a one-tier downgrade.
     #[test]

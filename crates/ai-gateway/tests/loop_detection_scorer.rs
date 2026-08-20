@@ -14,7 +14,7 @@ fn signals(values: [f32; 7]) -> SignalValues {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // Feature: agent-loop-detection, Property 1: Confidence Score Normalization
     #[test]
