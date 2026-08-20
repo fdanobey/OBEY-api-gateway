@@ -6,11 +6,14 @@ use std::time::Duration;
 const DEFAULT_SEARCH_BASE_URL: &str = "https://chatgpt.com/backend-api/codex/alpha/search";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 15;
 const DEFAULT_MAX_ITERATIONS: u32 = 5;
+const DEFAULT_OUTPUT_TO_CHAT: bool = true;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CodexSearchConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub output_to_chat: Option<bool>,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
@@ -43,6 +46,14 @@ impl CodexSearchConfig {
 
     pub fn effective_enabled(&self, has_codex_provider: bool) -> bool {
         self.enabled.unwrap_or(has_codex_provider)
+    }
+
+    /// When enabled, executed search tool results are also appended to the
+    /// assistant message content so they persist in the visible chat
+    /// history instead of living only in tool-call metadata that context
+    /// compression can strip.
+    pub fn effective_output_to_chat(&self) -> bool {
+        self.output_to_chat.unwrap_or(DEFAULT_OUTPUT_TO_CHAT)
     }
 
     pub fn effective_timeout(&self) -> Duration {
@@ -186,6 +197,21 @@ mod tests {
             ..Default::default()
         };
         assert!(!cfg.effective_enabled(true));
+    }
+
+    #[test]
+    fn effective_output_to_chat_defaults_true() {
+        let cfg = CodexSearchConfig::default();
+        assert!(cfg.effective_output_to_chat());
+    }
+
+    #[test]
+    fn effective_output_to_chat_respects_explicit_false() {
+        let cfg = CodexSearchConfig {
+            output_to_chat: Some(false),
+            ..Default::default()
+        };
+        assert!(!cfg.effective_output_to_chat());
     }
 
     #[test]

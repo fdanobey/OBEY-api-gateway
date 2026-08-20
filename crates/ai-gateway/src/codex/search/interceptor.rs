@@ -32,13 +32,19 @@ pub struct InterceptResult {
 pub struct ToolInterceptor {
     executor: Arc<SearchExecutor>,
     max_iterations: u32,
+    output_to_chat: bool,
 }
 
 impl ToolInterceptor {
-    pub fn new(executor: Arc<SearchExecutor>, max_iterations: u32) -> Self {
+    pub fn new(
+        executor: Arc<SearchExecutor>,
+        max_iterations: u32,
+        output_to_chat: bool,
+    ) -> Self {
         Self {
             executor,
             max_iterations,
+            output_to_chat,
         }
     }
 
@@ -56,11 +62,17 @@ impl ToolInterceptor {
         let start = Instant::now();
         let mut current_response = initial_response;
         let mut iterations: u32 = 0;
+        let mut all_results: Vec<Value> = Vec::new();
+        let mut seen_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         loop {
             let tool_calls = extract_tool_calls(&current_response);
 
             if tool_calls.is_empty() {
+                if self.output_to_chat {
+                    append_results_to_chat(&mut current_response, &all_results);
+                }
+                attach_results_to_response(&mut current_response, &all_results);
                 return Ok(InterceptResult {
                     response: current_response,
                     pending_client_tool_calls: Vec::new(),
@@ -77,14 +89,14 @@ impl ToolInterceptor {
                 let executed_results = self
                     .execute_and_append_tool_results(&mut request, &gateway_calls)
                     .await;
-                let mut response_with_results = current_response;
-                response_with_results.extra.insert(
-                    "codex_search_tool_results".to_string(),
-                    Value::Array(executed_results),
-                );
+                extend_results_deduped(&mut all_results, &mut seen_call_ids, executed_results);
+                if self.output_to_chat {
+                    append_results_to_chat(&mut current_response, &all_results);
+                }
+                attach_results_to_response(&mut current_response, &all_results);
 
                 return Ok(InterceptResult {
-                    response: response_with_results,
+                    response: current_response,
                     pending_client_tool_calls: client_calls.into_iter().cloned().collect(),
                     iteration_limit_reached: false,
                     total_latency_ms: start.elapsed().as_millis() as u64,
@@ -93,7 +105,11 @@ impl ToolInterceptor {
 
             if iterations >= self.max_iterations {
                 append_iteration_limit_message(&mut request);
-                let final_response = self.resubmit(provider, &request).await?;
+                let mut final_response = self.resubmit(provider, &request).await?;
+                if self.output_to_chat {
+                    append_results_to_chat(&mut final_response, &all_results);
+                }
+                attach_results_to_response(&mut final_response, &all_results);
                 return Ok(InterceptResult {
                     response: final_response,
                     pending_client_tool_calls: Vec::new(),
@@ -103,8 +119,10 @@ impl ToolInterceptor {
             }
 
             append_assistant_message(&mut request, &current_response);
-            self.execute_and_append_tool_results(&mut request, &gateway_calls)
+            let executed_results = self
+                .execute_and_append_tool_results(&mut request, &gateway_calls)
                 .await;
+            extend_results_deduped(&mut all_results, &mut seen_call_ids, executed_results);
 
             iterations += 1;
 
@@ -136,19 +154,21 @@ impl ToolInterceptor {
                 .and_then(|f| f.get("arguments"))
                 .and_then(|a| a.as_str())
                 .unwrap_or("{}");
-            let args_value: Value =
-                serde_json::from_str(args_str).unwrap_or(Value::Object(Default::default()));
+        let args_value: Value =
+            serde_json::from_str(args_str).unwrap_or(Value::Object(Default::default()));
 
-            let result = match tool_name.as_str() {
-                "codex_search" => {
-                    let parsed: CodexSearchArgs = serde_json::from_value(args_value.clone())
-                        .unwrap_or(CodexSearchArgs {
-                            q: String::new(),
-                            domains: None,
-                            recency: None,
-                        });
-                    self.executor.execute_search(parsed).await
-                }
+        let mut query: Option<String> = None;
+        let result = match tool_name.as_str() {
+            "codex_search" => {
+                let parsed: CodexSearchArgs = serde_json::from_value(args_value.clone())
+                    .unwrap_or(CodexSearchArgs {
+                        q: String::new(),
+                        domains: None,
+                        recency: None,
+                    });
+                query = Some(parsed.q.clone());
+                self.executor.execute_search(parsed).await
+            }
                 "codex_web" => {
                     let parsed: CodexWebArgs = serde_json::from_value(args_value.clone())
                         .unwrap_or(CodexWebArgs {
@@ -165,15 +185,19 @@ impl ToolInterceptor {
                 },
             };
 
-            let tool_message = build_tool_message(&call_id, &result);
-            executed_results.push(json!({
+        let tool_message = build_tool_message(&call_id, &result);
+        let mut executed = json!({
             "tool_call_id": call_id,
             "name": tool_name,
             "content": result.content,
             "is_error": result.is_error,
             "session_id": result.session_id,
-            }));
-            request.messages.push(tool_message);
+        });
+        if let Some(q) = query {
+            executed["query"] = Value::String(q);
+        }
+        executed_results.push(executed);
+        request.messages.push(tool_message);
         }
         executed_results
     }
@@ -239,6 +263,73 @@ fn append_iteration_limit_message(request: &mut OpenAIRequest) {
         content: Value::String(ITERATION_LIMIT_MESSAGE.to_string()),
         extra: serde_json::Map::new(),
     });
+}
+
+/// Append executed results to `all_results`, skipping call IDs already seen.
+fn extend_results_deduped(
+    all_results: &mut Vec<Value>,
+    seen_call_ids: &mut std::collections::HashSet<String>,
+    executed_results: Vec<Value>,
+) {
+    for result in executed_results {
+        let call_id = result
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        if seen_call_ids.insert(call_id) {
+            all_results.push(result);
+        }
+    }
+}
+
+/// Attach executed results to the response as `codex_search_tool_results`
+/// metadata for programmatic consumption by API clients.
+fn attach_results_to_response(response: &mut OpenAIResponse, all_results: &[Value]) {
+    if all_results.is_empty() {
+        return;
+    }
+    response.extra.insert(
+        "codex_search_tool_results".to_string(),
+        Value::Array(all_results.to_vec()),
+    );
+}
+
+/// Append executed results to the assistant message content so they are
+/// visible in chat history. Unlike tool-call metadata, plain content
+/// survives downstream context/tool compression, preventing the model
+/// from forgetting that the search already ran.
+fn append_results_to_chat(response: &mut OpenAIResponse, all_results: &[Value]) {
+    if all_results.is_empty() {
+        return;
+    }
+    if let Some(choice) = response.choices.first_mut() {
+        let block = format_results_block(all_results);
+        let existing = choice.message.content_as_text();
+        let combined = if existing.trim().is_empty() {
+            block
+        } else {
+            format!("{}\n\n{}", existing, block)
+        };
+        choice.message.content = Value::String(combined);
+    }
+}
+
+fn format_results_block(results: &[Value]) -> String {
+    let mut lines = vec!["--- codex search results ---".to_string()];
+    for result in results {
+        let name = result.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+        let header = match result.get("query").and_then(|v| v.as_str()) {
+            Some(q) if !q.is_empty() => format!("[{} \"{}\"]", name, q),
+            _ => format!("[{}]", name),
+        };
+        lines.push(header);
+        if let Some(content) = result.get("content").and_then(|v| v.as_str()) {
+            lines.push(content.to_string());
+        }
+    }
+    lines.push("--- end codex search results ---".to_string());
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -417,26 +508,26 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn no_tool_calls_returns_immediately() {
-        let executor = make_executor();
-        let interceptor = ToolInterceptor::new(executor, 5);
-        let provider = MockProvider::new(vec![make_final_response("hello")]);
+#[tokio::test]
+async fn no_tool_calls_returns_immediately() {
+    let executor = make_executor();
+    let interceptor = ToolInterceptor::new(executor, 5, false);
+    let provider = MockProvider::new(vec![make_final_response("hello")]);
 
-        let result = interceptor
-            .intercept(&provider, make_request(), make_final_response("hello"))
-            .await
-            .unwrap();
+    let result = interceptor
+        .intercept(&provider, make_request(), make_final_response("hello"))
+        .await
+        .unwrap();
 
-        assert!(!result.iteration_limit_reached);
-        assert!(result.pending_client_tool_calls.is_empty());
-        assert_eq!(provider.calls(), 0);
-    }
+    assert!(!result.iteration_limit_reached);
+    assert!(result.pending_client_tool_calls.is_empty());
+    assert_eq!(provider.calls(), 0);
+}
 
-    #[tokio::test]
-    async fn iteration_limit_enforced() {
-        let executor = make_executor();
-        let interceptor = ToolInterceptor::new(executor, 2);
+#[tokio::test]
+async fn iteration_limit_enforced() {
+    let executor = make_executor();
+    let interceptor = ToolInterceptor::new(executor, 2, false);
         let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
         let provider = MockProvider::new(vec![
             make_response_with_tool_calls(vec![search_call.clone()]),
@@ -453,10 +544,10 @@ mod tests {
         assert!(result.iteration_limit_reached);
     }
 
-    #[tokio::test]
-    async fn mixed_gateway_and_client_tools_stops_loop() {
-        let executor = make_executor();
-        let interceptor = ToolInterceptor::new(executor, 5);
+#[tokio::test]
+async fn mixed_gateway_and_client_tools_stops_loop() {
+    let executor = make_executor();
+    let interceptor = ToolInterceptor::new(executor, 5, false);
         let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
         let client_call = make_tool_call("call_2", "client_custom_tool", r#"{"x":1}"#);
         let provider = MockProvider::new(vec![]);
@@ -494,21 +585,130 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn single_tool_call_then_final_answer() {
-        let executor = make_executor();
-        let interceptor = ToolInterceptor::new(executor, 5);
-        let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
-        let provider = MockProvider::new(vec![make_final_response("final answer")]);
+#[tokio::test]
+async fn single_tool_call_then_final_answer() {
+    let executor = make_executor();
+    let interceptor = ToolInterceptor::new(executor, 5, false);
+    let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
+    let provider = MockProvider::new(vec![make_final_response("final answer")]);
 
-        let initial = make_response_with_tool_calls(vec![search_call]);
-        let result = interceptor
-            .intercept(&provider, make_request(), initial)
-            .await
-            .unwrap();
+    let initial = make_response_with_tool_calls(vec![search_call]);
+    let result = interceptor
+        .intercept(&provider, make_request(), initial)
+        .await
+        .unwrap();
 
-        assert!(!result.iteration_limit_reached);
-        assert!(result.pending_client_tool_calls.is_empty());
-        assert_eq!(provider.calls(), 1);
-    }
+    assert!(!result.iteration_limit_reached);
+    assert!(result.pending_client_tool_calls.is_empty());
+    assert_eq!(provider.calls(), 1);
+    // Metadata attachment happens on the final-answer path too.
+    let executed = result
+        .response
+        .extra
+        .get("codex_search_tool_results")
+        .and_then(|v| v.as_array())
+        .expect("results should be attached on final-answer path");
+    assert_eq!(executed.len(), 1);
+    assert_eq!(
+        executed[0].get("query").and_then(Value::as_str),
+        Some("test")
+    );
+    // With output_to_chat disabled the assistant content is untouched.
+    let content = result
+        .response
+        .choices
+        .first()
+        .map(|c| c.message.content_as_text())
+        .unwrap_or_default();
+    assert_eq!(content, "final answer");
+}
+
+#[tokio::test]
+async fn output_to_chat_appends_results_to_content() {
+    let executor = make_executor();
+    let interceptor = ToolInterceptor::new(executor, 5, true);
+    let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"rust news"}"#);
+    let provider = MockProvider::new(vec![make_final_response("final answer")]);
+
+    let initial = make_response_with_tool_calls(vec![search_call]);
+    let result = interceptor
+        .intercept(&provider, make_request(), initial)
+        .await
+        .unwrap();
+
+    let content = result
+        .response
+        .choices
+        .first()
+        .map(|c| c.message.content_as_text())
+        .expect("content should exist");
+    assert!(
+        content.starts_with("final answer"),
+        "original content must be preserved, got: {content}"
+    );
+    assert!(content.contains("--- codex search results ---"));
+    assert!(content.contains("[codex_search \"rust news\"]"));
+    assert!(content.contains("--- end codex search results ---"));
+    // Metadata is still attached alongside the chat block.
+    assert!(result
+        .response
+        .extra
+        .get("codex_search_tool_results")
+        .and_then(|v| v.as_array())
+        .is_some());
+}
+
+#[tokio::test]
+async fn output_to_chat_appends_on_client_tool_stop() {
+    let executor = make_executor();
+    let interceptor = ToolInterceptor::new(executor, 5, true);
+    let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
+    let client_call = make_tool_call("call_2", "client_custom_tool", r#"{"x":1}"#);
+    let provider = MockProvider::new(vec![]);
+
+    let initial = make_response_with_tool_calls(vec![search_call, client_call]);
+    let result = interceptor
+        .intercept(&provider, make_request(), initial)
+        .await
+        .unwrap();
+
+    let content = result
+        .response
+        .choices
+        .first()
+        .map(|c| c.message.content_as_text())
+        .expect("content should exist");
+    assert!(content.contains("--- codex search results ---"));
+    assert!(content.contains("[codex_search \"test\"]"));
+}
+
+#[tokio::test]
+async fn repeated_call_ids_are_deduplicated() {
+    let executor = make_executor();
+    let interceptor = ToolInterceptor::new(executor, 5, false);
+    // Same call ID echoed again after resubmit — must not duplicate results.
+    let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
+    let provider = MockProvider::new(vec![
+        make_response_with_tool_calls(vec![search_call.clone()]),
+        make_final_response("done"),
+    ]);
+
+    let initial = make_response_with_tool_calls(vec![search_call]);
+    let result = interceptor
+        .intercept(&provider, make_request(), initial)
+        .await
+        .unwrap();
+
+    let executed = result
+        .response
+        .extra
+        .get("codex_search_tool_results")
+        .and_then(|v| v.as_array())
+        .expect("results should be attached");
+    assert_eq!(
+        executed.len(),
+        1,
+        "duplicate call_id must be deduplicated, got {executed:?}"
+    );
+}
 }

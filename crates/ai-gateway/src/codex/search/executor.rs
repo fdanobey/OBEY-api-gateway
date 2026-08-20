@@ -255,7 +255,7 @@ impl SearchExecutor {
                     self.usage_tracker.update_from_headers(&headers).await;
                     return Ok(content);
                 }
-                SendOutcome::AuthError(status, latency_ms, headers) => {
+                SendOutcome::AuthError(_status, latency_ms, headers) => {
                     self.metrics.record_latency(tool, latency_ms);
                     self.usage_tracker.update_from_headers(&headers).await;
                     return Err(Self::error_tool_result("Search authentication failed."));

@@ -374,13 +374,43 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         <div class="hint">URL path for the Prometheus scrape endpoint</div>
       </div>
     </fieldset>
-    <fieldset><legend>Codex Backend</legend>
-      <div class="form-group">
-        <label for="codex-url">Codex Instructions URL <span class="hint-inline">(optional)</span></label>
-        <input type="text" id="codex-url" placeholder="Leave blank for default" autocomplete="off">
-        <div class="hint">Override the source URL for Codex system prompt instructions. Only relevant when using OpenAI OAuth with Codex backend translation.</div>
-      </div>
-    </fieldset>
+<fieldset><legend>Codex Backend</legend>
+<div class="form-group">
+<label for="codex-url">Codex Instructions URL <span class="hint-inline">(optional)</span></label>
+<input type="text" id="codex-url" placeholder="Leave blank for default" autocomplete="off">
+<div class="hint">Override the source URL for Codex system prompt instructions. Only relevant when using OpenAI OAuth with Codex backend translation.</div>
+</div>
+</fieldset>
+<fieldset><legend>Codex Search</legend>
+<div class="form-check">
+<input type="checkbox" id="codex-search-enabled">
+<label for="codex-search-enabled">Enable Codex web search tools</label>
+<div class="hint">Injects codex_search/codex_web tools into Codex-routed requests when OAuth is active. Default: enabled when a Codex OAuth provider exists.</div>
+</div>
+<div class="form-check">
+<input type="checkbox" id="codex-search-output-chat">
+<label for="codex-search-output-chat">Output search results to chat</label>
+<div class="hint">Appends executed search results to the assistant message content so they persist in chat history instead of tool-call metadata. Recommended when using tool compression.</div>
+</div>
+<div class="form-group">
+<label for="codex-search-base-url">Search Base URL <span class="hint-inline">(optional)</span></label>
+<input type="text" id="codex-search-base-url" placeholder="https://chatgpt.com/backend-api/codex/alpha/search" autocomplete="off">
+</div>
+<div class="form-row">
+<div class="form-group">
+<label for="codex-search-timeout">Search Timeout (seconds)</label>
+<input type="number" id="codex-search-timeout" value="15" min="1" max="120" aria-describedby="codex-search-timeout-error">
+<div class="hint">1–120, default 15</div>
+<div class="error" id="codex-search-timeout-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="codex-search-iterations">Max Search Iterations</label>
+<input type="number" id="codex-search-iterations" value="5" min="1" max="20" aria-describedby="codex-search-iterations-error">
+<div class="hint">1–20 agent-loop iterations, default 5</div>
+<div class="error" id="codex-search-iterations-error" role="alert"></div>
+</div>
+</div>
+</fieldset>
     <div class="actions">
       <button class="btn btn-primary" data-action="save">Save</button>
       <button class="btn btn-secondary" data-action="reset">Reset</button>
@@ -3213,6 +3243,7 @@ if (pageId === 'virtual-keys') { vkOnOpen(); }
     var dc=cfg.dashboard||{}; document.getElementById('dash-enabled').checked=dc.enabled!==false; document.getElementById('dash-path').value=dc.path||'/dashboard'; document.getElementById('dash-interval').value=dc.metrics_update_interval_seconds||1;
     var pc=cfg.prometheus||{}; document.getElementById('prom-enabled').checked=!!pc.enabled; document.getElementById('prom-path').value=pc.path||'/metrics';
     document.getElementById('codex-url').value=cfg.codex_instructions_url||'';
+var cs=cfg.codex_search||{}; document.getElementById('codex-search-enabled').checked=cs.enabled!==false; document.getElementById('codex-search-output-chat').checked=cs.output_to_chat!==false; document.getElementById('codex-search-base-url').value=cs.base_url||''; document.getElementById('codex-search-timeout').value=cs.timeout_seconds||15; document.getElementById('codex-search-iterations').value=cs.max_iterations||5;
     var ec=cfg.exact_cache||{}; document.getElementById('ecache-enabled').checked=ec.enabled!==false; document.getElementById('ecache-max-entries').value=ec.max_entries||5000; document.getElementById('ecache-ttl').value=ec.ttl_seconds!=null?ec.ttl_seconds:3600; document.getElementById('ecache-temp-threshold').value=ec.temperature_threshold!=null?ec.temperature_threshold:0.15;
     provList.innerHTML=''; if(cfg.providers){cfg.providers.forEach(function(p){addProviderCard(p);});}
     grpList.innerHTML=''; if(cfg.model_groups){cfg.model_groups.forEach(function(g){addGroupCard(g);});}
@@ -3292,6 +3323,11 @@ function simulateSmartRouting(){var group=document.getElementById('smart-sim-gro
     cfg.dashboard={enabled:document.getElementById('dash-enabled').checked,path:document.getElementById('dash-path').value.trim()||'/dashboard',metrics_update_interval_seconds:parseInt(document.getElementById('dash-interval').value,10)||1};
     cfg.prometheus=document.getElementById('prom-enabled').checked?{enabled:true,path:document.getElementById('prom-path').value.trim()||'/metrics'}:null;
     var codexUrl=document.getElementById('codex-url').value.trim(); if(codexUrl){cfg.codex_instructions_url=codexUrl;}else{delete cfg.codex_instructions_url;}
+var csSearch={enabled:document.getElementById('codex-search-enabled').checked,output_to_chat:document.getElementById('codex-search-output-chat').checked};
+var csBaseUrl=document.getElementById('codex-search-base-url').value.trim(); if(csBaseUrl){csSearch.base_url=csBaseUrl;}
+var csTimeout=parseInt(document.getElementById('codex-search-timeout').value,10); if(csTimeout){csSearch.timeout_seconds=csTimeout;}
+var csIter=parseInt(document.getElementById('codex-search-iterations').value,10); if(csIter){csSearch.max_iterations=csIter;}
+cfg.codex_search=csSearch;
     cfg.exact_cache={enabled:document.getElementById('ecache-enabled').checked,max_entries:parseInt(document.getElementById('ecache-max-entries').value,10)||5000,ttl_seconds:parseInt(document.getElementById('ecache-ttl').value,10)||3600,temperature_threshold:parseFloat(document.getElementById('ecache-temp-threshold').value)||0.15};
     var originalProviders = (config && config.providers) || [];
     cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});

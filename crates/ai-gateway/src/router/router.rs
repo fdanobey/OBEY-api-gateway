@@ -2425,10 +2425,11 @@ impl Router {
                     codex_search_config.effective_base_url(),
                     codex_search_config.effective_timeout(),
                 ));
-                let interceptor = crate::codex::search::interceptor::ToolInterceptor::new(
-                    executor,
-                    codex_search_config.effective_max_iterations(),
-                );
+let interceptor = crate::codex::search::interceptor::ToolInterceptor::new(
+executor,
+codex_search_config.effective_max_iterations(),
+codex_search_config.effective_output_to_chat(),
+);
                 let intercepted = interceptor
                     .intercept(&codex_client, codex_request, result.response)
                     .await?;

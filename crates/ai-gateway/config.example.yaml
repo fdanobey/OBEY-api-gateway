@@ -104,6 +104,16 @@ model_groups:
 xhigh_models_allowlist: []
 reasoning_models_allowlist: []
 
+# Codex web search: transparently injects codex_search/codex_web tools into
+# Codex-routed OAuth requests and executes them against the Codex search API.
+codex_search:
+  enabled: true                  # default: enabled when a Codex OAuth provider exists
+  output_to_chat: true           # append search results to assistant message content so they
+                                 # survive context/tool compression (models remember the search)
+  timeout_seconds: 15            # 1..120
+  max_iterations: 5              # 1..20 agent-loop resubmissions
+  # base_url: "https://chatgpt.com/backend-api/codex/alpha/search"  # optional override
+
 circuit_breaker:
   failure_threshold: 3
   backoff_sequence_seconds: [5, 10, 20, 40, 300]
