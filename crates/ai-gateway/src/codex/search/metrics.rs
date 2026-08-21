@@ -75,25 +75,9 @@ impl SearchMetrics {
                 .or_insert_with(LatencyHistogram::new)
                 .observe(duration_ms);
         }
-    }
+}
 
-    #[cfg(test)]
-    pub fn execution_count(&self, tool: &str) -> u64 {
-        self.executions
-            .get(tool)
-            .map(|counter| counter.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-
-    #[cfg(test)]
-    pub fn latency_count(&self, tool: &str) -> u64 {
-        self.latency
-            .get(tool)
-            .map(|histogram| histogram.count.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-
-    pub fn write_prometheus(&self, out: &mut String) {
+pub fn write_prometheus(&self, out: &mut String) {
         out.push_str(
             "# HELP obey_codex_search_tool_executions_total Total codex search tool executions\n",
         );

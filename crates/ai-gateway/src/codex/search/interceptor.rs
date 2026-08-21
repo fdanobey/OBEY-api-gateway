@@ -21,6 +21,7 @@ const ITERATION_LIMIT_MESSAGE: &str = "Codex search agent loop iteration limit r
      Please refine your request or provide the information directly.";
 
 /// Result of intercepting a provider response through the agent loop.
+#[allow(dead_code)]
 pub struct InterceptResult {
     pub response: OpenAIResponse,
     pub pending_client_tool_calls: Vec<Value>,

@@ -134,11 +134,13 @@ pub struct ToolInjector;
 
 impl ToolInjector {
     /// Returns the codex_search tool definition.
+    #[allow(dead_code)]
     pub fn codex_search_definition() -> &'static Value {
         &CODEX_SEARCH_DEFINITION
     }
 
     /// Returns the codex_web tool definition.
+    #[allow(dead_code)]
     pub fn codex_web_definition() -> &'static Value {
         &CODEX_WEB_DEFINITION
     }

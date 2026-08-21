@@ -70,6 +70,7 @@ impl SearchExecutor {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_sleeper(
         http: reqwest::Client,
         oauth: Arc<OAuthManager>,

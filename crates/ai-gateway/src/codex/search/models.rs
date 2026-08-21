@@ -84,12 +84,15 @@ impl ResponseLength {
     pub fn medium() -> Self {
         Self("medium".to_string())
     }
+    #[allow(dead_code)]
     pub fn long() -> Self {
         Self("long".to_string())
     }
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
+    #[allow(dead_code)]
     pub fn from_string(s: String) -> Self {
         Self(s)
     }
@@ -142,6 +145,7 @@ pub struct CodexSearchRequestCommands {
 }
 
 /// Upstream search response (opaque, untrusted).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CodexSearchResponse {
     #[serde(flatten)]
