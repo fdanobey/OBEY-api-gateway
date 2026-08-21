@@ -189,17 +189,20 @@ impl SearchExecutor {
             Err(_) => return Self::error_tool_result("Search authentication configuration error."),
         };
 
-        match self
-            .send_with_retry(tool, &access_token, &account_id, &body)
-            .await
-        {
-            Ok(content) => ToolResult {
-                content: truncate_content(&content),
+    match self
+        .send_with_retry(tool, &access_token, &account_id, &body)
+        .await
+    {
+        Ok(content) => {
+            let normalized = normalize_search_response(&content);
+            ToolResult {
+                content: truncate_content(&normalized),
                 is_error: false,
                 session_id: None,
-            },
-            Err(tool_err) => tool_err,
+            }
         }
+        Err(tool_err) => tool_err,
+    }
     }
 
     async fn send_with_retry(
@@ -519,6 +522,58 @@ fn truncate_content(content: &str) -> String {
     }
     let truncated: String = content.chars().take(MAX_RESULT_CHARS).collect();
     format!("{truncated}{TRUNCATION_SUFFIX}")
+}
+
+/// Normalize the raw upstream search response into a readable text block
+/// for the model. The endpoint returns JSON with an `encrypted_output`
+/// blob (opaque to the model) alongside structured `results` and an
+/// optional plaintext `output` field. We extract the useful parts and
+/// discard the encrypted payload so the model gets actionable content.
+fn normalize_search_response(raw: &str) -> String {
+    let parsed: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return raw.to_string(),
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(output) = parsed.get("output").and_then(|v| v.as_str()) {
+        if !output.trim().is_empty() {
+            parts.push(output.trim().to_string());
+        }
+    }
+
+    if let Some(results) = parsed.get("results").and_then(|v| v.as_array()) {
+        if !results.is_empty() {
+            parts.push("\nSearch results:".to_string());
+            for (i, item) in results.iter().enumerate() {
+                let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                let snippet = item.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
+                let ref_id = item.get("ref_id").and_then(|v| v.as_str()).unwrap_or("");
+                let mut line = format!("[{}] ", i + 1);
+                if !title.is_empty() {
+                    line.push_str(title);
+                }
+                if !url.is_empty() {
+                    line.push_str(&format!(" - {url}"));
+                }
+                if !ref_id.is_empty() {
+                    line.push_str(&format!(" (ref_id: {ref_id})"));
+                }
+                if !snippet.is_empty() {
+                    line.push_str(&format!("\n    {snippet}"));
+                }
+                parts.push(line);
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return raw.to_string();
+    }
+
+    parts.join("\n")
 }
 
 #[cfg(test)]
