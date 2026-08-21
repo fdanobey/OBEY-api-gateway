@@ -105,9 +105,12 @@ xhigh_models_allowlist: []
 reasoning_models_allowlist: []
 
 # Codex web search: transparently injects codex_search/codex_web tools into
-# Codex-routed OAuth requests and executes them against the Codex search API.
+# requests routed to ANY provider while a valid OpenAI OAuth token is active.
+# Search calls execute server-side against the Codex search endpoint using
+# the OAuth token; the completion itself is served by the routed provider,
+# so Codex completion quota is not consumed for the chat itself.
 codex_search:
-  enabled: true                  # default: enabled when a Codex OAuth provider exists
+  enabled: true                  # default: enabled when a valid OAuth token exists
   output_to_chat: true           # append search results to assistant message content so they
                                  # survive context/tool compression (models remember the search)
   timeout_seconds: 15            # 1..120

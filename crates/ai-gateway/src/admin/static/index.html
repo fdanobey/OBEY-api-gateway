@@ -385,7 +385,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 <div class="form-check">
 <input type="checkbox" id="codex-search-enabled">
 <label for="codex-search-enabled">Enable Codex web search tools</label>
-<div class="hint">Injects codex_search/codex_web tools into Codex-routed requests when OAuth is active. Default: enabled when a Codex OAuth provider exists.</div>
+<div class="hint">Injects codex_search/codex_web tools into requests routed to any provider while a valid OpenAI OAuth token is active. The serving model need not be the Codex backend — search calls run server-side against the Codex search endpoint using the OAuth token. Default: enabled when a token is available.</div>
 </div>
 <div class="form-check">
 <input type="checkbox" id="codex-search-output-chat">

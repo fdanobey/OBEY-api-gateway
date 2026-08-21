@@ -49,6 +49,67 @@ const TOOL_HINT_RECOVERY_SUCCESSES: u32 = 3;
 /// (see [`Router::should_inject_tool_hint`]).
 const XML_PRONE_MODEL_MARKERS: &[&str] = &["kimi", "glm", "qwen", "deepseek"];
 
+/// Adapter that lets the Codex Search agent loop resubmit through the
+/// normal dispatch pipeline (`attempt_with_retry`) for any provider.
+/// Resubmissions reuse the same model rewrite, retry, and translation
+/// logic as first attempts; interception itself lives at the failover
+/// layer, so re-entry cannot recurse into another interception.
+struct SearchResubmitter<'a> {
+    router: &'a Router,
+    provider_name: &'a str,
+    provider_model: &'a ProviderModel,
+    active: Option<ActiveRequestHandle>,
+    base_attempt: usize,
+}
+
+#[async_trait::async_trait]
+impl ProviderClient for SearchResubmitter<'_> {
+    async fn chat_completion(
+        &self,
+        request: OpenAIRequest,
+    ) -> Result<ProviderResponse, GatewayError> {
+        let response = self
+            .router
+            .attempt_with_retry(
+                self.provider_name,
+                &request,
+                self.provider_model,
+                self.active.clone(),
+                self.base_attempt,
+            )
+            .await?;
+        Ok(ProviderResponse {
+            response,
+            provider_name: self.provider_name.to_string(),
+            latency_ms: 0,
+        })
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        _request: OpenAIRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>> + Send>,
+        >,
+        GatewayError,
+    > {
+        Err(GatewayError::Provider {
+            provider: self.provider_name.to_string(),
+            message: "streaming is not supported for search resubmission".to_string(),
+            status_code: Some(500),
+        })
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
+        Ok(Vec::new())
+    }
+
+    fn provider_name(&self) -> &str {
+        self.provider_name
+    }
+}
+
 #[derive(Debug)]
 struct ProviderConcurrencyState {
     limit: usize,
@@ -2329,6 +2390,122 @@ impl Router {
         .await
     }
 
+    /// Returns the effective Codex Search configuration when the feature is
+    /// enabled and a valid OpenAI OAuth token exists, `None` otherwise.
+    ///
+    /// Unlike the Codex dispatch path, this check is independent of the
+    /// serving provider: any model group can invoke gateway search while a
+    /// valid token is available. The token validity check awaits token
+    /// refresh, so callers must not hold the config lock across it.
+    async fn codex_search_ready(&self) -> Option<crate::codex::search::CodexSearchConfig> {
+        let cfg = self
+            .config
+            .read()
+            .await
+            .codex_search
+            .clone()
+            .unwrap_or_default();
+        let token_available = match &self.oauth_manager {
+            Some(manager) => manager.get_access_token().await.is_some(),
+            None => false,
+        };
+        if cfg.effective_enabled(token_available) {
+            Some(cfg)
+        } else {
+            None
+        }
+    }
+
+    /// Inject `codex_search`/`codex_web` tool definitions into a prepared
+    /// request when the search feature is active. Runs after tool
+    /// compression so the injected definitions are never compressed away.
+    async fn maybe_inject_search_tools(&self, request: &mut OpenAIRequest) {
+        if self.codex_search_ready().await.is_some() {
+            crate::codex::search::injector::ToolInjector::inject(request, true, true);
+        }
+    }
+
+    /// Run the Codex Search agent loop when a buffered provider response
+    /// contains gateway-injected search tool calls. No-ops for Codex
+    /// providers (already intercepted during Codex dispatch) and for
+    /// responses without search tool calls.
+    async fn maybe_intercept_search_tools(
+        &self,
+        provider_model: &ProviderModel,
+        request: &OpenAIRequest,
+        response: OpenAIResponse,
+        active: Option<ActiveRequestHandle>,
+        base_attempt: usize,
+    ) -> Result<OpenAIResponse, GatewayError> {
+        let has_gateway_call = response
+            .choices
+            .first()
+            .and_then(|c| c.message.extra.get("tool_calls"))
+            .and_then(|v| v.as_array())
+            .map(|calls| {
+                calls.iter().any(|tc| {
+                    tc.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(|n| n == "codex_search" || n == "codex_web")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !has_gateway_call {
+            return Ok(response);
+        }
+        let Some(search_cfg) = self.codex_search_ready().await else {
+            return Ok(response);
+        };
+        let Some(oauth) = self.oauth_manager.clone() else {
+            return Ok(response);
+        };
+        let pool_config = {
+            let config = self.config.read().await;
+            config
+                .providers
+                .iter()
+                .find(|p| p.name == provider_model.provider)
+                .map(|p| p.connection_pool.clone())
+        };
+        let http = match pool_config {
+            Some(pool) => self.get_or_create_http_client(&provider_model.provider, &pool)?,
+            None => {
+                let default_pool = crate::config::ProviderConnectionPoolConfig::default();
+                self.get_or_create_http_client(&provider_model.provider, &default_pool)?
+            }
+        };
+        let usage_tracker = self
+            .oauth_usage_tracker
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::oauth::UsageTracker::new()));
+        let executor = Arc::new(crate::codex::search::executor::SearchExecutor::new(
+            http,
+            oauth,
+            usage_tracker,
+            self.search_metrics.clone(),
+            search_cfg.effective_base_url(),
+            search_cfg.effective_timeout(),
+        ));
+        let interceptor = crate::codex::search::interceptor::ToolInterceptor::new(
+            executor,
+            search_cfg.effective_max_iterations(),
+            search_cfg.effective_output_to_chat(),
+        );
+        let resubmitter = SearchResubmitter {
+            router: self,
+            provider_name: provider_model.provider.as_str(),
+            provider_model,
+            active,
+            base_attempt,
+        };
+        let intercepted = interceptor
+            .intercept(&resubmitter, request.clone(), response)
+            .await?;
+        Ok(intercepted.response)
+    }
+
     async fn dispatch_attempts_under_permit(
         &self,
         provider_name: &str,
@@ -3586,7 +3763,7 @@ codex_search_config.effective_output_to_chat(),
                 continue;
             }
 
-            let (prepared_request, compression) = self
+            let (mut prepared_request, compression) = self
                 .prepare_compressed_request_with_stats(
                     request,
                     model_group,
@@ -3594,6 +3771,11 @@ codex_search_config.effective_output_to_chat(),
                     &request_id,
                 )
                 .await;
+            // Inject gateway search tools after compression so the injected
+            // definitions are never compressed away. Applies to every
+            // provider type; the Codex dispatch path re-injects
+            // idempotently for itself.
+            self.maybe_inject_search_tools(&mut prepared_request).await;
             // Report the current attempt target to the in-flight registry. The
             // first attempt of the whole request uses the initial phase (Primary,
             // or Cascade when re-routed by smart routing); subsequent providers
@@ -3645,17 +3827,34 @@ codex_search_config.effective_output_to_chat(),
                             ),
                             None,
                         );
-                        attempts.push(ProviderAttempt::new(
-                            provider_model.provider.clone(),
-                            provider_model.model.clone(),
-                            "Provider returned empty response with no assistant content"
-                                .to_string(),
-                            Some(200),
-                        ));
-                        continue;
-                    }
+                attempts.push(ProviderAttempt::new(
+                    provider_model.provider.clone(),
+                    provider_model.model.clone(),
+                    "Provider returned empty response with no assistant content"
+                        .to_string(),
+                    Some(200),
+                ));
+                continue;
+            }
 
-                    // --- Truncation detection and retry (Req 6.1, 6.3, 6.4) ---
+            // --- Codex Search agent loop (any provider) ---
+            // When the buffered response contains gateway-injected search
+            // tool calls, execute them against the Codex search endpoint
+            // with the gateway's OpenAI OAuth token and resubmit through
+            // the normal dispatch pipeline until the model produces a
+            // final answer. No-ops for Codex providers (intercepted during
+            // Codex dispatch) and for responses without search tool calls.
+            response = self
+                .maybe_intercept_search_tools(
+                    &provider_model,
+                    &prepared_request,
+                    response,
+                    active.clone(),
+                    attempt_counter,
+                )
+                .await?;
+
+            // --- Truncation detection and retry (Req 6.1, 6.3, 6.4) ---
                     // A provider can return HTTP 200 with finish_reason="length"
                     // yet stop well short of the client's requested max_tokens —
                     // a sign it hit an internal cap rather than the legitimate
