@@ -6194,22 +6194,41 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             handle.set_target(&provider_model.provider, &provider_model.model, phase);
         }
 
-        // Compression is provider-specific and completes before model rewrite,
-        // sanitization, or the upstream streaming request starts.
-        let request_id = format!("stream-{}", uuid::Uuid::new_v4());
-        let (compressed_request, compression) = self
-            .prepare_compressed_request_with_stats(
-                &prepared_request,
-                &model_group,
-                &provider_model,
-                &request_id,
-            )
-            .await;
+    // Codex Search is active → route to the buffered path BEFORE running
+    // compression. Streaming pass-through cannot intercept tool calls to
+    // execute search server-side, and without injection the model never
+    // sees the codex_search/codex_web tools. The buffered path injects the
+    // tool definitions after its own compression and intercepts/executes
+    // any search tool calls before returning the final response. Checking
+    // here avoids burning a compression pass that the buffered path will
+    // redo anyway.
+    if self.codex_search_ready().await.is_some() {
+        debug!(
+            provider = %provider_model.provider,
+            "Codex search active — routing streaming request through buffered path for tool-call interception"
+        );
+        drop(concurrency_permit);
+        return Ok(StreamingResponse::Buffered(
+            self.route_request(request, active.clone()).await?,
+        ));
+    }
 
-        // Inspect the chosen provider config. Clone every field needed for the
-        // outgoing request before dropping the config guard — the guard must
-        // not be held across the network `.await`.
-        let provider_cfg = {
+    // Compression is provider-specific and completes before model rewrite,
+    // sanitization, or the upstream streaming request starts.
+    let request_id = format!("stream-{}", uuid::Uuid::new_v4());
+    let (compressed_request, compression) = self
+        .prepare_compressed_request_with_stats(
+            &prepared_request,
+            &model_group,
+            &provider_model,
+            &request_id,
+        )
+        .await;
+
+    // Inspect the chosen provider config. Clone every field needed for the
+    // outgoing request before dropping the config guard — the guard must
+    // not be held across the network `.await`.
+    let provider_cfg = {
             let config = self.config.read().await;
             config
                 .providers
