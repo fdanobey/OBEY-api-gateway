@@ -36,6 +36,11 @@ static CODEX_SEARCH_DEFINITION: LazyLock<Value> = LazyLock::new(|| {
                         "minimum": 1,
                         "maximum": 365,
                         "description": "Filter results by age in days"
+                    },
+                    "response_length": {
+                        "type": "string",
+                        "enum": ["short", "medium", "long"],
+                        "description": "Hint for result verbosity (default: short)"
                     }
                 },
                 "required": ["q"]
@@ -63,23 +68,52 @@ static CODEX_WEB_DEFINITION: LazyLock<Value> = LazyLock::new(|| {
                         "properties": {
                             "search_query": {
                                 "type": "array",
-                                "items": { "$ref": "#/definitions/searchQuery" },
-                                "maxItems": 10
+                                "maxItems": 10,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "q": { "type": "string", "description": "Search query text" },
+                                        "domains": { "type": "array", "items": { "type": "string" }, "description": "Restrict to these domains" },
+                                        "recency": { "type": "integer", "description": "Filter by age in days" }
+                                    },
+                                    "required": ["q"]
+                                }
                             },
                             "open": {
                                 "type": "array",
-                                "items": { "$ref": "#/definitions/open" },
-                                "maxItems": 10
+                                "maxItems": 10,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "ref_id": { "type": "string", "description": "Reference ID from search results" },
+                                        "lineno": { "type": "integer", "description": "Optional line number to open at" }
+                                    },
+                                    "required": ["ref_id"]
+                                }
                             },
                             "find": {
                                 "type": "array",
-                                "items": { "$ref": "#/definitions/find" },
-                                "maxItems": 10
+                                "maxItems": 10,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "ref_id": { "type": "string", "description": "Reference ID of the page to search" },
+                                        "pattern": { "type": "string", "description": "Text pattern to find" }
+                                    },
+                                    "required": ["ref_id", "pattern"]
+                                }
                             },
                             "click": {
                                 "type": "array",
-                                "items": { "$ref": "#/definitions/click" },
-                                "maxItems": 10
+                                "maxItems": 10,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "ref_id": { "type": "string", "description": "Reference ID of the result to click" },
+                                        "id": { "type": "integer", "description": "Numeric ID of the link to click" }
+                                    },
+                                    "required": ["ref_id"]
+                                }
                             }
                         }
                     },

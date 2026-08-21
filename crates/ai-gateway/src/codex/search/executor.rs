@@ -97,28 +97,30 @@ impl SearchExecutor {
             return e;
         }
 
-        let session_id = Uuid::new_v4().to_string();
-        let commands = CodexSearchRequestCommands {
-            search_query: Some(vec![crate::codex::search::models::SearchQueryCommand {
-                q: args.q,
-                domains: args.domains,
-                recency: args.recency,
-            }]),
-            open: None,
-            find: None,
-            click: None,
-            response_length: None,
-            extra: serde_json::Map::new(),
-        };
+    let session_id = Uuid::new_v4().to_string();
+    let commands = CodexSearchRequestCommands {
+        search_query: Some(vec![crate::codex::search::models::SearchQueryCommand {
+            q: args.q,
+            domains: args.domains,
+            recency: args.recency,
+        }]),
+        open: None,
+        find: None,
+        click: None,
+        response_length: Some(
+            args.response_length.unwrap_or_else(ResponseLength::short),
+        ),
+        extra: serde_json::Map::new(),
+    };
 
-        let request = CodexSearchRequest {
-            model: SEARCH_MODEL.to_string(),
-            session_id: session_id.clone(),
-            commands,
-            extra: serde_json::Map::new(),
-        };
+    let request = CodexSearchRequest {
+        id: session_id,
+        model: SEARCH_MODEL.to_string(),
+        commands,
+        extra: serde_json::Map::new(),
+    };
 
-        let result = self.dispatch_upstream("codex_search", &request).await;
+    let result = self.dispatch_upstream("codex_search", &request).await;
         self.metrics.record_execution("codex_search");
         result
     }
@@ -155,14 +157,14 @@ impl SearchExecutor {
             }
         };
 
-        let request = CodexSearchRequest {
-            model: SEARCH_MODEL.to_string(),
-            session_id: session_id.clone(),
-            commands,
-            extra: serde_json::Map::new(),
-        };
+    let request = CodexSearchRequest {
+        id: session_id.clone(),
+        model: SEARCH_MODEL.to_string(),
+        commands,
+        extra: serde_json::Map::new(),
+    };
 
-        let mut result = self.dispatch_upstream("codex_web", &request).await;
+    let mut result = self.dispatch_upstream("codex_web", &request).await;
         self.metrics.record_execution("codex_web");
         if result.session_id.is_none() {
             result.session_id = Some(session_id);
@@ -322,16 +324,17 @@ impl SearchExecutor {
     ) -> SendOutcome {
         let start = Instant::now();
 
-        let resp = self
-            .http
-            .post(&self.base_url)
-            .header("authorization", format!("Bearer {access_token}"))
-            .header("chatgpt-account-id", account_id)
-            .header("content-type", "application/json")
-            .timeout(self.timeout)
-            .json(body)
-            .send()
-            .await;
+    let resp = self
+        .http
+        .post(&self.base_url)
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("chatgpt-account-id", account_id)
+        .header("content-type", "application/json")
+        .header("user-agent", "codex-cli/0.147.0-alpha.6.5")
+        .timeout(self.timeout)
+        .json(body)
+        .send()
+        .await;
 
         let resp = match resp {
             Ok(r) => r,
@@ -530,22 +533,24 @@ mod tests {
 
     #[test]
     fn domains_length_10_accepted() {
-        let args = CodexSearchArgs {
-            q: "hello".to_string(),
-            domains: domains(10),
-            recency: None,
-        };
-        assert!(SearchExecutor::validate_search_args(&args).is_ok());
-    }
+    let args = CodexSearchArgs {
+        q: "hello".to_string(),
+        domains: domains(10),
+        recency: None,
+        response_length: None,
+    };
+    assert!(SearchExecutor::validate_search_args(&args).is_ok());
+}
 
     #[test]
     fn domains_length_11_rejected() {
-        let args = CodexSearchArgs {
-            q: "hello".to_string(),
-            domains: domains(11),
-            recency: None,
-        };
-        let err = SearchExecutor::validate_search_args(&args).unwrap_err();
+    let args = CodexSearchArgs {
+        q: "hello".to_string(),
+        domains: domains(11),
+        recency: None,
+        response_length: None,
+    };
+    let err = SearchExecutor::validate_search_args(&args).unwrap_err();
         assert!(err.is_error);
         assert_eq!(err.content, "Domains list exceeds 10 entries");
     }
@@ -557,6 +562,7 @@ mod tests {
             q,
             domains: None,
             recency: None,
+        response_length: None,
         };
         assert!(SearchExecutor::validate_search_args(&args).is_ok());
     }
@@ -568,6 +574,7 @@ mod tests {
             q,
             domains: None,
             recency: None,
+        response_length: None,
         };
         let err = SearchExecutor::validate_search_args(&args).unwrap_err();
         assert!(err.is_error);
@@ -580,6 +587,7 @@ mod tests {
             q: "hello".to_string(),
             domains: None,
             recency: Some(1),
+        response_length: None,
         };
         assert!(SearchExecutor::validate_search_args(&args).is_ok());
     }
@@ -590,6 +598,7 @@ mod tests {
             q: "hello".to_string(),
             domains: None,
             recency: Some(365),
+        response_length: None,
         };
         assert!(SearchExecutor::validate_search_args(&args).is_ok());
     }
@@ -600,6 +609,7 @@ mod tests {
             q: "hello".to_string(),
             domains: None,
             recency: Some(0),
+        response_length: None,
         };
         let err = SearchExecutor::validate_search_args(&args).unwrap_err();
         assert!(err.is_error);
@@ -612,6 +622,7 @@ mod tests {
             q: "hello".to_string(),
             domains: None,
             recency: Some(366),
+        response_length: None,
         };
         let err = SearchExecutor::validate_search_args(&args).unwrap_err();
         assert!(err.is_error);
@@ -624,6 +635,7 @@ mod tests {
             q: String::new(),
             domains: None,
             recency: None,
+        response_length: None,
         };
         let err = SearchExecutor::validate_search_args(&args).unwrap_err();
         assert!(err.is_error);
@@ -640,16 +652,18 @@ mod tests {
                     domains: Some(vec!["rust-lang.org".to_string()]),
                     recency: Some(7),
                 }]),
-                open: Some(vec![OpenCommand {
-                    ref_id: "1".to_string(),
-                }]),
-                find: Some(vec![FindCommand {
-                    ref_id: "1".to_string(),
-                    pattern: "tokio".to_string(),
-                }]),
-                click: Some(vec![ClickCommand {
-                    ref_id: "1".to_string(),
-                }]),
+        open: Some(vec![OpenCommand {
+            ref_id: "1".to_string(),
+            lineno: None,
+        }]),
+        find: Some(vec![FindCommand {
+            ref_id: "1".to_string(),
+            pattern: "tokio".to_string(),
+        }]),
+        click: Some(vec![ClickCommand {
+            ref_id: "1".to_string(),
+            id: None,
+        }]),
             }),
             response_length: None,
         };
@@ -790,6 +804,7 @@ mod tests {
                     q,
                     domains: None,
                     recency: None,
+                response_length: None,
                 };
                 let result = SearchExecutor::validate_search_args(&args);
                 let char_len = q_len as usize;
@@ -811,6 +826,7 @@ mod tests {
                     q: "test".to_string(),
                     domains: None,
                     recency: Some(recency),
+                response_length: None,
                 };
                 let result = SearchExecutor::validate_search_args(&args);
                 if (1..=365).contains(&recency) {

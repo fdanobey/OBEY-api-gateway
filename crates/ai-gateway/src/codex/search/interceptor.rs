@@ -160,12 +160,13 @@ impl ToolInterceptor {
         let mut query: Option<String> = None;
         let result = match tool_name.as_str() {
             "codex_search" => {
-                let parsed: CodexSearchArgs = serde_json::from_value(args_value.clone())
-                    .unwrap_or(CodexSearchArgs {
-                        q: String::new(),
-                        domains: None,
-                        recency: None,
-                    });
+            let parsed: CodexSearchArgs = serde_json::from_value(args_value.clone())
+                .unwrap_or(CodexSearchArgs {
+                    q: String::new(),
+                    domains: None,
+                    recency: None,
+                    response_length: None,
+                });
                 query = Some(parsed.q.clone());
                 self.executor.execute_search(parsed).await
             }

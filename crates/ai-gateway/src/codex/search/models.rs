@@ -10,6 +10,8 @@ pub struct CodexSearchArgs {
     pub domains: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recency: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_length: Option<ResponseLength>,
 }
 
 /// Arguments for the `codex_web` tool.
@@ -50,6 +52,8 @@ pub struct SearchQueryCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OpenCommand {
     pub ref_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineno: Option<u32>,
 }
 
 /// A find-in-page command.
@@ -63,6 +67,8 @@ pub struct FindCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClickCommand {
     pub ref_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u32>,
 }
 
 /// Response length hint for `codex_web`. Known values are `short`, `medium`,
@@ -111,8 +117,8 @@ impl<'de> Deserialize<'de> for ResponseLength {
 /// Upstream search API request body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CodexSearchRequest {
+    pub id: String,
     pub model: String,
-    pub session_id: String,
     pub commands: CodexSearchRequestCommands,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -183,17 +189,19 @@ mod property_tests {
             })
     }
 
-    fn open_command_strategy() -> impl Strategy<Value = OpenCommand> {
-        nonempty_id().prop_map(|ref_id| OpenCommand { ref_id })
-    }
+fn open_command_strategy() -> impl Strategy<Value = OpenCommand> {
+    (nonempty_id(), option::of(0u32..10000))
+        .prop_map(|(ref_id, lineno)| OpenCommand { ref_id, lineno })
+}
 
     fn find_command_strategy() -> impl Strategy<Value = FindCommand> {
         (nonempty_id(), query_text()).prop_map(|(ref_id, pattern)| FindCommand { ref_id, pattern })
     }
 
-    fn click_command_strategy() -> impl Strategy<Value = ClickCommand> {
-        nonempty_id().prop_map(|ref_id| ClickCommand { ref_id })
-    }
+fn click_command_strategy() -> impl Strategy<Value = ClickCommand> {
+    (nonempty_id(), option::of(0u32..10000))
+        .prop_map(|(ref_id, id)| ClickCommand { ref_id, id })
+}
 
     fn response_length_strategy() -> impl Strategy<Value = ResponseLength> {
         any::<String>().prop_map(ResponseLength::from_string)
@@ -219,19 +227,19 @@ mod property_tests {
             })
     }
 
-    fn search_request_strategy() -> impl Strategy<Value = CodexSearchRequest> {
-        (
-            nonempty_id(),
-            nonempty_id(),
-            search_request_commands_strategy(),
-        )
-            .prop_map(|(model, session_id, commands)| CodexSearchRequest {
-                model,
-                session_id,
-                commands,
-                extra: serde_json::Map::new(),
-            })
-    }
+fn search_request_strategy() -> impl Strategy<Value = CodexSearchRequest> {
+    (
+        nonempty_id(),
+        nonempty_id(),
+        search_request_commands_strategy(),
+    )
+    .prop_map(|(id, model, commands)| CodexSearchRequest {
+        id,
+        model,
+        commands,
+        extra: serde_json::Map::new(),
+    })
+}
 
     fn json_value_strategy() -> impl Strategy<Value = serde_json::Value> {
         prop_oneof![
@@ -309,11 +317,12 @@ mod property_tests {
         // Feature: codex-search, Property 8: Absent optional fields remain absent
         #[test]
         fn prop_absent_optional_fields(q in query_text()) {
-            let args = CodexSearchArgs {
-                q,
-                domains: None,
-                recency: None,
-            };
+    let args = CodexSearchArgs {
+        q,
+        domains: None,
+        recency: None,
+        response_length: None,
+    };
             let json = serde_json::to_value(&args).unwrap();
             if let serde_json::Value::Object(map) = &json {
                 prop_assert!(
