@@ -2433,10 +2433,16 @@ impl Router {
         &self,
         provider_model: &ProviderModel,
         request: &OpenAIRequest,
-        response: OpenAIResponse,
+        mut response: OpenAIResponse,
         active: Option<ActiveRequestHandle>,
         base_attempt: usize,
     ) -> Result<OpenAIResponse, GatewayError> {
+        // XML-prone models (GLM, Kimi, Qwen, DeepSeek) emit tool calls as
+        // XML text rather than native tool_calls. Translate first so
+        // gateway search calls become detectable; otherwise they slip past
+        // this hook and leak to the client (which doesn't know codex_search).
+        Self::translate_xml_tool_calls(&mut response, request);
+
         let has_gateway_call = response
             .choices
             .first()

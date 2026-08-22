@@ -95,6 +95,7 @@ impl ToolInterceptor {
                     append_results_to_chat(&mut current_response, &all_results);
                 }
                 attach_results_to_response(&mut current_response, &all_results);
+                strip_gateway_tool_calls(&mut current_response);
 
                 return Ok(InterceptResult {
                     response: current_response,
@@ -111,6 +112,7 @@ impl ToolInterceptor {
                     append_results_to_chat(&mut final_response, &all_results);
                 }
                 attach_results_to_response(&mut final_response, &all_results);
+                strip_gateway_tool_calls(&mut final_response);
                 return Ok(InterceptResult {
                     response: final_response,
                     pending_client_tool_calls: Vec::new(),
@@ -332,6 +334,32 @@ fn format_results_block(results: &[Value]) -> String {
     }
     lines.push("--- end codex search results ---".to_string());
     lines.join("\n")
+}
+
+/// Remove gateway-executed tool calls (codex_search/codex_web) from the
+/// response's tool_calls array. The gateway has already executed them
+/// server-side; leaking them back to the client causes harnesses to reject
+/// the response ("tried to call unavailable tool"). Client tool calls are
+/// preserved untouched.
+fn strip_gateway_tool_calls(response: &mut OpenAIResponse) {
+    if let Some(choice) = response.choices.first_mut() {
+        let should_remove = {
+            let calls = choice
+                .message
+                .extra
+                .get_mut("tool_calls")
+                .and_then(|v| v.as_array_mut());
+            if let Some(calls) = calls {
+                calls.retain(|tc| !is_gateway_tool_call(tc));
+                calls.is_empty()
+            } else {
+                false
+            }
+        };
+        if should_remove {
+            choice.message.extra.remove("tool_calls");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -581,11 +609,60 @@ async fn mixed_gateway_and_client_tools_stops_loop() {
             executed[0].get("tool_call_id").and_then(Value::as_str),
             Some("call_1")
         );
-        assert_eq!(
-            executed[0].get("name").and_then(Value::as_str),
-            Some("codex_search")
-        );
-    }
+    assert_eq!(
+        executed[0].get("name").and_then(Value::as_str),
+        Some("codex_search")
+    );
+    // Gateway tool calls must be stripped from the response; the client
+    // harness only knows its own tools and rejects codex_search calls.
+    let remaining = result
+        .response
+        .choices
+        .first()
+        .and_then(|c| c.message.extra.get("tool_calls"))
+        .and_then(|v| v.as_array())
+        .expect("client tool_calls must survive");
+    assert_eq!(remaining.len(), 1, "only the client call remains");
+    assert_eq!(
+        remaining[0]
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str()),
+        Some("client_custom_tool")
+    );
+}
+
+#[tokio::test]
+async fn gateway_only_calls_are_stripped_before_client_return() {
+    let executor = make_executor();
+    // output_to_chat = false keeps content assertions out of the way; the
+    // strip must still happen on the client-tool return path.
+    let interceptor = ToolInterceptor::new(executor, 5, false);
+    let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
+    let client_call = make_tool_call("call_2", "client_custom_tool", r#"{"x":1}"#);
+    let provider = MockProvider::new(vec![]);
+
+    let initial = make_response_with_tool_calls(vec![search_call, client_call]);
+    let result = interceptor
+        .intercept(&provider, make_request(), initial)
+        .await
+        .unwrap();
+
+    let remaining = result
+        .response
+        .choices
+        .first()
+        .and_then(|c| c.message.extra.get("tool_calls"))
+        .and_then(|v| v.as_array())
+        .expect("client tool_calls must survive");
+    assert!(remaining
+        .iter()
+        .all(|tc| tc.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .map(|n| n != "codex_search" && n != "codex_web")
+            .unwrap_or(true)));
+}
 
 #[tokio::test]
 async fn single_tool_call_then_final_answer() {
