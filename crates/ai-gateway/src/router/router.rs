@@ -1515,49 +1515,85 @@ impl Router {
         }
     }
 
-    /// Detect and strip image content parts from messages when the target
-    /// model does not support vision inputs.
-    ///
-    /// OpenAI-style messages can carry `content` as an array of parts
-    /// including `{ "type": "image_url", "image_url": { ... } }`. Many
-    /// providers respond with HTTP 400 if such parts reach a non-vision
-    /// model. This method removes those parts and logs that fact.
-    fn strip_image_content_if_unsupported(
-        request: &mut OpenAIRequest,
-        supports_vision: bool,
-        provider_name: &str,
-        model: &str,
-    ) -> usize {
-        if supports_vision {
-            return 0;
-        }
-
-        let mut stripped_total: usize = 0;
-        for (idx, msg) in request.messages.iter_mut().enumerate() {
-            if let serde_json::Value::Array(parts) = &mut msg.content {
-                let before = parts.len();
-                parts.retain(|part| {
-                    if part.get("type").and_then(|v| v.as_str()) == Some("image_url") {
-                        false
-                    } else {
-                        true
-                    }
-                });
-                let removed = before.saturating_sub(parts.len());
-                if removed > 0 && !parts.is_empty() {
-                    warn!(
-                        provider = provider_name,
-                        model = %model,
-                        message_index = idx,
-                        images_removed = removed,
-                        "Stripped image_url content parts from message for non-vision model"
-                    );
-                }
-                stripped_total += removed;
-            }
-        }
-        stripped_total
+/// Detect and strip image content parts from messages when the target
+/// model does not support vision inputs.
+///
+/// OpenAI-style messages can carry `content` as an array of parts
+/// including `{ "type": "image_url", "image_url": { ... } }`. Many
+/// providers respond with HTTP 400 if such parts reach a non-vision
+/// model. This method removes those parts and logs that fact.
+///
+/// Recognizes the common image part type spellings across client
+/// libraries (`image_url`, `image`, `input_image`). When stripping
+/// empties a message's part list entirely, a short text placeholder is
+/// inserted so the provider never sees an empty content array.
+fn strip_image_content_if_unsupported(
+    request: &mut OpenAIRequest,
+    supports_vision: bool,
+    provider_name: &str,
+    model: &str,
+) -> usize {
+    if supports_vision {
+        return 0;
     }
+
+    let mut stripped_total: usize = 0;
+    for (idx, msg) in request.messages.iter_mut().enumerate() {
+        if let serde_json::Value::Array(parts) = &mut msg.content {
+            let before = parts.len();
+            parts.retain(|part| {
+                !matches!(
+                    part.get("type").and_then(|v| v.as_str()),
+                    Some("image_url") | Some("image") | Some("input_image")
+                )
+            });
+            let removed = before.saturating_sub(parts.len());
+            if removed > 0 {
+                if parts.is_empty() {
+                    parts.push(serde_json::json!({
+                        "type": "text",
+                        "text": "[image content removed: model does not support image inputs]"
+                    }));
+                }
+                warn!(
+                    provider = provider_name,
+                    model = %model,
+                    message_index = idx,
+                    images_removed = removed,
+                    "Stripped image content parts from message for non-vision model"
+                );
+            }
+            stripped_total += removed;
+        }
+    }
+    stripped_total
+}
+
+/// Check whether an upstream rejection is caused by image content the
+/// model cannot accept, regardless of what the capabilities cache
+/// believed.
+///
+/// Providers phrase this differently ("This model does not support
+/// image inputs", "invalid content type: image", "does not support
+/// vision", …) and always with a 4xx status. A case-insensitive
+/// substring check over the body keeps the detection tolerant of the
+/// varied error envelopes.
+fn is_unsupported_image_error(status_code: u16, body: &str) -> bool {
+    if !(400..500).contains(&status_code) {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("does not support image")
+        || lower.contains("not support image inputs")
+        || lower.contains("unsupported image")
+        || lower.contains("image inputs")
+        || lower.contains("image content")
+        || lower.contains("input_image")
+        || lower.contains("does not support vision")
+        || lower.contains("vision is not supported")
+        || lower.contains("not a vision model")
+        || lower.contains("only supports text")
+}
 
     /// Get or create rate limiter for a provider
     pub async fn get_rate_limiter(&self, provider: &str) -> Arc<RateLimiter> {
@@ -2888,32 +2924,40 @@ codex_search_config.effective_output_to_chat(),
             outgoing.messages.push(Self::tool_calling_system_hint());
         }
 
-        let mut last_error = None;
+let mut last_error = None;
+// One-shot reactive image strip: when the provider rejects the request
+// with an "image inputs not supported" error despite the proactive
+// strip pass (stale/incorrect capabilities), remove the images and
+// retry the same provider once without waiting through backoff.
+let mut image_strip_retry_done = false;
+let mut skip_next_backoff = false;
 
-        for attempt in 0..=max_retries {
-            if attempt > 0 {
-                // Defense-in-depth: never burn backoff time on a
-                // rate-limit-class error from the previous attempt. The
-                // explicit branches above already short-circuit, but if a
-                // future change adds another rate-limit code path this
-                // guard ensures we don't accidentally sleep through it.
-                if let Some(GatewayError::Provider {
-                    status_code: Some(code),
-                    message: prev_msg,
-                    ..
-                }) = &last_error
-                {
-                    if Self::is_rate_limited(*code, prev_msg) {
-                        debug!(
-                            provider = provider_name,
-                            status = *code,
-                            "Skipping retry backoff for rate-limit-class error"
-                        );
-                        break;
-                    }
-                }
+for attempt in 0..=max_retries {
+    let skip_backoff_this_attempt = skip_next_backoff;
+    skip_next_backoff = false;
+    if attempt > 0 && !skip_backoff_this_attempt {
+        // Defense-in-depth: never burn backoff time on a
+        // rate-limit-class error from the previous attempt. The
+        // explicit branches above already short-circuit, but if a
+        // future change adds another rate-limit code path this
+        // guard ensures we don't accidentally sleep through it.
+        if let Some(GatewayError::Provider {
+            status_code: Some(code),
+            message: prev_msg,
+            ..
+        }) = &last_error
+        {
+            if Self::is_rate_limited(*code, prev_msg) {
+                debug!(
+                    provider = provider_name,
+                    status = *code,
+                    "Skipping retry backoff for rate-limit-class error"
+                );
+                break;
+            }
+        }
 
-                let backoff_secs = backoff_sequence
+        let backoff_secs = backoff_sequence
                     .get((attempt - 1) as usize)
                     .copied()
                     .unwrap_or(4);
@@ -3269,15 +3313,41 @@ codex_search_config.effective_output_to_chat(),
                         }
                     }
 
-                    // Don't retry 4xx errors except 408 (timeout)
-                    // 429 (rate limit) should fail over to next provider, not retry same one
-                    // 503 (service unavailable) signals provider is down — fail over immediately
-                    if status_code >= 400 && status_code < 500 && status_code != 408 {
-                        // For rate-limit signals, parse Retry-After /
-                        // retry_after_ms and put the provider in a
-                        // bounded cooldown window so subsequent requests
-                        // skip it via select_provider_order without
-                        // re-issuing.
+// Don't retry 4xx errors except 408 (timeout)
+// 429 (rate limit) should fail over to next provider, not retry same one
+// 503 (service unavailable) signals provider is down — fail over immediately
+if status_code >= 400 && status_code < 500 && status_code != 408 {
+    // Image-input rejection: the provider refused image content even
+    // though the proactive strip pass believed it safe (stale or
+    // incorrect capabilities cache). Strip every image part and retry
+    // the same provider immediately — bounded to one shot per request.
+    if !image_strip_retry_done && Self::is_unsupported_image_error(status_code, &body_text) {
+        let removed = Self::strip_image_content_if_unsupported(
+            &mut outgoing,
+            false,
+            provider_name,
+            &provider_model.model,
+        );
+        if removed > 0 {
+            image_strip_retry_done = true;
+            skip_next_backoff = true;
+            info!(
+                provider = provider_name,
+                model = %provider_model.model,
+                status = status_code,
+                images_removed = removed,
+                "Provider rejected image inputs — stripped images and retrying same provider"
+            );
+            last_error = Some(err);
+            continue;
+        }
+    }
+
+    // For rate-limit signals, parse Retry-After /
+    // retry_after_ms and put the provider in a
+    // bounded cooldown window so subsequent requests
+    // skip it via select_provider_order without
+    // re-issuing.
                         if Self::is_rate_limited(status_code, &body_text) {
                             let cooldown = self
                                 .parse_rate_limit_cooldown(
@@ -8846,16 +8916,102 @@ mod tests {
             extra: Default::default(),
         };
 
-        let removed = Router::strip_image_content_if_unsupported(
-            &mut request,
-            true,
-            "test-provider",
-            "vision",
-        );
-        assert_eq!(removed, 0);
-        let parts = request.messages[0].content.as_array().unwrap();
-        assert_eq!(parts.len(), 2);
-    }
+    let removed = Router::strip_image_content_if_unsupported(
+        &mut request,
+        true,
+        "test-provider",
+        "vision",
+    );
+    assert_eq!(removed, 0);
+    let parts = request.messages[0].content.as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+}
+
+#[test]
+fn test_strip_image_content_if_unsupported_inserts_placeholder_for_image_only_message() {
+    let mut request = OpenAIRequest {
+        model: "no-vision".to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "image_url", "image_url": {"url": "https://x.example/p.png"}},
+            ]),
+            extra: Default::default(),
+        }],
+        temperature: None,
+        max_tokens: None,
+        stream: false,
+        extra: Default::default(),
+    };
+
+    let removed = Router::strip_image_content_if_unsupported(
+        &mut request,
+        false,
+        "test-provider",
+        "no-vision",
+    );
+    assert_eq!(removed, 1);
+    let parts = request.messages[0].content.as_array().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0]["type"], serde_json::json!("text"));
+    assert!(parts[0]["text"].as_str().unwrap().contains("image"));
+}
+
+#[test]
+fn test_strip_image_content_if_unsupported_removes_variant_image_part_types() {
+    let mut request = OpenAIRequest {
+        model: "no-vision".to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": "describe this"},
+                {"type": "image", "source": {"type": "base64"}},
+                {"type": "input_image", "image_url": "https://x.example/p.png"},
+            ]),
+            extra: Default::default(),
+        }],
+        temperature: None,
+        max_tokens: None,
+        stream: false,
+        extra: Default::default(),
+    };
+
+    let removed = Router::strip_image_content_if_unsupported(
+        &mut request,
+        false,
+        "test-provider",
+        "no-vision",
+    );
+    assert_eq!(removed, 2);
+    let parts = request.messages[0].content.as_array().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0]["type"], serde_json::json!("text"));
+}
+
+#[test]
+fn test_is_unsupported_image_error_matches_provider_phrasings() {
+    assert!(Router::is_unsupported_image_error(
+        400,
+        "This model does not support image inputs."
+    ));
+    assert!(Router::is_unsupported_image_error(
+        400,
+        r#"{"error":{"message":"Invalid request: image content is not supported for this model"}}"#
+    ));
+    assert!(Router::is_unsupported_image_error(
+        422,
+        "model does not support vision"
+    ));
+    assert!(!Router::is_unsupported_image_error(
+        400,
+        "invalid model identifier"
+    ));
+    assert!(!Router::is_unsupported_image_error(500, "image inputs"));
+    assert!(!Router::is_unsupported_image_error(
+        200,
+        "This model does not support image inputs."
+    ));
+}
 }
 
 #[cfg(test)]

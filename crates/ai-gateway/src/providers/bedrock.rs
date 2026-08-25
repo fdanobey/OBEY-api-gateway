@@ -1574,32 +1574,72 @@ impl BedrockProvider {
         })
     }
 
-    fn mantle_responses_input(
-        request: OpenAIRequest,
-    ) -> (
-        String,
-        Option<f32>,
-        u32,
-        serde_json::Map<String, serde_json::Value>,
-        serde_json::Value,
-        usize,
-    ) {
-        let OpenAIRequest {
-            model,
-            messages,
-            temperature,
-            max_tokens,
-            mut extra,
-            ..
-        } = request;
-        let mut normalized = 0;
-        let input = match extra.remove("input") {
-            Some(serde_json::Value::Array(mut input)) => {
-                normalized = normalize_mantle_responses_input(&mut input);
-                serde_json::Value::Array(input)
-            }
-            Some(input) => input,
-            None => serde_json::Value::Array(
+fn mantle_responses_input(
+    request: OpenAIRequest,
+) -> (
+    String,
+    Option<f32>,
+    u32,
+    serde_json::Map<String, serde_json::Value>,
+    serde_json::Value,
+    usize,
+) {
+    let OpenAIRequest {
+        model,
+        mut messages,
+        temperature,
+        max_tokens,
+        mut extra,
+        ..
+    } = request;
+    let mut normalized = 0;
+
+    // First: normalize compaction_triggers in message content arrays.
+    // This mirrors normalize_mantle_chat_messages but operates on the
+    // messages before they're flattened into Responses API input items.
+    // The Responses API rejects requests with more than one compaction_trigger.
+    let mut compaction_triggers_remaining = messages
+        .iter()
+        .filter_map(|message| message.content.as_array())
+        .flatten()
+        .filter(|part| {
+            part.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
+        })
+        .count();
+    for message in &mut messages {
+        if let serde_json::Value::Array(parts) = &mut message.content {
+            let before = parts.len();
+            parts.retain(|part| {
+                let is_compaction_trigger = part.get("type").and_then(serde_json::Value::as_str)
+                    == Some("compaction_trigger");
+                if is_compaction_trigger && compaction_triggers_remaining > 1 {
+                    compaction_triggers_remaining -= 1;
+                    return false;
+                }
+                true
+            });
+            normalized += before - parts.len();
+        }
+    }
+
+    let input = match extra.remove("input") {
+        Some(serde_json::Value::Array(mut input)) => {
+            normalized += normalize_mantle_responses_input(&mut input);
+            serde_json::Value::Array(input)
+        }
+        Some(other) => {
+            // Non-array `input` values (e.g., string "auto" from previous session continuation)
+            // are passed through as-is. The Responses API only validates compaction_trigger
+            // counts inside arrays of input items, not scalar values.
+            other
+        }
+        None => {
+            // Build input from OpenAI-style messages. Flatten each message's content
+            // to text because the Responses API input items don't support multi-part
+            // content arrays. compaction_triggers were already normalized above.
+            // Any remaining compaction_trigger (at most one) in content arrays will
+            // be filtered out by content_as_text which only extracts text parts.
+            serde_json::Value::Array(
                 messages
                     .iter()
                     .map(|message| {
@@ -1609,17 +1649,18 @@ impl BedrockProvider {
                         })
                     })
                     .collect::<Vec<_>>(),
-            ),
-        };
-        (
-            model,
-            temperature,
-            max_tokens.unwrap_or(2048),
-            extra,
-            input,
-            normalized,
-        )
-    }
+            )
+        }
+    };
+    (
+        model,
+        temperature,
+        max_tokens.unwrap_or(2048),
+        extra,
+        input,
+        normalized,
+    )
+}
 
     async fn chat_completion_responses_api(
         &self,
