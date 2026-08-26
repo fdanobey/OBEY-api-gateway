@@ -26,13 +26,16 @@ use super::{MemoryEntry, MemoryError, MemoryType, ResolvedNamespace};
 
 const MIN_MEMORY_CHARS: usize = 5;
 const MAX_MEMORY_CHARS: usize = 4_096;
+/// Minimum whitespace-separated words for a stored memory. Single words and
+/// bare paths carry no reusable meaning on their own.
+const MIN_MEMORY_WORDS: usize = 3;
 pub const MEMORY_EXTRACTION_INTERNAL_TAG: &str = "memory_extraction";
 
 static TRIGGER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-r"(?i)\b(my preference is|remember this|keep in mind|always use|never use|save this|note that|i prefer)\b",
-)
-.expect("memory trigger regex must compile")
+        r"(?i)\b(my preference is|remember this|always use|never use|save this|i prefer)\b",
+    )
+    .expect("memory trigger regex must compile")
 });
 
 static DECISION_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -655,7 +658,6 @@ fn classify_trigger(trigger: &str) -> MemoryType {
         MemoryType::Fact
     }
 }
-
 fn namespace_for_type<'a>(namespace: &'a ResolvedNamespace, memory_type: MemoryType) -> &'a str {
     match memory_type {
         MemoryType::Preference => &namespace.user_scope,
@@ -687,6 +689,16 @@ async fn store_candidates(
             tracing::warn!(
                 character_count,
                 "discarding memory extraction outside content length limits"
+            );
+            continue;
+        }
+
+        let word_count = content.split_whitespace().count();
+        if word_count < MIN_MEMORY_WORDS {
+            counts.rejected = counts.rejected.saturating_add(1);
+            tracing::warn!(
+                word_count,
+                "discarding memory extraction below minimum word count"
             );
             continue;
         }
@@ -907,14 +919,14 @@ mod tests {
     async fn explicit_extraction_rejects_sensitive_and_skips_exact_duplicates() {
         let provider = Arc::new(MockProvider::new(MockResponse::Candidates(Vec::new())));
         let (extractor, store) = test_extractor(provider, 1, Duration::from_secs(1));
-        let messages = vec![
-            ExtractionMessage::caller(
-                ExtractionRole::User,
-                "Please remember this URL https://user:password@example.invalid.",
-            ),
-            ExtractionMessage::caller(ExtractionRole::User, "Note that stable fact."),
-            ExtractionMessage::caller(ExtractionRole::User, "Note that stable fact."),
-        ];
+    let messages = vec![
+        ExtractionMessage::caller(
+            ExtractionRole::User,
+            "Please remember this URL https://user:password@example.invalid.",
+        ),
+        ExtractionMessage::caller(ExtractionRole::User, "Remember this stable fact."),
+        ExtractionMessage::caller(ExtractionRole::User, "Remember this stable fact."),
+    ];
 
         let first = extractor
             .extract_explicit(&messages, &namespace(), None, ExtractionPolicy::default())

@@ -65,7 +65,7 @@ proptest! {
 
     #[test]
     fn property_trigger_phrase_classification(
-        trigger_index in 0usize..8,
+        trigger_index in 0usize..6,
         suffix in "[A-Za-z0-9 ]{5,80}",
         uppercase in any::<bool>(),
     ) {
@@ -73,8 +73,6 @@ proptest! {
             ("remember this", MemoryType::Fact),
             ("I prefer", MemoryType::Preference),
             ("save this", MemoryType::Context),
-            ("note that", MemoryType::Fact),
-            ("keep in mind", MemoryType::Fact),
             ("always use", MemoryType::Preference),
             ("never use", MemoryType::Preference),
             ("my preference is", MemoryType::Preference),

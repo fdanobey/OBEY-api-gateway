@@ -19,23 +19,40 @@ use crate::memory::extractor::{
 use crate::memory::MemoryType;
 
 /// System prompt instructing the model to extract structured memories.
-const EXTRACTION_SYSTEM_PROMPT: &str = r#"You are a memory extraction assistant. Your task is to identify memorable facts, preferences, decisions, and context from the conversation below.
+///
+/// The prompt enforces a strict quality bar: only durable, reusable
+/// information that would genuinely save effort in a future conversation
+/// should be extracted. Transient state, task progress, and one-off details
+/// are explicitly excluded to prevent noise accumulation.
+const EXTRACTION_SYSTEM_PROMPT: &str = r#"You are a memory extraction assistant. Extract ONLY durable, high-value information that will be useful in future conversations with this user or on this project.
 
-Extract concise, self-contained memory statements. Each memory must be:
-- A single sentence or short phrase (5-4096 characters)
-- Self-contained (understandable without the conversation)
-- Factual and non-transient
+QUALITY BAR — a memory must satisfy ALL of these:
+1. Durable: will remain true or relevant well beyond this conversation
+2. Reusable: would save time, prevent re-explanation, or avoid repeating a mistake in a future session
+3. Self-contained: fully understandable without the surrounding conversation
+4. Non-obvious: not trivially re-derivable from the project's code, docs, or standard tooling
+
+DO NOT EXTRACT:
+- Transient state: current task, current bug, what you are doing right now, work in progress
+- One-off questions, clarifications, or tentative ideas that were not adopted
+- Code snippets, implementation details, or syntax (unless they encode a durable convention)
+- Greetings, acknowledgments, status updates, or meta-conversation
+- File paths, build commands, or config values that are evident from the project itself
+- Anything the user is merely considering but has not committed to
+- Trivial facts (e.g., "the user writes code", "the project uses Git")
+
+Prefer extracting FEWER, higher-quality memories. When uncertain whether something is worth persisting, do NOT extract it.
 
 Classify each memory as one of:
-- "preference": User preferences, habits, or configuration choices
-- "fact": Objective facts about the user, project, or environment
-- "context": Project context, file paths, or working environment details
-- "decision": Technical or project decisions made during the conversation
+- "preference": Stable user preferences, habits, or conventions (e.g., "always use snake_case for Rust variables")
+- "fact": Objective, durable facts about the user, project, or environment (e.g., "the project targets Rust 1.78 and uses Tokio")
+- "context": Stable project context that is not obvious from the repo (e.g., "deployment runs on AWS via Terraform in the infra/ directory")
+- "decision": Concrete decisions that were committed to (e.g., "chose SQLite over Postgres for the memory store to keep deployment single-binary")
 
 Respond as a JSON array of objects with "content" and "memory_type" fields:
 [{"content": "...", "memory_type": "preference"}, ...]
 
-If no memories are worth extracting, respond with an empty array: []"#;
+If nothing durable and reusable can be extracted, respond with an empty array: []"#;
 
 /// Production adapter that calls a configured provider's chat-completions
 /// endpoint to extract structured memories from conversation messages.
