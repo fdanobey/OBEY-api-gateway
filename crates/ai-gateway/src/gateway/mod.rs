@@ -17,6 +17,7 @@ use tower_http::trace::TraceLayer;
 use crate::admin;
 use crate::assistants::AssistantsStore;
 use crate::cache::{ExactCache, SemanticCache};
+use crate::responses::ResponsesStore;
 use crate::config::Config;
 use crate::error::GatewayError;
 use crate::guardrail::GuardrailEngine;
@@ -84,6 +85,9 @@ pub struct AppState {
     pub onnx_assets: Arc<crate::compression::assets::OnnxAssetManager>,
     /// Shared state for the tool definition compression pipeline.
     pub tool_compression_state: Arc<crate::tool_compression::ToolCompressionState>,
+    /// Local SQLite store for Responses API (`/v1/responses`) stateful
+    /// persistence: `store`, `previous_response_id`, retrieval endpoints.
+    pub responses_store: Arc<ResponsesStore>,
 }
 
 /// Core HTTP server wrapping Axum with middleware and integrated components.
@@ -102,6 +106,11 @@ impl GatewayServer {
         let assistants_path = AssistantsStore::sibling_database_path(&config.logging.database_path);
         let assistants_store = AssistantsStore::new(&assistants_path)
             .map_err(|e| GatewayError::Database(e.to_string()))?;
+
+        let responses_path = ResponsesStore::sibling_database_path(&config.logging.database_path);
+        let responses_store = ResponsesStore::new(&responses_path)
+            .map_err(|e| GatewayError::Database(e.to_string()))?;
+
 
         let config_arc = Arc::new(RwLock::new(config.clone()));
         let metrics = Arc::new(Metrics::new());
@@ -276,10 +285,11 @@ impl GatewayServer {
                     ))
                 },
             )?),
-            tool_compression_state: Arc::new(crate::tool_compression::ToolCompressionState::new(
-                &config.tool_compression,
-            )),
-        };
+    tool_compression_state: Arc::new(crate::tool_compression::ToolCompressionState::new(
+        &config.tool_compression,
+    )),
+    responses_store: Arc::new(responses_store),
+};
 
         Ok(Self { state })
     }
@@ -370,10 +380,20 @@ impl GatewayServer {
                 "/v1/fine_tuning/jobs/{fine_tuning_id}/cancel",
                 post(cancel_fine_tuning_job),
             )
-            .route(
-                "/v1/fine_tuning/jobs/{fine_tuning_id}/events",
-                get(list_fine_tuning_events),
-            );
+        .route(
+            "/v1/fine_tuning/jobs/{fine_tuning_id}/events",
+            get(list_fine_tuning_events),
+        )
+        // Responses API (Req: responses-api-front-door)
+        .route("/v1/responses", post(responses_create).get(responses_list))
+        .route(
+            "/v1/responses/{response_id}",
+            get(responses_get).delete(responses_delete),
+        )
+        .route(
+            "/v1/responses/{response_id}/input_items",
+            get(responses_input_items),
+        );
 
         let api_routes =
             api_routes.layer(crate::loop_detection::middleware::LoopDetectorLayer::new(

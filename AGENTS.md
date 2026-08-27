@@ -45,6 +45,7 @@ Every `GatewayServer::new` opens SQLite databases. Tests use `common::isolate_da
 - **Circuit breaker reset**: All circuit breakers clear on config hot-reload via `/admin/config/reload`
 - **Tests use `tower::ServiceExt::oneshot()`**: Integration tests don't bind ports; they call router directly
 - **Property tests with proptest**: Many tests use `proptest!` macro for randomized input validation
+- **Admin panel parity (standing user requirement)**: every YAML-configurable feature must also expose matching controls in the embedded admin panel (`crates/ai-gateway/src/admin/static/index.html`). Config-only features without UI are considered incomplete; specs must include admin-UI tasks.
 
 ## Agent skills
 

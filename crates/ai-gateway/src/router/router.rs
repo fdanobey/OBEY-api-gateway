@@ -2322,9 +2322,47 @@ fn is_unsupported_image_error(status_code: u16, body: &str) -> bool {
         mut request: OpenAIRequest,
     ) -> Result<ProviderResponse, GatewayError> {
         let mut attempt = 0;
+        // One-shot reactive image strip: the Codex and Bedrock dispatch
+        // paths delegate through this wrapper and never run the proactive
+        // strip pass in `dispatch_attempts_under_permit`. When the provider
+        // rejects with an "image inputs not supported" error (stale or
+        // absent capabilities cache), strip the image parts and retry the
+        // same provider once — mirroring the standard buffered retry loop.
+        let mut image_strip_retry_done = false;
         loop {
             match client.chat_completion(request.clone()).await {
                 Ok(response) => return Ok(response),
+                Err(GatewayError::Provider {
+                    provider,
+                    message,
+                    status_code: Some(status_code),
+                }) if !image_strip_retry_done
+                    && Self::is_unsupported_image_error(status_code, &message) =>
+                {
+                    let model = request.model.clone();
+                    let removed = Self::strip_image_content_if_unsupported(
+                        &mut request,
+                        false,
+                        &provider,
+                        &model,
+                    );
+                    if removed > 0 {
+                        image_strip_retry_done = true;
+                        info!(
+                            provider = %provider,
+                            model = %model,
+                            status = status_code,
+                            images_removed = removed,
+                            "Provider rejected image inputs — stripped images and retrying same provider"
+                        );
+                        continue;
+                    }
+                    return Err(GatewayError::Provider {
+                        provider,
+                        message,
+                        status_code: Some(status_code),
+                    });
+                }
                 Err(GatewayError::Provider {
                     provider,
                     message,
@@ -6419,6 +6457,30 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
             info!(provider = %provider_model.provider, provider_type = %provider_type, fields_removed = stripped, "Sanitized streaming request for provider");
         }
         Self::normalize_message_tool_calls(&mut outgoing.messages);
+
+        // Strip image content parts when the target model is known not to
+        // support vision inputs. Mirrors the buffered path so streaming
+        // pass-through does not burn a 4xx round-trip before the buffered
+        // fallback's reactive strip rescues the request.
+        let supports_vision = self
+            .context_manager
+            .get_capabilities(&provider_model.model)
+            .map(|caps| caps.supports_vision)
+            .unwrap_or(false);
+        let images_stripped = Self::strip_image_content_if_unsupported(
+            &mut outgoing,
+            supports_vision,
+            &provider_model.provider,
+            &provider_model.model,
+        );
+        if images_stripped > 0 {
+            info!(
+                provider = %provider_model.provider,
+                model = %provider_model.model,
+                images_stripped,
+                "Removed image content from streaming request for non-vision model"
+            );
+        }
         if outgoing.extra.contains_key("tools") {
             Self::reverse_translate_tool_history(&mut outgoing.messages);
             // Same conditional policy as the buffered path: only learned
@@ -7476,13 +7538,105 @@ mod tests {
             },
         ];
 
-        let response = router
-            .dispatch_buffered_with_context_retry(&client, request)
-            .await
-            .expect("shared wrapper should truncate and retry");
-        assert_eq!(response.provider_name, "adapter");
-        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let response = router
+        .dispatch_buffered_with_context_retry(&client, request)
+        .await
+        .expect("shared wrapper should truncate and retry");
+    assert_eq!(response.provider_name, "adapter");
+    assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+struct ImageRejectThenSuccessClient {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ProviderClient for ImageRejectThenSuccessClient {
+    async fn chat_completion(
+        &self,
+        request: OpenAIRequest,
+    ) -> Result<ProviderResponse, GatewayError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let carries_images = request.messages.iter().any(|msg| {
+            msg.content
+                .as_array()
+                .map(|parts| {
+                    parts.iter().any(|part| {
+                        matches!(
+                            part.get("type").and_then(|v| v.as_str()),
+                            Some("image_url") | Some("image") | Some("input_image")
+                        )
+                    })
+                })
+                .unwrap_or(false)
+        });
+        if call == 0 {
+            assert!(carries_images, "first call should carry image parts");
+            return Err(GatewayError::Provider {
+                provider: "adapter".to_string(),
+                message: r#"Upstream HTTP 400: {"error":{"message":"This model does not support image inputs."}}"#.to_string(),
+                status_code: Some(400),
+            });
+        }
+        assert!(!carries_images, "retry must not carry image parts");
+        Ok(ProviderResponse {
+            response: serde_json::from_value(completion_response())
+                .expect("fixture should deserialize"),
+            provider_name: "adapter".to_string(),
+            latency_ms: 1,
+        })
     }
+
+    async fn chat_completion_stream(
+        &self,
+        _request: OpenAIRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        unreachable!()
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
+        Ok(Vec::new())
+    }
+
+    fn provider_name(&self) -> &str {
+        "adapter"
+    }
+}
+
+#[tokio::test]
+async fn buffered_adapter_image_error_strips_and_retries() {
+    let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+    let client = ImageRejectThenSuccessClient {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let mut request = compression_request(false);
+    request.model = "adapter-model".to_string();
+    request.messages = vec![
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": "what is in this picture?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+            ]),
+            extra: Default::default(),
+        },
+    ];
+
+    let response = router
+        .dispatch_buffered_with_context_retry(&client, request)
+        .await
+        .expect("shared wrapper should strip images and retry");
+    assert_eq!(response.provider_name, "adapter");
+    assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
 
     #[test]
     fn reasoning_only_response_is_promoted_to_content() {

@@ -43,6 +43,7 @@ mod smart_routing;
 mod structured_output;
 #[allow(dead_code, unused_imports)]
 mod tool_compression;
+mod responses;
 #[cfg(feature = "tray")]
 mod tray;
 mod virtual_keys;

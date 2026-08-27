@@ -52,6 +52,15 @@ use crate::structured_output::{
 use crate::virtual_keys::access::AccessError;
 use crate::virtual_keys::models::AuthenticatedKey;
 
+use crate::responses::{
+    EasyInputContent, EasyInputMessage, InputItem, InputTokensDetails, OutputTokensDetails,
+    ResponseObject, ResponsesInput, ResponsesListParams, ResponsesRequest, ResponsesSseEvent,
+    ResponsesStreamTranslator, ResponsesUsage, StoredConversation, StoredResponse,
+    SynthesisContext as ResponsesSynthesisContext,
+    TranslationContext as ResponsesTranslationContext, synthesize as synthesize_responses,
+    translate as translate_responses,
+};
+
 pub struct AssistantsIdentity(AuthenticatedKey);
 
 impl<S> FromRequestParts<S> for AssistantsIdentity
@@ -7628,4 +7637,677 @@ pub async fn reload_config(State(state): State<AppState>) -> Response {
         })),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Responses API — POST/GET/DELETE /v1/responses (responses-api-front-door)
+// ---------------------------------------------------------------------------
+
+/// Build a [`ResponsesSseEvent`] as an axum SSE [`Event`] with both `event:`
+/// and `data:` fields.
+fn responses_event_to_sse(event: &ResponsesSseEvent) -> Event {
+    let value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+    let event_type = value
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    Event::default()
+        .event(event_type)
+        .data(value.to_string())
+}
+
+/// Convert a [`StoredResponse`] into a full [`ResponseObject`] for retrieval
+/// endpoints.
+fn stored_to_response_object(stored: &StoredResponse) -> ResponseObject {
+    ResponseObject {
+        id: stored.id.clone(),
+        object: "response".to_string(),
+        created_at: stored.created_at,
+        status: if stored.error.is_some() {
+            "failed".to_string()
+        } else {
+            "completed".to_string()
+        },
+        error: stored.error.clone(),
+        incomplete_details: None,
+        instructions: stored.instructions.clone(),
+        metadata: stored.metadata.clone(),
+        model: stored.model.clone(),
+        output: stored.output_items.clone(),
+        parallel_tool_calls: None,
+        previous_response_id: stored.previous_response_id.clone(),
+        reasoning: None,
+        store: stored.store,
+        temperature: None,
+        text: None,
+        tool_choice: None,
+        tools: Vec::new(),
+        top_p: None,
+        truncation: None,
+        usage: stored.usage.clone(),
+        extra: Default::default(),
+    }
+}
+
+/// Build a [`StoredResponse`] from a synthesized [`ResponseObject`] and the
+/// original request fields needed for history replay.
+fn response_object_to_stored(
+    response: &ResponseObject,
+    owner_id: &str,
+    input_items: Vec<InputItem>,
+    model: &str,
+    instructions: Option<&str>,
+    store: bool,
+    metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+    previous_response_id: Option<&str>,
+) -> StoredResponse {
+    StoredResponse {
+        id: response.id.clone(),
+        owner_id: owner_id.to_string(),
+        created_at: response.created_at,
+        model: model.to_string(),
+        instructions: instructions.map(str::to_string),
+        store,
+        input_items,
+        output_items: response.output.clone(),
+        usage: response.usage.clone(),
+        metadata: metadata.cloned(),
+        previous_response_id: previous_response_id.map(str::to_string),
+        error: response.error.clone(),
+    }
+}
+
+fn responses_error(status: StatusCode, message: &str, error_type: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "message": message, "type": error_type }
+        })),
+    )
+        .into_response()
+}
+
+/// POST /v1/responses — create a model response (buffered or streaming).
+pub async fn responses_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    authenticated_key: Option<Extension<AuthenticatedKey>>,
+    Json(request): Json<ResponsesRequest>,
+) -> Response {
+    tracing::info!(
+        model = %request.model,
+        stream = request.stream,
+        "Received responses API request"
+    );
+    let trace_id = trace_id_from_headers(&headers);
+    let owner_id = authenticated_key
+        .as_ref()
+        .map(|Extension(key)| key.id.clone())
+        .unwrap_or_else(|| "anonymous".to_string());
+
+    state.metrics.start_request();
+    let start = std::time::Instant::now();
+    let active_handle = state.active_requests.register(build_active_request_info(
+        &trace_id,
+        &request.model,
+        Some(&owner_id),
+        crate::active_requests::RequestKind::Chat,
+    ));
+    let request_guard = RequestCompleteGuard::new(
+        state.metrics.clone(),
+        start,
+        Some((state.active_requests.clone(), trace_id.clone())),
+    );
+
+    let chat_request = {
+        let history = if let Some(prev_id) = &request.previous_response_id {
+            match state.responses_store.get_response(&owner_id, prev_id) {
+                Ok(Some(stored)) => Some(StoredConversation {
+                    input_items: stored.input_items,
+                    output_items: stored.output_items,
+                }),
+                Ok(None) => {
+                    return responses_error(
+                        StatusCode::NOT_FOUND,
+                        &format!(
+                            "previous_response_id '{prev_id}' was not found for this key"
+                        ),
+                        "invalid_request_error",
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to load previous response");
+                    return responses_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to load conversation history",
+                        "server_error",
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        let ctx = ResponsesTranslationContext {
+            resolved_model: &request.model,
+            model_supports_reasoning: false,
+        };
+
+        match translate_responses(&request, history, &ctx) {
+            Ok(chat_req) => chat_req,
+            Err(e) => {
+                return responses_error(
+                    StatusCode::BAD_REQUEST,
+                    &e.to_string(),
+                    "invalid_request_error",
+                );
+            }
+        }
+    };
+
+    if request.stream {
+        responses_create_stream(
+            state,
+            request,
+            chat_request,
+            trace_id,
+            owner_id,
+            active_handle,
+            request_guard,
+        )
+        .await
+    } else {
+        responses_create_buffered(
+            state,
+            request,
+            chat_request,
+            trace_id,
+            owner_id,
+            active_handle,
+            request_guard,
+        )
+        .await
+    }
+}
+
+/// Buffered (non-streaming) create path.
+async fn responses_create_buffered(
+    state: AppState,
+    request: ResponsesRequest,
+    chat_request: OpenAIRequest,
+    trace_id: String,
+    owner_id: String,
+    active_handle: crate::active_requests::ActiveRequestHandle,
+    mut request_guard: RequestCompleteGuard,
+) -> Response {
+    let result = state
+        .router
+        .route_request(&chat_request, Some(active_handle))
+        .await;
+
+    match result {
+        Ok(chat_response) => {
+            let synthesis_ctx = ResponsesSynthesisContext {
+                request_model: &request.model,
+                request_instructions: request.instructions.as_deref(),
+                request_temperature: request.temperature,
+                request_top_p: request.top_p,
+                request_tools: &request.tools,
+                request_tool_choice: request.tool_choice.as_ref(),
+                request_metadata: request.metadata.as_ref(),
+                request_store: request.store,
+                request_previous_response_id: request.previous_response_id.as_deref(),
+                request_truncation: request.truncation.as_deref(),
+                request_text: request.text.as_ref(),
+                request_parallel_tool_calls: request.parallel_tool_calls,
+                request_reasoning: request.reasoning.as_ref(),
+            };
+
+            let response_object = synthesize_responses(&chat_response, &synthesis_ctx);
+
+            if request.store {
+                let input_items = extract_input_items(&request);
+                let stored = response_object_to_stored(
+                    &response_object,
+                    &owner_id,
+                    input_items,
+                    &request.model,
+                    request.instructions.as_deref(),
+                    request.store,
+                    request.metadata.as_ref(),
+                    request.previous_response_id.as_deref(),
+                );
+                if let Err(e) = state
+                    .responses_store
+                    .store_response(&owner_id, &stored)
+                {
+                    tracing::warn!(error = %e, "Failed to persist response to store");
+                }
+            }
+
+            request_guard.complete();
+
+            let mut http = Json(&response_object).into_response();
+            attach_trace_id_header(&mut http, &trace_id);
+            http
+        }
+        Err(err) => {
+            request_guard.complete();
+            err.into_response()
+        }
+    }
+}
+
+/// Streaming create path: route_request_streaming → parse chat SSE → synthesize
+/// Responses events → axum SSE response.
+async fn responses_create_stream(
+    state: AppState,
+    request: ResponsesRequest,
+    chat_request: OpenAIRequest,
+    trace_id: String,
+    owner_id: String,
+    active_handle: crate::active_requests::ActiveRequestHandle,
+    mut request_guard: RequestCompleteGuard,
+) -> Response {
+    let streaming_config = state
+        .config
+        .read()
+        .await
+        .streaming
+        .clone()
+        .unwrap_or_default();
+
+    let result = state
+        .router
+        .route_request_streaming(&chat_request, Some(active_handle))
+        .await;
+
+    match result {
+        Ok(StreamingResponse::Buffered(chat_response)) => {
+            let synthesis_ctx = ResponsesSynthesisContext {
+                request_model: &request.model,
+                request_instructions: request.instructions.as_deref(),
+                request_temperature: request.temperature,
+                request_top_p: request.top_p,
+                request_tools: &request.tools,
+                request_tool_choice: request.tool_choice.as_ref(),
+                request_metadata: request.metadata.as_ref(),
+                request_store: request.store,
+                request_previous_response_id: request.previous_response_id.as_deref(),
+                request_truncation: request.truncation.as_deref(),
+                request_text: request.text.as_ref(),
+                request_parallel_tool_calls: request.parallel_tool_calls,
+                request_reasoning: request.reasoning.as_ref(),
+            };
+
+            let response_object = synthesize_responses(&chat_response, &synthesis_ctx);
+
+            if request.store {
+                let input_items = extract_input_items(&request);
+                let stored = response_object_to_stored(
+                    &response_object,
+                    &owner_id,
+                    input_items,
+                    &request.model,
+                    request.instructions.as_deref(),
+                    request.store,
+                    request.metadata.as_ref(),
+                    request.previous_response_id.as_deref(),
+                );
+                if let Err(e) = state
+                    .responses_store
+                    .store_response(&owner_id, &stored)
+                {
+                    tracing::warn!(error = %e, "Failed to persist streamed response to store");
+                }
+            }
+
+            request_guard.complete();
+
+            let response_for_stream = response_object.clone();
+            let stream = async_stream::stream! {
+                let event_type = "response.created";
+                let created_event = serde_json::to_value(&ResponsesSseEvent::Created {
+                    sequence_number: 0,
+                    response: response_for_stream.clone(),
+                }).unwrap_or_default();
+                yield Ok::<_, Infallible>(Event::default().event(event_type).data(created_event.to_string()));
+
+                let in_progress_event = serde_json::to_value(&ResponsesSseEvent::InProgress {
+                    sequence_number: 1,
+                    response: response_for_stream.clone(),
+                }).unwrap_or_default();
+                yield Ok(Event::default().event("response.in_progress").data(in_progress_event.to_string()));
+
+                let completed_event = serde_json::to_value(&ResponsesSseEvent::Completed {
+                    sequence_number: 2,
+                    response: response_for_stream,
+                }).unwrap_or_default();
+                yield Ok(Event::default().event("response.completed").data(completed_event.to_string()));
+
+                yield Ok(Event::default().data("[DONE]"));
+            };
+
+            let mut sse = Sse::new(stream)
+                .keep_alive(build_keepalive(&streaming_config))
+                .into_response();
+            attach_trace_id_header(&mut sse, &trace_id);
+            sse
+        }
+        Ok(StreamingResponse::PassThrough {
+            byte_stream,
+            provider: _,
+            model,
+            compression: _,
+            concurrency_permit: _,
+        }) => {
+            let store = request.store;
+            let request_model = request.model.clone();
+            let instructions = request.instructions.clone();
+            let metadata = request.metadata.clone();
+            let previous_response_id = request.previous_response_id.clone();
+            let owner = owner_id.clone();
+            let stream_trace_id = trace_id.clone();
+            let responses_store = state.responses_store.clone();
+
+            let stream = async_stream::stream! {
+                let mut _guard = request_guard;
+
+                let mut translator = ResponsesStreamTranslator::new(
+                    &model,
+                    instructions.as_deref(),
+                );
+
+                let mut buffer = String::new();
+                let mut bytes_stream = byte_stream.bytes_stream();
+                let mut final_usage: Option<ResponsesUsage> = None;
+
+                while let Some(chunk_result) = bytes_stream.next().await {
+                    match chunk_result {
+                        Ok(bytes) => {
+                            buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        }
+                        Err(e) => {
+                            tracing::warn!(trace_id = %stream_trace_id, error = %e, "Upstream stream error in responses pass-through");
+                            break;
+                        }
+                    }
+
+                    while let Some(newline_idx) = buffer.find('\n') {
+                        let raw: String = buffer.drain(..=newline_idx).collect();
+                        let line = raw.trim_end_matches(|c| c == '\n' || c == '\r');
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let payload = match line.strip_prefix("data:") {
+                            Some(rest) => rest.trim_start(),
+                            None => continue,
+                        };
+
+                        if payload == "[DONE]" {
+                            continue;
+                        }
+
+                        let chunk: serde_json::Value = match serde_json::from_str(payload) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        if let Some(usage) = chunk.get("usage") {
+                            final_usage = map_chat_usage(usage);
+                        }
+
+                        let events = translator.feed_chunk(&chunk);
+                        for event in &events {
+                            yield Ok::<_, Infallible>(responses_event_to_sse(event));
+                        }
+                    }
+                }
+
+                let terminal_events = translator.finish(final_usage);
+                for event in &terminal_events {
+                    yield Ok(responses_event_to_sse(event));
+                }
+
+                if store {
+                    if let Some(completed) = terminal_events.iter().rev().find_map(|e| {
+                        match e {
+                            ResponsesSseEvent::Completed { response, .. } => Some(response.clone()),
+                            ResponsesSseEvent::Failed { response, .. } => Some(response.clone()),
+                            ResponsesSseEvent::Incomplete { response, .. } => Some(response.clone()),
+                            _ => None,
+                        }
+                    }) {
+                        let input_items = Vec::new();
+                        let stored = response_object_to_stored(
+                            &completed,
+                            &owner,
+                            input_items,
+                            &request_model,
+                            instructions.as_deref(),
+                            store,
+                            metadata.as_ref(),
+                            previous_response_id.as_deref(),
+                        );
+                        if let Err(e) = responses_store.store_response(&owner, &stored) {
+                            tracing::warn!(error = %e, "Failed to persist streamed response");
+                        }
+                    }
+                }
+
+                yield Ok(Event::default().data("[DONE]"));
+            };
+
+            let mut sse = Sse::new(stream)
+                .keep_alive(build_keepalive(&streaming_config))
+                .into_response();
+            attach_trace_id_header(&mut sse, &trace_id);
+            sse
+        }
+        Err(err) => {
+            request_guard.complete();
+            err.into_response()
+        }
+    }
+}
+
+/// GET /v1/responses/{id} — retrieve a stored response (owner-scoped).
+pub async fn responses_get(
+    State(state): State<AppState>,
+    Path(response_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    match state
+        .responses_store
+        .get_response(&authenticated_key.id, &response_id)
+    {
+        Ok(Some(stored)) => {
+            let response_object = stored_to_response_object(&stored);
+            Json(&response_object).into_response()
+        }
+        Ok(None) => responses_error(
+            StatusCode::NOT_FOUND,
+            &format!("No response found with id '{response_id}'"),
+            "invalid_request_error",
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "Responses store get failed");
+            responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to retrieve response",
+                "server_error",
+            )
+        }
+    }
+}
+
+/// GET /v1/responses — list stored responses (cursor pagination).
+pub async fn responses_list(
+    State(state): State<AppState>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Query(params): Query<ResponsesListParams>,
+) -> Response {
+    match state
+        .responses_store
+        .list_responses(&authenticated_key.id, &params)
+    {
+        Ok(responses) => {
+            let data: Vec<serde_json::Value> = responses
+                .iter()
+                .map(|r| serde_json::to_value(stored_to_response_object(r)).unwrap_or_default())
+                .collect();
+            let first_id = data.first().and_then(|d| d.get("id")).cloned();
+            let last_id = data.last().and_then(|d| d.get("id")).cloned();
+            let has_more = data.len() == params.limit;
+            Json(serde_json::json!({
+                "object": "list",
+                "data": data,
+                "first_id": first_id,
+                "last_id": last_id,
+                "has_more": has_more,
+            }))
+            .into_response()
+        }
+        Err(crate::assistants::StoreError::InvalidRequest(msg)) => {
+            responses_error(StatusCode::BAD_REQUEST, &msg, "invalid_request_error")
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Responses store list failed");
+            responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to list responses",
+                "server_error",
+            )
+        }
+    }
+}
+
+/// DELETE /v1/responses/{id} — delete a stored response (owner-scoped).
+pub async fn responses_delete(
+    State(state): State<AppState>,
+    Path(response_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+) -> Response {
+    match state
+        .responses_store
+        .delete_response(&authenticated_key.id, &response_id)
+    {
+        Ok(deleted) => Json(serde_json::json!({
+            "id": response_id,
+            "object": "response",
+            "deleted": deleted,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Responses store delete failed");
+            responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to delete response",
+                "server_error",
+            )
+        }
+    }
+}
+
+/// GET /v1/responses/{id}/input_items — list stored input items (cursor pagination).
+pub async fn responses_input_items(
+    State(state): State<AppState>,
+    Path(response_id): Path<String>,
+    AssistantsIdentity(authenticated_key): AssistantsIdentity,
+    Query(params): Query<ResponsesListParams>,
+) -> Response {
+    match state
+        .responses_store
+        .list_input_items(&authenticated_key.id, &response_id, &params)
+    {
+        Ok(items) => {
+            let data: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| serde_json::to_value(item).unwrap_or_default())
+                .collect();
+            let first_id = data
+                .first()
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let last_id = data
+                .last()
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let has_more = data.len() == params.limit;
+            Json(serde_json::json!({
+                "object": "list",
+                "data": data,
+                "first_id": first_id,
+                "last_id": last_id,
+                "has_more": has_more,
+            }))
+            .into_response()
+        }
+        Err(crate::assistants::StoreError::NotFound { object, id }) => responses_error(
+            StatusCode::NOT_FOUND,
+            &format!("No {object} found with id '{id}'"),
+            "invalid_request_error",
+        ),
+        Err(crate::assistants::StoreError::InvalidRequest(msg)) => {
+            responses_error(StatusCode::BAD_REQUEST, &msg, "invalid_request_error")
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Responses store input_items failed");
+            responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to list input items",
+                "server_error",
+            )
+        }
+    }
+}
+
+/// Extract input items from a ResponsesRequest for store persistence.
+fn extract_input_items(request: &ResponsesRequest) -> Vec<InputItem> {
+    match &request.input {
+        ResponsesInput::Text(text) => vec![InputItem::Easy(EasyInputMessage {
+            content: EasyInputContent::Text(text.clone()),
+            role: "user".to_string(),
+            phase: None,
+            extra: Default::default(),
+        })],
+        ResponsesInput::Items(items) => items.clone(),
+    }
+}
+
+/// Map a chat-completions `usage` JSON object to a [`ResponsesUsage`].
+fn map_chat_usage(usage: &serde_json::Value) -> Option<ResponsesUsage> {
+    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let total_tokens = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    if prompt_tokens == 0 && completion_tokens == 0 && total_tokens == 0 {
+        return None;
+    }
+    let cached_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Some(ResponsesUsage {
+        input_tokens: prompt_tokens,
+        output_tokens: completion_tokens,
+        total_tokens,
+        input_tokens_details: Some(InputTokensDetails {
+            cached_tokens,
+            ..Default::default()
+        }),
+        output_tokens_details: Some(OutputTokensDetails {
+            reasoning_tokens,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }
