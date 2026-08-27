@@ -46,6 +46,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Streaming reliability** — true SSE pass-through for capable providers with early synthetic events (sub-500ms TTFB), configurable keep-alive, graceful in-stream error frames, mid-stream failover, and inter-chunk/total timeouts (see [Streaming Reliability](#streaming-reliability))
 - **Response caching** — built-in two-tier cache: in-memory exact-match (default-on, no setup) plus optional semantic Qdrant tier; works for both streaming and non-streaming requests, including tool-using clients
 - **OpenAI OAuth login** — browser-based sign-in with your ChatGPT Plus/Pro subscription (PKCE flow, automatic token refresh)
+- **Responses API front door** — native `/v1/responses` endpoint that accepts the OpenAI Responses wire format (used by Codex CLI and the OpenAI SDK's `responses.create`) and bridges it to Chat-Completions-native providers; translates requests inbound, synthesizes Responses-shaped output (streaming + non-streaming), and offers stateful persistence via `store` / `previous_response_id` with retrieval, list, and delete endpoints (see [Responses API](#responses-api))
 - **Codex backend translation** — transparently routes OAuth-authenticated requests through the ChatGPT Codex backend, translating Chat Completions ↔ Responses API on the fly
 - **Codex web search** — automatic web-search tool injection available to every model group while a valid OpenAI OAuth token is active; the routed provider serves the completion while search calls execute server-side against the Codex search API (configurable timeout, max iterations, base URL, and chat output so results survive context compression)
 - **Guardrail pipelines** — configurable pre-call and post-call policy enforcement with PII redaction/re-injection, regex scanning, Presidio NLP, OpenAI Moderation, Lakera, semantic prompt guard, and custom HTTP providers; includes refusal detection with automatic failover (see [Guardrail Pipelines](#guardrail-pipelines))
@@ -1073,6 +1074,11 @@ All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` re
 | `GET` | `/health` | Health check |
 | `GET` | `/metrics` | Prometheus metrics |
 | `POST` | `/v1/chat/completions` | Chat completions (streaming + non-streaming) |
+| `POST` | `/v1/responses` | Responses API — create (streaming + non-streaming) |
+| `GET` | `/v1/responses` | Responses API — list |
+| `GET` | `/v1/responses/{response_id}` | Retrieve a stored response |
+| `DELETE` | `/v1/responses/{response_id}` | Delete a stored response |
+| `GET` | `/v1/responses/{response_id}/input_items` | List a response's input items |
 | `POST` | `/v1/completions` | Legacy completions |
 | `POST` | `/v1/embeddings` | Embeddings |
 | `GET` | `/v1/models` | List available models |
@@ -1176,6 +1182,31 @@ dashboard:
   path: "/dashboard"
 ```
 
+## Responses API
+
+The gateway exposes a native `/v1/responses` endpoint that speaks the OpenAI Responses wire format — the format used by the Codex CLI and the OpenAI SDK's `responses.create()`. Clients that hardcode the Responses shape work against any Chat-Completions-native provider in your config, because the gateway bridges the two formats in both directions.
+
+### How It Works
+
+1. **Inbound translation** — a Responses request (`input`, `instructions`, `max_output_tokens`, `tools`, `text.format`, `reasoning.effort`, etc.) is translated into an internal Chat Completions request.
+2. **Routing** — the translated request flows through the normal model group routing (failover, circuit breakers, caching, guardrails, compression).
+3. **Outbound synthesis** — the provider's Chat Completions response is synthesized back into a Responses-shaped object (`output` items, `usage`, reasoning summaries). Streaming responses are re-emitted as Responses SSE events.
+
+### Stateful Conversations
+
+The endpoint supports OpenAI's stateful conversation model backed by a local SQLite store:
+
+| Field / Endpoint | Behavior |
+|------------------|----------|
+| `store: true` | Persist the response so it can be retrieved or chained later |
+| `previous_response_id` | Continue a stored conversation without resending prior turns |
+| `GET /v1/responses/{id}` | Retrieve a stored response |
+| `GET /v1/responses/{id}/input_items` | List the input items for a stored response |
+| `GET /v1/responses` | List stored responses |
+| `DELETE /v1/responses/{id}` | Delete a stored response |
+
+Stateful data is stored locally — no dependency on the upstream provider retaining conversation state.
+
 ## Assistants API
 
 The gateway includes a full local implementation of the OpenAI Assistants API — no upstream proxy required. All data is stored in a dedicated SQLite database (`assistants.db`, created automatically alongside your logging database).
@@ -1265,6 +1296,7 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── metrics/              # Prometheus metrics
 │           ├── oauth/                # OpenAI OAuth 2.0 login (PKCE flow)
 │           ├── codex/               # Codex backend: Chat Completions → Responses API translation, model discovery, instructions store, web search
+│           ├── responses/           # Responses API front door: inbound Responses→Chat translation, response/stream synthesis, SQLite stateful store
 │           ├── virtual_keys/         # Virtual key management (auth, budgets, rate limits, usage, admin API)
 │           ├── compression/          # Token compression engines & pipelines
 │           ├── tool_compression/     # Tool definition compression: 12-stage pipeline, provider-aware middleware
