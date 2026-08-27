@@ -1524,9 +1524,12 @@ impl Router {
 /// model. This method removes those parts and logs that fact.
 ///
 /// Recognizes the common image part type spellings across client
-/// libraries (`image_url`, `image`, `input_image`). When stripping
-/// empties a message's part list entirely, a short text placeholder is
-/// inserted so the provider never sees an empty content array.
+/// libraries (`image_url`, `image`, `input_image`) at every nesting
+/// depth — including image parts inside a `tool_result` part's own
+/// `content` array, which clients send when a tool returned an image.
+/// When stripping empties a content array entirely (top-level or
+/// nested), a short text placeholder is inserted so the provider never
+/// sees an empty content array.
 fn strip_image_content_if_unsupported(
     request: &mut OpenAIRequest,
     supports_vision: bool,
@@ -1540,33 +1543,68 @@ fn strip_image_content_if_unsupported(
     let mut stripped_total: usize = 0;
     for (idx, msg) in request.messages.iter_mut().enumerate() {
         if let serde_json::Value::Array(parts) = &mut msg.content {
-            let before = parts.len();
-            parts.retain(|part| {
-                !matches!(
-                    part.get("type").and_then(|v| v.as_str()),
-                    Some("image_url") | Some("image") | Some("input_image")
-                )
-            });
-            let removed = before.saturating_sub(parts.len());
-            if removed > 0 {
-                if parts.is_empty() {
-                    parts.push(serde_json::json!({
-                        "type": "text",
-                        "text": "[image content removed: model does not support image inputs]"
-                    }));
-                }
-                warn!(
-                    provider = provider_name,
-                    model = %model,
-                    message_index = idx,
-                    images_removed = removed,
-                    "Stripped image content parts from message for non-vision model"
-                );
+            let removed = Self::strip_image_parts_recursive(parts, idx, provider_name, model);
+            if removed > 0 && parts.is_empty() {
+                parts.push(serde_json::json!({
+                    "type": "text",
+                    "text": "[image content removed: model does not support image inputs]"
+                }));
             }
             stripped_total += removed;
         }
     }
     stripped_total
+}
+
+/// Recursively remove image content parts from a `content` array and
+/// from nested `content` arrays inside surviving parts (e.g.
+/// `{"type":"tool_result","content":[{"type":"image_url",...}]}`).
+/// Returns the total number of image parts removed at every depth.
+fn strip_image_parts_recursive(
+    parts: &mut Vec<serde_json::Value>,
+    message_index: usize,
+    provider_name: &str,
+    model: &str,
+) -> usize {
+    let mut stripped: usize = 0;
+
+    // First recurse into nested `content` arrays so images buried inside
+    // non-image parts (tool results, custom part shapes) are removed too.
+    for part in parts.iter_mut() {
+        if let Some(nested_value) = part.get_mut("content") {
+            if let serde_json::Value::Array(nested) = nested_value {
+                let nested_removed =
+                    Self::strip_image_parts_recursive(nested, message_index, provider_name, model);
+                if nested_removed > 0 && nested.is_empty() {
+                    nested.push(serde_json::json!({
+                        "type": "text",
+                        "text": "[image content removed: model does not support image inputs]"
+                    }));
+                }
+                stripped += nested_removed;
+            }
+        }
+    }
+
+    // Then remove image parts at this level.
+    let before = parts.len();
+    parts.retain(|part| {
+        !matches!(
+            part.get("type").and_then(|v| v.as_str()),
+            Some("image_url") | Some("image") | Some("input_image")
+        )
+    });
+    let removed = before.saturating_sub(parts.len());
+    if removed > 0 {
+        warn!(
+            provider = provider_name,
+            model = %model,
+            message_index = message_index,
+            images_removed = removed,
+            "Stripped image content parts from message for non-vision model"
+        );
+    }
+    stripped + removed
 }
 
 /// Check whether an upstream rejection is caused by image content the
@@ -1579,9 +1617,13 @@ fn strip_image_content_if_unsupported(
 /// substring check over the body keeps the detection tolerant of the
 /// varied error envelopes.
 fn is_unsupported_image_error(status_code: u16, body: &str) -> bool {
-    if !(400..500).contains(&status_code) {
-        return false;
-    }
+    (400..500).contains(&status_code) && Self::is_unsupported_image_phrasing(body)
+}
+
+/// Phrase-level detection of "model cannot accept image inputs" error
+/// text, independent of the HTTP status. Used for real 4xx rejections
+/// and for the error-inside-HTTP-200 envelopes some providers return.
+fn is_unsupported_image_phrasing(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("does not support image")
         || lower.contains("not support image inputs")
@@ -3170,18 +3212,44 @@ for attempt in 0..=max_retries {
                                     });
                                 }
 
-                                warn!(
-                                    provider = provider_name,
-                                    attempt,
-                                    error = %err_msg,
-                                    "Provider returned error inside HTTP 200 — treating as retryable"
-                                );
-                                last_error = Some(GatewayError::Provider {
-                                    provider: provider_name.to_string(),
-                                    message: format!("Error in 200 response: {}", err_msg),
-                                    status_code: Some(status_code),
-                                });
-                                continue;
+			// Image-input rejection inside a 200 envelope: same rescue
+			// as the 4xx branch below — strip image parts (including
+			// nested ones) and retry the same provider once instead of
+			// failing over with images still attached.
+			if !image_strip_retry_done
+				&& Self::is_unsupported_image_phrasing(&body_text)
+			{
+				let removed = Self::strip_image_content_if_unsupported(
+					&mut outgoing,
+					false,
+					provider_name,
+					&provider_model.model,
+				);
+				if removed > 0 {
+					image_strip_retry_done = true;
+					skip_next_backoff = true;
+					info!(
+						provider = provider_name,
+						model = %provider_model.model,
+						images_removed = removed,
+						"Provider rejected image inputs (in HTTP 200 envelope) — stripped images and retrying same provider"
+					);
+					continue;
+				}
+			}
+
+			warn!(
+				provider = provider_name,
+				attempt,
+				error = %err_msg,
+				"Provider returned error inside HTTP 200 — treating as retryable"
+			);
+			last_error = Some(GatewayError::Provider {
+				provider: provider_name.to_string(),
+				message: format!("Error in 200 response: {}", err_msg),
+				status_code: Some(status_code),
+			});
+			continue;
                             }
                         }
 
@@ -9111,61 +9179,148 @@ fn test_strip_image_content_if_unsupported_inserts_placeholder_for_image_only_me
     assert!(parts[0]["text"].as_str().unwrap().contains("image"));
 }
 
-#[test]
-fn test_strip_image_content_if_unsupported_removes_variant_image_part_types() {
-    let mut request = OpenAIRequest {
-        model: "no-vision".to_string(),
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: serde_json::json!([
-                {"type": "text", "text": "describe this"},
-                {"type": "image", "source": {"type": "base64"}},
-                {"type": "input_image", "image_url": "https://x.example/p.png"},
-            ]),
+    #[test]
+    fn test_strip_image_content_if_unsupported_removes_variant_image_part_types() {
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image", "source": {"type": "base64"}},
+                    {"type": "input_image", "image_url": "https://x.example/p.png"},
+                ]),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
             extra: Default::default(),
-        }],
-        temperature: None,
-        max_tokens: None,
-        stream: false,
-        extra: Default::default(),
-    };
+        };
 
-    let removed = Router::strip_image_content_if_unsupported(
-        &mut request,
-        false,
-        "test-provider",
-        "no-vision",
-    );
-    assert_eq!(removed, 2);
-    let parts = request.messages[0].content.as_array().unwrap();
-    assert_eq!(parts.len(), 1);
-    assert_eq!(parts[0]["type"], serde_json::json!("text"));
-}
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 2);
+        let parts = request.messages[0].content.as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], serde_json::json!("text"));
+    }
 
-#[test]
-fn test_is_unsupported_image_error_matches_provider_phrasings() {
-    assert!(Router::is_unsupported_image_error(
-        400,
-        "This model does not support image inputs."
-    ));
-    assert!(Router::is_unsupported_image_error(
-        400,
-        r#"{"error":{"message":"Invalid request: image content is not supported for this model"}}"#
-    ));
-    assert!(Router::is_unsupported_image_error(
-        422,
-        "model does not support vision"
-    ));
-    assert!(!Router::is_unsupported_image_error(
-        400,
-        "invalid model identifier"
-    ));
-    assert!(!Router::is_unsupported_image_error(500, "image inputs"));
-    assert!(!Router::is_unsupported_image_error(
-        200,
-        "This model does not support image inputs."
-    ));
-}
+    #[test]
+    fn test_strip_image_content_if_unsupported_removes_nested_tool_result_images() {
+        // Images nested inside a tool_result part's own content array
+        // must be stripped too — a top-level-only pass leaves them
+        // behind and the provider rejects the retry again.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "screenshot attached"},
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": [
+                        {"type": "text", "text": "tool output follows"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+                    ]},
+                ]),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1, "nested image must be counted and removed");
+        let parts = request.messages[0].content.as_array().unwrap();
+        assert_eq!(parts.len(), 2, "text + tool_result parts survive");
+        let nested = parts[1]["content"].as_array().unwrap();
+        assert_eq!(nested.len(), 1, "nested text part survives");
+        assert_eq!(nested[0]["type"], serde_json::json!("text"));
+    }
+
+    #[test]
+    fn test_strip_image_content_if_unsupported_nested_only_image_gets_placeholder() {
+        // A tool_result whose nested content is ONLY an image gets a text
+        // placeholder so the provider never sees an empty content array.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+                    ]},
+                ]),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        let parts = request.messages[0].content.as_array().unwrap();
+        let nested = parts[0]["content"].as_array().unwrap();
+        assert_eq!(nested.len(), 1, "placeholder inserted into nested array");
+        assert_eq!(nested[0]["type"], serde_json::json!("text"));
+    }
+
+    #[test]
+    fn test_is_unsupported_image_error_matches_provider_phrasings() {
+        assert!(Router::is_unsupported_image_error(
+            400,
+            "This model does not support image inputs."
+        ));
+        assert!(Router::is_unsupported_image_error(
+            400,
+            r#"{"error":{"message":"Invalid request: image content is not supported for this model"}}"#
+        ));
+        assert!(Router::is_unsupported_image_error(
+            422,
+            "model does not support vision"
+        ));
+        assert!(!Router::is_unsupported_image_error(
+            400,
+            "invalid model identifier"
+        ));
+        assert!(!Router::is_unsupported_image_error(500, "image inputs"));
+        assert!(!Router::is_unsupported_image_error(
+            200,
+            "This model does not support image inputs."
+        ));
+    }
+
+    #[test]
+    fn test_is_unsupported_image_phrasing_detects_200_envelope_rejections() {
+        // The phrase check is status-independent: used for real 4xx
+        // rejections AND error-inside-HTTP-200 envelopes.
+        assert!(Router::is_unsupported_image_phrasing(
+            "This model does not support image inputs."
+        ));
+        assert!(Router::is_unsupported_image_phrasing(
+            r#"{"error":{"message":"This model does not support image inputs."}}"#
+        ));
+        assert!(!Router::is_unsupported_image_phrasing(
+            "invalid model identifier"
+        ));
+    }
 }
 
 #[cfg(test)]

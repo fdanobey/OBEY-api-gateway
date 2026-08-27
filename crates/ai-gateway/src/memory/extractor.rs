@@ -31,11 +31,23 @@ const MAX_MEMORY_CHARS: usize = 4_096;
 const MIN_MEMORY_WORDS: usize = 3;
 pub const MEMORY_EXTRACTION_INTERNAL_TAG: &str = "memory_extraction";
 
+/// Patterns that indicate image or binary content which must never be
+/// persisted as text memories. These match both raw image data URIs and
+/// JSON-encoded image part shapes that clients send.
+const IMAGE_DATA_PATTERNS: &[&str] = &[
+	"data:image/",
+	"\"type\":\"image_url\"",
+	"\"type\":\"input_image\"",
+	"\"type\":\"image\"",
+	"[{\"type\":\"image",
+	"image_url\":{\"url\":",
+];
+
 static TRIGGER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\b(my preference is|remember this|always use|never use|save this|i prefer)\b",
-    )
-    .expect("memory trigger regex must compile")
+	Regex::new(
+		r"(?i)\b(my preference is|remember this|always use|never use|save this|i prefer)\b",
+	)
+	.expect("memory trigger regex must compile")
 });
 
 static DECISION_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -612,7 +624,15 @@ fn looks_like_path(text: &str) -> bool {
 }
 
 fn ranges_overlap(left: &Range<usize>, right: &ProtectedRange) -> bool {
-    left.start < right.end && right.start < left.end
+	left.start < right.end && right.start < left.end
+}
+
+/// Return true if the candidate content looks like an encoded image or
+/// binary blob. These must never be persisted as text memories — they
+/// bloat storage, break search, and can re-inject incompatible image
+/// parts into non-vision models later.
+fn looks_like_image_or_binary(content: &str) -> bool {
+	IMAGE_DATA_PATTERNS.iter().any(|pat| content.contains(pat))
 }
 
 pub(crate) fn explicit_candidates(message: &str) -> Vec<StructuredMemoryCandidate> {
@@ -693,17 +713,28 @@ async fn store_candidates(
             continue;
         }
 
-        let word_count = content.split_whitespace().count();
-        if word_count < MIN_MEMORY_WORDS {
-            counts.rejected = counts.rejected.saturating_add(1);
-            tracing::warn!(
-                word_count,
-                "discarding memory extraction below minimum word count"
-            );
-            continue;
-        }
+	let word_count = content.split_whitespace().count();
+	if word_count < MIN_MEMORY_WORDS {
+		counts.rejected = counts.rejected.saturating_add(1);
+		tracing::warn!(
+			word_count,
+			"discarding memory extraction below minimum word count"
+		);
+		continue;
+	}
 
-        let target_namespace = namespace_for_type(namespace, candidate.memory_type);
+	// Reject image or binary content that would pollute the text search
+	// index and cause issues when re-injected into non-vision models.
+	if looks_like_image_or_binary(content) {
+		counts.rejected = counts.rejected.saturating_add(1);
+		tracing::warn!(
+			content_preview = %content.chars().take(100).collect::<String>(),
+			"discarding memory extraction that looks like encoded image or binary data"
+		);
+		continue;
+	}
+
+	let target_namespace = namespace_for_type(namespace, candidate.memory_type);
         if store.find_duplicate(target_namespace, content)?.is_some() {
             counts.duplicates_skipped = counts.duplicates_skipped.saturating_add(1);
             continue;
@@ -1048,15 +1079,39 @@ mod tests {
         assert_eq!(provider.maximum_active.load(Ordering::SeqCst), 1);
         provider.release.notify_one();
 
-        assert!(matches!(
-            first.await.unwrap(),
-            AsyncExtractionOutcome::Completed(_)
-        ));
-        assert!(matches!(
-            second.await.unwrap(),
-            AsyncExtractionOutcome::Completed(_)
-        ));
-    }
+	assert!(matches!(
+		first.await.unwrap(),
+		AsyncExtractionOutcome::Completed(_)
+	));
+	assert!(matches!(
+		second.await.unwrap(),
+		AsyncExtractionOutcome::Completed(_)
+	));
+}
+
+#[test]
+fn looks_like_image_or_binary_detects_image_patterns() {
+	// Direct data URI
+	assert!(looks_like_image_or_binary(
+		"data:image/png;base64,AAEC"
+	));
+	// JSON-encoded image_url part (what the user saw in their memory browser)
+	assert!(looks_like_image_or_binary(
+		"[{\"type\":\"image_url\",\"image_url\":\"data:image/png;base64,AAEC\"}]"
+	));
+	// Flattened JSON spelling
+	assert!(looks_like_image_or_binary(
+		"{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AAEC\"}}"
+	));
+	// Claude-style input_image
+	assert!(looks_like_image_or_binary(
+		"{\"type\":\"input_image\",\"image_url\":\"https://example.com/img.png\"}"
+	));
+	// Plain text memory should pass
+	assert!(!looks_like_image_or_binary(
+		"I prefer concise code comments and snake_case for variables."
+	));
+}
 }
 
 #[cfg(test)]
