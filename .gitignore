@@ -44,6 +44,9 @@ tmp-*/
 .spec-workflow/
 .kiro/
 
+# Internal research notes (kept local, not published)
+/docs/research/
+
 # OS files
 Thumbs.db
 .DS_Store
