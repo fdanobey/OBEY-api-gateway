@@ -53,13 +53,15 @@ use crate::virtual_keys::access::AccessError;
 use crate::virtual_keys::models::AuthenticatedKey;
 
 use crate::responses::{
-    EasyInputContent, EasyInputMessage, InputItem, InputTokensDetails, OutputTokensDetails,
-    ResponseObject, ResponsesInput, ResponsesListParams, ResponsesRequest, ResponsesSseEvent,
-    ResponsesStreamTranslator, ResponsesUsage, StoredConversation, StoredResponse,
-    SynthesisContext as ResponsesSynthesisContext,
+    EasyInputContent, EasyInputMessage, InputItem, InputTokensDetails, OutputContentPart,
+    OutputFunctionCall, OutputItem, OutputMessage, OutputTokensDetails,
+    ResponseError, ResponseObject, ResponsesInput, ResponsesListParams, ResponsesRequest,
+    ResponsesSseEvent, ResponsesStreamTranslator, ResponsesUsage, StoredConversation,
+    StoredResponse, SynthesisContext as ResponsesSynthesisContext,
     TranslationContext as ResponsesTranslationContext, synthesize as synthesize_responses,
     translate as translate_responses,
 };
+use crate::codex::sse::ResponsesEvent as CodexResponsesEvent;
 
 pub struct AssistantsIdentity(AuthenticatedKey);
 
@@ -6235,12 +6237,247 @@ mod tests {
             None,
             None,
         );
-        let _events: Vec<_> = stream.collect().await;
-        assert!(matches!(
-            &*outcome.lock().await,
-            RelayOutcome::Completed { .. }
-        ));
-    }
+let _events: Vec<_> = stream.collect().await;
+assert!(matches!(
+&*outcome.lock().await,
+RelayOutcome::Completed { .. }
+));
+}
+
+// ── Task 9 parity tests: Codex native vs chat-synthesized event taxonomy ──
+
+fn event_type_name(event: &crate::responses::ResponsesSseEvent) -> String {
+    serde_json::to_value(event)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+        .unwrap_or_default()
+}
+
+#[test]
+fn codex_native_and_chat_synthesized_produce_same_event_taxonomy_for_text() {
+use crate::codex::sse::{CompletedPayload, ResponsesEvent as CodexResponsesEvent};
+use crate::responses::ResponsesStreamTranslator;
+
+// Simulate Codex native events for a simple text response
+let codex_events = vec![
+CodexResponsesEvent::Created {
+id: "resp_test".to_string(),
+model: "gpt-4".to_string(),
+sequence_number: 0,
+},
+CodexResponsesEvent::OutputTextDelta {
+item_id: "msg_1".to_string(),
+delta: "Hello".to_string(),
+sequence_number: 1,
+},
+CodexResponsesEvent::OutputTextDelta {
+item_id: "msg_1".to_string(),
+delta: " world".to_string(),
+sequence_number: 2,
+},
+CodexResponsesEvent::OutputTextDone {
+item_id: "msg_1".to_string(),
+text: "Hello world".to_string(),
+sequence_number: 3,
+},
+CodexResponsesEvent::Completed {
+response: CompletedPayload {
+id: "resp_test".to_string(),
+model: "gpt-4".to_string(),
+output: vec![],
+usage: None,
+incomplete_details: None,
+},
+sequence_number: 4,
+},
+];
+
+// Convert Codex native events to gateway ResponsesSseEvent
+let mut native_types: Vec<String> = Vec::new();
+for e in &codex_events {
+for ge in super::codex_event_to_responses_sse(e) {
+native_types.push(event_type_name(&ge));
+}
+}
+
+// Simulate equivalent chat SSE chunks
+let chat_chunks = vec![
+serde_json::json!({
+"id": "chatcmpl-1",
+"object": "chat.completion.chunk",
+"model": "gpt-4",
+"choices": [{"index": 0, "delta": {"role": "assistant"}}]
+}),
+serde_json::json!({
+"id": "chatcmpl-1",
+"object": "chat.completion.chunk",
+"model": "gpt-4",
+"choices": [{"index": 0, "delta": {"content": "Hello"}}]
+}),
+serde_json::json!({
+"id": "chatcmpl-1",
+"object": "chat.completion.chunk",
+"model": "gpt-4",
+"choices": [{"index": 0, "delta": {"content": " world"}}]
+}),
+serde_json::json!({
+"id": "chatcmpl-1",
+"object": "chat.completion.chunk",
+"model": "gpt-4",
+"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+"usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+}),
+];
+
+let mut translator = ResponsesStreamTranslator::new("gpt-4", None);
+let mut synth_types: Vec<String> = Vec::new();
+for chunk in &chat_chunks {
+for event in translator.feed_chunk(chunk) {
+synth_types.push(event_type_name(&event));
+}
+}
+for event in translator.finish(None) {
+synth_types.push(event_type_name(&event));
+}
+
+// Both must emit the same core lifecycle events
+assert!(native_types.contains(&"response.created".to_string()),
+"Native events missing response.created: {:?}", native_types);
+assert!(synth_types.contains(&"response.created".to_string()),
+"Synthesized events missing response.created: {:?}", synth_types);
+assert!(native_types.contains(&"response.output_text.delta".to_string()),
+"Native events missing output_text.delta: {:?}", native_types);
+assert!(synth_types.contains(&"response.output_text.delta".to_string()),
+"Synthesized events missing output_text.delta: {:?}", synth_types);
+assert!(native_types.contains(&"response.completed".to_string()),
+"Native events missing response.completed: {:?}", native_types);
+assert!(synth_types.contains(&"response.completed".to_string()),
+"Synthesized events missing response.completed: {:?}", synth_types);
+}
+
+#[test]
+fn codex_native_and_chat_synthesized_produce_same_event_taxonomy_for_tool_calls() {
+use crate::codex::sse::ResponsesEvent as CodexResponsesEvent;
+use crate::responses::ResponsesStreamTranslator;
+
+// Simulate Codex native events for a tool-call response
+let codex_events = vec![
+CodexResponsesEvent::Created {
+id: "resp_tool".to_string(),
+model: "gpt-4".to_string(),
+sequence_number: 0,
+},
+CodexResponsesEvent::OutputItemAdded {
+item_id: "fc_1".to_string(),
+kind: "function_call".to_string(),
+call_id: Some("call_abc".to_string()),
+name: Some("get_weather".to_string()),
+sequence_number: 1,
+},
+CodexResponsesEvent::FunctionCallArgumentsDelta {
+item_id: "fc_1".to_string(),
+delta: "{\"city\":\"Paris\"}".to_string(),
+sequence_number: 2,
+},
+];
+
+let mut native_types: Vec<String> = Vec::new();
+for e in &codex_events {
+for ge in super::codex_event_to_responses_sse(e) {
+native_types.push(event_type_name(&ge));
+}
+}
+
+// Simulate equivalent chat SSE with tool_calls
+let chat_chunks = vec![
+serde_json::json!({
+"id": "chatcmpl-2",
+"object": "chat.completion.chunk",
+"model": "gpt-4",
+"choices": [{"index": 0, "delta": {"role": "assistant"}}]
+}),
+serde_json::json!({
+"id": "chatcmpl-2",
+"object": "chat.completion.chunk",
+"model": "gpt-4",
+"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_abc", "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]}}]
+}),
+serde_json::json!({
+"id": "chatcmpl-2",
+"object": "chat.completion.chunk",
+"model": "gpt-4",
+"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+}),
+];
+
+let mut translator = ResponsesStreamTranslator::new("gpt-4", None);
+let mut synth_types: Vec<String> = Vec::new();
+for chunk in &chat_chunks {
+for event in translator.feed_chunk(chunk) {
+synth_types.push(event_type_name(&event));
+}
+}
+for event in translator.finish(None) {
+synth_types.push(event_type_name(&event));
+}
+
+// Both paths must emit function_call_arguments.delta events
+assert!(native_types.contains(&"response.function_call_arguments.delta".to_string()),
+"Native missing function_call_arguments.delta: {:?}", native_types);
+assert!(synth_types.contains(&"response.function_call_arguments.delta".to_string()),
+"Synthesized missing function_call_arguments.delta: {:?}", synth_types);
+
+// Both paths must emit output_item.added for the function call
+assert!(native_types.contains(&"response.output_item.added".to_string()),
+"Native missing output_item.added: {:?}", native_types);
+assert!(synth_types.contains(&"response.output_item.added".to_string()),
+"Synthesized missing output_item.added: {:?}", synth_types);
+}
+
+#[test]
+fn codex_native_event_sequence_numbers_are_monotonic() {
+use crate::codex::sse::ResponsesEvent as CodexResponsesEvent;
+
+let codex_events = vec![
+CodexResponsesEvent::Created {
+id: "resp_seq".to_string(),
+model: "gpt-4".to_string(),
+sequence_number: 0,
+},
+CodexResponsesEvent::OutputTextDelta {
+item_id: "msg_1".to_string(),
+delta: "A".to_string(),
+sequence_number: 1,
+},
+CodexResponsesEvent::OutputTextDelta {
+item_id: "msg_1".to_string(),
+delta: "B".to_string(),
+sequence_number: 2,
+},
+CodexResponsesEvent::OutputTextDone {
+item_id: "msg_1".to_string(),
+text: "AB".to_string(),
+sequence_number: 3,
+},
+];
+
+let mut seqs: Vec<u64> = Vec::new();
+for e in &codex_events {
+for ge in super::codex_event_to_responses_sse(e) {
+if let Some(v) = serde_json::to_value(&ge).ok() {
+if let Some(s) = v.get("sequence_number").and_then(|s| s.as_u64()) {
+seqs.push(s);
+}
+}
+}
+}
+
+for i in 1..seqs.len() {
+assert!(seqs[i] > seqs[i - 1],
+"Sequence numbers must be strictly increasing: {:?}", seqs);
+}
+}
 }
 
 // ---------------------------------------------------------------------------
@@ -7728,6 +7965,264 @@ fn responses_error(status: StatusCode, message: &str, error_type: &str) -> Respo
         .into_response()
 }
 
+fn is_codex_provider(provider: &crate::config::Provider) -> bool {
+    provider.auth_method.as_deref() == Some("oauth") && provider.provider_type == "openai"
+}
+
+fn build_codex_envelope(
+    req: &ResponsesRequest,
+    resolved_model: &str,
+    instructions: &str,
+    mapped_effort: &str,
+    emit_reasoning: bool,
+) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+    
+    let mut env: Map<String, Value> = Map::new();
+    env.insert("model".to_string(), json!(resolved_model));
+    env.insert("instructions".to_string(), json!(instructions));
+    
+    let input = match &req.input {
+        ResponsesInput::Text(t) => json!([{"type": "message", "role": "user", "content": t}]),
+        ResponsesInput::Items(items) => serde_json::to_value(items).unwrap_or(json!([])),
+    };
+    env.insert("input".to_string(), input);
+    env.insert("store".to_string(), json!(req.store));
+    env.insert("stream".to_string(), json!(true));
+    
+    if !req.tools.is_empty() {
+        env.insert("tools".to_string(), serde_json::to_value(&req.tools).unwrap_or(json!([])));
+    }
+    if let Some(tc) = &req.tool_choice {
+        env.insert("tool_choice".to_string(), serde_json::to_value(tc).unwrap_or(Value::Null));
+    }
+    if let Some(parallel) = req.parallel_tool_calls {
+        env.insert("parallel_tool_calls".to_string(), json!(parallel));
+    }
+    if emit_reasoning {
+        env.insert("reasoning".to_string(), json!({"effort": mapped_effort, "summary": "auto"}));
+    }
+    if let Some(text) = &req.text {
+        env.insert("text".to_string(), serde_json::to_value(text).unwrap_or(Value::Null));
+    }
+    
+    Value::Object(env)
+}
+
+fn codex_event_to_responses_sse(event: &CodexResponsesEvent) -> Vec<ResponsesSseEvent> {
+    match event.clone() {
+        CodexResponsesEvent::Created { id, model, sequence_number } => {
+            let response = ResponseObject {
+                id,
+                object: "response".to_string(),
+                created_at: 0,
+                status: "in_progress".to_string(),
+                error: None,
+                incomplete_details: None,
+                instructions: None,
+                metadata: None,
+                model,
+                output: Vec::new(),
+                parallel_tool_calls: None,
+                previous_response_id: None,
+                reasoning: None,
+                store: false,
+                temperature: None,
+                text: None,
+                tool_choice: None,
+                tools: Vec::new(),
+                top_p: None,
+                truncation: None,
+                usage: None,
+                extra: Default::default(),
+            };
+            vec![ResponsesSseEvent::Created { sequence_number, response }]
+        }
+        CodexResponsesEvent::OutputTextDelta { item_id, delta, sequence_number } => {
+            vec![ResponsesSseEvent::OutputTextDelta {
+                sequence_number,
+                item_id,
+                output_index: 0,
+                content_index: 0,
+                delta,
+            }]
+        }
+        CodexResponsesEvent::OutputTextDone { item_id, text, sequence_number } => {
+            vec![ResponsesSseEvent::OutputTextDone {
+                sequence_number,
+                item_id,
+                output_index: 0,
+                content_index: 0,
+                text,
+            }]
+        }
+        CodexResponsesEvent::OutputItemAdded { item_id, kind: _, call_id, name, sequence_number } => {
+            let output_item = OutputItem::FunctionCall(OutputFunctionCall {
+                id: item_id.clone(),
+                call_id: call_id.unwrap_or_default(),
+                name: name.unwrap_or_default(),
+                arguments: String::new(),
+                status: "in_progress".to_string(),
+                extra: Default::default(),
+            });
+            vec![ResponsesSseEvent::OutputItemAdded {
+                sequence_number,
+                output_index: 0,
+                item: output_item,
+            }]
+        }
+        CodexResponsesEvent::FunctionCallArgumentsDelta { item_id, delta, sequence_number } => {
+            vec![ResponsesSseEvent::FunctionCallArgumentsDelta {
+                sequence_number,
+                item_id,
+                output_index: 0,
+                delta,
+            }]
+        }
+        CodexResponsesEvent::Completed { response, sequence_number } => {
+            let resp = ResponseObject {
+                id: response.id,
+                object: "response".to_string(),
+                created_at: 0,
+                status: "completed".to_string(),
+                error: None,
+                incomplete_details: None,
+                instructions: None,
+                metadata: None,
+                model: response.model,
+                output: response.output.into_iter().map(|item| {
+                    if item.kind == "message" {
+                        OutputItem::Message(OutputMessage {
+                            id: item.id.unwrap_or_default(),
+                            role: "assistant".to_string(),
+                            status: "completed".to_string(),
+                            content: item.content.map(|c| {
+                                c.into_iter().filter_map(|part| {
+                                    if part.kind == "output_text" {
+                                        Some(OutputContentPart::OutputText {
+                                            text: part.text.unwrap_or_default(),
+                                            annotations: None,
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                }).collect()
+                            }).unwrap_or_default(),
+                            extra: Default::default(),
+                        })
+                    } else if item.kind == "function_call" {
+                        OutputItem::FunctionCall(OutputFunctionCall {
+                            id: item.id.unwrap_or_default(),
+                            call_id: item.call_id.unwrap_or_default(),
+                            name: item.name.unwrap_or_default(),
+                            arguments: item.arguments.unwrap_or_default(),
+                            status: "completed".to_string(),
+                            extra: Default::default(),
+                        })
+                    } else {
+                        OutputItem::FunctionCall(OutputFunctionCall {
+                            id: item.id.unwrap_or_default(),
+                            call_id: item.call_id.unwrap_or_default(),
+                            name: item.name.unwrap_or_default(),
+                            arguments: item.arguments.unwrap_or_default(),
+                            status: "completed".to_string(),
+                            extra: Default::default(),
+                        })
+                    }
+                }).collect(),
+                parallel_tool_calls: None,
+                previous_response_id: None,
+                reasoning: None,
+                store: false,
+                temperature: None,
+                text: None,
+                tool_choice: None,
+                tools: Vec::new(),
+                top_p: None,
+                truncation: None,
+                usage: response.usage.as_ref().map(|u| ResponsesUsage {
+                    input_tokens: u.input_tokens.unwrap_or(0),
+                    output_tokens: u.output_tokens.unwrap_or(0),
+                    total_tokens: u.total_tokens.unwrap_or(0),
+                    input_tokens_details: None,
+                    output_tokens_details: None,
+                    extra: Default::default(),
+                }),
+                extra: Default::default(),
+            };
+            vec![ResponsesSseEvent::Completed { sequence_number, response: resp }]
+        }
+        CodexResponsesEvent::Failed { error, sequence_number } => {
+            let resp = ResponseObject {
+                id: String::new(),
+                object: "response".to_string(),
+                created_at: 0,
+                status: "failed".to_string(),
+                error: Some(ResponseError {
+                    code: error.code,
+                    message: error.message,
+                    param: None,
+                    extra: Default::default(),
+                }),
+                incomplete_details: None,
+                instructions: None,
+                metadata: None,
+                model: String::new(),
+                output: Vec::new(),
+                parallel_tool_calls: None,
+                previous_response_id: None,
+                reasoning: None,
+                store: false,
+                temperature: None,
+                text: None,
+                tool_choice: None,
+                tools: Vec::new(),
+                top_p: None,
+                truncation: None,
+                usage: None,
+                extra: Default::default(),
+            };
+            vec![ResponsesSseEvent::Failed { sequence_number, response: resp }]
+        }
+        CodexResponsesEvent::Error { error, sequence_number } => {
+            let resp = ResponseObject {
+                id: String::new(),
+                object: "response".to_string(),
+                created_at: 0,
+                status: "failed".to_string(),
+                error: Some(ResponseError {
+                    code: error.code,
+                    message: error.message,
+                    param: None,
+                    extra: Default::default(),
+                }),
+                incomplete_details: None,
+                instructions: None,
+                metadata: None,
+                model: String::new(),
+                output: Vec::new(),
+                parallel_tool_calls: None,
+                previous_response_id: None,
+                reasoning: None,
+                store: false,
+                temperature: None,
+                text: None,
+                tool_choice: None,
+                tools: Vec::new(),
+                top_p: None,
+                truncation: None,
+                usage: None,
+                extra: Default::default(),
+            };
+            vec![ResponsesSseEvent::Failed { sequence_number, response: resp }]
+        }
+        CodexResponsesEvent::Other { kind, sequence_number } => {
+            tracing::trace!(kind, sequence_number, "Skipping non-standard Codex event");
+            vec![]
+        }
+    }
+}
+
 /// POST /v1/responses — create a model response (buffered or streaming).
 pub async fn responses_create(
     State(state): State<AppState>,
@@ -7760,74 +8255,193 @@ pub async fn responses_create(
         Some((state.active_requests.clone(), trace_id.clone())),
     );
 
-    let chat_request = {
-        let history = if let Some(prev_id) = &request.previous_response_id {
-            match state.responses_store.get_response(&owner_id, prev_id) {
-                Ok(Some(stored)) => Some(StoredConversation {
-                    input_items: stored.input_items,
-                    output_items: stored.output_items,
-                }),
-                Ok(None) => {
-                    return responses_error(
-                        StatusCode::NOT_FOUND,
-                        &format!(
-                            "previous_response_id '{prev_id}' was not found for this key"
-                        ),
-                        "invalid_request_error",
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to load previous response");
-                    return responses_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to load conversation history",
-                        "server_error",
-                    );
+    let codex_dispatch = async {
+        match state.router.first_provider_for_model(&request.model).await {
+            Ok(Some((provider_cfg, provider_model))) => {
+                if is_codex_provider(&provider_cfg) {
+                    Some((provider_cfg, provider_model))
+                } else {
+                    None
                 }
             }
-        } else {
-            None
-        };
-
-        let ctx = ResponsesTranslationContext {
-            resolved_model: &request.model,
-            model_supports_reasoning: false,
-        };
-
-        match translate_responses(&request, history, &ctx) {
-            Ok(chat_req) => chat_req,
-            Err(e) => {
-                return responses_error(
-                    StatusCode::BAD_REQUEST,
-                    &e.to_string(),
-                    "invalid_request_error",
-                );
-            }
+            _ => None,
         }
     };
 
+    let codex_provider = codex_dispatch.await;
+
+    if let Some((provider_cfg, provider_model)) = codex_provider {
+        let resolved_model = provider_model.model.clone();
+        let instructions = provider_cfg.instructions_override.clone()
+            .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+        
+        let reasoning_effort = request.reasoning.as_ref().and_then(|r| r.effort.as_deref());
+        let mapped_effort = crate::codex::effort_map::map_effort(
+            reasoning_effort,
+            &resolved_model,
+            &state.config.read().await.xhigh_models_allowlist,
+        ).to_string();
+        
+        let emit_reasoning = crate::codex::model_map::is_reasoning(
+            &resolved_model,
+            &state.config.read().await.reasoning_models_allowlist,
+        );
+
+        let envelope = build_codex_envelope(
+            &request,
+            &resolved_model,
+            &instructions,
+            &mapped_effort,
+            emit_reasoning,
+        );
+
+        let oauth = match state.router.oauth_manager() {
+            Some(o) => o,
+            None => {
+                return responses_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "OAuth manager not configured for Codex provider",
+                    "server_error",
+                );
+            }
+        };
+
+        let instructions_store = match state.router.instructions_store() {
+            Some(s) => s,
+            None => {
+                return responses_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Instructions store not configured for Codex provider",
+                    "server_error",
+                );
+        }
+    };
+
+    let http = match state.router.get_http_client(
+        &provider_cfg.name,
+        &provider_cfg.connection_pool,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get HTTP client: {}", e),
+                "server_error",
+            )
+        }
+    };
+    let usage_tracker = state.router.oauth_usage_tracker()
+        .unwrap_or_else(|| std::sync::Arc::new(crate::oauth::UsageTracker::new()));
+
+    let codex_client = crate::codex::client::CodexProviderClient::new(
+        provider_cfg.name.clone(),
+        oauth.clone(),
+        instructions_store,
+        http,
+        state.metrics.clone(),
+        usage_tracker,
+        provider_cfg.codex_base_url_override.clone(),
+        provider_cfg.codex_model_override.clone(),
+        provider_cfg.instructions_override.clone(),
+        state.config.read().await.xhigh_models_allowlist.clone(),
+        state.config.read().await.reasoning_models_allowlist.clone(),
+    );
+
     if request.stream {
-        responses_create_stream(
+        responses_create_codex_stream(
             state,
             request,
-            chat_request,
+            codex_client,
+            envelope,
+            provider_cfg,
             trace_id,
             owner_id,
             active_handle,
             request_guard,
-        )
-        .await
+        ).await
     } else {
-        responses_create_buffered(
+        responses_create_codex_buffered(
             state,
             request,
-            chat_request,
+            codex_client,
+            envelope,
+            provider_cfg,
             trace_id,
             owner_id,
             active_handle,
             request_guard,
-        )
-        .await
+        ).await
+        }
+    } else {
+        let chat_request = {
+            let history = if let Some(prev_id) = &request.previous_response_id {
+                match state.responses_store.get_response(&owner_id, prev_id) {
+                    Ok(Some(stored)) => Some(StoredConversation {
+                        input_items: stored.input_items,
+                        output_items: stored.output_items,
+                    }),
+                    Ok(None) => {
+                        return responses_error(
+                            StatusCode::NOT_FOUND,
+                            &format!(
+                                "previous_response_id '{prev_id}' was not found for this key"
+                            ),
+                            "invalid_request_error",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to load previous response");
+                        return responses_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to load conversation history",
+                            "server_error",
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+
+            let ctx = ResponsesTranslationContext {
+                resolved_model: &request.model,
+                model_supports_reasoning: false,
+            };
+
+            match translate_responses(&request, history, &ctx) {
+                Ok(chat_req) => chat_req,
+                Err(e) => {
+                    return responses_error(
+                        StatusCode::BAD_REQUEST,
+                        &e.to_string(),
+                        "invalid_request_error",
+                    );
+                }
+            }
+        };
+
+        if request.stream {
+            responses_create_stream(
+                state,
+                request,
+                chat_request,
+                trace_id,
+                owner_id,
+                active_handle,
+                request_guard,
+            )
+            .await
+        } else {
+            responses_create_buffered(
+                state,
+                request,
+                chat_request,
+                trace_id,
+                owner_id,
+                active_handle,
+                request_guard,
+            )
+            .await
+        }
     }
 }
 
@@ -7890,13 +8504,410 @@ async fn responses_create_buffered(
 
             let mut http = Json(&response_object).into_response();
             attach_trace_id_header(&mut http, &trace_id);
-            http
-        }
-        Err(err) => {
+        http
+    }
+    Err(err) => {
+        request_guard.complete();
+        err.into_response()
+    }
+    }
+}
+
+/// Buffered create path using native Codex API dispatch.
+async fn responses_create_codex_buffered(
+    state: AppState,
+    request: ResponsesRequest,
+    codex_client: crate::codex::client::CodexProviderClient,
+    envelope: serde_json::Value,
+    provider_cfg: crate::config::Provider,
+    trace_id: String,
+    owner_id: String,
+    _active_handle: crate::active_requests::ActiveRequestHandle,
+    mut request_guard: RequestCompleteGuard,
+) -> Response {
+    let access_token = match codex_client.oauth().get_access_token().await {
+        Some(t) => t,
+        None => {
             request_guard.complete();
-            err.into_response()
+            return responses_error(
+                StatusCode::UNAUTHORIZED,
+                "OAuth session not authenticated for Codex provider",
+                "authentication_error",
+            );
+        }
+    };
+
+    let account_id = match crate::codex::jwt::extract_chatgpt_account_id(&access_token) {
+        Ok(id) => id,
+        Err(e) => {
+            request_guard.complete();
+            tracing::warn!(error = %e, "Failed to extract account ID from JWT");
+            return responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to extract OAuth account ID",
+                "server_error",
+            );
+        }
+    };
+
+    let http_client = match state.router.get_http_client(
+        &provider_cfg.name,
+        &provider_cfg.connection_pool,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            request_guard.complete();
+            return responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get HTTP client: {}", e),
+                "server_error",
+            )
+        }
+    };
+    let base_url = codex_client.base_url().to_string();
+
+    let resp = match http_client
+        .post(&base_url)
+        .header("authorization", format!("Bearer {}", access_token))
+        .header("chatgpt-account-id", account_id)
+        .header("openai-beta", "responses=experimental")
+        .header("originator", "obey_gateway")
+        .header("accept", "text/event-stream")
+        .header("content-type", "application/json")
+        .json(&envelope)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            request_guard.complete();
+            tracing::error!(error = %e, "Codex native request failed");
+            return responses_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("Codex backend request failed: {}", e),
+                "server_error",
+            );
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        request_guard.complete();
+        tracing::warn!(status, body = %body.chars().take(500).collect::<String>(), "Codex native returned non-2xx");
+        return responses_error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            &format!("Codex backend error: {}", body.chars().take(200).collect::<String>()),
+            "server_error",
+        );
+    }
+
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            request_guard.complete();
+            return responses_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("Failed to read Codex response: {}", e),
+                "server_error",
+            );
+        }
+    };
+
+    let mut parser = crate::codex::sse::SseLineParser::new();
+    let parse_results = parser.feed(&bytes);
+    let mut events: Vec<CodexResponsesEvent> = Vec::new();
+    for result in parse_results {
+        match result {
+            Ok(event) => events.push(event),
+            Err(e) => {
+                tracing::warn!(error = %e, "SSE parse error on Codex native response");
+            }
         }
     }
+
+    let completed = events.into_iter().rev().find_map(|e| {
+        if let CodexResponsesEvent::Completed { response, .. } = e {
+            Some(response)
+        } else {
+            None
+        }
+    });
+
+    let Some(completed) = completed else {
+        request_guard.complete();
+        return responses_error(
+            StatusCode::BAD_GATEWAY,
+            "Codex native response did not contain completed event",
+            "server_error",
+        );
+    };
+
+    let response_object = ResponseObject {
+        id: completed.id,
+        object: "response".to_string(),
+        created_at: 0,
+        status: "completed".to_string(),
+        error: None,
+        incomplete_details: None,
+        instructions: None,
+        metadata: None,
+        model: completed.model.clone(),
+        output: completed.output.into_iter().map(|item| {
+            if item.kind == "message" {
+                OutputItem::Message(OutputMessage {
+                    id: item.id.unwrap_or_default(),
+                    role: "assistant".to_string(),
+                    status: "completed".to_string(),
+                    content: item.content.map(|c| {
+                        c.into_iter().filter_map(|part| {
+                            if part.kind == "output_text" {
+                                Some(OutputContentPart::OutputText {
+                                    text: part.text.unwrap_or_default(),
+                                    annotations: None,
+                                })
+                            } else {
+                                None
+                            }
+                        }).collect()
+                    }).unwrap_or_default(),
+                    extra: Default::default(),
+                })
+            } else if item.kind == "function_call" {
+                OutputItem::FunctionCall(OutputFunctionCall {
+                    id: item.id.unwrap_or_default(),
+                    call_id: item.call_id.unwrap_or_default(),
+                    name: item.name.unwrap_or_default(),
+                    arguments: item.arguments.unwrap_or_default(),
+                    status: "completed".to_string(),
+                    extra: Default::default(),
+                })
+            } else {
+                OutputItem::FunctionCall(OutputFunctionCall {
+                    id: item.id.unwrap_or_default(),
+                    call_id: item.call_id.unwrap_or_default(),
+                    name: item.name.unwrap_or_default(),
+                    arguments: item.arguments.unwrap_or_default(),
+                    status: "completed".to_string(),
+                    extra: Default::default(),
+                })
+            }
+        }).collect(),
+        parallel_tool_calls: None,
+        previous_response_id: None,
+        reasoning: None,
+        store: false,
+        temperature: None,
+        text: None,
+        tool_choice: None,
+        tools: Vec::new(),
+        top_p: None,
+        truncation: None,
+        usage: completed.usage.as_ref().map(|u| ResponsesUsage {
+            input_tokens: u.input_tokens.unwrap_or(0),
+            output_tokens: u.output_tokens.unwrap_or(0),
+            total_tokens: u.total_tokens.unwrap_or(0),
+            input_tokens_details: None,
+            output_tokens_details: None,
+            extra: Default::default(),
+        }),
+        extra: Default::default(),
+    };
+
+    if request.store {
+        let input_items = extract_input_items(&request);
+        let stored = response_object_to_stored(
+            &response_object,
+            &owner_id,
+            input_items,
+            &request.model,
+            request.instructions.as_deref(),
+            request.store,
+            request.metadata.as_ref(),
+            request.previous_response_id.as_deref(),
+        );
+        if let Err(e) = state.responses_store.store_response(&owner_id, &stored) {
+            tracing::warn!(error = %e, "Failed to persist Codex native response");
+        }
+    }
+
+    request_guard.complete();
+
+    let mut http = Json(&response_object).into_response();
+    attach_trace_id_header(&mut http, &trace_id);
+    http
+}
+
+/// Streaming create path using native Codex API dispatch.
+async fn responses_create_codex_stream(
+    state: AppState,
+    request: ResponsesRequest,
+    codex_client: crate::codex::client::CodexProviderClient,
+    envelope: serde_json::Value,
+    provider_cfg: crate::config::Provider,
+    trace_id: String,
+    owner_id: String,
+    _active_handle: crate::active_requests::ActiveRequestHandle,
+    mut request_guard: RequestCompleteGuard,
+) -> Response {
+    let streaming_config = state
+        .config
+        .read()
+        .await
+        .streaming
+        .clone()
+        .unwrap_or_default();
+
+    let access_token = match codex_client.oauth().get_access_token().await {
+        Some(t) => t,
+        None => {
+            request_guard.complete();
+            return responses_error(
+                StatusCode::UNAUTHORIZED,
+                "OAuth session not authenticated for Codex provider",
+                "authentication_error",
+            );
+        }
+    };
+
+    let account_id = match crate::codex::jwt::extract_chatgpt_account_id(&access_token) {
+        Ok(id) => id,
+        Err(e) => {
+            request_guard.complete();
+            tracing::warn!(error = %e, "Failed to extract account ID from JWT");
+            return responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to extract OAuth account ID",
+                "server_error",
+            );
+        }
+    };
+
+    let http_client = match state.router.get_http_client(
+        &provider_cfg.name,
+        &provider_cfg.connection_pool,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            request_guard.complete();
+            return responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get HTTP client: {}", e),
+                "server_error",
+            )
+        }
+    };
+    let base_url = codex_client.base_url().to_string();
+    let store = request.store;
+    let request_model = request.model.clone();
+    let instructions = request.instructions.clone();
+    let metadata = request.metadata.clone();
+    let previous_response_id = request.previous_response_id.clone();
+    let owner = owner_id.clone();
+    let responses_store = state.responses_store.clone();
+    let stream_trace_id = trace_id.clone();
+
+    let resp = match http_client
+        .post(&base_url)
+        .header("authorization", format!("Bearer {}", access_token))
+        .header("chatgpt-account-id", account_id)
+        .header("openai-beta", "responses=experimental")
+        .header("originator", "obey_gateway")
+        .header("accept", "text/event-stream")
+        .header("content-type", "application/json")
+        .json(&envelope)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            request_guard.complete();
+            tracing::error!(error = %e, "Codex native streaming request failed");
+            return responses_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("Codex backend request failed: {}", e),
+                "server_error",
+            );
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        request_guard.complete();
+        return responses_error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            &format!("Codex backend error: {}", body.chars().take(200).collect::<String>()),
+            "server_error",
+        );
+    }
+
+    let byte_stream = resp.bytes_stream();
+    let stream = async_stream::stream! {
+        let mut _guard = request_guard;
+        let mut buffer = String::new();
+        let mut bytes_stream = byte_stream;
+        let mut parser = crate::codex::sse::SseLineParser::new();
+        let mut terminal_response: Option<ResponseObject> = None;
+
+        while let Some(chunk_result) = futures::StreamExt::next(&mut bytes_stream).await {
+            match chunk_result {
+                Ok(bytes) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                Err(e) => {
+                    tracing::warn!(trace_id = %stream_trace_id, error = %e, "Upstream stream error in Codex native pass-through");
+                    break;
+                }
+            }
+
+            let parse_results = parser.feed(buffer.as_bytes());
+            buffer.clear();
+
+            for result in parse_results {
+                match result {
+                    Ok(event) => {
+                        for responses_event in codex_event_to_responses_sse(&event) {
+                            if let ResponsesSseEvent::Completed { response, .. } = &responses_event {
+                                terminal_response = Some(response.clone());
+                            }
+                            yield Ok::<_, Infallible>(responses_event_to_sse(&responses_event));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "SSE parse error in Codex native stream");
+                    }
+                }
+            }
+        }
+
+        if store {
+            if let Some(completed) = terminal_response {
+                let input_items = Vec::new();
+                let stored = response_object_to_stored(
+                    &completed,
+                    &owner,
+                    input_items,
+                    &request_model,
+                    instructions.as_deref(),
+                    store,
+                    metadata.as_ref(),
+                    previous_response_id.as_deref(),
+                );
+                if let Err(e) = responses_store.store_response(&owner, &stored) {
+                    tracing::warn!(error = %e, "Failed to persist Codex native streamed response");
+                }
+            }
+        }
+
+        yield Ok(Event::default().data("[DONE]"));
+    };
+
+    let mut sse = Sse::new(stream)
+        .keep_alive(build_keepalive(&streaming_config))
+        .into_response();
+    attach_trace_id_header(&mut sse, &trace_id);
+    sse
 }
 
 /// Streaming create path: route_request_streaming → parse chat SSE → synthesize
@@ -8123,6 +9134,13 @@ pub async fn responses_get(
         .get_response(&authenticated_key.id, &response_id)
     {
         Ok(Some(stored)) => {
+            if stored.owner_id != authenticated_key.id {
+                return responses_error(
+                    StatusCode::NOT_FOUND,
+                    &format!("No response found with id '{response_id}'"),
+                    "invalid_request_error",
+                );
+            }
             let response_object = stored_to_response_object(&stored);
             Json(&response_object).into_response()
         }

@@ -102,6 +102,8 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/oauth/openai/usage", get(oauth_usage))
         .route("/oauth/openai/logout", post(oauth_logout))
         .route("/metrics/reset-active", post(reset_active_requests))
+        .route("/circuit-breaker/states", get(get_circuit_breaker_states))
+        .route("/circuit-breaker/reset", post(reset_circuit_breakers))
         .route("/", get(index_handler))
         .route("/{*path}", get(static_handler))
         .route_layer(middleware::from_fn_with_state(state, admin_auth_middleware))
@@ -1224,6 +1226,76 @@ async fn reset_active_requests(State(state): State<AppState>) -> Response {
         })),
     )
         .into_response()
+}
+
+/// GET /admin/circuit-breaker/states — list current circuit breaker states.
+///
+/// Returns the set of provider keys that currently have circuit breaker
+/// entries along with their state label ("closed", "open", or "half_open").
+async fn get_circuit_breaker_states(State(state): State<AppState>) -> Response {
+    let cb_states = state.router.get_circuit_breaker_states().await;
+    let entries: Vec<serde_json::Value> = cb_states
+        .iter()
+        .map(|(key, st)| json!({ "provider": key, "state": st }))
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "states": entries })),
+    )
+        .into_response()
+}
+
+/// POST /admin/circuit-breaker/reset — reset circuit breaker(s).
+///
+/// Request body: `{ "provider": "<key>" | "all" }`
+/// When `provider` is `"all"` every circuit breaker is cleared. Otherwise
+/// only the breaker matching the given provider key is removed.
+async fn reset_circuit_breakers(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let provider = payload
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("all");
+
+    if provider.eq_ignore_ascii_case("all") {
+        state.router.clear_circuit_breakers();
+        tracing::info!("Admin endpoint reset all circuit breakers");
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "message": "All circuit breakers reset"
+            })),
+        )
+            .into_response()
+    } else {
+        let existed = state.router.reset_circuit_breaker(provider);
+        if existed {
+            tracing::info!("Admin endpoint reset circuit breaker for '{}'", provider);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ok",
+                    "message": format!("Circuit breaker reset for '{}'", provider),
+                    "provider": provider
+                })),
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "message": format!("No circuit breaker found for provider '{}'", provider),
+                        "type": "not_found"
+                    }
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// GET /admin/config/export — download current config as YAML (Req 32.1, 32.2, 32.7)

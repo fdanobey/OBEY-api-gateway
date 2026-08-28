@@ -73,15 +73,6 @@ fn responses_request_with_previous(model: &str, input: &str, previous_id: &str, 
     })
 }
 
-fn responses_request_with_instructions(model: &str, input: &str, instructions: &str, stream: bool) -> Value {
-    json!({
-        "model": model,
-        "input": input,
-        "instructions": instructions,
-        "stream": stream
-    })
-}
-
 struct TestApp {
     app: axum::Router,
     _temp: TempDir,
@@ -256,11 +247,6 @@ async fn start_buffered_mock(response: Value) -> MockServer {
         .mount(&server)
         .await;
     server
-}
-
-async fn capture_provider_request(server: &MockServer) -> Value {
-    let requests = server.received_requests().await.unwrap();
-    serde_json::from_slice(&requests[0].body).unwrap()
 }
 
 #[tokio::test]
@@ -509,18 +495,18 @@ async fn test_previous_response_id_chaining() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let first_response: Value = serde_json::from_slice(&body).unwrap();
-    let first_id = first_response["id"].as_str().expect("response id");
+let first_response: Value = serde_json::from_slice(&body).unwrap();
+let first_id = first_response["id"].as_str().expect("response id");
 
-    server.reset();
+server.reset().await;
 
-    Mock::given(method("POST"))
-        .and(path(PROVIDER_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_response("chatcmpl-2", "gpt-4", "Hello again!")))
-        .mount(&server)
-        .await;
+Mock::given(method("POST"))
+.and(path(PROVIDER_PATH))
+.respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_response("chatcmpl-2", "gpt-4", "Hello again!")))
+.mount(&server)
+.await;
 
-    let (status, _body) = post_responses(
+let (status, _body) = post_responses(
         app.app,
         &serde_json::json!({
             "model": "test-group",
@@ -580,7 +566,7 @@ async fn test_instructions_non_carryover() {
     let first_response: Value = serde_json::from_slice(&body).unwrap();
     let first_id = first_response["id"].as_str().expect("response id");
 
-    server.reset();
+    server.reset().await;
 
     Mock::given(method("POST"))
         .and(path(PROVIDER_PATH))

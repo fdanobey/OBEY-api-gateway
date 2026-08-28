@@ -25,7 +25,10 @@ use ai_gateway::compression::token_counter::TokenCounter;
 use ai_gateway::compression::{CompressiblePayload, CompressionContext, CompressionLevel};
 use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
-use ai_gateway::models::openai::{Message, OpenAIRequest};
+use ai_gateway::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
+use ai_gateway::responses::{
+    synthesize, translate, ResponsesInput, ResponsesRequest, SynthesisContext, TranslationContext,
+};
 use ai_gateway::router::circuit_breaker::CircuitState;
 use ai_gateway::router::router::Router;
 use ai_gateway::router::{CircuitBreaker, LatencyTracker};
@@ -1562,13 +1565,121 @@ async fn config_lookup_cardinality_measurement() {
                     "expected half the providers budgeted"
                 );
             }
-            eprintln!(
-                "config_lookup[{}][budget_map] ({} providers, {} budgeted): {}",
-                scenario.label,
-                scenario.providers,
-                scenario.providers.div_ceil(2),
-                samples.report()
-            );
+        eprintln!(
+            "config_lookup[{}][budget_map] ({} providers, {} budgeted): {}",
+            scenario.label,
+            scenario.providers,
+            scenario.providers.div_ceil(2),
+            samples.report()
+        );
         }
     }
+}
+
+/// Measure pure Responses-API translation overhead (translate + synthesize)
+/// with no network I/O. Asserts per-iteration < 10ms and p95 < 10ms across
+/// 100 iterations, matching the existing forwarding-overhead budget.
+#[tokio::test]
+#[ignore]
+async fn responses_translation_overhead_within_budget() {
+    const ITERATIONS: usize = 100;
+    const BUDGET: Duration = Duration::from_millis(10);
+
+    let req = ResponsesRequest {
+        model: "gpt-4o".to_string(),
+        input: ResponsesInput::Text("Translate this prompt for latency measurement.".to_string()),
+        instructions: None,
+        previous_response_id: None,
+        store: false,
+        metadata: None,
+        temperature: None,
+        top_p: None,
+        max_output_tokens: None,
+        truncation: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        text: None,
+        tools: Vec::new(),
+        tool_choice: None,
+        stream: false,
+        stream_options: None,
+        extra: serde_json::Map::new(),
+    };
+
+    let tx_ctx = TranslationContext {
+        resolved_model: "gpt-4o",
+        model_supports_reasoning: false,
+    };
+
+    let chat_response = OpenAIResponse {
+        id: "chatcmpl-perf".to_string(),
+        object: "chat.completion".to_string(),
+        created: 1_700_000_000,
+        model: "gpt-4o".to_string(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("Response from the gateway."),
+                extra: serde_json::Map::new(),
+            },
+            finish_reason: Some("stop".to_string()),
+            extra: serde_json::Map::new(),
+        }],
+        usage: Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            extra: serde_json::Map::new(),
+        },
+        extra: serde_json::Map::new(),
+    };
+
+    let synth_ctx = SynthesisContext {
+        request_model: "gpt-4o",
+        request_instructions: None,
+        request_temperature: None,
+        request_top_p: None,
+        request_tools: &[],
+        request_tool_choice: None,
+        request_metadata: None,
+        request_store: false,
+        request_previous_response_id: None,
+        request_truncation: None,
+        request_text: None,
+        request_parallel_tool_calls: None,
+        request_reasoning: None,
+    };
+
+    // Warmup
+    for _ in 0..10 {
+        let translated = translate(&req, None, &tx_ctx).unwrap();
+        let _ = synthesize(&chat_response, &synth_ctx);
+        drop(translated);
+    }
+
+    let mut samples = ResponsivenessSampleSet::new();
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let translated = std::hint::black_box(translate(&req, None, &tx_ctx).unwrap());
+        let _ = std::hint::black_box(synthesize(&chat_response, &synth_ctx));
+        drop(translated);
+        let elapsed = start.elapsed();
+        samples.record(elapsed);
+        assert!(
+            elapsed < BUDGET,
+            "per-iteration overhead {:?} exceeds {:?}",
+            elapsed,
+            BUDGET
+        );
+    }
+
+    let report = samples.report();
+    eprintln!("responses_translation_overhead: {}", report);
+    assert!(
+        report.p95 < BUDGET,
+        "p95 {:?} exceeds {:?}",
+        report.p95,
+        BUDGET
+    );
 }

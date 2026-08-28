@@ -899,6 +899,21 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
       <button class="btn btn-primary" data-action="save">Save</button>
       <button class="btn btn-secondary" data-action="reset">Reset</button>
     </div>
+    <fieldset><legend>Reset Circuit Breakers</legend>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="cb-reset-provider">Provider</label>
+          <select id="cb-reset-provider" aria-describedby="cb-reset-hint">
+            <option value="all">All Providers</option>
+          </select>
+          <div class="hint" id="cb-reset-hint">Select a specific provider or all providers, then click Reset to clear circuit breaker states</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" type="button" id="cb-reset-btn">Reset Circuit Breaker(s)</button>
+      </div>
+      <div class="error" id="cb-reset-error" role="alert"></div>
+    </fieldset>
   </section>
 
   <!-- Logging (Req 13.8) -->
@@ -1888,6 +1903,7 @@ if (pageId === 'loop-detection') { populateLoopDetection((config && config.loop_
 if (pageId === 'smart-routing') { populateSmartRouting((config && config.smart_routing) || {}); }
 if (pageId === 'virtual-keys') { vkOnOpen(); }
     if (pageId === 'guardrails') { loadGuardrailVirtualKeys(); }
+    if (pageId === 'circuit-breaker') { loadCircuitBreakerStates(); }
   }
 
   /** Re-fetch each model row's provider model list, preserving the current selection. */
@@ -3386,6 +3402,57 @@ document.getElementById('smart-reset').addEventListener('click',function(){popul
 document.getElementById('smart-model-check').addEventListener('click',checkSmartModel);
 document.getElementById('smart-model-install').addEventListener('click',installSmartModel);
 document.getElementById('smart-simulate').addEventListener('click',simulateSmartRouting);
+
+// --- Circuit Breaker Reset ---
+function loadCircuitBreakerStates() {
+  var select = document.getElementById('cb-reset-provider');
+  if (!select) return;
+  var currentVal = select.value || 'all';
+  select.innerHTML = '<option value="all">All Providers</option>';
+  var errEl = document.getElementById('cb-reset-error');
+  if (errEl) errEl.textContent = '';
+  fetch(apiUrl('circuit-breaker/states'))
+    .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
+    .then(function(data){
+      var states = (data && data.states) || [];
+      states.forEach(function(entry){
+        var key = entry.provider;
+        var st = entry.state;
+        var opt = document.createElement('option');
+        opt.value = key;
+        opt.textContent = key + ' (' + st + ')';
+        select.appendChild(opt);
+      });
+      select.value = currentVal;
+    })
+    .catch(function(err){
+      if (errEl) errEl.textContent = 'Failed to load circuit breaker states: ' + err.message;
+    });
+}
+
+document.getElementById('cb-reset-btn').addEventListener('click', function() {
+  var select = document.getElementById('cb-reset-provider');
+  if (!select) return;
+  var provider = select.value || 'all';
+  var errEl = document.getElementById('cb-reset-error');
+  if (errEl) errEl.textContent = '';
+  if (!window.confirm('Reset circuit breaker for ' + (provider === 'all' ? 'ALL providers' : "'" + provider + "'") + '?')) return;
+  fetch(apiUrl('circuit-breaker/reset'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: provider })
+  })
+    .then(function(r){return r.text().then(function(text){var data=null;try{data=text?JSON.parse(text):null;}catch(_){}if(!r.ok)throw new Error((data&&data.error&&data.error.message)||text||('HTTP '+r.status));return data;});})
+    .then(function(data){
+      showToast((data && data.message) || 'Circuit breaker(s) reset');
+      setStatus((data && data.message) || 'Circuit breaker(s) reset');
+      loadCircuitBreakerStates();
+    })
+    .catch(function(err){
+      if (errEl) errEl.textContent = 'Reset failed: ' + err.message;
+      setStatus('Reset failed: ' + err.message);
+    });
+});
 
   // --- Action Buttons ---
   document.addEventListener('click', function(e) {

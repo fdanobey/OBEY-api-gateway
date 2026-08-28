@@ -1106,12 +1106,51 @@ impl Router {
         stats.savings_percent > 50.0
     }
 
-    /// Get the instructions store (used by admin test-connection endpoint).
-    pub fn instructions_store(&self) -> Option<Arc<crate::codex::InstructionsStore>> {
-        self.instructions_store.clone()
-    }
+/// Get the instructions store (used by admin test-connection endpoint).
+pub fn instructions_store(&self) -> Option<Arc<crate::codex::InstructionsStore>> {
+self.instructions_store.clone()
+}
 
-    /// Find the model group containing the requested model
+/// Get the OAuth manager (used by Responses API Codex native dispatch).
+pub fn oauth_manager(&self) -> Option<Arc<crate::oauth::OAuthManager>> {
+self.oauth_manager.clone()
+}
+
+/// Get the OAuth usage tracker (used by Responses API Codex native dispatch).
+pub fn oauth_usage_tracker(&self) -> Option<Arc<crate::oauth::UsageTracker>> {
+self.oauth_usage_tracker.clone()
+}
+
+/// Get or create an HTTP client for a provider.
+pub fn get_http_client(&self, provider_name: &str, config: &crate::config::ProviderConnectionPoolConfig) -> Result<reqwest::Client, GatewayError> {
+self.get_or_create_http_client(provider_name, config)
+}
+
+/// Resolve the first candidate provider for a model group.
+/// Returns `(provider_config, provider_model)` if found.
+/// Used by the Responses API handler to detect Codex providers.
+pub async fn first_provider_for_model(
+&self,
+model: &str,
+) -> Result<Option<(Provider, ProviderModel)>, GatewayError> {
+let model_group = self.find_model_group(model).await?;
+let candidates = self.select_provider_order(&model_group).await;
+
+let Some(first) = candidates.into_iter().next() else {
+return Ok(None);
+};
+
+let config = self.config.read().await;
+let provider_cfg = config
+.providers
+.iter()
+.find(|p| p.name == first.provider)
+.cloned();
+
+Ok(provider_cfg.map(|p| (p, first)))
+}
+
+/// Find the model group containing the requested model
     ///
     /// Returns the model group if found, or an error if the model is not configured
     pub async fn find_model_group(&self, model: &str) -> Result<ModelGroup, GatewayError> {
@@ -1666,6 +1705,12 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
     /// Clear all circuit breaker states (used during config reload)
     pub fn clear_circuit_breakers(&self) {
         self.circuit_breakers.clear();
+    }
+
+    /// Reset the circuit breaker for a specific provider key.
+    /// Returns `true` if the breaker existed and was removed.
+    pub fn reset_circuit_breaker(&self, provider_key: &str) -> bool {
+        self.circuit_breakers.remove(provider_key).is_some()
     }
 
     /// Get circuit breaker states for all providers (used by Prometheus exporter).

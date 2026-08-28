@@ -6,12 +6,12 @@ pub mod translate_request;
 
 pub use models::{
     EasyInputContent, EasyInputMessage, FunctionCall, FunctionCallOutput,
-    FunctionCallOutputContent, IncompleteDetails, InputContentPart, InputImage, InputItem,
-    InputText, InputTokensDetails, ItemReference, Message, OutputContentPart,
-    OutputFunctionCall, OutputItem, OutputMessage, OutputReasoning, OutputTokensDetails,
-    ReasoningConfig, ReasoningItem, ReasoningSummaryConfig, ReasoningSummaryPart, ResponseError,
+    FunctionCallOutputContent, InputContentPart, InputImage, InputItem,
+    InputTokensDetails, Message, OutputContentPart,
+    OutputFunctionCall, OutputItem, OutputMessage, OutputTokensDetails,
+    ResponseError,
     ResponseObject, ResponsesInput, ResponsesRequest, ResponsesSseEvent,
-    ResponsesTranslationError, ResponsesUsage, StreamOptions, TextConfig, TextFormat,
+    ResponsesTranslationError, ResponsesUsage, TextFormat,
     ToolChoice, ToolDefinition, TypedInputItem,
 };
 

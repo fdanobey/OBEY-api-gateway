@@ -1207,6 +1207,79 @@ The endpoint supports OpenAI's stateful conversation model backed by a local SQL
 
 Stateful data is stored locally — no dependency on the upstream provider retaining conversation state.
 
+### Responses API Compatibility Matrix
+
+The table below documents exactly which Responses API request fields the gateway translates, how each maps to the Chat Completions wire format, which input item types are supported, and which capabilities are explicitly rejected with a named error. This is the authoritative reference for SDK and CLI interoperability against `/v1/responses`.
+
+#### Supported request fields and their Chat Completions mappings
+
+| Responses field | Chat Completions mapping | Notes |
+|-----------------|--------------------------|-------|
+| `model` | `model` | Passthrough; resolved through model groups (priority → cost → latency) |
+| `input` (string) | single `user` message | The whole string becomes one message with `role: "user"` |
+| `input` (array of items) | `messages` (per-item mapping) | Each item is translated by its type — see input item types below |
+| `instructions` | leading `system` message | Prepended before any history or input; not carried over across `previous_response_id` turns |
+| `previous_response_id` | loads history from `ResponsesStore` | Prior input + output items are replayed as chat messages, then new input is appended |
+| `store` | persists response to `ResponsesStore` (owner-scoped) | `true`/absent persists; `store: false` skips persistence entirely |
+| `metadata` | echoed in response (passthrough) | Up to 16 keys (≤64-char keys, ≤512-char values) |
+| `temperature` | `temperature` | Direct passthrough |
+| `top_p` | `top_p` | Direct passthrough |
+| `max_output_tokens` | `max_tokens` | Renamed only |
+| `truncation` | `truncation` (passthrough) | `"none"` disables gateway context truncation for the request; `"auto"`/absent retains default behavior |
+| `parallel_tool_calls` | `parallel_tool_calls` | Direct passthrough |
+| `tools` (function type) | `tools` (nested function format) | Flat `{type:"function",name,description,parameters,strict}` → chat `{"type":"function","function":{...}}` preserving `strict` |
+| `tool_choice` | `tool_choice` | `"auto"`/`"none"`/`"required"` map to chat strings; named-function maps to `{"type":"function","function":{"name":...}}` |
+| `stream` | `stream` (with injected `stream_options.include_usage`) | When `true`, the gateway injects `stream_options: {include_usage: true}` so usage arrives in the terminal event |
+| `text.format` (`text`) | `response_format`: none | Plain-text format produces no `response_format` constraint |
+| `text.format` (`json_object`) | `response_format`: `{type: "json_object"}` | Structured-output validation runs on the synthesized response |
+| `text.format` (`json_schema`) | `response_format`: `{type: "json_schema", json_schema: ...}` | Preserves `name`, `description`, `schema`, and `strict` |
+| `reasoning.effort` | `reasoning_effort` | Forwarded only when the selected model supports reasoning; otherwise omitted without error |
+
+#### Supported input item types
+
+| Input item type | Chat Completions mapping | Notes |
+|-----------------|--------------------------|-------|
+| `EasyInputMessage` (string content) | message with `role` | Content becomes a plain string message body |
+| `EasyInputMessage` (parts array with `input_text`) | message with text content | `input_text` parts → `{"type":"text","text":...}` content parts |
+| `EasyInputMessage` (parts with `input_image` via `image_url`) | message with `image_url` content | `image_url`/`detail` → `{"type":"image_url","image_url":{url,detail}}`; `file_id`-based images are rejected |
+| `Message` (typed) | message with `role` | Same content-part translation as `EasyInputMessage` |
+| `FunctionCall` | assistant message with `tool_calls` | `call_id` → chat `tool_calls[].id`; `name`/`arguments` nested under `function` |
+| `FunctionCallOutput` | `tool` message | `call_id` → `tool_call_id`; content parts stringified into the message body |
+| `Reasoning` items | dropped | Not replayed in subsequent turns (providers have no reasoning input channel) |
+
+#### Rejected fields (HTTP 400 with a field-naming error)
+
+All rejections return before any provider dispatch, with an error naming the unsupported field/tool. Rejected capabilities never degrade silently.
+
+| Rejected field / tool | Error message pattern |
+|-----------------------|-----------------------|
+| `background: true` | `background mode is not supported` |
+| `input_audio` content parts | `input_audio content is not supported` |
+| `input_file` content parts | `input_file content is not supported` |
+| `input_image` with `file_id` | `input_image.file_id is not supported` (URL-based images are supported) |
+| `item_reference` inputs | `item_reference is not supported` |
+| Hosted tool: `web_search` (`web_search_2025_08_26`) | `web_search tool is not supported` |
+| Hosted tool: `file_search` | `file_search tool is not supported` |
+| Hosted tool: `computer` / `computer_use_preview` | `computer tool is not supported` |
+| Hosted tool: `code_interpreter` | `code_interpreter tool is not supported` |
+| Hosted tool: `image_generation` | `image_generation tool is not supported` |
+| Hosted tool: `mcp` | `mcp tool is not supported` |
+| Hosted tool: `custom` | `custom tool is not supported` |
+| Hosted tool: `apply_patch` | `apply_patch tool is not supported` |
+| Hosted tool: `tool_search` | `tool_search tool is not supported` |
+| `conversation` param | `conversation is not supported` |
+| `context_management` param | `context_management is not supported` |
+| `POST /v1/responses/{id}/cancel` | `background response cancellation is not supported` |
+| `POST /v1/responses/compact` | `response compaction is not supported` |
+
+#### Codex native pass-through
+
+When the selected provider uses `auth_method: oauth` (Codex / ChatGPT backend), the gateway forwards the Responses request natively — reusing the Codex client transport and SSE line parser — without translating through Chat Completions. Codex envelope adjustments (instructions collapsing, sampling-parameter stripping, `reasoning.effort`/`summary` mapping) apply only on this path. If failover moves a request from a Codex provider to a chat-completions provider, the gateway re-synthesizes Responses events from the chat response. The client-visible event taxonomy is identical regardless of backend (Codex native or chat-synthesized).
+
+#### Accepted-but-local-only fields
+
+Fields such as `service_tier`, `safety_identifier`, `prompt_cache_key`, `user`, and `include[]` are accepted via the request's `#[serde(flatten)] extra` catch-all so that clients sending them do not receive a parse error, but they have no gateway-side effect. The gateway applies `include`/usage flags only where it holds the underlying data (e.g. `cached_tokens`, `reasoning_tokens`); other accepted flags are stored/echoed but not acted upon.
+
 ## Assistants API
 
 The gateway includes a full local implementation of the OpenAI Assistants API — no upstream proxy required. All data is stored in a dedicated SQLite database (`assistants.db`, created automatically alongside your logging database).

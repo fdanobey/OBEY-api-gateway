@@ -615,7 +615,7 @@ fn replay_output_function_call(fc: &OutputFunctionCall, messages: &mut Vec<Messa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::responses::ReasoningItem;
+    use crate::responses::models::ReasoningItem;
 
     fn ctx(model_supports_reasoning: bool) -> TranslationContext<'static> {
         TranslationContext {
@@ -749,7 +749,7 @@ mod tests {
     #[test]
     fn text_format_json_object_becomes_response_format() {
         let mut req = make_request(ResponsesInput::Text("Test".to_string()));
-        req.text = Some(crate::responses::TextConfig {
+        req.text = Some(crate::responses::models::TextConfig {
             verbosity: None,
             format: Some(TextFormat::JsonObject),
             extra: Map::new(),
@@ -766,7 +766,7 @@ mod tests {
     #[test]
     fn text_format_json_schema_passthrough() {
         let mut req = make_request(ResponsesInput::Text("Test".to_string()));
-        req.text = Some(crate::responses::TextConfig {
+        req.text = Some(crate::responses::models::TextConfig {
             verbosity: None,
             format: Some(TextFormat::JsonSchema {
                 name: Some("MySchema".to_string()),
@@ -789,7 +789,7 @@ mod tests {
     #[test]
     fn reasoning_effort_becomes_reasoning_effort_when_supported() {
         let mut req = make_request(ResponsesInput::Text("Test".to_string()));
-        req.reasoning = Some(crate::responses::ReasoningConfig {
+        req.reasoning = Some(crate::responses::models::ReasoningConfig {
             effort: Some("high".to_string()),
             summary: None,
             extra: Map::new(),
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn reasoning_effort_omitted_when_not_supported() {
         let mut req = make_request(ResponsesInput::Text("Test".to_string()));
-        req.reasoning = Some(crate::responses::ReasoningConfig {
+        req.reasoning = Some(crate::responses::models::ReasoningConfig {
             effort: Some("high".to_string()),
             summary: None,
             extra: Map::new(),
@@ -947,7 +947,7 @@ mod tests {
     #[test]
     fn reject_item_reference() {
         let req = make_request(ResponsesInput::Items(vec![InputItem::Typed(
-            TypedInputItem::ItemReference(crate::responses::ItemReference {
+            TypedInputItem::ItemReference(crate::responses::models::ItemReference {
                 id: "msg_123".to_string(),
                 extra: Map::new(),
             }),

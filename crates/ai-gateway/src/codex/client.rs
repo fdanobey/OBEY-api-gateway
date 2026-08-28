@@ -81,6 +81,16 @@ impl CodexProviderClient {
             reasoning_models_allowlist,
         }
     }
+
+    /// Get the OAuth manager.
+    pub fn oauth(&self) -> Arc<OAuthManager> {
+        self.oauth.clone()
+    }
+
+    /// Get the base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
 }
 
 // ─── ProviderClient trait implementation ─────────────────────────────────────

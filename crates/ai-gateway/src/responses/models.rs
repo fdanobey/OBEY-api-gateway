@@ -5,8 +5,6 @@
 //! captured in `extra` maps via `#[serde(flatten)]` and passed through,
 //! mirroring the conventions of [`crate::models::openai`].
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -694,26 +692,8 @@ pub enum ResponsesSseEvent {
 pub enum ResponsesTranslationError {
     #[error("unsupported Responses feature: field `{field}` cannot be translated")]
     UnsupportedField { field: &'static str },
-    #[error("unsupported Responses feature: `{feature}` is not supported")]
-    UnsupportedFeature { feature: &'static str },
-    #[error("invalid request: {reason}")]
-    InvalidRequest { reason: String },
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-impl ResponsesRequest {
-    /// Flatten `metadata` into owned key/value pairs (UI/logging helper).
-    pub fn metadata_pairs(&self) -> HashMap<String, String> {
-        self.metadata
-            .as_ref()
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-}

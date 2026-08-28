@@ -117,8 +117,13 @@ pub fn synthesize(chat: &OpenAIResponse, ctx: &SynthesisContext<'_>) -> Response
         incomplete_details,
         instructions: ctx.request_instructions.map(str::to_string),
         metadata: ctx.request_metadata.cloned(),
-        // Model reflects the responding provider's model, not the request alias.
-        model: chat.model.clone(),
+    model: {
+        if chat.model.is_empty() {
+            ctx.request_model.to_string()
+        } else {
+            chat.model.clone()
+        }
+    },
         output,
         parallel_tool_calls: ctx.request_parallel_tool_calls,
         previous_response_id: ctx.request_previous_response_id.map(str::to_string),
