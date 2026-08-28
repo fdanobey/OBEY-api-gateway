@@ -1,4 +1,4 @@
-//! End-to-end structured-output validation scenarios for Wave 10 tasks 13.1-13.4.
+﻿//! End-to-end structured-output validation scenarios for Wave 10 tasks 13.1-13.4.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -258,6 +258,7 @@ fn post_call_redaction_guardrail() -> GuardrailConfig {
             instruction_insertion_mode: InstructionInsertionMode::default(),
             failover_on_refusal: false,
             refusal_phrase_list: None,
+            tool_result: ai_gateway::guardrail::config::ToolResultPhaseConfig::default(),
         }],
         global_default_pipeline: Some("post-call-redaction".to_string()),
         bindings: Default::default(),

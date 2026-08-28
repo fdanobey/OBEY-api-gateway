@@ -189,6 +189,7 @@ fn refusal_failover_guardrails() -> GuardrailConfig {
             failover_on_refusal: true,
             // Use a simple, deterministic phrase list for testing.
             refusal_phrase_list: Some(vec!["i cannot help with".to_string()]),
+            tool_result: ai_gateway::guardrail::config::ToolResultPhaseConfig::default(),
         }],
         global_default_pipeline: Some("refusal_pipeline".to_string()),
         bindings: Default::default(),

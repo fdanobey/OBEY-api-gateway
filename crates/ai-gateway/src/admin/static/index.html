@@ -1493,16 +1493,17 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         <button type="button" class="btn btn-secondary guardrail-preset" data-guardrail-preset="moderation">Block harmful content<span>Uses OpenAI Moderation before the model runs.</span></button>
         <button type="button" class="btn btn-secondary guardrail-preset" data-guardrail-preset="pii">Protect personal information<span>Finds and safely redacts names, email addresses, and phone numbers.</span></button>
         <button type="button" class="btn btn-secondary guardrail-preset" data-guardrail-preset="injection">Block prompt attacks<span>Uses Lakera to detect prompt injection attempts.</span></button>
+        <button type="button" class="btn btn-secondary guardrail-preset" data-guardrail-preset="tool-traffic">Guard tool traffic<span>Blocks hidden-character injection in tool results and redacts poisoned tool calls.</span></button>
         <button type="button" class="btn btn-secondary guardrail-preset" data-guardrail-preset="refusal">Try another model after a refusal<span>Automatically fails over when a model refuses or skips a requested tool.</span></button>
       </div>
       <div class="guardrail-simple-rule">
         <strong>Create a custom rule</strong>
         <div class="form-row" style="margin-top:.6rem">
           <div class="form-group"><label for="gr-simple-name">Rule name</label><input id="gr-simple-name" type="text" placeholder="Block unsafe requests"><div class="hint">A friendly name shown in this page and logs.</div></div>
-          <div class="form-group"><label for="gr-simple-type">Check for</label><select id="gr-simple-type"><option value="openai_moderation">Harmful or unsafe content</option><option value="presidio">Personal information</option><option value="lakera">Prompt attacks</option><option value="regex">A word or text pattern</option></select><div class="hint">Select the kind of content you want to detect.</div></div>
+          <div class="form-group"><label for="gr-simple-type">Check for</label><select id="gr-simple-type"><option value="openai_moderation">Harmful or unsafe content</option><option value="presidio">Personal information</option><option value="lakera">Prompt attacks</option><option value="unicode_stego">Hidden-character injection</option><option value="regex">A word or text pattern</option></select><div class="hint">Select the kind of content you want to detect.</div></div>
         </div>
         <div class="form-row">
-          <div class="form-group"><label for="gr-simple-when">Check</label><select id="gr-simple-when"><option value="pre_call">Before sending to the model</option><option value="post_call">Before returning the model response</option></select></div>
+          <div class="form-group"><label for="gr-simple-when">Check</label><select id="gr-simple-when"><option value="pre_call">Before sending to the model</option><option value="post_call">Before returning the model response</option><option value="tool_result">Tool results entering the model context</option><option value="tool_call">Tool calls from the model</option></select></div>
           <div class="form-group"><label for="gr-simple-action">When found</label><select id="gr-simple-action"><option value="block">Block it</option><option value="redact">Hide it safely</option><option value="mask">Replace it with asterisks</option><option value="replace_with_policy_message">Show a policy message</option><option value="allow">Record it only</option></select></div>
         </div>
         <button type="button" class="btn btn-primary btn-sm" id="create-guardrail-rule">Create Rule</button>
@@ -4838,13 +4839,14 @@ document.getElementById('cb-reset-btn').addEventListener('click', function() {
     card.className = 'item-card';
     card.innerHTML = '<div class="item-card-header"><strong class="gr-prov-title">' + escapeHtml(d.name || 'New Guardrail Type') + '</strong><button type="button" class="btn btn-danger btn-sm gr-remove-prov">Remove</button></div>' +
       '<div class="form-row"><div class="form-group"><label>Name</label><input type="text" class="gr-prov-name" value="' + escapeHtml(d.name || '') + '" autocomplete="off"><div class="hint">A unique internal name used by rules.</div></div>' +
-      '<div class="form-group"><label>Guardrail Type</label><select class="gr-prov-type"><option value="regex">Text pattern</option><option value="presidio">Personal information (Presidio)</option><option value="openai_moderation">Harmful content (OpenAI Moderation)</option><option value="lakera">Prompt attacks (Lakera)</option><option value="custom_http">Custom checking service</option><option value="semantic">Meaning-based match</option></select><div class="hint">The service or method that checks the content.</div></div></div>' +
+      '<div class="form-group"><label>Guardrail Type</label><select class="gr-prov-type"><option value="regex">Text pattern</option><option value="presidio">Personal information (Presidio)</option><option value="openai_moderation">Harmful content (OpenAI Moderation)</option><option value="lakera">Prompt attacks (Lakera)</option><option value="custom_http">Custom checking service</option><option value="unicode_stego">Hidden-character injection</option><option value="semantic">Meaning-based match</option></select><div class="hint">The service or method that checks the content.</div></div></div>' +
       '<div class="guardrail-type-fields gr-fields-regex" hidden><strong style="font-size:.8rem;display:block;margin-bottom:.4rem">Text patterns</strong><div class="hint" style="margin-bottom:.5rem">Deny patterns create findings. Allow patterns take priority when both match.</div><div class="gr-patterns-list"></div><button type="button" class="btn btn-secondary btn-sm gr-add-pattern">+ Add Text Pattern</button></div>' +
       '<div class="guardrail-type-fields gr-fields-presidio" hidden><div class="form-row"><div class="form-group"><label>Presidio URL</label><input type="url" class="gr-presidio-endpoint" placeholder="http://localhost:5002/analyze"><div class="hint">The full URL of your running Presidio Analyzer.</div></div><div class="form-group"><label>Language</label><input type="text" class="gr-presidio-language" value="en" placeholder="en"><div class="hint">Language code supported by your Presidio Analyzer.</div></div><div class="form-group"><label>Minimum confidence</label><input type="number" class="gr-presidio-confidence" value="0.5" min="0" max="1" step="0.05"><div class="hint">Higher values reduce false positives. 0.5 is a balanced start.</div></div></div><div class="form-group"><label>Information to find</label><input type="text" class="gr-presidio-entities" placeholder="PERSON, EMAIL_ADDRESS, PHONE_NUMBER"><div class="hint">Comma-separated Presidio entity names.</div></div></div>' +
       '<div class="guardrail-type-fields gr-fields-openai-moderation" hidden><div class="form-row"><div class="form-group"><label>API Key or Env Variable</label><input type="text" class="gr-api-key-env" placeholder="OPENAI_API_KEY" autocomplete="off"><div class="hint">Use an environment variable name instead of pasting a key when possible.</div></div><div class="form-group"><label>Custom URL (optional)</label><input type="url" class="gr-api-endpoint" placeholder="https://api.openai.com/v1/moderations"><div class="hint">Leave blank to use the standard OpenAI moderation service.</div></div></div></div>' +
       '<div class="guardrail-type-fields gr-fields-lakera" hidden><div class="form-row"><div class="form-group"><label>API Key or Env Variable</label><input type="text" class="gr-api-key-env" placeholder="LAKERA_API_KEY" autocomplete="off"><div class="hint">Use an environment variable name instead of pasting a key when possible.</div></div><div class="form-group"><label>Custom URL (optional)</label><input type="url" class="gr-api-endpoint" placeholder="Lakera Guard API URL"><div class="hint">Leave blank to use the standard Lakera service.</div></div></div></div>' +
       '<div class="guardrail-type-fields gr-fields-custom-http" hidden><div class="form-group"><label>Checking Service URL</label><input type="url" class="gr-custom-url" placeholder="https://example.com/check"><div class="hint">Receives content and returns findings using the gateway custom-check format.</div></div></div>' +
       '<div class="guardrail-type-fields gr-fields-semantic" hidden><div class="form-row"><div class="form-group"><label>Allowed examples collection</label><input type="text" class="gr-semantic-allow-collection" placeholder="guardrail_allow"><div class="hint">Qdrant collection containing examples that should pass.</div></div><div class="form-group"><label>Blocked examples collection</label><input type="text" class="gr-semantic-deny-collection" placeholder="guardrail_deny"><div class="hint">Qdrant collection containing examples that should trigger this rule.</div></div></div><div class="form-row"><div class="form-group"><label>Allowed match sensitivity</label><input type="number" class="gr-semantic-allow" value="0.90" min="0" max="1" step="0.01"><div class="hint">Minimum similarity to an allowed example.</div></div><div class="form-group"><label>Blocked match sensitivity</label><input type="number" class="gr-semantic-deny" value="0.85" min="0" max="1" step="0.01"><div class="hint">Minimum similarity to a blocked example.</div></div></div></div>' +
+      '<div class="guardrail-type-fields gr-fields-unicode-stego" hidden><div class="form-row" style="gap:.4rem 1rem;flex-wrap:wrap"><div class="form-check"><input type="checkbox" class="gr-stego-detect-tag-chars" checked id="gr-stego-tag"><label for="gr-stego-tag">Tag characters</label></div><div class="form-check"><input type="checkbox" class="gr-stego-detect-zero-width" checked id="gr-stego-zw"><label for="gr-stego-zw">Zero-width characters</label></div><div class="form-check"><input type="checkbox" class="gr-stego-detect-bidi" checked id="gr-stego-bidi"><label for="gr-stego-bidi">Bidi controls</label></div><div class="form-check"><input type="checkbox" class="gr-stego-detect-mixed-script" checked id="gr-stego-mixed"><label for="gr-stego-mixed">Mixed-script homoglyphs</label></div></div><div class="form-row"><div class="form-group"><label>Zero-width run length</label><input type="number" class="gr-stego-zero-width" value="4" min="0" max="1000" step="1"><div class="hint">Flag zero-width runs of at least this many characters (default 4).</div></div><div class="form-group"><label>Tag-character count</label><input type="number" class="gr-stego-tag-threshold" value="0" min="0" max="1000" step="1"><div class="hint">Flag tag characters only beyond this count (default 0, any).</div></div><div class="form-group"><label>Bidi control count</label><input type="number" class="gr-stego-bidi-threshold" value="0" min="0" max="1000" step="1"><div class="hint">Flag bidi controls only beyond this count (default 0, any).</div></div></div><div class="hint">Runs locally with no network calls. Detects hidden ASCII smuggling, invisible-character clusters, reversed-text tricks, and confusable scripts.</div></div>' +
       '<details class="guardrail-advanced"><summary>Advanced reliability settings</summary><div class="form-row"><div class="form-group"><label>When this check is unavailable</label><select class="gr-prov-failure-policy"><option value="fail_open">Continue without this check</option><option value="fail_close">Stop the request</option></select><div class="hint">Continuing avoids outages; stopping provides stricter enforcement.</div></div><div class="form-group"><label>Wait up to (seconds)</label><input type="number" class="gr-prov-timeout" value="' + (d.timeout_seconds || 5) + '" min="1"><div class="hint">Maximum time to wait for this guardrail service.</div></div></div></details>';
     grProvList.appendChild(card);
     var typeSelect = card.querySelector('.gr-prov-type');
@@ -4864,6 +4866,14 @@ document.getElementById('cb-reset-btn').addEventListener('click', function() {
     if (d.deny_threshold != null) card.querySelector('.gr-semantic-deny').value = d.deny_threshold;
     if (d.allow_collection) card.querySelector('.gr-semantic-allow-collection').value = d.allow_collection;
     if (d.deny_collection) card.querySelector('.gr-semantic-deny-collection').value = d.deny_collection;
+    var st = d.unicode_stego || {};
+    if (st.zero_width_threshold != null) card.querySelector('.gr-stego-zero-width').value = st.zero_width_threshold;
+    if (st.tag_chars_threshold != null) card.querySelector('.gr-stego-tag-threshold').value = st.tag_chars_threshold;
+    if (st.bidi_threshold != null) card.querySelector('.gr-stego-bidi-threshold').value = st.bidi_threshold;
+    if (st.detect_tag_chars != null) card.querySelector('.gr-stego-detect-tag-chars').checked = st.detect_tag_chars;
+    if (st.detect_zero_width != null) card.querySelector('.gr-stego-detect-zero-width').checked = st.detect_zero_width;
+    if (st.detect_bidi != null) card.querySelector('.gr-stego-detect-bidi').checked = st.detect_bidi;
+    if (st.detect_mixed_script != null) card.querySelector('.gr-stego-detect-mixed-script').checked = st.detect_mixed_script;
     if (d.patterns && d.patterns.length) d.patterns.forEach(function(p) { addPatternRow(card.querySelector('.gr-patterns-list'), p); });
     typeSelect.addEventListener('change', function() { showTypeFields(card, this.value); validateGuardrailsPage(); });
     card.querySelector('.gr-prov-name').addEventListener('input', function() { card.querySelector('.gr-prov-title').textContent = this.value || 'New Guardrail Type'; refreshGuardrailProviderSelects(); });
@@ -4906,11 +4916,13 @@ document.getElementById('cb-reset-btn').addEventListener('click', function() {
       '<button type="button" class="btn btn-secondary btn-sm gr-add-stage">+ Add Check</button>' +
       '<details class="guardrail-advanced"><summary>Advanced refusal and privacy settings</summary>' +
       '<div class="form-check"><input type="checkbox" class="gr-pipe-failover"><label>Try another model when this one refuses</label></div><div class="hint" style="margin-top:-.5rem;margin-bottom:.75rem">Detects common refusal phrases and requested tools that were not called.</div>' +
+      '<div class="form-check"><input type="checkbox" class="gr-pipe-scan-json" checked><label>Scan JSON inside tool results</label></div><div class="hint" style="margin-top:-.5rem;margin-bottom:.75rem">When a tool returns structured data, scan the serialized JSON content in addition to plain text parts.</div>' +
       '<div class="form-group"><label>Custom refusal phrases (optional)</label><textarea class="gr-pipe-refusal-phrases" rows="2" placeholder="I cannot help with that&#10;I\'m sorry, but"></textarea><div class="hint">One case-insensitive regular expression per line. Leave blank for built-in phrases.</div></div>' +
       '<div class="form-group"><label>Custom privacy notice (optional)</label><textarea class="gr-pipe-redaction-notice" rows="2"></textarea><div class="hint">Instruction sent to the model when personal information is temporarily replaced.</div></div>' +
       '<div class="form-group"><label>Where to place the privacy notice</label><select class="gr-pipe-insertion-mode"><option value="separate">Add a separate system message</option><option value="merged">Add it to the first system message</option></select><div class="hint">Merged falls back to a separate message if no system message exists.</div></div></details>';
     grPipeList.appendChild(card);
     if (d.failover_on_refusal) card.querySelector('.gr-pipe-failover').checked = true;
+    card.querySelector('.gr-pipe-scan-json').checked = !(d.tool_result && d.tool_result.scan_json_content === false);
     if (d.refusal_phrase_list && d.refusal_phrase_list.length) card.querySelector('.gr-pipe-refusal-phrases').value = d.refusal_phrase_list.join('\n');
     if (d.redaction_notice_instruction) card.querySelector('.gr-pipe-redaction-notice').value = d.redaction_notice_instruction;
     if (d.instruction_insertion_mode) card.querySelector('.gr-pipe-insertion-mode').value = d.instruction_insertion_mode;
@@ -4928,7 +4940,7 @@ document.getElementById('cb-reset-btn').addEventListener('click', function() {
     row.className = 'guardrail-stage';
     row.innerHTML = '<div class="form-group" style="margin:0"><label>Check name</label><input type="text" class="gr-stage-name" value="' + escapeHtml(d.name || 'content-check') + '"><div class="hint">Shown in logs and metrics.</div></div>' +
       '<div class="form-group" style="margin:0"><label>Guardrail type</label><select class="gr-stage-provider"><option value="">— choose —</option></select><div class="hint">Which configured checker to use.</div></div>' +
-      '<div class="form-group" style="margin:0"><label>When to check</label><select class="gr-stage-phase"><option value="pre_call">Before the model</option><option value="post_call">After the model</option></select><div class="hint">Checks requests before or responses after the model.</div></div>' +
+      '<div class="form-group" style="margin:0"><label>When to check</label><select class="gr-stage-phase"><option value="pre_call">Before the model</option><option value="post_call">After the model</option><option value="tool_result">Tool results</option><option value="tool_call">Tool calls</option></select><div class="hint">Checks requests before, responses after, tool outputs entering the model context, or tool calls from the model.</div></div>' +
       '<div class="form-group" style="margin:0"><label>When found</label><select class="gr-stage-action"><option value="block">Block it</option><option value="redact">Hide it safely</option><option value="mask">Replace with asterisks</option><option value="replace_with_policy_message">Show a policy message</option><option value="allow">Record it only</option></select><div class="hint">The action applied when this check finds something.</div></div>' +
       '<button type="button" class="btn btn-danger btn-sm gr-remove-stage" style="align-self:center" aria-label="Remove check">✕</button>';
     container.appendChild(row);
@@ -4937,21 +4949,32 @@ document.getElementById('cb-reset-btn').addEventListener('click', function() {
     if (d.provider) provSel.value = d.provider;
     if (d.phase) row.querySelector('.gr-stage-phase').value = d.phase;
     if (d.action) row.querySelector('.gr-stage-action').value = d.action;
-    row.querySelectorAll('input,select').forEach(function(el) { el.addEventListener('input', function() { renderGuardrailFlow(row.closest('.item-card')); }); });
+    applyStageActionFilter(row);
+    row.querySelectorAll('input,select').forEach(function(el) { el.addEventListener('input', function() { applyStageActionFilter(row); renderGuardrailFlow(row.closest('.item-card')); }); });
     row.querySelector('.gr-remove-stage').addEventListener('click', function() { var card = row.closest('.item-card'); row.remove(); renderGuardrailFlow(card); });
     renderGuardrailFlow(row.closest('.item-card'));
   }
 
-  function renderGuardrailFlow(card) {
+  function applyStageActionFilter(row) {
+    var phase = row.querySelector('.gr-stage-phase').value;
+    var actionSel = row.querySelector('.gr-stage-action');
+    var policyOk = phase !== 'pre_call' && phase !== 'tool_result';
+    actionSel.querySelectorAll('option').forEach(function(opt) { opt.disabled = opt.value === 'replace_with_policy_message' && !policyOk; });
+    if (actionSel.selectedOptions[0] && actionSel.selectedOptions[0].disabled) actionSel.value = 'block';
+ }
+
+ function renderGuardrailFlow(card) {
     if (!card) return;
     var flow = card.querySelector('.guardrail-flow');
     if (!flow) return;
     var pre = [];
     var post = [];
+    var phaseLabels = { pre_call: '', tool_result: ' (tool results)', post_call: '', tool_call: ' (tool calls)' };
     card.querySelectorAll('.guardrail-stage').forEach(function(row) {
       var name = row.querySelector('.gr-stage-name').value.trim() || 'Check';
-      var item = {name:name, action:row.querySelector('.gr-stage-action').selectedOptions[0].textContent};
-      (row.querySelector('.gr-stage-phase').value === 'pre_call' ? pre : post).push(item);
+      var phase = row.querySelector('.gr-stage-phase').value;
+      var item = {name:name + (phaseLabels[phase] || ''), action:row.querySelector('.gr-stage-action').selectedOptions[0].textContent};
+      (phase === 'pre_call' || phase === 'tool_result' ? pre : post).push(item);
     });
     flow.innerHTML = '';
     function addStep(text, className) { var span = document.createElement('span'); span.className = 'guardrail-flow-step ' + (className || ''); span.textContent = text; flow.appendChild(span); }
@@ -5093,7 +5116,18 @@ var pipeSel = row.querySelector('.gr-binding-pipeline');
         var apiFields = card.querySelector('.gr-fields-' + p.type.replace(/_/g, '-'));
         p.api_key_env = apiFields.querySelector('.gr-api-key-env').value.trim() || null;
         p.endpoint = apiFields.querySelector('.gr-api-endpoint').value.trim() || null;
-      } else if (p.type === 'custom_http') {
+      } else if (p.type === 'unicode_stego') {
+          var clamp = function(v, lo, hi, dflt) { v = parseInt(v, 10); return isNaN(v) || v < lo || v > hi ? dflt : v; };
+          p.unicode_stego = {
+            detect_tag_chars: card.querySelector('.gr-stego-detect-tag-chars').checked,
+            detect_zero_width: card.querySelector('.gr-stego-detect-zero-width').checked,
+            detect_bidi: card.querySelector('.gr-stego-detect-bidi').checked,
+            detect_mixed_script: card.querySelector('.gr-stego-detect-mixed-script').checked,
+            zero_width_threshold: clamp(card.querySelector('.gr-stego-zero-width').value, 0, 1000, 4),
+            tag_chars_threshold: clamp(card.querySelector('.gr-stego-tag-threshold').value, 0, 1000, 0),
+            bidi_threshold: clamp(card.querySelector('.gr-stego-bidi-threshold').value, 0, 1000, 0)
+          };
+        } else if (p.type === 'custom_http') {
         p.url = card.querySelector('.gr-custom-url').value.trim() || null;
       } else if (p.type === 'semantic') {
         p.allow_threshold = parseFloat(card.querySelector('.gr-semantic-allow').value) || null;
@@ -5105,7 +5139,7 @@ var pipeSel = row.querySelector('.gr-binding-pipeline');
     });
     var pipelines = [];
     grPipeList.querySelectorAll('.item-card').forEach(function(card) {
-      var pipe = { name: card.querySelector('.gr-pipe-name').value.trim(), failover_on_refusal: card.querySelector('.gr-pipe-failover').checked, instruction_insertion_mode: card.querySelector('.gr-pipe-insertion-mode').value, stages: [] };
+      var pipe = { name: card.querySelector('.gr-pipe-name').value.trim(), failover_on_refusal: card.querySelector('.gr-pipe-failover').checked, instruction_insertion_mode: card.querySelector('.gr-pipe-insertion-mode').value, tool_result: { scan_json_content: card.querySelector('.gr-pipe-scan-json').checked }, stages: [] };
       var refusal = card.querySelector('.gr-pipe-refusal-phrases').value.trim();
       pipe.refusal_phrase_list = refusal ? refusal.split('\n').map(function(s) { return s.trim(); }).filter(Boolean) : null;
       var redaction = card.querySelector('.gr-pipe-redaction-notice').value.trim();
@@ -5260,6 +5294,18 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
       if (preset === 'moderation') addGuardrailSetup({providerName:'harmful-content',ruleName:'block-harmful-content',type:'openai_moderation',stageName:'harmful-content-check'});
       else if (preset === 'pii') addGuardrailSetup({providerName:'personal-information',ruleName:'protect-personal-information',type:'presidio',stageName:'personal-information-check',action:'redact',redactionNotice:CROSS_MODEL_PRIVACY_NOTICE,insertionMode:'separate'});
       else if (preset === 'injection') addGuardrailSetup({providerName:'prompt-attacks',ruleName:'block-prompt-attacks',type:'lakera',stageName:'prompt-attack-check'});
+      else if (preset === 'tool-traffic') {
+        var stegoName = uniqueGuardrailName('hidden-characters', getGuardrailProviderNames());
+        var toolRuleName = uniqueGuardrailName('guard-tool-traffic', getGuardrailPipelineNames());
+        addGuardrailProviderCard({name:stegoName,type:'unicode_stego',failure_policy:'fail_close',timeout_seconds:5,unicode_stego:{detect_tag_chars:true,detect_zero_width:true,detect_bidi:true,detect_mixed_script:true,zero_width_threshold:4,tag_chars_threshold:0,bidi_threshold:0}});
+        addGuardrailPipelineCard({name:toolRuleName,failover_on_refusal:false,refusal_phrase_list:null,redaction_notice_instruction:null,instruction_insertion_mode:'separate',stages:[
+          {name:'tool-result-guard',provider:stegoName,phase:'tool_result',action:'block'},
+          {name:'outbound-tool-calls',provider:stegoName,phase:'tool_call',action:'redact'}
+        ]});
+        document.getElementById('gr-global-pipeline').value = toolRuleName;
+        document.querySelector('.guardrail-details').open = true;
+        showToast('Tool-traffic guardrail created. Review its stages, then save.');
+      }
       else addGuardrailSetup({providerName:'refusal-detection-support',ruleName:'try-another-model-on-refusal',type:'regex',stageName:'refusal-monitor',phase:'post_call',action:'allow',failover:true,patterns:refusalPatternRows(),refusalPhrases:COMMON_REFUSAL_PATTERNS.slice()});
     });
   });

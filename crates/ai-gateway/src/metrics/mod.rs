@@ -58,8 +58,13 @@ pub struct Metrics {
     /// signal ∈ {phrase, tool_omission} (Req 12.11).
     guardrail_refusal_detected: Arc<DashMap<(String, String), AtomicU64>>,
     /// Refusal failover outcome counter, keyed by (pipeline, outcome) where
-    /// outcome ∈ {recovered, exhausted} (Req 12.11).
+    /// outcome âˆˆ {recovered, exhausted} (Req 12.11).
     guardrail_refusal_failover: Arc<DashMap<(String, String), AtomicU64>>,
+    /// unicode_stego provider detection counter, keyed by (category, phase)
+    /// where category âˆˆ {unicode_tag, zero_width, bidi_control,
+    /// mixed_script_confusable} and phase âˆˆ {pre_call, tool_result,
+    /// tool_call, post_call} (indirect-injection defense, task 5.2).
+    guardrail_stego_detections: Arc<DashMap<(String, String), AtomicU64>>,
     /// Structured output validation, retry, and latency metrics.
     structured_output: Arc<StructuredOutputMetrics>,
     /// Compression tokens saved counter, keyed by bounded (level, provider).
@@ -321,11 +326,13 @@ fn smart_routing_transition_label(value: &str) -> String {
     smart_routing_enum_label(value, &["fast", "balanced", "powerful", "none"])
 }
 
-/// Label set for the guardrail stage execution counter (Req 11.1).
-type GuardrailStageCounterKey = (String, String, String, String);
+/// Label set for the guardrail stage execution counter (Req 11.1; phase label
+/// added by the indirect-injection defense, task 5.1).
+type GuardrailStageCounterKey = (String, String, String, String, String);
 
-/// Label set for the guardrail stage latency histogram (Req 11.2).
-type GuardrailLatencyKey = (String, String, String);
+/// Label set for the guardrail stage latency histogram (Req 11.2; phase label
+/// added by the indirect-injection defense, task 5.1).
+type GuardrailLatencyKey = (String, String, String, String);
 
 /// Upper bucket boundaries (inclusive, milliseconds) for the guardrail stage
 /// latency histogram (Req 11.2). Observations greater than the last boundary
@@ -523,6 +530,7 @@ impl Metrics {
             guardrail_stage_latency: Arc::new(DashMap::new()),
             guardrail_refusal_detected: Arc::new(DashMap::new()),
             guardrail_refusal_failover: Arc::new(DashMap::new()),
+            guardrail_stego_detections: Arc::new(DashMap::new()),
             structured_output: Arc::new(StructuredOutputMetrics::new()),
             compression_tokens_saved: Arc::new(DashMap::new()),
             compression_ratio: Arc::new(DashMap::new()),
@@ -971,18 +979,21 @@ impl Metrics {
     }
 
     /// Record a single guardrail stage execution: bumps the execution counter
-    /// for `(pipeline, stage, provider_type, action)` and observes `latency_ms`
-    /// in the latency histogram for `(pipeline, stage, provider_type)`
-    /// (Req 11.1, 11.2).
+    /// for `(pipeline, stage, provider_type, phase, action)` and observes
+    /// `latency_ms` in the latency histogram for
+    /// `(pipeline, stage, provider_type, phase)` (Req 11.1, 11.2; phase label
+    /// added by the indirect-injection defense, task 5.1).
     ///
     /// `action` must be one of `pass`, `block`, `redact`, `mask`,
-    /// `replace_with_policy_message`, or `error`. Recording is best-effort and
-    /// never fails the calling request (Req 11.7).
+    /// `replace_with_policy_message`, or `error`. `phase` is one of
+    /// `pre_call`, `tool_result`, `tool_call`, `post_call`. Recording is
+    /// best-effort and never fails the calling request (Req 11.7).
     pub fn record_guardrail_stage(
         &self,
         pipeline: &str,
         stage: &str,
         provider_type: &str,
+        phase: &str,
         action: &str,
         latency_ms: f64,
     ) {
@@ -990,6 +1001,7 @@ impl Metrics {
             pipeline.to_string(),
             stage.to_string(),
             provider_type.to_string(),
+            phase.to_string(),
             action.to_string(),
         );
         self.guardrail_stage_executions
@@ -1001,11 +1013,23 @@ impl Metrics {
             pipeline.to_string(),
             stage.to_string(),
             provider_type.to_string(),
+            phase.to_string(),
         );
         self.guardrail_stage_latency
             .entry(latency_key)
             .or_insert_with(GuardrailLatencyHistogram::new)
             .observe(latency_ms);
+    }
+
+    /// Increment the unicode_stego detection counter for `(category, phase)`
+    /// (indirect-injection defense, task 5.2). Best-effort: never fails the
+    /// request (Req 11.7). Content-safe: labels only, never matched text.
+    pub fn record_guardrail_stego_detection(&self, category: &str, phase: &str) {
+        let key = (category.to_string(), phase.to_string());
+        self.guardrail_stego_detections
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increment the refusal-detected counter for `(pipeline, signal)` where
@@ -1050,13 +1074,13 @@ impl Metrics {
 
             out.push_str(
                 "# HELP obey_api_guardrail_stage_executions_total \
-Total guardrail stage executions by pipeline, stage, provider, and action\n",
+Total guardrail stage executions by pipeline, stage, provider, phase, and action\n",
             );
             out.push_str("# TYPE obey_api_guardrail_stage_executions_total counter\n");
-            for ((pipeline, stage, provider, action), value) in &rows {
+            for ((pipeline, stage, provider, phase, action), value) in &rows {
                 out.push_str(&format!(
-                    "obey_api_guardrail_stage_executions_total{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\",action=\"{}\"}} {}\n",
-                    pipeline, stage, provider, action, value
+                    "obey_api_guardrail_stage_executions_total{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\",phase=\"{}\",action=\"{}\"}} {}\n",
+                    pipeline, stage, provider, phase, action, value
                 ));
             }
         }
@@ -1072,7 +1096,7 @@ Total guardrail stage executions by pipeline, stage, provider, and action\n",
 
             out.push_str(
                 "# HELP obey_api_guardrail_stage_latency_ms \
-Guardrail stage latency in milliseconds by pipeline, stage, and provider\n",
+Guardrail stage latency in milliseconds by pipeline, stage, provider, and phase\n",
             );
             out.push_str("# TYPE obey_api_guardrail_stage_latency_ms histogram\n");
             for key in &keys {
@@ -1081,29 +1105,29 @@ Guardrail stage latency in milliseconds by pipeline, stage, and provider\n",
                     None => continue,
                 };
                 let hist = entry.value();
-                let (pipeline, stage, provider) = key;
+                let (pipeline, stage, provider, phase) = key;
 
                 let mut cumulative = 0u64;
                 for (idx, boundary) in GUARDRAIL_LATENCY_BUCKETS_MS.iter().enumerate() {
                     cumulative += hist.buckets[idx].load(Ordering::Relaxed);
                     out.push_str(&format!(
-                        "obey_api_guardrail_stage_latency_ms_bucket{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\",le=\"{}\"}} {}\n",
-                        pipeline, stage, provider, boundary, cumulative
+                        "obey_api_guardrail_stage_latency_ms_bucket{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\",phase=\"{}\",le=\"{}\"}} {}\n",
+                        pipeline, stage, provider, phase, boundary, cumulative
                     ));
                 }
                 let total = hist.count.load(Ordering::Relaxed);
                 out.push_str(&format!(
-                    "obey_api_guardrail_stage_latency_ms_bucket{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\",le=\"+Inf\"}} {}\n",
-                    pipeline, stage, provider, total
+                    "obey_api_guardrail_stage_latency_ms_bucket{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\",phase=\"{}\",le=\"+Inf\"}} {}\n",
+                    pipeline, stage, provider, phase, total
                 ));
                 let sum_ms = hist.sum_micros.load(Ordering::Relaxed) as f64 / 1000.0;
                 out.push_str(&format!(
-                    "obey_api_guardrail_stage_latency_ms_sum{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\"}} {}\n",
-                    pipeline, stage, provider, sum_ms
+                    "obey_api_guardrail_stage_latency_ms_sum{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\",phase=\"{}\"}} {}\n",
+                    pipeline, stage, provider, phase, sum_ms
                 ));
                 out.push_str(&format!(
-                    "obey_api_guardrail_stage_latency_ms_count{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\"}} {}\n",
-                    pipeline, stage, provider, total
+                    "obey_api_guardrail_stage_latency_ms_count{{pipeline=\"{}\",stage=\"{}\",provider=\"{}\",phase=\"{}\"}} {}\n",
+                    pipeline, stage, provider, phase, total
                 ));
             }
         }
@@ -1148,6 +1172,29 @@ Total refusal failover outcomes by pipeline and outcome\n",
                 out.push_str(&format!(
                     "obey_api_guardrail_refusal_failover_total{{pipeline=\"{}\",outcome=\"{}\"}} {}\n",
                     pipeline, outcome, value
+                ));
+            }
+        }
+
+        // Counter: obey_api_guardrail_stego_detections_total
+        // (indirect-injection defense, task 5.2)
+        if !self.guardrail_stego_detections.is_empty() {
+            let mut rows: Vec<((String, String), u64)> = self
+                .guardrail_stego_detections
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+            out.push_str(
+                "# HELP obey_api_guardrail_stego_detections_total \
+Total unicode_stego provider detections by category and phase\n",
+            );
+            out.push_str("# TYPE obey_api_guardrail_stego_detections_total counter\n");
+            for ((category, phase), value) in &rows {
+                out.push_str(&format!(
+                    "obey_api_guardrail_stego_detections_total{{category=\"{}\",phase=\"{}\"}} {}\n",
+                    category, phase, value
                 ));
             }
         }
@@ -2295,9 +2342,11 @@ mod tests {
     fn test_guardrail_stage_counter_exposition() {
         let metrics = Metrics::new();
 
-        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "redact", 12.0);
-        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "redact", 8.0);
-        metrics.record_guardrail_stage("standard", "secret-block", "regex", "block", 3.0);
+        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "pre_call", "redact", 12.0);
+        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "pre_call", "redact", 8.0);
+        metrics.record_guardrail_stage("standard", "secret-block", "regex", "pre_call", "block", 3.0);
+        // Same stage shape in a different phase keeps a separate series.
+        metrics.record_guardrail_stage("standard", "secret-block", "regex", "tool_result", "mask", 1.0);
 
         let mut out = String::new();
         metrics.write_guardrail_prometheus(&mut out);
@@ -2306,10 +2355,13 @@ mod tests {
         assert!(out.contains("# TYPE obey_api_guardrail_stage_executions_total counter"));
         // Two executions of the redact stage, one of the block stage.
         assert!(out.contains(
-            "obey_api_guardrail_stage_executions_total{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",action=\"redact\"} 2"
+            "obey_api_guardrail_stage_executions_total{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",phase=\"pre_call\",action=\"redact\"} 2"
         ));
         assert!(out.contains(
-            "obey_api_guardrail_stage_executions_total{pipeline=\"standard\",stage=\"secret-block\",provider=\"regex\",action=\"block\"} 1"
+            "obey_api_guardrail_stage_executions_total{pipeline=\"standard\",stage=\"secret-block\",provider=\"regex\",phase=\"pre_call\",action=\"block\"} 1"
+        ));
+        assert!(out.contains(
+            "obey_api_guardrail_stage_executions_total{pipeline=\"standard\",stage=\"secret-block\",provider=\"regex\",phase=\"tool_result\",action=\"mask\"} 1"
         ));
     }
 
@@ -2318,8 +2370,8 @@ mod tests {
         let metrics = Metrics::new();
 
         // One observation at 8ms (falls in le="10"), one at 300ms (le="500").
-        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "pass", 8.0);
-        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "pass", 300.0);
+        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "pre_call", "pass", 8.0);
+        metrics.record_guardrail_stage("standard", "pii-redact", "presidio", "pre_call", "pass", 300.0);
 
         let mut out = String::new();
         metrics.write_guardrail_prometheus(&mut out);
@@ -2327,25 +2379,25 @@ mod tests {
         assert!(out.contains("# TYPE obey_api_guardrail_stage_latency_ms histogram"));
         // Design bucket boundaries are present.
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",le=\"5\"} 0"
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",phase=\"pre_call\",le=\"5\"} 0"
         ));
         // Cumulative: 8ms counted at le="10".
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",le=\"10\"} 1"
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",phase=\"pre_call\",le=\"10\"} 1"
         ));
         // Cumulative: both observations counted by le="500".
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",le=\"500\"} 2"
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",phase=\"pre_call\",le=\"500\"} 2"
         ));
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",le=\"+Inf\"} 2"
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",phase=\"pre_call\",le=\"+Inf\"} 2"
         ));
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\"} 2"
+            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",phase=\"pre_call\"} 2"
         ));
         // Sum = 8 + 300 = 308 ms.
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_sum{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\"} 308"
+            "obey_api_guardrail_stage_latency_ms_sum{pipeline=\"standard\",stage=\"pii-redact\",provider=\"presidio\",phase=\"pre_call\"} 308"
         ));
     }
 
@@ -2361,16 +2413,36 @@ mod tests {
     fn test_guardrail_latency_over_max_bucket_only_in_inf() {
         let metrics = Metrics::new();
         // 6000ms exceeds the last boundary (5000) → only in +Inf/count.
-        metrics.record_guardrail_stage("p", "s", "regex", "error", 6000.0);
+        metrics.record_guardrail_stage("p", "s", "regex", "post_call", "error", 6000.0);
 
         let mut out = String::new();
         metrics.write_guardrail_prometheus(&mut out);
 
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"p\",stage=\"s\",provider=\"regex\",le=\"5000\"} 0"
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"p\",stage=\"s\",provider=\"regex\",phase=\"post_call\",le=\"5000\"} 0"
         ));
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"p\",stage=\"s\",provider=\"regex\",le=\"+Inf\"} 1"
+            "obey_api_guardrail_stage_latency_ms_bucket{pipeline=\"p\",stage=\"s\",provider=\"regex\",phase=\"post_call\",le=\"+Inf\"} 1"
+        ));
+    }
+
+    #[test]
+    fn test_guardrail_stego_detections_exposition() {
+        let metrics = Metrics::new();
+
+        metrics.record_guardrail_stego_detection("unicode_tag", "tool_result");
+        metrics.record_guardrail_stego_detection("unicode_tag", "tool_result");
+        metrics.record_guardrail_stego_detection("zero_width", "tool_call");
+
+        let mut out = String::new();
+        metrics.write_guardrail_prometheus(&mut out);
+
+        assert!(out.contains("# TYPE obey_api_guardrail_stego_detections_total counter"));
+        assert!(out.contains(
+            "obey_api_guardrail_stego_detections_total{category=\"unicode_tag\",phase=\"tool_result\"} 2"
+        ));
+        assert!(out.contains(
+            "obey_api_guardrail_stego_detections_total{category=\"zero_width\",phase=\"tool_call\"} 1"
         ));
     }
 

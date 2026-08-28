@@ -1,4 +1,4 @@
-//! Pipeline binding resolution and stage ordering.
+﻿//! Pipeline binding resolution and stage ordering.
 //!
 //! The [`PipelineResolver`] compiles the configured [`GuardrailConfig`] against
 //! a [`ProviderRegistry`] once at load time, producing a `name -> ResolvedPipeline`
@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use crate::guardrail::config::{
     FailurePolicy, GuardrailConfig, InstructionInsertionMode, PolicyAction, StagePhase,
+    ToolResultPhaseConfig,
 };
 use crate::guardrail::provider::{GuardrailProvider, ProviderRegistry};
 
@@ -113,6 +114,9 @@ pub struct ResolvedPipeline {
     /// Per-pipeline "failover if refusal is detected" toggle (Req 12.4).
     /// Default: `false`.
     pub failover_on_refusal: bool,
+    /// Per-pipeline `tool_result` phase tuning (indirect-injection defense):
+    /// whether JSON-object tool-result content is serialized and scanned.
+    pub tool_result: ToolResultPhaseConfig,
 }
 
 /// Error produced while compiling the [`PipelineResolver`] from configuration.
@@ -175,11 +179,11 @@ pub struct PipelineResolver {
     pipelines: HashMap<String, ResolvedPipeline>,
     /// Name of the global-default pipeline, if configured.
     global_default: Option<String>,
-    /// virtual-key id → pipeline name.
+    /// virtual-key id â†’ pipeline name.
     virtual_keys: HashMap<String, String>,
-    /// model-group name → pipeline name.
+    /// model-group name â†’ pipeline name.
     model_groups: HashMap<String, String>,
-    /// route path → pipeline name.
+    /// route path â†’ pipeline name.
     routes: HashMap<String, String>,
     /// Per-binding "failover if refusal is detected" overrides (Req 12.4).
     failover_on_refusal_bindings: HashMap<String, bool>,
@@ -196,7 +200,7 @@ impl PipelineResolver {
         config: &GuardrailConfig,
         registry: &ProviderRegistry,
     ) -> Result<Self, PipelineResolverError> {
-        // Map provider name → (failure_policy, timeout) from the config list.
+        // Map provider name â†’ (failure_policy, timeout) from the config list.
         let provider_meta: HashMap<&str, (FailurePolicy, Duration)> = config
             .providers
             .iter()
@@ -248,6 +252,7 @@ impl PipelineResolver {
                     redaction_notice_instruction: pipeline.redaction_notice_instruction.clone(),
                     instruction_insertion_mode: pipeline.instruction_insertion_mode,
                     failover_on_refusal: pipeline.failover_on_refusal,
+                    tool_result: pipeline.tool_result.clone(),
                 },
             );
         }
@@ -264,8 +269,8 @@ impl PipelineResolver {
 
     /// Resolve the ordered, flat list of stages that apply to a request.
     ///
-    /// Stages are concatenated in the fixed order global-default → virtual-key →
-    /// model-group → route, each source contributing its stages in definition
+    /// Stages are concatenated in the fixed order global-default â†’ virtual-key â†’
+    /// model-group â†’ route, each source contributing its stages in definition
     /// order (Req 1.7). Returns an empty vector when nothing applies (Req 1.4,
     /// 1.6).
     pub fn resolve(&self, selector: &BindingSelector) -> Vec<ResolvedStage> {
@@ -354,6 +359,37 @@ impl PipelineResolver {
     #[allow(dead_code)] // public accessor; unused in the binary build
     pub fn global_default(&self) -> Option<&str> {
         self.global_default.as_deref()
+    }
+
+    /// Resolve the effective `tool_result` phase config for a request
+    /// (indirect-injection defense, Req 1.6).
+    ///
+    /// Mirrors [`Self::resolve_instruction_config`]: the most-specific bound
+    /// pipeline (route > model-group > vkey > global) provides the config;
+    /// when no pipeline applies, the default (JSON scanning enabled) is used.
+    pub fn resolve_tool_result_config(&self, selector: &BindingSelector) -> ToolResultPhaseConfig {
+        let pipeline_name = selector
+            .route_path
+            .as_ref()
+            .and_then(|r| self.routes.get(r))
+            .or_else(|| {
+                selector
+                    .model_group
+                    .as_ref()
+                    .and_then(|g| self.model_groups.get(g))
+            })
+            .or_else(|| {
+                selector
+                    .virtual_key_id
+                    .as_ref()
+                    .and_then(|v| self.virtual_keys.get(v))
+            })
+            .or(self.global_default.as_ref());
+
+        pipeline_name
+            .and_then(|n| self.pipelines.get(n))
+            .map(|p| p.tool_result.clone())
+            .unwrap_or_default()
     }
 
     /// Resolve the effective `failover_on_refusal` toggle for a request (Req 12.4).
@@ -459,6 +495,7 @@ mod tests {
             instruction_insertion_mode: InstructionInsertionMode::default(),
             failover_on_refusal: false,
             refusal_phrase_list: None,
+            tool_result: crate::guardrail::config::ToolResultPhaseConfig::default(),
         }
     }
 
@@ -820,7 +857,7 @@ mod tests {
         /// `true` OR the resolved pipeline's own `failover_on_refusal` field is
         /// `true`. When the toggle is disabled (both binding and pipeline
         /// default to `false`), refusal detection fires but no re-dispatch
-        /// occurs — the response is returned unmodified (Req 12.6). When
+        /// occurs â€” the response is returned unmodified (Req 12.6). When
         /// enabled via either path, a refusal triggers failover (Req 12.4,
         /// 12.5).
         ///
@@ -936,9 +973,9 @@ mod tests {
         /// bounded failover re-dispatch loop (modeled here as a pure function)
         /// guarantees:
         /// 1. Each target is attempted at most once (bounded by ordering length)
-        ///    — Req 12.7.
+        ///    â€” Req 12.7.
         /// 2. Targets with open circuit breakers are NEVER dispatched to
-        ///    — Req 12.10.
+        ///    â€” Req 12.10.
         /// 3. The total number of dispatch attempts is at most the number of
         ///    available (CB-closed, not-yet-tried) targets.
         ///
@@ -960,7 +997,7 @@ mod tests {
                 .map(|i| format!("provider_{i}"))
                 .collect();
 
-            // Which targets have open CBs (bit i → target i is open).
+            // Which targets have open CBs (bit i â†’ target i is open).
             let cb_open: Vec<bool> = (0..num_targets)
                 .map(|i| (cb_open_bits >> (i % 8)) & 1 == 1)
                 .collect();
@@ -987,7 +1024,7 @@ mod tests {
                 tried.push(target.clone());
 
                 // In this property test, the fake dispatcher always returns a
-                // refusal, so we never break early — exercising the full loop.
+                // refusal, so we never break early â€” exercising the full loop.
             }
 
             // --- Assertions ---
@@ -1221,7 +1258,7 @@ mod tests {
         /// For any combination of present/absent global-default, vkey,
         /// model-group, and route bindings, the resolved stage list equals the
         /// concatenation of global-default stages, then vkey, then model-group,
-        /// then route stages — each source in definition order.
+        /// then route stages â€” each source in definition order.
         ///
         /// Validates: Requirements 1.5, 1.7
         #[test]

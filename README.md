@@ -696,7 +696,7 @@ The admin panel's **Virtual Keys** section provides a searchable/sortable key ta
 
 ## Guardrail Pipelines
 
-Guardrail Pipelines add a configurable policy-enforcement layer that intercepts requests before provider routing (pre-call) and responses before returning to the caller (post-call). Use them for PII/DLP filtering, content moderation, semantic prompt guarding, and sensitive data redaction with transparent re-injection.
+Guardrail Pipelines add a configurable policy-enforcement layer that intercepts requests before provider routing (pre-call), responses before returning to the caller (post-call), tool results before they enter the model context (tool_result), and outbound/inbound tool calls (tool_call). Use them for PII/DLP filtering, content moderation, semantic prompt guarding, sensitive data redaction with transparent re-injection, and indirect prompt-injection defense.
 
 Guardrails are opt-in per virtual key, model group, or route and execute through a pluggable provider interface.
 
@@ -710,16 +710,37 @@ Guardrails are opt-in per virtual key, model group, or route and execute through
 | `lakera` | Lakera Guard prompt injection detection |
 | `semantic` | Embedding-based similarity matching against allow/deny example collections in Qdrant |
 | `custom_http` | POST content to any HTTP endpoint implementing the documented findings JSON schema |
+| `unicode_stego` | Local detection of invisible-character injection channels: zero-width clusters, tag-character ASCII smuggling, bidi overrides, and mixed-script homoglyph confusables |
 
 ### Policy Actions
 
-| Action | Pre-Call | Post-Call | Behavior |
-|--------|:--------:|:---------:|----------|
-| `allow` | ✓ | ✓ | Pass through unmodified |
-| `block` | ✓ | ✓ | Reject with HTTP 403 (pre-call stops forwarding; post-call discards response) |
-| `mask` | ✓ | | Replace each character with `*`, preserving byte length |
-| `redact` | ✓ | ✓ | Replace with placeholder tokens (pre-call) or `[REDACTED]` (post-call) |
-| `replace_with_policy_message` | | ✓ | Replace assistant content with a configured message |
+| Action | Pre-Call | Post-Call | Tool Result | Tool Call | Behavior |
+|--------|:--------:|:---------:|:-----------:|:---------:|----------|
+| `allow` | ✓ | ✓ | ✓ | ✓ | Pass through unmodified |
+| `block` | ✓ | ✓ | ✓ | ✓ | Reject with HTTP 403 (pre-call/tool-result stops forwarding; post-call/tool-call discards the response) |
+| `mask` | ✓ | ✓ | ✓ | ✓ | Replace each character with `*`, preserving byte length |
+| `redact` | ✓ | ✓ | ✓ | ✓ | Replace with placeholder tokens (pre-call) or `[REDACTED]` (post-call/tool phases) |
+| `replace_with_policy_message` | | ✓ | | ✓ | Replace assistant content (or the offending tool call's arguments) with a configured message |
+
+### Indirect Prompt-Injection Defense
+
+Two additional scanning phases target indirect prompt-injection attacks that ride in on tool traffic rather than plain user text:
+
+- **`tool_result`** — inspects `role:"tool"` messages (tool outputs, retrieved documents, MCP results) *before* the request is forwarded. A poisoned document ("ignore previous instructions…") can be blocked, masked, or redacted like any pre-call content.
+- **`tool_call`** — inspects assistant `tool_call` function names and arguments in two places: (a) outbound, on the model's response before it reaches the caller (or its agent runtime), and (b) inbound, on assistant history entries replayed in later requests. Argument redaction rewrites only the offending call — multi-call precision keeps sibling calls intact — and masked arguments remain valid JSON.
+
+Streaming responses with a bound `tool_call` stage are fully buffered and assembled (streamed tool-call deltas are merged by index), so streamed tool calls receive the same inspection as non-streaming ones. A block on a streamed tool call terminates the SSE stream with a policy-violation error frame instead of forwarding the deltas.
+
+The `unicode_stego` provider detects the invisible-character channels such payloads commonly use. Detection runs locally with no network calls:
+
+| Category | Trigger |
+|----------|---------|
+| `unicode_tag` | Tag characters (U+E0000–U+E007F) encoding hidden ASCII payloads |
+| `zero_width` | Zero-width/format characters (U+200B–U+200D, U+2060–U+2064, U+FEFF, U+180E, U+061C, U+00AD, variation selectors U+FE00–U+FE0F) in runs |
+| `bidi_control` | RLO/PDF and other bidi controls that reverse rendered text |
+| `mixed_script_confusable` | Mixed-script runs that render as Latin (e.g., Cyrillic 'а' inside "password") |
+
+Settings (each category can be toggled off): `detect_tag_chars`, `detect_zero_width`, `detect_bidi`, `detect_mixed_script` (all default `true`), plus per-category suppression thresholds `zero_width_threshold` (default 4), `tag_chars_threshold` (default 0 — any tag character), and `bidi_threshold` (default 0), each 0–1000 characters.
 
 ### PII Redaction & Re-Injection
 
@@ -773,22 +794,34 @@ guardrails:
       entities: [EMAIL_ADDRESS, US_SSN, CREDIT_CARD]
       confidence_threshold: 0.6
 
-    - name: prompt-guard
-      type: semantic
-      failure_policy: fail_open
-      allow_collection: "guardrail_allow"
-      deny_collection: "guardrail_deny"
-      allow_threshold: 0.90
-      deny_threshold: 0.85
+- name: prompt-guard
+type: semantic
+failure_policy: fail_open
+allow_collection: "guardrail_allow"
+deny_collection: "guardrail_deny"
+allow_threshold: 0.90
+deny_threshold: 0.85
 
-  pipelines:
-    - name: standard
-      failover_on_refusal: true
-      stages:
-        - { name: pii-redact, provider: pii-detector, phase: pre_call, action: redact }
-        - { name: secret-block, provider: secret-scanner, phase: pre_call, action: block }
-        - { name: injection-guard, provider: prompt-guard, phase: pre_call, action: block }
-        - { name: out-redact, provider: secret-scanner, phase: post_call, action: redact }
+- name: stego-scanner
+type: unicode_stego
+failure_policy: fail_close
+zero_width_threshold: 4
+tag_chars_threshold: 0
+bidi_threshold: 0
+
+pipelines:
+- name: standard
+failover_on_refusal: true
+stages:
+- { name: pii-redact, provider: pii-detector, phase: pre_call, action: redact }
+- { name: secret-block, provider: secret-scanner, phase: pre_call, action: block }
+- { name: injection-guard, provider: prompt-guard, phase: pre_call, action: block }
+- { name: out-redact, provider: secret-scanner, phase: post_call, action: redact }
+
+- name: injection-defense
+stages:
+- { name: tool-result-guard, provider: stego-scanner, phase: tool_result, action: block }
+- { name: outbound-tool-calls, provider: stego-scanner, phase: tool_call, action: redact }
 
   global_default_pipeline: standard
 
@@ -812,8 +845,9 @@ Each provider must declare a `failure_policy`:
 
 Guardrail execution is fully observable:
 
-- Counter: `obey_api_guardrail_stage_executions_total{pipeline, stage, provider, action}`
-- Histogram: `obey_api_guardrail_stage_latency_ms{pipeline, stage, provider}` (buckets: 5–5000ms)
+- Counter: `obey_api_guardrail_stage_executions_total{pipeline, stage, provider, phase, action}` (`phase` is the execution surface: `pre_call`, `post_call`, `tool_result`, or `tool_call`)
+- Histogram: `obey_api_guardrail_stage_latency_ms{pipeline, stage, provider, phase}` (buckets: 5–5000ms)
+- Counter: `obey_api_guardrail_stego_detections_total{category, phase}` (invisible-character channels: `unicode_tag`, `zero_width`, `bidi_control`, `mixed_script_confusable`)
 - Counter: `obey_api_guardrail_refusal_detected_total{pipeline, signal}`
 - Counter: `obey_api_guardrail_refusal_failover_total{pipeline, outcome}`
 - INFO logs for non-pass actions (never includes triggering content)

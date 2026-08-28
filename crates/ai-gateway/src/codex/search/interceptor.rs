@@ -18,7 +18,12 @@ use crate::providers::{ProviderClient, ProviderResponse};
 
 const GATEWAY_TOOLS: [&str; 2] = ["codex_search", "codex_web"];
 const ITERATION_LIMIT_MESSAGE: &str = "Codex search agent loop iteration limit reached. \
-     Please refine your request or provide the information directly.";
+Please refine your request or provide the information directly.";
+const CONTINUATION_NUDGE_MESSAGE: &str = "The gateway executed the codex_search/codex_web tool \
+call server-side; the result is already in the conversation above. This is not a new user \
+request: do not acknowledge, summarize, or restate the search result. Continue the user's \
+original task. If any work remains, emit your next native tool call now; reply with plain \
+text only when the entire task is complete.";
 
 /// Result of intercepting a provider response through the agent loop.
 #[allow(dead_code)]
@@ -63,24 +68,45 @@ impl ToolInterceptor {
         let start = Instant::now();
         let mut current_response = initial_response;
         let mut iterations: u32 = 0;
-        let mut all_results: Vec<Value> = Vec::new();
-        let mut seen_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+ let mut all_results: Vec<Value> = Vec::new();
+ let mut seen_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+ // One-shot guard for the reactive continuation nudge (see the
+ // tool_calls-empty branch of the loop).
+ let mut nudged = false;
 
         loop {
             let tool_calls = extract_tool_calls(&current_response);
 
-            if tool_calls.is_empty() {
-                if self.output_to_chat {
-                    append_results_to_chat(&mut current_response, &all_results);
-                }
-                attach_results_to_response(&mut current_response, &all_results);
-                return Ok(InterceptResult {
-                    response: current_response,
-                    pending_client_tool_calls: Vec::new(),
-                    iteration_limit_reached: false,
-                    total_latency_ms: start.elapsed().as_millis() as u64,
-                });
-            }
+ if tool_calls.is_empty() {
+ // Reactive continuation nudge: the model produced a text-only
+ // response right after gateway-executed search results. Client
+ // harnesses treat "text + no tool_calls" as end of the whole
+ // turn, so an interim answer here ends the task prematurely.
+ // Give the model exactly one extra round-trip to continue via
+ // its own (client) tools before accepting the stop. The nudge
+ // lives only in the resubmitted request — the client never
+ // sees it. Skipped when no search ran this turn, when the
+ // nudge already fired, or when the iteration budget is spent
+ // (the explicit limit branch handles that case).
+ if !all_results.is_empty() && !nudged && iterations < self.max_iterations {
+ append_continuation_nudge(&mut request, &current_response);
+ nudged = true;
+ iterations += 1;
+ let next_response = self.resubmit(provider, &request).await?;
+ current_response = next_response;
+ continue;
+ }
+ if self.output_to_chat {
+ append_results_to_chat(&mut current_response, &all_results);
+ }
+ attach_results_to_response(&mut current_response, &all_results);
+ return Ok(InterceptResult {
+ response: current_response,
+ pending_client_tool_calls: Vec::new(),
+ iteration_limit_reached: false,
+ total_latency_ms: start.elapsed().as_millis() as u64,
+ });
+ }
 
             let (gateway_calls, client_calls): (Vec<&Value>, Vec<&Value>) =
                 tool_calls.iter().partition(|tc| is_gateway_tool_call(tc));
@@ -262,11 +288,25 @@ fn build_tool_message(call_id: &str, result: &ToolResult) -> Message {
 }
 
 fn append_iteration_limit_message(request: &mut OpenAIRequest) {
-    request.messages.push(Message {
-        role: "system".to_string(),
-        content: Value::String(ITERATION_LIMIT_MESSAGE.to_string()),
-        extra: serde_json::Map::new(),
-    });
+ request.messages.push(Message {
+ role: "system".to_string(),
+ content: Value::String(ITERATION_LIMIT_MESSAGE.to_string()),
+ extra: serde_json::Map::new(),
+ });
+}
+
+/// Append the model's text-only response as an assistant message,
+/// followed by a one-shot user-role nudge to continue the task. The
+/// nudge is placed after any tool messages (assistant -> tool ->
+/// user), which strict providers accept; interleaving it between the
+/// assistant tool_calls message and its tool results would not.
+fn append_continuation_nudge(request: &mut OpenAIRequest, response: &OpenAIResponse) {
+ append_assistant_message(request, response);
+ request.messages.push(Message {
+ role: "user".to_string(),
+ content: Value::String(CONTINUATION_NUDGE_MESSAGE.to_string()),
+ extra: serde_json::Map::new(),
+ });
 }
 
 /// Append executed results to `all_results`, skipping call IDs already seen.
@@ -436,31 +476,41 @@ mod tests {
         }
     }
 
-    struct MockProvider {
-        responses: Vec<OpenAIResponse>,
-        call_count: std::sync::atomic::AtomicU32,
-    }
+ struct MockProvider {
+ responses: Vec<OpenAIResponse>,
+ call_count: std::sync::atomic::AtomicU32,
+ requests: std::sync::Mutex<Vec<OpenAIRequest>>,
+ }
 
-    impl MockProvider {
-        fn new(responses: Vec<OpenAIResponse>) -> Self {
-            Self {
-                responses,
-                call_count: std::sync::atomic::AtomicU32::new(0),
-            }
-        }
+ impl MockProvider {
+ fn new(responses: Vec<OpenAIResponse>) -> Self {
+ Self {
+ responses,
+ call_count: std::sync::atomic::AtomicU32::new(0),
+ requests: std::sync::Mutex::new(Vec::new()),
+ }
+ }
 
-        fn calls(&self) -> u32 {
-            self.call_count.load(std::sync::atomic::Ordering::Relaxed)
-        }
-    }
+ fn calls(&self) -> u32 {
+ self.call_count.load(std::sync::atomic::Ordering::Relaxed)
+ }
+
+ fn requests(&self) -> Vec<OpenAIRequest> {
+ self.requests.lock().expect("mock requests mutex").clone()
+ }
+ }
 
     #[async_trait]
     impl ProviderClient for MockProvider {
-        async fn chat_completion(
-            &self,
-            _request: OpenAIRequest,
-        ) -> Result<ProviderResponse, GatewayError> {
-            let idx = self
+ async fn chat_completion(
+ &self,
+ request: OpenAIRequest,
+ ) -> Result<ProviderResponse, GatewayError> {
+ self.requests
+ .lock()
+ .expect("mock requests mutex")
+ .push(request);
+ let idx = self
                 .call_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
             let resp = self
@@ -666,40 +716,58 @@ async fn gateway_only_calls_are_stripped_before_client_return() {
 
 #[tokio::test]
 async fn single_tool_call_then_final_answer() {
-    let executor = make_executor();
-    let interceptor = ToolInterceptor::new(executor, 5, false);
-    let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
-    let provider = MockProvider::new(vec![make_final_response("final answer")]);
+ let executor = make_executor();
+ let interceptor = ToolInterceptor::new(executor, 5, false);
+ let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
+ // First resubmit returns an interim text-only answer, which triggers
+ // the one-shot continuation nudge; the second resubmit completes.
+ let provider = MockProvider::new(vec![
+ make_final_response("interim answer"),
+ make_final_response("task complete"),
+ ]);
 
-    let initial = make_response_with_tool_calls(vec![search_call]);
-    let result = interceptor
-        .intercept(&provider, make_request(), initial)
-        .await
-        .unwrap();
+ let initial = make_response_with_tool_calls(vec![search_call]);
+ let result = interceptor
+ .intercept(&provider, make_request(), initial)
+ .await
+ .unwrap();
 
-    assert!(!result.iteration_limit_reached);
-    assert!(result.pending_client_tool_calls.is_empty());
-    assert_eq!(provider.calls(), 1);
-    // Metadata attachment happens on the final-answer path too.
-    let executed = result
-        .response
-        .extra
-        .get("codex_search_tool_results")
-        .and_then(|v| v.as_array())
-        .expect("results should be attached on final-answer path");
-    assert_eq!(executed.len(), 1);
-    assert_eq!(
-        executed[0].get("query").and_then(Value::as_str),
-        Some("test")
-    );
-    // With output_to_chat disabled the assistant content is untouched.
-    let content = result
-        .response
-        .choices
-        .first()
-        .map(|c| c.message.content_as_text())
-        .unwrap_or_default();
-    assert_eq!(content, "final answer");
+ assert!(!result.iteration_limit_reached);
+ assert!(result.pending_client_tool_calls.is_empty());
+ assert_eq!(provider.calls(), 2);
+ // Metadata attachment happens on the final-answer path too.
+ let executed = result
+ .response
+ .extra
+ .get("codex_search_tool_results")
+ .and_then(|v| v.as_array())
+ .expect("results should be attached on final-answer path");
+ assert_eq!(executed.len(), 1);
+ assert_eq!(
+ executed[0].get("query").and_then(Value::as_str),
+ Some("test")
+ );
+ // With output_to_chat disabled the assistant content is untouched.
+ let content = result
+ .response
+ .choices
+ .first()
+ .map(|c| c.message.content_as_text())
+ .unwrap_or_default();
+ assert_eq!(content, "task complete");
+ // The nudge resubmission carried the interim assistant answer
+ // followed by a user-role continuation instruction.
+ let requests = provider.requests();
+ let nudged_request = &requests[1];
+ let nudge = nudged_request
+ .messages
+ .last()
+ .expect("nudge message should be present");
+ assert_eq!(nudge.role, "user");
+ assert!(nudge.content_as_text().contains("server-side"));
+ let interim = &nudged_request.messages[nudged_request.messages.len() - 2];
+ assert_eq!(interim.role, "assistant");
+ assert_eq!(interim.content_as_text(), "interim answer");
 }
 
 #[tokio::test]
@@ -707,7 +775,12 @@ async fn output_to_chat_appends_results_to_content() {
     let executor = make_executor();
     let interceptor = ToolInterceptor::new(executor, 5, true);
     let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"rust news"}"#);
-    let provider = MockProvider::new(vec![make_final_response("final answer")]);
+    // Second response answers the one-shot continuation nudge so the
+    // returned content is a genuine final answer.
+    let provider = MockProvider::new(vec![
+        make_final_response("final answer"),
+        make_final_response("final answer"),
+    ]);
 
     let initial = make_response_with_tool_calls(vec![search_call]);
     let result = interceptor
@@ -788,6 +861,98 @@ async fn repeated_call_ids_are_deduplicated() {
         executed.len(),
         1,
         "duplicate call_id must be deduplicated, got {executed:?}"
+    );
+}
+
+#[tokio::test]
+async fn continuation_nudge_fires_once_after_text_stop() {
+    let executor = make_executor();
+    let interceptor = ToolInterceptor::new(executor, 5, false);
+    let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
+    // The model keeps answering with text after the nudge: the stop is
+    // accepted on the second text-only response (nudge is one-shot).
+    let provider = MockProvider::new(vec![
+        make_final_response("stop one"),
+        make_final_response("stop two"),
+    ]);
+
+    let initial = make_response_with_tool_calls(vec![search_call]);
+    let result = interceptor
+        .intercept(&provider, make_request(), initial)
+        .await
+        .unwrap();
+
+    assert_eq!(provider.calls(), 2);
+    let content = result
+        .response
+        .choices
+        .first()
+        .map(|c| c.message.content_as_text())
+        .unwrap_or_default();
+    assert_eq!(content, "stop two");
+    // Exactly one nudge message was appended across all resubmits.
+    let nudges = provider
+        .requests()
+        .iter()
+        .flat_map(|r| r.messages.iter())
+        .filter(|m| m.role == "user" && m.content_as_text().contains("server-side"))
+        .count();
+    assert_eq!(nudges, 1);
+}
+
+#[tokio::test]
+async fn continuation_nudge_respects_iteration_budget() {
+    let executor = make_executor();
+    // max_iterations=1: the single resubmit slot is consumed by the
+    // search round-trip, so the following text-only stop must finalize
+    // without a nudge.
+    let interceptor = ToolInterceptor::new(executor, 1, false);
+    let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
+    let provider = MockProvider::new(vec![make_final_response("answer")]);
+
+    let initial = make_response_with_tool_calls(vec![search_call]);
+    let result = interceptor
+        .intercept(&provider, make_request(), initial)
+        .await
+        .unwrap();
+
+    assert_eq!(provider.calls(), 1);
+    let content = result
+        .response
+        .choices
+        .first()
+        .map(|c| c.message.content_as_text())
+        .unwrap_or_default();
+    assert_eq!(content, "answer");
+}
+
+#[tokio::test]
+async fn continuation_nudge_revives_client_tool_call() {
+    let executor = make_executor();
+    let interceptor = ToolInterceptor::new(executor, 5, false);
+    let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
+    let client_call = make_tool_call("call_2", "client_custom_tool", r#"{"x":1}"#);
+    // After the nudge the model continues via a client tool: the loop
+    // must hand the call back instead of accepting the interim text.
+    let provider = MockProvider::new(vec![
+        make_final_response("interim"),
+        make_response_with_tool_calls(vec![client_call.clone()]),
+    ]);
+
+    let initial = make_response_with_tool_calls(vec![search_call]);
+    let result = interceptor
+        .intercept(&provider, make_request(), initial)
+        .await
+        .unwrap();
+
+    assert_eq!(provider.calls(), 2);
+    assert_eq!(result.pending_client_tool_calls.len(), 1);
+    assert_eq!(
+        result.pending_client_tool_calls[0]
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str()),
+        Some("client_custom_tool")
     );
 }
 }

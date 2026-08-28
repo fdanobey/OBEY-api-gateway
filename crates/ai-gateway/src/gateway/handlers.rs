@@ -2127,11 +2127,14 @@ async fn chat_completions_stream(
         //       `<<PII_..>>` placeholders instead of the restored originals.
         // `run_post_call` handles the no-post-call-stage case: it runs no stages
         // and performs re-injection when the context is non-empty.
+        // The tool_call phase (indirect-injection defense) also executes inside
+        // `run_post_call`, so a bound tool_call stage forces buffering too —
+        // streamed tool_calls must be assembled before they can be inspected.
         let post_call_bound = engine
             .resolver()
             .resolve(&selector)
             .iter()
-            .any(|s| s.phase == StagePhase::PostCall);
+            .any(|s| matches!(s.phase, StagePhase::PostCall | StagePhase::ToolCall));
         let needs_buffering = post_call_bound || !guardrail_ctx.is_empty();
         if needs_buffering && !force_eager_structured_stream(&request) {
             return stream_buffered_with_post_call(
@@ -4404,33 +4407,29 @@ fn relay_passthrough_stream(
                            // for it takes the buffer-and-translate path. This one
                            // request still streamed the raw XML — learning is for
                            // subsequent requests.
-                           if let Some(det) = xml_detect.as_ref() {
-                               let choice = assembled.choices.first();
-                               let has_native_tc = choice
-                                   .map(|c| c.message.extra.contains_key("tool_calls"))
-                                   .unwrap_or(false);
-                               let content_text = choice
-                                   .map(|c| c.message.content_as_text())
-                                   .unwrap_or_default();
-                   if !has_native_tc
-                       && crate::router::router::Router::looks_like_xml_tool_use(&content_text)
-                   {
-                       det.router.mark_xml_tool_combo(&det.provider, &det.model);
-                       tracing::warn!(
-                           trace_id = %trace_id,
-                           provider = %det.provider,
-                           model = %det.model,
-                           "Detected XML-style tool use in streamed response; future tool requests for this provider/model will use the buffered translate path"
-                       );
-                   } else if has_native_tc {
-                       // Mirror of the buffered-path diagnostic: native
-                       // tool_calls count toward forgiving a learned XML
-                       // combo (hint injection + buffer-and-translate stand
-                       // down after TOOL_HINT_RECOVERY_SUCCESSES).
-                       det.router
-                           .record_native_tool_success(&det.provider, &det.model);
-                   }
-                           }
+        if let Some(det) = xml_detect.as_ref() {
+            let choice = assembled.choices.first();
+            let has_native_tc = choice
+                .map(|c| c.message.extra.contains_key("tool_calls"))
+                .unwrap_or(false);
+            let content_text = choice
+                .map(|c| c.message.content_as_text())
+                .unwrap_or_default();
+            if !has_native_tc
+                && crate::router::router::Router::looks_like_xml_tool_use(&content_text)
+            {
+                det.router.mark_xml_tool_combo(&det.provider, &det.model);
+                tracing::warn!(
+                    trace_id = %trace_id,
+                    provider = %det.provider,
+                    model = %det.model,
+                    "Detected XML-style tool use in streamed response; future tool requests for this provider/model will use the buffered translate path"
+                );
+            }
+            // Native tool_calls need no action: learned combos are
+            // intentionally sticky so the injected hint never toggles
+            // on/off between turns of a conversation.
+        }
                            // Req 3.7: surface usage from the final chunk in logs.
                            tracing::info!(
                                trace_id = %trace_id,

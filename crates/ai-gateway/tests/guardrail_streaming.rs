@@ -1,4 +1,4 @@
-//! Integration tests for streaming (SSE) post-call guardrails (task 13.4, Req 10).
+﻿//! Integration tests for streaming (SSE) post-call guardrails (task 13.4, Req 10).
 //!
 //! These tests drive the full Axum router via `tower::ServiceExt::oneshot()`
 //! (no port binding, per repo conventions) with a `guardrails` section whose
@@ -7,10 +7,10 @@
 //! a real HTTP endpoint.
 //!
 //! Endpoint-tested here:
-//!   - post-call `redact`  → assembled/re-chunked SSE contains `[REDACTED]`
+//!   - post-call `redact`  â†’ assembled/re-chunked SSE contains `[REDACTED]`
 //!     (never the secret) and ends with `data: [DONE]` (Req 10.2/10.4, and the
 //!     re-chunk itself proves the buffered path was taken).
-//!   - post-call `block`   → a terminal block frame carrying
+//!   - post-call `block`   â†’ a terminal block frame carrying
 //!     `guardrail_policy_violation` + the triggering category, followed by
 //!     `data: [DONE]` (Req 10.3).
 //!   - premature disconnect (upstream SSE ends with no `finish_reason` while
@@ -20,12 +20,12 @@
 //!
 //! Covered by the `guardrail::stream` module's own unit tests (documented rather
 //! than re-asserted at the endpoint level, where they are impractical):
-//!   - the 10 MB buffer cap abort (Req 10.1) — see
+//!   - the 10 MB buffer cap abort (Req 10.1) â€” see
 //!     `stream::tests::sse_buffer_enforces_default_10mb_cap` /
 //!     `append_within_cap_rejects_overflow_and_leaves_buffer_intact`; reaching
 //!     10 MB through a mock is prohibitively slow and axum's SSE body is not
 //!     introspectable byte-by-byte.
-//!   - keep-alive comment cadence (Req 10.2) — axum's `KeepAlive` interval and
+//!   - keep-alive comment cadence (Req 10.2) â€” axum's `KeepAlive` interval and
 //!     the buffering-loop keepalive comment are timing-driven and not
 //!     deterministically observable via a fast `oneshot()`; buffering behavior
 //!     is instead proven by the re-chunk assertions below.
@@ -48,7 +48,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod common;
 
 // ---------------------------------------------------------------------------
-// Config builders (local — this file must not edit shared test helpers).
+// Config builders (local â€” this file must not edit shared test helpers).
 // ---------------------------------------------------------------------------
 
 /// A single OpenAI-typed provider pointed at `base_url`.
@@ -177,6 +177,7 @@ fn post_call_guardrails(action: PolicyAction, failure_policy: FailurePolicy) -> 
             instruction_insertion_mode: InstructionInsertionMode::default(),
             failover_on_refusal: false,
             refusal_phrase_list: None,
+            tool_result: ai_gateway::guardrail::config::ToolResultPhaseConfig::default(),
         }],
         global_default_pipeline: Some("post_pipeline".to_string()),
         bindings: Default::default(),
@@ -258,7 +259,7 @@ async fn start_json_mock(content: &str) -> MockServer {
 }
 
 /// Mock provider that returns a raw SSE body with content deltas but NO
-/// `finish_reason` and no `[DONE]` sentinel — i.e. a premature disconnect once
+/// `finish_reason` and no `[DONE]` sentinel â€” i.e. a premature disconnect once
 /// the body ends (Req 10.5).
 async fn start_incomplete_sse_mock(content: &str) -> MockServer {
     let server = MockServer::start().await;
@@ -315,7 +316,7 @@ fn passthrough_config(base_url: &str, guardrails: GuardrailConfig) -> Config {
 }
 
 // ---------------------------------------------------------------------------
-// Req 10.2 / 10.4 — post-call redact re-chunks the assembled response
+// Req 10.2 / 10.4 â€” post-call redact re-chunks the assembled response
 // ---------------------------------------------------------------------------
 
 /// A bound post-call `redact` stage forces the buffered path: the gateway
@@ -356,12 +357,12 @@ async fn post_call_redact_rechunks_redacted_content_and_terminates_with_done() {
 }
 
 // ---------------------------------------------------------------------------
-// Req 10.3 — post-call block emits a terminal block frame then [DONE]
+// Req 10.3 â€” post-call block emits a terminal block frame then [DONE]
 // ---------------------------------------------------------------------------
 
 /// A bound post-call `block` stage terminates the SSE stream with a single
 /// policy-violation event carrying `guardrail_policy_violation` and the
-/// triggering category, followed by `data: [DONE]` — and never forwards the
+/// triggering category, followed by `data: [DONE]` â€” and never forwards the
 /// upstream content (Req 10.3).
 #[tokio::test]
 async fn post_call_block_emits_terminal_frame_then_done() {
@@ -406,7 +407,7 @@ async fn post_call_block_emits_terminal_frame_then_done() {
 }
 
 // ---------------------------------------------------------------------------
-// Req 10.5 — premature disconnect failure policy
+// Req 10.5 â€” premature disconnect failure policy
 // ---------------------------------------------------------------------------
 
 /// With a `fail_close` post-call stage, an upstream SSE stream that ends before
@@ -476,7 +477,7 @@ async fn premature_disconnect_fail_open_forwards_partial_content() {
 }
 
 // ---------------------------------------------------------------------------
-// Req 9.5 (streaming) — pre-call redaction forces buffering for re-injection
+// Req 9.5 (streaming) â€” pre-call redaction forces buffering for re-injection
 // even when NO post-call stage is bound.
 // ---------------------------------------------------------------------------
 
@@ -513,6 +514,7 @@ fn pre_call_redact_guardrails() -> GuardrailConfig {
             instruction_insertion_mode: InstructionInsertionMode::default(),
             failover_on_refusal: false,
             refusal_phrase_list: None,
+            tool_result: ai_gateway::guardrail::config::ToolResultPhaseConfig::default(),
         }],
         global_default_pipeline: Some("pre_only".to_string()),
         bindings: Default::default(),

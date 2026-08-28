@@ -459,6 +459,7 @@ async fn test_prometheus_exposes_guardrail_metrics_with_prefix() {
         "pii_pipeline",
         "pii_scan",
         "regex",
+        "pre_call",
         "redact",
         12.5,
     );

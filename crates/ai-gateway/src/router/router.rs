@@ -26,7 +26,7 @@ use crate::smart_routing::{
     PinnedRoutingContext, RoutingPlanOutcome, RoutingPlanningError, SmartRouter, SmartRoutingInput,
 };
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,17 +37,7 @@ use tracing::{debug, info, warn};
 const PRECOMPRESSED_CACHE_MARKER_KEY: &str = "cache_control";
 const PRECOMPRESSED_CACHE_MARKER_TYPE: &str = "obey_precompressed_context";
 
-/// Consecutive native-`tool_calls` responses required before a learned
-/// XML-tool combo is forgiven: both hint injection and buffer-and-translate
-/// stand down until the combo regresses (re-marked on the next XML output).
-const TOOL_HINT_RECOVERY_SUCCESSES: u32 = 3;
 
-/// Model-name substrings (matched case-insensitively) of families known to
-/// emit XML/pseudo-XML tool calls instead of native `tool_calls`. The
-/// tool-calling hint is injected on first contact for these families;
-/// every other model starts clean and learns from observed responses
-/// (see [`Router::should_inject_tool_hint`]).
-const XML_PRONE_MODEL_MARKERS: &[&str] = &["kimi", "glm", "qwen", "deepseek"];
 
 /// Adapter that lets the Codex Search agent loop resubmit through the
 /// normal dispatch pipeline (`attempt_with_retry`) for any provider.
@@ -274,20 +264,15 @@ pub struct Router {
     oauth_usage_tracker: Option<Arc<crate::oauth::UsageTracker>>,
     /// Codex Search Prometheus metrics (tool executions + latency).
     search_metrics: Arc<crate::codex::search::metrics::SearchMetrics>,
-    /// Adaptively learned set of `provider::model` combinations whose model
-    /// emits XML-style tool calls (instead of native `tool_calls`). Populated
-    /// at runtime when a streaming pass-through response is detected to contain
-    /// XML tool use. Subsequent tool requests for a learned combo take the
-    /// buffer-and-translate path so the XML is rewritten into native
-    /// `tool_calls`. In-memory only — resets on process restart.
-    xml_tool_combos: Arc<std::sync::RwLock<HashSet<String>>>,
-    /// Per-combo (`provider::model`) count of consecutive responses that used
-    /// native `tool_calls`. Feeds the tool-hint recovery loop: once a learned
-    /// XML combo accumulates `TOOL_HINT_RECOVERY_SUCCESSES` consecutive
-    /// native-tool-call responses, it is forgiven (removed from
-    /// `xml_tool_combos`) so hint injection and buffer-and-translate stand
-    /// down. Reset on XML regression. In-memory only.
-    tool_hint_tallies: Arc<std::sync::RwLock<HashMap<String, u32>>>,
+/// Adaptively learned set of `provider::model` combinations whose model
+/// emits XML-style tool calls (instead of native `tool_calls`). Populated
+/// at runtime when a response is detected to contain XML tool use.
+/// Subsequent tool requests for a learned combo take the buffer-and-
+/// translate path and receive the tool-calling hint. Entries are sticky
+/// for the process lifetime: un-marking a combo mid-session would make
+/// the hint appear and disappear between turns, which models flag as a
+/// prompt-injection pattern. In-memory only — resets on process restart.
+xml_tool_combos: Arc<std::sync::RwLock<HashSet<String>>>,
 }
 
 /// Result of [`Router::route_request_streaming`].
@@ -470,12 +455,11 @@ impl Router {
             instructions_store: None,
             oauth_usage_tracker: None,
             search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
-            xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            tool_hint_tallies: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        }
-    }
+xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+}
+}
 
-    /// Create a new Router with explicit context configuration
+/// Create a new Router with explicit context configuration
     #[allow(dead_code)]
     pub fn with_context_config(
         config: Arc<RwLock<Config>>,
@@ -509,13 +493,12 @@ impl Router {
             oauth_manager: None,
             instructions_store: None,
             oauth_usage_tracker: None,
-            search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
-            xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            tool_hint_tallies: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        }
-    }
+search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
+xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+}
+}
 
-    /// Attach an [`OAuthManager`](crate::oauth::OAuthManager) so providers
+/// Attach an [`OAuthManager`](crate::oauth::OAuthManager) so providers
     /// configured with `auth_method: oauth` can resolve a Bearer access token
     /// per request. Called once during gateway startup (task 14.1).
     pub fn set_oauth_manager(&mut self, manager: Arc<crate::oauth::OAuthManager>) {
@@ -3025,29 +3008,32 @@ codex_search_config.effective_output_to_chat(),
             Self::reverse_translate_tool_history(&mut outgoing.messages);
         }
 
-        // Conditionally inject the tool-calling guide.
-        //
-        // Goal: make native OpenAI-style tool use clear for models that were
-        // primarily trained on XML/pseudo-XML agent formats — without taxing
-        // every capable model with ~500 uncached prompt tokens (and guidance
-        // that conflicts with parallel tool calling).
-        //
-        // Injection is automatic (no operator configuration): only learned
-        // XML combos (observed emitting XML tool use) and built-in XML-prone
-        // model families get the hint. Recovery is equally automatic — see
-        // the diagnostic below and `record_native_tool_success`. Appended as
-        // the last system message so it doesn't override the client's system
-        // prompt.
-        let inject_tool_hint =
-            has_tools && self.should_inject_tool_hint(provider_name, &provider_model.model);
-        if inject_tool_hint {
-            debug!(
-                provider = provider_name,
-                model = %provider_model.model,
-                "Injecting tool-calling system hint (learned or built-in XML-prone combo)"
-            );
-            outgoing.messages.push(Self::tool_calling_system_hint());
-        }
+// Conditionally inject the tool-calling guide.
+//
+// Goal: make native OpenAI-style tool use clear for models that were
+// primarily trained on XML/pseudo-XML agent formats — without taxing
+// every capable model with uncached prompt tokens (and guidance that
+// conflicts with parallel tool calling).
+//
+// Injection targets **learned XML combos only** — models actually
+// observed emitting XML-style tool use — so models that call tools
+// natively never see unexplained instructions. Learned combos keep the
+// hint for the process lifetime; toggling it mid-session is the context
+// mutation that models flag as prompt injection. The hint is inserted
+// directly after the client's system prompt (see
+// [`Self::insert_tool_calling_hint`]) — not appended at the tail, where
+// a system message after user/tool content reads as an injection
+// attempt.
+let inject_tool_hint =
+    has_tools && self.should_inject_tool_hint(provider_name, &provider_model.model);
+if inject_tool_hint {
+    debug!(
+        provider = provider_name,
+        model = %provider_model.model,
+        "Injecting tool-calling system hint (learned XML combo)"
+    );
+    Self::insert_tool_calling_hint(&mut outgoing.messages);
+}
 
 let mut last_error = None;
 // One-shot reactive image strip: when the provider rejects the request
@@ -3302,47 +3288,38 @@ for attempt in 0..=max_retries {
                         if let Ok(mut openai_response) =
                             serde_json::from_str::<OpenAIResponse>(&body_text)
                         {
-                            // Diagnostic: detect whether the model used native tool_calls
-                            // or fell back to XML-style tool use in plain text content.
-                            // This is the buffered-path feed of the same adaptive signal the
-                            // streaming relay uses: XML output (re)marks the combo (hint +
-                            // buffer-and-translate), native tool_calls count toward
-                            // recovery (see `record_native_tool_success`).
-                            if let Some(choice) = openai_response.choices.first() {
-                                let has_native_tc = choice.message.extra.contains_key("tool_calls");
-                                let content_text = choice.message.content_as_text();
-                                let has_xml_tool_use = Self::looks_like_xml_tool_use(&content_text);
-                                if has_native_tc {
-                                    debug!(
-                                        provider = provider_name,
-                                        model = %provider_model.model,
-                                        finish_reason = ?choice.finish_reason,
-                                        "Provider returned native tool_calls"
-                                    );
-                                }
-                                if has_xml_tool_use {
-                                    warn!(
-                                        provider = provider_name,
-                                        model = %provider_model.model,
-                                        content_preview = %content_text.chars().take(200).collect::<String>(),
-                                        has_tools_in_request = has_tools,
-                                        "Model output XML-style tool use as plain text instead of native tool_calls"
-                                    );
-                                }
-                                if has_tools {
-                                    if has_xml_tool_use {
-                                        self.mark_xml_tool_combo(
-                                            provider_name,
-                                            &provider_model.model,
-                                        );
-                                    } else if has_native_tc {
-                                        self.record_native_tool_success(
-                                            provider_name,
-                                            &provider_model.model,
-                                        );
-                                    }
-                                }
-                            }
+// Diagnostic: detect whether the model used native tool_calls
+// or fell back to XML-style tool use in plain text content.
+// This is the buffered-path feed of the same adaptive signal the
+// streaming relay uses: XML output marks the combo (hint +
+// buffer-and-translate). Native tool_calls need no action —
+// learned combos are intentionally sticky so the injected hint
+// never appears/disappears between turns of a conversation.
+if let Some(choice) = openai_response.choices.first() {
+    let has_native_tc = choice.message.extra.contains_key("tool_calls");
+    let content_text = choice.message.content_as_text();
+    let has_xml_tool_use = Self::looks_like_xml_tool_use(&content_text);
+    if has_native_tc {
+        debug!(
+            provider = provider_name,
+            model = %provider_model.model,
+            finish_reason = ?choice.finish_reason,
+            "Provider returned native tool_calls"
+        );
+    }
+    if has_xml_tool_use {
+        warn!(
+            provider = provider_name,
+            model = %provider_model.model,
+            content_preview = %content_text.chars().take(200).collect::<String>(),
+            has_tools_in_request = has_tools,
+            "Model output XML-style tool use as plain text instead of native tool_calls"
+        );
+    }
+    if has_tools && has_xml_tool_use {
+        self.mark_xml_tool_combo(provider_name, &provider_model.model);
+    }
+}
                             if has_tools {
                                 openai_response.extra.insert(
                                     "gateway_tool_hint_injected".to_string(),
@@ -5953,81 +5930,31 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
             .unwrap_or(false)
     }
 
-    /// Record a `provider`/`model` combo as one that emits XML-style tool calls.
-    /// Idempotent. Called from the streaming relay and the buffered-response
-    /// diagnostic when XML tool use is detected. Regression also resets the
-    /// native-tool-call recovery tally so forgiveness starts over.
-    pub fn mark_xml_tool_combo(&self, provider: &str, model: &str) {
-        if let Ok(mut set) = self.xml_tool_combos.write() {
-            set.insert(Self::xml_combo_key(provider, model));
-        }
-        if let Ok(mut tallies) = self.tool_hint_tallies.write() {
-            tallies.remove(&Self::xml_combo_key(provider, model));
-        }
+/// Record a `provider`/`model` combo as one that emits XML-style tool calls.
+/// Idempotent. Called from the streaming relay and the buffered-response
+/// diagnostic when XML tool use is detected. Combos are sticky for the
+/// process lifetime — see [`Self::is_xml_tool_combo`].
+pub fn mark_xml_tool_combo(&self, provider: &str, model: &str) {
+    if let Ok(mut set) = self.xml_tool_combos.write() {
+        set.insert(Self::xml_combo_key(provider, model));
     }
+}
 
-    /// True when the tool-calling system hint should be injected for a
-    /// tools-bearing request to this combo.
-    ///
-    /// Injection is automatic and requires no operator configuration:
-    /// - **Built-in XML-prone families** (see `XML_PRONE_MODEL_MARKERS`)
-    ///   get the hint from first contact.
-    /// - **Learned combos** — combos observed emitting XML-style tool use
-    ///   (streaming relay or buffered diagnostic) — get the hint until they
-    ///   recover via [`Self::record_native_tool_success`].
-    /// - Everything else (capable native tool-calling models) never sees
-    ///   the hint: zero prompt overhead and no guidance that conflicts
-    ///   with parallel tool calling. The worst case for an unknown but
-    ///   XML-prone model is one XML-flavored response, which the existing
-    ///   `translate_xml_tool_calls` / buffer-and-replay layer already
-    ///   repairs transparently.
-    pub(crate) fn should_inject_tool_hint(&self, provider: &str, model: &str) -> bool {
-        self.is_xml_tool_combo(provider, model) || Self::model_family_is_xml_prone(model)
-    }
-
-    /// Case-insensitive model-name match against the built-in list of
-    /// XML-prone model families.
-    fn model_family_is_xml_prone(model: &str) -> bool {
-        let lower = model.to_ascii_lowercase();
-        XML_PRONE_MODEL_MARKERS.iter().any(|m| lower.contains(m))
-    }
-
-    /// Record that a tools-bearing response from this combo used native
-    /// `tool_calls`. After `TOOL_HINT_RECOVERY_SUCCESSES` consecutive
-    /// native responses, a learned combo is forgiven: it is removed from
-    /// the XML-combo set (hint injection AND buffer-and-translate stand
-    /// down) and the tally resets. The next XML regression re-marks the
-    /// combo immediately via [`Self::mark_xml_tool_combo`]. Built-in
-    /// XML-prone families never recover through this path — the family
-    /// marker keeps the hint enabled until the list is updated in code.
-    pub(crate) fn record_native_tool_success(&self, provider: &str, model: &str) {
-        let key = Self::xml_combo_key(provider, model);
-        let recovered = self
-            .tool_hint_tallies
-            .write()
-            .map(|mut tallies| {
-                let count = tallies.entry(key.clone()).or_insert(0);
-                *count += 1;
-                *count >= TOOL_HINT_RECOVERY_SUCCESSES
-            })
-            .unwrap_or(false);
-        if recovered {
-            // Drop the guards before touching the other map: both use
-            // independent std RwLocks, but keep lock scopes minimal.
-            if let Ok(mut tallies) = self.tool_hint_tallies.write() {
-                tallies.remove(&key);
-            }
-            if let Ok(mut set) = self.xml_tool_combos.write() {
-                set.remove(&key);
-            }
-            info!(
-                provider = provider,
-                model = model,
-                successes = TOOL_HINT_RECOVERY_SUCCESSES,
-                "Provider/model recovered native tool calling; tool hint and buffer-and-translate standing down"
-            );
-        }
-    }
+/// True when the tool-calling system hint should be injected for a
+/// tools-bearing request to this combo.
+///
+/// Only **learned combos** — combos observed emitting XML-style tool use
+/// (streaming relay or buffered diagnostic) — get the hint, and it stays
+/// enabled for the process lifetime: toggling guidance on and off
+/// mid-conversation is exactly the context mutation that makes models
+/// flag injected instructions as a prompt-injection attack in their
+/// reasoning. Everything else (including known XML-prone families)
+/// starts clean; a first XML-flavored response is repaired transparently
+/// by `translate_xml_tool_calls` and marks the combo for subsequent
+/// requests.
+pub(crate) fn should_inject_tool_hint(&self, provider: &str, model: &str) -> bool {
+    self.is_xml_tool_combo(provider, model)
+}
 
     /// Heuristic: does `text` contain XML/pseudo-XML tool-call markers that some
     /// models emit instead of native OpenAI `tool_calls`? Shared by the
@@ -6207,42 +6134,48 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
         Ok(response)
     }
 
-    /// Build the native tool-calling system hint appended to outgoing requests
-    /// that carry `tools`. Shared by the buffered ([`Self::attempt_with_retry`])
-    /// and streaming pass-through ([`Self::route_request_streaming`]) paths so
-    /// both send identical guidance to the provider.
-    fn tool_calling_system_hint() -> Message {
-        Message {
-            role: "system".to_string(),
-            content: serde_json::Value::String(
-                r#"TOOL CALLING RULES:
-You have access to tools through the API's native function-calling interface.
-If you need a tool, respond with native `tool_calls` only. Do not write XML tags, pseudo-XML, markdown code fences, or plain-text tool instructions.
-
-Use the exact tool name from the provided tools list. Arguments must be valid JSON and must match the tool schema exactly. Include only the fields the tool needs; do not repeat large amounts of context unnecessarily.
-
-Correct single-tool example:
-{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/main.rs\"}"}}]}
-
-Best practice for multi-step work:
-1. Call one tool to inspect or gather information.
-2. Wait for the tool result.
-3. Then decide the next tool call or give a normal text answer.
-4. Finish with plain assistant text only when no more tools are needed.
-
-Common mistakes to avoid:
-- Do NOT output <use_tool>...</use_tool>, <tool_call>...</tool_call>, <function_call>...</function_call>, <tool_calls><invoke>...</invoke></tool_calls>, or direct tags like <read_file>.
-- Do NOT put tool JSON inside markdown fences or regular message text.
-- Do NOT mix fake textual tool calls with native `tool_calls`.
-- Do NOT invent argument names or guess missing required inputs; request the missing information with an appropriate question tool instead.
-- Do NOT call multiple tools in one response unless they are independent and parallel tool calling is explicitly supported.
-
-If no tool is needed, respond normally with plain assistant text and no `tool_calls`."#
-                    .to_string(),
-            ),
-            extra: serde_json::Map::new(),
-        }
+/// Build the native tool-calling system hint inserted into outgoing
+/// requests that carry `tools` for learned XML combos. Shared by the
+/// buffered ([`Self::attempt_with_retry`]) and streaming pass-through
+/// ([`Self::route_request_streaming`]) paths so both send identical
+/// guidance to the provider.
+///
+/// The text is deliberately short, attributed (`[gateway]`), and
+/// positively framed, and it contains no XML tag examples: long
+/// anonymous imperative blocks — especially ones enumerating forbidden
+/// markup — match the fingerprints models associate with prompt-injection
+/// payloads and get flagged in reasoning output, eroding user trust.
+fn tool_calling_system_hint() -> Message {
+    Message {
+        role: "system".to_string(),
+        content: serde_json::Value::String(
+            "[gateway] Tools on this endpoint are available through the \
+             API's native function-calling interface. When a tool would \
+             help, emit a native `tool_calls` payload using the exact \
+             names and argument schemas from the provided tools list. \
+             When no tool is needed, reply with plain text."
+                .to_string(),
+        ),
+        extra: serde_json::Map::new(),
     }
+}
+
+/// Insert the tool-calling hint directly after the last system message
+/// so it reads as operator guidance in the trusted system region of the
+/// prompt. A system message appended at the tail — after user and tool
+/// content, immediately before generation — is the canonical
+/// prompt-injection position and is what reasoning models flag as
+/// suspicious. When the conversation has no system message, the hint
+/// becomes the first message. Positioning right after the system block
+/// also keeps the prefix stable for provider prompt caching.
+fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
+    let hint = Self::tool_calling_system_hint();
+    let pos = messages
+        .iter()
+        .rposition(|message| message.role == "system")
+        .map_or(0, |index| index + 1);
+    messages.insert(pos, hint);
+}
 
     /// Route a streaming request, returning a [`StreamingResponse`].
     ///
@@ -6594,22 +6527,21 @@ If no tool is needed, respond normally with plain assistant text and no `tool_ca
                 "Removed image content from streaming request for non-vision model"
             );
         }
-        if outgoing.extra.contains_key("tools") {
-            Self::reverse_translate_tool_history(&mut outgoing.messages);
-            // Same conditional policy as the buffered path: only learned
-            // XML combos and built-in XML-prone families get the hint.
-            // `known_xml_combo` above already routed learned combos to the
-            // buffered path, so a hint here means the built-in family list
-            // matched — or the exclusion list skipped that check.
-            if self.should_inject_tool_hint(&provider_model.provider, &provider_model.model) {
-                debug!(
-                    provider = %provider_model.provider,
-                    model = %provider_model.model,
-                    "Injecting tool-calling system hint (streaming, learned or built-in XML-prone combo)"
-                );
-                outgoing.messages.push(Self::tool_calling_system_hint());
-            }
-        }
+if outgoing.extra.contains_key("tools") {
+    Self::reverse_translate_tool_history(&mut outgoing.messages);
+    // Same conditional policy as the buffered path: only learned XML
+    // combos get the hint. `known_xml_combo` above already routed
+    // learned combos to the buffered path, so a hint here only fires
+    // when the exclusion list skipped that check for this candidate.
+    if self.should_inject_tool_hint(&provider_model.provider, &provider_model.model) {
+        debug!(
+            provider = %provider_model.provider,
+            model = %provider_model.model,
+            "Injecting tool-calling system hint (streaming, learned XML combo)"
+        );
+        Self::insert_tool_calling_hint(&mut outgoing.messages);
+    }
+}
 
         let http_client = self.get_or_create_http_client(&provider_model.provider, &pool_config)?;
 
@@ -10334,76 +10266,82 @@ mod property_tests {
         ));
     }
 
-    #[test]
-    fn test_tool_hint_injection_is_conditional() {
-        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+#[test]
+fn test_tool_hint_injection_targets_learned_combos_only() {
+    let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
 
-        // Capable unknown models never see the hint: zero prompt overhead and
-        // no guidance conflicting with parallel tool calling.
-        assert!(!router.should_inject_tool_hint("openai-main", "gpt-4o"));
-        assert!(!router.should_inject_tool_hint("lite", "claude-sonnet-4-5"));
-        assert!(!router.should_inject_tool_hint("local", "llama3.1-8b"));
+    // Unknown models never see the hint: zero prompt overhead, no
+    // unexplained instructions for models that call tools natively.
+    assert!(!router.should_inject_tool_hint("openai-main", "gpt-4o"));
+    assert!(!router.should_inject_tool_hint("lite", "claude-sonnet-4-5"));
+    assert!(!router.should_inject_tool_hint("local", "llama3.1-8b"));
 
-        // Built-in XML-prone families get it from first contact
-        // (case-insensitive substring match on the model name).
-        assert!(router.should_inject_tool_hint("x", "Kimi-K2-Instruct"));
-        assert!(router.should_inject_tool_hint("x", "qwen2.5-72b-instruct"));
-        assert!(router.should_inject_tool_hint("x", "glm-4.6"));
-        assert!(router.should_inject_tool_hint("x", "deepseek-v3"));
+    // Former built-in XML-prone families also start clean now — the
+    // hint is demoted to learned combos only, with
+    // `translate_xml_tool_calls` repairing any first XML-flavored
+    // response transparently.
+    assert!(!router.should_inject_tool_hint("x", "Kimi-K2-Instruct"));
+    assert!(!router.should_inject_tool_hint("x", "qwen2.5-72b-instruct"));
+    assert!(!router.should_inject_tool_hint("x", "glm-4.6"));
+    assert!(!router.should_inject_tool_hint("x", "deepseek-v3"));
 
-        // Learned combos get it regardless of family.
-        router.mark_xml_tool_combo("weird-provider", "some-model");
-        assert!(router.should_inject_tool_hint("weird-provider", "some-model"));
+    // Learned combos get it regardless of family — and stay learned:
+    // the hint must not appear/disappear between conversation turns.
+    router.mark_xml_tool_combo("weird-provider", "some-model");
+    assert!(router.should_inject_tool_hint("weird-provider", "some-model"));
+    assert!(router.is_xml_tool_combo("weird-provider", "some-model"));
+}
+
+#[test]
+fn test_tool_hint_text_is_attributed_and_xml_free() {
+    // The hint must read as attributed infrastructure guidance, not an
+    // anonymous imperative block: attributed, positively framed, and
+    // free of the XML tag litany that matches prompt-injection
+    // fingerprints (and would trip `looks_like_xml_tool_use`).
+    let content = match Router::tool_calling_system_hint().content {
+        serde_json::Value::String(text) => text,
+        other => panic!("hint content must be a string, got: {other:?}"),
+    };
+    assert!(content.starts_with("[gateway]"));
+    assert!(!content.contains('<'));
+    assert!(!Router::looks_like_xml_tool_use(&content));
+    assert!(content.len() < 500, "hint should stay short, got {} bytes", content.len());
+}
+
+#[test]
+fn test_insert_tool_calling_hint_positions_after_system_block() {
+    let msg = |role: &str| Message {
+        role: role.to_string(),
+        content: serde_json::Value::String(format!("{role} content")),
+        extra: serde_json::Map::new(),
+    };
+
+    // With a system prompt present, the hint lands directly after the
+    // last system message — never at the tail after user/tool content.
+    let mut messages = vec![msg("system"), msg("user"), msg("assistant"), msg("user")];
+    Router::insert_tool_calling_hint(&mut messages);
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[1].role, "system");
+    assert_eq!(messages[2].role, "user");
+    assert_eq!(messages[4].role, "user");
+    match messages[1].content {
+        serde_json::Value::String(ref text) => assert!(text.starts_with("[gateway]")),
+        ref other => panic!("hint content must be a string, got: {other:?}"),
     }
 
-    #[test]
-    fn test_tool_hint_recovers_after_consecutive_native_successes() {
-        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+    // Multiple system messages: insert after the last one.
+    let mut messages = vec![msg("system"), msg("system"), msg("user")];
+    Router::insert_tool_calling_hint(&mut messages);
+    assert_eq!(messages[2].role, "system");
+    assert!(match messages[2].content {
+        serde_json::Value::String(ref text) => text.starts_with("[gateway]"),
+        ref other => panic!("hint content must be a string, got: {other:?}"),
+    });
 
-        router.mark_xml_tool_combo("p", "m");
-        assert!(router.should_inject_tool_hint("p", "m"));
-
-        // Below the recovery threshold: still injecting.
-        router.record_native_tool_success("p", "m");
-        router.record_native_tool_success("p", "m");
-        assert!(router.should_inject_tool_hint("p", "m"));
-
-        // Third consecutive native success forgives the combo — hint AND
-        // buffer-and-translate both stand down.
-        router.record_native_tool_success("p", "m");
-        assert!(!router.should_inject_tool_hint("p", "m"));
-        assert!(!router.is_xml_tool_combo("p", "m"));
-
-        // Regression re-arms immediately and resets recovery progress:
-        // the re-mark below wipes the tally, so two later successes are
-        // not enough to forgive again.
-        router.mark_xml_tool_combo("p", "m");
-        assert!(router.should_inject_tool_hint("p", "m"));
-        router.record_native_tool_success("p", "m");
-        router.mark_xml_tool_combo("p", "m");
-        router.record_native_tool_success("p", "m");
-        router.record_native_tool_success("p", "m");
-        assert!(router.should_inject_tool_hint("p", "m"));
-    }
-
-    #[test]
-    fn test_builtin_xml_prone_families_do_not_recover() {
-        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
-
-        // Built-in family match keeps the hint enabled even after many native
-        // successes — only a code change to the marker list disables it.
-        for _ in 0..10 {
-            router.record_native_tool_success("x", "kimi-k2");
-        }
-        assert!(router.should_inject_tool_hint("x", "kimi-k2"));
-    }
-
-    #[test]
-    fn test_model_family_is_xml_prone_is_case_insensitive_substring() {
-        assert!(Router::model_family_is_xml_prone("Qwen2.5-72B"));
-        assert!(Router::model_family_is_xml_prone("GLM-4.6"));
-        assert!(!Router::model_family_is_xml_prone("gpt-4o"));
-        assert!(!Router::model_family_is_xml_prone("claude-sonnet"));
-        assert!(!Router::model_family_is_xml_prone("llama3.1"));
-    }
+    // No system message at all: the hint becomes the first message.
+    let mut messages = vec![msg("user"), msg("assistant")];
+    Router::insert_tool_calling_hint(&mut messages);
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[1].role, "user");
+}
 }

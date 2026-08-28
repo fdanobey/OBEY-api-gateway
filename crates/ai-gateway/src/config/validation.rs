@@ -1,4 +1,4 @@
-use super::*;
+﻿use super::*;
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -97,8 +97,25 @@ pub enum ValidationError {
         max: usize,
     },
 
-    #[error("Guardrail pipeline '{pipeline_name}' refusal_phrase_list entry {index} is invalid: {reason} (pattern: '{pattern}')")]
-    GuardrailInvalidRefusalPhrase {
+#[error("Guardrail pipeline '{pipeline_name}' stage {stage_index} uses action '{action}' which is invalid for phase '{phase}'")]
+GuardrailInvalidPhaseAction {
+    pipeline_name: String,
+    stage_index: usize,
+    phase: String,
+    action: String,
+},
+
+#[error("Guardrail provider '{provider}' unicode_stego field '{field}' must be within {min}..={max}, got: {value}")]
+GuardrailStegoThresholdOutOfRange {
+    provider: String,
+    field: String,
+    value: u32,
+    min: u32,
+    max: u32,
+},
+
+#[error("Guardrail pipeline '{pipeline_name}' refusal_phrase_list entry {index} is invalid: {reason} (pattern: '{pattern}')")]
+GuardrailInvalidRefusalPhrase {
         pipeline_name: String,
         index: usize,
         pattern: String,
@@ -332,20 +349,20 @@ impl Config {
                     && env::var(env_var).is_err()
                     && provider.resolved_api_key.is_none()
                 {
-                    tracing::warn!("Environment variable '{}' for provider '{}' is not set — provider will be unavailable until configured", env_var, provider.name);
+                    tracing::warn!("Environment variable '{}' for provider '{}' is not set â€” provider will be unavailable until configured", env_var, provider.name);
                 }
             }
 
             if provider.api_key_encrypted.is_some() && provider.resolved_api_key.is_none() {
                 tracing::warn!(
-                    "Encrypted API key for provider '{}' could not be resolved — provider will be unavailable until the key is re-entered",
+                    "Encrypted API key for provider '{}' could not be resolved â€” provider will be unavailable until the key is re-entered",
                     provider.name
                 );
             }
 
             if let Some(ref env_var) = provider.api_secret_env {
                 if !env_var.is_empty() && env::var(env_var).is_err() {
-                    tracing::warn!("Environment variable '{}' for provider '{}' is not set — provider will be unavailable until configured", env_var, provider.name);
+                    tracing::warn!("Environment variable '{}' for provider '{}' is not set â€” provider will be unavailable until configured", env_var, provider.name);
                 }
             }
 
@@ -386,7 +403,7 @@ impl Config {
                 }
             }
 
-            // Req 10.9 — codex_model_override must be non-empty when set
+            // Req 10.9 â€” codex_model_override must be non-empty when set
             if let Some(ref m) = provider.codex_model_override {
                 if m.trim().is_empty() {
                     errors.push(ValidationError::InvalidCodexField {
@@ -396,11 +413,11 @@ impl Config {
                 }
             }
 
-            // Req 12.6 — ToS warning when Codex provider active with admin auth disabled
+            // Req 12.6 â€” ToS warning when Codex provider active with admin auth disabled
             if is_codex_capable && !self.admin.auth.enabled {
                 tracing::warn!(
                     provider = %provider.name,
-                    "Codex provider active with admin auth disabled — ToS risk: \
+                    "Codex provider active with admin auth disabled â€” ToS risk: \
                      a shared ChatGPT session over an unauthenticated admin panel \
                      violates OpenAI terms. Enable admin.auth.enabled = true."
                 );
@@ -414,7 +431,7 @@ impl Config {
 
                 if !provider.has_api_key_configured() {
                     tracing::warn!(
-                        "Bedrock provider '{}' has no API key configured — authentication is required for Bedrock Mantle endpoints",
+                        "Bedrock provider '{}' has no API key configured â€” authentication is required for Bedrock Mantle endpoints",
                         provider.name
                     );
                 }
@@ -451,7 +468,7 @@ impl Config {
         // The whole `streaming` section is re-read on hot-reload via
         // `apply_runtime_config_update`, which validates through this path.
         if let Some(ref streaming) = self.streaming {
-            // keepalive_interval_seconds must be within 0–60 (0 = disabled).
+            // keepalive_interval_seconds must be within 0â€“60 (0 = disabled).
             if streaming.keepalive_interval_seconds > 60 {
                 errors.push(ValidationError::InvalidValue {
                     field: "streaming.keepalive_interval_seconds".to_string(),
@@ -486,7 +503,7 @@ impl Config {
 
             if codex_search.effective_enabled(has_codex_provider) && !has_codex_provider {
                 tracing::warn!(
-    "codex_search.enabled is true but no Codex (oauth+openai) provider is configured — \
+    "codex_search.enabled is true but no Codex (oauth+openai) provider is configured â€” \
     search tools will not be injected and no upstream search calls will be made"
     );
             }
@@ -496,12 +513,12 @@ impl Config {
         if self.admin.auth.enabled {
             if let Some(ref env_var) = self.admin.auth.username_env {
                 if env::var(env_var).is_err() {
-                    tracing::warn!("Admin auth env var '{}' is not set — admin auth will be disabled until configured", env_var);
+                    tracing::warn!("Admin auth env var '{}' is not set â€” admin auth will be disabled until configured", env_var);
                 }
             }
             if let Some(ref env_var) = self.admin.auth.password_env {
                 if env::var(env_var).is_err() {
-                    tracing::warn!("Admin auth env var '{}' is not set — admin auth will be disabled until configured", env_var);
+                    tracing::warn!("Admin auth env var '{}' is not set â€” admin auth will be disabled until configured", env_var);
                 }
             }
         }
@@ -674,11 +691,27 @@ impl Config {
     /// report pattern used throughout [`Config::validate`]) so a single load
     /// surfaces all problems at once.
     fn validate_guardrails(&self, guardrails: &GuardrailConfig, errors: &mut Vec<ValidationError>) {
-        use crate::guardrail::GuardrailProviderType;
+        use crate::guardrail::{GuardrailProviderType, PolicyAction, StagePhase};
         use std::collections::HashSet;
 
         /// Maximum regex patterns per regex provider (Req 5.1).
         const MAX_REGEX_PATTERNS: usize = 256;
+
+        /// Maximum stego suppression threshold (indirect-injection defense).
+        const MAX_STEGO_THRESHOLD: u32 = 1000;
+
+        /// Phase × action validity matrix (design §2.4). `replace_with_policy_message`
+        /// is invalid for the two inbound phases; all other actions are valid
+        /// everywhere.
+        fn phase_allows_action(phase: StagePhase, action: PolicyAction) -> bool {
+            match (phase, action) {
+                (
+                    StagePhase::PreCall | StagePhase::ToolResult,
+                    PolicyAction::ReplaceWithPolicyMessage,
+                ) => false,
+                _ => true,
+            }
+        }
 
         // Collect declared provider names and detect duplicates. Provider-type
         // specific settings are validated in the same pass.
@@ -735,6 +768,31 @@ impl Config {
                 });
             }
 
+            // unicode_stego provider: suppression thresholds must be within
+            // 0..=1000 (indirect-injection defense, task 1.3).
+            if provider.provider_type == GuardrailProviderType::UnicodeStego {
+                let stego = &provider.settings.unicode_stego;
+                let thresholds = [
+                    (
+                        "zero_width_threshold",
+                        stego.zero_width_threshold,
+                    ),
+                    ("tag_chars_threshold", stego.tag_chars_threshold),
+                    ("bidi_threshold", stego.bidi_threshold),
+                ];
+                for (field, value) in thresholds {
+                    if value > MAX_STEGO_THRESHOLD {
+                        errors.push(ValidationError::GuardrailStegoThresholdOutOfRange {
+                            provider: provider.name.clone(),
+                            field: field.to_string(),
+                            value,
+                            min: 0,
+                            max: MAX_STEGO_THRESHOLD,
+                        });
+                    }
+                }
+            }
+
             // Req 8.7: each provider must declare a failure_policy. The field is
             // a required, non-Option `FailurePolicy`, so its presence (and
             // validity) is structurally guaranteed at deserialization time;
@@ -770,6 +828,19 @@ impl Config {
                         pipeline: pipeline.name.clone(),
                         stage_index,
                         provider: stage.provider.clone(),
+                    });
+                }
+
+                // Phase × action validity matrix (design §2.4, task 1.3).
+                if !phase_allows_action(stage.phase, stage.action) {
+                    errors.push(ValidationError::GuardrailInvalidPhaseAction {
+                        pipeline_name: pipeline.name.clone(),
+                        stage_index,
+                        phase: stage.phase.as_str().to_string(),
+                        action: serde_json::to_string(&stage.action)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                            .to_string(),
                     });
                 }
             }
@@ -810,7 +881,7 @@ impl Config {
         }
 
         // Every binding (virtual_keys / model_groups / routes) must reference a
-        // defined pipeline; undefined → error identifying binding target and
+        // defined pipeline; undefined â†’ error identifying binding target and
         // pipeline name (Req 1.10).
         let binding_groups: [(&str, &std::collections::HashMap<String, String>); 3] = [
             ("virtual_keys", &guardrails.bindings.virtual_keys),
@@ -1837,7 +1908,7 @@ model_groups:
                 yaml.push_str(&format!("api_key_env: \"{key}\"\n"));
             }
 
-            // Deserialize — must succeed
+            // Deserialize â€” must succeed
             let provider: Provider = serde_yaml::from_str(&yaml)
                 .expect("Provider YAML without auth_method must deserialize successfully");
 
@@ -1940,6 +2011,7 @@ model_groups:
                 instruction_insertion_mode: InstructionInsertionMode::default(),
                 failover_on_refusal: false,
                 refusal_phrase_list: None,
+                tool_result: crate::guardrail::config::ToolResultPhaseConfig::default(),
             }],
             global_default_pipeline: None,
             bindings: GuardrailBindings::default(),
@@ -1972,6 +2044,146 @@ model_groups:
         assert!(config.validate().is_ok());
     }
 
+    // Feature: indirect-injection-defense, task 1.3/1.4 — phase × action
+    // matrix and unicode_stego threshold bounds.
+
+    #[test]
+    fn test_guardrail_matrix_rejects_replace_in_inbound_phases() {
+        for phase in [StagePhase::PreCall, StagePhase::ToolResult] {
+            let mut guardrails = minimal_guardrails();
+            guardrails.pipelines[0].stages = vec![StageConfig {
+                name: "bad".to_string(),
+                provider: "scanner".to_string(),
+                phase,
+                action: PolicyAction::ReplaceWithPolicyMessage,
+            }];
+            let config = config_with_guardrails(guardrails);
+            let errors = config.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::GuardrailInvalidPhaseAction {
+                        phase: p, ..
+                    } if p == phase.as_str()
+                )),
+                "phase {phase:?} + replace_with_policy_message must be rejected: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_guardrail_matrix_accepts_all_actions_in_outbound_and_tool_call_phases() {
+        for phase in [StagePhase::PostCall, StagePhase::ToolCall] {
+            for action in [
+                PolicyAction::Allow,
+                PolicyAction::Block,
+                PolicyAction::Mask,
+                PolicyAction::Redact,
+                PolicyAction::ReplaceWithPolicyMessage,
+            ] {
+                let mut guardrails = minimal_guardrails();
+                guardrails.pipelines[0].stages = vec![StageConfig {
+                    name: "ok".to_string(),
+                    provider: "scanner".to_string(),
+                    phase,
+                    action,
+                }];
+                let config = config_with_guardrails(guardrails);
+                assert!(
+                    config.validate().is_ok(),
+                    "phase {phase:?} + {action:?} must be accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_guardrail_matrix_accepts_field_actions_in_inbound_phases() {
+        // allow/block/mask/redact are valid in every phase (design §2.4 rows
+        // 1–2).
+        for phase in [StagePhase::PreCall, StagePhase::ToolResult] {
+            for action in [
+                PolicyAction::Allow,
+                PolicyAction::Block,
+                PolicyAction::Mask,
+                PolicyAction::Redact,
+            ] {
+                let mut guardrails = minimal_guardrails();
+                guardrails.pipelines[0].stages = vec![StageConfig {
+                    name: "ok".to_string(),
+                    provider: "scanner".to_string(),
+                    phase,
+                    action,
+                }];
+                let config = config_with_guardrails(guardrails);
+                assert!(
+                    config.validate().is_ok(),
+                    "phase {phase:?} + {action:?} must be accepted"
+                );
+            }
+        }
+    }
+
+    fn stego_provider(name: &str) -> GuardrailProviderConfig {
+        GuardrailProviderConfig {
+            name: name.to_string(),
+            provider_type: GuardrailProviderType::UnicodeStego,
+            failure_policy: FailurePolicy::FailOpen,
+            timeout_seconds: 5,
+            settings: ProviderSettings::default(),
+        }
+    }
+
+    #[test]
+    fn test_guardrail_stego_defaults_accepted() {
+        let mut guardrails = minimal_guardrails();
+        guardrails.providers.push(stego_provider("stego"));
+        guardrails.pipelines[0].stages.push(StageConfig {
+            name: "tool-result-scan".to_string(),
+            provider: "stego".to_string(),
+            phase: StagePhase::ToolResult,
+            action: PolicyAction::Mask,
+        });
+        let config = config_with_guardrails(guardrails);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_guardrail_stego_threshold_out_of_range_rejected() {
+        for field in ["zero_width_threshold", "tag_chars_threshold", "bidi_threshold"] {
+            let mut guardrails = minimal_guardrails();
+            let mut provider = stego_provider("stego");
+            let yaml = format!("{field}: 1001");
+            provider.settings.unicode_stego =
+                serde_yaml::from_str(&yaml).expect("valid stego settings");
+            guardrails.providers.push(provider);
+            let config = config_with_guardrails(guardrails);
+            let errors = config.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::GuardrailStegoThresholdOutOfRange {
+                        field: f, value: 1001, ..
+                    } if f == field
+                )),
+                "{field} = 1001 must be rejected: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_guardrail_stego_threshold_upper_bound_accepted() {
+        let mut guardrails = minimal_guardrails();
+        let mut provider = stego_provider("stego");
+        provider.settings.unicode_stego = serde_yaml::from_str(
+            "zero_width_threshold: 1000\ntag_chars_threshold: 1000\nbidi_threshold: 1000\n",
+        )
+        .expect("valid stego settings");
+        guardrails.providers.push(provider);
+        let config = config_with_guardrails(guardrails);
+        assert!(config.validate().is_ok());
+    }
+
     #[test]
     fn test_guardrail_empty_pipeline_rejected() {
         let mut guardrails = minimal_guardrails();
@@ -1999,6 +2211,7 @@ model_groups:
             instruction_insertion_mode: InstructionInsertionMode::default(),
             failover_on_refusal: false,
             refusal_phrase_list: None,
+            tool_result: crate::guardrail::config::ToolResultPhaseConfig::default(),
         });
         let config = config_with_guardrails(guardrails);
 
@@ -2101,7 +2314,7 @@ model_groups:
             timeout_seconds: 5,
             settings: ProviderSettings {
                 endpoint: Some("http://presidio:3000/analyze".to_string()),
-                entities: vec![], // empty → rejected (Req 6.3)
+                entities: vec![], // empty â†’ rejected (Req 6.3)
                 ..Default::default()
             },
         });
@@ -2250,7 +2463,7 @@ model_groups:
         let mut guardrails = minimal_guardrails();
         guardrails.pipelines[0].refusal_phrase_list = Some(vec![
             "i can't help".to_string(),
-            "".to_string(), // empty → rejected (Req 12.13)
+            "".to_string(), // empty â†’ rejected (Req 12.13)
         ]);
         let config = config_with_guardrails(guardrails);
 
@@ -2271,7 +2484,7 @@ model_groups:
         let mut guardrails = minimal_guardrails();
         guardrails.pipelines[0].refusal_phrase_list = Some(vec![
             "i can'?t (help|assist)".to_string(), // valid
-            "(unclosed".to_string(),              // invalid regex → rejected (Req 12.13)
+            "(unclosed".to_string(),              // invalid regex â†’ rejected (Req 12.13)
         ]);
         let config = config_with_guardrails(guardrails);
 
@@ -2304,7 +2517,7 @@ model_groups:
 
     #[test]
     fn test_guardrail_refusal_phrase_list_none_accepted() {
-        // When refusal_phrase_list is None, default list is used — no validation needed.
+        // When refusal_phrase_list is None, default list is used â€” no validation needed.
         let guardrails = minimal_guardrails();
         assert!(guardrails.pipelines[0].refusal_phrase_list.is_none());
         let config = config_with_guardrails(guardrails);
@@ -2312,7 +2525,7 @@ model_groups:
     }
 
     // ---------------------------------------------------------------------
-    // Feature: guardrail-pipelines, Task 3.2 — Property 3: Pipeline
+    // Feature: guardrail-pipelines, Task 3.2 â€” Property 3: Pipeline
     // configuration validation.
     // **Validates: Requirements 1.1, 1.2, 1.9, 1.10**
     //
@@ -2330,7 +2543,7 @@ model_groups:
     // exercised. This lets the test independently recompute expected validity
     // and match it exactly (both directions of the iff). `PolicyAction` and
     // `StagePhase` are enums, so an invalid action/phase is unrepresentable and
-    // rejected at deserialization — validity is structurally guaranteed and not
+    // rejected at deserialization â€” validity is structurally guaranteed and not
     // separately generated here.
 
     /// Provider names declared by every generated config.
@@ -2373,7 +2586,12 @@ model_groups:
     }
 
     fn p3_arb_phase() -> impl Strategy<Value = StagePhase> {
-        prop::sample::select(vec![StagePhase::PreCall, StagePhase::PostCall])
+        prop::sample::select(vec![
+            StagePhase::PreCall,
+            StagePhase::PostCall,
+            StagePhase::ToolResult,
+            StagePhase::ToolCall,
+        ])
     }
 
     fn p3_arb_stage() -> impl Strategy<Value = P3Stage> {
@@ -2443,6 +2661,7 @@ model_groups:
                     instruction_insertion_mode: InstructionInsertionMode::default(),
                     failover_on_refusal: false,
                     refusal_phrase_list: None,
+                    tool_result: crate::guardrail::config::ToolResultPhaseConfig::default(),
                 })
                 .collect();
 
@@ -2513,10 +2732,28 @@ model_groups:
                 }
             }
 
+            // Design §2.4: phase × action matrix — `replace_with_policy_message`
+            // is invalid for the two inbound phases.
+            let matrix_violations: Vec<(&str, usize)> = gen_pipelines
+                .iter()
+                .flat_map(|p| p.stages.iter().enumerate().map(move |(i, s)| (p, i, s)))
+                .filter(|(_, _, s)| {
+                    matches!(
+                        (s.phase, s.action),
+                        (
+                            StagePhase::PreCall | StagePhase::ToolResult,
+                            PolicyAction::ReplaceWithPolicyMessage
+                        )
+                    )
+                })
+                .map(|(p, i, _)| (p.name.as_str(), i))
+                .collect();
+
             let expected_valid = dup_names.is_empty()
                 && empty_names.is_empty()
                 && undeclared.is_empty()
-                && undefined_bindings.is_empty();
+                && undefined_bindings.is_empty()
+                && matrix_violations.is_empty();
 
             // --- Property: validation succeeds iff no offending condition. ---
             let result = config.validate();
@@ -2576,7 +2813,7 @@ model_groups:
     }
 
     // -------------------------------------------------------------------------
-    // Feature: guardrail-pipelines, Task 16.6 — Property 34: Refusal
+    // Feature: guardrail-pipelines, Task 16.6 â€” Property 34: Refusal
     // phrase-list validation rejects malformed entries.
     // **Validates: Requirements 12.13**
     //

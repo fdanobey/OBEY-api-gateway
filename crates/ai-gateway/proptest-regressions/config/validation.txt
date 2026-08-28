@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc efb51b0c8423b8f1e47f8206e46ae87e8d9502984ca5ed949aee40d1e1743614 # shrinks to gen_pipelines = [P3Pipeline { name: "pipeA", stages: [P3Stage { provider_ref: "p0", action: ReplaceWithPolicyMessage, phase: PreCall }] }], gen_bindings = []

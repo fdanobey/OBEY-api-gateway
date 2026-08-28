@@ -1,4 +1,4 @@
-//! Guardrail provider-registry and engine factory (task 13.1).
+﻿//! Guardrail provider-registry and engine factory (task 13.1).
 //!
 //! Builds a [`ProviderRegistry`] from a [`GuardrailConfig`] by mapping each
 //! [`GuardrailProviderConfig`] to its concrete `Arc<dyn GuardrailProvider>`
@@ -22,6 +22,7 @@ use crate::guardrail::providers::moderation::OpenAiModerationProvider;
 use crate::guardrail::providers::presidio::PresidioProvider;
 use crate::guardrail::providers::regex::{RegexCompileError, RegexProvider};
 use crate::guardrail::providers::semantic::SemanticProvider;
+use crate::guardrail::providers::unicode_stego::UnicodeStegoProvider;
 use crate::guardrail::GuardrailEngine;
 use crate::metrics::Metrics;
 
@@ -231,6 +232,10 @@ fn build_provider(
                 settings.deny_threshold,
             ))
         }
+        // Local, deterministic: no HTTP client, no external settings required.
+        GuardrailProviderType::UnicodeStego => {
+            Arc::new(UnicodeStegoProvider::new(&settings.unicode_stego))
+        }
     };
 
     Ok(provider)
@@ -350,6 +355,7 @@ mod tests {
                 instruction_insertion_mode: InstructionInsertionMode::default(),
                 failover_on_refusal: false,
                 refusal_phrase_list: None,
+                tool_result: crate::guardrail::config::ToolResultPhaseConfig::default(),
             }],
             global_default_pipeline: Some("default".to_string()),
             ..Default::default()

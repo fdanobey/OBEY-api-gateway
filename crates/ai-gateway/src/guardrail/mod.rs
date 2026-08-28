@@ -1,14 +1,14 @@
-//! Guardrail pipelines: configurable, opt-in policy enforcement for the gateway.
+﻿//! Guardrail pipelines: configurable, opt-in policy enforcement for the gateway.
 //!
 //! This module tree adds pre-call and post-call policy evaluation to the
 //! request lifecycle. It is organized as:
 //!
-//! - [`config`]      — configuration data model (`guardrails` section).
-//! - `provider`      — `GuardrailProvider` trait, `Finding`, registry (task 2).
-//! - `pipeline`      — binding resolution and stage ordering (task 9).
-//! - `pii`           — PII placeholder generation and re-injection (task 4).
-//! - `stream`        — SSE buffering and re-chunking for post-call (task 13).
-//! - [`providers`]   — provider backend implementations.
+//! - [`config`]      â€” configuration data model (`guardrails` section).
+//! - `provider`      â€” `GuardrailProvider` trait, `Finding`, registry (task 2).
+//! - `pipeline`      â€” binding resolution and stage ordering (task 9).
+//! - `pii`           â€” PII placeholder generation and re-injection (task 4).
+//! - `stream`        â€” SSE buffering and re-chunking for post-call (task 13).
+//! - [`providers`]   â€” provider backend implementations.
 //!
 //! Only [`config`] and [`providers`] exist so far; the remaining submodules are
 //! declared as work lands in later tasks to keep the crate compiling.
@@ -35,6 +35,7 @@ pub use config::{
     default_provider_timeout_secs, FailurePolicy, GuardrailBindings, GuardrailConfig,
     GuardrailProviderConfig, GuardrailProviderType, InstructionInsertionMode, PipelineConfig,
     PolicyAction, ProviderSettings, RegexPatternConfig, RegexRuleMode, StageConfig, StagePhase,
+    ToolResultPhaseConfig, UnicodeStegoSettings,
 };
 #[allow(unused_imports)]
 pub use factory::{build_engine, build_registry, RegistryBuildError};
@@ -123,8 +124,8 @@ pub struct GuardrailBlock {
 /// Outcome of [`GuardrailEngine::run_pre_call`].
 ///
 /// The handler (task 13.2) maps these to HTTP responses:
-/// `Proceed` → forward to the router; `Block` → 403 policy violation;
-/// `InvalidAction` → 400; `Timeout` → 503 scan timeout; `ServiceFailure` → 503
+/// `Proceed` â†’ forward to the router; `Block` â†’ 403 policy violation;
+/// `InvalidAction` â†’ 400; `Timeout` â†’ 503 scan timeout; `ServiceFailure` â†’ 503
 /// guardrail service failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreCallOutcome {
@@ -146,9 +147,9 @@ pub enum PreCallOutcome {
 
 /// Outcome of [`GuardrailEngine::run_post_call`].
 ///
-/// `Proceed` → return the (possibly redacted + re-injected) response;
-/// `Block` → 403; `Replaced` → 200 with the policy message; `ServiceFailure`
-/// → 503.
+/// `Proceed` â†’ return the (possibly redacted + re-injected) response;
+/// `Block` â†’ 403; `Replaced` â†’ 200 with the policy message; `ServiceFailure`
+/// â†’ 503.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostCallOutcome {
     /// `allow`/`redact` applied and re-injection completed; return the response
@@ -301,7 +302,7 @@ impl GuardrailEngine {
     /// Record a refusal-failover outcome, best-effort (Req 12.11, 11.7).
     ///
     /// Called by the handler after the bounded re-dispatch loop settles.
-    /// `pipeline` is the effective pipeline label, `outcome` ∈ {recovered,
+    /// `pipeline` is the effective pipeline label, `outcome` âˆˆ {recovered,
     /// exhausted}, and `attempt_count` is the total number of provider targets
     /// attempted (including the original). Emits an INFO log and increments
     /// the `obey_api_guardrail_refusal_failover_total` counter. Never fails the
@@ -356,7 +357,7 @@ impl GuardrailEngine {
         let mut terminal: Option<PreCallOutcome> = None;
 
         for stage in pre_stages {
-            // An action invalid for the pre-call phase → HTTP 400 (Req 2.7).
+            // An action invalid for the pre-call phase â†’ HTTP 400 (Req 2.7).
             // No provider is executed, so this stage is not counted/metered.
             if stage.action == PolicyAction::ReplaceWithPolicyMessage {
                 terminal = Some(PreCallOutcome::InvalidAction);
@@ -442,8 +443,107 @@ impl GuardrailEngine {
             }
         }
 
-        // Req 4.4, 4.8–4.11, 4.13: inject the redaction-notice instruction iff
-        // redaction recorded at least one Re_Injection_Map entry — only when proceeding.
+        // ------------------------------------------------------------------
+        // Indirect-injection defense (task 3.3): tool_result phase — stricter
+        // policy on inbound `role:"tool"` content, then tool_call phase —
+        // inbound assistant-history tool calls. Both run inside the pre-call
+        // window after the generic pre_call stages.
+        // ------------------------------------------------------------------
+
+        // --- tool_result phase (inbound tool output, Req 1.x). ---
+        let tool_result_stages: Vec<&ResolvedStage> = stages
+            .iter()
+            .filter(|s| s.phase == StagePhase::ToolResult)
+            .collect();
+        for stage in tool_result_stages {
+            // Req 1.4: `replace_with_policy_message` is invalid here → 400.
+            // (Also rejected at config validation; runtime defense in depth.)
+            if stage.action == PolicyAction::ReplaceWithPolicyMessage {
+                terminal = Some(PreCallOutcome::InvalidAction);
+                break;
+            }
+
+            stages_executed += 1;
+            let stage_start = Instant::now();
+            let scan_json = self
+                .resolver
+                .resolve_tool_result_config(selector)
+                .scan_json_content;
+            let slots = collect_tool_result_slots(&request.messages, scan_json);
+            let run = self
+                .execute_stage_on_slots(stage, slots, |addr, text| {
+                    set_request_slot(request, addr, text)
+                }, trace_id)
+                .await;
+
+            let latency_ms = duration_ms(stage_start.elapsed());
+            self.record_stage_metric(stage, run.label, latency_ms);
+            self.log_stage_action(stage, run.label, run.entity.as_deref(), trace_id);
+            if run.label != "pass" {
+                non_pass_actions.push(run.label.to_string());
+            }
+
+            match run.terminal {
+                Some(SlotTerminal::Block(block)) => {
+                    terminal = Some(PreCallOutcome::Block(block));
+                }
+                Some(SlotTerminal::Timeout) => terminal = Some(PreCallOutcome::Timeout),
+                Some(SlotTerminal::ServiceFailure) => {
+                    terminal = Some(PreCallOutcome::ServiceFailure)
+                }
+                // A `replaced` outcome cannot originate from this phase
+                // (rejected above); invalid actions are impossible after
+                // validation.
+                Some(SlotTerminal::Replaced | SlotTerminal::InvalidAction) | None => {}
+            }
+            if terminal.is_some() {
+                break;
+            }
+        }
+
+        // --- tool_call phase, inbound history (Req 3.5). ---
+        if terminal.is_none() {
+            let tool_call_stages: Vec<&ResolvedStage> = stages
+                .iter()
+                .filter(|s| s.phase == StagePhase::ToolCall)
+                .collect();
+            for stage in tool_call_stages {
+                stages_executed += 1;
+                let stage_start = Instant::now();
+                let slots = collect_tool_call_slots_request(&request.messages);
+                let run = self
+                    .execute_stage_on_slots(stage, slots, |addr, text| {
+                        set_request_slot(request, addr, text)
+                    }, trace_id)
+                    .await;
+
+                let latency_ms = duration_ms(stage_start.elapsed());
+                self.record_stage_metric(stage, run.label, latency_ms);
+                self.log_stage_action(stage, run.label, run.entity.as_deref(), trace_id);
+                if run.label != "pass" {
+                    non_pass_actions.push(run.label.to_string());
+                }
+
+                match run.terminal {
+                    Some(SlotTerminal::Block(block)) => {
+                        terminal = Some(PreCallOutcome::Block(block));
+                    }
+                    Some(SlotTerminal::Timeout) => terminal = Some(PreCallOutcome::Timeout),
+                    Some(SlotTerminal::ServiceFailure) => {
+                        terminal = Some(PreCallOutcome::ServiceFailure)
+                    }
+                    // Rewritten history arguments are a modification, not a
+                    // halting outcome for the inbound window.
+                    Some(SlotTerminal::Replaced) | Some(SlotTerminal::InvalidAction) | None => {}
+                }
+                if terminal.is_some() {
+                    break;
+                }
+            }
+        }
+
+        // Req 4.4, 4.8â€“4.11, 4.13: inject the redaction-notice instruction iff
+        // redaction recorded at least one Re_Injection_Map entry â€” only when proceeding.
         if terminal.is_none() {
             let (override_instruction, insertion_mode) =
                 self.resolver.resolve_instruction_config(selector);
@@ -623,6 +723,52 @@ impl GuardrailEngine {
             }
         }
 
+        // ------------------------------------------------------------------
+        // Indirect-injection defense (task 3.3, 4.1): tool_call phase —
+        // outbound assistant tool_calls (including assembled SSE streams,
+        // which reach this method through the buffered post-call window).
+        // Action-level blocking happens here: the *action* is the attack
+        // surface even when the final text looks benign.
+        // ------------------------------------------------------------------
+        let tool_call_stages: Vec<&ResolvedStage> = stages
+            .iter()
+            .filter(|s| s.phase == StagePhase::ToolCall)
+            .collect();
+        for stage in tool_call_stages {
+            stages_executed += 1;
+            let stage_start = Instant::now();
+            let slots = collect_tool_call_slots_response(response);
+            let run = self
+                .execute_stage_on_slots(stage, slots, |addr, text| {
+                    set_response_slot(response, addr, text)
+                }, trace_id)
+                .await;
+
+            let latency_ms = duration_ms(stage_start.elapsed());
+            self.record_stage_metric(stage, run.label, latency_ms);
+            self.log_stage_action(stage, run.label, run.entity.as_deref(), trace_id);
+            if run.label != "pass" {
+                non_pass_actions.push(run.label.to_string());
+            }
+
+            match run.terminal {
+                Some(SlotTerminal::Block(block)) => {
+                    terminal = Some(PostCallOutcome::Block(block));
+                }
+                Some(SlotTerminal::Timeout | SlotTerminal::ServiceFailure) => {
+                    terminal = Some(PostCallOutcome::ServiceFailure)
+                }
+                // Rewritten tool-call arguments → 200 with the sanitized
+                // response (matrix: replace valid for tool_call, Req 3.4).
+                Some(SlotTerminal::Replaced) => terminal = Some(PostCallOutcome::Replaced),
+                // All actions are valid for tool_call; unreachable.
+                Some(SlotTerminal::InvalidAction) | None => {}
+            }
+            if terminal.is_some() {
+                break;
+            }
+        }
+
         // Req 12.12: run refusal detection as part of the post-call guardrail
         // stage, reusing the post-call observability model. Only meaningful when
         // the pipeline completed without a halting action.
@@ -661,7 +807,7 @@ impl GuardrailEngine {
                         .map(|s| s.pipeline_name.as_str())
                         .unwrap_or("unknown");
 
-                    // Req 12.11: INFO log on refusal detection — never includes
+                    // Req 12.11: INFO log on refusal detection â€” never includes
                     // response content.
                     tracing::info!(
                         target: "guardrail",
@@ -757,6 +903,7 @@ impl GuardrailEngine {
                 &stage.pipeline_name,
                 &stage.stage_name,
                 stage.provider_type,
+                stage.phase.as_str(),
                 action,
                 latency_ms,
             );
@@ -781,6 +928,7 @@ impl GuardrailEngine {
                     pipeline = %stage.pipeline_name,
                     stage = %stage.stage_name,
                     provider_type = %stage.provider_type,
+                    phase = %stage.phase.as_str(),
                     trace_id = %trace_id,
                     "guardrail stage provider error"
                 );
@@ -793,6 +941,7 @@ impl GuardrailEngine {
                     stage = %stage.stage_name,
                     entity_label = %entity_label.unwrap_or(""),
                     action = %action,
+                    phase = %stage.phase.as_str(),
                     trace_id = %trace_id,
                     "guardrail stage action"
                 );
@@ -867,6 +1016,176 @@ enum FieldEffect {
     Modified(String),
     /// A halting `block` fired, carrying the triggering entity label.
     Block(String),
+}
+
+// ---------------------------------------------------------------------------
+// Indirect-injection defense: shared slot-stage executor (tasks 3.3, 3.4).
+// ---------------------------------------------------------------------------
+
+/// Terminal outcome of running one stage over a slot list, phase-agnostic;
+/// callers map onto `PreCallOutcome` / `PostCallOutcome`.
+enum SlotTerminal {
+    /// `fail_close` provider timeout.
+    Timeout,
+    /// `fail_close` provider error.
+    ServiceFailure,
+    /// A `block` action fired.
+    Block(GuardrailBlock),
+    /// A `replace_with_policy_message` action rewrote tool-call arguments.
+    Replaced,
+    /// An action invalid for the phase (defense in depth; validation rejects
+    /// these at load time).
+    InvalidAction,
+}
+
+/// Summary of one stage execution over a slot list: the single action label
+/// (Req 11.1), the first triggering entity label for logs (Req 11.3), and any
+/// terminal outcome.
+struct SlotStageRun {
+    label: &'static str,
+    entity: Option<String>,
+    terminal: Option<SlotTerminal>,
+}
+
+impl GuardrailEngine {
+    /// Execute one stage's provider and action over a pre-collected slot
+    /// list, writing modifications back through `write_back`.
+    ///
+    /// Action semantics for the tool phases (task 3.4): `mask` strips the
+    /// flagged spans (invisible characters are removed, not asterisked);
+    /// `redact` inserts `[REDACTED:<CATEGORY>]` literals (never PII
+    /// placeholders, so stego findings stay out of re-injection);
+    /// `replace_with_policy_message` (tool_call phase only) rewrites the
+    /// offending call's `arguments` to the policy message.
+    async fn execute_stage_on_slots<W>(
+        &self,
+        stage: &ResolvedStage,
+        slots: Vec<(SlotAddress, String)>,
+        mut write_back: W,
+        trace_id: &str,
+    ) -> SlotStageRun
+    where
+        W: FnMut(SlotAddress, String),
+    {
+        let phase = stage.phase;
+        let mut modified = false;
+        let mut replaced = false;
+        let mut errored = false;
+        let mut entity_for_log: Option<String> = None;
+        let mut block: Option<GuardrailBlock> = None;
+        let mut terminal: Option<SlotTerminal> = None;
+
+        'slots: for (addr, text) in slots {
+            let clamped = clamp_content(&text, self.max_content_chars);
+            let findings = match evaluate_stage(stage, clamped).await {
+                StageAnalysis::Findings(f) => f,
+                StageAnalysis::Timeout => {
+                    errored = true;
+                    terminal = Some(SlotTerminal::Timeout);
+                    break 'slots;
+                }
+                StageAnalysis::ServiceFailure => {
+                    errored = true;
+                    terminal = Some(SlotTerminal::ServiceFailure);
+                    break 'slots;
+                }
+                StageAnalysis::Skip => {
+                    errored = true;
+                    continue;
+                }
+            };
+
+            if findings.is_empty() || stage.action == PolicyAction::Allow {
+                continue;
+            }
+
+            // Attribute unicode_stego detections for the phase-scoped counter
+            // (task 5.2). Content-safe: labels only, never matched text.
+            if stage.provider_type == "unicode_stego" {
+                if let Some(metrics) = &self.metrics {
+                    for finding in &findings {
+                        metrics.record_guardrail_stego_detection(
+                            &finding.entity_label,
+                            phase.as_str(),
+                        );
+                    }
+                }
+            }
+
+            if entity_for_log.is_none() {
+                entity_for_log = findings.first().map(|f| f.entity_label.clone());
+            }
+
+            let effect = match stage.action {
+                PolicyAction::Allow => FieldEffect::Pass,
+                PolicyAction::Block => FieldEffect::Block(findings[0].entity_label.clone()),
+                // Strip the flagged invisible characters entirely (design
+                // §2.3 `mask` = "strip invisible chars").
+                PolicyAction::Mask => FieldEffect::Modified(redact_literal(&text, &findings, "")),
+                PolicyAction::Redact => FieldEffect::Modified(redact_by_category(&text, &findings)),
+                PolicyAction::ReplaceWithPolicyMessage => {
+                    if phase == StagePhase::ToolCall
+                        && matches!(addr, SlotAddress::ToolCall { field: ToolCallField::Arguments, .. })
+                    {
+                        // Req 3.4: rewrite the offending call's arguments.
+                        replaced = true;
+                        FieldEffect::Modified(self.policy_message.clone())
+                    } else if phase == StagePhase::ToolCall {
+                        // Name slots sanitize in place; only arguments carry
+                        // the policy message.
+                        FieldEffect::Modified(redact_by_category(&text, &findings))
+                    } else {
+                        // Pre-call/tool_result reject this action; unreachable
+                        // after validation. Treat as invalid.
+                        terminal = Some(SlotTerminal::InvalidAction);
+                        break 'slots;
+                    }
+                }
+            };
+
+            match effect {
+                FieldEffect::Pass => {}
+                FieldEffect::Modified(new_text) => {
+                    modified = true;
+                    write_back(addr, new_text);
+                }
+                FieldEffect::Block(entity_label) => {
+                    block = Some(GuardrailBlock {
+                        pipeline_name: stage.pipeline_name.clone(),
+                        stage_name: stage.stage_name.clone(),
+                        entity_label,
+                        phase,
+                    });
+                    break 'slots;
+                }
+            }
+        }
+
+        let label = if block.is_some() {
+            "block"
+        } else if errored {
+            "error"
+        } else if replaced {
+            "replace_with_policy_message"
+        } else {
+            derive_action_label(stage.action, false, false, modified)
+        };
+        let _ = trace_id; // logged by the caller with the phase context
+
+        let resolved_terminal = match terminal {
+            Some(t) => Some(t),
+            None => match block {
+                Some(b) => Some(SlotTerminal::Block(b)),
+                None if replaced && !errored => Some(SlotTerminal::Replaced),
+                None => None,
+            },
+        };
+        SlotStageRun {
+            label,
+            entity: entity_for_log,
+            terminal: resolved_terminal,
+        }
+    }
 }
 
 /// Apply a pre-call action to a content field's `text` given its `findings`.
@@ -993,6 +1312,278 @@ fn set_text_slot(content: &mut Value, slot: TextSlot, new_text: String) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Indirect-injection defense: slot addressing for tool-result and tool-call
+// traffic inspection (tasks 3.1, 3.2).
+// ---------------------------------------------------------------------------
+
+/// Which field of a `tool_calls[i].function` entry a slot addresses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToolCallField {
+    /// `function.name`.
+    Name,
+    /// `function.arguments` (JSON-encoded string; scanned via its compact
+    /// serialization, with a raw-string fallback when not valid JSON).
+    Arguments,
+}
+
+/// Address of every scannable surface in a request or response, generalizing
+/// [`TextSlot`] so tool-result content and tool-call traffic can be analyzed
+/// and written back with the same engine machinery.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotAddress {
+    /// A message content text slot. `index` addresses the inbound request
+    /// message; `part` is the array-part index for multi-part content.
+    MessageContent { index: usize, part: Option<usize> },
+    /// A `role:"tool"` message whose content is a JSON object/number/bool:
+    /// the compact serialization is scanned; write-back replaces the whole
+    /// content with the sanitized string (Req 1.6).
+    MessageContentJson { index: usize },
+    /// A `tool_calls[call_index].function` field. For inbound requests
+    /// `choice_index` is `None` and `msg_index` addresses `request.messages`;
+    /// for responses `choice_index` is `Some(choice_idx)` and `msg_index`
+    /// equals the choice index.
+    ToolCall {
+        msg_index: usize,
+        choice_index: Option<usize>,
+        call_index: usize,
+        field: ToolCallField,
+    },
+}
+
+/// Collect `role:"tool"` content slots: string content, `{"type":"text"}`
+/// array parts, and — gated by `scan_json` — the compact-JSON serialization
+/// of non-string/non-array content (Req 1.2, 1.6).
+fn collect_tool_result_slots(
+    messages: &[Message],
+    scan_json: bool,
+) -> Vec<(SlotAddress, String)> {
+    let mut slots = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if message.role != "tool" {
+            continue;
+        }
+        match &message.content {
+            Value::String(s) => {
+                slots.push((
+                    SlotAddress::MessageContent { index, part: None },
+                    s.clone(),
+                ));
+            }
+            Value::Array(parts) => {
+                for (i, part) in parts.iter().enumerate() {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            slots.push((
+                                SlotAddress::MessageContent { index, part: Some(i) },
+                                text.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            // JSON-object (and scalar) tool results were previously invisible
+            // to every stage: serialize compactly and scan (Req 1.6).
+            other @ (Value::Object(_) | Value::Number(_) | Value::Bool(_)) => {
+                if scan_json {
+                    slots.push((
+                        SlotAddress::MessageContentJson { index },
+                        other.to_string(),
+                    ));
+                }
+            }
+            Value::Null => {}
+        }
+    }
+    slots
+}
+
+/// Normalize a `function.arguments` value into the text to scan: valid JSON is
+/// re-serialized compactly (deterministic offsets, valid-JSON round-trip);
+/// anything else is scanned raw (Req 3.5 raw-string fallback).
+fn arguments_scan_text(raw: &str) -> String {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(parsed) => parsed.to_string(),
+        Err(_) => raw.to_string(),
+    }
+}
+
+/// Extract `(name, arguments)` slots from one `tool_calls` array value.
+fn tool_call_slots_from_value(
+    tool_calls: &Value,
+    msg_index: usize,
+    choice_index: Option<usize>,
+) -> Vec<(SlotAddress, String)> {
+    let mut slots = Vec::new();
+    let Some(calls) = tool_calls.as_array() else {
+        return slots;
+    };
+    for (call_index, call) in calls.iter().enumerate() {
+        let Some(function) = call.get("function") else {
+            continue;
+        };
+        if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
+            slots.push((
+                SlotAddress::ToolCall {
+                    msg_index,
+                    choice_index,
+                    call_index,
+                    field: ToolCallField::Name,
+                },
+                name.to_string(),
+            ));
+        }
+        if let Some(args) = function.get("arguments").and_then(|a| a.as_str()) {
+            slots.push((
+                SlotAddress::ToolCall {
+                    msg_index,
+                    choice_index,
+                    call_index,
+                    field: ToolCallField::Arguments,
+                },
+                arguments_scan_text(args),
+            ));
+        }
+    }
+    slots
+}
+
+/// Collect inbound assistant-history `tool_calls` slots from a request
+/// (Req 3.5 inbound half).
+fn collect_tool_call_slots_request(messages: &[Message]) -> Vec<(SlotAddress, String)> {
+    let mut slots = Vec::new();
+    for (msg_index, message) in messages.iter().enumerate() {
+        if message.role != "assistant" {
+            continue;
+        }
+        if let Some(tool_calls) = message.extra.get("tool_calls") {
+            slots.extend(tool_call_slots_from_value(tool_calls, msg_index, None));
+        }
+    }
+    slots
+}
+
+/// Collect outbound assistant `tool_calls` slots from a response (Req 3.1–3.5).
+fn collect_tool_call_slots_response(response: &OpenAIResponse) -> Vec<(SlotAddress, String)> {
+    let mut slots = Vec::new();
+    for (choice_index, choice) in response.choices.iter().enumerate() {
+        if !is_assistant(&choice.message) {
+            continue;
+        }
+        if let Some(tool_calls) = choice.message.extra.get("tool_calls") {
+            slots.extend(tool_call_slots_from_value(
+                tool_calls,
+                choice_index,
+                Some(choice_index),
+            ));
+        }
+    }
+    slots
+}
+
+/// Write `new_text` into the `function` field of `tool_calls[call_index]`.
+fn set_tool_call_field(
+    message_extra: &mut serde_json::Map<String, Value>,
+    call_index: usize,
+    field: ToolCallField,
+    new_text: String,
+) {
+    let Some(tool_calls) = message_extra.get_mut("tool_calls") else {
+        return;
+    };
+    let Some(call) = tool_calls.get_mut(call_index) else {
+        return;
+    };
+    let Some(function) = call
+        .get_mut("function")
+        .and_then(|f| f.as_object_mut())
+    else {
+        return;
+    };
+    let key = match field {
+        ToolCallField::Name => "name",
+        ToolCallField::Arguments => "arguments",
+    };
+    function.insert(key.to_string(), Value::String(new_text));
+}
+
+/// Write a modified slot back into an inbound request.
+fn set_request_slot(request: &mut OpenAIRequest, addr: SlotAddress, new_text: String) {
+    match addr {
+        SlotAddress::MessageContent { index, part } => {
+            if let Some(message) = request.messages.get_mut(index) {
+                let slot = match part {
+                    None => TextSlot::Whole,
+                    Some(i) => TextSlot::Part(i),
+                };
+                set_text_slot(&mut message.content, slot, new_text);
+            }
+        }
+        SlotAddress::MessageContentJson { index } => {
+            if let Some(message) = request.messages.get_mut(index) {
+                message.content = Value::String(new_text);
+            }
+        }
+        SlotAddress::ToolCall {
+            msg_index,
+            choice_index: None,
+            call_index,
+            field,
+        } => {
+            if let Some(message) = request.messages.get_mut(msg_index) {
+                set_tool_call_field(&mut message.extra, call_index, field, new_text);
+            }
+        }
+        SlotAddress::ToolCall {
+            choice_index: Some(_),
+            ..
+        } => {}
+    }
+}
+
+/// Write a modified slot back into an outbound response (tool-call slots only;
+/// assistant content slots keep their dedicated post-call path).
+fn set_response_slot(response: &mut OpenAIResponse, addr: SlotAddress, new_text: String) {
+    match addr {
+        SlotAddress::ToolCall {
+            msg_index,
+            choice_index: Some(_),
+            call_index,
+            field,
+        } => {
+            if let Some(choice) = response.choices.get_mut(msg_index) {
+                set_tool_call_field(&mut choice.message.extra, call_index, field, new_text);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace each in-bounds finding span with `[REDACTED:<CATEGORY>]`, where the
+/// category is the finding's own entity label. Used by the `tool_result` and
+/// `tool_call` phases, whose redaction must NOT create PII placeholders
+/// (stego findings are excluded from re-injection; Req 1.3, 3.3).
+fn redact_by_category(content: &str, findings: &[Finding]) -> String {
+    let mut out = content.to_string();
+    // Right-to-left so earlier offsets stay valid; skip overlaps.
+    let mut spans: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.start < f.end && f.end <= content.len())
+        .filter(|f| content.is_char_boundary(f.start) && content.is_char_boundary(f.end))
+        .collect();
+    spans.sort_by(|a, b| b.start.cmp(&a.start));
+    let mut last_consumed_start = usize::MAX;
+    for finding in spans {
+        if finding.end > last_consumed_start {
+            continue;
+        }
+        let replacement = format!("[REDACTED:{}]", finding.entity_label);
+        out.replace_range(finding.start..finding.end, &replacement);
+        last_consumed_start = finding.start;
+    }
+    out
+}
+
 /// Whether a message carries the assistant role (Req 3.5).
 fn is_assistant(message: &Message) -> bool {
     message.role == "assistant"
@@ -1039,7 +1630,7 @@ fn derive_action_label(
 
 #[cfg(test)]
 mod engine_tests {
-    //! Task 10.1 — core engine behavior with stub providers.
+    //! Task 10.1 â€” core engine behavior with stub providers.
 
     use super::*;
     use crate::guardrail::config::{
@@ -1157,6 +1748,7 @@ mod engine_tests {
                 instruction_insertion_mode: InstructionInsertionMode::default(),
                 failover_on_refusal: false,
                 refusal_phrase_list: None,
+                tool_result: crate::guardrail::config::ToolResultPhaseConfig::default(),
             }],
             global_default_pipeline: Some("pl".to_string()),
             bindings: GuardrailBindings::default(),
@@ -1452,6 +2044,7 @@ mod engine_tests {
                 instruction_insertion_mode: InstructionInsertionMode::default(),
                 failover_on_refusal: false,
                 refusal_phrase_list: None,
+                tool_result: crate::guardrail::config::ToolResultPhaseConfig::default(),
             }],
             global_default_pipeline: None,
             bindings: GuardrailBindings::default(),
@@ -1534,7 +2127,7 @@ mod engine_tests {
     }
 
     // =====================================================================
-    // Tasks 10.2–10.11 — engine property tests and error-mapping unit tests.
+    // Tasks 10.2â€“10.11 â€” engine property tests and error-mapping unit tests.
     //
     // These reuse the stub providers / builders above and add a few extra
     // stubs (`Slow`, `Recorder`) plus a multi-provider engine builder for
@@ -1642,6 +2235,7 @@ mod engine_tests {
                 instruction_insertion_mode: InstructionInsertionMode::default(),
                 failover_on_refusal: false,
                 refusal_phrase_list: None,
+                tool_result: crate::guardrail::config::ToolResultPhaseConfig::default(),
             }],
             global_default_pipeline: Some("pl".to_string()),
             bindings: GuardrailBindings::default(),
@@ -1673,7 +2267,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.2 — Feature: guardrail-pipelines, Property 4: Allow action is identity
+    // 10.2 â€” Feature: guardrail-pipelines, Property 4: Allow action is identity
     // **Validates: Requirements 2.4, 3.4**
     //
     // Applying an `allow` stage (even when the provider reports a whole-content
@@ -1728,7 +2322,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.3 — Feature: guardrail-pipelines, Property 9: All message content is
+    // 10.3 â€” Feature: guardrail-pipelines, Property 9: All message content is
     //        scanned regardless of role or shape
     // **Validates: Requirements 2.5, 3.5**
     //
@@ -1839,7 +2433,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.4 — Feature: guardrail-pipelines, Property 10: Post-call block
+    // 10.4 â€” Feature: guardrail-pipelines, Property 10: Post-call block
     //        discards; replace rewrites; redact preserves structure elsewhere
     // **Validates: Requirements 3.1, 3.2, 3.3**
     // -----------------------------------------------------------------
@@ -1854,7 +2448,7 @@ mod engine_tests {
             let text = format!("{pre}BAD{post}");
             let sel = BindingSelector::default();
 
-            // block → 403-mapped Block outcome, response discarded.
+            // block â†’ 403-mapped Block outcome, response discarded.
             let e_block = make_engine(
                 Arc::new(Substr("BAD", "CAT")),
                 FailurePolicy::FailClose,
@@ -1871,7 +2465,7 @@ mod engine_tests {
                 other => prop_assert!(false, "expected Block, got {:?}", other),
             }
 
-            // replace_with_policy_message → assistant content replaced, 200.
+            // replace_with_policy_message â†’ assistant content replaced, 200.
             let e_rep = make_engine(
                 Arc::new(Substr("BAD", "CAT")),
                 FailurePolicy::FailClose,
@@ -1891,7 +2485,7 @@ mod engine_tests {
             prop_assert_eq!(r_rep.choices.len(), 1);
             prop_assert_eq!(r_rep.choices[0].finish_reason.as_deref(), Some("stop"));
 
-            // redact → each matched span → [REDACTED]; other fields unchanged.
+            // redact â†’ each matched span â†’ [REDACTED]; other fields unchanged.
             let e_red = make_engine(
                 Arc::new(Substr("BAD", "CAT")),
                 FailurePolicy::FailClose,
@@ -1913,7 +2507,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.5 — Feature: guardrail-pipelines, Property 11: Pre-call block carries
+    // 10.5 â€” Feature: guardrail-pipelines, Property 11: Pre-call block carries
     //        the triggering category and forwards nothing
     // **Validates: Requirements 2.2**
     //
@@ -1959,7 +2553,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.6 — Feature: guardrail-pipelines, Property 18: Content is clamped
+    // 10.6 â€” Feature: guardrail-pipelines, Property 18: Content is clamped
     //        before provider analysis
     // **Validates: Requirements 8.1**
     // -----------------------------------------------------------------
@@ -1991,7 +2585,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.7 — Feature: guardrail-pipelines, Property 20: In-order execution and
+    // 10.7 â€” Feature: guardrail-pipelines, Property 20: In-order execution and
     //        continuation for non-halting actions
     // **Validates: Requirements 9.1, 9.3**
     // -----------------------------------------------------------------
@@ -2045,7 +2639,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.8 — Feature: guardrail-pipelines, Property 21: Halting actions
+    // 10.8 â€” Feature: guardrail-pipelines, Property 21: Halting actions
     //        short-circuit the pipeline
     // **Validates: Requirements 9.2, 9.4**
     // -----------------------------------------------------------------
@@ -2108,7 +2702,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.9 — Feature: guardrail-pipelines, Property 22: Re-injection runs
+    // 10.9 â€” Feature: guardrail-pipelines, Property 22: Re-injection runs
     //        exactly once as the final post-call step
     // **Validates: Requirements 9.5**
     //
@@ -2198,7 +2792,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.10 — Feature: guardrail-pipelines, Property 23: fail_open skips,
+    // 10.10 â€” Feature: guardrail-pipelines, Property 23: fail_open skips,
     //         fail_close halts
     // **Validates: Requirements 8.6, 9.6, 9.7**
     // -----------------------------------------------------------------
@@ -2265,7 +2859,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.11 — Unit tests for engine error mapping.
+    // 10.11 â€” Unit tests for engine error mapping.
     // **Validates: Requirements 2.7, 2.9, 3.6, 8.6**
     // -----------------------------------------------------------------
 
@@ -2331,7 +2925,7 @@ mod engine_tests {
             choices: vec![Choice {
                 index: 0,
                 message: Message {
-                    // Not an assistant message → skipped by the scanner.
+                    // Not an assistant message â†’ skipped by the scanner.
                     role: "user".to_string(),
                     content: Value::String("some content".to_string()),
                     extra: serde_json::Map::new(),
@@ -2421,7 +3015,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 12.2 — Metrics/log emission wiring.
+    // 12.2 â€” Metrics/log emission wiring.
     // **Validates: Requirements 11.1, 11.2, 11.6, 11.7**
     //
     // Minimal coverage that per-stage counters/latency are recorded on the
@@ -2456,6 +3050,7 @@ mod engine_tests {
                 instruction_insertion_mode: InstructionInsertionMode::default(),
                 failover_on_refusal: false,
                 refusal_phrase_list: None,
+                tool_result: crate::guardrail::config::ToolResultPhaseConfig::default(),
             }],
             global_default_pipeline: Some("pl".to_string()),
             bindings: GuardrailBindings::default(),
@@ -2485,10 +3080,10 @@ mod engine_tests {
         let mut out = String::new();
         metrics.write_guardrail_prometheus(&mut out);
         assert!(out.contains(
-            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"pii\",provider=\"regex\",action=\"redact\"} 1"
+            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"pii\",provider=\"regex\",phase=\"pre_call\",action=\"redact\"} 1"
         ));
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"pii\",provider=\"regex\"} 1"
+            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"pii\",provider=\"regex\",phase=\"pre_call\"} 1"
         ));
     }
 
@@ -2512,7 +3107,7 @@ mod engine_tests {
         let mut out = String::new();
         metrics.write_guardrail_prometheus(&mut out);
         assert!(out.contains(
-            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"scan\",provider=\"regex\",action=\"pass\"} 1"
+            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"scan\",provider=\"regex\",phase=\"pre_call\",action=\"pass\"} 1"
         ));
     }
 
@@ -2537,7 +3132,7 @@ mod engine_tests {
         let mut out = String::new();
         metrics.write_guardrail_prometheus(&mut out);
         assert!(out.contains(
-            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"scan\",provider=\"regex\",action=\"error\"} 1"
+            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"scan\",provider=\"regex\",phase=\"pre_call\",action=\"error\"} 1"
         ));
     }
 
@@ -2566,7 +3161,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // Task 12.3 — metric/log field coverage complementary to 12.2.
+    // Task 12.3 â€” metric/log field coverage complementary to 12.2.
     //
     // 12.2 already asserts the `redact`, `pass`, and `error` action labels
     // and one latency `_count` sample. The tests below add the remaining
@@ -2617,10 +3212,10 @@ mod engine_tests {
         let mut out = String::new();
         metrics.write_guardrail_prometheus(&mut out);
         assert!(out.contains(
-            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"pii\",provider=\"regex\",action=\"mask\"} 1"
+            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"pii\",provider=\"regex\",phase=\"pre_call\",action=\"mask\"} 1"
         ));
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"pii\",provider=\"regex\"} 1"
+            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"pii\",provider=\"regex\",phase=\"pre_call\"} 1"
         ));
     }
 
@@ -2655,10 +3250,10 @@ mod engine_tests {
         let mut out = String::new();
         metrics.write_guardrail_prometheus(&mut out);
         assert!(out.contains(
-            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"out\",provider=\"regex\",action=\"replace_with_policy_message\"} 1"
+            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"out\",provider=\"regex\",phase=\"post_call\",action=\"replace_with_policy_message\"} 1"
         ));
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"out\",provider=\"regex\"} 1"
+            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"out\",provider=\"regex\",phase=\"post_call\"} 1"
         ));
     }
 
@@ -2689,7 +3284,7 @@ mod engine_tests {
         let mut out = String::new();
         metrics.write_guardrail_prometheus(&mut out);
         assert!(out.contains(
-            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"blk\",provider=\"regex\",action=\"block\"} 1"
+            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"blk\",provider=\"regex\",phase=\"post_call\",action=\"block\"} 1"
         ));
     }
 
@@ -2714,9 +3309,9 @@ mod engine_tests {
 
         let mut out = String::new();
         metrics.write_guardrail_prometheus(&mut out);
-        // One latency observation per stage execution (3 requests → 3).
+        // One latency observation per stage execution (3 requests â†’ 3).
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"scan\",provider=\"regex\"} 3"
+            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"scan\",provider=\"regex\",phase=\"pre_call\"} 3"
         ));
         assert_eq!(total_stage_executions(&out), 3);
     }
@@ -2725,7 +3320,7 @@ mod engine_tests {
     /// `actions` list, and `total_latency_ms`. Asserted indirectly through the
     /// per-stage counters that feed the summary (see module NOTE):
     /// two stages execute (stages_executed == 2), stage "a" redacts (a non-pass
-    /// entry in the actions list) and stage "b" — seeing only the placeholder —
+    /// entry in the actions list) and stage "b" â€” seeing only the placeholder â€”
     /// passes (excluded from the list). One latency sample per stage confirms
     /// total latency aggregates both executions.
     #[tokio::test]
@@ -2752,26 +3347,26 @@ mod engine_tests {
 
         // summary.stages_executed == 2.
         assert_eq!(total_stage_executions(&out), 2);
-        // Stage "a" redacted the sole occurrence → non-pass entry in the list.
+        // Stage "a" redacted the sole occurrence â†’ non-pass entry in the list.
         assert!(out.contains(
-            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"a\",provider=\"regex\",action=\"redact\"} 1"
+            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"a\",provider=\"regex\",phase=\"pre_call\",action=\"redact\"} 1"
         ));
-        // Stage "b" saw only the placeholder → no findings → pass (not listed).
+        // Stage "b" saw only the placeholder â†’ no findings â†’ pass (not listed).
         assert!(out.contains(
-            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"b\",provider=\"regex\",action=\"pass\"} 1"
+            "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"b\",provider=\"regex\",phase=\"pre_call\",action=\"pass\"} 1"
         ));
         // total_latency_ms aggregates one sample per executed stage (Req 11.2).
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"a\",provider=\"regex\"} 1"
+            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"a\",provider=\"regex\",phase=\"pre_call\"} 1"
         ));
         assert!(out.contains(
-            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"b\",provider=\"regex\"} 1"
+            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"b\",provider=\"regex\",phase=\"pre_call\"} 1"
         ));
     }
 
     /// Req 11.7: with no metrics handle, the INFO (enforcement) and WARN
     /// (provider error) log paths are still exercised and enforcement still
-    /// applies — best-effort recording never fails the request.
+    /// applies â€” best-effort recording never fails the request.
     #[tokio::test]
     async fn no_metrics_handle_warn_and_info_paths_still_enforce() {
         // WARN path: provider error under fail_open still proceeds.
