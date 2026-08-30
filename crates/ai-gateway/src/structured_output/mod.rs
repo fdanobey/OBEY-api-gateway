@@ -481,6 +481,10 @@ structured_output:
             ..StructuredOutputOverride::default()
         });
         group.models.push(ProviderModel {
+            cache_support: None,
+            cache_min_tokens: None,
+            cost_per_million_cache_read_input_tokens: None,
+            cost_per_million_cache_creation_input_tokens: None,
             provider: provider.to_owned(),
             model: model.to_owned(),
             cost_per_million_input_tokens: 0.0,
@@ -490,6 +494,9 @@ structured_output:
             tier: None,
             context_window: 0,
             specializations: vec![],
+        cost_per_million_reasoning_tokens: None,
+        reasoning_family: None,
+        reasoning_parameter: None,
         });
 
         StructuredOutputEngine::from_config(&config).unwrap()

@@ -1,4 +1,4 @@
-﻿//! Integration tests for streaming (SSE) post-call guardrails (task 13.4, Req 10).
+//! Integration tests for streaming (SSE) post-call guardrails (task 13.4, Req 10).
 //!
 //! These tests drive the full Axum router via `tower::ServiceExt::oneshot()`
 //! (no port binding, per repo conventions) with a `guardrails` section whose
@@ -91,6 +91,7 @@ fn provider(base_url: &str) -> Provider {
 /// Base config with one provider/model group and no guardrails yet.
 fn base_config(base_url: &str) -> Config {
     Config {
+        cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -109,6 +110,10 @@ fn base_config(base_url: &str) -> Config {
             structured_output: None,
             memory: None,
             models: vec![ProviderModel {
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
                 provider: "test-provider".to_string(),
                 model: "gpt-4".to_string(),
                 cost_per_million_input_tokens: 30.0,
@@ -118,6 +123,9 @@ fn base_config(base_url: &str) -> Config {
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -142,6 +150,7 @@ fn base_config(base_url: &str) -> Config {
         codex_search: None,
         structured_output: None,
         memory: None,
+        reasoning_compat: Default::default(),
     }
 }
 

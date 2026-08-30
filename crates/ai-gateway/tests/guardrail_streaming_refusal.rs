@@ -79,6 +79,7 @@ fn provider_named(name: &str, base_url: &str) -> Provider {
 /// the backup.
 fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: GuardrailConfig) -> Config {
     Config {
+        cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -101,6 +102,10 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
             structured_output: None,
             models: vec![
                 ProviderModel {
+                    cache_support: None,
+                    cache_min_tokens: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
                     provider: "primary".to_string(),
                     model: "gpt-4".to_string(),
                     cost_per_million_input_tokens: 30.0,
@@ -110,8 +115,15 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
                 ProviderModel {
+                    cache_support: None,
+                    cache_min_tokens: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
                     provider: "backup".to_string(),
                     model: "gpt-4".to_string(),
                     cost_per_million_input_tokens: 30.0,
@@ -121,6 +133,9 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
             ],
         }],
@@ -150,6 +165,7 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
+        reasoning_compat: Default::default(),
     }
 }
 

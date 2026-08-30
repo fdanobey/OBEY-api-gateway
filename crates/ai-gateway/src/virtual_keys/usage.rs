@@ -15,6 +15,26 @@
 //! warning, or per Requirement 4.5 estimate the token counts and record the
 //! estimate. Either way, whatever [`UsageRecord`] reaches `record` is persisted
 //! verbatim.
+//!
+//! ## Reasoning-token attribution (Req 4.5, 4.7)
+//!
+//! [`UsageRecord`] has no separate reasoning-token column: the schema lives in
+//! `models.rs` and the constructors in `gateway/handlers.rs` / `auth.rs`, both
+//! owned by the integration tasks. Reasoning economics still flow through this
+//! pipeline:
+//!
+//! - **Cost**: OpenAI-carrier reasoning tokens are a subset of
+//!   `completion_tokens`, so [`compute_cost`] already prices them at the
+//!   output rate; when callers fall back to the router's `gateway_cost`
+//!   (computed by `router::cache_cost::compute_actual_cost`), dedicated
+//!   `cost_per_million_reasoning_tokens` pricing is included.
+//! - **Re-billed prior-turn reasoning (Req 4.5)**: keep-all models re-bill
+//!   preserved thinking as *input* tokens, so they arrive inside
+//!   `input_tokens` of the consuming request and are attributed to the
+//!   consuming key — never to the request that originally produced them.
+//! - **Per-request token counts**: the durable, queryable reasoning split
+//!   (`reasoning_tokens` + `reasoning_compat_actions`) is persisted in the
+//!   request log by `logger::LogEntry::with_reasoning_usage` (Req 4.7).
 
 use std::sync::Arc;
 
@@ -47,7 +67,10 @@ impl UsageTracker {
     ///
     /// This method records whatever it is given; handling of missing provider
     /// usage (skip vs estimate) is the caller's responsibility (see module docs,
-    /// Req 3.6 / 4.5).
+    /// Req 3.6 / 4.5). Re-billed prior-turn reasoning is already embedded in
+    /// `input_tokens` of the consuming request (Req 4.5); the per-request
+    /// reasoning split is persisted in the request log, not here (see module
+    /// docs "Reasoning-token attribution").
     ///
     /// _Requirements: 3.5, 4.4, 9.1, 9.6_
     pub fn record(&self, record: UsageRecord) -> Result<(), KeyStoreError> {

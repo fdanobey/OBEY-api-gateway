@@ -7,7 +7,10 @@ use crate::compression::{
     stats::CompressionStats,
     CompressiblePayload, CompressionContext,
 };
-use crate::config::{Config, ContextConfig, ModelGroup, Provider, ProviderModel};
+use crate::config::{
+    CacheAwareRouting, Config, ContextConfig, ModelGroup, Provider, ProviderModel,
+    PromptCacheSupport,
+};
 use crate::context::ContextManager;
 use crate::dashboard::CompressionEventHub;
 use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
@@ -21,6 +24,7 @@ use crate::providers::bedrock::{
     normalize_mantle_chat_messages, sanitize_mantle_chat_request, BedrockProvider,
 };
 use crate::providers::{ProviderClient, ProviderResponse};
+use crate::reasoning_compat::{self, AttemptReport};
 use crate::smart_routing::budget_controller::BudgetController;
 use crate::smart_routing::{
     PinnedRoutingContext, RoutingPlanOutcome, RoutingPlanningError, SmartRouter, SmartRoutingInput,
@@ -195,7 +199,42 @@ struct CompressionRuntime {
     precompressed_manager: Option<Arc<PrecompressedManager>>,
 }
 
+use super::cache_cost::{compute_actual_cost, extract_cache_usage};
+use super::cache_inject::{inject_explicit_cache_breakpoints, CacheInjectorConfig};
+use super::sticky_cache::StickyCache;
 use super::{CircuitBreaker, LatencyTracker, RateLimiter};
+
+/// Computes the prompt-cache cost savings of a completed response in
+/// whole cents versus its uncached baseline (Req 4.2). `actual_cost`
+/// is the cache-aware dollar cost from [`compute_actual_cost`]; the
+/// baseline prices every prompt token at the model's base input rate
+/// and every completion token at the output rate — i.e. what the
+/// request would have cost with zero cache. Can be negative when a
+/// cache-creation premium exceeds the read discount.
+fn cache_savings_cents(model: &ProviderModel, usage: &Usage, actual_cost: f64) -> i64 {
+let baseline_cost = (usage.prompt_tokens as f64 * model.cost_per_million_input_tokens
++ usage.completion_tokens as f64 * model.cost_per_million_output_tokens)
+/ 1_000_000.0;
+((baseline_cost - actual_cost) * 100.0).round() as i64
+}
+
+/// Records prompt-cache token telemetry for a provider response
+/// (Req 4.2): the extracted cache token split plus the savings
+/// versus the uncached baseline. Keeps the success-path call sites
+/// one-liners.
+fn record_cache_usage(
+metrics: &crate::metrics::Metrics,
+provider: &str,
+model: &ProviderModel,
+usage: &Usage,
+actual_cost: f64,
+) {
+metrics.add_cache_usage(
+provider,
+extract_cache_usage(usage),
+cache_savings_cents(model, usage, actual_cost),
+);
+}
 
 fn smart_routing_tier_name(tier: crate::smart_routing::tier::SmartRoutingTier) -> &'static str {
     match tier {
@@ -272,7 +311,11 @@ pub struct Router {
 /// for the process lifetime: un-marking a combo mid-session would make
 /// the hint appear and disappear between turns, which models flag as a
 /// prompt-injection pattern. In-memory only — resets on process restart.
-xml_tool_combos: Arc<std::sync::RwLock<HashSet<String>>>,
+    xml_tool_combos: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Prompt-cache sticky routing affinity (prefix hash → last successful
+    /// provider/model, TTL-bounded). Zero-TTL when cache-aware routing is
+    /// disabled, so lookups always miss (Req 1.4, prompt-cache-routing spec).
+    sticky_cache: StickyCache,
 }
 
 /// Result of [`Router::route_request_streaming`].
@@ -421,16 +464,39 @@ impl Router {
             .clone()
     }
 
-    /// Create a new Router with the given configuration
-    pub fn new(config: Arc<RwLock<Config>>, metrics: Arc<crate::metrics::Metrics>) -> Self {
-        let (context_config, compression_config, smart_routing_config) = {
-            let cfg = config.try_read().expect("config lock");
-            (
-                cfg.context.clone(),
-                cfg.compression.clone(),
-                cfg.smart_routing.clone(),
-            )
-        };
+/// Create a new Router with the given configuration
+/// Builds the sticky-routing cache from the effective cache-aware
+/// routing config. A disabled feature (or a zero stickiness TTL)
+/// produces a zero-TTL cache whose lookups always miss (Req 1.4).
+/// The reasoning-compat conversation-model-affinity feature (Task 6)
+/// rides the same prefix→provider entries, so it also needs a live
+/// TTL; `stickiness_ttl_seconds` (default 300) is the shared knob.
+fn sticky_cache_from_config(
+cache_aware_routing: &CacheAwareRouting,
+reasoning_compat: &reasoning_compat::ReasoningCompatConfig,
+) -> StickyCache {
+let affinity_enabled =
+reasoning_compat.enabled && reasoning_compat.conversation_model_affinity;
+if (cache_aware_routing.enabled || affinity_enabled)
+&& cache_aware_routing.stickiness_ttl_seconds > 0
+{
+StickyCache::new(Duration::from_secs(cache_aware_routing.stickiness_ttl_seconds))
+} else {
+StickyCache::new(Duration::ZERO)
+}
+}
+
+pub fn new(config: Arc<RwLock<Config>>, metrics: Arc<crate::metrics::Metrics>) -> Self {
+let (context_config, compression_config, smart_routing_config, cache_aware_routing, reasoning_compat) = {
+let cfg = config.try_read().expect("config lock");
+(
+cfg.context.clone(),
+cfg.compression.clone(),
+cfg.smart_routing.clone(),
+cfg.cache_aware_routing.clone(),
+cfg.reasoning_compat.clone(),
+)
+};
         let smart_router = Self::build_smart_router(smart_routing_config.clone());
         if smart_routing_config.enabled {
             metrics.enable_smart_routing();
@@ -455,21 +521,27 @@ impl Router {
             instructions_store: None,
             oauth_usage_tracker: None,
             search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
-xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
 }
 }
 
 /// Create a new Router with explicit context configuration
-    #[allow(dead_code)]
-    pub fn with_context_config(
-        config: Arc<RwLock<Config>>,
-        context_config: ContextConfig,
-        metrics: Arc<crate::metrics::Metrics>,
-    ) -> Self {
-        let (compression_config, smart_routing_config) = {
-            let cfg = config.try_read().expect("config lock");
-            (cfg.compression.clone(), cfg.smart_routing.clone())
-        };
+#[allow(dead_code)]
+pub fn with_context_config(
+config: Arc<RwLock<Config>>,
+context_config: ContextConfig,
+metrics: Arc<crate::metrics::Metrics>,
+) -> Self {
+let (compression_config, smart_routing_config, cache_aware_routing, reasoning_compat) = {
+let cfg = config.try_read().expect("config lock");
+(
+cfg.compression.clone(),
+cfg.smart_routing.clone(),
+cfg.cache_aware_routing.clone(),
+cfg.reasoning_compat.clone(),
+)
+};
         let smart_router = Self::build_smart_router(smart_routing_config.clone());
         if smart_routing_config.enabled {
             metrics.enable_smart_routing();
@@ -494,7 +566,8 @@ xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             instructions_store: None,
             oauth_usage_tracker: None,
 search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
-xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
 }
 }
 
@@ -1212,7 +1285,10 @@ Ok(provider_cfg.map(|p| (p, first)))
     ///    exhaustion is *not* used as a pre-filter — `route_with_failover`
     ///    handles that with proper attempt logging so failover is visible.
     /// 3. Sort by priority (ascending - lower priority value = higher priority)
-    /// 4. Within same priority, sort by cost (ascending - lower cost first)
+    /// 4. Within same priority, sort by cost (ascending - lower cost first).
+    ///    When `cache_aware_routing.enabled` and `cost_sort_hit_rate > 0.0`,
+    ///    the cost key blends cache-read and uncached input prices at that
+    ///    assumed hit rate (Req 3.1); otherwise it is the uncached cost.
     /// 5. Within similar costs (±10%), sort by latency (ascending - lower latency first)
     /// 6. If version_fallback_enabled, re-sort the whole candidate list by
     ///    version date (descending - newer first). This is intentionally the
@@ -1281,14 +1357,40 @@ Ok(provider_cfg.map(|p| (p, first)))
         // Eliminates repeated DashMap traversal and median calculation in the comparator.
         let latency_snapshot = self.latency_tracker.snapshot();
 
+        // Cache-aware cost sort key (Req 3.1): when the feature is enabled
+        // and a positive hit rate is configured, the comparator weighs
+        // cache-read vs uncached input prices at that assumed hit rate.
+        // Hoisted out of the closure so the config lock is acquired exactly
+        // once (never per comparison) and the sort stays deterministic even
+        // if a hot-reload lands mid-sort. `None` keeps the uncached
+        // `total_cost()` behavior (Req 3.2).
+        let assumed_hit_rate = {
+            let config = self.config.read().await;
+            let cache_cfg = &config.cache_aware_routing;
+            if cache_cfg.enabled && cache_cfg.cost_sort_hit_rate > 0.0 {
+                Some(cache_cfg.cost_sort_hit_rate)
+            } else {
+                None
+            }
+        };
+
         // Stage 3: Sort by priority, cost, and latency
         candidates.sort_by(|a, b| {
             // First: sort by priority (ascending)
             match a.priority.cmp(&b.priority) {
                 std::cmp::Ordering::Equal => {
-                    // Second: sort by total cost (ascending)
-                    let cost_a = a.total_cost();
-                    let cost_b = b.total_cost();
+                    // Second: sort by total cost (ascending). With an assumed
+                    // cache hit rate this blends cache-read and uncached
+                    // input pricing; without one it falls back to the
+                    // uncached `total_cost()`.
+                    let cost_a = match assumed_hit_rate {
+                        Some(hit_rate) => a.total_cost_with_hit_rate(Some(hit_rate)),
+                        None => a.total_cost(),
+                    };
+                    let cost_b = match assumed_hit_rate {
+                        Some(hit_rate) => b.total_cost_with_hit_rate(Some(hit_rate)),
+                        None => b.total_cost(),
+                    };
 
                     // Check if costs are within 10% of each other
                     let cost_diff = (cost_a - cost_b).abs();
@@ -1319,6 +1421,193 @@ Ok(provider_cfg.map(|p| (p, first)))
         }
 
         candidates
+    }
+
+/// Whether sticky/affinity routing is active right now: the cache-aware
+/// feature flag must be enabled with a positive stickiness TTL
+/// (`stickiness_ttl_seconds: 0` disables stickiness, Req 1.4), OR the
+/// reasoning-compat conversation-model-affinity feature must be on
+/// (Task 6) — it records and consults the same prefix→provider entries
+/// for source-model attribution in strip/preserve decisions.
+async fn sticky_routing_enabled(&self) -> bool {
+let config = self.config.read().await;
+let cache_cfg = &config.cache_aware_routing;
+let reasoning_cfg = &config.reasoning_compat;
+(cache_cfg.enabled
+|| (reasoning_cfg.enabled && reasoning_cfg.conversation_model_affinity))
+&& cache_cfg.stickiness_ttl_seconds > 0
+}
+
+    /// Promotes the sticky provider for `request`'s conversation prefix to
+    /// the head of `candidates` (Req 1.2).
+    ///
+    /// MUST be applied to the output of [`Self::select_provider_order`] —
+    /// after the circuit-breaker and cooldown gates have filtered the list —
+    /// so a sticky entry for an unhealthy provider is simply not promoted
+    /// and normal priority/cost/latency routing serves the request
+    /// (Req 1.3). The entry is deliberately left in the cache (never
+    /// deleted on a gate miss) so stickiness resumes once the breaker
+    /// closes. Promotion moves the entry's provider/model to index 0 and
+    /// never removes other candidates.
+    async fn promote_sticky_provider(
+        &self,
+        request: &OpenAIRequest,
+        candidates: &mut Vec<ProviderModel>,
+    ) {
+        if !self.sticky_routing_enabled().await {
+            debug!(reason = "disabled", "sticky_skipped");
+            return;
+        }
+        let prefix_hash = StickyCache::compute_prefix_hash(request);
+        // `get` lazily evicts expired entries, so an expired affinity is
+        // indistinguishable from a miss here.
+        let Some(entry) = self.sticky_cache.get(prefix_hash) else {
+            debug!(prefix_hash, reason = "miss", "sticky_skipped");
+            return;
+        };
+        let Some(index) = candidates
+            .iter()
+            .position(|pm| pm.provider == entry.provider_id && pm.model == entry.model_id)
+        else {
+            debug!(
+                provider = %entry.provider_id,
+                prefix_hash,
+                reason = "not-in-candidates",
+                "sticky_skipped"
+            );
+            return;
+        };
+        if index > 0 {
+            let promoted = candidates.remove(index);
+            candidates.insert(0, promoted);
+        }
+        debug!(
+            provider = %entry.provider_id,
+            model = %entry.model_id,
+            prefix_hash,
+            last_cache_read_tokens =
+                entry.last_success_usage.map(|u| u.cache_read_input_tokens),
+            "sticky_promoted"
+        );
+    }
+
+    /// Upserts the sticky-routing affinity entry after a successful
+    /// response (Req 1.1). The prefix hash is computed from the ORIGINAL
+    /// client request (pre-transform), so affinity stays stable across the
+    /// provider-specific mutations applied to the outgoing copy.
+    async fn record_sticky_success(
+        &self,
+        request: &OpenAIRequest,
+        provider: &str,
+        model: &str,
+        usage: &Usage,
+    ) {
+        if !self.sticky_routing_enabled().await {
+            return;
+        }
+let prefix_hash = StickyCache::compute_prefix_hash(request);
+self.sticky_cache.insert(
+prefix_hash,
+provider.to_string(),
+model.to_string(),
+Some(extract_cache_usage(usage)),
+);
+debug!(provider = %provider, model = %model, prefix_hash, "sticky_recorded");
+}
+
+/// Source-model attribution for the reasoning-compat strip/preserve
+/// policy (reasoning-failover-compat spec, Req 6.4): resolves the
+/// conversation-prefix affinity entry to a policy
+/// [`ModelRef`](reasoning_compat::policy::ModelRef) describing the
+/// provider + model that last served this conversation.
+///
+/// Returns `None` when the affinity feature is off (zero overhead: no
+/// prefix hash, no lookup) or when no fresh affinity entry exists for
+/// this prefix (first turn, TTL expired, or config hot-reload cleared
+/// the cache) — the policy then falls back to family matching.
+/// Synchronous and lock-free: a single DashMap read.
+fn model_affinity_source(
+&self,
+request: &OpenAIRequest,
+reasoning_compat_cfg: &reasoning_compat::ReasoningCompatConfig,
+) -> Option<reasoning_compat::policy::ModelRef> {
+if !reasoning_compat_cfg.conversation_model_affinity {
+return None;
+}
+let prefix_hash = StickyCache::compute_prefix_hash(request);
+let (provider, model) = self.sticky_cache.get_model_affinity(prefix_hash)?;
+Some(reasoning_compat::policy::ModelRef {
+provider,
+family: reasoning_compat::detect::classify_family(&model),
+model,
+})
+}
+
+    /// Applies prompt-cache decorations to an outgoing provider request:
+    /// gateway-computed `cache_control` breakpoints for explicit-cache
+    /// providers (Req 2.1) and a deterministic OpenRouter session id derived
+    /// from the conversation prefix hash so intermediary stickiness aligns
+    /// with gateway stickiness (Req 1.5). No-op unless cache-aware routing
+    /// is enabled. Synchronous and lock-free: the sticky-cache lookup is a
+    /// DashMap read with no await points.
+    fn apply_cache_routing_decorations(
+        &self,
+        outgoing: &mut OpenAIRequest,
+        request: &OpenAIRequest,
+        provider_model: &ProviderModel,
+        is_openrouter: bool,
+        cache_cfg: &CacheAwareRouting,
+    ) {
+        if !cache_cfg.enabled {
+            return;
+        }
+        let prefix_hash = StickyCache::compute_prefix_hash(request);
+        if is_openrouter {
+            // Deterministic session id from the prefix hash: same
+            // conversation prefix → same OpenRouter affinity bucket.
+            let session_id = format!("obey-{:016x}", prefix_hash);
+            outgoing
+                .extra
+                .insert("session_id".to_string(), serde_json::json!(session_id));
+            debug!(session_id = %session_id, prefix_hash, "openrouter_session_id_attached");
+        }
+        if let Some(PromptCacheSupport::Explicit { max_breakpoints }) = &provider_model.cache_support
+        {
+            let cache_min_tokens = provider_model
+                .cache_min_tokens
+                .unwrap_or(cache_cfg.default_cache_min_tokens);
+            let prior_usage = self
+                .sticky_cache
+                .get(prefix_hash)
+                .and_then(|entry| entry.last_success_usage);
+            match inject_explicit_cache_breakpoints(
+                outgoing,
+                &CacheInjectorConfig {
+                    max_breakpoints: *max_breakpoints,
+                    cache_min_tokens,
+                },
+                prior_usage.as_ref(),
+            ) {
+                Ok(()) => {
+                    debug!(
+                        provider = %provider_model.provider,
+                        model = %provider_model.model,
+                        prefix_hash,
+                        max_breakpoints,
+                        "cache_breakpoints_injected"
+                    );
+                }
+                Err(err) => {
+                    // Injection failing its own post-condition must never
+                    // fail the request — send without markers.
+                    warn!(
+                        provider = %provider_model.provider,
+                        error = %err,
+                        "cache_breakpoint_injection_failed_sending_without_markers"
+                    );
+                }
+            }
+        }
     }
 
     /// Sort models by version date (descending - newer versions first)
@@ -1484,8 +1773,13 @@ Ok(provider_cfg.map(|p| (p, first)))
     /// provider omitted usage frames); cost is accrued from the configured
     /// per-model rates only when token usage is actually known, mirroring the
     /// buffered path's `usage_known` handling.
+    ///
+    /// `request` is the original client request; it is used to upsert the
+    /// cache-aware sticky-routing affinity entry (Req 1.1) so the next turn
+    /// of the same conversation prefix prefers this provider.
     pub async fn record_streaming_success(
         &self,
+        request: &OpenAIRequest,
         provider: &str,
         model: &str,
         duration: std::time::Duration,
@@ -1512,29 +1806,58 @@ Ok(provider_cfg.map(|p| (p, first)))
             self.metrics.record_provider_unknown_cost(provider);
             return;
         }
-        let rates = {
+        // Cache-aware actual cost (Req 3.5): price the reassembled usage
+        // split (uncached / cache-read / cache-creation) at the model's
+        // configured per-million rates. Falls back to base-price math,
+        // bit-identical to the previous formula, when the usage carries
+        // no cache fields.
+        {
             let config = self.config.read().await;
-            config.model_groups.iter().find_map(|group| {
-                group
-                    .models
-                    .iter()
-                    .find(|m| m.provider == provider && m.model == model)
-                    .map(|m| {
-                        (
-                            m.cost_per_million_input_tokens,
-                            m.cost_per_million_output_tokens,
-                        )
-                    })
-            })
-        };
-        match rates {
-            Some((input_rate, output_rate)) => {
-                let input_cost = usage.prompt_tokens as f64 * input_rate / 1_000_000.0;
-                let output_cost = usage.completion_tokens as f64 * output_rate / 1_000_000.0;
-                self.metrics.add_cost(provider, input_cost + output_cost);
+            let model_entry = config
+                .model_groups
+                .iter()
+                .find_map(|group| {
+                    group
+                        .models
+                        .iter()
+                        .find(|m| m.provider == provider && m.model == model)
+                });
+        match model_entry {
+            Some(model_entry) => {
+                let cost = compute_actual_cost(model_entry, usage);
+                self.metrics.add_cost(provider, cost);
+                record_cache_usage(&self.metrics, provider, model_entry, usage, cost);
+                // Reasoning-token attribution (Req 4.7) for pass-through
+                // streams: the relay's reassembled usage carries the
+                // provider's reasoning-token field; price it at the
+                // dedicated (or output-fallback) rate when attribution is
+                // enabled. No response object exists here, so there are no
+                // gateway_* extras to attach — metrics only.
+                let reasoning_usage =
+                    reasoning_compat::cost::extract_reasoning_usage(usage);
+                if reasoning_usage.reasoning_tokens > 0
+                    && config.reasoning_compat.attribute_reasoning_cost
+                {
+                    let reasoning_cost = reasoning_compat::cost::reasoning_cost(
+                        model_entry,
+                        reasoning_usage.reasoning_tokens,
+                    );
+                    self.metrics.add_reasoning_usage(
+                        provider,
+                        u64::from(reasoning_usage.reasoning_tokens),
+                        reasoning_cost,
+                    );
+                }
             }
             None => self.metrics.record_provider_unknown_cost(provider),
         }
+        }
+
+        // Cache-aware sticky routing (Req 1.1): upsert the prefix→provider
+        // affinity from the original client request so the next turn of
+        // this conversation prefers this provider.
+        self.record_sticky_success(request, provider, model, usage)
+            .await;
     }
 
 /// Detect and strip image content parts from messages when the target
@@ -1657,7 +1980,24 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
         || lower.contains("vision is not supported")
         || lower.contains("not a vision model")
         || lower.contains("only supports text")
-}
+    }
+
+    /// Check whether an upstream 400 is an Anthropic-style thinking/budget
+    /// validation failure (reasoning-failover-compat spec, Req 6.2).
+    ///
+    /// The provider error body mentions `thinking` or `budget_tokens` when
+    /// the request's extended-thinking state or parameters failed
+    /// validation (e.g. `thinking.budget_tokens` >= `max_tokens`, adaptive
+    /// models rejecting `type: "enabled"`, or signature mismatches on
+    /// replayed thinking blocks). Matched on the body text, never on the
+    /// bare status, so unrelated 400s keep their normal classification.
+    fn is_thinking_validation_error(status_code: u16, body: &str) -> bool {
+        if status_code != 400 {
+            return false;
+        }
+        let lower = body.to_ascii_lowercase();
+        lower.contains("thinking") || lower.contains("budget_tokens")
+    }
 
     /// Get or create rate limiter for a provider
     pub async fn get_rate_limiter(&self, provider: &str) -> Arc<RateLimiter> {
@@ -1716,6 +2056,20 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
     /// Clear all rate limiter states (used during config reload)
     pub fn clear_rate_limiters(&self) {
         self.rate_limiters.clear();
+    }
+
+    /// Clear all sticky-routing affinity entries (used during config
+    /// reload, mirroring the circuit-breaker / rate-limiter resets).
+    pub fn clear_sticky_cache(&self) {
+        self.sticky_cache.clear();
+    }
+
+    /// Sweeps expired prefix-affinity entries (maintenance complement to
+    /// the lazy TTL eviction in `StickyCache::get`; called periodically
+    /// by the gateway background task so dead conversations don't
+    /// accumulate).
+    pub fn evict_expired_sticky_entries(&self) {
+        self.sticky_cache.evict_expired();
     }
 
     fn provider_concurrency_limiter(
@@ -2855,12 +3209,15 @@ codex_search_config.effective_output_to_chat(),
         let provider_type = provider_cfg.provider_type.clone();
         let cross_region_inference = provider_cfg.cross_region_inference;
         let global_inference_profile = provider_cfg.global_inference_profile;
-        let prompt_caching = provider_cfg.prompt_caching;
-        let reasoning = provider_cfg.reasoning;
+let prompt_caching = provider_cfg.prompt_caching;
+let reasoning = provider_cfg.reasoning;
+let reasoning_compat_cfg = config.reasoning_compat.clone();
         let provider_region = provider_cfg.region.clone();
         let is_oauth_provider = provider_cfg.auth_method.as_deref() == Some("oauth");
         let jitter_enabled = config.retry.jitter_enabled;
         let jitter_ratio = config.retry.jitter_ratio;
+        let cache_aware_routing_cfg = config.cache_aware_routing.clone();
+        let configured_base_url = provider_cfg.base_url.clone();
 
         // Drop config lock before making HTTP calls
         drop(config);
@@ -2880,6 +3237,47 @@ codex_search_config.effective_output_to_chat(),
         }
         outgoing.stream = false;
         let mut context_retry_attempt: usize = 0;
+
+        // Reasoning-compat per-attempt stage (reasoning-failover-compat
+        // spec, Req 6.1/6.2): detect reasoning carriers on the ORIGINAL
+        // request (they live in prior assistant turns, pre-transform),
+        // strip/preserve per source→target transition, and normalize the
+        // client's reasoning parameter into the target family's accepted
+        // shape. Runs inside the per-provider dispatch so every failover
+        // attempt is transformed against its own target. `enabled: false`
+        // skips everything (exact passthrough, Bedrock legacy block below
+        // unchanged) and only emits a debug note when carriers were seen.
+let mut reasoning_report: Option<AttemptReport> = None;
+if reasoning_compat_cfg.enabled {
+// Source-model attribution (Task 6): the provider + model that
+// last served this conversation prefix, from the sticky cache.
+// None on a miss — the policy then falls back to family matching.
+let source_ref = self.model_affinity_source(request, &reasoning_compat_cfg);
+let report = reasoning_compat::prepare_attempt(
+&mut outgoing,
+request,
+source_ref,
+provider_model,
+&reasoning_compat_cfg,
+);
+            if report.strip.messages_touched > 0 || report.strip.thinking_blocks > 0 {
+                reasoning_compat::policy::log_strip_action(
+                    &report.strip,
+                    report.decision,
+                    &crate::router::trace_id::generate_trace_id(None),
+                );
+            }
+            reasoning_report = Some(report);
+        } else {
+            let footprint = reasoning_compat::detect::detect(&request.messages);
+            if !footprint.is_empty() {
+                debug!(
+                    provider = provider_name,
+                    model = %provider_model.model,
+                    "Reasoning carriers detected in request but reasoning_compat is disabled; forwarding unmodified"
+                );
+            }
+        }
 
         // Apply Bedrock inference profiles only in AWS SDK mode. Mantle model
         // IDs never accept geo/global prefixes, and only some Runtime models
@@ -2905,8 +3303,13 @@ codex_search_config.effective_output_to_chat(),
             );
         }
 
-        // Inject reasoning/extended thinking parameter for Bedrock providers
-        if provider_type == "bedrock" && reasoning {
+        // Inject reasoning/extended thinking parameter for Bedrock providers.
+        // Legacy passthrough block: when reasoning_compat is enabled, the
+        // normalization stage above already emitted the correct parameter
+        // shape (honoring the provider `reasoning` flag via the target's
+        // family/shape resolution), so the hardcoded budget_tokens: 4096
+        // injection must not run.
+        if provider_type == "bedrock" && reasoning && !reasoning_compat_cfg.enabled {
             if model_supports_reasoning(&outgoing.model) {
                 outgoing.extra.insert(
                     "thinking".to_string(),
@@ -3024,24 +3427,45 @@ codex_search_config.effective_output_to_chat(),
 // [`Self::insert_tool_calling_hint`]) — not appended at the tail, where
 // a system message after user/tool content reads as an injection
 // attempt.
-let inject_tool_hint =
-    has_tools && self.should_inject_tool_hint(provider_name, &provider_model.model);
-if inject_tool_hint {
-    debug!(
-        provider = provider_name,
-        model = %provider_model.model,
-        "Injecting tool-calling system hint (learned XML combo)"
-    );
-    Self::insert_tool_calling_hint(&mut outgoing.messages);
-}
+        let inject_tool_hint =
+            has_tools && self.should_inject_tool_hint(provider_name, &provider_model.model);
+        if inject_tool_hint {
+            debug!(
+                provider = provider_name,
+                model = %provider_model.model,
+                "Injecting tool-calling system hint (learned XML combo)"
+            );
+            Self::insert_tool_calling_hint(&mut outgoing.messages);
+        }
+
+        // Prompt-cache decorations (Req 2.1 / 1.5): explicit-cache
+        // providers get gateway-computed `cache_control` breakpoints;
+        // OpenRouter gets a deterministic session id aligned with the
+        // gateway's prefix-hash stickiness. Applied after all message
+        // mutations so the marker positions reflect the final wire body.
+        let is_openrouter = provider_type.eq_ignore_ascii_case("openrouter")
+            || configured_base_url
+                .as_deref()
+                .map_or(false, |u| u.contains("openrouter.ai"));
+        self.apply_cache_routing_decorations(
+            &mut outgoing,
+            request,
+            provider_model,
+            is_openrouter,
+            &cache_aware_routing_cfg,
+        );
 
 let mut last_error = None;
 // One-shot reactive image strip: when the provider rejects the request
 // with an "image inputs not supported" error despite the proactive
 // strip pass (stale/incorrect capabilities), remove the images and
 // retry the same provider once without waiting through backoff.
-let mut image_strip_retry_done = false;
-let mut skip_next_backoff = false;
+        let mut image_strip_retry_done = false;
+        // One-shot reasoning-compat 400 recovery (see the 4xx branch
+        // below): an Anthropic-style thinking/budget_tokens validation 400
+        // triggers one aggressive strip + retry of the same provider.
+        let mut reasoning_strip_retry_done = false;
+        let mut skip_next_backoff = false;
 
 for attempt in 0..=max_retries {
     let skip_backoff_this_attempt = skip_next_backoff;
@@ -3321,31 +3745,47 @@ if let Some(choice) = openai_response.choices.first() {
     }
 }
                             if has_tools {
-                                openai_response.extra.insert(
-                                    "gateway_tool_hint_injected".to_string(),
-                                    serde_json::json!(inject_tool_hint),
-                                );
-                            }
-                            return Ok(openai_response);
-                        }
+            openai_response.extra.insert(
+                "gateway_tool_hint_injected".to_string(),
+                serde_json::json!(inject_tool_hint),
+            );
+        }
+        // Reasoning-compat log telemetry (Req 4.6): attach the compat
+        // stage's actions (counts/families only) where the report exists;
+        // the failover success path and the handler pass it through and
+        // strip it before the client sees the response.
+        if let Some(actions) = reasoning_report.and_then(AttemptReport::actions_json) {
+            openai_response.extra.insert(
+                "gateway_reasoning_compat_actions".to_string(),
+                serde_json::Value::String(actions),
+            );
+        }
+        return Ok(openai_response);
+        }
 
-                        // Provider may have ignored stream:false and returned SSE chunks.
-                        // Parse the SSE stream and reconstruct a single OpenAIResponse.
-                        if body_text.starts_with("data: ") {
-                            tracing::debug!(
-                                provider = provider_name,
-                                "Provider returned SSE despite stream:false, reassembling"
-                            );
-                            match Self::reassemble_sse_response(&body_text) {
-                                Ok(mut response) => {
-                                    if has_tools {
-                                        response.extra.insert(
-                                            "gateway_tool_hint_injected".to_string(),
-                                            serde_json::json!(inject_tool_hint),
-                                        );
-                                    }
-                                    return Ok(response);
-                                }
+        // Provider may have ignored stream:false and returned SSE chunks.
+        // Parse the SSE stream and reconstruct a single OpenAIResponse.
+        if body_text.starts_with("data: ") {
+            tracing::debug!(
+                provider = provider_name,
+                "Provider returned SSE despite stream:false, reassembling"
+            );
+            match Self::reassemble_sse_response(&body_text) {
+                Ok(mut response) => {
+                    if has_tools {
+                        response.extra.insert(
+                            "gateway_tool_hint_injected".to_string(),
+                            serde_json::json!(inject_tool_hint),
+                        );
+                    }
+                    if let Some(actions) = reasoning_report.and_then(AttemptReport::actions_json) {
+                        response.extra.insert(
+                            "gateway_reasoning_compat_actions".to_string(),
+                            serde_json::Value::String(actions),
+                        );
+                    }
+                    return Ok(response);
+                }
                                 Err(e) => {
                                     tracing::error!(provider = provider_name, error = %e, body = %body_text.chars().take(500).collect::<String>(), "Failed to reassemble SSE response");
                                     return Err(GatewayError::Provider {
@@ -3456,20 +3896,60 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
             provider_name,
             &provider_model.model,
         );
-        if removed > 0 {
-            image_strip_retry_done = true;
-            skip_next_backoff = true;
-            info!(
-                provider = provider_name,
-                model = %provider_model.model,
-                status = status_code,
-                images_removed = removed,
-                "Provider rejected image inputs — stripped images and retrying same provider"
-            );
-            last_error = Some(err);
-            continue;
-        }
-    }
+                    if removed > 0 {
+                        image_strip_retry_done = true;
+                        skip_next_backoff = true;
+                        info!(
+                            provider = provider_name,
+                            model = %provider_model.model,
+                            status = status_code,
+                            images_removed = removed,
+                            "Provider rejected image inputs — stripped images and retrying same provider"
+                        );
+                        last_error = Some(err);
+                        continue;
+                    }
+                }
+
+                // Reasoning-compat 400 recovery (reasoning-failover-compat
+                // spec, Req 6.2): an Anthropic-style thinking/budget_tokens
+                // validation 400 means the request carried reasoning state
+                // or params the target rejected. Classify as non-retryable
+                // in-provider (fail over) with a `reasoning_compat` tagged
+                // diagnostic, but first one-shot an aggressive strip of
+                // every reasoning carrier and retry the same provider
+                // without backoff.
+                if reasoning_compat_cfg.enabled
+                    && !reasoning_strip_retry_done
+                    && Self::is_thinking_validation_error(status_code, &body_text)
+                {
+                    let strip_report = reasoning_compat::policy::apply(
+                        &mut outgoing,
+                        reasoning_compat::policy::StripDecision::StripAll,
+                    );
+                    if strip_report.messages_touched > 0 {
+                        reasoning_strip_retry_done = true;
+                        skip_next_backoff = true;
+                        info!(
+                            provider = provider_name,
+                            model = %provider_model.model,
+                            status = status_code,
+                            thinking_blocks = strip_report.thinking_blocks,
+                            redacted_thinking_blocks = strip_report.redacted_thinking_blocks,
+                            fields_removed = strip_report.fields_removed,
+                            "[reasoning_compat] thinking validation 400 — aggressively stripped reasoning carriers, retrying same provider"
+                        );
+                        last_error = Some(GatewayError::Provider {
+                            provider: provider_name.to_string(),
+                            message: format!(
+                                "[reasoning_compat] HTTP {}: thinking-parameter validation failed",
+                                status_code
+                            ),
+                            status_code: Some(status_code),
+                        });
+                        continue;
+                    }
+                }
 
     // For rate-limit signals, parse Retry-After /
     // retry_after_ms and put the provider in a
@@ -3505,14 +3985,29 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                                 cooldown_ms = cooldown.as_millis() as u64,
                                 "Rate limited, failing over and cooling down provider"
                             );
-                        } else {
-                            warn!(
-                                provider = provider_name,
-                                status = status_code,
-                                "Non-retryable client error, failing over"
-                            );
-                        }
-                        return Err(err);
+                } else {
+                    warn!(
+                        provider = provider_name,
+                        status = status_code,
+                        "Non-retryable client error, failing over"
+                    );
+                }
+                // Tag thinking-validation 400s with the reasoning_compat
+                // diagnostic so the aggregated per-attempt record shows why
+                // the provider was skipped (Req 6.2).
+                if reasoning_compat_cfg.enabled
+                    && Self::is_thinking_validation_error(status_code, &body_text)
+                {
+                    return Err(GatewayError::Provider {
+                        provider: provider_name.to_string(),
+                        message: format!(
+                            "[reasoning_compat] HTTP {}: {}",
+                            status_code, body_text
+                        ),
+                        status_code: Some(status_code),
+                    });
+                }
+                return Err(err);
                     }
                     if status_code == 503 {
                         warn!(
@@ -3872,12 +4367,16 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
             .collect();
         // Effective truncation-retry setting (Req 6.4). Defaults to true when
         // no `streaming` section is configured.
-        let retry_on_truncation = config
-            .streaming
-            .clone()
-            .unwrap_or_default()
-            .retry_on_truncation;
-        drop(config);
+    let retry_on_truncation = config
+        .streaming
+        .clone()
+        .unwrap_or_default()
+        .retry_on_truncation;
+    // Reasoning-compat knobs for the buffered success path below (Req 4.6/
+    // 4.7). Cloned before the guard is dropped, mirroring the other
+    // snapshots.
+    let reasoning_compat_cfg = config.reasoning_compat.clone();
+    drop(config);
 
         for provider_model in providers {
             let start = std::time::Instant::now();
@@ -4104,14 +4603,12 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                         // if every provider truncates. Annotate it with the same
                         // gateway metadata + cost the success path attaches, so it
                         // can be returned directly without reprocessing.
-                        let mut candidate = response;
-                        let input_cost = candidate.usage.prompt_tokens as f64
-                            * provider_model.cost_per_million_input_tokens
-                            / 1_000_000.0;
-                        let output_cost = candidate.usage.completion_tokens as f64
-                            * provider_model.cost_per_million_output_tokens
-                            / 1_000_000.0;
-                        let candidate_cost = input_cost + output_cost;
+        let mut candidate = response;
+        // Cache-aware actual cost (Req 3.5/3.7): the partial
+        // response's usage already carries the provider's cache
+        // token split, so price it with the same formula as the
+        // success path. Base-price identical when no cache fields.
+        let candidate_cost = compute_actual_cost(&provider_model, &candidate.usage);
                         candidate.extra.insert(
                             "gateway_provider".to_string(),
                             serde_json::Value::String(provider_model.provider.clone()),
@@ -4159,27 +4656,61 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                     self.metrics
                         .clear_provider_cooldown(&provider_model.provider);
 
-                    // Calculate and record cost from token usage
-                    let usage_known = response.usage.total_tokens > 0
-                        || response.usage.prompt_tokens > 0
-                        || response.usage.completion_tokens > 0;
-                    let total_cost = if usage_known {
-                        let input_cost = response.usage.prompt_tokens as f64
-                            * provider_model.cost_per_million_input_tokens
-                            / 1_000_000.0;
-                        let output_cost = response.usage.completion_tokens as f64
-                            * provider_model.cost_per_million_output_tokens
-                            / 1_000_000.0;
-                        let total_cost = input_cost + output_cost;
-                        if total_cost > 0.0 {
-                            self.metrics.add_cost(&provider_model.provider, total_cost);
-                        }
-                        total_cost
-                    } else {
-                        self.metrics
-                            .record_provider_unknown_cost(&provider_model.provider);
-                        0.0
-                    };
+        // Cache-aware actual cost (Req 3.5): price the response's usage
+        // split (uncached / cache-read / cache-creation) at the model's
+        // per-million rates. Bit-identical to the previous base-price
+        // formula when the usage carries no cache fields, so providers
+        // that never report cache telemetry are unaffected.
+        let usage_known = response.usage.total_tokens > 0
+            || response.usage.prompt_tokens > 0
+            || response.usage.completion_tokens > 0;
+    let total_cost = if usage_known {
+        let cost = compute_actual_cost(&provider_model, &response.usage);
+        if cost > 0.0 {
+            self.metrics.add_cost(&provider_model.provider, cost);
+        }
+        record_cache_usage(
+            &self.metrics,
+            &provider_model.provider,
+            &provider_model,
+            &response.usage,
+            cost,
+        );
+        cost
+    } else {
+        self.metrics
+            .record_provider_unknown_cost(&provider_model.provider);
+        0.0
+    };
+
+    // Reasoning-token attribution (Req 4.7): extract the reasoning /
+    // thinking token count (any carrier shape, never double-counted) and
+    // accrue the provider metric + dedicated reasoning cost when the
+    // attribution knob is on.
+    let reasoning_usage = reasoning_compat::cost::extract_reasoning_usage(&response.usage);
+    if reasoning_usage.reasoning_tokens > 0 && reasoning_compat_cfg.attribute_reasoning_cost {
+        let reasoning_cost = reasoning_compat::cost::reasoning_cost(
+            &provider_model,
+            reasoning_usage.reasoning_tokens,
+        );
+        self.metrics.add_reasoning_usage(
+            &provider_model.provider,
+            u64::from(reasoning_usage.reasoning_tokens),
+            reasoning_cost,
+        );
+    }
+
+        // Cache-aware sticky routing (Req 1.1): remember which provider
+        // served this conversation prefix so the next turn is promoted back
+        // to it. The hash is computed from the original client request
+        // (`request`), not the provider-mutated outgoing copy.
+        self.record_sticky_success(
+            request,
+            &provider_model.provider,
+            &provider_model.model,
+            &response.usage,
+        )
+        .await;
 
                     // Translate XML-style tool use to native tool_calls.
                     // Models that don't support the OpenAI tools parameter
@@ -4205,16 +4736,56 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                         "gateway_responded_model".to_string(),
                         serde_json::Value::String(provider_model.model.clone()),
                     );
-                    response
-                        .extra
-                        .insert("gateway_cost".to_string(), serde_json::json!(total_cost));
-                    response.extra.insert(
-                        "gateway_compression".to_string(),
-                        serde_json::to_value(&compression)
-                            .expect("CompressionStats serialization must succeed"),
-                    );
+        response
+            .extra
+            .insert("gateway_cost".to_string(), serde_json::json!(total_cost));
+        // Prompt-cache log telemetry (Req 4.3): attach the cache token
+        // split, realized savings, and the prefix affinity hash so the
+        // request logger can persist them. Only present when the provider
+        // actually reported cached tokens.
+        {
+            let cache_usage = extract_cache_usage(&response.usage);
+            if cache_usage.cache_read_input_tokens > 0 || cache_usage.cache_creation_input_tokens > 0
+            {
+                let prefix_hash = StickyCache::compute_prefix_hash(request);
+                let savings = cache_savings_cents(&provider_model, &response.usage, total_cost);
+                response.extra.insert(
+                    "gateway_cache_read_tokens".to_string(),
+                    serde_json::json!(cache_usage.cache_read_input_tokens as i64),
+                );
+                response.extra.insert(
+                    "gateway_cache_creation_tokens".to_string(),
+                    serde_json::json!(cache_usage.cache_creation_input_tokens as i64),
+                );
+                response.extra.insert(
+                    "gateway_cache_savings_cents".to_string(),
+                    serde_json::json!(savings),
+                );
+                response.extra.insert(
+                    "gateway_prefix_hash".to_string(),
+                    serde_json::json!(crate::logger::encode_prefix_hash(prefix_hash)),
+                );
+            }
+        }
+        response.extra.insert(
+            "gateway_compression".to_string(),
+            serde_json::to_value(&compression)
+                .expect("CompressionStats serialization must succeed"),
+        );
+        // Reasoning-compat log telemetry (Req 4.6/4.7): expose the
+        // per-request reasoning-token count so the request logger can
+        // persist it. The compat stage's actions JSON
+        // (`gateway_reasoning_compat_actions`) is attached by the
+        // per-attempt dispatch right where the report exists. The handler
+        // strips both keys before returning the response to the client.
+        if reasoning_usage.reasoning_tokens > 0 {
+            response.extra.insert(
+                "gateway_reasoning_tokens".to_string(),
+                serde_json::json!(reasoning_usage.reasoning_tokens),
+            );
+        }
 
-                    return Ok(response);
+        return Ok(response);
                 }
                 Err(e) => {
                     // Record failure — except rate-limit-class errors (HTTP 429
@@ -6018,7 +6589,13 @@ pub(crate) fn should_inject_tool_hint(&self, provider: &str, model: &str) -> boo
         };
 
         // Select provider order
-        let providers = self.select_provider_order(&model_group).await;
+        let mut providers = self.select_provider_order(&model_group).await;
+        // Cache-aware sticky routing (Req 1.2): promote the provider that
+        // last served this conversation prefix to the head of the list.
+        // Applied after `select_provider_order`'s health gates so an
+        // unhealthy sticky provider falls through to normal routing.
+        self.promote_sticky_provider(&prepared_request, &mut providers)
+            .await;
         // Drop explicitly excluded provider:model entries (streaming 429
         // fallback — see `route_request_streaming_excluding`).
         let providers = if exclude.is_empty() {
@@ -6253,7 +6830,12 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
         } else {
             (model_group, None, true)
         };
-        let providers = self.select_provider_order(&model_group).await;
+        let mut providers = self.select_provider_order(&model_group).await;
+        // Cache-aware sticky routing (Req 1.2): promote the sticky provider
+        // for this prefix after the health gates inside
+        // `select_provider_order` (mirrors the buffered path).
+        self.promote_sticky_provider(&prepared_request, &mut providers)
+            .await;
         if providers.is_empty() {
             return Err(GatewayError::InvalidRequest(
                 "No available providers for model".to_string(),
@@ -6484,9 +7066,9 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
             if provider_type == "bedrock" && !api_key.is_empty() && !custom_vpc_endpoint {
                 let region = provider_region.as_deref().unwrap_or("us-east-1");
                 format!("https://bedrock-mantle.{}.api.aws/v1", region)
-            } else {
-                configured_base_url.unwrap_or_default()
-            };
+} else {
+    configured_base_url.as_deref().unwrap_or_default().to_string()
+};
         base_url = base_url.trim_end_matches('/').to_string();
         if !base_url.ends_with("/v1") {
             base_url.push_str("/v1");
@@ -6498,6 +7080,31 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
         let mut outgoing = compressed_request;
         outgoing.model = provider_model.model.clone();
         outgoing.stream = true;
+// Reasoning-compat per-attempt stage (reasoning-failover-compat
+// spec, Req 6.1/6.2), mirroring the buffered dispatch path: detect
+// carriers on the original request, strip/preserve for this
+// target, normalize reasoning params. Source-model attribution
+// (Task 6) comes from the sticky prefix affinity; None on a miss.
+// Pass-through streams carry no response object, so the report is
+// only logged here; usage metrics land in `record_streaming_success`.
+let reasoning_compat_cfg = self.config.read().await.reasoning_compat.clone();
+if reasoning_compat_cfg.enabled {
+let source_ref = self.model_affinity_source(request, &reasoning_compat_cfg);
+let report = reasoning_compat::prepare_attempt(
+&mut outgoing,
+request,
+source_ref,
+&provider_model,
+&reasoning_compat_cfg,
+);
+            if report.strip.messages_touched > 0 || report.strip.thinking_blocks > 0 {
+                reasoning_compat::policy::log_strip_action(
+                    &report.strip,
+                    report.decision,
+                    &crate::router::trace_id::generate_trace_id(None),
+                );
+            }
+        }
         let stripped = Self::sanitize_request_for_provider(&mut outgoing, &provider_type);
         if stripped > 0 {
             info!(provider = %provider_model.provider, provider_type = %provider_type, fields_removed = stripped, "Sanitized streaming request for provider");
@@ -6527,21 +7134,37 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
                 "Removed image content from streaming request for non-vision model"
             );
         }
-if outgoing.extra.contains_key("tools") {
-    Self::reverse_translate_tool_history(&mut outgoing.messages);
-    // Same conditional policy as the buffered path: only learned XML
-    // combos get the hint. `known_xml_combo` above already routed
-    // learned combos to the buffered path, so a hint here only fires
-    // when the exclusion list skipped that check for this candidate.
-    if self.should_inject_tool_hint(&provider_model.provider, &provider_model.model) {
-        debug!(
-            provider = %provider_model.provider,
-            model = %provider_model.model,
-            "Injecting tool-calling system hint (streaming, learned XML combo)"
+        if outgoing.extra.contains_key("tools") {
+            Self::reverse_translate_tool_history(&mut outgoing.messages);
+            // Same conditional policy as the buffered path: only learned XML
+            // combos get the hint. `known_xml_combo` above already routed
+            // learned combos to the buffered path, so a hint here only fires
+            // when the exclusion list skipped that check for this candidate.
+            if self.should_inject_tool_hint(&provider_model.provider, &provider_model.model) {
+                debug!(
+                    provider = %provider_model.provider,
+                    model = %provider_model.model,
+                    "Injecting tool-calling system hint (streaming, learned XML combo)"
+                );
+                Self::insert_tool_calling_hint(&mut outgoing.messages);
+            }
+        }
+
+        // Prompt-cache decorations (Req 2.1 / 1.5), mirroring the
+        // buffered dispatch path: explicit-cache breakpoints and the
+        // OpenRouter session id, applied after all message mutations.
+        let cache_aware_routing_cfg = self.config.read().await.cache_aware_routing.clone();
+        let is_openrouter = provider_type.eq_ignore_ascii_case("openrouter")
+            || configured_base_url
+                .as_deref()
+                .map_or(false, |u| u.contains("openrouter.ai"));
+        self.apply_cache_routing_decorations(
+            &mut outgoing,
+            request,
+            &provider_model,
+            is_openrouter,
+            &cache_aware_routing_cfg,
         );
-        Self::insert_tool_calling_hint(&mut outgoing.messages);
-    }
-}
 
         let http_client = self.get_or_create_http_client(&provider_model.provider, &pool_config)?;
 
@@ -7825,11 +8448,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
             tool_compression: Default::default(),
             smart_routing: Default::default(),
             memory: None,
-            xhigh_models_allowlist: Default::default(),
-            reasoning_models_allowlist: Default::default(),
-            codex_search: None,
-        }
-    }
+xhigh_models_allowlist: Default::default(),
+reasoning_models_allowlist: Default::default(),
+codex_search: None,
+cache_aware_routing: Default::default(),
+reasoning_compat: Default::default(),
+}
+}
 
     fn test_provider(name: &str, base_url: String) -> crate::config::Provider {
         crate::config::Provider {
@@ -7867,23 +8492,30 @@ async fn buffered_adapter_image_error_strips_and_retries() {
         }
     }
 
-    fn test_model(provider: &str, priority: u32) -> ProviderModel {
-        test_model_named(provider, "upstream-model", priority)
-    }
+fn test_model(provider: &str, priority: u32) -> ProviderModel {
+test_model_named(provider, "upstream-model", priority)
+}
 
-    fn test_model_named(provider: &str, model: &str, priority: u32) -> ProviderModel {
-        ProviderModel {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            cost_per_million_input_tokens: 0.0,
-            cost_per_million_output_tokens: 0.0,
-            priority,
-            structured_output_passthrough: None,
-            tier: None,
-            context_window: 0,
-            specializations: vec![],
-        }
-    }
+fn test_model_named(provider: &str, model: &str, priority: u32) -> ProviderModel {
+ProviderModel {
+provider: provider.to_string(),
+model: model.to_string(),
+cost_per_million_input_tokens: 0.0,
+cost_per_million_output_tokens: 0.0,
+priority,
+structured_output_passthrough: None,
+tier: None,
+context_window: 0,
+specializations: vec![],
+cache_min_tokens: None,
+cache_support: None,
+cost_per_million_cache_read_input_tokens: None,
+cost_per_million_cache_creation_input_tokens: None,
+cost_per_million_reasoning_tokens: None,
+reasoning_family: None,
+reasoning_parameter: None,
+}
+}
 
     fn test_group(models: Vec<ProviderModel>) -> ModelGroup {
         ModelGroup {
@@ -8669,6 +9301,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cache_min_tokens: None,
+                cache_support: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             }],
         }];
 
@@ -8708,6 +9347,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
                 ProviderModel {
                     provider: "provider-high-priority".to_string(),
@@ -8719,6 +9365,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
             ],
         }];
@@ -8752,6 +9405,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
                 ProviderModel {
                     provider: "cheap-provider".to_string(),
@@ -8763,6 +9423,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
             ],
         }];
@@ -8796,6 +9463,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
                 ProviderModel {
                     provider: "fast-provider".to_string(),
@@ -8807,6 +9481,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
             ],
         }];
@@ -8890,6 +9571,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
                 ProviderModel {
                     provider: "provider-2".to_string(),
@@ -8901,6 +9589,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
                 ProviderModel {
                     provider: "provider-3".to_string(),
@@ -8915,6 +9610,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
             ],
         }];
@@ -9032,6 +9734,13 @@ async fn buffered_adapter_image_error_strips_and_retries() {
             tier: None,
             context_window: 0,
             specializations: vec![],
+            cache_min_tokens: None,
+            cache_support: None,
+            cost_per_million_cache_read_input_tokens: None,
+            cost_per_million_cache_creation_input_tokens: None,
+            cost_per_million_reasoning_tokens: None,
+            reasoning_family: None,
+            reasoning_parameter: None,
         }];
         config.model_groups = vec![ModelGroup {
             name: "test-group".to_string(),
@@ -9294,15 +10003,224 @@ fn test_strip_image_content_if_unsupported_inserts_placeholder_for_image_only_me
         assert!(Router::is_unsupported_image_phrasing(
             r#"{"error":{"message":"This model does not support image inputs."}}"#
         ));
-        assert!(!Router::is_unsupported_image_phrasing(
-            "invalid model identifier"
-        ));
-    }
+assert!(!Router::is_unsupported_image_phrasing(
+"invalid model identifier"
+));
+}
+
+// --- Reasoning-compat conversation-model affinity (Task 6) ---
+
+fn affinity_router(reasoning_compat: crate::reasoning_compat::ReasoningCompatConfig) -> Router {
+let mut config = create_test_config();
+config.reasoning_compat = reasoning_compat;
+Router::new(Arc::new(RwLock::new(config)), test_metrics())
+}
+
+fn affinity_conversation() -> OpenAIRequest {
+OpenAIRequest {
+model: "test-group".to_string(),
+messages: vec![
+Message {
+role: "assistant".to_string(),
+content: serde_json::json!([
+{"type": "thinking", "thinking": "deep", "signature": "sig"},
+{"type": "text", "text": "partial answer"}
+]),
+extra: Default::default(),
+},
+Message {
+role: "user".to_string(),
+content: serde_json::json!("continue"),
+extra: Default::default(),
+},
+],
+stream: false,
+temperature: None,
+max_tokens: None,
+extra: Default::default(),
+}
+}
+
+#[test]
+fn model_affinity_source_resolves_entry_to_model_ref() {
+let router = affinity_router(Default::default());
+let request = affinity_conversation();
+let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
+
+let prefix_hash = StickyCache::compute_prefix_hash(&request);
+router.sticky_cache.insert(
+prefix_hash,
+"anthropic".to_string(),
+"claude-sonnet-4-5".to_string(),
+None,
+);
+
+let source = router
+.model_affinity_source(&request, &cfg)
+.expect("fresh affinity entry resolves to a source ModelRef");
+assert_eq!(source.provider, "anthropic");
+assert_eq!(source.model, "claude-sonnet-4-5");
+assert_eq!(
+source.family,
+crate::reasoning_compat::detect::classify_family("claude-sonnet-4-5")
+);
+}
+
+#[test]
+fn model_affinity_source_is_none_on_miss_or_disabled() {
+let request = affinity_conversation();
+let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
+
+// No entry for this prefix → miss → None (no source attribution).
+let router = affinity_router(Default::default());
+assert!(router.model_affinity_source(&request, &cfg).is_none());
+
+// Affinity flag off → no lookup at all, even with a fresh entry.
+let router = affinity_router(crate::reasoning_compat::ReasoningCompatConfig {
+conversation_model_affinity: false,
+..Default::default()
+});
+let prefix_hash = StickyCache::compute_prefix_hash(&request);
+router.sticky_cache.insert(
+prefix_hash,
+"anthropic".to_string(),
+"claude-sonnet-4-5".to_string(),
+None,
+);
+assert!(router.model_affinity_source(&request, &cfg).is_none());
+}
+
+#[test]
+fn affinity_hit_same_model_preserves_reasoning_state() {
+let router = affinity_router(Default::default());
+let request = affinity_conversation();
+let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
+
+let prefix_hash = StickyCache::compute_prefix_hash(&request);
+router.sticky_cache.insert(
+prefix_hash,
+"anthropic".to_string(),
+"claude-sonnet-4-5".to_string(),
+None,
+);
+let source = router.model_affinity_source(&request, &cfg).unwrap();
+
+// Same resolved provider + model (mid-tool-loop continuation): the
+// signed thinking blocks must survive verbatim.
+let target = test_model_named("anthropic", "claude-sonnet-4-5", 1);
+let mut outgoing = request.clone();
+let report = reasoning_compat::prepare_attempt(
+&mut outgoing,
+&request,
+Some(source),
+&target,
+&cfg,
+);
+assert_eq!(
+report.decision,
+reasoning_compat::policy::StripDecision::Preserve
+);
+assert_eq!(report.strip, reasoning_compat::policy::StripReport::default());
+assert_eq!(
+serde_json::to_value(&outgoing.messages).unwrap(),
+serde_json::to_value(&request.messages).unwrap()
+);
+}
+
+#[test]
+fn affinity_hit_cross_family_strips_all_reasoning_state() {
+let router = affinity_router(Default::default());
+let request = affinity_conversation();
+let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
+
+let prefix_hash = StickyCache::compute_prefix_hash(&request);
+router.sticky_cache.insert(
+prefix_hash,
+"anthropic".to_string(),
+"claude-sonnet-4-5".to_string(),
+None,
+);
+let source = router.model_affinity_source(&request, &cfg).unwrap();
+
+let target = test_model_named("deepseek", "deepseek-reasoner", 1);
+let mut outgoing = request.clone();
+let report = reasoning_compat::prepare_attempt(
+&mut outgoing,
+&request,
+Some(source),
+&target,
+&cfg,
+);
+assert_eq!(
+report.decision,
+reasoning_compat::policy::StripDecision::StripAll
+);
+assert_eq!(report.strip.thinking_blocks, 1);
+assert!(outgoing.messages[0]
+.content
+.as_array()
+.unwrap()
+.iter()
+.all(|block| block["type"] != "thinking"));
+}
+
+#[test]
+fn affinity_miss_cross_family_strips_with_unknown_attribution() {
+let router = affinity_router(Default::default());
+let request = affinity_conversation();
+let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
+
+// No affinity entry: attribution unknown, conservative strip on a
+// cross-family target.
+assert!(router.model_affinity_source(&request, &cfg).is_none());
+let target = test_model_named("deepseek", "deepseek-reasoner", 1);
+let mut outgoing = request.clone();
+let report =
+reasoning_compat::prepare_attempt(&mut outgoing, &request, None, &target, &cfg);
+assert_eq!(
+report.decision,
+reasoning_compat::policy::StripDecision::StripAttributionUnknown
+);
+assert_eq!(report.strip.thinking_blocks, 1);
+}
+
+#[tokio::test]
+async fn sticky_routing_gate_widens_to_reasoning_affinity() {
+// Reasoning affinity on, cache-aware routing off (its default): the
+// gate is active and successes record affinity entries.
+let router = affinity_router(Default::default());
+assert!(router.sticky_routing_enabled().await);
+assert!(!router.config.read().await.cache_aware_routing.enabled);
+
+let request = affinity_conversation();
+let usage = crate::models::openai::Usage::default();
+router
+.record_sticky_success(&request, "anthropic", "claude-sonnet-4-5", &usage)
+.await;
+let prefix_hash = StickyCache::compute_prefix_hash(&request);
+assert_eq!(
+router.sticky_cache.get_model_affinity(prefix_hash),
+Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string()))
+);
+
+// Both features off: gate closed, zero-TTL cache, nothing recorded.
+let router = affinity_router(crate::reasoning_compat::ReasoningCompatConfig {
+enabled: false,
+conversation_model_affinity: false,
+..Default::default()
+});
+assert!(!router.sticky_routing_enabled().await);
+router
+.record_sticky_success(&request, "anthropic", "claude-sonnet-4-5", &usage)
+.await;
+let prefix_hash = StickyCache::compute_prefix_hash(&request);
+assert!(router.sticky_cache.get_model_affinity(prefix_hash).is_none());
+}
 }
 
 #[cfg(test)]
 mod property_tests {
-    use super::tests::{create_test_config, test_metrics};
+use super::tests::{create_test_config, test_metrics};
     use super::*;
     use proptest::prelude::*;
 
@@ -9326,6 +10244,13 @@ mod property_tests {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 }
             })
     }
@@ -9498,6 +10423,13 @@ mod property_tests {
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cache_min_tokens: None,
+                cache_support: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             }],
         };
 
@@ -9525,6 +10457,13 @@ mod property_tests {
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cache_min_tokens: None,
+                cache_support: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             }],
         };
 
@@ -10048,6 +10987,13 @@ mod property_tests {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
                 ProviderModel {
                     provider: "backup".to_string(),
@@ -10059,6 +11005,13 @@ mod property_tests {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 },
             ],
         };
@@ -10338,10 +11291,10 @@ fn test_insert_tool_calling_hint_positions_after_system_block() {
         ref other => panic!("hint content must be a string, got: {other:?}"),
     });
 
-    // No system message at all: the hint becomes the first message.
-    let mut messages = vec![msg("user"), msg("assistant")];
-    Router::insert_tool_calling_hint(&mut messages);
-    assert_eq!(messages[0].role, "system");
-    assert_eq!(messages[1].role, "user");
+// No system message at all: the hint becomes the first message.
+let mut messages = vec![msg("user"), msg("assistant")];
+Router::insert_tool_calling_hint(&mut messages);
+assert_eq!(messages[0].role, "system");
+assert_eq!(messages[1].role, "user");
 }
 }

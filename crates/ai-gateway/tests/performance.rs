@@ -144,6 +144,10 @@ impl ProviderSelectionFixture {
                     }
                 };
                 ProviderModel {
+                    cache_support: None,
+                    cache_min_tokens: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
                     provider,
                     model,
                     cost_per_million_input_tokens: input_cost,
@@ -153,6 +157,9 @@ impl ProviderSelectionFixture {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 }
             })
             .collect();
@@ -232,6 +239,7 @@ fn test_metrics() -> Arc<ai_gateway::metrics::Metrics> {
 
 fn build_router_from_fixture(fixture: &ProviderSelectionFixture) -> Router {
     let mut config = Config {
+        cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -266,6 +274,7 @@ fn build_router_from_fixture(fixture: &ProviderSelectionFixture) -> Router {
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
         structured_output: None,
+        reasoning_compat: Default::default(),
     };
     common::isolate_databases(&mut config);
     Router::new(Arc::new(RwLock::new(config)), test_metrics())
@@ -430,6 +439,10 @@ async fn provider_order_matches_reference_policy_fixed_scenarios() {
     }
 
     let mk = |provider: &str, model: &str, input: f64, output: f64, priority: u32| ProviderModel {
+        cache_support: None,
+        cache_min_tokens: None,
+        cost_per_million_cache_read_input_tokens: None,
+        cost_per_million_cache_creation_input_tokens: None,
         provider: provider.to_string(),
         model: model.to_string(),
         cost_per_million_input_tokens: input,
@@ -439,6 +452,9 @@ async fn provider_order_matches_reference_policy_fixed_scenarios() {
         tier: None,
         context_window: 0,
         specializations: vec![],
+        cost_per_million_reasoning_tokens: None,
+        reasoning_family: None,
+        reasoning_parameter: None,
     };
 
     let scenarios = vec![
@@ -578,6 +594,10 @@ async fn provider_order_matches_reference_policy_generated_scenarios() {
             .map(|i| {
                 let input = 5.0 + (next() % 100) as f64;
                 ProviderModel {
+                    cache_support: None,
+                    cache_min_tokens: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
                     provider: format!("gen-p{round}-{i}"),
                     model: format!("gen-model-{i}"),
                     cost_per_million_input_tokens: input,
@@ -587,6 +607,9 @@ async fn provider_order_matches_reference_policy_generated_scenarios() {
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 }
             })
             .collect();
@@ -625,6 +648,7 @@ async fn provider_order_matches_reference_policy_generated_scenarios() {
 /// Build a minimal valid Config for performance tests.
 fn test_config() -> Config {
     Config {
+        cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -675,6 +699,10 @@ fn test_config() -> Config {
             memory: None,
             structured_output: None,
             models: vec![ProviderModel {
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
                 provider: "test-provider".to_string(),
                 model: "gpt-4".to_string(),
                 cost_per_million_input_tokens: 30.0,
@@ -684,6 +712,9 @@ fn test_config() -> Config {
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -708,6 +739,7 @@ fn test_config() -> Config {
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
         structured_output: None,
+        reasoning_compat: Default::default(),
     }
 }
 
@@ -1376,6 +1408,10 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
         .map(|g| {
             let models = (0..scenario.models_per_group)
                 .map(|m| ProviderModel {
+                    cache_support: None,
+                    cache_min_tokens: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
                     provider: format!(
                         "provider-{}",
                         (g * scenario.models_per_group + m) % scenario.providers
@@ -1388,6 +1424,9 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 })
                 .collect();
             ModelGroup {
@@ -1402,6 +1441,7 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
         .collect();
 
     let mut config = Config {
+        cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -1436,6 +1476,7 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
         structured_output: None,
+        reasoning_compat: Default::default(),
     };
     common::isolate_databases(&mut config);
     let shared = Arc::new(RwLock::new(config));

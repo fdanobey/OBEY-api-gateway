@@ -76,6 +76,7 @@ async fn start_mock_provider() -> MockServer {
 /// virtual-key store at `db_path`.
 fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) -> Config {
     Config {
+        cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -126,6 +127,10 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
             structured_output: None,
             memory: None,
             models: vec![ProviderModel {
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
                 provider: "test-provider".to_string(),
                 model: TEST_MODEL.to_string(),
                 cost_per_million_input_tokens: 30.0,
@@ -135,6 +140,9 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -171,6 +179,7 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
         codex_search: None,
         structured_output: None,
         memory: None,
+        reasoning_compat: Default::default(),
     }
 }
 

@@ -16,6 +16,7 @@ mod common;
 /// Build a minimal valid Config for integration tests.
 fn test_config() -> Config {
     Config {
+        cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -66,6 +67,10 @@ fn test_config() -> Config {
             memory: None,
             structured_output: None,
             models: vec![ProviderModel {
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
                 provider: "test-provider".to_string(),
                 model: "gpt-4".to_string(),
                 cost_per_million_input_tokens: 30.0,
@@ -75,6 +80,9 @@ fn test_config() -> Config {
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -99,6 +107,7 @@ fn test_config() -> Config {
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
+        reasoning_compat: Default::default(),
     }
 }
 
@@ -478,7 +487,7 @@ async fn test_prometheus_exposes_guardrail_metrics_with_prefix() {
     );
     assert!(
         text.contains(
-            "obey_api_guardrail_stage_executions_total{pipeline=\"pii_pipeline\",stage=\"pii_scan\",provider=\"regex\",action=\"redact\"} 1"
+            "obey_api_guardrail_stage_executions_total{pipeline=\"pii_pipeline\",stage=\"pii_scan\",provider=\"regex\",phase=\"pre_call\",action=\"redact\"} 1"
         ),
         "expected the recorded guardrail counter sample with the obey_api_guardrail_ prefix"
     );
@@ -490,7 +499,7 @@ async fn test_prometheus_exposes_guardrail_metrics_with_prefix() {
     );
     assert!(
         text.contains(
-            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pii_pipeline\",stage=\"pii_scan\",provider=\"regex\"} 1"
+            "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pii_pipeline\",stage=\"pii_scan\",provider=\"regex\",phase=\"pre_call\"} 1"
         ),
         "expected the recorded guardrail latency count with the obey_api_guardrail_ prefix"
     );
@@ -1219,6 +1228,10 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
         structured_output: None,
         models: vec![
             ProviderModel {
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
                 provider: "primary".to_string(),
                 model: "gpt-4".to_string(),
                 cost_per_million_input_tokens: 30.0,
@@ -1228,8 +1241,15 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             },
             ProviderModel {
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
                 provider: "backup".to_string(),
                 model: "gpt-4".to_string(),
                 cost_per_million_input_tokens: 30.0,
@@ -1239,6 +1259,9 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             },
         ],
     }];
@@ -1556,6 +1579,10 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
         structured_output: None,
         models: vec![
             ProviderModel {
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
                 provider: "primary".to_string(),
                 model: "gpt-4".to_string(),
                 cost_per_million_input_tokens: 30.0,
@@ -1565,8 +1592,15 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             },
             ProviderModel {
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
                 provider: "backup".to_string(),
                 model: "gpt-4".to_string(),
                 cost_per_million_input_tokens: 30.0,
@@ -1576,6 +1610,9 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             },
         ],
     }];

@@ -17,6 +17,7 @@ mod common;
 /// Build a minimal valid Config with a Codex-style provider (oauth + openai).
 fn codex_test_config() -> Config {
     Config {
+        cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -66,16 +67,23 @@ fn codex_test_config() -> Config {
             compression: None,
             structured_output: None,
             memory: None,
-            models: vec![ProviderModel {
-                provider: "codex-provider".to_string(),
-                model: "gpt-4.1-nano".to_string(),
-                cost_per_million_input_tokens: 30.0,
-                cost_per_million_output_tokens: 60.0,
-                priority: 100,
+        models: vec![ProviderModel {
+            provider: "codex-provider".to_string(),
+            model: "gpt-4.1-nano".to_string(),
+            cost_per_million_input_tokens: 30.0,
+            cost_per_million_output_tokens: 60.0,
+            cache_support: None,
+            cache_min_tokens: None,
+            cost_per_million_cache_read_input_tokens: None,
+            cost_per_million_cache_creation_input_tokens: None,
+            priority: 100,
                 structured_output_passthrough: None,
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -100,6 +108,7 @@ fn codex_test_config() -> Config {
         codex_search: None,
         structured_output: None,
         memory: None,
+        reasoning_compat: Default::default(),
     }
 }
 

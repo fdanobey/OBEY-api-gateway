@@ -7,6 +7,8 @@ use crate::compression::config::{
 };
 use crate::guardrail::GuardrailConfig;
 use crate::memory::{MemoryConfig, ModelGroupMemoryOverride, ProviderMemoryOverride};
+use crate::reasoning_compat::config::{ReasoningFamily, ReasoningParamShape};
+use crate::reasoning_compat::ReasoningCompatConfig;
 use crate::secrets;
 use crate::smart_routing::config::SmartRoutingConfig;
 use crate::smart_routing::tier::{SmartRoutingTier, TaskType};
@@ -124,11 +126,23 @@ pub struct Config {
     /// Additional model identifiers that accept Codex reasoning parameters.
     #[serde(default)]
     pub reasoning_models_allowlist: Vec<String>,
-    /// Codex Search feature configuration. Absent section defaults to
-    /// enabled-when-codex-provider-exists with default timeout/iterations.
-    /// See [`crate::codex::search::config::CodexSearchConfig`].
-    #[serde(default)]
-    pub codex_search: Option<crate::codex::search::config::CodexSearchConfig>,
+/// Codex Search feature configuration. Absent section defaults to
+/// enabled-when-codex-provider-exists with default timeout/iterations.
+/// See [`crate::codex::search::config::CodexSearchConfig`].
+#[serde(default)]
+pub codex_search: Option<crate::codex::search::config::CodexSearchConfig>,
+/// Prompt-cache-aware routing (sticky provider selection, cache-control
+/// breakpoint injection, cached-token-aware cost sorting). Absent section
+/// applies [`CacheAwareRouting::default`] (disabled). See the
+/// `prompt-cache-routing` spec.
+#[serde(default)]
+pub cache_aware_routing: CacheAwareRouting,
+/// Reasoning-state failover compatibility (detect → strip/preserve →
+/// normalize → cost attribution). Absent section applies
+/// [`ReasoningCompatConfig::default`] (enabled). See
+/// [`crate::reasoning_compat`].
+#[serde(default)]
+pub reasoning_compat: ReasoningCompatConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -700,6 +714,35 @@ pub struct ProviderModel {
     /// Task categories this model should be preferred for within its tier.
     #[serde(default)]
     pub specializations: Vec<TaskType>,
+    /// Price per million cache-read input tokens. `None` falls back to
+    /// `cost_per_million_input_tokens` as the read price.
+    #[serde(default)]
+    pub cost_per_million_cache_read_input_tokens: Option<f64>,
+    /// Price per million cache-creation (write) input tokens. `None` falls
+    /// back to `cost_per_million_input_tokens` as the write price.
+    #[serde(default)]
+    pub cost_per_million_cache_creation_input_tokens: Option<f64>,
+    /// Minimum uncached prefix tokens required before a cache breakpoint is
+    /// placed for this model. `None` defers to
+    /// `cache_aware_routing.default_cache_min_tokens`.
+    #[serde(default)]
+    pub cache_min_tokens: Option<u32>,
+    /// How this provider model supports prompt caching. `None` means no
+    /// cache handling (no injection, base input pricing).
+    #[serde(default)]
+    pub cache_support: Option<PromptCacheSupport>,
+    /// Price per million reasoning (thinking) tokens. `None` prices
+    /// reasoning tokens as regular output tokens (legacy behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_per_million_reasoning_tokens: Option<f64>,
+    /// Reasoning family this model belongs to. `None` defers to runtime
+    /// classification (e.g. `is_thinking_model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_family: Option<ReasoningFamily>,
+    /// Reasoning parameter shape this model accepts. `None` defers to
+    /// family-based defaults during normalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_parameter: Option<ReasoningParamShape>,
 }
 
 fn default_priority() -> u32 {
@@ -712,6 +755,21 @@ impl ProviderModel {
     pub fn total_cost(&self) -> f64 {
         self.cost_per_million_input_tokens + self.cost_per_million_output_tokens
     }
+}
+
+/// How a provider model supports upstream prompt caching.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum PromptCacheSupport {
+    /// The provider caches prompts automatically (OpenAI-style discounting);
+    /// the gateway never injects cache markers.
+    Automatic,
+    /// The provider requires explicit `cache_control` breakpoints
+    /// (Anthropic-style). `max_breakpoints` must be 1..=4.
+    Explicit {
+        /// Maximum number of cache breakpoints the provider accepts.
+        max_breakpoints: u32,
+    },
 }
 
 /// Circuit breaker configuration
@@ -948,6 +1006,56 @@ fn default_exact_ttl() -> u64 {
 
 fn default_exact_temperature_threshold() -> f32 {
     0.15
+}
+
+/// Prompt-cache-aware routing configuration.
+///
+/// Controls prefix-hash sticky provider selection, cache-control
+/// breakpoint injection, and cached-token-aware cost sorting. All fields
+/// have defaults so an absent or partial `cache_aware_routing` section
+/// keeps existing configs loading unchanged. See the `prompt-cache-routing`
+/// spec.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheAwareRouting {
+    /// Master switch. Default: disabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// TTL in seconds for prefix-hash → provider affinity entries.
+    /// `0` disables stickiness (allowed even when `enabled` is true).
+    #[serde(default = "default_stickiness_ttl_seconds")]
+    pub stickiness_ttl_seconds: u64,
+    /// Fallback minimum uncached prefix tokens for models without an
+    /// explicit `cache_min_tokens`.
+    #[serde(default = "default_cache_min_tokens")]
+    pub default_cache_min_tokens: u32,
+    /// Assumed cache hit rate (0.0–1.0 inclusive) used by the routing cost
+    /// sort when weighting cache-read vs uncached input prices. `0.0`
+    /// keeps cost sorting identical to the uncached behavior.
+    #[serde(default = "default_cost_sort_hit_rate")]
+    pub cost_sort_hit_rate: f64,
+}
+
+impl Default for CacheAwareRouting {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stickiness_ttl_seconds: default_stickiness_ttl_seconds(),
+            default_cache_min_tokens: default_cache_min_tokens(),
+            cost_sort_hit_rate: default_cost_sort_hit_rate(),
+        }
+    }
+}
+
+fn default_stickiness_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_cache_min_tokens() -> u32 {
+    1024
+}
+
+fn default_cost_sort_hit_rate() -> f64 {
+    0.0
 }
 
 /// Prometheus metrics configuration
@@ -1218,21 +1326,108 @@ structured_output:
         );
     }
 
-    #[test]
-    fn structured_output_yaml_fields_default_to_none_when_absent() {
-        let model: ProviderModel =
-            serde_yaml::from_str("provider: openai\nmodel: gpt-4o\n").unwrap();
-        assert_eq!(model.structured_output_passthrough, None);
-        assert_eq!(model.tier, None);
-        assert_eq!(model.context_window, 0);
-        assert!(model.specializations.is_empty());
+#[test]
+fn structured_output_yaml_fields_default_to_none_when_absent() {
+    let model: ProviderModel =
+        serde_yaml::from_str("provider: openai\nmodel: gpt-4o\n").unwrap();
+    assert_eq!(model.structured_output_passthrough, None);
+    assert_eq!(model.tier, None);
+    assert_eq!(model.context_window, 0);
+    assert!(model.specializations.is_empty());
 
-        let group: ModelGroup = serde_yaml::from_str(
-            "name: default\nmodels:\n  - provider: openai\n    model: gpt-4o\n",
-        )
-        .unwrap();
-        assert_eq!(group.structured_output, None);
-    }
+    let group: ModelGroup = serde_yaml::from_str(
+        "name: default\nmodels:\n  - provider: openai\n    model: gpt-4o\n",
+    )
+    .unwrap();
+    assert_eq!(group.structured_output, None);
+}
+
+#[test]
+fn provider_model_cache_fields_default_to_none_when_absent() {
+    // Existing (pre-cache) model YAML must load unchanged.
+    let legacy: ProviderModel =
+        serde_yaml::from_str("provider: openai\nmodel: gpt-4o\n").unwrap();
+    assert_eq!(legacy.cost_per_million_cache_read_input_tokens, None);
+    assert_eq!(legacy.cost_per_million_cache_creation_input_tokens, None);
+    assert_eq!(legacy.cache_min_tokens, None);
+    assert_eq!(legacy.cache_support, None);
+}
+
+#[test]
+fn provider_model_cache_fields_deserialize_when_present() {
+    let model: ProviderModel = serde_yaml::from_str(
+        r#"
+provider: anthropic
+model: claude-3-7-sonnet
+cost_per_million_cache_read_input_tokens: 0.30
+cost_per_million_cache_creation_input_tokens: 3.75
+cache_min_tokens: 2048
+cache_support:
+  type: explicit
+  max_breakpoints: 4
+"#,
+    )
+    .unwrap();
+    assert_eq!(model.cost_per_million_cache_read_input_tokens, Some(0.30));
+    assert_eq!(
+        model.cost_per_million_cache_creation_input_tokens,
+        Some(3.75)
+    );
+    assert_eq!(model.cache_min_tokens, Some(2048));
+    assert_eq!(
+        model.cache_support,
+        Some(PromptCacheSupport::Explicit {
+            max_breakpoints: 4
+        })
+    );
+
+    let automatic: ProviderModel = serde_yaml::from_str(
+        "provider: openai\nmodel: gpt-4o\ncache_support:\n  type: automatic\n",
+    )
+    .unwrap();
+    assert_eq!(automatic.cache_support, Some(PromptCacheSupport::Automatic));
+}
+
+#[test]
+fn cache_aware_routing_section_defaults_and_deserializes() {
+    // Absent section applies defaults (disabled).
+    let config: Config = serde_yaml::from_str(
+        "server:\n  host: 127.0.0.1\n  port: 8080\nproviders: []\nmodel_groups: []\n",
+    )
+    .unwrap();
+    assert_eq!(config.cache_aware_routing, CacheAwareRouting::default());
+    assert!(!config.cache_aware_routing.enabled);
+
+    // Empty section fills every field from defaults.
+    let empty: CacheAwareRouting = serde_yaml::from_str("{}").unwrap();
+    assert_eq!(empty, CacheAwareRouting::default());
+    assert_eq!(empty.stickiness_ttl_seconds, 300);
+    assert_eq!(empty.default_cache_min_tokens, 1024);
+    assert_eq!(empty.cost_sort_hit_rate, 0.0);
+
+    // Partial section defaults the rest.
+    let yaml = "enabled: true\nstickiness_ttl_seconds: 60";
+    let partial: CacheAwareRouting = serde_yaml::from_str(yaml).unwrap();
+    assert!(partial.enabled);
+    assert_eq!(partial.stickiness_ttl_seconds, 60);
+    assert_eq!(partial.default_cache_min_tokens, 1024);
+    assert_eq!(partial.cost_sort_hit_rate, 0.0);
+
+    // Full section round-trips.
+    let full: CacheAwareRouting = serde_yaml::from_str(
+        "enabled: true\nstickiness_ttl_seconds: 600\ndefault_cache_min_tokens: 512\ncost_sort_hit_rate: 0.8",
+    )
+    .unwrap();
+    assert_eq!(
+        full,
+        CacheAwareRouting {
+            enabled: true,
+            stickiness_ttl_seconds: 600,
+            default_cache_min_tokens: 512,
+            cost_sort_hit_rate: 0.8,
+        }
+    );
+}
 
     #[test]
     fn provider_model_smart_routing_fields_deserialize_and_default() {

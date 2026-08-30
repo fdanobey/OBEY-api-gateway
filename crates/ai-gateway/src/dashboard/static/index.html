@@ -190,6 +190,10 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
             <th data-sort="total">Total Requests <span class="sort-arrow"></span></th>
             <th data-sort="success_rate">Success Rate <span class="sort-arrow"></span></th>
             <th data-sort="avg_rt">Avg Response Time <span class="sort-arrow"></span></th>
+            <th data-sort="cache_read">Cache Read <span class="sort-arrow"></span></th>
+            <th data-sort="cache_write">Cache Write <span class="sort-arrow"></span></th>
+            <th data-sort="cache_hit">Cache Hit Rate <span class="sort-arrow"></span></th>
+            <th data-sort="cache_savings">Cache Savings <span class="sort-arrow"></span></th>
             <th data-sort="last_success">Last Success <span class="sort-arrow"></span></th>
             <th data-sort="last_failure_reason">Last Failure Reason <span class="sort-arrow"></span></th>
           </tr>
@@ -684,6 +688,10 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
         case 'total':va=a.total_requests;vb=b.total_requests;break;
         case 'success_rate':va=a.success_rate;vb=b.success_rate;break;
         case 'avg_rt':va=a.avg_response_time_ms;vb=b.avg_response_time_ms;break;
+        case 'cache_read':va=a.cache_read_tokens||0;vb=b.cache_read_tokens||0;break;
+        case 'cache_write':va=a.cache_creation_tokens||0;vb=b.cache_creation_tokens||0;break;
+        case 'cache_hit':va=a.cache_prompt_hit_rate||0;vb=b.cache_prompt_hit_rate||0;break;
+        case 'cache_savings':va=a.cache_savings_cents||0;vb=b.cache_savings_cents||0;break;
         case 'last_success':va=a.last_success_timestamp||0;vb=b.last_success_timestamp||0;break;
         case 'last_failure_reason':va=a.last_failure_reason||'';vb=b.last_failure_reason||'';break;
         default:va=a.provider;vb=b.provider;
@@ -734,6 +742,10 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
         +'<td>'+p.total_requests+'</td>'
         +'<td>'+fmtPct(p.success_rate)+'</td>'
         +'<td>'+fmtMs(p.avg_response_time_ms)+'</td>'
+        +'<td>'+fmtTokens(p.cache_read_tokens)+'</td>'
+        +'<td>'+fmtTokens(p.cache_creation_tokens)+'</td>'
+        +'<td>'+(p.cache_prompt_hit_rate!=null?fmtPct(p.cache_prompt_hit_rate):'—')+'</td>'
+        +'<td title="'+(p.cache_savings_cents||0)+' cents vs uncached baseline">'+fmtCost((p.cache_savings_cents||0)/100)+'</td>'
         +'<td>'+fmtTime(p.last_success_timestamp)+'</td>'
         +'<td>'+reasonHtml+'</td></tr>';
     });

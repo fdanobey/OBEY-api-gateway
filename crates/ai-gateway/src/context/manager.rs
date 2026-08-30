@@ -244,12 +244,25 @@ impl ContextManager {
     /// - "This model's maximum context length is 131072 tokens"
     /// - "token limit: 32768"
     /// - {"detail":"This model's maximum context length is 32768 tokens. However, your messages resulted in 186686 tokens."}
+    /// - "Your request exceeds the context size limit. (max: 271000 tokens, requested: 256163 prompt + 65536 output = 321699 context tokens)"
     fn parse_context_limit_from_error(body: &str) -> Option<u32> {
         let body_lower = body.to_lowercase();
 
         // Pattern: "maximum context length is N tokens"
         if let Some(pos) = body_lower.find("maximum context length is ") {
             let after = &body[pos + "maximum context length is ".len()..];
+            if let Some(num) = after.split(|c: char| !c.is_ascii_digit()).next() {
+                if let Ok(limit) = num.parse::<u32>() {
+                    if limit > 0 {
+                        return Some(limit);
+                    }
+                }
+            }
+        }
+
+        // Pattern: "max: N tokens" (e.g. NanoGPT-style "(max: 271000 tokens, requested: ...)")
+        if let Some(pos) = body_lower.find("max: ") {
+            let after = &body[pos + "max: ".len()..];
             if let Some(num) = after.split(|c: char| !c.is_ascii_digit()).next() {
                 if let Ok(limit) = num.parse::<u32>() {
                     if limit > 0 {
@@ -294,6 +307,8 @@ impl ContextManager {
             || body_lower.contains("context window")
             || body_lower.contains("too many tokens")
             || body_lower.contains("input is too long")
+            || body_lower.contains("context size limit")
+            || body_lower.contains("exceeds the context")
     }
 
     /// Get the current configuration
@@ -388,8 +403,24 @@ mod tests {
             .is_context_length_error(400, "This model's maximum context length is 4096 tokens"));
         assert!(manager.is_context_length_error(400, "context_length_exceeded"));
         assert!(manager.is_context_length_error(413, "Input is too long"));
+        assert!(manager.is_context_length_error(
+            400,
+            "Request validation failed. At 'tokens': Your request exceeds the context size limit. (max: 271000 tokens, requested: 256163 prompt + 65536 output = 321699 context tokens)"
+        ));
         assert!(!manager.is_context_length_error(400, "Invalid API key"));
         assert!(!manager.is_context_length_error(500, "Internal server error"));
+        assert!(!manager.is_context_length_error(
+            400,
+            "Request validation failed. At 'model': Unknown model"
+        ));
+    }
+
+    #[test]
+    fn test_parse_context_limit_from_max_colon_format() {
+        let limit = ContextManager::parse_context_limit_from_error(
+            "Request validation failed. At 'tokens': Your request exceeds the context size limit. (max: 271000 tokens, requested: 256163 prompt + 65536 output = 321699 context tokens)",
+        );
+        assert_eq!(limit, Some(271_000));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -349,20 +349,20 @@ impl Config {
                     && env::var(env_var).is_err()
                     && provider.resolved_api_key.is_none()
                 {
-                    tracing::warn!("Environment variable '{}' for provider '{}' is not set â€” provider will be unavailable until configured", env_var, provider.name);
+                    tracing::warn!("Environment variable '{}' for provider '{}' is not set Ã¢â‚¬â€ provider will be unavailable until configured", env_var, provider.name);
                 }
             }
 
             if provider.api_key_encrypted.is_some() && provider.resolved_api_key.is_none() {
                 tracing::warn!(
-                    "Encrypted API key for provider '{}' could not be resolved â€” provider will be unavailable until the key is re-entered",
+                    "Encrypted API key for provider '{}' could not be resolved Ã¢â‚¬â€ provider will be unavailable until the key is re-entered",
                     provider.name
                 );
             }
 
             if let Some(ref env_var) = provider.api_secret_env {
                 if !env_var.is_empty() && env::var(env_var).is_err() {
-                    tracing::warn!("Environment variable '{}' for provider '{}' is not set â€” provider will be unavailable until configured", env_var, provider.name);
+                    tracing::warn!("Environment variable '{}' for provider '{}' is not set Ã¢â‚¬â€ provider will be unavailable until configured", env_var, provider.name);
                 }
             }
 
@@ -403,7 +403,7 @@ impl Config {
                 }
             }
 
-            // Req 10.9 â€” codex_model_override must be non-empty when set
+            // Req 10.9 Ã¢â‚¬â€ codex_model_override must be non-empty when set
             if let Some(ref m) = provider.codex_model_override {
                 if m.trim().is_empty() {
                     errors.push(ValidationError::InvalidCodexField {
@@ -413,11 +413,11 @@ impl Config {
                 }
             }
 
-            // Req 12.6 â€” ToS warning when Codex provider active with admin auth disabled
+            // Req 12.6 Ã¢â‚¬â€ ToS warning when Codex provider active with admin auth disabled
             if is_codex_capable && !self.admin.auth.enabled {
                 tracing::warn!(
                     provider = %provider.name,
-                    "Codex provider active with admin auth disabled â€” ToS risk: \
+                    "Codex provider active with admin auth disabled Ã¢â‚¬â€ ToS risk: \
                      a shared ChatGPT session over an unauthenticated admin panel \
                      violates OpenAI terms. Enable admin.auth.enabled = true."
                 );
@@ -431,7 +431,7 @@ impl Config {
 
                 if !provider.has_api_key_configured() {
                     tracing::warn!(
-                        "Bedrock provider '{}' has no API key configured â€” authentication is required for Bedrock Mantle endpoints",
+                        "Bedrock provider '{}' has no API key configured Ã¢â‚¬â€ authentication is required for Bedrock Mantle endpoints",
                         provider.name
                     );
                 }
@@ -468,7 +468,7 @@ impl Config {
         // The whole `streaming` section is re-read on hot-reload via
         // `apply_runtime_config_update`, which validates through this path.
         if let Some(ref streaming) = self.streaming {
-            // keepalive_interval_seconds must be within 0â€“60 (0 = disabled).
+            // keepalive_interval_seconds must be within 0Ã¢â‚¬â€œ60 (0 = disabled).
             if streaming.keepalive_interval_seconds > 60 {
                 errors.push(ValidationError::InvalidValue {
                     field: "streaming.keepalive_interval_seconds".to_string(),
@@ -487,6 +487,50 @@ impl Config {
             }
         }
 
+        // Validate cache-aware routing (prompt-cache-routing spec, Req 3 & 4).
+        // An absent section deserializes to disabled defaults and is valid.
+        if !self.cache_aware_routing.cost_sort_hit_rate.is_finite()
+            || !(0.0..=1.0).contains(&self.cache_aware_routing.cost_sort_hit_rate)
+        {
+            errors.push(ValidationError::InvalidValue {
+                field: "cache_aware_routing.cost_sort_hit_rate".to_string(),
+                value: self.cache_aware_routing.cost_sort_hit_rate.to_string(),
+                expected: "a number between 0.0 and 1.0".to_string(),
+            });
+        }
+
+// stickiness_ttl_seconds: 0 is allowed (stickiness disabled), even
+// when cache-aware routing is enabled — warn so the intent is visible.
+if self.cache_aware_routing.enabled
+&& self.cache_aware_routing.stickiness_ttl_seconds == 0
+{
+tracing::warn!(
+"cache_aware_routing.enabled is true but stickiness_ttl_seconds is 0 — \
+prefix stickiness is disabled and routing uses normal priority/cost/latency sorting"
+);
+}
+
+// Validate reasoning_compat (reasoning-failover-compat spec, Task 6
+// wiring): effort-map completeness/budget floors and per_provider
+// override keys referencing configured providers. Runs on load and
+// hot-reload alongside the other section validations.
+let known_provider_names: Vec<&str> = self
+.providers
+.iter()
+.map(|provider| provider.name.as_str())
+.collect();
+if let Err(reasoning_compat_errors) =
+self.reasoning_compat.validate(&known_provider_names)
+{
+errors.extend(reasoning_compat_errors.into_iter().map(|error| {
+ValidationError::InvalidValue {
+field: "reasoning_compat".to_string(),
+value: error,
+expected: "a valid reasoning compatibility configuration".to_string(),
+}
+}));
+}
+
         if let Some(ref codex_search) = self.codex_search {
             if let Err(msg) = codex_search.validate() {
                 errors.push(ValidationError::InvalidValue {
@@ -503,7 +547,7 @@ impl Config {
 
             if codex_search.effective_enabled(has_codex_provider) && !has_codex_provider {
                 tracing::warn!(
-    "codex_search.enabled is true but no Codex (oauth+openai) provider is configured â€” \
+    "codex_search.enabled is true but no Codex (oauth+openai) provider is configured Ã¢â‚¬â€ \
     search tools will not be injected and no upstream search calls will be made"
     );
             }
@@ -513,12 +557,12 @@ impl Config {
         if self.admin.auth.enabled {
             if let Some(ref env_var) = self.admin.auth.username_env {
                 if env::var(env_var).is_err() {
-                    tracing::warn!("Admin auth env var '{}' is not set â€” admin auth will be disabled until configured", env_var);
+                    tracing::warn!("Admin auth env var '{}' is not set Ã¢â‚¬â€ admin auth will be disabled until configured", env_var);
                 }
             }
             if let Some(ref env_var) = self.admin.auth.password_env {
                 if env::var(env_var).is_err() {
-                    tracing::warn!("Admin auth env var '{}' is not set â€” admin auth will be disabled until configured", env_var);
+                    tracing::warn!("Admin auth env var '{}' is not set Ã¢â‚¬â€ admin auth will be disabled until configured", env_var);
                 }
             }
         }
@@ -578,6 +622,21 @@ impl Config {
                             "0 for unknown, or a token count in 1..={MAX_CONTEXT_WINDOW_TOKENS}"
                         ),
                     });
+                }
+
+                if let Some(PromptCacheSupport::Explicit { max_breakpoints }) =
+                    &model.cache_support
+                {
+                    if !(1..=4).contains(max_breakpoints) {
+                        errors.push(ValidationError::InvalidValue {
+                            field: format!(
+                                "model_groups.{}.models.{}.cache_support.max_breakpoints",
+                                group.name, model.model
+                            ),
+                            value: max_breakpoints.to_string(),
+                            expected: "a value between 1 and 4".to_string(),
+                        });
+                    }
                 }
 
                 let mut specializations = std::collections::HashSet::new();
@@ -700,7 +759,7 @@ impl Config {
         /// Maximum stego suppression threshold (indirect-injection defense).
         const MAX_STEGO_THRESHOLD: u32 = 1000;
 
-        /// Phase × action validity matrix (design §2.4). `replace_with_policy_message`
+        /// Phase Ã— action validity matrix (design Â§2.4). `replace_with_policy_message`
         /// is invalid for the two inbound phases; all other actions are valid
         /// everywhere.
         fn phase_allows_action(phase: StagePhase, action: PolicyAction) -> bool {
@@ -831,7 +890,7 @@ impl Config {
                     });
                 }
 
-                // Phase × action validity matrix (design §2.4, task 1.3).
+                // Phase Ã— action validity matrix (design Â§2.4, task 1.3).
                 if !phase_allows_action(stage.phase, stage.action) {
                     errors.push(ValidationError::GuardrailInvalidPhaseAction {
                         pipeline_name: pipeline.name.clone(),
@@ -881,7 +940,7 @@ impl Config {
         }
 
         // Every binding (virtual_keys / model_groups / routes) must reference a
-        // defined pipeline; undefined â†’ error identifying binding target and
+        // defined pipeline; undefined Ã¢â€ â€™ error identifying binding target and
         // pipeline name (Req 1.10).
         let binding_groups: [(&str, &std::collections::HashMap<String, String>); 3] = [
             ("virtual_keys", &guardrails.bindings.virtual_keys),
@@ -1073,17 +1132,24 @@ mod property_tests {
                 compression: None,
                 memory: None,
                 structured_output: None,
-                models: vec![ProviderModel {
-                    provider: "test-provider".to_string(),
-                    model: "gpt-4".to_string(),
-                    cost_per_million_input_tokens: 10.0,
-                    cost_per_million_output_tokens: 30.0,
-                    priority: 100,
-                    structured_output_passthrough: None,
-                    tier: None,
-                    context_window: 0,
-                    specializations: vec![],
-                }],
+        models: vec![ProviderModel {
+            provider: "test-provider".to_string(),
+            model: "gpt-4".to_string(),
+            cost_per_million_input_tokens: 10.0,
+            cost_per_million_output_tokens: 30.0,
+            priority: 100,
+            structured_output_passthrough: None,
+            tier: None,
+            context_window: 0,
+            specializations: vec![],
+            cost_per_million_cache_read_input_tokens: None,
+            cost_per_million_cache_creation_input_tokens: None,
+            cache_min_tokens: None,
+cache_support: None,
+cost_per_million_reasoning_tokens: None,
+reasoning_family: None,
+reasoning_parameter: None,
+}],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
             retry: RetryConfig::default(),
@@ -1104,11 +1170,13 @@ mod property_tests {
             guardrails: None,
             tool_compression: Default::default(),
             smart_routing: Default::default(),
-            xhigh_models_allowlist: Default::default(),
-            reasoning_models_allowlist: Default::default(),
-            codex_search: None,
-        }
-    }
+        xhigh_models_allowlist: Default::default(),
+        reasoning_models_allowlist: Default::default(),
+        codex_search: None,
+cache_aware_routing: Default::default(),
+reasoning_compat: Default::default(),
+}
+}
 
     #[test]
     fn smart_routing_unknown_group_keys_are_rejected() {
@@ -1131,12 +1199,92 @@ mod property_tests {
             ValidationError::InvalidValue { field, .. }
                 if field == "smart_routing.model_group_overrides.missing-override"
         )));
-        assert!(errors.iter().any(|error| matches!(
-            error,
-            ValidationError::InvalidValue { field, .. }
-                if field == "smart_routing.budget_limits.missing-budget"
-        )));
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, .. }
+        if field == "smart_routing.budget_limits.missing-budget"
+    )));
+}
+
+#[test]
+fn cache_aware_routing_hit_rate_boundaries_are_valid() {
+    for hit_rate in [0.0, 1.0] {
+        let mut config = minimal_valid_config();
+        config.cache_aware_routing.enabled = true;
+        config.cache_aware_routing.cost_sort_hit_rate = hit_rate;
+        assert!(
+            config.validate().is_ok(),
+            "hit_rate {hit_rate} should be valid"
+        );
     }
+}
+
+#[test]
+fn cache_aware_routing_hit_rate_out_of_range_is_rejected() {
+    for hit_rate in [1.5, -0.1] {
+        let mut config = minimal_valid_config();
+        config.cache_aware_routing.enabled = true;
+        config.cache_aware_routing.cost_sort_hit_rate = hit_rate;
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidValue { field, .. }
+                if field == "cache_aware_routing.cost_sort_hit_rate"
+            )),
+            "hit_rate {hit_rate} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn absent_cache_aware_routing_section_is_valid() {
+    // Defaults from an absent section: disabled, valid hit rate.
+    let config = minimal_valid_config();
+    assert!(!config.cache_aware_routing.enabled);
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn zero_stickiness_ttl_with_enabled_routing_is_allowed() {
+    // ttl 0 = stickiness disabled; allowed even when enabled.
+    let mut config = minimal_valid_config();
+    config.cache_aware_routing.enabled = true;
+    config.cache_aware_routing.stickiness_ttl_seconds = 0;
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn explicit_cache_breakpoint_boundaries_are_valid() {
+    for max_breakpoints in [1u32, 4] {
+        let mut config = minimal_valid_config();
+        config.model_groups[0].models[0].cache_support =
+            Some(PromptCacheSupport::Explicit { max_breakpoints });
+        assert!(
+            config.validate().is_ok(),
+            "max_breakpoints {max_breakpoints} should be valid"
+        );
+    }
+}
+
+#[test]
+fn explicit_cache_breakpoints_out_of_range_are_rejected() {
+    for max_breakpoints in [0u32, 5] {
+        let mut config = minimal_valid_config();
+        config.model_groups[0].models[0].cache_support =
+            Some(PromptCacheSupport::Explicit { max_breakpoints });
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidValue { field, .. }
+                if field
+                    == "model_groups.test-group.models.gpt-4.cache_support.max_breakpoints"
+            )),
+            "max_breakpoints {max_breakpoints} should be rejected"
+        );
+    }
+}
 
     #[test]
     fn provider_model_context_and_duplicate_specializations_are_rejected() {
@@ -1908,7 +2056,7 @@ model_groups:
                 yaml.push_str(&format!("api_key_env: \"{key}\"\n"));
             }
 
-            // Deserialize â€” must succeed
+            // Deserialize Ã¢â‚¬â€ must succeed
             let provider: Provider = serde_yaml::from_str(&yaml)
                 .expect("Provider YAML without auth_method must deserialize successfully");
 
@@ -2044,7 +2192,7 @@ model_groups:
         assert!(config.validate().is_ok());
     }
 
-    // Feature: indirect-injection-defense, task 1.3/1.4 — phase × action
+    // Feature: indirect-injection-defense, task 1.3/1.4 â€” phase Ã— action
     // matrix and unicode_stego threshold bounds.
 
     #[test]
@@ -2099,8 +2247,8 @@ model_groups:
 
     #[test]
     fn test_guardrail_matrix_accepts_field_actions_in_inbound_phases() {
-        // allow/block/mask/redact are valid in every phase (design §2.4 rows
-        // 1–2).
+        // allow/block/mask/redact are valid in every phase (design Â§2.4 rows
+        // 1â€“2).
         for phase in [StagePhase::PreCall, StagePhase::ToolResult] {
             for action in [
                 PolicyAction::Allow,
@@ -2314,7 +2462,7 @@ model_groups:
             timeout_seconds: 5,
             settings: ProviderSettings {
                 endpoint: Some("http://presidio:3000/analyze".to_string()),
-                entities: vec![], // empty â†’ rejected (Req 6.3)
+                entities: vec![], // empty Ã¢â€ â€™ rejected (Req 6.3)
                 ..Default::default()
             },
         });
@@ -2463,7 +2611,7 @@ model_groups:
         let mut guardrails = minimal_guardrails();
         guardrails.pipelines[0].refusal_phrase_list = Some(vec![
             "i can't help".to_string(),
-            "".to_string(), // empty â†’ rejected (Req 12.13)
+            "".to_string(), // empty Ã¢â€ â€™ rejected (Req 12.13)
         ]);
         let config = config_with_guardrails(guardrails);
 
@@ -2484,7 +2632,7 @@ model_groups:
         let mut guardrails = minimal_guardrails();
         guardrails.pipelines[0].refusal_phrase_list = Some(vec![
             "i can'?t (help|assist)".to_string(), // valid
-            "(unclosed".to_string(),              // invalid regex â†’ rejected (Req 12.13)
+            "(unclosed".to_string(),              // invalid regex Ã¢â€ â€™ rejected (Req 12.13)
         ]);
         let config = config_with_guardrails(guardrails);
 
@@ -2517,7 +2665,7 @@ model_groups:
 
     #[test]
     fn test_guardrail_refusal_phrase_list_none_accepted() {
-        // When refusal_phrase_list is None, default list is used â€” no validation needed.
+        // When refusal_phrase_list is None, default list is used Ã¢â‚¬â€ no validation needed.
         let guardrails = minimal_guardrails();
         assert!(guardrails.pipelines[0].refusal_phrase_list.is_none());
         let config = config_with_guardrails(guardrails);
@@ -2525,7 +2673,7 @@ model_groups:
     }
 
     // ---------------------------------------------------------------------
-    // Feature: guardrail-pipelines, Task 3.2 â€” Property 3: Pipeline
+    // Feature: guardrail-pipelines, Task 3.2 Ã¢â‚¬â€ Property 3: Pipeline
     // configuration validation.
     // **Validates: Requirements 1.1, 1.2, 1.9, 1.10**
     //
@@ -2543,7 +2691,7 @@ model_groups:
     // exercised. This lets the test independently recompute expected validity
     // and match it exactly (both directions of the iff). `PolicyAction` and
     // `StagePhase` are enums, so an invalid action/phase is unrepresentable and
-    // rejected at deserialization â€” validity is structurally guaranteed and not
+    // rejected at deserialization Ã¢â‚¬â€ validity is structurally guaranteed and not
     // separately generated here.
 
     /// Provider names declared by every generated config.
@@ -2732,7 +2880,7 @@ model_groups:
                 }
             }
 
-            // Design §2.4: phase × action matrix — `replace_with_policy_message`
+            // Design Â§2.4: phase Ã— action matrix â€” `replace_with_policy_message`
             // is invalid for the two inbound phases.
             let matrix_violations: Vec<(&str, usize)> = gen_pipelines
                 .iter()
@@ -2813,7 +2961,7 @@ model_groups:
     }
 
     // -------------------------------------------------------------------------
-    // Feature: guardrail-pipelines, Task 16.6 â€” Property 34: Refusal
+    // Feature: guardrail-pipelines, Task 16.6 Ã¢â‚¬â€ Property 34: Refusal
     // phrase-list validation rejects malformed entries.
     // **Validates: Requirements 12.13**
     //

@@ -12,7 +12,7 @@
 //! 1. Requests whose declared `Content-Length` already exceeds the limit are
 //!    rejected with 413 before the body is downloaded.
 //! 2. Otherwise, the per-request extension makes body-consuming extractors
-//!    (`Json`, `Bytes`, `Multipart`) enforce the dynamic limit natively —
+//!    (`Json`, `Bytes`, `Multipart`) enforce the dynamic limit natively Ã¢â‚¬â€
 //!    including for chunked bodies that have no `Content-Length`.
 
 use std::sync::Arc;
@@ -116,10 +116,11 @@ mod tests {
     fn minimal_config() -> Config {
         // Mirrors the minimal_config in gateway::mod::tests but kept local to
         // avoid depending on private test helpers.
-        Config {
-            server: ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: 3000,
+    Config {
+        cache_aware_routing: Default::default(),
+        server: ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3000,
                 request_timeout_seconds: 30,
                 max_request_size_mb: 10,
             },
@@ -167,17 +168,24 @@ mod tests {
                 memory: None,
                 compression: None,
                 structured_output: None,
-                models: vec![ProviderModel {
-                    provider: "test".to_string(),
-                    model: "gpt-4".to_string(),
-                    cost_per_million_input_tokens: 0.0,
-                    cost_per_million_output_tokens: 0.0,
-                    priority: 100,
+            models: vec![ProviderModel {
+                provider: "test".to_string(),
+                model: "gpt-4".to_string(),
+                cost_per_million_input_tokens: 0.0,
+                cost_per_million_output_tokens: 0.0,
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
+                priority: 100,
                     structured_output_passthrough: None,
                     tier: None,
                     context_window: 0,
-                    specializations: vec![],
-                }],
+specializations: vec![],
+cost_per_million_reasoning_tokens: None,
+reasoning_family: None,
+reasoning_parameter: None,
+}],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
             retry: RetryConfig::default(),
@@ -199,8 +207,9 @@ mod tests {
             smart_routing: Default::default(),
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
-            codex_search: None,
-        }
+codex_search: None,
+reasoning_compat: Default::default(),
+}
     }
 
     fn config_with_size_limit(max_mb: u64) -> Config {

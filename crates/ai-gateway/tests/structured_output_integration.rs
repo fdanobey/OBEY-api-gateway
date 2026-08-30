@@ -1,4 +1,4 @@
-﻿//! End-to-end structured-output validation scenarios for Wave 10 tasks 13.1-13.4.
+//! End-to-end structured-output validation scenarios for Wave 10 tasks 13.1-13.4.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -120,6 +120,7 @@ async fn build_app(
 
 fn base_config(provider_uri: &str) -> Config {
     Config {
+        cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -170,6 +171,10 @@ fn base_config(provider_uri: &str) -> Config {
             memory: None,
             structured_output: None,
             models: vec![ProviderModel {
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
                 provider: "test-provider".to_string(),
                 model: "provider-model".to_string(),
                 cost_per_million_input_tokens: 0.0,
@@ -179,6 +184,9 @@ fn base_config(provider_uri: &str) -> Config {
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -217,6 +225,7 @@ fn base_config(provider_uri: &str) -> Config {
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
+        reasoning_compat: Default::default(),
     }
 }
 

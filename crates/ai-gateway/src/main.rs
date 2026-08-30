@@ -34,6 +34,7 @@ mod metrics;
 mod models;
 mod oauth;
 mod providers;
+mod reasoning_compat;
 mod request_body_limit;
 mod router;
 mod secrets;

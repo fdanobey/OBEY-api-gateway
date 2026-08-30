@@ -68,6 +68,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Dynamic request body limit** — configurable `max_request_size_mb` (default 10 MB) enforced per-request; adjustable via admin UI or hot-reload without restart, rejects oversized payloads with HTTP 413 before forwarding
 - **Smart timeouts** — split TTFB / total timeouts with auto-detection of thinking models (o1, o3, DeepSeek-R1, Claude)
 - **Smart model routing** — complexity-aware tier selection (Fast / Balanced / Powerful) with heuristic, ML (ONNX), LLM, or composite classifiers; cascade escalation, online optimization, A/B testing, budget limits, semantic routing cache, and per-model-group overrides (see [Smart Model Routing](#smart-model-routing))
+- **Prompt-cache-aware routing** — prefix-hash sticky provider selection, automatic Anthropic-style `cache_control` breakpoint injection and advancement, cached-token-aware cost sorting and billing, and per-provider cache hit-rate telemetry with OpenRouter session affinity (see [Prompt-Cache-Aware Routing](#prompt-cache-aware-routing))
 
 ## Quick Start
 
@@ -352,6 +353,32 @@ exact_cache:
 ```
 
 The dashboard's **Cache Hit Rate** card stays at `N/A` until the first eligible request is observed, then switches to a percentage. To force traffic through the cache, send the same request twice with `temperature: 0` (or omit it).
+
+### Prompt-Cache-Aware Routing
+
+Beyond the response cache above, the gateway is aware of **upstream provider prompt caching** (Anthropic `cache_control`, OpenAI cached-token discounting, OpenRouter session affinity) and routes to keep that KV-cache state warm. Disabled by default — an absent `cache_aware_routing` section is a no-op and existing behavior is unchanged.
+
+- **Prefix-hash sticky routing** — a deterministic hash of the conversation prefix (model + tools + system + all messages except the newest user turn) maps to the provider that last served it. Subsequent turns with the same prefix are promoted to the head of the candidate list while still respecting circuit-breaker, cooldown, and rate-limit gates. An unhealthy sticky provider falls through to normal priority/cost/latency routing; the affinity entry survives and resumes when the provider recovers. Entries TTL-evict (lazy on lookup, plus a 60s background sweep) and are cleared on config hot-reload.
+- **Automatic `cache_control` breakpoint injection** — for provider models declared `cache_support: { type: explicit, max_breakpoints: 1–4 }`, the gateway strips any client-supplied markers, then places `cache_control: {"type":"ephemeral"}` breakpoints on up to `max_breakpoints - 1` blocks (priority: last tool definition → system prompt) and advances the oldest marker onto the newest cacheable turn when the prior turn reported cache creation. Only runs when the feature is enabled and the block exceeds `cache_min_tokens` (model override or `default_cache_min_tokens`) plus a 10% safety margin. `Automatic` and unset providers are never modified.
+- **Cached-token-aware cost math** — routing sort and recorded cost use cache-read and cache-creation pricing. With `cost_sort_hit_rate > 0`, the comparator weights input cost as `(read_price × h) + (write_price × (1 − h))`; `h = 0` is bit-identical to the previous base-price ordering. Recorded cost splits `prompt_tokens` into uncached / read / creation, parsing both Anthropic (`cache_read_input_tokens`, `cache_creation_input_tokens`) and OpenAI (`prompt_tokens_details.cached_tokens`) usage shapes.
+- **Telemetry** — per-provider cache read/creation tokens, effective savings (cents vs the uncached baseline), and a running hit rate are exposed in the dashboard provider table and the metrics snapshot. The SQLite `requests` log gains `cache_read_tokens`, `cache_creation_tokens`, `cache_savings_cents`, and `prefix_hash` columns (auto-migrated).
+
+```yaml
+cache_aware_routing:
+  enabled: true
+  stickiness_ttl_seconds: 300   # 0 disables stickiness only
+  default_cache_min_tokens: 1024
+  cost_sort_hit_rate: 0.8        # 0.0 keeps cost sorting identical to uncached
+
+# Per provider model (model_groups[].models[]):
+#   cost_per_million_cache_read_input_tokens: 0.30       # None → base input price
+#   cost_per_million_cache_creation_input_tokens: 3.75   # None → base input price
+#   cache_min_tokens: 1024                              # None → default above
+#   cache_support: { type: automatic }                   # OpenAI-style; never inject markers
+#   cache_support: { type: explicit, max_breakpoints: 4 }  # Anthropic-style
+```
+
+For OpenRouter (or any `provider_type: openrouter` provider), the gateway derives a deterministic `session_id` from the prefix hash (`obey-<hex>`) so intermediary stickiness aligns with gateway stickiness. Every field above is editable in the embedded admin panel's provider-model card and global Routing Settings page.
 
 ### Streaming Reliability
 
@@ -1513,3 +1540,19 @@ This project is licensed under the [MIT License](LICENSE).
 | Agent gets 429 with `loop_detected` | Loop detection hard-stop triggered | The agent is stuck in a repetitive loop. Reset the session via `POST /admin/loop-detection/sessions/{id}/reset`, or adjust thresholds/consecutive counts. Check the `dominant_signal` field for the root cause. |
 | `x-loop-warning` header appearing | Loop confidence is elevated | Not blocking yet — the agent is showing repetitive patterns. Monitor the dominant signal. If false-positive, raise thresholds or lower the relevant signal weight. |
 | Timeout on large prompts | `total_timeout_seconds` too low for model | Increase the provider's `total_timeout_seconds`. For thinking models (o1, o3, DeepSeek-R1), also check `ttfb_timeout_seconds` — these models need longer to start responding |
+
+## Reasoning-State Failover Compatibility
+
+Multi-turn conversations that carry provider reasoning state (Anthropic `thinking`/`redacted_thinking` blocks, DeepSeek `reasoning_content`, OpenRouter `reasoning` fields) fail over safely: signed thinking blocks are preserved verbatim on same-model continuations and stripped on any model transition, so failover never triggers provider 400s. Reasoning parameters are normalized per target family (`reasoning_effort` <-> `thinking.budget_tokens` <-> `thinking:{type:"adaptive"}` <-> `reasoning:{max_tokens}`), replacing the hardcoded Bedrock `budget_tokens:4096`. Reasoning tokens (including invisible ones) are priced, logged (`reasoning_tokens`, `reasoning_compat_actions` columns), and exposed in per-provider metrics.
+
+```yaml
+reasoning_compat:
+ enabled: true                    # false = exact legacy passthrough
+ strip_on_model_change: true
+ attribute_reasoning_cost: true
+ conversation_model_affinity: true # prefix-hash affinity drives preserve/strip
+ effort_budget_map: { minimal: 1024, low: 2048, medium: 8192, high: 16384, xhigh: 32768 }
+ per_provider: {}                 # optional per-provider overrides
+```
+
+Per-model overrides: `reasoning_family`, `reasoning_parameter`, `cost_per_million_reasoning_tokens` on each model entry. All controls are also available in the admin panel (Routing page). Tests: `cargo test -p ai-gateway --lib reasoning_compat`, `--test reasoning_failover_compat`, `--test reasoning_compat_property`.

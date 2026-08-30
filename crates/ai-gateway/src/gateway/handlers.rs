@@ -100,6 +100,21 @@ struct RequestLogContext {
     memories_stored: u32,
     injection_tokens: u32,
     detected_project: Option<String>,
+    /// Prompt tokens served from the upstream KV cache for this request.
+    cache_read_tokens: Option<i64>,
+    /// Prompt tokens written into the upstream cache for this request.
+    cache_creation_tokens: Option<i64>,
+    /// Effective cache savings in cents of USD
+    /// (`(base_price_cost - actual_cost) * 100`, rounded).
+    cache_savings_cents: Option<i64>,
+    /// Hex-encoded prefix affinity hash when cache-aware routing applied.
+    prefix_hash: Option<String>,
+    /// Reasoning/thinking tokens attributable to this response, extracted
+    /// from the provider usage object by the router (Req 4.7).
+    reasoning_tokens: Option<u32>,
+    /// JSON report of reasoning-compat strip/normalize actions taken for
+    /// this request: counts and model/family identifiers only (Req 4.6).
+    reasoning_compat_actions: Option<String>,
 }
 
 impl RequestLogContext {
@@ -178,6 +193,39 @@ impl RequestLogContext {
             memories_stored: 0,
             injection_tokens: 0,
             detected_project: None,
+            // Prompt-cache log telemetry (Req 4.3): the router attaches
+            // the cache token split, savings, and prefix hash to the
+            // response extras on the success path.
+            cache_read_tokens: response
+                .extra
+                .get("gateway_cache_read_tokens")
+                .and_then(|v| v.as_i64()),
+            cache_creation_tokens: response
+                .extra
+                .get("gateway_cache_creation_tokens")
+                .and_then(|v| v.as_i64()),
+            cache_savings_cents: response
+                .extra
+                .get("gateway_cache_savings_cents")
+                .and_then(|v| v.as_i64()),
+            prefix_hash: response
+                .extra
+                .get("gateway_prefix_hash")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            // Reasoning-compat telemetry (Req 4.6/4.7): the router attaches
+            // the reasoning-token count and the compat stage's actions to
+            // the response extras on the buffered success path.
+            reasoning_tokens: response
+                .extra
+                .get("gateway_reasoning_tokens")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            reasoning_compat_actions: response
+                .extra
+                .get("gateway_reasoning_compat_actions")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         }
     }
 
@@ -203,6 +251,15 @@ impl RequestLogContext {
             memories_stored: 0,
             injection_tokens: 0,
             detected_project: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            cache_savings_cents: None,
+            prefix_hash: None,
+            // Pass-through streams have no response extras to read; the
+            // reasoning usage itself is attributed to metrics inside
+            // `record_streaming_success`.
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
         }
     }
 
@@ -246,8 +303,14 @@ impl RequestLogContext {
             memories_stored: 0,
             injection_tokens: 0,
             detected_project: None,
-        }
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
+        cache_savings_cents: None,
+        prefix_hash: None,
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
     }
+}
 }
 
 /// Log a completed request to the SQLite database for the dashboard log viewer.
@@ -274,6 +337,15 @@ fn log_request(state: &super::AppState, request: &OpenAIRequest, context: &Reque
         memories_stored: context.memories_stored,
         injection_tokens: context.injection_tokens,
         detected_project: context.detected_project.clone(),
+        cache_read_tokens: context.cache_read_tokens,
+        cache_creation_tokens: context.cache_creation_tokens,
+        cache_savings_cents: context.cache_savings_cents,
+        prefix_hash: context.prefix_hash.clone(),
+        // Reasoning-compat telemetry (Req 4.6/4.7), populated by
+        // `from_response_with_compression` from the router's
+        // gateway_reasoning_* response extras.
+        reasoning_tokens: context.reasoning_tokens,
+        reasoning_compat_actions: context.reasoning_compat_actions.clone(),
     };
     if let Err(e) = state.logger.log(entry) {
         tracing::warn!(error = %e, trace_id = %context.trace_id, "Failed to write request log entry");
@@ -286,6 +358,12 @@ fn strip_gateway_response_metadata(response: &mut OpenAIResponse) {
     response.extra.remove("gateway_cost");
     response.extra.remove("gateway_compression");
     response.extra.remove("gateway_smart_routing");
+    response.extra.remove("gateway_cache_read_tokens");
+    response.extra.remove("gateway_cache_creation_tokens");
+    response.extra.remove("gateway_cache_savings_cents");
+    response.extra.remove("gateway_prefix_hash");
+    response.extra.remove("gateway_reasoning_tokens");
+    response.extra.remove("gateway_reasoning_compat_actions");
 }
 
 fn prepare_response_for_client(response: &OpenAIResponse) -> OpenAIResponse {
@@ -2387,15 +2465,16 @@ async fn chat_completions_stream(
                         // the latency tracker, accrue cost from the relay's
                         // reassembled usage, and clear any upstream-driven cooldown
                         // so a recovered provider is reselected immediately.
-                        state
-                            .router
-                            .record_streaming_success(
-                                &current_provider,
-                                &current_model,
-                                duration,
-                                &usage,
-                            )
-                            .await;
+            state
+                .router
+                .record_streaming_success(
+                    &request,
+                    &current_provider,
+                    &current_model,
+                    duration,
+                    &usage,
+                )
+                .await;
                         let duration_ms = duration.as_millis() as u64;
                         let log_context = RequestLogContext::from_streaming_success(
                             &request,

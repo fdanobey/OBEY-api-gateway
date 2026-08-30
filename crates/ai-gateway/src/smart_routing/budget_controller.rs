@@ -771,6 +771,10 @@ mod tests {
 
     fn model(input_price: f64, output_price: f64) -> ProviderModel {
         ProviderModel {
+            cache_support: None,
+            cache_min_tokens: None,
+            cost_per_million_cache_read_input_tokens: None,
+            cost_per_million_cache_creation_input_tokens: None,
             provider: "provider".to_owned(),
             model: "model".to_owned(),
             cost_per_million_input_tokens: input_price,
@@ -780,6 +784,9 @@ mod tests {
             tier: Some(SmartRoutingTier::Powerful),
             context_window: 100_000,
             specializations: vec![],
+        cost_per_million_reasoning_tokens: None,
+        reasoning_family: None,
+        reasoning_parameter: None,
         }
     }
 

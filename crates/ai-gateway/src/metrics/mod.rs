@@ -2,10 +2,11 @@ use crate::compression::{
     stats::{sanitize_operational_metadata, CompressionStats, MAX_PROVIDER_LEN},
     CompressionLevel,
 };
+use crate::router::sticky_cache::CacheUsage;
 use crate::structured_output::metrics::StructuredOutputMetrics;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -399,10 +400,31 @@ pub struct ProviderHealth {
     /// operators can see why a provider is currently failing without
     /// digging through logs.
     pub last_failure_reason: Mutex<Option<String>>,
-    /// Unix epoch seconds at which an upstream-driven cooldown
-    /// (e.g. a `Retry-After` from a 429) expires. `None` when no
-    /// cooldown is active. Used to render a countdown in the UI.
-    pub cooldown_until_timestamp: AtomicU64,
+/// Unix epoch seconds at which an upstream-driven cooldown
+/// (e.g. a `Retry-After` from a 429) expires. `None` when no
+/// cooldown is active. Used to render a countdown in the UI.
+pub cooldown_until_timestamp: AtomicU64,
+/// Cumulative prompt tokens served from the upstream KV cache
+/// (cache reads) across recorded responses (Req 4.2).
+pub cache_read_tokens: AtomicU64,
+/// Cumulative prompt tokens written into the upstream cache
+/// (cache creations) across recorded responses (Req 4.2).
+pub cache_creation_tokens: AtomicU64,
+/// Cumulative uncached prompt tokens; with the two counters above
+/// this forms the denominator of the running prompt-cache hit rate
+/// (Req 4.2).
+pub cache_uncached_tokens: AtomicU64,
+    /// Cumulative prompt-cache cost savings in whole cents versus the
+    /// uncached baseline (Req 4.2). Signed because a cache-creation
+    /// premium can make a single response cost more than the baseline.
+    pub cache_savings_cents: AtomicI64,
+    /// Cumulative reasoning/thinking tokens across recorded responses,
+    /// extracted from provider usage objects of any carrier shape and
+    /// never double-counted (Req 4.7).
+    pub reasoning_tokens: AtomicU64,
+    /// Cumulative reasoning cost in micro-dollars (USD × 1e6), stored
+    /// as an integer to avoid float atomics (Req 4.7).
+    pub reasoning_cost_usd_micros: AtomicU64,
 }
 
 /// Snapshot of current metrics for serialization
@@ -487,11 +509,37 @@ pub struct ProviderHealthSnapshot {
     /// provider has succeeded again.
     #[serde(default)]
     pub last_failure_reason: Option<String>,
-    /// Unix epoch seconds at which an upstream-driven cooldown ends.
-    /// Only set while a cooldown is active. The dashboard can use this
-    /// to render a live countdown.
+/// Unix epoch seconds at which an upstream-driven cooldown ends.
+/// Only set while a cooldown is active. The dashboard can use this
+/// to render a live countdown.
+#[serde(default)]
+pub cooldown_until_timestamp: Option<u64>,
+/// Cumulative prompt tokens served from the upstream KV cache
+/// (cache reads) across recorded responses (Req 4.2).
+#[serde(default)]
+pub cache_read_tokens: u64,
+/// Cumulative prompt tokens written into the upstream cache
+/// (cache creations) across recorded responses (Req 4.2).
+#[serde(default)]
+pub cache_creation_tokens: u64,
+/// Cumulative prompt-cache cost savings in whole cents versus the
+/// uncached baseline (Req 4.2). Signed (see [`ProviderHealth::cache_savings_cents`]).
+#[serde(default)]
+pub cache_savings_cents: i64,
+    /// Running prompt-cache hit rate across recorded responses:
+    /// `cache_read_tokens / (cache_read_tokens + cache_creation_tokens
+    /// + cache_uncached_tokens)`. `None` until at least one prompt
+    /// token has been recorded (Req 4.2).
     #[serde(default)]
-    pub cooldown_until_timestamp: Option<u64>,
+    pub cache_prompt_hit_rate: Option<f64>,
+    /// Cumulative reasoning/thinking tokens across recorded responses
+    /// (Req 4.7).
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// Cumulative reasoning cost in USD across recorded responses
+    /// (Req 4.7). Reconstructed from the micro-dollar counter.
+    #[serde(default)]
+    pub reasoning_cost_usd: f64,
 }
 
 fn default_cb_state() -> String {
@@ -768,6 +816,12 @@ impl Metrics {
                 last_failure_timestamp: AtomicU64::new(0),
                 last_failure_reason: Mutex::new(None),
                 cooldown_until_timestamp: AtomicU64::new(0),
+                cache_read_tokens: AtomicU64::new(0),
+                cache_creation_tokens: AtomicU64::new(0),
+                cache_uncached_tokens: AtomicU64::new(0),
+                cache_savings_cents: AtomicI64::new(0),
+                reasoning_tokens: AtomicU64::new(0),
+                reasoning_cost_usd_micros: AtomicU64::new(0),
             });
 
         health.total_requests.fetch_add(1, Ordering::Relaxed);
@@ -821,6 +875,12 @@ impl Metrics {
                 last_failure_timestamp: AtomicU64::new(0),
                 last_failure_reason: Mutex::new(None),
                 cooldown_until_timestamp: AtomicU64::new(0),
+                cache_read_tokens: AtomicU64::new(0),
+                cache_creation_tokens: AtomicU64::new(0),
+                cache_uncached_tokens: AtomicU64::new(0),
+                cache_savings_cents: AtomicI64::new(0),
+                reasoning_tokens: AtomicU64::new(0),
+                reasoning_cost_usd_micros: AtomicU64::new(0),
             });
 
         health.total_requests.fetch_add(1, Ordering::Relaxed);
@@ -861,6 +921,12 @@ impl Metrics {
                 last_failure_timestamp: AtomicU64::new(0),
                 last_failure_reason: Mutex::new(None),
                 cooldown_until_timestamp: AtomicU64::new(0),
+                cache_read_tokens: AtomicU64::new(0),
+                cache_creation_tokens: AtomicU64::new(0),
+                cache_uncached_tokens: AtomicU64::new(0),
+                cache_savings_cents: AtomicI64::new(0),
+                reasoning_tokens: AtomicU64::new(0),
+                reasoning_cost_usd_micros: AtomicU64::new(0),
             });
 
         if let Ok(mut slot) = health.last_failure_reason.lock() {
@@ -917,17 +983,104 @@ impl Metrics {
         }
     }
 
-    /// Add cost to cumulative total and per-provider tracking
-    pub fn add_cost(&self, provider: &str, cost: f64) {
-        let cost_cents = (cost * 100.0) as u64;
-        self.cumulative_cost_cents
-            .fetch_add(cost_cents, Ordering::Relaxed);
+/// Add cost to cumulative total and per-provider tracking
+pub fn add_cost(&self, provider: &str, cost: f64) {
+let cost_cents = (cost * 100.0) as u64;
+self.cumulative_cost_cents
+.fetch_add(cost_cents, Ordering::Relaxed);
 
-        self.cost_by_provider_cents
-            .entry(provider.to_string())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(cost_cents, Ordering::Relaxed);
-    }
+self.cost_by_provider_cents
+.entry(provider.to_string())
+.or_insert_with(|| AtomicU64::new(0))
+.fetch_add(cost_cents, Ordering::Relaxed);
+}
+
+/// Record prompt-cache token usage and realized savings for a
+/// provider's response (Req 4.2). Mirrors [`Metrics::add_cost`]:
+/// lock-free atomic accumulation on the provider's health entry.
+///
+/// Counters are running totals, so the prompt-cache hit rate is
+/// derived at snapshot time as
+/// `read / (read + creation + uncached)` and stays `None` until at
+/// least one prompt token has been recorded (divide-by-zero guard).
+/// `savings_cents` may be negative when a cache-creation premium
+/// exceeded the read discount on a response.
+pub fn add_cache_usage(&self, provider: &str, usage: CacheUsage, savings_cents: i64) {
+let health = self
+.provider_health
+.entry(provider.to_string())
+.or_insert_with(|| ProviderHealth {
+total_requests: AtomicU64::new(0),
+successful_requests: AtomicU64::new(0),
+failed_requests: AtomicU64::new(0),
+total_response_time_ms: AtomicU64::new(0),
+last_success_timestamp: AtomicU64::new(0),
+last_failure_timestamp: AtomicU64::new(0),
+last_failure_reason: Mutex::new(None),
+cooldown_until_timestamp: AtomicU64::new(0),
+cache_read_tokens: AtomicU64::new(0),
+cache_creation_tokens: AtomicU64::new(0),
+            cache_uncached_tokens: AtomicU64::new(0),
+            cache_savings_cents: AtomicI64::new(0),
+            reasoning_tokens: AtomicU64::new(0),
+            reasoning_cost_usd_micros: AtomicU64::new(0),
+        });
+
+    health
+        .cache_read_tokens
+        .fetch_add(usage.cache_read_input_tokens, Ordering::Relaxed);
+health
+.cache_creation_tokens
+.fetch_add(usage.cache_creation_input_tokens, Ordering::Relaxed);
+health
+.cache_uncached_tokens
+.fetch_add(usage.uncached_input_tokens, Ordering::Relaxed);
+    health
+        .cache_savings_cents
+        .fetch_add(savings_cents, Ordering::Relaxed);
+}
+
+/// Accumulate per-provider reasoning-token usage and cost (Req 4.7).
+///
+/// `reasoning_tokens` is the count extracted from the response usage
+/// object (any carrier shape, never double-counted) and
+/// `reasoning_cost_usd` its price; both are attributed to the provider
+/// that actually served the response. The cost is accumulated as
+/// integer micro-dollars to keep the counters lock-free.
+pub fn add_reasoning_usage(
+    &self,
+    provider: &str,
+    reasoning_tokens: u64,
+    reasoning_cost_usd: f64,
+) {
+    let health = self
+        .provider_health
+        .entry(provider.to_string())
+        .or_insert_with(|| ProviderHealth {
+            total_requests: AtomicU64::new(0),
+            successful_requests: AtomicU64::new(0),
+            failed_requests: AtomicU64::new(0),
+            total_response_time_ms: AtomicU64::new(0),
+            last_success_timestamp: AtomicU64::new(0),
+            last_failure_timestamp: AtomicU64::new(0),
+            last_failure_reason: Mutex::new(None),
+            cooldown_until_timestamp: AtomicU64::new(0),
+            cache_read_tokens: AtomicU64::new(0),
+            cache_creation_tokens: AtomicU64::new(0),
+            cache_uncached_tokens: AtomicU64::new(0),
+            cache_savings_cents: AtomicI64::new(0),
+            reasoning_tokens: AtomicU64::new(0),
+            reasoning_cost_usd_micros: AtomicU64::new(0),
+        });
+
+    health
+        .reasoning_tokens
+        .fetch_add(reasoning_tokens, Ordering::Relaxed);
+    let cost_micros = (reasoning_cost_usd.max(0.0) * 1_000_000.0).round() as u64;
+    health
+        .reasoning_cost_usd_micros
+        .fetch_add(cost_micros, Ordering::Relaxed);
+}
 
     /// Record a retry and its applied delay for a provider.
     pub fn record_provider_retry(&self, provider: &str, delay_ms: u64) {
@@ -1756,13 +1909,31 @@ Total unicode_stego provider detections by category and phase\n",
                     HealthStatus::Unhealthy
                 };
 
-                let last_failure_reason = health
-                    .last_failure_reason
-                    .lock()
-                    .ok()
-                    .and_then(|guard| guard.clone());
+let last_failure_reason = health
+.last_failure_reason
+.lock()
+.ok()
+.and_then(|guard| guard.clone());
 
-                let cooldown_until_raw = health.cooldown_until_timestamp.load(Ordering::Relaxed);
+let cache_read_tokens = health.cache_read_tokens.load(Ordering::Relaxed);
+let cache_creation_tokens = health.cache_creation_tokens.load(Ordering::Relaxed);
+let cache_uncached_tokens = health.cache_uncached_tokens.load(Ordering::Relaxed);
+// Divide-by-zero guard: leave the hit rate unset until at least one
+// prompt token has been recorded for this provider (Req 4.2).
+let cache_denominator = cache_read_tokens
+.saturating_add(cache_creation_tokens)
+.saturating_add(cache_uncached_tokens);
+let cache_prompt_hit_rate = if cache_denominator > 0 {
+Some(cache_read_tokens as f64 / cache_denominator as f64)
+} else {
+None
+};
+        let cache_savings_cents = health.cache_savings_cents.load(Ordering::Relaxed);
+        let reasoning_tokens = health.reasoning_tokens.load(Ordering::Relaxed);
+        let reasoning_cost_usd =
+            health.reasoning_cost_usd_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+
+let cooldown_until_raw = health.cooldown_until_timestamp.load(Ordering::Relaxed);
                 let now_secs = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -1792,13 +1963,19 @@ Total unicode_stego provider detections by category and phase\n",
                     } else {
                         None
                     },
-                    status,
-                    circuit_breaker_state: "closed".to_string(),
-                    last_failure_reason,
-                    cooldown_until_timestamp,
-                }
-            })
-            .collect();
+            status,
+            circuit_breaker_state: "closed".to_string(),
+            last_failure_reason,
+            cooldown_until_timestamp,
+            cache_read_tokens,
+            cache_creation_tokens,
+            cache_savings_cents,
+            cache_prompt_hit_rate,
+            reasoning_tokens,
+            reasoning_cost_usd,
+        }
+    })
+    .collect();
 
         let cost_by_provider: Vec<(String, f64)> = self
             .cost_by_provider_cents
@@ -2299,17 +2476,148 @@ mod tests {
         assert_eq!(rate_limit_exhaustions, 1);
     }
 
-    #[test]
-    fn test_cache_hit_rate() {
-        let metrics = Metrics::new();
+#[test]
+fn test_cache_hit_rate() {
+let metrics = Metrics::new();
 
-        metrics.record_cache_hit();
-        metrics.record_cache_hit();
-        metrics.record_cache_miss();
+metrics.record_cache_hit();
+metrics.record_cache_hit();
+metrics.record_cache_miss();
 
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.cache_hit_rate, Some(2.0 / 3.0));
-    }
+let snapshot = metrics.snapshot();
+assert_eq!(snapshot.cache_hit_rate, Some(2.0 / 3.0));
+}
+
+#[test]
+fn test_provider_cache_usage_tracking() {
+let metrics = Metrics::new();
+
+metrics.add_cache_usage(
+"provider1",
+CacheUsage {
+cache_read_input_tokens: 800,
+cache_creation_input_tokens: 200,
+uncached_input_tokens: 0,
+},
+12,
+);
+metrics.add_cache_usage(
+"provider1",
+CacheUsage {
+cache_read_input_tokens: 900,
+cache_creation_input_tokens: 0,
+uncached_input_tokens: 100,
+},
+7,
+);
+
+let snapshot = metrics.snapshot();
+let health = snapshot
+.provider_health
+.iter()
+.find(|h| h.provider == "provider1")
+.unwrap();
+
+assert_eq!(health.cache_read_tokens, 1700);
+assert_eq!(health.cache_creation_tokens, 200);
+assert_eq!(health.cache_savings_cents, 19);
+// 1700 read / (1700 read + 200 creation + 100 uncached) = 0.85
+assert_eq!(health.cache_prompt_hit_rate, Some(0.85));
+}
+
+#[test]
+fn test_provider_cache_hit_rate_none_until_prompt_tokens_recorded() {
+let metrics = Metrics::new();
+
+// Provider exists in the health map (request recorded) but no
+// cache usage yet: the hit rate must stay None (divide-by-zero
+// guard), not panic or default to 0.0.
+metrics.record_provider_success("provider1", 50);
+
+let snapshot = metrics.snapshot();
+let health = snapshot
+.provider_health
+.iter()
+.find(|h| h.provider == "provider1")
+.unwrap();
+
+assert_eq!(health.cache_read_tokens, 0);
+assert_eq!(health.cache_creation_tokens, 0);
+assert_eq!(health.cache_savings_cents, 0);
+assert_eq!(health.cache_prompt_hit_rate, None);
+}
+
+#[test]
+fn test_provider_cache_usage_all_uncached_and_negative_savings() {
+    let metrics = Metrics::new();
+
+    // Fully uncached response with a net cache-write premium: hit
+    // rate 0.0 and negative (accumulating) savings.
+    metrics.add_cache_usage(
+        "provider1",
+        CacheUsage {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            uncached_input_tokens: 500,
+        },
+        -3,
+    );
+
+    let snapshot = metrics.snapshot();
+    let health = snapshot
+        .provider_health
+        .iter()
+        .find(|h| h.provider == "provider1")
+        .unwrap();
+
+    assert_eq!(health.cache_prompt_hit_rate, Some(0.0));
+    assert_eq!(health.cache_savings_cents, -3);
+}
+
+#[test]
+fn test_provider_reasoning_usage_accumulates() {
+    let metrics = Metrics::new();
+
+    metrics.add_reasoning_usage("provider1", 500, 0.015);
+    metrics.add_reasoning_usage("provider1", 250, 0.0075);
+    metrics.add_reasoning_usage("provider2", 4096, 0.12288);
+
+    let snapshot = metrics.snapshot();
+    let health = snapshot
+        .provider_health
+        .iter()
+        .find(|h| h.provider == "provider1")
+        .unwrap();
+    assert_eq!(health.reasoning_tokens, 750);
+    assert!((health.reasoning_cost_usd - 0.0225).abs() < 1e-9);
+
+    let other = snapshot
+        .provider_health
+        .iter()
+        .find(|h| h.provider == "provider2")
+        .unwrap();
+    assert_eq!(other.reasoning_tokens, 4096);
+    assert!((other.reasoning_cost_usd - 0.12288).abs() < 1e-9);
+}
+
+#[test]
+fn test_provider_reasoning_usage_zero_until_recorded() {
+    let metrics = Metrics::new();
+
+    // Provider exists in the health map (request recorded) but no
+    // reasoning usage yet: counters must read zero, not panic.
+    metrics.record_provider_success("provider1", 50);
+
+    let snapshot = metrics.snapshot();
+    let health = snapshot
+        .provider_health
+        .iter()
+        .find(|h| h.provider == "provider1")
+        .unwrap();
+
+    assert_eq!(health.reasoning_tokens, 0);
+    assert_eq!(health.reasoning_cost_usd, 0.0);
+}
 
     #[test]
     fn structured_output_prometheus_is_exposed_through_metrics() {

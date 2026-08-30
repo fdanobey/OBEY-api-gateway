@@ -928,6 +928,10 @@ mod tests {
 
     fn candidate(name: &str, context_window: u32, tier: SmartRoutingTier) -> ProviderModel {
         ProviderModel {
+            cache_support: None,
+            cache_min_tokens: None,
+            cost_per_million_cache_read_input_tokens: None,
+            cost_per_million_cache_creation_input_tokens: None,
             provider: "test".to_string(),
             model: name.to_string(),
             cost_per_million_input_tokens: 0.0,
@@ -937,6 +941,9 @@ mod tests {
             tier: Some(tier),
             context_window,
             specializations: Vec::new(),
+        cost_per_million_reasoning_tokens: None,
+        reasoning_family: None,
+        reasoning_parameter: None,
         }
     }
 
@@ -946,6 +953,10 @@ mod tests {
         specializations: Vec<TaskType>,
     ) -> ProviderModel {
         ProviderModel {
+            cache_support: None,
+            cache_min_tokens: None,
+            cost_per_million_cache_read_input_tokens: None,
+            cost_per_million_cache_creation_input_tokens: None,
             provider: format!("provider-{index}"),
             model: format!("model-{index}"),
             cost_per_million_input_tokens: index as f64 / 10.0,
@@ -955,6 +966,9 @@ mod tests {
             tier,
             context_window: 8_192 + index as u32 * 1_024,
             specializations,
+        cost_per_million_reasoning_tokens: None,
+        reasoning_family: None,
+        reasoning_parameter: None,
         }
     }
 

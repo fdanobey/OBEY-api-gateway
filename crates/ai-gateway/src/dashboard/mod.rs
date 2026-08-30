@@ -643,9 +643,9 @@ fn mime_from_path(path: &str) -> &'static str {
     }
 }
 
-// ─── Tool Compression Dashboard Handlers ──────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Tool Compression Dashboard Handlers Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
-/// GET /dashboard/tool-compression/config — serve current tool compression config as JSON.
+/// GET /dashboard/tool-compression/config Ã¢â‚¬â€ serve current tool compression config as JSON.
 async fn tool_compression_config_handler(State(state): State<AppState>) -> Response {
     let config = state.config.read().await;
     let tc_config = &config.tool_compression;
@@ -656,7 +656,7 @@ async fn tool_compression_config_handler(State(state): State<AppState>) -> Respo
         .into_response()
 }
 
-/// GET /dashboard/tool-compression/overrides — serve per-model-group overrides.
+/// GET /dashboard/tool-compression/overrides Ã¢â‚¬â€ serve per-model-group overrides.
 async fn tool_compression_overrides_handler(State(state): State<AppState>) -> Response {
     let config = state.config.read().await;
     let overrides = &config.tool_compression.model_group_overrides;
@@ -667,7 +667,7 @@ async fn tool_compression_overrides_handler(State(state): State<AppState>) -> Re
         .into_response()
 }
 
-/// GET /dashboard/tool-compression/stats — serve real-time compression statistics.
+/// GET /dashboard/tool-compression/stats Ã¢â‚¬â€ serve real-time compression statistics.
 async fn tool_compression_stats_handler(State(state): State<AppState>) -> Response {
     let tc_state = &state.tool_compression_state;
 
@@ -702,7 +702,7 @@ async fn tool_compression_stats_handler(State(state): State<AppState>) -> Respon
     (StatusCode::OK, Json(stats)).into_response()
 }
 
-/// POST /dashboard/tool-compression/test — apply compression to sample input.
+/// POST /dashboard/tool-compression/test Ã¢â‚¬â€ apply compression to sample input.
 ///
 /// Accepts `{"tools": [...]}`, runs the configured compression pipeline stages,
 /// and returns a side-by-side comparison of original vs compressed output with
@@ -836,7 +836,7 @@ async fn tool_compression_test_handler(
         .into_response()
 }
 
-/// GET /dashboard/tool-compression/activity — pruning and disclosure activity.
+/// GET /dashboard/tool-compression/activity Ã¢â‚¬â€ pruning and disclosure activity.
 async fn tool_compression_activity_handler(State(state): State<AppState>) -> Response {
     let tc_state = &state.tool_compression_state;
     let config = state.config.read().await;
@@ -966,6 +966,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            cache_aware_routing: Default::default(),
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 8080,
@@ -1016,6 +1017,10 @@ mod tests {
                 structured_output: None,
                 memory: None,
                 models: vec![ProviderModel {
+                    cache_support: None,
+                    cache_min_tokens: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
                     provider: "test-provider".to_string(),
                     model: "gpt-4".to_string(),
                     cost_per_million_input_tokens: 0.0,
@@ -1024,8 +1029,11 @@ mod tests {
                     structured_output_passthrough: None,
                     tier: None,
                     context_window: 0,
-                    specializations: vec![],
-                }],
+specializations: vec![],
+cost_per_million_reasoning_tokens: None,
+reasoning_family: None,
+reasoning_parameter: None,
+}],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
             retry: RetryConfig::default(),
@@ -1048,8 +1056,9 @@ mod tests {
             memory: None,
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
-            codex_search: None,
-        }
+codex_search: None,
+reasoning_compat: Default::default(),
+}
     }
 
     fn compression_stats(request_id: impl Into<String>) -> CompressionStats {
@@ -1335,13 +1344,19 @@ mod tests {
                         timed_out: false,
                         error: false,
                     }),
-                    memories_injected: 0,
-                    memories_stored: 0,
-                    injection_tokens: 0,
-                    detected_project: None,
-                })
-                .unwrap();
-        }
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            cache_savings_cents: None,
+            prefix_hash: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
+        })
+        .unwrap();
+    }
 
         let response = server
             .build_router()
@@ -1393,8 +1408,14 @@ mod tests {
                 memories_stored: 0,
                 injection_tokens: 0,
                 detected_project: None,
-            })
-            .unwrap();
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            cache_savings_cents: None,
+            prefix_hash: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
+        })
+        .unwrap();
 
         let app = server.build_router();
         let response = app

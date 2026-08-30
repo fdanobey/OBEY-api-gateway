@@ -58,7 +58,7 @@ pub struct AppState {
     /// `None` (inner) when no `guardrails` section is configured. Wrapped in an
     /// `Arc<RwLock<..>>` so hot-reload can swap in a freshly built engine while
     /// in-flight requests keep the `Arc<GuardrailEngine>` they cloned at request
-    /// start — mirroring how `config: Arc<RwLock<Config>>` is snapshotted.
+    /// start ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â mirroring how `config: Arc<RwLock<Config>>` is snapshotted.
     /// Handlers (tasks 13.2/13.3) take a snapshot with
     /// `state.guardrail_engine.read().await.clone()` and run the whole request
     /// against that clone.
@@ -310,7 +310,7 @@ impl GatewayServer {
         use handlers::*;
 
         let api_routes = Router::new()
-            // Chat completions — streaming & non-streaming (Req 2.1)
+            // Chat completions ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â streaming & non-streaming (Req 2.1)
             .route("/v1/chat/completions", post(chat_completions))
             // Legacy completions (Req 2.2)
             .route("/v1/completions", post(completions))
@@ -476,7 +476,7 @@ impl GatewayServer {
             tracing::warn!("Dashboard routes are disabled by configuration");
         }
 
-        // Prometheus metrics endpoint (Req 20.7-20.11) — conditional on config
+        // Prometheus metrics endpoint (Req 20.7-20.11) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â conditional on config
         if let Some(prom) = prometheus_cfg {
             if prom.enabled {
                 router = router.route(&prom.path, get(handlers::prometheus_metrics));
@@ -587,6 +587,17 @@ crate::request_body_limit::request_body_limit_middleware,
             }
         });
 
+        // Sweep expired prompt-cache sticky entries every 60s (lazy
+        // eviction already covers lookups; this bounds memory growth).
+        let sticky_router = self.state.router.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                sticky_router.evict_expired_sticky_entries();
+            }
+        });
+
         if let Some(rustls_config) = rustls_config {
             // Req 36.1: HTTPS only when TLS enabled
             let addr_parsed: std::net::SocketAddr = addr.parse().map_err(|e| {
@@ -626,9 +637,9 @@ crate::request_body_limit::request_body_limit_middleware,
                 .map_err(|e| GatewayError::Http(format!("Server error: {}", e)))?;
         }
 
-        // Server has stopped — all in-flight requests are complete.
+        // Server has stopped ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â all in-flight requests are complete.
         // Flush metrics and close database connections (Req 18.3, 18.4).
-        tracing::info!("In-flight requests drained, cleaning up resources…");
+        tracing::info!("In-flight requests drained, cleaning up resourcesÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦");
         metrics.flush();
         logger.flush();
         tracing::info!("Graceful shutdown complete");
@@ -657,7 +668,7 @@ crate::request_body_limit::request_body_limit_middleware,
             .filter_map(|o| {
                 if o == "*" {
                     tracing::warn!(
-                        "CORS wildcard origin configured — review security implications"
+                        "CORS wildcard origin configured ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â review security implications"
                     );
                 }
                 o.parse().ok()
@@ -808,9 +819,10 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     state
         .router
         .reload_compression_runtime(compression, precompressed_manager);
-    state.router.clear_circuit_breakers();
-    state.router.clear_rate_limiters();
-    state.router.clear_http_clients();
+        state.router.clear_circuit_breakers();
+        state.router.clear_rate_limiters();
+        state.router.clear_sticky_cache();
+        state.router.clear_http_clients();
     state.router.clear_model_capabilities();
 
     // Reset tool compression state on config reload (feedback loops, descriptions, etc.)
@@ -934,8 +946,8 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => tracing::info!("Received SIGINT, shutting down…"),
-        _ = terminate => tracing::info!("Received SIGTERM, shutting down…"),
+        _ = ctrl_c => tracing::info!("Received SIGINT, shutting downÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦"),
+        _ = terminate => tracing::info!("Received SIGTERM, shutting downÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦"),
     }
 }
 
@@ -955,6 +967,7 @@ mod tests {
 
     fn minimal_config() -> Config {
         Config {
+            cache_aware_routing: Default::default(),
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0, // OS-assigned
@@ -1006,6 +1019,10 @@ mod tests {
                 compression: None,
                 structured_output: None,
                 models: vec![ProviderModel {
+                    cache_support: None,
+                    cache_min_tokens: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
                     provider: "test".to_string(),
                     model: "gpt-4".to_string(),
                     cost_per_million_input_tokens: 0.0,
@@ -1014,8 +1031,11 @@ mod tests {
                     structured_output_passthrough: None,
                     tier: None,
                     context_window: 0,
-                    specializations: vec![],
-                }],
+specializations: vec![],
+cost_per_million_reasoning_tokens: None,
+reasoning_family: None,
+reasoning_parameter: None,
+}],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
             retry: RetryConfig::default(),
@@ -1037,8 +1057,9 @@ mod tests {
             smart_routing: Default::default(),
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
-            codex_search: None,
-        }
+codex_search: None,
+reasoning_compat: Default::default(),
+}
     }
 
     #[tokio::test]
@@ -1390,7 +1411,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_body_limit() {
-        // Validates: Req 45.3 — default 10 MB
+        // Validates: Req 45.3 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â default 10 MB
         let cfg = minimal_config();
         assert_eq!(cfg.server.max_request_size_mb, 10);
         let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -1488,7 +1509,7 @@ mod tests {
         let trace_layer = TraceLayer::new_for_http();
         drop(config);
 
-        // A trivial handler that consumes the full body — triggers limit check
+        // A trivial handler that consumes the full body ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â triggers limit check
         async fn echo_handler(body: Bytes) -> String {
             format!("{}", body.len())
         }
@@ -1606,6 +1627,10 @@ mod tests {
                                .or_insert_with(|| prov_name.clone());
 
                            models.push(ProviderModel {
+                               cache_support: None,
+                               cache_min_tokens: None,
+                               cost_per_million_cache_read_input_tokens: None,
+                               cost_per_million_cache_creation_input_tokens: None,
                                provider: prov_name,
                                model: model_name,
                                cost_per_million_input_tokens: 0.0,
@@ -1615,6 +1640,9 @@ mod tests {
     tier: None,
     context_window: 0,
     specializations: vec![],
+                           cost_per_million_reasoning_tokens: None,
+                           reasoning_family: None,
+                           reasoning_parameter: None,
                            });
                        }
 
@@ -1629,6 +1657,7 @@ mod tests {
                    }
 
                    let cfg = Config {
+                       cache_aware_routing: Default::default(),
                        server: ServerConfig {
                            host: "127.0.0.1".to_string(),
                            port: 0,
@@ -1662,10 +1691,11 @@ mod tests {
         smart_routing: Default::default(),
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
-        codex_search: None,
-    };
+codex_search: None,
+reasoning_compat: Default::default(),
+};
 
-                   let server = GatewayServer::new(cfg, None).await.unwrap();
+let server = GatewayServer::new(cfg, None).await.unwrap();
                    let app = server.build_router();
 
                    // Hit GET /v1/models
@@ -1698,7 +1728,7 @@ mod tests {
                        );
                    }
 
-                   // Req 24.2: union — every unique model from config must appear
+                   // Req 24.2: union ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â every unique model from config must appear
                    for model_id in expected_unique_models.keys() {
                        prop_assert!(
                            seen_ids.contains(model_id.as_str()),
@@ -1887,7 +1917,7 @@ mod tests {
                 let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
                 if !tls_enabled {
-                    // Case: TLS disabled explicitly → validate_tls returns Ok(None) → HTTP mode
+                    // Case: TLS disabled explicitly ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ validate_tls returns Ok(None) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ HTTP mode
                     let tls_cfg = Some(TlsConfig {
                         enabled: false,
                         cert_path: "/nonexistent/cert.pem".to_string(),
@@ -1897,12 +1927,12 @@ mod tests {
                     prop_assert!(result.is_ok(), "Disabled TLS should return Ok");
                     prop_assert!(result.unwrap().is_none(), "Disabled TLS should return None (HTTP mode)");
 
-                    // Case: TLS config is None → validate_tls returns Ok(None) → HTTP mode
+                    // Case: TLS config is None ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ validate_tls returns Ok(None) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ HTTP mode
                     let result_none = GatewayServer::validate_tls(&None).await;
                     prop_assert!(result_none.is_ok(), "None TLS should return Ok");
                     prop_assert!(result_none.unwrap().is_none(), "None TLS should return None (HTTP mode)");
                 } else if !has_valid_files {
-                    // Case: TLS enabled but cert/key files don't exist → must error
+                    // Case: TLS enabled but cert/key files don't exist ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ must error
                     let tls_cfg = Some(TlsConfig {
                         enabled: true,
                         cert_path: "/nonexistent/cert.pem".to_string(),
@@ -1911,7 +1941,7 @@ mod tests {
                     let result = GatewayServer::validate_tls(&tls_cfg).await;
                     prop_assert!(result.is_err(), "TLS enabled with missing files must return Err");
                 } else {
-                    // Case: TLS enabled with valid cert/key files → must return Ok(Some(_)) → HTTPS mode
+                    // Case: TLS enabled with valid cert/key files ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ must return Ok(Some(_)) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ HTTPS mode
                     let key_pair = rcgen::KeyPair::generate().unwrap();
                     let cert_signed = rcgen::CertificateParams::new(vec!["localhost".to_string()])
                         .unwrap()
@@ -2080,7 +2110,7 @@ mod tests {
                 let server = GatewayServer::new(cfg, None).await.unwrap();
                 let app = build_test_router(&server);
 
-                // --- Oversized request: body exceeds limit by 1 byte → must get 413 ---
+                // --- Oversized request: body exceeds limit by 1 byte ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ must get 413 ---
                 let oversized_body = vec![b'x'; expected_limit_bytes + 1];
                 let req = Request::builder()
                     .method("POST")
@@ -2098,7 +2128,7 @@ mod tests {
                     max_mb
                 );
 
-                // --- Within-limit request: body exactly at limit → must NOT get 413 ---
+                // --- Within-limit request: body exactly at limit ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ must NOT get 413 ---
                 let ok_body = vec![b'x'; expected_limit_bytes];
                 let req = Request::builder()
                     .method("POST")
@@ -2169,6 +2199,7 @@ mod tests {
                    // 3. Build a NEW valid config with different settings
                    let new_provider_name = format!("prov-{}", provider_suffix);
                    let new_cfg = Config {
+                       cache_aware_routing: Default::default(),
                        server: ServerConfig {
                            host: "127.0.0.1".to_string(),
                            port: new_port,
@@ -2220,6 +2251,10 @@ mod tests {
                            compression: None,
                            structured_output: None,
                            models: vec![ProviderModel {
+                               cache_support: None,
+                               cache_min_tokens: None,
+                               cost_per_million_cache_read_input_tokens: None,
+                               cost_per_million_cache_creation_input_tokens: None,
                                provider: new_provider_name.clone(),
                                model: "gpt-4".to_string(),
                                cost_per_million_input_tokens: 0.0,
@@ -2229,6 +2264,9 @@ mod tests {
     tier: None,
     context_window: 0,
     specializations: vec![],
+                           cost_per_million_reasoning_tokens: None,
+                           reasoning_family: None,
+                           reasoning_parameter: None,
                            }],
                        }],
                        circuit_breaker: CircuitBreakerConfig::default(),
@@ -2251,10 +2289,11 @@ mod tests {
         smart_routing: Default::default(),
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
-        codex_search: None,
-    };
+codex_search: None,
+reasoning_compat: Default::default(),
+};
 
-                   // Write new config to disk
+// Write new config to disk
                    let new_yaml = serde_yaml::to_string(&new_cfg).unwrap();
                    std::fs::write(&config_path, &new_yaml).unwrap();
 

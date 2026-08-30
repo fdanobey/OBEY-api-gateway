@@ -12,7 +12,10 @@ use crate::{
         stats::{sanitize_operational_metadata, CompressionStats, MAX_ENGINE_LABEL_LEN},
         CompressionLevel,
     },
-    config::LoggingConfig,
+    config::{LoggingConfig, ProviderModel},
+    models::openai::Usage as OpenAIUsage,
+    router::cache_cost::{compute_actual_cost, extract_cache_usage},
+    router::sticky_cache::CacheUsage,
 };
 
 #[derive(Debug, Error)]
@@ -180,6 +183,108 @@ pub struct LogEntry {
     pub injection_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_project: Option<String>,
+    /// Prompt tokens served from the upstream KV cache for this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<i64>,
+    /// Prompt tokens written into the upstream cache for this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<i64>,
+    /// Effective cache savings in cents of USD, rounded:
+    /// `(base_price_cost - actual_cost) * 100`. Negative when cache-creation
+    /// surcharges exceed cache-read savings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_savings_cents: Option<i64>,
+    /// Hex-encoded prefix affinity hash ([`encode_prefix_hash`]) when
+    /// cache-aware routing computed one for this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_hash: Option<String>,
+    /// Reasoning/thinking tokens attributable to this response, extracted
+    /// from the provider usage object (any carrier shape, never
+    /// double-counted) (Req 4.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+    /// JSON report of reasoning-compat strip/normalize actions taken for
+    /// this request: counts and model/family identifiers only, never
+    /// reasoning payloads, signatures, or redacted data (Req 4.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_compat_actions: Option<String>,
+}
+
+impl LogEntry {
+    /// Builder-style setter for the cache telemetry columns.
+    ///
+    /// Router-side wiring seam: success paths that already hold a
+    /// [`CacheUsage`], the computed savings cents, and the prefix hash call
+    /// `entry.with_cache(Some(&usage), savings_cents, Some(hash))` before
+    /// `logger.log(entry)`; callers without cache data pass `None` and the
+    /// columns stay NULL.
+    pub fn with_cache(
+        mut self,
+        cache_usage: Option<&CacheUsage>,
+        cache_savings_cents: Option<i64>,
+        prefix_hash: Option<u64>,
+    ) -> Self {
+        if let Some(usage) = cache_usage {
+            let (read, creation) = cache_usage_token_columns(usage);
+            self.cache_read_tokens = read;
+            self.cache_creation_tokens = creation;
+        }
+        self.cache_savings_cents = cache_savings_cents;
+        self.prefix_hash = prefix_hash.map(encode_prefix_hash);
+        self
+    }
+
+    /// Builder-style setter for the reasoning telemetry columns.
+    ///
+    /// Router-side wiring seam: success paths that extracted reasoning
+    /// usage (`reasoning_compat::cost::extract_reasoning_usage`) and a
+    /// compat strip/normalize report call
+    /// `entry.with_reasoning_usage(Some(tokens), Some(report_json))`
+    /// before `logger.log(entry)`; callers without reasoning data pass
+    /// `None` and the columns stay NULL.
+    pub fn with_reasoning_usage(
+        mut self,
+        reasoning_tokens: Option<u32>,
+        actions: Option<String>,
+    ) -> Self {
+        self.reasoning_tokens = reasoning_tokens;
+        self.reasoning_compat_actions = actions;
+        self
+    }
+}
+
+/// Hex-encodes a prefix affinity hash as 16 lowercase hex digits.
+pub fn encode_prefix_hash(hash: u64) -> String {
+    format!("{hash:016x}")
+}
+
+/// Maps a [`CacheUsage`] into the `(cache_read_tokens, cache_creation_tokens)`
+/// log columns, widening the `u64` counts through `i64::try_from`.
+pub fn cache_usage_token_columns(usage: &CacheUsage) -> (Option<i64>, Option<i64>) {
+    (
+        i64::try_from(usage.cache_read_input_tokens).ok(),
+        i64::try_from(usage.cache_creation_input_tokens).ok(),
+    )
+}
+
+/// Computes the effective cache savings of a completed response in cents.
+///
+/// `savings = round((base_price_cost - actual_cost) * 100)` where
+/// `base_price_cost` prices every prompt token at the uncached input rate —
+/// what the turn would have cost without prompt caching — and `actual_cost`
+/// is [`compute_actual_cost`] with the model's cache prices. Returns `None`
+/// when the usage object reports no cached tokens, so cache-unaware requests
+/// keep NULL columns.
+pub fn compute_cache_savings_cents(model: &ProviderModel, usage: &OpenAIUsage) -> Option<i64> {
+    let cache = extract_cache_usage(usage);
+    if cache.cache_read_input_tokens == 0 && cache.cache_creation_input_tokens == 0 {
+        return None;
+    }
+    let base_cost = (f64::from(usage.prompt_tokens) * model.cost_per_million_input_tokens
+        + f64::from(usage.completion_tokens) * model.cost_per_million_output_tokens)
+        / 1_000_000.0;
+    let actual_cost = compute_actual_cost(model, usage);
+    Some(((base_cost - actual_cost) * 100.0).round() as i64)
 }
 
 /// Filter for querying log entries
@@ -312,20 +417,32 @@ impl RequestLogger {
                 responded_model TEXT,
                 compression_metadata TEXT,
                 compression_level TEXT,
-                memories_injected INTEGER NOT NULL DEFAULT 0,
-                memories_stored INTEGER NOT NULL DEFAULT 0,
-                injection_tokens INTEGER NOT NULL DEFAULT 0,
-                detected_project TEXT
+            memories_injected INTEGER NOT NULL DEFAULT 0,
+            memories_stored INTEGER NOT NULL DEFAULT 0,
+            injection_tokens INTEGER NOT NULL DEFAULT 0,
+            detected_project TEXT,
+            cache_read_tokens INTEGER,
+            cache_creation_tokens INTEGER,
+            cache_savings_cents INTEGER,
+            prefix_hash TEXT,
+            reasoning_tokens INTEGER,
+            reasoning_compat_actions TEXT
             )",
-            [],
-        )?;
+        [],
+    )?;
 
-        Self::ensure_column(conn, "compression_metadata", "TEXT")?;
-        Self::ensure_column(conn, "compression_level", "TEXT")?;
-        Self::ensure_column(conn, "memories_injected", "INTEGER NOT NULL DEFAULT 0")?;
-        Self::ensure_column(conn, "memories_stored", "INTEGER NOT NULL DEFAULT 0")?;
-        Self::ensure_column(conn, "injection_tokens", "INTEGER NOT NULL DEFAULT 0")?;
-        Self::ensure_column(conn, "detected_project", "TEXT")?;
+    Self::ensure_column(conn, "compression_metadata", "TEXT")?;
+    Self::ensure_column(conn, "compression_level", "TEXT")?;
+    Self::ensure_column(conn, "memories_injected", "INTEGER NOT NULL DEFAULT 0")?;
+    Self::ensure_column(conn, "memories_stored", "INTEGER NOT NULL DEFAULT 0")?;
+    Self::ensure_column(conn, "injection_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+    Self::ensure_column(conn, "detected_project", "TEXT")?;
+        Self::ensure_column(conn, "cache_read_tokens", "INTEGER")?;
+        Self::ensure_column(conn, "cache_creation_tokens", "INTEGER")?;
+        Self::ensure_column(conn, "cache_savings_cents", "INTEGER")?;
+        Self::ensure_column(conn, "prefix_hash", "TEXT")?;
+        Self::ensure_column(conn, "reasoning_tokens", "INTEGER")?;
+        Self::ensure_column(conn, "reasoning_compat_actions", "TEXT")?;
 
         // Create indexes for common query patterns
         conn.execute(
@@ -367,11 +484,26 @@ impl RequestLogger {
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        if !columns.iter().any(|column| column == column_name) {
-            conn.execute(
-                &format!("ALTER TABLE requests ADD COLUMN {column_name} {column_type}"),
-                [],
-            )?;
+        if columns.iter().any(|column| column == column_name) {
+            return Ok(());
+        }
+
+        // Concurrent openers of the same database may both observe the
+        // column missing and both attempt the ALTER; losing that race
+        // ("duplicate column name") means the column exists, which is
+        // exactly what this function guarantees.
+        if let Err(error) = conn.execute(
+            &format!("ALTER TABLE requests ADD COLUMN {column_name} {column_type}"),
+            [],
+        ) {
+            let lost_race = matches!(
+                &error,
+                rusqlite::Error::SqliteFailure(_, Some(message))
+                    if message.contains("duplicate column name")
+            );
+            if !lost_race {
+                return Err(error.into());
+            }
         }
 
         Ok(())
@@ -689,10 +821,12 @@ fn insert_entry(
             trace_id, timestamp, method, path, model, provider,
             status_code, duration_ms, cost, request_body, response_body,
             requested_model, responded_model, compression_metadata, compression_level,
-            memories_injected, memories_stored, injection_tokens, detected_project
+            memories_injected, memories_stored, injection_tokens, detected_project,
+            cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
+            reasoning_tokens, reasoning_compat_actions
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
         )",
         params![
             entry.trace_id,
@@ -714,6 +848,12 @@ fn insert_entry(
             entry.memories_stored,
             entry.injection_tokens,
             entry.detected_project,
+            entry.cache_read_tokens,
+            entry.cache_creation_tokens,
+            entry.cache_savings_cents,
+            entry.prefix_hash,
+            entry.reasoning_tokens.map(i64::from),
+            entry.reasoning_compat_actions,
         ],
     )?;
 
@@ -722,7 +862,7 @@ fn insert_entry(
 
 /// Query log entries with optional filtering. Runs on the writer thread.
 fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
-    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project FROM requests WHERE 1=1");
+    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions FROM requests WHERE 1=1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     if let Some(ref trace_id) = filter.trace_id {
@@ -791,12 +931,20 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
                 response_body: row.get(10)?,
                 requested_model: row.get(11)?,
                 responded_model: row.get(12)?,
-                compression,
-                memories_injected: row.get(14)?,
-                memories_stored: row.get(15)?,
-                injection_tokens: row.get(16)?,
-                detected_project: row.get(17)?,
-            })
+            compression,
+            memories_injected: row.get(14)?,
+            memories_stored: row.get(15)?,
+            injection_tokens: row.get(16)?,
+            detected_project: row.get(17)?,
+            cache_read_tokens: row.get(18)?,
+            cache_creation_tokens: row.get(19)?,
+            cache_savings_cents: row.get(20)?,
+            prefix_hash: row.get(21)?,
+            reasoning_tokens: row
+                .get::<_, Option<i64>>(22)?
+                .and_then(|tokens| u32::try_from(tokens).ok()),
+            reasoning_compat_actions: row.get(23)?,
+        })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -871,13 +1019,19 @@ mod tests {
             response_body: None,
             requested_model: None,
             responded_model: None,
-            compression,
-            memories_injected: 0,
-            memories_stored: 0,
-            injection_tokens: 0,
-            detected_project: None,
-        }
+        compression,
+        memories_injected: 0,
+        memories_stored: 0,
+        injection_tokens: 0,
+        detected_project: None,
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
+        cache_savings_cents: None,
+        prefix_hash: None,
+    reasoning_tokens: None,
+    reasoning_compat_actions: None,
     }
+}
 
     fn sample_compression(level: CompressionLevel) -> CompressionLogMetadata {
         CompressionLogMetadata {
@@ -952,9 +1106,315 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        assert!(columns.contains(&"compression_metadata".to_owned()));
-        assert!(columns.contains(&"compression_level".to_owned()));
-    }
+    assert!(columns.contains(&"compression_metadata".to_owned()));
+    assert!(columns.contains(&"compression_level".to_owned()));
+}
+
+#[test]
+fn fresh_schema_has_cache_columns() {
+    let (_logger, temp) = create_test_logger();
+    let conn = Connection::open(temp.path()).unwrap();
+    let columns = conn
+        .prepare("PRAGMA table_info(requests)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.contains(&"cache_read_tokens".to_owned()));
+    assert!(columns.contains(&"cache_creation_tokens".to_owned()));
+    assert!(columns.contains(&"cache_savings_cents".to_owned()));
+    assert!(columns.contains(&"prefix_hash".to_owned()));
+}
+
+#[test]
+fn migrates_pre_cache_schema_and_preserves_rows() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let conn = Connection::open(temp_file.path()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE requests (
+            id INTEGER PRIMARY KEY,
+            trace_id TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            method TEXT NOT NULL,
+            path TEXT NOT NULL,
+            model TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            status_code INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            cost REAL NOT NULL,
+            request_body TEXT,
+            response_body TEXT,
+            requested_model TEXT,
+            responded_model TEXT,
+            compression_metadata TEXT,
+            compression_level TEXT,
+            memories_injected INTEGER NOT NULL DEFAULT 0,
+            memories_stored INTEGER NOT NULL DEFAULT 0,
+            injection_tokens INTEGER NOT NULL DEFAULT 0,
+            detected_project TEXT
+        );
+        INSERT INTO requests (
+            trace_id, timestamp, method, path, model, provider, status_code,
+            duration_ms, cost, request_body, response_body, requested_model,
+            responded_model, memories_injected
+        ) VALUES (
+            'pre-cache', 1700000000, 'POST', '/v1/chat/completions', 'gpt-4',
+            'openai', 200, 10, 0.0, NULL, NULL, NULL, NULL, 3
+        );",
+    )
+    .unwrap();
+    drop(conn);
+
+    let config = LoggingConfig {
+        database_path: temp_file.path().to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let logger = RequestLogger::new(config).unwrap();
+    let rows = logger
+        .query(LogFilter {
+            trace_id: Some("pre-cache".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].memories_injected, 3);
+    assert!(rows[0].cache_read_tokens.is_none());
+    assert!(rows[0].cache_creation_tokens.is_none());
+    assert!(rows[0].cache_savings_cents.is_none());
+    assert!(rows[0].prefix_hash.is_none());
+    drop(logger);
+
+    let conn = Connection::open(temp_file.path()).unwrap();
+    let columns = conn
+        .prepare("PRAGMA table_info(requests)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.contains(&"cache_read_tokens".to_owned()));
+    assert!(columns.contains(&"cache_creation_tokens".to_owned()));
+    assert!(columns.contains(&"cache_savings_cents".to_owned()));
+    assert!(columns.contains(&"prefix_hash".to_owned()));
+    let preserved: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM requests WHERE trace_id = 'pre-cache'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(preserved, 1);
+}
+
+#[test]
+fn cache_fields_round_trip() {
+    let (logger, _temp) = create_test_logger();
+    let usage = CacheUsage {
+        cache_read_input_tokens: 8_000,
+        cache_creation_input_tokens: 1_500,
+        uncached_input_tokens: 500,
+    };
+    let entry = sample_entry("cache-hit", None).with_cache(Some(&usage), Some(42), Some(0xDEAD_BEEF));
+    logger.log(entry).unwrap();
+
+    let results = logger
+        .query(LogFilter {
+            trace_id: Some("cache-hit".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].cache_read_tokens, Some(8_000));
+    assert_eq!(results[0].cache_creation_tokens, Some(1_500));
+    assert_eq!(results[0].cache_savings_cents, Some(42));
+    assert_eq!(results[0].prefix_hash.as_deref(), Some("00000000deadbeef"));
+
+    logger.log(sample_entry("cache-miss", None)).unwrap();
+    let results = logger
+        .query(LogFilter {
+            trace_id: Some("cache-miss".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].cache_read_tokens.is_none());
+    assert!(results[0].cache_creation_tokens.is_none());
+    assert!(results[0].cache_savings_cents.is_none());
+    assert!(results[0].prefix_hash.is_none());
+}
+
+#[test]
+fn fresh_schema_has_reasoning_columns() {
+    let (_logger, temp) = create_test_logger();
+    let conn = Connection::open(temp.path()).unwrap();
+    let columns = conn
+        .prepare("PRAGMA table_info(requests)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.contains(&"reasoning_tokens".to_owned()));
+    assert!(columns.contains(&"reasoning_compat_actions".to_owned()));
+}
+
+#[test]
+fn migrates_pre_reasoning_schema_and_preserves_rows() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let conn = Connection::open(temp_file.path()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE requests (
+            id INTEGER PRIMARY KEY,
+            trace_id TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            method TEXT NOT NULL,
+            path TEXT NOT NULL,
+            model TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            status_code INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            cost REAL NOT NULL,
+            request_body TEXT,
+            response_body TEXT,
+            requested_model TEXT,
+            responded_model TEXT,
+            compression_metadata TEXT,
+            compression_level TEXT,
+            memories_injected INTEGER NOT NULL DEFAULT 0,
+            memories_stored INTEGER NOT NULL DEFAULT 0,
+            injection_tokens INTEGER NOT NULL DEFAULT 0,
+            detected_project TEXT,
+            cache_read_tokens INTEGER,
+            cache_creation_tokens INTEGER,
+            cache_savings_cents INTEGER,
+            prefix_hash TEXT
+        );
+        INSERT INTO requests (
+            trace_id, timestamp, method, path, model, provider, status_code,
+            duration_ms, cost, request_body, response_body, requested_model,
+            responded_model, cache_read_tokens
+        ) VALUES (
+            'pre-reasoning', 1700000000, 'POST', '/v1/chat/completions', 'gpt-4',
+            'openai', 200, 10, 0.0, NULL, NULL, NULL, NULL, 512
+        );",
+    )
+    .unwrap();
+    drop(conn);
+
+    let config = LoggingConfig {
+        database_path: temp_file.path().to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let logger = RequestLogger::new(config).unwrap();
+    let rows = logger
+        .query(LogFilter {
+            trace_id: Some("pre-reasoning".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].cache_read_tokens, Some(512));
+    assert!(rows[0].reasoning_tokens.is_none());
+    assert!(rows[0].reasoning_compat_actions.is_none());
+    drop(logger);
+
+    let conn = Connection::open(temp_file.path()).unwrap();
+    let columns = conn
+        .prepare("PRAGMA table_info(requests)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.contains(&"reasoning_tokens".to_owned()));
+    assert!(columns.contains(&"reasoning_compat_actions".to_owned()));
+    let preserved: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM requests WHERE trace_id = 'pre-reasoning'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(preserved, 1);
+}
+
+#[test]
+fn reasoning_fields_round_trip() {
+    let (logger, _temp) = create_test_logger();
+    let actions = r#"{"stripped":{"thinking_blocks":2,"redacted_thinking_blocks":1},"families":["anthropic_manual","openai_reasoning"]}"#;
+    let entry = sample_entry("reasoning-turn", None)
+        .with_reasoning_usage(Some(1_024), Some(actions.to_owned()));
+    logger.log(entry).unwrap();
+
+    let results = logger
+        .query(LogFilter {
+            trace_id: Some("reasoning-turn".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].reasoning_tokens, Some(1_024));
+    assert_eq!(results[0].reasoning_compat_actions.as_deref(), Some(actions));
+
+    logger.log(sample_entry("no-reasoning", None)).unwrap();
+    let results = logger
+        .query(LogFilter {
+            trace_id: Some("no-reasoning".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].reasoning_tokens.is_none());
+    assert!(results[0].reasoning_compat_actions.is_none());
+}
+
+#[test]
+fn encode_prefix_hash_is_sixteen_lowercase_hex_digits() {
+    assert_eq!(encode_prefix_hash(0), "0000000000000000");
+    assert_eq!(encode_prefix_hash(u64::MAX), "ffffffffffffffff");
+    assert_eq!(encode_prefix_hash(0x0123_4567_89AB_CDEF), "0123456789abcdef");
+}
+
+#[test]
+fn compute_cache_savings_cents_prices_cached_turns() {
+    let model: ProviderModel = serde_json::from_value(serde_json::json!({
+        "provider": "anthropic",
+        "model": "claude",
+        "cost_per_million_input_tokens": 3.0,
+        "cost_per_million_output_tokens": 15.0,
+        "cost_per_million_cache_read_input_tokens": 0.3,
+        "cost_per_million_cache_creation_input_tokens": 3.75
+    }))
+    .unwrap();
+
+    // No cached tokens -> NULL column.
+    let uncached: OpenAIUsage = serde_json::from_value(serde_json::json!({
+        "prompt_tokens": 1_000,
+        "completion_tokens": 200
+    }))
+    .unwrap();
+    assert_eq!(compute_cache_savings_cents(&model, &uncached), None);
+
+    // 800k read + 200k creation of 1M prompt tokens, 200k completion
+    // tokens. Expected value is derived from the same per-million formula
+    // the cost model uses, so this asserts the seam rather than
+    // re-implementing pricing constants twice.
+    let cached: OpenAIUsage = serde_json::from_value(serde_json::json!({
+        "prompt_tokens": 1_000_000,
+        "completion_tokens": 200_000,
+        "cache_read_input_tokens": 800_000,
+        "cache_creation_input_tokens": 200_000
+    }))
+    .unwrap();
+    let base: f64 = (1_000_000.0 * 3.0 + 200_000.0 * 15.0) / 1_000_000.0;
+    // uncached = prompt - read - creation = 0 here, so the actual cost skips
+    // the base-rate term and prices read/creation/completion only.
+    let actual: f64 = (800_000.0 * 0.3 + 200_000.0 * 3.75 + 200_000.0 * 15.0) / 1_000_000.0;
+    let expected = ((base - actual) * 100.0).round() as i64;
+    assert_eq!(compute_cache_savings_cents(&model, &cached), Some(expected));
+    assert!(expected > 0);
+}
 
     #[test]
     fn compression_metadata_round_trips() {
@@ -1123,6 +1583,12 @@ mod tests {
             memories_stored: 0,
             injection_tokens: 0,
             detected_project: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            cache_savings_cents: None,
+            prefix_hash: None,
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
         };
 
         logger.log(entry.clone()).unwrap();
@@ -1242,6 +1708,12 @@ mod tests {
             memories_stored: 0,
             injection_tokens: 0,
             detected_project: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            cache_savings_cents: None,
+            prefix_hash: None,
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
         };
 
         logger.log(old_entry).unwrap();
@@ -1266,6 +1738,12 @@ mod tests {
             memories_stored: 0,
             injection_tokens: 0,
             detected_project: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            cache_savings_cents: None,
+            prefix_hash: None,
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
         };
 
         logger.log(recent_entry).unwrap();
@@ -1340,6 +1818,12 @@ mod property_tests {
                         memories_stored: 0,
                         injection_tokens: 0,
                         detected_project: None,
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
+                        cache_savings_cents: None,
+                        prefix_hash: None,
+                    reasoning_tokens: None,
+                    reasoning_compat_actions: None,
                     }
                 },
             )
@@ -1427,6 +1911,12 @@ mod property_tests {
                 memories_stored: 0,
                 injection_tokens: 0,
                 detected_project: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                cache_savings_cents: None,
+                prefix_hash: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
             };
 
             logger.log(entry.clone()).unwrap();
@@ -1494,6 +1984,12 @@ mod property_tests {
                 memories_stored: 0,
                 injection_tokens: 0,
                 detected_project: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                cache_savings_cents: None,
+                prefix_hash: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
             };
 
             logger.log(entry).unwrap();
@@ -1558,6 +2054,12 @@ mod property_tests {
                 memories_stored: 0,
                 injection_tokens: 0,
                 detected_project: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                cache_savings_cents: None,
+                prefix_hash: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
             };
 
             logger.log(entry).unwrap();
@@ -1620,6 +2122,12 @@ mod property_tests {
                 memories_stored: 0,
                 injection_tokens: 0,
                 detected_project: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                cache_savings_cents: None,
+                prefix_hash: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
             };
 
             logger.log(entry).unwrap();
@@ -1693,6 +2201,12 @@ mod property_tests {
                 memories_stored: 0,
                 injection_tokens: 0,
                 detected_project: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                cache_savings_cents: None,
+                prefix_hash: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
             };
 
             logger.log(entry).unwrap();

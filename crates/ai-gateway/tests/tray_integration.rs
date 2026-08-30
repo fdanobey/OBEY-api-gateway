@@ -72,6 +72,13 @@ fn test_config() -> Config {
                 tier: None,
                 context_window: 0,
                 specializations: vec![],
+                cache_min_tokens: None,
+                cache_support: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             }],
         }],
         circuit_breaker: Default::default(),
@@ -104,6 +111,7 @@ fn test_config() -> Config {
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
         structured_output: None,
+        reasoning_compat: Default::default(),
     }
 }
 

@@ -83,6 +83,9 @@ font-size:.875rem;font-weight:500;cursor:pointer;transition:background .15s}
   display:grid;grid-template-columns:auto auto minmax(100px,1fr) minmax(120px,2.5fr) auto auto auto;gap:.5rem;align-items:end;
   background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:.75rem;margin-bottom:.5rem}
   .models-container .form-row .mdl-priority{display:none}
+.models-container .form-row .mdl-cache-details{grid-column:1 / -1}
+.mdl-cache-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.5rem;margin-top:.5rem}
+.mdl-cache-bp-group[hidden]{display:none}
   .models-container .form-row.draggable{cursor:grab}
   .models-container .form-row.dragging{opacity:.4;cursor:grabbing}
   .models-container .form-row.drag-over-top{border-top:2px solid var(--primary);margin-top:-2px}
@@ -720,11 +723,74 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
           <label>Cost In ($/M tok)</label>
           <input type="number" class="mdl-cost-in" value="0" min="0" step="0.01">
         </div>
-        <div class="form-group" style="margin:0">
-          <label>Cost Out ($/M tok)</label>
-          <input type="number" class="mdl-cost-out" value="0" min="0" step="0.01">
-        </div>
-        <button class="btn btn-danger btn-sm remove-model" style="align-self:center" aria-label="Remove model">✕</button>
+<div class="form-group" style="margin:0">
+<label>Cost Out ($/M tok)</label>
+<input type="number" class="mdl-cost-out" value="0" min="0" step="0.01">
+</div>
+<details class="mdl-cache-details">
+<summary>Prompt-Cache Settings</summary>
+<div class="mdl-cache-row">
+<div class="form-group" style="margin:0">
+<label>Cache Read ($/M tok)</label>
+<input type="number" class="mdl-cache-read" value="" min="0" step="0.01" placeholder="inherit">
+</div>
+<div class="form-group" style="margin:0">
+<label>Cache Creation ($/M tok)</label>
+<input type="number" class="mdl-cache-write" value="" min="0" step="0.01" placeholder="inherit">
+</div>
+<div class="form-group" style="margin:0">
+<label>Cache Min Tokens</label>
+<input type="number" class="mdl-cache-min-tokens" value="" min="0" step="1" placeholder="inherit">
+</div>
+<div class="form-group" style="margin:0">
+<label>Cache Support</label>
+<select class="mdl-cache-support">
+<option value="none">None</option>
+<option value="automatic">Automatic</option>
+<option value="explicit">Explicit</option>
+</select>
+</div>
+<div class="form-group mdl-cache-bp-group" style="margin:0" hidden>
+<label>Max Breakpoints</label>
+<input type="number" class="mdl-cache-max-bp" value="4" min="1" max="4" step="1">
+</div>
+</div>
+</details>
+<details class="mdl-reasoning-details">
+<summary>Reasoning Settings</summary>
+<div class="form-row" style="flex-wrap:wrap;row-gap:.5rem">
+<div class="form-group" style="margin:0">
+<label>Reasoning Family</label>
+<select class="mdl-reasoning-family">
+<option value="">Inherit (auto-detect)</option>
+<option value="anthropic_manual">Anthropic Manual</option>
+<option value="anthropic_adaptive">Anthropic Adaptive</option>
+<option value="openai_reasoning">OpenAI Reasoning</option>
+<option value="deepseek">DeepSeek</option>
+<option value="openrouter">OpenRouter</option>
+<option value="gemini">Gemini</option>
+<option value="xai">xAI</option>
+<option value="none">None</option>
+</select>
+</div>
+<div class="form-group" style="margin:0">
+<label>Parameter Shape</label>
+<select class="mdl-reasoning-param">
+<option value="">Inherit (family default)</option>
+<option value="thinking_budget">thinking.budget_tokens</option>
+<option value="adaptive">adaptive</option>
+<option value="reasoning_max_tokens">reasoning.max_tokens</option>
+<option value="reasoning_effort">reasoning_effort</option>
+<option value="none">None</option>
+</select>
+</div>
+<div class="form-group" style="margin:0">
+<label>Reasoning Cost ($/M tok)</label>
+<input type="number" class="mdl-reasoning-cost" value="" min="0" step="0.01" placeholder="inherit">
+</div>
+</div>
+</details>
+<button class="btn btn-danger btn-sm remove-model" style="align-self:center" aria-label="Remove model">✕</button>
       </div>
     </template>
     <div class="actions">
@@ -771,8 +837,156 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
           <div class="error" id="retry-jitter-ratio-error" role="alert"></div>
         </div>
       </div>
-    </fieldset>
-    <fieldset><legend>CORS</legend>
+</fieldset>
+<fieldset><legend>Cache-Aware Routing</legend>
+<div class="form-check">
+<input type="checkbox" id="car-enabled">
+<label for="car-enabled">Enable Cache-Aware Routing</label>
+</div>
+<div class="form-row">
+<div class="form-group">
+<label for="car-ttl">Stickiness TTL (seconds)</label>
+<input type="number" id="car-ttl" value="300" min="0" step="1" aria-describedby="car-ttl-error">
+<div class="hint">0 disables prefix-to-provider stickiness</div>
+<div class="error" id="car-ttl-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="car-default-min-tokens">Default Cache Min Tokens</label>
+<input type="number" id="car-default-min-tokens" value="1024" min="0" step="1" aria-describedby="car-default-min-tokens-error">
+<div class="hint">Minimum prefix size eligible for caching when a model has no explicit value</div>
+<div class="error" id="car-default-min-tokens-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="car-hit-rate">Cost Sort Hit Rate</label>
+<input type="number" id="car-hit-rate" value="0" min="0" max="1" step="0.05" aria-describedby="car-hit-rate-error">
+<div class="hint">Assumed cache hit rate (0–1) used when sorting providers by cost; 0 keeps uncached pricing</div>
+<div class="error" id="car-hit-rate-error" role="alert"></div>
+</div>
+</div>
+</fieldset>
+<fieldset><legend>Reasoning Compatibility</legend>
+<div class="hint" style="margin-bottom:.75rem">Detects reasoning state (thinking, redacted_thinking, reasoning_content, reasoning) in prior turns, strips it on cross-model failover, normalizes reasoning parameters for the target model family, and attributes reasoning-token costs.</div>
+<div class="form-check">
+<input type="checkbox" id="rc-enabled">
+<label for="rc-enabled">Enable Reasoning Compatibility</label>
+</div>
+<div class="form-check">
+<input type="checkbox" id="rc-strip-on-model-change">
+<label for="rc-strip-on-model-change">Strip Reasoning State on Model Change</label>
+</div>
+<div class="form-check">
+<input type="checkbox" id="rc-attribute-cost">
+<label for="rc-attribute-cost">Attribute Reasoning-Token Costs</label>
+</div>
+<div class="form-check">
+<input type="checkbox" id="rc-model-affinity">
+<label for="rc-model-affinity">Track Conversation Model Affinity</label>
+</div>
+<div class="form-row">
+<div class="form-group">
+<label for="rc-budget-minimal">Minimal Budget (tokens)</label>
+<input type="number" id="rc-budget-minimal" value="1024" min="1024" step="1" aria-describedby="rc-budget-minimal-error">
+<div class="hint">reasoning_effort → thinking.budget_tokens</div>
+<div class="error" id="rc-budget-minimal-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="rc-budget-low">Low Budget (tokens)</label>
+<input type="number" id="rc-budget-low" value="2048" min="1024" step="1" aria-describedby="rc-budget-low-error">
+<div class="hint">Minimum 1024 per effort level</div>
+<div class="error" id="rc-budget-low-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="rc-budget-medium">Medium Budget (tokens)</label>
+<input type="number" id="rc-budget-medium" value="8192" min="1024" step="1" aria-describedby="rc-budget-medium-error">
+<div class="error" id="rc-budget-medium-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="rc-budget-high">High Budget (tokens)</label>
+<input type="number" id="rc-budget-high" value="16384" min="1024" step="1" aria-describedby="rc-budget-high-error">
+<div class="error" id="rc-budget-high-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="rc-budget-xhigh">XHigh Budget (tokens)</label>
+<input type="number" id="rc-budget-xhigh" value="32768" min="1024" step="1" aria-describedby="rc-budget-xhigh-error">
+<div class="error" id="rc-budget-xhigh-error" role="alert"></div>
+</div>
+</div>
+<div class="form-group">
+<label>Per-Provider Overrides</label>
+<div class="item-list" id="rc-providers-list"></div>
+<button class="btn btn-secondary btn-sm" id="rc-add-provider" type="button">+ Add Provider Override</button>
+<datalist id="rc-prov-names"></datalist>
+</div>
+<template id="tpl-rc-provider">
+<div class="item-card">
+<div class="item-card-header">
+<strong class="rc-prov-title">Provider Override</strong>
+<button class="btn btn-danger btn-sm rc-prov-remove" type="button">Remove</button>
+</div>
+<div class="form-row">
+<div class="form-group">
+<label>Provider Name</label>
+<input type="text" class="rc-prov-name" list="rc-prov-names" placeholder="anthropic" autocomplete="off">
+<div class="hint">Must match a configured provider name</div>
+<div class="error" role="alert"></div>
+</div>
+<div class="form-group">
+<label>Strip on Model Change</label>
+<select class="rc-prov-strip">
+<option value="">Inherit</option>
+<option value="true">On</option>
+<option value="false">Off</option>
+</select>
+</div>
+<div class="form-group">
+<label>Normalize Parameters</label>
+<select class="rc-prov-normalize">
+<option value="">Inherit</option>
+<option value="true">On</option>
+<option value="false">Off</option>
+</select>
+</div>
+</div>
+<div class="form-check">
+<input type="checkbox" class="rc-prov-map-use">
+<label>Override effort→budget map for this provider</label>
+</div>
+<div class="form-row rc-prov-map-fields" hidden>
+<div class="form-group">
+<label>Minimal (tokens)</label>
+<input type="number" class="rc-prov-map-minimal" value="1024" min="1024" step="1">
+<div class="error" role="alert"></div>
+</div>
+<div class="form-group">
+<label>Low (tokens)</label>
+<input type="number" class="rc-prov-map-low" value="2048" min="1024" step="1">
+<div class="error" role="alert"></div>
+</div>
+<div class="form-group">
+<label>Medium (tokens)</label>
+<input type="number" class="rc-prov-map-medium" value="8192" min="1024" step="1">
+<div class="error" role="alert"></div>
+</div>
+<div class="form-group">
+<label>High (tokens)</label>
+<input type="number" class="rc-prov-map-high" value="16384" min="1024" step="1">
+<div class="error" role="alert"></div>
+</div>
+<div class="form-group">
+<label>XHigh (tokens)</label>
+<input type="number" class="rc-prov-map-xhigh" value="32768" min="1024" step="1">
+<div class="error" role="alert"></div>
+</div>
+</div>
+</div>
+</template>
+<div class="form-group">
+<label>Recent Reasoning Events</label>
+<div id="reasoning-events-list" class="hint" role="status">No events</div>
+<div class="hint">Strip/normalize decisions by trace ID (counts and model IDs only)</div>
+</div>
+</fieldset>
+<fieldset><legend>CORS</legend>
       <div class="form-check">
         <input type="checkbox" id="cors-enabled">
         <label for="cors-enabled">Enable CORS</label>
@@ -2243,16 +2457,40 @@ if (pageId === 'virtual-keys') { vkOnOpen(); }
         showError(nameIn, 'Group must have at least one model');
         ok = false;
       }
-      modelRows.forEach(function(row) {
-        var provIn = row.querySelector('.mdl-provider');
-        var mdlIn = row.querySelector('.mdl-name');
-        var costIn = row.querySelector('.mdl-cost-in');
-        var costOut = row.querySelector('.mdl-cost-out');
-        if (provIn && !validateRequired(provIn, 'Provider')) ok = false;
-        if (mdlIn && !validateRequired(mdlIn, 'Model')) ok = false;
-        if (costIn && !validateNonNegativeNum(costIn, 'Cost in')) ok = false;
-        if (costOut && !validateNonNegativeNum(costOut, 'Cost out')) ok = false;
-      });
+		modelRows.forEach(function(row) {
+			var provIn = row.querySelector('.mdl-provider');
+			var mdlIn = row.querySelector('.mdl-name');
+			var costIn = row.querySelector('.mdl-cost-in');
+			var costOut = row.querySelector('.mdl-cost-out');
+			var cacheReadIn = row.querySelector('.mdl-cache-read');
+			var cacheWriteIn = row.querySelector('.mdl-cache-write');
+			var cacheMinIn = row.querySelector('.mdl-cache-min-tokens');
+			var cacheSupportSel = row.querySelector('.mdl-cache-support');
+			var cacheBpIn = row.querySelector('.mdl-cache-max-bp');
+			if (provIn && !validateRequired(provIn, 'Provider')) ok = false;
+			if (mdlIn && !validateRequired(mdlIn, 'Model')) ok = false;
+			if (costIn && !validateNonNegativeNum(costIn, 'Cost in')) ok = false;
+			if (costOut && !validateNonNegativeNum(costOut, 'Cost out')) ok = false;
+			if (cacheReadIn) {
+				if (cacheReadIn.value !== '' && !validateNonNegativeNum(cacheReadIn, 'Cache read price')) ok = false;
+				else if (cacheReadIn.value === '') clearError(cacheReadIn);
+			}
+			if (cacheWriteIn) {
+				if (cacheWriteIn.value !== '' && !validateNonNegativeNum(cacheWriteIn, 'Cache creation price')) ok = false;
+				else if (cacheWriteIn.value === '') clearError(cacheWriteIn);
+			}
+			if (cacheMinIn) {
+				if (cacheMinIn.value !== '' && !validateNonNegativeInt(cacheMinIn, 'Cache min tokens')) ok = false;
+				else if (cacheMinIn.value === '') clearError(cacheMinIn);
+			}
+			if (cacheSupportSel && cacheSupportSel.value === 'explicit' && cacheBpIn) {
+				var cacheBp = parseInt(cacheBpIn.value, 10);
+				if (isNaN(cacheBp) || cacheBp < 1 || cacheBp > 4) { showError(cacheBpIn, 'Max breakpoints must be between 1 and 4'); ok = false; }
+				else { clearError(cacheBpIn); }
+			} else if (cacheBpIn) {
+				clearError(cacheBpIn);
+			}
+		});
     });
     return ok;
   }
@@ -2263,9 +2501,15 @@ if (pageId === 'virtual-keys') { vkOnOpen(); }
     if (!validateNonNegativeNum(document.getElementById('retry-backoff'), 'Backoff')) ok = false;
     if (!validatePositiveNum(document.getElementById('retry-multiplier'), 'Multiplier')) ok = false;
     if (!validateNonNegativeNum(document.getElementById('retry-jitter-ratio'), 'Jitter ratio')) ok = false;
-    if (parseFloat(document.getElementById('retry-jitter-ratio').value) > 1) { showError(document.getElementById('retry-jitter-ratio'), 'Jitter ratio must be between 0 and 1'); ok = false; }
-    return ok;
-  }
+	if (parseFloat(document.getElementById('retry-jitter-ratio').value) > 1) { showError(document.getElementById('retry-jitter-ratio'), 'Jitter ratio must be between 0 and 1'); ok = false; }
+	if (!validateNonNegativeInt(document.getElementById('car-ttl'), 'Stickiness TTL')) ok = false;
+	if (!validateNonNegativeInt(document.getElementById('car-default-min-tokens'), 'Default cache min tokens')) ok = false;
+ var carHitRate = parseFloat(document.getElementById('car-hit-rate').value);
+ if (isNaN(carHitRate) || carHitRate < 0 || carHitRate > 1) { showError(document.getElementById('car-hit-rate'), 'Hit rate must be between 0 and 1'); ok = false; }
+ else { clearError(document.getElementById('car-hit-rate')); }
+ if (!validateReasoningCompat()) ok = false;
+ return ok;
+}
 
   function validateCircuitBreakerPage() {
     var ok = true;
@@ -2929,14 +3173,31 @@ if (pageId === 'virtual-keys') { vkOnOpen(); }
   function addModelRow(container, data) {
     var clone = mdlTpl.content.cloneNode(true);
     var row = clone.querySelector('.form-row');
-    if (data) {
-      row.querySelector('.mdl-cost-in').value = data.cost_per_million_input_tokens || 0;
-      row.querySelector('.mdl-cost-out').value = data.cost_per_million_output_tokens || 0;
-      // Persist the intended model value so it survives async fetch race conditions
-      // (e.g. tab-switch triggering refreshModelGroupModels while a fetch is in-flight).
-      if (data.model) { row.dataset.model = data.model; }
-    }
-    row.querySelector('.remove-model').addEventListener('click', function() { row.remove(); updatePriorityBadges(container); });
+	if (data) {
+		row.querySelector('.mdl-cost-in').value = data.cost_per_million_input_tokens || 0;
+		row.querySelector('.mdl-cost-out').value = data.cost_per_million_output_tokens || 0;
+		row.querySelector('.mdl-cache-read').value = data.cost_per_million_cache_read_input_tokens != null ? data.cost_per_million_cache_read_input_tokens : '';
+		row.querySelector('.mdl-cache-write').value = data.cost_per_million_cache_creation_input_tokens != null ? data.cost_per_million_cache_creation_input_tokens : '';
+ row.querySelector('.mdl-cache-min-tokens').value = data.cache_min_tokens != null ? data.cache_min_tokens : '';
+ row.querySelector('.mdl-reasoning-family').value = data.reasoning_family || '';
+ row.querySelector('.mdl-reasoning-param').value = data.reasoning_parameter || '';
+ row.querySelector('.mdl-reasoning-cost').value = data.cost_per_million_reasoning_tokens != null ? data.cost_per_million_reasoning_tokens : '';
+		var cacheSupport = data.cache_support;
+		if (cacheSupport && cacheSupport.type === 'explicit') {
+			row.querySelector('.mdl-cache-support').value = 'explicit';
+			row.querySelector('.mdl-cache-bp-group').hidden = false;
+			row.querySelector('.mdl-cache-max-bp').value = cacheSupport.max_breakpoints != null ? cacheSupport.max_breakpoints : 4;
+		} else if (cacheSupport && cacheSupport.type === 'automatic') {
+			row.querySelector('.mdl-cache-support').value = 'automatic';
+		}
+		// Persist the intended model value so it survives async fetch race conditions
+		// (e.g. tab-switch triggering refreshModelGroupModels while a fetch is in-flight).
+		if (data.model) { row.dataset.model = data.model; }
+	}
+	row.querySelector('.mdl-cache-support').addEventListener('change', function() {
+		row.querySelector('.mdl-cache-bp-group').hidden = this.value !== 'explicit';
+	});
+	row.querySelector('.remove-model').addEventListener('click', function() { row.remove(); updatePriorityBadges(container); });
     initDragAndDrop(row, container);
     container.appendChild(clone);
     var provSel = container.querySelector('.form-row:last-child .mdl-provider');
@@ -3244,7 +3505,116 @@ if (pageId === 'virtual-keys') { vkOnOpen(); }
   function applyLoopPreset(name){var weights=LOOP_PRESETS[name];if(!weights)return;Object.keys(LOOP_WEIGHT_IDS).forEach(function(key){document.getElementById(LOOP_WEIGHT_IDS[key]).value=weights[key];});updateLoopWeightSum();}
   function saveLoopDetection(){if(!validateLoopDetectionPage()){setStatus('Validation failed — fix Loop Detection settings');return;}var cfg=config?JSON.parse(JSON.stringify(config)):{};cfg.loop_detection=collectLoopDetection();setStatus('Saving loop detection…');fetch(apiUrl('config'),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)}).then(function(r){return r.text().then(function(text){var data=null;try{data=text?JSON.parse(text):null;}catch(_){}if(!r.ok)throw new Error((data&&data.error&&((data.error.details||[]).join(' ')||data.error.message))||text||('HTTP '+r.status));return data;});}).then(function(){config=cfg;document.getElementById('loop-server-error').textContent='';setStatus('Loop detection saved and applied');showToast('Loop detection saved and applied');}).catch(function(error){document.getElementById('loop-server-error').textContent=error.message;setStatus('Loop detection save failed');showToast('Loop detection save failed',true);});}
 
-  // --- Load Config from API ---
+  // --- Reasoning Compatibility (reasoning_compat) ---
+var RC_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+var RC_DEFAULT_BUDGETS = { minimal: 1024, low: 2048, medium: 8192, high: 16384, xhigh: 32768 };
+
+function populateReasoningCompat(rc) {
+rc = rc || {};
+document.getElementById('rc-enabled').checked = rc.enabled !== false;
+document.getElementById('rc-strip-on-model-change').checked = rc.strip_on_model_change !== false;
+document.getElementById('rc-attribute-cost').checked = rc.attribute_reasoning_cost !== false;
+document.getElementById('rc-model-affinity').checked = rc.conversation_model_affinity !== false;
+var map = rc.effort_budget_map || {};
+RC_EFFORTS.forEach(function(e) { document.getElementById('rc-budget-' + e).value = map[e] != null ? map[e] : RC_DEFAULT_BUDGETS[e]; });
+populateReasoningProviders(rc.per_provider || {});
+refreshReasoningProviderNames();
+}
+
+function populateReasoningProviders(perProvider) {
+var list = document.getElementById('rc-providers-list');
+list.innerHTML = '';
+Object.keys(perProvider || {}).forEach(function(name) {
+var card = addReasoningProviderCard(perProvider[name]);
+card.querySelector('.rc-prov-name').value = name;
+});
+}
+
+function addReasoningProviderCard(data) {
+var clone = document.getElementById('tpl-rc-provider').content.cloneNode(true);
+var card = clone.querySelector('.item-card');
+data = data || {};
+if (data.strip_on_model_change != null) { card.querySelector('.rc-prov-strip').value = data.strip_on_model_change ? 'true' : 'false'; }
+if (data.normalize_reasoning_parameters != null) { card.querySelector('.rc-prov-normalize').value = data.normalize_reasoning_parameters ? 'true' : 'false'; }
+var map = data.effort_budget_map;
+RC_EFFORTS.forEach(function(e) { card.querySelector('.rc-prov-map-' + e).value = (map && map[e] != null) ? map[e] : RC_DEFAULT_BUDGETS[e]; });
+if (map) {
+card.querySelector('.rc-prov-map-use').checked = true;
+card.querySelector('.rc-prov-map-fields').hidden = false;
+}
+card.querySelector('.rc-prov-map-use').addEventListener('change', function() { card.querySelector('.rc-prov-map-fields').hidden = !this.checked; });
+card.querySelector('.rc-prov-remove').addEventListener('click', function() { card.remove(); });
+document.getElementById('rc-providers-list').appendChild(clone);
+return card;
+}
+
+function collectReasoningCompat() {
+var map = {};
+RC_EFFORTS.forEach(function(e) { map[e] = parseInt(document.getElementById('rc-budget-' + e).value, 10) || RC_DEFAULT_BUDGETS[e]; });
+var perProvider = {};
+document.querySelectorAll('#rc-providers-list .item-card').forEach(function(card) {
+var name = card.querySelector('.rc-prov-name').value.trim();
+if (!name) { return; }
+var override = {};
+var strip = card.querySelector('.rc-prov-strip').value;
+if (strip !== '') { override.strip_on_model_change = strip === 'true'; }
+var normalize = card.querySelector('.rc-prov-normalize').value;
+if (normalize !== '') { override.normalize_reasoning_parameters = normalize === 'true'; }
+if (card.querySelector('.rc-prov-map-use').checked) {
+var overrideMap = {};
+RC_EFFORTS.forEach(function(e) { overrideMap[e] = parseInt(card.querySelector('.rc-prov-map-' + e).value, 10) || RC_DEFAULT_BUDGETS[e]; });
+override.effort_budget_map = overrideMap;
+}
+perProvider[name] = override;
+});
+return {
+enabled: document.getElementById('rc-enabled').checked,
+strip_on_model_change: document.getElementById('rc-strip-on-model-change').checked,
+attribute_reasoning_cost: document.getElementById('rc-attribute-cost').checked,
+effort_budget_map: map,
+per_provider: perProvider,
+conversation_model_affinity: document.getElementById('rc-model-affinity').checked
+};
+}
+
+function validateReasoningCompat() {
+var ok = true;
+RC_EFFORTS.forEach(function(e) {
+var input = document.getElementById('rc-budget-' + e);
+var v = parseInt(input.value, 10);
+if (isNaN(v) || String(input.value).trim() === '' || v < 1024) { showError(input, 'Budget must be an integer of at least 1024'); ok = false; }
+else { clearError(input); }
+});
+var seen = {};
+document.querySelectorAll('#rc-providers-list .item-card').forEach(function(card) {
+var nameInput = card.querySelector('.rc-prov-name');
+var name = nameInput.value.trim();
+if (!name) { showError(nameInput, 'Provider name is required'); ok = false; }
+else if (seen[name]) { showError(nameInput, 'Duplicate provider override'); ok = false; }
+else { clearError(nameInput); seen[name] = true; }
+if (card.querySelector('.rc-prov-map-use').checked) {
+RC_EFFORTS.forEach(function(e) {
+var input = card.querySelector('.rc-prov-map-' + e);
+var v = parseInt(input.value, 10);
+if (isNaN(v) || String(input.value).trim() === '' || v < 1024) { showError(input, 'Budget must be an integer of at least 1024'); ok = false; }
+else { clearError(input); }
+});
+}
+});
+return ok;
+}
+
+function refreshReasoningProviderNames() {
+var seen = {}, opts = '';
+getProviderNames().concat(((config && config.providers) || []).map(function(p) { return p.name || ''; })).forEach(function(n) {
+if (!n || seen[n]) { return; }
+seen[n] = true;
+opts += '<option value="' + n.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;') + '"></option>';
+});
+document.getElementById('rc-prov-names').innerHTML = opts;
+}
+
+// --- Load Config from API ---
   function loadConfig() {
     setStatus('Loading configuration…');
     fetch(apiUrl('config'))
@@ -3265,7 +3635,9 @@ var cs=cfg.codex_search||{}; document.getElementById('codex-search-enabled').che
     provList.innerHTML=''; if(cfg.providers){cfg.providers.forEach(function(p){addProviderCard(p);});}
     grpList.innerHTML=''; if(cfg.model_groups){cfg.model_groups.forEach(function(g){addGroupCard(g);});}
     if(cfg.retry){document.getElementById('retry-max').value=cfg.retry.max_retries_per_provider||1; document.getElementById('retry-backoff').value=(cfg.retry.backoff_sequence_seconds&&cfg.retry.backoff_sequence_seconds[0])||1; if(cfg.retry.backoff_sequence_seconds&&cfg.retry.backoff_sequence_seconds.length>1&&cfg.retry.backoff_sequence_seconds[0]){document.getElementById('retry-multiplier').value=(cfg.retry.backoff_sequence_seconds[1]/cfg.retry.backoff_sequence_seconds[0]).toFixed(2).replace(/\.00$/,'');}else{document.getElementById('retry-multiplier').value=2;} document.getElementById('retry-jitter-enabled').value=cfg.retry.jitter_enabled===false?'false':'true'; document.getElementById('retry-jitter-ratio').value=cfg.retry.jitter_ratio!=null?cfg.retry.jitter_ratio:0.2;}
-    if(cfg.cors){document.getElementById('cors-enabled').checked=!!cfg.cors.enabled; document.getElementById('cors-origins').value=(cfg.cors.allowed_origins||[]).join(', '); document.getElementById('cors-methods').value=(cfg.cors.allowed_methods||[]).join(', '); document.getElementById('cors-headers').value=(cfg.cors.allowed_headers||[]).join(', ');}
+    var car=cfg.cache_aware_routing||{};document.getElementById('car-enabled').checked=!!car.enabled;document.getElementById('car-ttl').value=car.stickiness_ttl_seconds!=null?car.stickiness_ttl_seconds:300;document.getElementById('car-default-min-tokens').value=car.default_cache_min_tokens!=null?car.default_cache_min_tokens:1024;document.getElementById('car-hit-rate').value=car.cost_sort_hit_rate!=null?car.cost_sort_hit_rate:0;
+populateReasoningCompat(cfg.reasoning_compat);
+if(cfg.cors){document.getElementById('cors-enabled').checked=!!cfg.cors.enabled; document.getElementById('cors-origins').value=(cfg.cors.allowed_origins||[]).join(', '); document.getElementById('cors-methods').value=(cfg.cors.allowed_methods||[]).join(', '); document.getElementById('cors-headers').value=(cfg.cors.allowed_headers||[]).join(', ');}
     if(cfg.circuit_breaker){document.getElementById('cb-threshold').value=cfg.circuit_breaker.failure_threshold||1; document.getElementById('cb-initial-backoff').value=(cfg.circuit_breaker.backoff_sequence_seconds&&cfg.circuit_breaker.backoff_sequence_seconds[0])||5; document.getElementById('cb-max-backoff').value=(cfg.circuit_breaker.backoff_sequence_seconds&&cfg.circuit_breaker.backoff_sequence_seconds[cfg.circuit_breaker.backoff_sequence_seconds.length-1])||300; if(cfg.circuit_breaker.backoff_sequence_seconds&&cfg.circuit_breaker.backoff_sequence_seconds.length>1&&cfg.circuit_breaker.backoff_sequence_seconds[0]){document.getElementById('cb-multiplier').value=(cfg.circuit_breaker.backoff_sequence_seconds[1]/cfg.circuit_breaker.backoff_sequence_seconds[0]).toFixed(2).replace(/\.00$/,'');}else{document.getElementById('cb-multiplier').value=2;}}
     if(cfg.logging){document.getElementById('log-request-body').checked=!!cfg.logging.request_body_logging; document.getElementById('log-response-body').checked=!!cfg.logging.response_body_logging; document.getElementById('log-max-body').value=cfg.logging.max_body_size_bytes||10240; document.getElementById('log-db-path').value=cfg.logging.database_path||'logs.db'; document.getElementById('log-excluded-fields').value=(cfg.logging.excluded_fields||[]).join(', '); document.getElementById('log-retention').value=cfg.logging.retention_days||30; document.getElementById('log-cleanup').value=cfg.logging.cleanup_schedule_hours||24;}
     if(cfg.semantic_cache){document.getElementById('cache-enabled').checked=!!cfg.semantic_cache.enabled; document.getElementById('cache-qdrant-url').value=cfg.semantic_cache.qdrant_url||''; document.getElementById('cache-collection').value=cfg.semantic_cache.collection_name||'ai_gateway_cache'; document.getElementById('cache-threshold').value=cfg.semantic_cache.similarity_threshold||0.95; document.getElementById('cache-ttl').value=cfg.semantic_cache.ttl_seconds||3600; document.getElementById('cache-max-entries').value=cfg.semantic_cache.max_cache_size||10000;}
@@ -3349,12 +3721,14 @@ cfg.codex_search=csSearch;
     var originalProviders = (config && config.providers) || [];
     cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
     var originalGroups = (config && config.model_groups) || [];
-    cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container .form-row').forEach(function(row,modelIndex){var originalModel=(originalGroup&&originalGroup.models&&originalGroup.models[modelIndex])||{};var m=JSON.parse(JSON.stringify(originalModel));Object.assign(m,{provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});g.models.push(m);});cfg.model_groups.push(g);});
+    cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container .form-row').forEach(function(row,modelIndex){var originalModel=(originalGroup&&originalGroup.models&&originalGroup.models[modelIndex])||{};var m=JSON.parse(JSON.stringify(originalModel));Object.assign(m,{provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});var mdlCacheReadVal=(row.querySelector('.mdl-cache-read')||{}).value;var mdlCacheWriteVal=(row.querySelector('.mdl-cache-write')||{}).value;var mdlCacheMinVal=(row.querySelector('.mdl-cache-min-tokens')||{}).value;var mdlCacheSupportVal=(row.querySelector('.mdl-cache-support')||{}).value||'none';m.cost_per_million_cache_read_input_tokens=mdlCacheReadVal!==''?parseFloat(mdlCacheReadVal):null;m.cost_per_million_cache_creation_input_tokens=mdlCacheWriteVal!==''?parseFloat(mdlCacheWriteVal):null;m.cache_min_tokens=mdlCacheMinVal!==''?parseInt(mdlCacheMinVal,10):null;m.cache_support=mdlCacheSupportVal==='explicit'?{type:'explicit',max_breakpoints:parseInt((row.querySelector('.mdl-cache-max-bp')||{}).value||'4',10)}:(mdlCacheSupportVal==='automatic'?{type:'automatic'}:null);var mdlReasoningFamilyVal=(row.querySelector('.mdl-reasoning-family')||{}).value||'';var mdlReasoningParamVal=(row.querySelector('.mdl-reasoning-param')||{}).value||'';var mdlReasoningCostVal=(row.querySelector('.mdl-reasoning-cost')||{}).value;m.reasoning_family=mdlReasoningFamilyVal!==''?mdlReasoningFamilyVal:null;m.reasoning_parameter=mdlReasoningParamVal!==''?mdlReasoningParamVal:null;m.cost_per_million_reasoning_tokens=mdlReasoningCostVal!==''?parseFloat(mdlReasoningCostVal):null;g.models.push(m);});cfg.model_groups.push(g);});
     var retryMax=parseInt(document.getElementById('retry-max').value,10);
     var retryBackoff=parseFloat(document.getElementById('retry-backoff').value);
     var retryMultiplier=parseFloat(document.getElementById('retry-multiplier').value);
     var retrySequence=[retryBackoff,retryBackoff*retryMultiplier,retryBackoff*retryMultiplier*retryMultiplier].map(function(v){return Math.max(0,Math.round(v));});
     cfg.retry={max_retries_per_provider:retryMax,backoff_sequence_seconds:retrySequence,jitter_enabled:document.getElementById('retry-jitter-enabled').value==='true',jitter_ratio:parseFloat(document.getElementById('retry-jitter-ratio').value)};
+cfg.cache_aware_routing={enabled:document.getElementById('car-enabled').checked,stickiness_ttl_seconds:Math.max(0,parseInt(document.getElementById('car-ttl').value,10)||0),default_cache_min_tokens:Math.max(0,parseInt(document.getElementById('car-default-min-tokens').value,10)||0),cost_sort_hit_rate:Math.min(1,Math.max(0,parseFloat(document.getElementById('car-hit-rate').value)||0))};
+cfg.reasoning_compat=collectReasoningCompat();
     cfg.cors={enabled:document.getElementById('cors-enabled').checked,allowed_origins:document.getElementById('cors-origins').value.split(',').map(function(s){return s.trim();}).filter(Boolean),allowed_methods:document.getElementById('cors-methods').value.split(',').map(function(s){return s.trim();}).filter(Boolean),allowed_headers:document.getElementById('cors-headers').value.split(',').map(function(s){return s.trim();}).filter(Boolean)};
     cfg.circuit_breaker=cfg.circuit_breaker||{}; cfg.circuit_breaker.failure_threshold=parseInt(document.getElementById('cb-threshold').value,10); cfg.circuit_breaker.success_threshold=cfg.circuit_breaker.success_threshold||1; cfg.circuit_breaker.backoff_sequence_seconds=[parseInt(document.getElementById('cb-initial-backoff').value,10),Math.round(parseInt(document.getElementById('cb-initial-backoff').value,10)*parseFloat(document.getElementById('cb-multiplier').value||'2')),Math.round(parseInt(document.getElementById('cb-max-backoff').value,10)/2),parseInt(document.getElementById('cb-max-backoff').value,10)].filter(function(v,i,arr){return Number.isFinite(v)&&v>0&&(i===0||v!==arr[i-1]);});
     cfg.logging={request_body_logging:document.getElementById('log-request-body').checked,response_body_logging:document.getElementById('log-response-body').checked,max_body_size_bytes:parseInt(document.getElementById('log-max-body').value,10),database_path:document.getElementById('log-db-path').value.trim(),excluded_fields:document.getElementById('log-excluded-fields').value.split(',').map(function(s){return s.trim();}).filter(Boolean),retention_days:parseInt(document.getElementById('log-retention').value,10),cleanup_schedule_hours:parseInt(document.getElementById('log-cleanup').value,10)};
@@ -3397,6 +3771,8 @@ cfg.codex_search=csSearch;
   document.getElementById('loop-preset').addEventListener('change',function(){applyLoopPreset(this.value);});
   document.getElementById('loop-save').addEventListener('click',saveLoopDetection);
   document.getElementById('loop-reset-defaults').addEventListener('click',function(){if(window.confirm('Reset all Loop Detection settings to defaults?'))populateLoopDetection(LOOP_DEFAULTS);});
+
+document.getElementById('rc-add-provider').addEventListener('click',function(){addReasoningProviderCard();});
 
 document.getElementById('smart-save').addEventListener('click',saveSmartRouting);
 document.getElementById('smart-reset').addEventListener('click',function(){populateSmartRouting((config&&config.smart_routing)||{});});
