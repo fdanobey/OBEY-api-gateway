@@ -7266,15 +7266,47 @@ source_ref,
                         .await?,
                 ));
             }
-            // Non-rate-limit failure: the body was drained above so the
-            // connection can be reused; fall back to the buffered path
-            // which has full multi-provider failover.
-            warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
-            drop(concurrency_permit);
-            return Ok(StreamingResponse::Buffered(
-                self.route_request(request, active.clone()).await?,
-            ));
+    // Non-rate-limit failure: the body was drained above so the
+    // connection can be reused; fall back to the buffered path
+    // which has full multi-provider failover.
+    // Context-length errors: attempt truncation before falling back.
+    if self.is_context_length_error(status_code, &body_text) {
+        let mut truncated_request = request.clone();
+        match self.context_manager.handle_context_error(
+            &mut truncated_request,
+            0,
+            Some(&body_text),
+        ) {
+            Ok(result) => {
+                info!(
+                    provider = %provider_model.provider,
+                    model = %provider_model.model,
+                    original_tokens = result.original_tokens,
+                    final_tokens = result.final_tokens,
+                    messages_removed = result.messages_removed,
+                    "Context-length error on streaming pass-through, truncated request and retrying via buffered path"
+                );
+                drop(concurrency_permit);
+                return Ok(StreamingResponse::Buffered(
+                    self.route_request(&truncated_request, active.clone()).await?,
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    provider = %provider_model.provider,
+                    model = %provider_model.model,
+                    error = %e,
+                    "Context-length error on streaming pass-through but truncation cannot continue"
+                );
+            }
         }
+    }
+    warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
+    drop(concurrency_permit);
+    return Ok(StreamingResponse::Buffered(
+        self.route_request(request, active.clone()).await?,
+    ));
+}
 
         // Success — hand the live streaming body and permit to the caller.
         // The handler keeps both alive until the relay finishes or is dropped.
