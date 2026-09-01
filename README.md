@@ -1408,11 +1408,14 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 ```
 .
 ├── Cargo.toml                        # Workspace manifest
+├── Dockerfile                        # Container image (used by Railway)
+├── railway.toml                      # Railway build/deploy + healthcheck config
 ├── crates/
 │   └── ai-gateway/
 │       ├── Cargo.toml                # Crate manifest & dependencies
 │       ├── build.rs                  # Windows resource embedding
 │       ├── config.example.yaml       # Reference configuration
+│       ├── tests/                    # Integration & property test suites
 │       └── src/
 │           ├── main.rs               # Entry point, CLI, tray bootstrap
 │           ├── lib.rs                # Public module exports
@@ -1429,6 +1432,7 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── logger/               # SQLite request logging
 │           ├── metrics/              # Prometheus metrics
 │           ├── oauth/                # OpenAI OAuth 2.0 login (PKCE flow)
+│           ├── reasoning_compat/     # Reasoning-state failover compat: carrier detection, strip policy, param normalization, cost attribution
 │           ├── codex/               # Codex backend: Chat Completions → Responses API translation, model discovery, instructions store, web search
 │           ├── responses/           # Responses API front door: inbound Responses→Chat translation, response/stream synthesis, SQLite stateful store
 │           ├── virtual_keys/         # Virtual key management (auth, budgets, rate limits, usage, admin API)
@@ -1441,15 +1445,28 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── request_body_limit.rs # Dynamic per-request body size enforcement (hot-reloadable)
 │           ├── memory/               # Persistent memory store: extraction, injection, decay, namespaces, Qdrant
 │           ├── secrets.rs            # API key encryption/decryption
+│           ├── description_utils.rs  # Shared description/schema text helpers
 │           ├── error/                # Error types & HTTP status mapping
 │           ├── models/               # OpenAI-compatible data models
 │           └── tray/                 # Windows system tray (feature-gated)
 ├── scripts/
 │   ├── build-release.ps1             # Release packaging script
 │   ├── build-installer.ps1           # Inno Setup installer build
-│   └── installer.iss                 # Inno Setup configuration
+│   ├── bump-version.ps1              # Version bump helper
+│   ├── installer.iss                 # Inno Setup configuration
+│   ├── sync-bedrock-fallback.ps1     # Refresh bundled Bedrock model catalog
+│   ├── sync-nvidia-nim-fallback.ps1  # Refresh bundled NVIDIA NIM model catalog
+│   └── fixtures/                     # Catalog fixtures for the sync scripts
 ├── Assets/                           # Icons and logos
-└── .github/workflows/release.yml     # CI/CD: build + GitHub Release on tag
+├── docs/agents/                      # Agent workflow docs (issue tracker, domain model)
+├── wiki/                             # Documentation wiki sources
+├── AGENTS.md                         # Build/test conventions for contributors & agents
+├── LICENSE                           # MIT license
+├── NOTICE                            # Third-party attribution
+└── .github/workflows/
+    ├── release.yml                   # CI/CD: build + GitHub Release on tag
+    ├── sync-bedrock-fallback.yml      # Scheduled Bedrock catalog refresh
+    └── sync-nvidia-nim-fallback.yml   # Scheduled NVIDIA NIM catalog refresh
 ```
 
 ## Technologies
@@ -1461,7 +1478,11 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 | Web framework | Axum + Tower middleware |
 | HTTP client | Reqwest |
 | Database | SQLite (rusqlite, bundled) |
-| Vector DB | Qdrant (optional, for semantic cache) |
+| Vector DB | Qdrant (optional, for semantic cache & memory) |
+| Concurrency | DashMap (lock-free caches, registries) |
+| ML inference | ONNX Runtime (`ort`) + `tokenizers` — ML classifier & perplexity engine |
+| Tokenization | tiktoken-rs |
+| Schema validation | jsonschema (structured output) |
 | Crypto | ring + base64 |
 | TLS | rustls via axum-server |
 | AWS | aws-sdk-bedrockruntime + aws-sdk-bedrock + aws-config |
@@ -1496,12 +1517,23 @@ panic = "abort"
 ## Testing
 
 ```bash
-cargo test -p ai-gateway               # All tests
+cargo test -p ai-gateway               # All tests (fast profile)
 cargo test -p ai-gateway <test_name>   # Single test
 cargo test -p ai-gateway -- --nocapture # With output
+cargo test -p ai-gateway -- --ignored  # Wall-clock latency budget tests
+PROPTEST_CASES=64 cargo test -p ai-gateway  # Lower property-test case count
 ```
 
-Tests use `tower::ServiceExt::oneshot()` for integration testing (no port binding) and `proptest` for property-based validation of config parsing and input handling.
+Tests use `tower::ServiceExt::oneshot()` for integration testing (no port binding) and `proptest` for property-based validation of config parsing and input handling. Every `GatewayServer::new` opens SQLite databases, so tests redirect them into unique temp directories (`common::isolate_databases`) to avoid lock contention when running in parallel.
+
+Wall-clock budget tests are marked `#[ignore]` and only run with `--ignored`: startup under 2s and forwarding overhead under 10ms (`performance.rs`), guardrail pre-call and streaming assembly budgets (`guardrail_timing.rs`).
+
+Builds must be clean — zero errors and zero warnings:
+
+```bash
+cargo check -p ai-gateway --all-targets
+cargo clippy -p ai-gateway
+```
 
 ## Contributing
 

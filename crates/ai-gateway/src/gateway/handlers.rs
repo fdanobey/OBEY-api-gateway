@@ -2695,43 +2695,9 @@ async fn chat_completions_stream(
     //   Chunk 1: delta has role, content:null, tool_calls[0] with index/id/type/function.name/arguments:""
     //   Chunk 2..N: delta has tool_calls[0] with index + function.arguments fragment
     //   Final: delta:{}, finish_reason:"tool_calls", usage:{...}
-    let stream_trace_id = trace_id.clone();
+    //   Reasoning models: any reasoning/reasoning_content delta is replayed
+    //   before the first tool_calls chunk, matching provider stream order.
     let stream = async_stream::stream! {
-        let choice = response.choices.first();
-
-        // Extract tool_calls from message extra fields
-        let tool_calls = choice
-            .and_then(|c| c.message.extra.get("tool_calls"))
-            .and_then(|v| v.as_array())
-            .cloned();
-
-        let has_tool_calls = tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
-        let reasoning_text = choice
-            .and_then(|c| {
-                c.message
-                    .extra
-                    .get("reasoning")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        c.message
-                            .extra
-                            .get("reasoning_content")
-                            .and_then(|v| v.as_str())
-                    })
-            })
-            .unwrap_or("");
-
-        if !reasoning_text.is_empty() {
-            tracing::warn!(
-                trace_id = %stream_trace_id,
-                model = %response.model,
-                reasoning_len = reasoning_text.len(),
-                has_tool_calls,
-                finish_reason = ?choice.and_then(|c| c.finish_reason.as_deref()),
-                "Buffered provider response contains reasoning content, but synthesized SSE currently emits only content/tool_calls chunks"
-            );
-        }
-
     for chunk in streaming_chunks_from_response(&response) {
         yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
     }
@@ -4640,9 +4606,31 @@ fn build_streaming_chunks(
             .and_then(|n| n.as_str())
             .unwrap_or("");
 
-        // The first tool-call chunk also carries the `role` marker. When the
-        // early event already sent it, drop just the role field and keep the
-        // tool-call metadata (Req 1.5).
+        // Reasoning must reach the client BEFORE the first `tool_calls` delta.
+        // Providers emit thinking ahead of the tool call, and clients treat the
+        // opening tool-call delta as the start of the turn's terminal phase:
+        // Kilo Code stops consuming reasoning once a tool call has begun, so a
+        // trailing reasoning chunk is read as an early stop signal and the turn
+        // is cut short. Replaying reasoning first keeps the synthesized stream
+        // in the same order as a genuine provider stream.
+        //
+        // The role marker still has to lead the stream, so it rides on whichever
+        // delta goes out first (reasoning when present, else the tool-call
+        // header) and is skipped entirely when an early event already sent it
+        // (Req 1.5).
+        let mut role_emitted = skip_role;
+
+        if let Some(mut delta) = reasoning_delta {
+            if !role_emitted {
+                if let Some(obj) = delta.as_object_mut() {
+                    obj.insert("role".to_string(), serde_json::json!("assistant"));
+                    obj.insert("content".to_string(), serde_json::Value::Null);
+                }
+                role_emitted = true;
+            }
+            chunks.push(build_chunk_payload(response, delta, None));
+        }
+
         let mut first_delta = serde_json::json!({
             "content": null,
             "tool_calls": [{
@@ -4655,14 +4643,10 @@ fn build_streaming_chunks(
                 }
             }]
         });
-        if !skip_role {
+        if !role_emitted {
             first_delta["role"] = serde_json::json!("assistant");
         }
         chunks.push(build_chunk_payload(response, first_delta, None));
-
-        if let Some(delta) = reasoning_delta.clone() {
-            chunks.push(build_chunk_payload(response, delta, None));
-        }
 
         let fn_args = first_tc
             .get("function")
@@ -5669,6 +5653,106 @@ mod tests {
             chunks[2]["choices"][0]["delta"]["content"],
             "visible answer"
         );
+    }
+
+    /// A reasoning response whose turn ends in a tool call.
+    fn reasoning_tool_call_response() -> OpenAIResponse {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "reasoning_content".to_string(),
+            serde_json::json!("weighing the options"),
+        );
+        extra.insert(
+            "tool_calls".to_string(),
+            serde_json::json!([{
+                "index": 0,
+                "id": "call_abc",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
+            }]),
+        );
+
+        base_response(Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::Null,
+            extra,
+        })
+    }
+
+    /// Regression: the reasoning delta must be replayed BEFORE the first
+    /// `tool_calls` delta. Clients (Kilo Code) treat the opening tool-call delta
+    /// as the start of the turn's terminal phase, so a trailing reasoning chunk
+    /// reads as an early stop signal and truncates the turn.
+    #[test]
+    fn streaming_chunks_emit_reasoning_before_tool_calls() {
+        let chunks = streaming_chunks_from_response(&reasoning_tool_call_response());
+
+        let first_reasoning = chunks
+            .iter()
+            .position(|c| c["choices"][0]["delta"].get("reasoning_content").is_some())
+            .expect("reasoning delta must be emitted");
+        let first_tool_call = chunks
+            .iter()
+            .position(|c| c["choices"][0]["delta"].get("tool_calls").is_some())
+            .expect("tool_call delta must be emitted");
+
+        assert!(
+            first_reasoning < first_tool_call,
+            "reasoning (idx {first_reasoning}) must precede tool_calls (idx {first_tool_call})"
+        );
+
+        // The role marker leads the stream and appears exactly once, riding on
+        // the reasoning chunk now that it goes out first.
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(first_reasoning, 0);
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|c| c["choices"][0]["delta"].get("role").is_some())
+                .count(),
+            1,
+            "exactly one role marker"
+        );
+
+        // Tool-call metadata and arguments still follow in order, and the turn
+        // terminates on tool_calls.
+        assert_eq!(
+            chunks[first_tool_call]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(
+            chunks[first_tool_call + 1]["choices"][0]["delta"]["tool_calls"][0]["function"]
+                ["arguments"],
+            "{\"path\":\"a.rs\"}"
+        );
+        assert_eq!(
+            chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+    }
+
+    /// Same ordering guarantee on the early-event path, where the role marker
+    /// was already sent and must not be duplicated onto the reasoning chunk.
+    #[test]
+    fn streaming_chunks_after_early_event_emit_reasoning_before_tool_calls() {
+        let chunks = streaming_chunks_after_early_event(
+            &reasoning_tool_call_response(),
+            "chatcmpl-early",
+            1700,
+        );
+
+        assert_eq!(
+            chunks[0]["choices"][0]["delta"]["reasoning_content"],
+            "weighing the options"
+        );
+        assert!(chunks[1]["choices"][0]["delta"]["tool_calls"].is_array());
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c["choices"][0]["delta"].get("role").is_none()),
+            "early event already sent the role marker"
+        );
+        assert!(chunks.iter().all(|c| c["id"] == "chatcmpl-early"));
     }
 
     // -- Early synthetic SSE event (task 2.3) --------------------------------
