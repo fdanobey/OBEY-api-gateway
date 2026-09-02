@@ -88,6 +88,10 @@ pub struct AppState {
     /// Local SQLite store for Responses API (`/v1/responses`) stateful
     /// persistence: `store`, `previous_response_id`, retrieval endpoints.
     pub responses_store: Arc<ResponsesStore>,
+    /// Lock-free snapshot of the per-request limits (body size, global
+    /// deadline). Read on every request instead of taking `config.read()`, so a
+    /// queued config writer cannot stall the whole gateway.
+    pub runtime_limits: Arc<crate::runtime_limits::RuntimeLimits>,
 }
 
 /// Core HTTP server wrapping Axum with middleware and integrated components.
@@ -289,7 +293,16 @@ impl GatewayServer {
         &config.tool_compression,
     )),
     responses_store: Arc::new(responses_store),
+    runtime_limits: Arc::new(crate::runtime_limits::RuntimeLimits::from_config(&config)),
 };
+
+        tracing::info!(
+            configured_request_timeout_seconds = config.server.request_timeout_seconds,
+            effective_request_timeout_seconds = state.runtime_limits.request_timeout_seconds(),
+            max_request_size_bytes = state.runtime_limits.max_request_size_bytes(),
+            "Per-request limits published; the effective deadline is the larger of \
+             server.request_timeout_seconds and the longest provider total_timeout_seconds plus grace"
+        );
 
         Ok(Self { state })
     }
@@ -441,10 +454,10 @@ impl GatewayServer {
             "Gateway route mount configuration resolved"
         );
 
-        let mut router = Router::new()
-            .merge(api_routes)
-            // Health check (Req 20.1-20.3)
-            .route("/health", get(handlers::health_check));
+        // NOTE: `/health` is deliberately NOT mounted here. It is merged after
+        // the global layer stack below so liveness probes bypass the body-limit
+        // and request-timeout middleware entirely. See `health_routes`.
+        let mut router = Router::new().merge(api_routes);
 
         if admin_enabled {
             tracing::info!(path = %admin_path, "Mounting admin routes");
@@ -483,7 +496,7 @@ impl GatewayServer {
             }
         }
 
-        router
+        let layered = router
             .fallback(|req: axum::extract::Request| async move {
                 tracing::warn!(method = %req.method(), uri = %req.uri(), "No route matched");
                 axum::response::Response::builder()
@@ -494,17 +507,39 @@ impl GatewayServer {
                     ))
                     .unwrap()
             })
-// --- Request size limit (Req 45.1-45.5) ---
-// Dynamic middleware reads `server.max_request_size_mb` from live config on
-// every request so the limit applies hot-reload changes (admin UI / config
-// reload) without a process restart.
-.layer(axum::middleware::from_fn_with_state(
-self.state.clone(),
-crate::request_body_limit::request_body_limit_middleware,
-))
-.layer(cors)
-.layer(trace_layer)
-.with_state(self.state.clone())
+            // --- Request size limit (Req 45.1-45.5) ---
+            // Reads the body ceiling from the lock-free `RuntimeLimits` snapshot
+            // so hot-reload changes apply without a restart and without taking
+            // the write-preferring config lock on every request.
+            .layer(axum::middleware::from_fn_with_state(
+                self.state.clone(),
+                crate::request_body_limit::request_body_limit_middleware,
+            ))
+            // --- Global request deadline ---
+            // Outermost application layer so it also bounds the middleware below
+            // it. Guarantees no request occupies gateway resources forever, which
+            // previously left `server.request_timeout_seconds` unenforced.
+            .layer(axum::middleware::from_fn_with_state(
+                self.state.clone(),
+                crate::runtime_limits::request_timeout_middleware,
+            ))
+            .layer(cors.clone())
+            .layer(trace_layer.clone())
+            .with_state(self.state.clone());
+
+        // --- Liveness endpoints (Req 20.1-20.3) ---
+        // Mounted outside the global stack: a liveness probe must stay
+        // answerable even when the body-limit / timeout middleware or a config
+        // writer is degraded, which is exactly when it is most needed. Only CORS
+        // and tracing apply.
+        let health_routes = Router::new()
+            .route("/health", get(handlers::health_check))
+            .route("/ping", get(handlers::ping))
+            .layer(cors)
+            .layer(trace_layer)
+            .with_state(self.state.clone());
+
+        health_routes.merge(layered)
     }
 
     /// Validate TLS configuration on startup (Req 36.2-36.5).
@@ -813,6 +848,19 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     {
         let mut cfg = state.config.write().await;
         *cfg = new_config;
+    }
+    // Republish the lock-free per-request limits so the body ceiling and the
+    // global deadline track the new config without any request needing to take
+    // the config lock.
+    {
+        let cfg = state.config.read().await;
+        state.runtime_limits.apply(&cfg);
+        tracing::info!(
+            configured_request_timeout_seconds = cfg.server.request_timeout_seconds,
+            effective_request_timeout_seconds = state.runtime_limits.request_timeout_seconds(),
+            max_request_size_bytes = state.runtime_limits.max_request_size_bytes(),
+            "Per-request limits republished after config reload"
+        );
     }
     *state.structured_output_engine.write().await = rebuilt_structured_output_engine;
     state.loop_detector.apply_config(loop_detection).await;

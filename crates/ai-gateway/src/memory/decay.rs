@@ -201,7 +201,7 @@ async fn run_cycle(
         store.run_decay_cycle(max_memories_per_namespace, Utc::now())
     })
     .await
-    .map_err(|error| MemoryError::Config(format!("memory decay task failed: {error}")))?
+    .map_err(|error| MemoryError::TaskFailed(format!("memory decay task failed: {error}")))?
 }
 
 #[cfg(test)]

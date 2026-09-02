@@ -93,6 +93,32 @@ pub enum MemoryError {
     /// Memory extraction failed.
     #[error("memory extraction error: {0}")]
     Extraction(String),
+
+    /// A blocking store task was cancelled or panicked before completing.
+    ///
+    /// Synchronous SQLite work is dispatched to the blocking thread pool so it
+    /// cannot occupy an async worker; this is distinct from a SQL-level failure.
+    #[error("memory blocking task error: {0}")]
+    TaskFailed(String),
+}
+
+/// Run a blocking memory-store operation on the blocking thread pool.
+///
+/// [`MemoryStore`] holds a `std::sync::Mutex<Connection>` and every method does
+/// synchronous SQLite I/O, including FTS5 scans and write transactions. Awaiting
+/// those inline parks a Tokio worker for the lock wait plus the query; because a
+/// single connection serializes all callers, sufficient concurrency can occupy
+/// every worker and stall the gateway. Mirrors the decay module's `run_cycle`,
+/// which already dispatched its store work this way.
+async fn spawn_store_task<T, F>(task: F) -> Result<T, MemoryError>
+where
+    F: FnOnce() -> Result<T, MemoryError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(task).await {
+        Ok(result) => result,
+        Err(error) => Err(MemoryError::TaskFailed(error.to_string())),
+    }
 }
 
 /// Administrative creation was rejected before or during persistence.
@@ -446,17 +472,37 @@ impl MemorySystem {
             ContextType::Agent(_) => "agent",
             ContextType::User => "user",
         };
-        self.store.upsert_namespace_labels(
-            namespace
-                .context_scope
-                .as_deref()
-                .unwrap_or(&namespace.user_scope),
-            context_kind,
-            detected.display_name.as_deref(),
-            None,
-        )?;
+        // `upsert_namespace_labels` is a synchronous SQLite write and
+        // `retrieve_lexical` runs an FTS5 + bm25 scan; both take the single
+        // connection mutex. Run them on the blocking pool so a slow query cannot
+        // park an async worker — with memory enabled this sits on the path of
+        // every chat request, so inline execution let concurrent traffic occupy
+        // every worker thread at once.
+        let store = Arc::clone(&self.store);
+        let label_scope = namespace
+            .context_scope
+            .as_deref()
+            .unwrap_or(&namespace.user_scope)
+            .to_owned();
+        let display_name = detected.display_name.clone();
+        spawn_store_task(move || {
+            store.upsert_namespace_labels(
+                &label_scope,
+                context_kind,
+                display_name.as_deref(),
+                None,
+            )
+        })
+        .await?;
+
         let injection = if effective_config.enabled {
-            let lexical = self.injector.retrieve_lexical(&namespace, query, None)?;
+            let injector = Arc::clone(&self.injector);
+            let retrieval_namespace = namespace.clone();
+            let retrieval_query = query.to_owned();
+            let lexical = spawn_store_task(move || {
+                injector.retrieve_lexical(&retrieval_namespace, &retrieval_query, None)
+            })
+            .await?;
             let candidates = if let (Some(tier), Some(qdrant)) = (
                 self.vector_tier.read().await.clone(),
                 self.config.read().await.qdrant.clone(),

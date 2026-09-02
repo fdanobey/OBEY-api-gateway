@@ -22,6 +22,7 @@ pub mod reasoning_compat;
 pub mod request_body_limit;
 pub mod responses;
 pub mod router;
+pub mod runtime_limits;
 pub mod secrets;
 pub mod smart_routing;
 pub mod structured_output;

@@ -2122,7 +2122,11 @@ if (pageId === 'virtual-keys') { vkOnOpen(); }
     if (pageId === 'circuit-breaker') { loadCircuitBreakerStates(); }
   }
 
-  /** Re-fetch each model row's provider model list, preserving the current selection. */
+  /**
+   * Refresh each model row's provider model list, preserving the current selection.
+   * Lookups are deduplicated per provider by getProviderModels, so a page with many
+   * rows costs one request per distinct provider rather than one per dropdown.
+   */
 function refreshModelGroupModels() {
   document.querySelectorAll('#groups-list .models-container > .form-row').forEach(function(row) {
     var provSel = row.querySelector('.mdl-provider');
@@ -2135,7 +2139,7 @@ function refreshModelGroupModels() {
       // Use the data-model attribute as authoritative source — it survives async fetch
       // states where mdlSel.value may be empty (e.g. "Loading…" placeholder).
       var current = mdlSel.value || row.dataset.model || '';
-      fetchModelsForProvider(provSel.value, mdlSel, current);
+      fetchModelsForProvider(provSel.value, mdlSel, current, PROVIDER_MODELS_TTL_MS);
     });
   }
 
@@ -2892,6 +2896,8 @@ function refreshModelGroupModels() {
         tempSelect.style.cssText = 'width:100%;padding:.5rem .75rem;border:1px solid var(--border);border-radius:var(--radius);font-size:.875rem;margin-top:.5rem';
         card.querySelector('.btn-refresh-models').insertAdjacentElement('afterend', tempSelect);
       }
+      // Explicit user refresh: bypass the shared model-list cache for this provider.
+      invalidateProviderModels(card.querySelector('.prov-name').value.trim());
       fetchModelsForBedrock(region, apiKey, globalInference, tempSelect, '', manualModels, card.querySelector('.prov-name').value.trim());
       setStatus('Fetching Bedrock models for ' + region + '…');
     });
@@ -3012,7 +3018,112 @@ function refreshModelGroupModels() {
     return mm;
   }
 
-  function fetchModelsForProvider(providerName, selectEl, currentModel) {
+  // --- Provider model-list cache -------------------------------------------
+  // Model Group rows reuse the same handful of providers, so without caching
+  // every model dropdown fires its own /providers/models request on page load.
+  // Entries are keyed by the provider fields that influence discovery, and
+  // concurrent lookups share a single in-flight promise.
+  var PROVIDER_MODELS_TTL_MS = 5 * 60 * 1000;
+  var providerModelsCache = {};
+
+  /** Non-reversible short hash so API key material never lands in a cache key. */
+  function hashCacheToken(s) {
+    var h = 5381;
+    for (var i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) | 0; }
+    return (h >>> 0).toString(36);
+  }
+
+  /** Drop cached model lists. Omit providerName to clear every provider. */
+  function invalidateProviderModels(providerName) {
+    if (!providerName) { providerModelsCache = {}; return; }
+    var prefix = providerName + '\u0000';
+    Object.keys(providerModelsCache).forEach(function(k) {
+      if (k.indexOf(prefix) === 0) { delete providerModelsCache[k]; }
+    });
+  }
+
+  // Editing a provider (URL, key, type, manual models, region) can change what
+  // discovery returns, so drop the cache and let the next lookup re-query.
+  (function wireProviderCacheInvalidation() {
+    var list = document.getElementById('providers-list');
+    if (list) { list.addEventListener('change', function() { invalidateProviderModels(); }); }
+  })();
+
+  /**
+   * Perform the actual discovery request(s) for one provider.
+   * Resolves to { models: string[], failed: boolean, noBaseUrl: boolean }.
+   * Never rejects, so a shared promise can safely fan out to many dropdowns.
+   */
+  function fetchProviderModelsUncached(providerName, provType, baseUrl, apiKey) {
+    if (!baseUrl) {
+      if (provType === 'bedrock') {
+        return Promise.resolve({ models: getBedrockFallbackModels(providerName), failed: false, noBaseUrl: false });
+      }
+      return Promise.resolve({ models: [], failed: false, noBaseUrl: true });
+    }
+
+    // For Bedrock, query both the standard /v1 and the OpenAI-specific /openai/v1 paths
+    if (provType === 'bedrock') {
+      var openaiBase = baseUrl.replace(/\/v1\/?$/, '/openai/v1');
+      var bedrockUrl1 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=bedrock';
+      var bedrockUrl2 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(openaiBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=bedrock';
+      return Promise.all([
+        fetch(bedrockUrl1, { signal: AbortSignal.timeout(12000) }).then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};}),
+        fetch(bedrockUrl2, { signal: AbortSignal.timeout(12000) }).then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};})
+      ]).then(function(results) {
+        var seen = {};
+        var models = [];
+        // Include only the catalog compatible with this provider's auth mode.
+        getBedrockFallbackModels(providerName).forEach(function(id) { if (!seen[id]) { seen[id] = true; models.push(id); } });
+        // Merge any live-discovered models on top
+        results.forEach(function(data) {
+          (data.data || []).forEach(function(m) {
+            var id = m.id || m.name || '';
+            if (id && !seen[id]) { seen[id] = true; models.push(id); }
+          });
+        });
+        return { models: models, failed: false, noBaseUrl: false };
+      }).catch(function() {
+        return { models: getBedrockFallbackModels(providerName), failed: false, noBaseUrl: false };
+      });
+    }
+
+    // Proxy through backend to avoid CORS issues with external provider APIs
+    var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=' + encodeURIComponent(provType || '');
+    return fetch(proxyUrl, { signal: AbortSignal.timeout(12000) })
+      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function(data) {
+        var models = (data.data || []).map(function(m) { return m.id || m.name || ''; }).filter(Boolean);
+        return { models: models, failed: false, noBaseUrl: false };
+      })
+      .catch(function() {
+        return { models: [], failed: true, noBaseUrl: false };
+      });
+  }
+
+  /**
+   * Resolve a provider's model list, reusing an in-flight or recent result so N
+   * dropdowns on the same provider cost one request. `maxAgeMs` bounds how stale
+   * a cached entry may be (default: any age). Failed lookups are not cached.
+   */
+  function getProviderModels(providerName, maxAgeMs) {
+    var provType = getProviderType(providerName);
+    var baseUrl = getProviderBaseUrl(providerName);
+    var apiKey = getProviderApiKey(providerName);
+    var key = [providerName, provType || '', baseUrl || '', hashCacheToken(apiKey || '')].join('\u0000');
+    var entry = providerModelsCache[key];
+    var limit = (typeof maxAgeMs === 'number') ? maxAgeMs : Infinity;
+    if (entry && (Date.now() - entry.at) <= limit) { return entry.promise; }
+    var promise = fetchProviderModelsUncached(providerName, provType, baseUrl, apiKey);
+    providerModelsCache[key] = { at: Date.now(), promise: promise };
+    promise.then(function(res) {
+      var cached = providerModelsCache[key];
+      if (res && res.failed && cached && cached.promise === promise) { delete providerModelsCache[key]; }
+    });
+    return promise;
+  }
+
+  function fetchModelsForProvider(providerName, selectEl, currentModel, maxAgeMs) {
     var baseUrl = getProviderBaseUrl(providerName);
     var manualModels = getManualModelsForProvider(providerName);
     var provType = getProviderType(providerName);
@@ -3040,52 +3151,20 @@ function refreshModelGroupModels() {
       if (row && currentModel) { row.dataset.model = currentModel; }
     }
 
-    if (!baseUrl) {
-      // For bedrock with no base URL, use built-in catalog
-      if (provType === 'bedrock') { populateSelect(getBedrockFallbackModels(providerName)); return; }
-      if (manualModels.length) { populateSelect([]); return; }
+    // No base URL and nothing to discover from: resolve locally, no request.
+    if (!baseUrl && provType !== 'bedrock' && !manualModels.length) {
       selectEl.innerHTML = '<option value="">-- no base URL --</option>';
       return;
     }
-    selectEl.innerHTML = '<option value="">Loading…</option>';
-    // Proxy through backend to avoid CORS issues with external provider APIs
-    var apiKey = getProviderApiKey(providerName);
+    if (baseUrl) { selectEl.innerHTML = '<option value="">Loading…</option>'; }
 
-    // For Bedrock, query both the standard /v1 and the OpenAI-specific /openai/v1 paths
-    if (provType === 'bedrock') {
-      var openaiBase = baseUrl.replace(/\/v1\/?$/, '/openai/v1');
-      var proxyUrl1 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=bedrock';
-      var proxyUrl2 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(openaiBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=bedrock';
-      Promise.all([
-        fetch(proxyUrl1, { signal: AbortSignal.timeout(12000) }).then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};}),
-        fetch(proxyUrl2, { signal: AbortSignal.timeout(12000) }).then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};})
-      ]).then(function(results) {
-        var seen = {};
-        var models = [];
-        // Include only the catalog compatible with this provider's auth mode.
-        getBedrockFallbackModels(providerName).forEach(function(id) { if (!seen[id]) { seen[id] = true; models.push(id); } });
-        // Merge any live-discovered models on top
-        results.forEach(function(data) {
-          (data.data || []).forEach(function(m) {
-            var id = m.id || m.name || '';
-            if (id && !seen[id]) { seen[id] = true; models.push(id); }
-          });
-        });
-        populateSelect(models);
-      }).catch(function() {
-        populateSelect(getBedrockFallbackModels(providerName));
-      });
-      return;
-    }
-
-    var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=' + encodeURIComponent(provType || '');
-    fetch(proxyUrl, { signal: AbortSignal.timeout(12000) })
-      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(function(data) {
-        var models = (data.data || []).map(function(m) { return m.id || m.name || ''; }).filter(Boolean);
-        populateSelect(models);
-      })
-      .catch(function() {
+    getProviderModels(providerName, maxAgeMs).then(function(res) {
+      if (res.noBaseUrl) {
+        if (manualModels.length) { populateSelect([]); return; }
+        selectEl.innerHTML = '<option value="">-- no base URL --</option>';
+        return;
+      }
+      if (res.failed) {
         if (manualModels.length) { populateSelect([]); return; }
         // Fallback: replace select with text input for manual model entry
         var textInput = document.createElement('input');
@@ -3099,7 +3178,11 @@ function refreshModelGroupModels() {
         } else {
           selectEl.innerHTML = '<option value="' + (currentModel || '') + '">' + (currentModel || 'Type model name') + '</option>';
         }
-      });
+        return;
+      }
+      // Copy: populateSelect mutates the array, and the cached list is shared.
+      populateSelect(res.models.slice());
+    });
   }
 
   // --- Bedrock Region Group Prefix (Req 4.3, 4.4) ---

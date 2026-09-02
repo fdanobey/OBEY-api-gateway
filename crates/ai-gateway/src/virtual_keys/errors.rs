@@ -107,6 +107,14 @@ pub enum KeyError {
     /// non-sensitive message; the plaintext key is never included.
     #[error("Encryption error: {0}")]
     Encryption(String),
+
+    /// A blocking database task failed to run to completion (HTTP 500).
+    ///
+    /// Store access is dispatched to the blocking thread pool so `keys.db`
+    /// writes never occupy an async worker; this represents the task being
+    /// cancelled or panicking, which is distinct from a SQL-level failure.
+    #[error("Background task error: {0}")]
+    TaskFailed(String),
 }
 
 /// Map a [`KeyError`] to its HTTP response per the design "HTTP Error Mapping"
@@ -146,6 +154,10 @@ impl IntoResponse for KeyError {
             }
             KeyError::Encryption(err) => {
                 tracing::error!(error = %err, "virtual key encryption error");
+                internal_error()
+            }
+            KeyError::TaskFailed(err) => {
+                tracing::error!(error = %err, "virtual key blocking task failed");
                 internal_error()
             }
         }

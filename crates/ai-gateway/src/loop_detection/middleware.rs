@@ -7,7 +7,7 @@ use crate::loop_detection::{
     injection::InjectionEngine,
     metrics::LoopDetectionMetrics,
     scorer::ConfidenceScorer,
-    session::{RequestRecord, ResponseDescriptor, SessionResolver, SessionState},
+    session::{RequestRecord, ResponseDescriptor, SessionId, SessionResolver, SessionState},
     signals::SignalComputer,
     simhash,
 };
@@ -65,6 +65,11 @@ impl LoopDetectorState {
     pub fn clear_sessions(&self) {
         self.sessions.clear();
         self.session_locks.clear();
+    }
+
+    /// Drop `session_locks` entries whose session no longer exists.
+    fn prune_orphaned_session_locks(&self, max_sessions: usize) {
+        prune_orphaned_session_locks(&self.session_locks, &self.sessions, max_sessions);
     }
 
     pub async fn apply_config(&self, config: crate::loop_detection::LoopDetectionConfig) {
@@ -206,6 +211,11 @@ where
                     Some(&state.metrics),
                 );
             }
+
+            // `sessions` is bounded by TTL and capacity eviction, but the
+            // per-session mutexes live in a separate map that eviction never
+            // touched, so it grew without bound on a caller-supplied session id.
+            state.prune_orphaned_session_locks(effective_config.max_sessions as usize);
 
             let decision = {
                 let mut session = state
@@ -593,4 +603,124 @@ fn hard_stop_response(session_id: &str, confidence: f32, dominant_signal: &str) 
             .to_string(),
         ))
         .expect("hard-stop response")
+}
+
+/// Drop `session_locks` entries whose session is no longer tracked.
+///
+/// Reconciling against `sessions` is what bounds this map: a lock is only useful
+/// while its session exists or is being created, and `sessions` is already TTL-
+/// and capacity-bounded. Without this, the lock map grew for the process lifetime
+/// on a caller-supplied session id even as the sessions themselves were evicted.
+///
+/// An entry is removed only when the map holds the sole reference. A concurrent
+/// request that already cloned the `Arc` keeps the count above one, so its turn
+/// stays serialized — dropping the entry underneath it would let the next request
+/// build a fresh mutex and run concurrently with it. `remove_if` evaluates the
+/// predicate while holding the shard lock, so the count check and the removal
+/// cannot interleave with another `entry` call on the same key.
+///
+/// Returns the number of entries removed.
+fn prune_orphaned_session_locks(
+    session_locks: &DashMap<String, Arc<Mutex<()>>>,
+    sessions: &DashMap<SessionId, SessionState>,
+    max_sessions: usize,
+) -> usize {
+    let cap = max_sessions.max(1);
+    if session_locks.len() <= cap {
+        return 0;
+    }
+
+    let orphaned: Vec<String> = session_locks
+        .iter()
+        .filter(|entry| !sessions.contains_key(entry.key()))
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    let mut removed = 0usize;
+    for session_id in orphaned {
+        if session_locks
+            .remove_if(&session_id, |_, lock| Arc::strong_count(lock) == 1)
+            .is_some()
+        {
+            removed += 1;
+        }
+    }
+
+    if removed > 0 {
+        tracing::debug!(
+            removed,
+            retained = session_locks.len(),
+            cap,
+            "Pruned orphaned loop-detection session locks"
+        );
+    }
+    removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type LockMap = DashMap<String, Arc<Mutex<()>>>;
+
+    fn insert_lock(locks: &LockMap, session_id: &str) -> Arc<Mutex<()>> {
+        locks
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    #[test]
+    fn prune_is_a_no_op_below_the_cap() {
+        let locks = LockMap::new();
+        let sessions = DashMap::new();
+        let held = insert_lock(&locks, "only-session");
+
+        assert_eq!(prune_orphaned_session_locks(&locks, &sessions, 10), 0);
+        assert_eq!(locks.len(), 1);
+        drop(held);
+    }
+
+    #[test]
+    fn prune_drops_locks_whose_session_was_evicted() {
+        let locks = LockMap::new();
+        let sessions = DashMap::new();
+        // Two orphaned locks (no matching session) plus one live session, with a
+        // cap of 1 so pruning engages. Nothing holds the returned Arcs.
+        drop(insert_lock(&locks, "orphan-a"));
+        drop(insert_lock(&locks, "orphan-b"));
+        drop(insert_lock(&locks, "live"));
+        sessions.insert("live".to_string(), SessionState::new(None, 4));
+
+        let removed = prune_orphaned_session_locks(&locks, &sessions, 1);
+
+        assert_eq!(removed, 2);
+        assert!(!locks.contains_key("orphan-a"));
+        assert!(!locks.contains_key("orphan-b"));
+        assert!(
+            locks.contains_key("live"),
+            "a lock whose session still exists must be retained"
+        );
+    }
+
+    #[test]
+    fn prune_retains_locks_still_held_by_a_request() {
+        let locks = LockMap::new();
+        let sessions = DashMap::new();
+        // Simulate an in-flight request that cloned the Arc but whose session has
+        // not been created yet. Dropping this entry would let the next request
+        // build a fresh mutex and run concurrently, breaking serialization.
+        let in_flight = insert_lock(&locks, "in-flight");
+        drop(insert_lock(&locks, "orphan"));
+
+        let removed = prune_orphaned_session_locks(&locks, &sessions, 1);
+
+        assert_eq!(removed, 1);
+        assert!(
+            locks.contains_key("in-flight"),
+            "must not drop a lock that a live request is holding"
+        );
+        assert!(!locks.contains_key("orphan"));
+        drop(in_flight);
+    }
 }

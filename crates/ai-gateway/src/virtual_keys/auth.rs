@@ -301,10 +301,10 @@ async fn enforce_authenticated(
 
     // Buffer + inspect request bodies to extract the requested model group.
     let (request, requested_model) = if json_body || multipart_body {
-        let max_body_bytes = {
-            let cfg = state.config.read().await;
-            (cfg.server.max_request_size_mb as usize).saturating_mul(1024 * 1024)
-        };
+        // Read from the lock-free snapshot rather than `config.read().await`:
+        // this middleware wraps every API route, and the config lock is
+        // write-preferring.
+        let max_body_bytes = state.runtime_limits.max_request_size_bytes();
         let (parts, body) = request.into_parts();
         let bytes = match to_bytes(body, max_body_bytes).await {
             Ok(b) => b,

@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -129,9 +130,21 @@ impl MemoryStore {
         }
 
         let mut conn = Connection::open(db_path)?;
+        // Retrieval runs FTS5 + bm25 scoring and `record_access` runs a
+        // transaction, both synchronously under a single `Mutex<Connection>` on
+        // the request path. Without WAL every commit fsyncs, which serializes
+        // request handling behind disk latency; `busy_timeout` keeps lock
+        // contention from surfacing as an immediate `SQLITE_BUSY` error.
+        // In-memory databases do not support WAL, so that pragma is file-only.
+        let file_backed = db_path != Path::new(":memory:");
+        conn.busy_timeout(Duration::from_secs(5))?;
+        if file_backed {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+        }
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::verify_fts5(&conn)?;
         Self::initialize_schema(&mut conn)?;
-        let db_path = (db_path != Path::new(":memory:")).then(|| db_path.to_path_buf());
+        let db_path = file_backed.then(|| db_path.to_path_buf());
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

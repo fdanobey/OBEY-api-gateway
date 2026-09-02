@@ -66,7 +66,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Tool definition compression** — 12-stage pipeline for reducing token waste from large `tools` arrays: schema minification, description truncation, deduplication with `$ref`, frequency-based pruning, progressive disclosure with namespace grouping, semantic retrieval (TF-IDF + embeddings), canonical text rewriting, cache-aware placement, and adaptive feedback loop with auto-tuning; provider-aware, per-model-group overrides, zero overhead when disabled (see [Tool Definition Compression](#tool-definition-compression))
 - **Hot config reload** — change settings through the admin UI without restarting
 - **Dynamic request body limit** — configurable `max_request_size_mb` (default 10 MB) enforced per-request; adjustable via admin UI or hot-reload without restart, rejects oversized payloads with HTTP 413 before forwarding
-- **Smart timeouts** — split TTFB / total timeouts with auto-detection of thinking models (o1, o3, DeepSeek-R1, Claude)
+- **Smart timeouts** — split TTFB / total timeouts with auto-detection of thinking models (o1, o3, DeepSeek-R1, Claude), plus a gateway-wide request deadline derived from the longest configured provider timeout that catches stalls no provider timeout covers (see [Global request deadline](#global-request-deadline))
 - **Smart model routing** — complexity-aware tier selection (Fast / Balanced / Powerful) with heuristic, ML (ONNX), LLM, or composite classifiers; cascade escalation, online optimization, A/B testing, budget limits, semantic routing cache, and per-model-group overrides (see [Smart Model Routing](#smart-model-routing))
 - **Prompt-cache-aware routing** — prefix-hash sticky provider selection, automatic Anthropic-style `cache_control` breakpoint injection and advancement, cached-token-aware cost sorting and billing, and per-provider cache hit-rate telemetry with OpenRouter session affinity (see [Prompt-Cache-Aware Routing](#prompt-cache-aware-routing))
 
@@ -201,7 +201,7 @@ If no config exists on first run, a default is created automatically. See [`conf
 server:
   host: "0.0.0.0"
   port: 8080
-  request_timeout_seconds: 30
+  request_timeout_seconds: 30         # One input to the global deadline, not a literal cap — see Global request deadline
   max_request_size_mb: 10             # Dynamic body limit (hot-reloadable)
 
 providers:
@@ -425,6 +425,40 @@ providers:
 ```
 
 When a timeout fires, the error response tells the user exactly which timeout was hit and which config field to adjust.
+
+#### Global request deadline
+
+Above the per-provider timeouts sits a single gateway-wide ceiling that catches work no provider timeout covers — concurrency-slot queue waits, and guardrail or OAuth HTTP calls made without their own timeout. Those are what turn a stall into a permanent hang.
+
+The ceiling is **derived, not taken literally** from `server.request_timeout_seconds`:
+
+```text
+ceiling = max(server.request_timeout_seconds,
+              longest provider total_timeout_seconds + 60s grace)
+```
+
+The maximum is deliberate. `server.request_timeout_seconds` defaults to 30s while provider `total_timeout_seconds` values routinely run into the hundreds, so enforcing the server value literally would abort requests the provider configuration explicitly permits. Set `server.request_timeout_seconds` higher than that derived value when you want a stricter cap.
+
+Exceeding the ceiling returns HTTP 504 with `"code": "gateway_timeout"` and names both fields in the message. The deadline bounds how long a handler may take to *produce a response*, not the lifetime of a streaming body — SSE relays keep streaming afterwards under their own inter-chunk and total limits, while buffered requests are bounded end to end.
+
+Both this deadline and `max_request_size_mb` are read per request from a lock-free atomic snapshot rather than the config lock, so a queued hot-reload writer can never block liveness endpoints like `/health` and `/ping`. Hot-reload republishes the snapshot.
+
+#### Provider concurrency slots
+
+Each provider allows `max_connections` requests in flight at once (default 100). A slot is held for the whole upstream call, including the full duration of a streaming relay, so a provider with a small `max_connections` and a large `total_timeout_seconds` can stay saturated for a long time.
+
+Waiting for a slot is bounded by that provider's effective `total_timeout_seconds`: if a slot cannot be obtained within the time the provider is allowed to spend on an entire request, waiting longer cannot produce a useful response. Requests that cannot get a slot in that window return **HTTP 503** naming the provider, the wait, and the current `max_connections`, rather than queueing indefinitely with no response.
+
+```yaml
+providers:
+  - name: "ollama"
+    type: "ollama"
+    base_url: "http://localhost:11434"
+    max_connections: 2              # only 2 concurrent requests; a 3rd waits, then 503s
+    total_timeout_seconds: 800      # also the maximum slot wait
+```
+
+If you see these 503s, raise `max_connections` for that provider, lower its `total_timeout_seconds`, or reduce concurrent load. Diagnostic tip: when `/ping` answers promptly but `/v1/*` requests stall, the bottleneck is provider slots or upstream latency rather than the gateway itself.
 
 ### Environment Variables
 
@@ -1132,7 +1166,8 @@ All `/v1/*` endpoints are OpenAI-compatible. Requests include an `x-trace-id` re
 | `DELETE` | `/admin/memory/namespaces/{namespace}` | Clear all entries in a namespace |
 | `GET` | `/admin/memory/stats` | Memory store statistics |
 | `GET` | `/admin/memory/projects` | List detected project namespaces |
-| `GET` | `/health` | Health check |
+| `GET` | `/health` | Health check — reports `shutting_down` during drain |
+| `GET` | `/ping` | Minimal liveness probe — always `200 pong` while the process can schedule work |
 | `GET` | `/metrics` | Prometheus metrics |
 | `POST` | `/v1/chat/completions` | Chat completions (streaming + non-streaming) |
 | `POST` | `/v1/responses` | Responses API — create (streaming + non-streaming) |
@@ -1443,6 +1478,7 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── assistants/          # OpenAI Assistants API: local SQLite-backed CRUD for assistants, threads, messages, runs, files
 │           ├── active_requests.rs   # Live in-flight request registry for dashboard phase tracking
 │           ├── request_body_limit.rs # Dynamic per-request body size enforcement (hot-reloadable)
+│           ├── runtime_limits.rs    # Lock-free atomic snapshot of hot-reloadable per-request limits + global request-deadline middleware
 │           ├── memory/               # Persistent memory store: extraction, injection, decay, namespaces, Qdrant
 │           ├── secrets.rs            # API key encryption/decryption
 │           ├── description_utils.rs  # Shared description/schema text helpers
@@ -1489,6 +1525,7 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 | CLI | clap |
 | Logging | tracing + tracing-subscriber |
 | Asset embedding | rust-embed |
+| Windows tray (feature-gated) | tray-item + winit + winrt-notification |
 | Testing | proptest, wiremock, tempfile |
 | CI/CD | GitHub Actions |
 | Installer | Inno Setup 6 |

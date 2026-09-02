@@ -1165,6 +1165,18 @@ pub async fn health_check(State(state): State<AppState>) -> Response {
     }
 }
 
+/// Minimal liveness probe — always 200 while the process can schedule work.
+///
+/// Unlike [`health_check`] this reports nothing about drain state and touches no
+/// shared state at all, so it stays answerable under lock contention or worker
+/// saturation. Mounted outside the global middleware stack, which makes a
+/// successful `/ping` alongside a hanging `/v1/*` route a positive signal that
+/// the runtime is alive and the stall is downstream (provider slots, upstream
+/// latency) rather than a gateway-wide deadlock.
+pub async fn ping() -> Response {
+    (StatusCode::OK, "pong").into_response()
+}
+
 // ---------------------------------------------------------------------------
 // POST /v1/chat/completions  (Req 2.1)
 // ---------------------------------------------------------------------------
@@ -4111,6 +4123,41 @@ fn chunk_carries_content(payload: &str) -> bool {
     false
 }
 
+/// True iff an SSE chunk payload carries an *answer*: assistant text or a tool
+/// call. Reasoning does NOT count.
+///
+/// This is the stricter sibling of [`chunk_carries_content`]. The two answer
+/// different questions and conflating them is what let reasoning-only turns pass
+/// as complete: `chunk_carries_content` asks "have bytes the client cares about
+/// already gone out?" (so, is silent failover still safe), while this asks "did
+/// the turn actually produce something a tool-using client can act on?".
+fn chunk_carries_answer(payload: &str) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let Some(delta) = value
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+    else {
+        return false;
+    };
+
+    if delta
+        .get("content")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return true;
+    }
+    delta
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .is_some_and(|calls| !calls.is_empty())
+}
+
 fn reqwest_error_chain(error: &reqwest::Error) -> String {
     let mut messages = Vec::new();
     let mut current: Option<&(dyn StdError + 'static)> = Some(error);
@@ -4241,6 +4288,12 @@ fn relay_passthrough_stream(
            // Task 6.1: track whether any content/tool_call/reasoning delta has been
            // forwarded. Drives the pre- vs post-content failure branch below.
            let mut content_forwarded = false;
+           // Narrower than `content_forwarded`: only answer text or a tool call
+           // counts, never reasoning. A turn made of pure reasoning deltas has
+           // sent bytes to the client (so silent failover is off the table) yet
+           // gave a tool-using client nothing to act on — see the clean-close
+           // branch below.
+           let mut answer_forwarded = false;
 
            // `terminated` => the relay already wrote its own terminal frame(s) — a
            // graceful error event (post-content, appends `[DONE]`) OR deliberate
@@ -4367,6 +4420,9 @@ fn relay_passthrough_stream(
                            if !content_forwarded && chunk_carries_content(payload) {
                                content_forwarded = true;
                            }
+                           if !answer_forwarded && chunk_carries_answer(payload) {
+                               answer_forwarded = true;
+                           }
                            sse_accumulator.push_str("data: ");
                            sse_accumulator.push_str(payload);
                            sse_accumulator.push_str("\n\n");
@@ -4432,6 +4488,35 @@ fn relay_passthrough_stream(
                    // Any role-only chunks we already forwarded are idempotent with
                    // the early event and won't confuse the client on retry.
                    return;
+               }
+
+               // The stream closed cleanly but the turn produced only reasoning —
+               // no answer text, no tool call. A tool-using client has nothing to
+               // act on and treats the terminal chunk as a finished reply, which
+               // is how an agent run stalls mid-work with no error anywhere.
+               //
+               // This request cannot be salvaged: the reasoning deltas and the
+               // provider's terminal chunk have already reached the client, so
+               // silent failover would duplicate output. Learn the combo instead,
+               // so the next tools-bearing request for it takes the buffered path
+               // where the router's degenerate-turn failover can run. Caching is
+               // already refused for contentless turns by `should_cache_response`.
+               if !answer_forwarded {
+                   if let Some(det) = xml_detect.as_ref() {
+                       det.router
+                           .mark_degenerate_stream_combo(&det.provider, &det.model);
+                       tracing::warn!(
+                           trace_id = %trace_id,
+                           provider = %det.provider,
+                           model = %det.model,
+                           "Streamed turn ended after reasoning with no answer text and no tool call; future tool requests for this provider/model will use the buffered retry path"
+                       );
+                   } else {
+                       tracing::warn!(
+                           trace_id = %trace_id,
+                           "Streamed turn ended after reasoning with no answer text and no tool call"
+                       );
+                   }
                }
 
                // Req 3.7 / 3.10: clean completion — reassemble the accumulated chunks
@@ -4794,7 +4879,8 @@ fn reasoning_delta(choice: Option<&Choice>) -> Option<serde_json::Value> {
 mod tests {
     use super::{
         append_feedback_to_response, attach_smart_routing_headers, attach_validation_status_header,
-        build_keepalive, cache_allowed_for_validation, chunk_carries_content, classify_relay_line,
+        build_keepalive, cache_allowed_for_validation, chunk_carries_answer, chunk_carries_content,
+        classify_relay_line,
         classify_stream_error, collect_structured_output_failure, eager_sse_response,
         early_event_chunk, emit_sse_error_event, force_eager_structured_stream, json_model,
         memory_feedback_chunk, multipart_model, openai_json_response, prepare_response_for_client,
@@ -6317,6 +6403,41 @@ mod tests {
             !chunk_carries_content("not json"),
             "malformed is not content"
         );
+    }
+
+    /// `chunk_carries_answer` is deliberately stricter than
+    /// `chunk_carries_content`: reasoning proves bytes went out (so silent
+    /// failover is unsafe) but proves nothing about the turn having done work.
+    /// Conflating the two is what let reasoning-only streams pass as complete.
+    #[test]
+    fn chunk_carries_answer_ignores_reasoning() {
+        let content = r#"{"choices":[{"index":0,"delta":{"content":"hi"}}]}"#;
+        assert!(chunk_carries_answer(content), "answer text counts");
+
+        let tool = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1"}]}}]}"#;
+        assert!(chunk_carries_answer(tool), "a tool call counts");
+
+        for reasoning in [
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning":"think"}}]}"#,
+        ] {
+            assert!(
+                chunk_carries_content(reasoning),
+                "reasoning still counts as forwarded bytes"
+            );
+            assert!(
+                !chunk_carries_answer(reasoning),
+                "reasoning alone is not an answer"
+            );
+        }
+
+        // Whitespace-only content is not an answer either.
+        let blank = r#"{"choices":[{"index":0,"delta":{"content":"  \n"}}]}"#;
+        assert!(!chunk_carries_answer(blank));
+
+        let role_only = r#"{"choices":[{"index":0,"delta":{"role":"assistant"}}]}"#;
+        assert!(!chunk_carries_answer(role_only));
+        assert!(!chunk_carries_answer("not json"));
     }
 
     /// Build a streaming `reqwest::Response` whose body errors immediately,

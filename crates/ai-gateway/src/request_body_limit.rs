@@ -3,10 +3,16 @@
 //! Replaces Axum's static [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit)
 //! layer, which fixes the limit at router construction time and therefore
 //! requires a process restart to change. This middleware instead reads
-//! `server.max_request_size_mb` from the live configuration on every request
-//! and installs a per-request [`DefaultBodyLimit`] extension, so the limit can
-//! be adjusted via the admin panel or config hot-reload without restarting
-//! the gateway process.
+//! `server.max_request_size_mb` from the lock-free
+//! [`RuntimeLimits`](crate::runtime_limits::RuntimeLimits) snapshot and installs
+//! a per-request [`DefaultBodyLimit`] extension, so the limit can be adjusted
+//! via the admin panel or config hot-reload without restarting the gateway
+//! process.
+//!
+//! The snapshot is deliberately an atomic rather than a `config.read().await`.
+//! This middleware wraps every route, so taking the write-preferring config lock
+//! here meant one queued config writer could stall all traffic — `/health`
+//! included — until the writer completed.
 //!
 //! Enforcement happens in two stages:
 //! 1. Requests whose declared `Content-Length` already exceeds the limit are
@@ -14,8 +20,6 @@
 //! 2. Otherwise, the per-request extension makes body-consuming extractors
 //!    (`Json`, `Bytes`, `Multipart`) enforce the dynamic limit natively Ã¢â‚¬â€
 //!    including for chunked bodies that have no `Content-Length`.
-
-use std::sync::Arc;
 
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
@@ -25,19 +29,8 @@ use axum::{
     Json,
 };
 use serde_json::json;
-use tokio::sync::RwLock;
 
-use crate::config::Config;
 use crate::gateway::AppState;
-
-/// Read the current body limit (bytes) from the live config (Req 45.1).
-///
-/// Saturating multiplication guards against overflow when an operator sets a
-/// very large `max_request_size_mb` value.
-pub async fn current_limit_bytes(config: &Arc<RwLock<Config>>) -> usize {
-    let config = config.read().await;
-    (config.server.max_request_size_mb as usize).saturating_mul(1024 * 1024)
-}
 
 /// Axum middleware enforcing the request body size limit dynamically (Req 45.2).
 ///
@@ -48,7 +41,7 @@ pub async fn request_body_limit_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let max_body_bytes = current_limit_bytes(&state.config).await;
+    let max_body_bytes = state.runtime_limits.max_request_size_bytes();
 
     // Fast path: reject bodyful requests whose declared size already exceeds
     // the limit without downloading the body.
@@ -313,11 +306,14 @@ reasoning_compat: Default::default(),
             "1 MB + 1 body must be rejected at 1 MB limit"
         );
 
-        // Raise the limit via live config (same path apply_runtime_config_update takes)
-        {
-            let mut config = server.state.config.write().await;
-            config.server.max_request_size_mb = 2;
-        }
+        // Raise the limit through the real hot-reload entry point. Writing
+        // `state.config` directly would no longer be representative: the
+        // middleware reads the `RuntimeLimits` snapshot, which only
+        // `apply_runtime_config_update` republishes.
+        server
+            .reload_config(config_with_size_limit(2))
+            .await
+            .unwrap();
 
         let resp = app.oneshot(post_body(oversized)).await.unwrap();
         assert_eq!(
@@ -333,10 +329,12 @@ reasoning_compat: Default::default(),
         let server = GatewayServer::new(cfg, None).await.unwrap();
         let app = build_test_router(&server);
 
-        {
-            let mut config = server.state.config.write().await;
-            config.server.max_request_size_mb = 1;
-        }
+        // Lower the limit through the real hot-reload entry point so the
+        // `RuntimeLimits` snapshot is republished alongside the config swap.
+        server
+            .reload_config(config_with_size_limit(1))
+            .await
+            .unwrap();
 
         let resp = app
             .oneshot(post_body(vec![b'x'; 1024 * 1024 + 1]))

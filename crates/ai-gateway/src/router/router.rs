@@ -177,6 +177,7 @@ impl ProviderConcurrencyLimiter {
     }
 }
 
+#[derive(Debug)]
 pub struct ProviderConcurrencyPermit {
     limiter: Arc<ProviderConcurrencyLimiter>,
 }
@@ -191,6 +192,35 @@ impl Drop for ProviderConcurrencyPermit {
         state.in_flight = state.in_flight.saturating_sub(1);
         drop(state);
         self.limiter.notify.notify_waiters();
+    }
+}
+
+/// Longest a request will queue for one of `provider_cfg`'s in-flight slots.
+///
+/// Derived from the provider's own effective total timeout: if a slot cannot be
+/// obtained within the time that provider is permitted to spend on an entire
+/// request, waiting longer cannot yield a useful response. Using the configured
+/// value rather than a constant keeps deliberately slow local providers (e.g.
+/// Ollama with a long `total_timeout_seconds`) working, while still guaranteeing
+/// the wait terminates. Floored at one second so a zero config cannot produce a
+/// non-blocking spin.
+fn provider_slot_wait(provider_cfg: &Provider, model: &str) -> Duration {
+    Duration::from_secs(provider_cfg.effective_total_timeout(model).max(1))
+}
+
+/// 503 returned when a provider's in-flight slots stay exhausted.
+fn provider_saturated_error(provider_cfg: &Provider, waited: Duration) -> GatewayError {
+    GatewayError::Provider {
+        provider: provider_cfg.name.clone(),
+        message: format!(
+            "Provider '{}' has no free in-flight slot after {}s (max_connections = {}). \
+             Raise `max_connections` for this provider, lower its `total_timeout_seconds`, \
+             or reduce concurrent load.",
+            provider_cfg.name,
+            waited.as_secs(),
+            provider_cfg.max_connections
+        ),
+        status_code: Some(503),
     }
 }
 
@@ -312,6 +342,15 @@ pub struct Router {
 /// the hint appear and disappear between turns, which models flag as a
 /// prompt-injection pattern. In-memory only — resets on process restart.
     xml_tool_combos: Arc<std::sync::RwLock<HashSet<String>>>,
+
+    /// `provider::model` combos observed ending a *streamed* turn with reasoning
+    /// only — no answer text and no tool call. These take the buffered path for
+    /// tools-bearing requests so the degenerate-turn failover in
+    /// [`Self::route_with_failover_for_group`] can actually run: during a live
+    /// relay the provider's terminal chunk has already reached the client by the
+    /// time the shortfall is detectable, so there is nothing left to retry.
+    /// In-memory only — resets on process restart.
+    degenerate_stream_combos: Arc<std::sync::RwLock<HashSet<String>>>,
     /// Prompt-cache sticky routing affinity (prefix hash → last successful
     /// provider/model, TTL-bounded). Zero-TTL when cache-aware routing is
     /// disabled, so lookups always miss (Req 1.4, prompt-cache-routing spec).
@@ -522,6 +561,7 @@ cfg.reasoning_compat.clone(),
             oauth_usage_tracker: None,
             search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
 sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
 }
 }
@@ -567,6 +607,7 @@ cfg.reasoning_compat.clone(),
             oauth_usage_tracker: None,
 search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
 sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
 }
 }
@@ -2094,16 +2135,28 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
         limiter
     }
 
-    /// Acquire one provider-wide in-flight request slot. The permit is released
-    /// automatically when it is dropped, including cancellation and error paths.
-    async fn acquire_provider_concurrency(
+    /// Acquire one provider-wide in-flight request slot, giving up after `wait`.
+    ///
+    /// The permit is released automatically when it is dropped, including
+    /// cancellation and error paths. `None` means the provider stayed saturated
+    /// for the whole window; callers must surface that as a 503 rather than
+    /// continuing to wait.
+    ///
+    /// The bound matters because a permit is held for the entire upstream call —
+    /// including the full duration of a streaming relay. With a small
+    /// `max_connections` and a large `total_timeout_seconds`, an unbounded wait
+    /// let requests queue behind saturated slots indefinitely with no response
+    /// and no diagnostic, which is indistinguishable from a gateway hang.
+    async fn acquire_provider_concurrency_within(
         &self,
         provider_name: &str,
         limit: u32,
-    ) -> ProviderConcurrencyPermit {
-        self.provider_concurrency_limiter(provider_name, limit)
-            .acquire()
-            .await
+        wait: Duration,
+    ) -> Option<ProviderConcurrencyPermit> {
+        let limiter = self.provider_concurrency_limiter(provider_name, limit);
+        // `timeout` only drops the pending `acquire` future; a permit produced by
+        // the final poll is returned as `Ok`, so no permit can be leaked here.
+        tokio::time::timeout(wait, limiter.acquire()).await.ok()
     }
 
     fn try_acquire_provider_concurrency(
@@ -2113,6 +2166,50 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
     ) -> Option<ProviderConcurrencyPermit> {
         self.provider_concurrency_limiter(provider_name, limit)
             .try_acquire()
+    }
+
+    /// Unbounded-in-practice acquire used by the limiter mechanics tests.
+    ///
+    /// Production code must go through [`Self::acquire_provider_slot_or_reject`]
+    /// so saturation surfaces as a 503 instead of an open-ended wait.
+    #[cfg(test)]
+    async fn acquire_provider_concurrency(
+        &self,
+        provider_name: &str,
+        limit: u32,
+    ) -> ProviderConcurrencyPermit {
+        self.acquire_provider_concurrency_within(provider_name, limit, Duration::from_secs(30))
+            .await
+            .expect("test slot acquisition must not time out")
+    }
+
+    /// Acquire a slot or fail with a 503 describing the saturated provider.
+    async fn acquire_provider_slot_or_reject(
+        &self,
+        provider_cfg: &Provider,
+        model: &str,
+    ) -> Result<ProviderConcurrencyPermit, GatewayError> {
+        let wait = provider_slot_wait(provider_cfg, model);
+        match self
+            .acquire_provider_concurrency_within(
+                &provider_cfg.name,
+                provider_cfg.max_connections,
+                wait,
+            )
+            .await
+        {
+            Some(permit) => Ok(permit),
+            None => {
+                warn!(
+                    provider = %provider_cfg.name,
+                    model = %model,
+                    max_connections = provider_cfg.max_connections,
+                    waited_seconds = wait.as_secs(),
+                    "Provider in-flight slot unavailable within the wait window; rejecting"
+                );
+                Err(provider_saturated_error(provider_cfg, wait))
+            }
+        }
     }
 
     pub fn clear_http_clients(&self) {
@@ -2873,8 +2970,8 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
         let _concurrency_permit = match concurrency_permit {
             Some(permit) => permit,
             None => {
-                self.acquire_provider_concurrency(provider_name, provider_cfg.max_connections)
-                    .await
+                self.acquire_provider_slot_or_reject(&provider_cfg, &provider_model.model)
+                    .await?
             }
         };
         self.dispatch_attempts_under_permit(
@@ -3722,7 +3819,12 @@ for attempt in 0..=max_retries {
 if let Some(choice) = openai_response.choices.first() {
     let has_native_tc = choice.message.extra.contains_key("tool_calls");
     let content_text = choice.message.content_as_text();
-    let has_xml_tool_use = Self::looks_like_xml_tool_use(&content_text);
+    // XML tool use can land in a reasoning carrier rather than `content`
+    // (GLM emits `reasoning_content`), so scan both or the combo is never
+    // learned and every turn for it keeps losing the tool call.
+    let reasoning_text = Self::reasoning_text(choice).unwrap_or_default();
+    let has_xml_tool_use = Self::looks_like_xml_tool_use(&content_text)
+        || Self::looks_like_xml_tool_use(reasoning_text);
     if has_native_tc {
         debug!(
             provider = provider_name,
@@ -4192,8 +4294,13 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                         // Accumulate streamed tool_calls by index
                         if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                             for tc_delta in tc_arr {
-                                let idx =
-                                    tc_delta.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let idx = match tc_delta.get("index").and_then(|v| v.as_u64()) {
+                                    Some(explicit) => explicit,
+                                    None => Self::implicit_tool_call_index(
+                                        &tool_calls_map,
+                                        tc_delta,
+                                    ),
+                                };
                                 let entry = tool_calls_map.entry(idx).or_insert_with(|| {
                                     serde_json::json!({
                                         "id": "",
@@ -4254,16 +4361,18 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
             return Err("No SSE chunks found in response body".to_string());
         }
 
-        // If we have reasoning content but no regular content, use reasoning as content
-        let final_content = if full_content.is_empty() && !reasoning_content.is_empty() {
-            reasoning_content.clone()
-        } else {
-            full_content
-        };
+        // Reasoning stays in its own carrier and is NOT copied into `content`.
+        // Copying it made a turn that only thought look identical to a finished
+        // answer, which defeated the degenerate-turn detection on the success
+        // path and let agentic clients stop mid-work. `promote_reasoning_to_content`
+        // still performs that fallback deliberately, but only where it is safe
+        // (no tools in play) or as a last resort after failover is exhausted.
+        let final_content = full_content;
 
-        // Estimate tokens if provider didn't send usage
+        // Estimate tokens if provider didn't send usage. Reasoning counts:
+        // it is generated output even when it never reaches `content`.
         if total_tokens == 0 {
-            completion_tokens = (final_content.len() / 4) as u32; // rough estimate
+            completion_tokens = ((final_content.len() + reasoning_content.len()) / 4) as u32;
             total_tokens = prompt_tokens + completion_tokens;
         }
 
@@ -4283,7 +4392,7 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
             );
         }
 
-        Ok(OpenAIResponse {
+        let mut response = OpenAIResponse {
             id: if response_id.is_empty() {
                 format!("chatcmpl-reassembled-{}", chunk_count)
             } else {
@@ -4309,7 +4418,78 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                 extra: Default::default(),
             },
             extra: Default::default(),
-        })
+        };
+
+        // Streamed tool-call deltas routinely omit the `id`, and the merge above
+        // seeds it empty; downstream validation reads an empty id as a malformed
+        // call and throws the whole turn away. Mint one, and align a `stop` /
+        // absent finish_reason with the tool call that is actually present.
+        Self::repair_tool_calls(&mut response);
+
+        Ok(response)
+    }
+
+    /// Slot a `tool_calls` delta that arrived without an `index` field.
+    ///
+    /// OpenAI always indexes streamed tool-call deltas, but some
+    /// OpenAI-compatible providers omit `index` entirely. Folding every such
+    /// delta into slot 0 concatenated the argument fragments of unrelated
+    /// parallel calls into one unparseable string and silently dropped all but
+    /// the first call.
+    ///
+    /// A delta that identifies a different call than the one in progress — by
+    /// `id`, or by `function.name` when no id is supplied — opens the next slot.
+    /// Anything else (a bare `arguments` fragment, or a repeat of the same
+    /// identity) continues the call in progress. Parallel calls to the *same*
+    /// tool with neither indices nor ids are genuinely indistinguishable on the
+    /// wire; those still merge, which is the conservative outcome.
+    fn implicit_tool_call_index(
+        tool_calls: &std::collections::BTreeMap<u64, serde_json::Value>,
+        delta: &serde_json::Value,
+    ) -> u64 {
+        fn field(value: &serde_json::Value, key: &str) -> String {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        }
+        fn fn_name(value: &serde_json::Value) -> String {
+            value
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        }
+
+        let Some((last_index, last_entry)) = tool_calls.iter().next_back() else {
+            return 0;
+        };
+
+        let delta_id = field(delta, "id");
+        let delta_name = fn_name(delta);
+        // Pure continuation fragment: no identity of its own.
+        if delta_id.is_empty() && delta_name.is_empty() {
+            return *last_index;
+        }
+
+        let last_id = field(last_entry, "id");
+        let identifies_new_call = if !delta_id.is_empty() && !last_id.is_empty() {
+            delta_id != last_id
+        } else if !delta_name.is_empty() {
+            let last_name = fn_name(last_entry);
+            !last_name.is_empty() && delta_name != last_name
+        } else {
+            // Supplying the id for the call already in progress.
+            false
+        };
+
+        if identifies_new_call {
+            last_index + 1
+        } else {
+            *last_index
+        }
     }
 
     /// Route request with failover orchestration
@@ -4354,6 +4534,12 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
         // well below max_tokens). Task 7.2 returns the longest of these instead
         // of an error when every provider truncates (Req 6.2).
         let mut truncated_candidates: Vec<OpenAIResponse> = Vec::new();
+        // Turns that carried only reasoning — no answer text, no tool call.
+        // These fail over (see the success arm below) because a tool-using
+        // client cannot act on them, but they are kept so a request where every
+        // provider stops after thinking still returns something rather than a
+        // hard error.
+        let mut reasoning_only_candidates: Vec<OpenAIResponse> = Vec::new();
         let config = self.config.read().await;
         let provider_budgets: std::collections::HashMap<String, f64> = config
             .providers
@@ -4504,6 +4690,99 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                 .await
             {
                 Ok(mut response) => {
+                    // ---- Repair the turn before judging it ----------------
+                    // Order matters here. Each of these steps can turn what
+                    // looks like a dead-end turn into a usable one, so judging
+                    // emptiness first is how real tool calls get discarded.
+                    let tools_present = prepared_request.extra.contains_key("tools");
+
+                    // An inline `<think>…</think>` prefix becomes a proper
+                    // reasoning carrier, so deliberation is never mistaken for
+                    // the model's answer.
+                    if Self::split_think_tags(&mut response) {
+                        debug!(
+                            provider = %provider_model.provider,
+                            model = %provider_model.model,
+                            "Split inline <think> block out of assistant content"
+                        );
+                    }
+
+                    // Recover tool calls the model encoded as XML/text in
+                    // `content` or in a reasoning carrier. This also runs later
+                    // on the success path; doing it here means a recovered call
+                    // counts as real work in the checks below, and the later
+                    // call is a no-op once `tool_calls` exists.
+                    if tools_present {
+                        Self::translate_xml_tool_calls(&mut response, &prepared_request);
+                    }
+
+                    // Mint missing tool-call ids and align finish_reason so a
+                    // structurally sloppy but perfectly usable call survives
+                    // validation instead of being failed over.
+                    Self::repair_tool_calls(&mut response);
+
+                    // ---- Judge the turn ----------------------------------
+                    // A turn carrying only reasoning is not an answer for a
+                    // tool-using client; it is a turn that stopped mid-work.
+                    // Promoting the chain of thought into `content` (the old
+                    // unconditional behavior) made it indistinguishable from a
+                    // finished reply, so the harness rendered the thinking and
+                    // stopped. Fail over instead, keeping it as a last resort.
+                    if tools_present && Self::reasoning_only_turn(&response) {
+                        warn!(
+                            provider = %provider_model.provider,
+                            model = %provider_model.model,
+                            finish_reason = ?response
+                                .choices
+                                .first()
+                                .and_then(|c| c.finish_reason.as_deref()),
+                            "Provider returned reasoning with no answer and no tool call; failing over"
+                        );
+                        cb.record_failure().await;
+                        self.metrics.record_provider_failure_with_reason(
+                            &provider_model.provider,
+                            Some(
+                                "Provider stopped after its reasoning block — no answer text and no tool call"
+                                    .to_string(),
+                            ),
+                            None,
+                        );
+                        attempts.push(ProviderAttempt::new(
+                            provider_model.provider.clone(),
+                            provider_model.model.clone(),
+                            "Provider returned reasoning only (no answer text, no tool call)"
+                                .to_string(),
+                            Some(200),
+                        ));
+                        // Annotate with the same gateway metadata the success
+                        // path attaches so the last-resort return below needs no
+                        // reprocessing.
+                        let mut candidate = response;
+                        let candidate_cost =
+                            compute_actual_cost(&provider_model, &candidate.usage);
+                        candidate.extra.insert(
+                            "gateway_provider".to_string(),
+                            serde_json::Value::String(provider_model.provider.clone()),
+                        );
+                        candidate.extra.insert(
+                            "gateway_responded_model".to_string(),
+                            serde_json::Value::String(provider_model.model.clone()),
+                        );
+                        candidate.extra.insert(
+                            "gateway_cost".to_string(),
+                            serde_json::json!(candidate_cost),
+                        );
+                        candidate.extra.insert(
+                            "gateway_compression".to_string(),
+                            serde_json::to_value(&compression)
+                                .expect("CompressionStats serialization must succeed"),
+                        );
+                        reasoning_only_candidates.push(candidate);
+                        continue;
+                    }
+
+                    // With no tools in play there is no agent loop to stall, so
+                    // surfacing the reasoning beats returning nothing at all.
                     if Self::promote_reasoning_to_content(&mut response) {
                         warn!(
                             provider = %provider_model.provider,
@@ -4919,9 +5198,229 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
             return Ok(longest);
         }
 
+        // Every provider stopped after its reasoning block. Failing over was
+        // worth trying — usually another provider completes the turn — but once
+        // the chain is exhausted, surfacing the model's thinking beats returning
+        // a hard error, which is what the client saw before this fallback
+        // existed. The reasoning is promoted into `content` so the harness has
+        // something to render.
+        if let Some(mut best) = reasoning_only_candidates
+            .into_iter()
+            .max_by_key(|response| {
+                response
+                    .choices
+                    .first()
+                    .and_then(Self::reasoning_text)
+                    .map(str::len)
+                    .unwrap_or(0)
+            })
+        {
+            let chosen_provider = best
+                .extra
+                .get("gateway_provider")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            Self::promote_reasoning_to_content(&mut best);
+            warn!(
+                provider = %chosen_provider,
+                "All providers returned reasoning without an answer or tool call; returning the longest reasoning as content"
+            );
+            return Ok(best);
+        }
+
         Err(GatewayError::AllProvidersFailed(AggregatedError::new(
             attempts,
         )))
+    }
+
+    /// The non-empty reasoning carrier on a choice, if any.
+    ///
+    /// `reasoning` is the Nano-GPT/OpenRouter spelling; `reasoning_content` is
+    /// the DeepSeek-style spelling used by GLM and friends. Both are checked
+    /// everywhere the gateway reasons about reasoning, because a provider only
+    /// ever populates one of them and code that checks a single key silently
+    /// misses half the ecosystem.
+    fn reasoning_text(choice: &Choice) -> Option<&str> {
+        for key in ["reasoning", "reasoning_content"] {
+            if let Some(text) = choice
+                .message
+                .extra
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+            {
+                return Some(text);
+            }
+        }
+        None
+    }
+
+    /// Split a leading `<think>…</think>` block out of assistant content into
+    /// the `reasoning_content` carrier. Returns `true` when content was rewritten.
+    ///
+    /// Some reasoning models — the GLM family in particular — inline their chain
+    /// of thought in `content` rather than using a dedicated reasoning field.
+    /// Left in place it reads as the assistant's answer, so a turn that only
+    /// thought and never acted looks like a finished reply and an agentic client
+    /// stops mid-work. Extracting it lets [`Self::reasoning_only_turn`] see the
+    /// turn for what it is, and lets the XML tool-call extractors work on the
+    /// model's real output instead of its deliberation.
+    ///
+    /// Only a block at the very start of the content counts as thinking — that
+    /// is where these models emit it — so prose or code that merely mentions
+    /// `<think>` further in is left alone. An unclosed `<think>` (the model was
+    /// cut off mid-thought) makes the whole remainder reasoning.
+    fn split_think_tags(response: &mut OpenAIResponse) -> bool {
+        const OPEN: &str = "<think>";
+        const CLOSE: &str = "</think>";
+
+        let Some(choice) = response.choices.first_mut() else {
+            return false;
+        };
+        let text = choice.message.content_as_text();
+        let trimmed = text.trim_start();
+        if !trimmed.starts_with(OPEN) {
+            return false;
+        }
+
+        let body = &trimmed[OPEN.len()..];
+        let (thought, rest) = match body.find(CLOSE) {
+            Some(end) => (&body[..end], &body[end + CLOSE.len()..]),
+            None => (body, ""),
+        };
+
+        let thought = thought.trim();
+        if !thought.is_empty() {
+            let existing = choice
+                .message
+                .extra
+                .get("reasoning_content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let merged = if existing.is_empty() {
+                thought.to_string()
+            } else {
+                format!("{existing}{thought}")
+            };
+            choice.message.extra.insert(
+                "reasoning_content".to_string(),
+                serde_json::Value::String(merged),
+            );
+        }
+
+        let rest = rest.trim();
+        choice.message.content = if rest.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(rest.to_string())
+        };
+        true
+    }
+
+    /// Repair structurally incomplete `tool_calls` so a usable tool call is
+    /// never thrown away by [`Self::response_has_content`].
+    ///
+    /// `id` is a correlation token the client echoes back on the tool result;
+    /// when a provider omits it (common on OpenAI-compatible gateways, and the
+    /// streamed-delta merge in [`Self::reassemble_sse_response`] seeds it empty)
+    /// the gateway can mint one safely. Before this, a missing id failed
+    /// validation and the entire turn — tool call included — was discarded and
+    /// failed over, which is one of the ways an agent loop stalls with no
+    /// visible error.
+    ///
+    /// A call with no `function.name` is genuinely unusable and is left for
+    /// validation to reject.
+    ///
+    /// Also normalizes `finish_reason` to `tool_calls` when the provider
+    /// reported `stop` or omitted it entirely, because clients branch on
+    /// `finish_reason` to decide whether to run a tool. `length` and
+    /// `content_filter` are preserved — those carry information this function
+    /// must not erase (truncation detection reads `length`).
+    fn repair_tool_calls(response: &mut OpenAIResponse) -> bool {
+        let Some(choice) = response.choices.first_mut() else {
+            return false;
+        };
+        let Some(calls) = choice
+            .message
+            .extra
+            .get_mut("tool_calls")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return false;
+        };
+        if calls.is_empty() {
+            return false;
+        }
+
+        let mut repaired = false;
+        for call in calls.iter_mut() {
+            let Some(object) = call.as_object_mut() else {
+                continue;
+            };
+            let has_name = object
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| !name.is_empty());
+            if !has_name {
+                continue;
+            }
+            let has_id = object
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !id.is_empty());
+            if !has_id {
+                object.insert(
+                    "id".to_string(),
+                    serde_json::Value::String(format!(
+                        "call_{}",
+                        uuid::Uuid::new_v4().simple()
+                    )),
+                );
+                repaired = true;
+            }
+            if object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            {
+                object.insert("type".to_string(), serde_json::json!("function"));
+                repaired = true;
+            }
+        }
+
+        if matches!(choice.finish_reason.as_deref(), None | Some("stop")) {
+            choice.finish_reason = Some("tool_calls".to_string());
+            repaired = true;
+        }
+
+        repaired
+    }
+
+    /// True when a provider turn produced reasoning and nothing else: no answer
+    /// text and no tool call.
+    ///
+    /// For a tool-using client this is not an answer, it is a turn that stopped
+    /// mid-work. Handing it back as a completed reply is what makes a harness
+    /// like Kilo Code render the chain of thought and stop.
+    fn reasoning_only_turn(response: &OpenAIResponse) -> bool {
+        let Some(choice) = response.choices.first() else {
+            return false;
+        };
+        if !Self::content_is_empty(&choice.message.content) {
+            return false;
+        }
+        let has_tool_calls = choice
+            .message
+            .extra
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|calls| !calls.is_empty());
+        if has_tool_calls {
+            return false;
+        }
+        Self::reasoning_text(choice).is_some()
     }
 
     fn promote_reasoning_to_content(response: &mut OpenAIResponse) -> bool {
@@ -4931,19 +5430,11 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
         if !Self::content_is_empty(&choice.message.content) {
             return false;
         }
-        for key in ["reasoning", "reasoning_content"] {
-            if let Some(text) = choice
-                .message
-                .extra
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .filter(|text| !text.is_empty())
-            {
-                choice.message.content = serde_json::Value::String(text.to_string());
-                return true;
-            }
-        }
-        false
+        let Some(text) = Self::reasoning_text(choice).map(str::to_string) else {
+            return false;
+        };
+        choice.message.content = serde_json::Value::String(text);
+        true
     }
 
     /// Check whether a provider response contains usable assistant content.
@@ -5062,16 +5553,26 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
         }
 
         let content_text = choice.message.content_as_text();
-        // Some providers (e.g. Nano-GPT with thinking models) put tool calls
-        // in a `reasoning` field instead of `content`. Check both.
-        let reasoning_text = choice
-            .message
-            .extra
-            .get("reasoning")
+        // Some providers put tool calls in a reasoning carrier instead of
+        // `content`: Nano-GPT thinking models use `reasoning`, DeepSeek-style
+        // providers and the GLM family use `reasoning_content`. Checking only
+        // `reasoning` left GLM tool calls unrecoverable, so the turn arrived at
+        // the client as a thinking block with no tool to run.
+        let reasoning_key = ["reasoning", "reasoning_content"].into_iter().find(|key| {
+            choice
+                .message
+                .extra
+                .get(*key)
+                .and_then(|v| v.as_str())
+                .is_some_and(|text| !text.is_empty())
+        });
+        let reasoning_text = reasoning_key
+            .and_then(|key| choice.message.extra.get(key))
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
         let combined_text = if content_text.is_empty() && !reasoning_text.is_empty() {
-            reasoning_text.to_string()
+            reasoning_text.clone()
         } else {
             content_text.clone()
         };
@@ -5219,10 +5720,13 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
             choice.message.content = serde_json::Value::String(cleaned.to_string());
         }
 
-        // If tool calls were extracted from the reasoning field, clear it
-        // so the translated response doesn't carry stale XML in reasoning.
+        // If tool calls were extracted from the reasoning field, clear whichever
+        // carrier they came from so the translated response doesn't ship stale
+        // XML back to the client as a thinking block.
         if !reasoning_text.is_empty() && content_text.is_empty() {
-            choice.message.extra.remove("reasoning");
+            if let Some(key) = reasoning_key {
+                choice.message.extra.remove(key);
+            }
         }
 
         // Set tool_calls on the message
@@ -6249,7 +6753,11 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
     /// Check if message content is empty/null.
     fn content_is_empty(content: &serde_json::Value) -> bool {
         match content {
-            serde_json::Value::String(s) => s.is_empty(),
+            // Whitespace-only content is not an answer. Providers that stop
+            // after their thinking phase often emit a stray newline as the
+            // whole message body; treating that as content lets a turn that
+            // did no work look like a finished reply.
+            serde_json::Value::String(s) => s.trim().is_empty(),
             serde_json::Value::Null => true,
             serde_json::Value::Array(arr) => arr.is_empty(),
             _ => false,
@@ -6444,6 +6952,14 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
             return false;
         }
 
+        // Never cache a turn with no answer text. A provider that stopped after
+        // its reasoning block produces exactly this shape, and caching it would
+        // replay that dead end for every identical prefix — turning a transient
+        // provider hiccup into a permanent one.
+        if Self::content_is_empty(&choice.message.content) {
+            return false;
+        }
+
         // Only cache complete responses
         match choice.finish_reason.as_deref() {
             Some("stop") => true,
@@ -6510,6 +7026,26 @@ pub fn mark_xml_tool_combo(&self, provider: &str, model: &str) {
         set.insert(Self::xml_combo_key(provider, model));
     }
 }
+
+    /// True if this `provider`/`model` combo has been observed ending a streamed
+    /// turn with reasoning only. Such combos take the buffer-and-retry path when
+    /// the request carries `tools` — see [`Self::degenerate_stream_combos`].
+    pub fn is_degenerate_stream_combo(&self, provider: &str, model: &str) -> bool {
+        self.degenerate_stream_combos
+            .read()
+            .map(|set| set.contains(&Self::xml_combo_key(provider, model)))
+            .unwrap_or(false)
+    }
+
+    /// Record a `provider`/`model` combo as one that ends streamed turns with
+    /// reasoning and no answer. Idempotent; sticky for the process lifetime, for
+    /// the same reason the XML combos are: flipping transport mode back and
+    /// forth mid-conversation is worse than committing to the safe path.
+    pub fn mark_degenerate_stream_combo(&self, provider: &str, model: &str) {
+        if let Ok(mut set) = self.degenerate_stream_combos.write() {
+            set.insert(Self::xml_combo_key(provider, model));
+        }
+    }
 
 /// True when the tool-calling system hint should be injected for a
 /// tools-bearing request to this combo.
@@ -6998,9 +7534,16 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
         let tools_present = prepared_request.extra.contains_key("tools");
         let known_xml_combo = tools_present
             && self.is_xml_tool_combo(&provider_model.provider, &provider_model.model);
+        // A combo that has already ended a streamed turn with reasoning and no
+        // tool call also buffers, so the degenerate-turn failover can run. On a
+        // live relay the terminal chunk is long gone before the shortfall is
+        // detectable, leaving nothing to retry.
+        let known_degenerate_combo = tools_present
+            && self.is_degenerate_stream_combo(&provider_model.provider, &provider_model.model);
         if is_codex
             || self.provider_needs_transformation(&provider_cfg, &prepared_request)
             || known_xml_combo
+            || known_degenerate_combo
         {
             debug!(provider = %provider_model.provider, "Provider needs transformation or is Codex, using buffered path with full failover");
             drop(concurrency_permit);
@@ -7406,9 +7949,9 @@ source_ref,
         };
 
         let provider_name = provider.name.clone();
-        let _concurrency_permit = self
-            .acquire_provider_concurrency(&provider_name, provider.max_connections)
-            .await;
+        // Fine-tuning dispatch is not model-specific, so the slot wait resolves
+        // from the provider's non-thinking default.
+        let _concurrency_permit = self.acquire_provider_slot_or_reject(&provider, "").await?;
         let rate_limiter = self.get_rate_limiter(&provider_name).await;
         if !rate_limiter.consume().await {
             return Err(GatewayError::Provider {
@@ -7553,8 +8096,8 @@ source_ref,
         let provider_name = &target.provider.name;
         let model_name = &target.model.model;
         let _concurrency_permit = self
-            .acquire_provider_concurrency(provider_name, target.provider.max_connections)
-            .await;
+            .acquire_provider_slot_or_reject(&target.provider, model_name)
+            .await?;
         let rate_limiter = self.get_rate_limiter(provider_name).await;
         if !rate_limiter.consume().await {
             return Err(GatewayError::Provider {
@@ -7912,6 +8455,80 @@ mod tests {
             .expect("waiting request should acquire after release")
             .expect("waiting task should complete");
         drop(second_permit);
+    }
+
+    #[tokio::test]
+    async fn provider_slot_wait_times_out_instead_of_waiting_forever() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+
+        let _held = router.acquire_provider_concurrency("electron", 1).await;
+
+        // A saturated provider must yield `None` once the wait window elapses
+        // rather than parking the caller indefinitely.
+        let denied = router
+            .acquire_provider_concurrency_within("electron", 1, StdDuration::from_millis(50))
+            .await;
+
+        assert!(
+            denied.is_none(),
+            "saturated provider must not hand out a permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_provider_is_rejected_with_503() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+        let mut provider_cfg =
+            test_provider("electron", "http://localhost:1/v1".to_string());
+        // Saturate the single slot, then force a short wait window so the
+        // rejection path runs without a long test delay.
+        provider_cfg.max_connections = 1;
+        provider_cfg.total_timeout_seconds = Some(1);
+
+        let _held = router
+            .acquire_provider_slot_or_reject(&provider_cfg, "gpt-4")
+            .await
+            .expect("first request should get the only slot");
+
+        let error = router
+            .acquire_provider_slot_or_reject(&provider_cfg, "gpt-4")
+            .await
+            .expect_err("second request must be rejected, not queued forever");
+
+        match error {
+            GatewayError::Provider {
+                status_code,
+                provider,
+                message,
+            } => {
+                assert_eq!(status_code, Some(503));
+                assert_eq!(provider, "electron");
+                assert!(
+                    message.contains("max_connections"),
+                    "message should name the knob to change, got: {message}"
+                );
+            }
+            other => panic!("expected a provider 503, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_slot_wait_is_derived_from_the_provider_total_timeout() {
+        let mut provider_cfg =
+            test_provider("electron", "http://localhost:1/v1".to_string());
+
+        provider_cfg.total_timeout_seconds = Some(800);
+        assert_eq!(
+            provider_slot_wait(&provider_cfg, "gpt-4"),
+            StdDuration::from_secs(800)
+        );
+
+        // A zero configuration must still produce a blocking wait, not a spin.
+        provider_cfg.total_timeout_seconds = Some(0);
+        assert_eq!(
+            provider_slot_wait(&provider_cfg, "gpt-4"),
+            StdDuration::from_secs(1)
+        );
     }
 
     #[tokio::test]
@@ -8368,6 +8985,321 @@ async fn buffered_adapter_image_error_strips_and_retries() {
             "reasoning fallback"
         );
         assert!(Router::response_has_content(&response));
+    }
+
+    // ── Degenerate turns: reasoning with no answer and no tool call ──
+    //
+    // The failure these guard against: a provider (GLM in the field report)
+    // finishes its thinking phase and stops. Handed back verbatim, the turn is
+    // indistinguishable from a completed reply, so an agentic harness renders
+    // the chain of thought and stops working mid-task.
+
+    /// A response shaped like a provider turn: `content` plus message extras.
+    fn turn(
+        content: serde_json::Value,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> OpenAIResponse {
+        OpenAIResponse {
+            id: "chatcmpl-turn".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1,
+            model: "glm-4.6".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: "assistant".to_string(),
+                    content,
+                    extra,
+                },
+                finish_reason: Some("stop".to_string()),
+                extra: Default::default(),
+            }],
+            usage: Usage::default(),
+            extra: Default::default(),
+        }
+    }
+
+    fn extras(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect()
+    }
+
+    fn request_carrying_tools() -> OpenAIRequest {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {"name": "read_file", "parameters": {}}
+            }]),
+        );
+        OpenAIRequest {
+            model: "test-model".to_string(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra,
+        }
+    }
+
+    #[test]
+    fn reasoning_only_turn_is_detected() {
+        let thinking = extras(&[(
+            "reasoning_content",
+            serde_json::json!("I should read the file"),
+        )]);
+
+        assert!(Router::reasoning_only_turn(&turn(
+            serde_json::Value::Null,
+            thinking.clone()
+        )));
+        // Whitespace-only content is still not an answer.
+        assert!(Router::reasoning_only_turn(&turn(
+            serde_json::json!("\n  \n"),
+            thinking.clone()
+        )));
+        // The `reasoning` spelling counts as well as `reasoning_content`.
+        assert!(Router::reasoning_only_turn(&turn(
+            serde_json::Value::Null,
+            extras(&[("reasoning", serde_json::json!("thinking"))])
+        )));
+
+        // Real answer text means the turn completed.
+        assert!(!Router::reasoning_only_turn(&turn(
+            serde_json::json!("here you go"),
+            thinking.clone()
+        )));
+        // A tool call is work, even with no answer text alongside it.
+        let mut with_call = thinking;
+        with_call.insert(
+            "tool_calls".to_string(),
+            serde_json::json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }]),
+        );
+        assert!(!Router::reasoning_only_turn(&turn(
+            serde_json::Value::Null,
+            with_call
+        )));
+        // No reasoning either: a plain hollow response, handled by
+        // `response_has_content` rather than here.
+        assert!(!Router::reasoning_only_turn(&turn(
+            serde_json::Value::Null,
+            extras(&[])
+        )));
+    }
+
+    #[test]
+    fn split_think_tags_moves_inline_thinking_into_reasoning() {
+        let mut response = turn(
+            serde_json::json!("<think>weighing options</think>the answer"),
+            extras(&[]),
+        );
+
+        assert!(Router::split_think_tags(&mut response));
+        assert_eq!(response.choices[0].message.content_as_text(), "the answer");
+        assert_eq!(
+            response.choices[0].message.extra.get("reasoning_content"),
+            Some(&serde_json::json!("weighing options"))
+        );
+    }
+
+    /// A think block with nothing after it is the degenerate turn in disguise:
+    /// once split out, the emptiness check can finally see it.
+    #[test]
+    fn split_think_tags_exposes_a_thinking_only_turn() {
+        let mut response = turn(
+            serde_json::json!("<think>just thinking</think>"),
+            extras(&[]),
+        );
+
+        assert!(Router::split_think_tags(&mut response));
+        assert!(Router::reasoning_only_turn(&response));
+    }
+
+    /// Cut off mid-thought: no closing tag, so the whole remainder is reasoning.
+    #[test]
+    fn split_think_tags_handles_an_unclosed_block() {
+        let mut response = turn(serde_json::json!("<think>cut off"), extras(&[]));
+
+        assert!(Router::split_think_tags(&mut response));
+        assert!(response.choices[0].message.content.is_null());
+        assert_eq!(
+            response.choices[0].message.extra.get("reasoning_content"),
+            Some(&serde_json::json!("cut off"))
+        );
+    }
+
+    /// Only a leading block counts as thinking. Content that merely mentions the
+    /// tag — documentation or a code sample — must survive untouched.
+    #[test]
+    fn split_think_tags_ignores_mid_content_mentions() {
+        let body = "Use `<think>` to open a reasoning block.";
+        let mut response = turn(serde_json::json!(body), extras(&[]));
+
+        assert!(!Router::split_think_tags(&mut response));
+        assert_eq!(response.choices[0].message.content_as_text(), body);
+    }
+
+    /// Regression: a provider that omits the tool-call `id` used to lose the
+    /// entire turn to validation and fail over, destroying a usable tool call.
+    #[test]
+    fn repair_tool_calls_mints_missing_id_and_aligns_finish_reason() {
+        let mut response = turn(
+            serde_json::Value::Null,
+            extras(&[(
+                "tool_calls",
+                serde_json::json!([{
+                    "id": "",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
+                }]),
+            )]),
+        );
+        assert!(
+            !Router::response_has_content(&response),
+            "an empty id is rejected before repair"
+        );
+
+        assert!(Router::repair_tool_calls(&mut response));
+
+        let call = &response.choices[0].message.extra["tool_calls"][0];
+        assert!(call["id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(call["type"], "function");
+        assert_eq!(
+            response.choices[0].finish_reason.as_deref(),
+            Some("tool_calls"),
+            "a tool call present means finish_reason must say so"
+        );
+        assert!(Router::response_has_content(&response));
+    }
+
+    /// `length` is what truncation detection reads, so a tool call must not
+    /// overwrite it.
+    #[test]
+    fn repair_tool_calls_preserves_truncation_finish_reason() {
+        let mut response = turn(
+            serde_json::Value::Null,
+            extras(&[(
+                "tool_calls",
+                serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{"}
+                }]),
+            )]),
+        );
+        response.choices[0].finish_reason = Some("length".to_string());
+
+        Router::repair_tool_calls(&mut response);
+
+        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("length"));
+    }
+
+    /// GLM puts XML tool calls in `reasoning_content`. Reading only `reasoning`
+    /// meant they were never recovered, so the turn reached the client as a
+    /// thinking block with no tool to run.
+    #[test]
+    fn translate_xml_tool_calls_reads_the_reasoning_content_carrier() {
+        let mut response = turn(
+            serde_json::Value::Null,
+            extras(&[(
+                "reasoning_content",
+                serde_json::json!("<read_file><path>src/main.rs</path></read_file>"),
+            )]),
+        );
+
+        assert!(Router::translate_xml_tool_calls(
+            &mut response,
+            &request_carrying_tools()
+        ));
+
+        let calls = response.choices[0].message.extra["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "read_file");
+        assert_eq!(
+            response.choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+        // The consumed carrier is cleared so stale XML is not shipped as thinking.
+        assert!(!response.choices[0]
+            .message
+            .extra
+            .contains_key("reasoning_content"));
+    }
+
+    /// Reassembly must leave reasoning in its own carrier. Copying it into
+    /// `content` was what made a thinking-only turn look like a real answer.
+    #[test]
+    fn reassemble_sse_response_keeps_reasoning_out_of_content() {
+        let body = concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"glm\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking hard\"}}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"glm\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let response = Router::reassemble_sse_response(body).unwrap();
+
+        assert!(Router::content_is_empty(&response.choices[0].message.content));
+        assert_eq!(
+            response.choices[0].message.extra.get("reasoning_content"),
+            Some(&serde_json::json!("thinking hard"))
+        );
+        assert!(Router::reasoning_only_turn(&response));
+        // And it must never be cached, or the dead end replays for every
+        // identical prefix.
+        assert!(!Router::should_cache_response(&response));
+    }
+
+    /// Providers that omit `index` used to have every parallel tool call folded
+    /// into slot 0, concatenating unrelated arguments into one invalid blob and
+    /// losing all but the first call.
+    #[test]
+    fn reassemble_sse_response_separates_unindexed_parallel_tool_calls() {
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_a\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_b\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"path\\\":\\\"b.rs\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let response = Router::reassemble_sse_response(body).unwrap();
+
+        let calls = response.choices[0].message.extra["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 2, "each call keeps its own slot");
+        assert_eq!(calls[0]["id"], "call_a");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a.rs\"}");
+        assert_eq!(calls[1]["id"], "call_b");
+        assert_eq!(calls[1]["function"]["arguments"], "{\"path\":\"b.rs\"}");
+        assert_eq!(
+            response.choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+    }
+
+    /// A learned degenerate-stream combo is what routes the next tools-bearing
+    /// request to the buffered path, where failover can actually run.
+    #[test]
+    fn degenerate_stream_combos_are_learned_per_provider_model() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+
+        assert!(!router.is_degenerate_stream_combo("zai", "glm-4.6"));
+
+        router.mark_degenerate_stream_combo("zai", "glm-4.6");
+
+        assert!(router.is_degenerate_stream_combo("zai", "glm-4.6"));
+        // Learning is scoped to the exact combo, not the provider.
+        assert!(!router.is_degenerate_stream_combo("zai", "glm-4.5"));
+        assert!(!router.is_degenerate_stream_combo("other", "glm-4.6"));
     }
 
     #[test]

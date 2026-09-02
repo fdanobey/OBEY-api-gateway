@@ -37,6 +37,7 @@ mod providers;
 mod reasoning_compat;
 mod request_body_limit;
 mod router;
+mod runtime_limits;
 mod secrets;
 #[allow(dead_code, unused_imports)]
 mod smart_routing;

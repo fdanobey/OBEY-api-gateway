@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 06c530565e856ef201e45401f0d1d7619440ab4d65a5a828001b0dd8af80ba80 # shrinks to (_carrier_types, messages) = ([[], [ResponsesReasoning, ResponsesReasoning], [], [ResponsesReasoning, ResponsesReasoning]], [Message { role: "user", content: Array [Object {"text": String("User message 0"), "type": String("text")}], extra: {} }, Message { role: "assistant", content: Array [Object {"text": String("xxxxxxxxxx"), "type": String("reasoning")}, Object {"text": String("xxxxxxxxxx"), "type": String("reasoning")}], extra: {} }, Message { role: "user", content: Array [Object {"text": String("User message 2"), "type": String("text")}], extra: {} }, Message { role: "assistant", content: Array [Object {"text": String("xxxxxxxxxx"), "type": String("reasoning")}, Object {"text": String("xxxxxxxxxx"), "type": String("reasoning")}], extra: {} }])

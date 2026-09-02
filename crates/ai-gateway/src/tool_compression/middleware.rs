@@ -310,6 +310,14 @@ where
                         .map(|auth| format!("vk-{:016x}", hash_auth_value(auth)))
                 });
 
+            // Register the session before any per-session map is touched so the
+            // LRU registry can bound their growth. Session ids are
+            // caller-supplied, so this is what keeps them from accumulating for
+            // the process lifetime.
+            if let Some(sid) = &session_id {
+                state.touch_session(sid);
+            }
+
             let config_snapshot = config.try_read().ok().map(|c| c.tool_compression.clone());
 
             // Resolution order: header > feedback > config override > auto-tune > config global default.

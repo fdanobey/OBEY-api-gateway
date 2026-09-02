@@ -10,6 +10,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type as SqlType;
@@ -127,8 +128,19 @@ impl KeyStore {
         }
 
         let conn = Connection::open(db_path)?;
+        // Every method below serializes on a single `Mutex<Connection>` and is
+        // called from async request paths (auth lookups, per-response usage
+        // writes). In the default rollback-journal mode with `synchronous=FULL`
+        // each commit costs several `fsync`s, so a burst of usage writes can
+        // park every Tokio worker thread on this one connection. WAL +
+        // `synchronous=NORMAL` removes the per-commit fsync, and `busy_timeout`
+        // makes lock contention wait rather than fail immediately. This matches
+        // `ResponsesStore::new` and `AssistantsStore::new`.
+        conn.busy_timeout(Duration::from_secs(5))?;
         // CASCADE deletes require foreign keys to be enabled per-connection.
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::create_schema(&conn)?;
         Self::migrate_schema(&conn)?;
 

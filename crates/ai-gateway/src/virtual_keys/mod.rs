@@ -257,10 +257,16 @@ impl VirtualKeyManager {
     /// recording on missing provider usage (Req 3.6) or to record an estimate
     /// (Req 4.5) is the caller's responsibility.
     ///
+    /// Runs on the blocking thread pool: `record` performs two synchronous
+    /// SQLite transactions (usage row insert, then counter update) that serialize
+    /// on the single `keys.db` connection mutex. Executing that inline made every
+    /// completed response park an async worker on disk I/O, so a burst of traffic
+    /// could starve the runtime and stall unrelated requests.
+    ///
     /// _Requirements: 3.5, 4.4, 9.1, 9.6_
     pub async fn record_usage(&self, record: UsageRecord) -> Result<(), KeyError> {
-        self.usage_tracker.record(record)?;
-        Ok(())
+        let usage_tracker = Arc::clone(&self.usage_tracker);
+        spawn_store_task(move || Ok(usage_tracker.record(record)?)).await
     }
 
     /// Aggregate a key's usage over the inclusive `[start, end]` range.
@@ -275,14 +281,38 @@ impl VirtualKeyManager {
         id: &str,
         params: UsageQueryParams,
     ) -> Result<UsageAggregate, KeyError> {
-        // Distinguish "unknown key" (404) from "known key, no usage" (zeros).
-        if self.store.get_key_by_id(id)?.is_none() {
-            return Err(KeyError::NotFound(id.to_string()));
-        }
-        let aggregate = self
-            .usage_tracker
-            .query_aggregate(id, params.start, params.end)?;
-        Ok(aggregate)
+        // Both the existence check and the aggregate scan are synchronous SQLite
+        // queries; the aggregate walks `virtual_key_usage` over a time range and
+        // can be slow on a large table, so keep it off the async workers.
+        let store = Arc::clone(&self.store);
+        let usage_tracker = Arc::clone(&self.usage_tracker);
+        let key_id = id.to_string();
+        spawn_store_task(move || {
+            // Distinguish "unknown key" (404) from "known key, no usage" (zeros).
+            if store.get_key_by_id(&key_id)?.is_none() {
+                return Err(KeyError::NotFound(key_id));
+            }
+            Ok(usage_tracker.query_aggregate(&key_id, params.start, params.end)?)
+        })
+        .await
+    }
+}
+
+/// Run a blocking `keys.db` operation on the blocking thread pool.
+///
+/// Every [`KeyStore`] method takes a `std::sync::Mutex<Connection>` and performs
+/// synchronous SQLite I/O. Calling those directly from an async context parks a
+/// Tokio worker for the duration of the lock wait plus the query, and because a
+/// single connection serializes all callers, enough concurrent requests can
+/// occupy every worker at once and stall the whole gateway.
+async fn spawn_store_task<T, F>(task: F) -> Result<T, KeyError>
+where
+    F: FnOnce() -> Result<T, KeyError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(task).await {
+        Ok(result) => result,
+        Err(error) => Err(KeyError::TaskFailed(error.to_string())),
     }
 }
 
