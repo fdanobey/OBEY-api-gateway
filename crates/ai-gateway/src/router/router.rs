@@ -4608,8 +4608,14 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
         // client cannot act on them, but they are kept so a request where every
         // provider stops after thinking still returns something rather than a
         // hard error.
-        let mut reasoning_only_candidates: Vec<OpenAIResponse> = Vec::new();
-        let config = self.config.read().await;
+ let mut reasoning_only_candidates: Vec<OpenAIResponse> = Vec::new();
+ // One-shot guard for the reasoning continuation nudge (see the
+ // reasoning-only branch in the success arm below): per request, a
+ // single stalled turn whose thinking announces an action ("let me
+ // ...") is retried on the same provider with a nudge before
+ // failover gives up on it.
+ let mut reasoning_nudge_done = false;
+ let config = self.config.read().await;
         let provider_budgets: std::collections::HashMap<String, f64> = config
             .providers
             .iter()
@@ -4798,56 +4804,109 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                     // finished reply, so the harness rendered the thinking and
                     // stopped. Fail over instead, keeping it as a last resort.
                     if tools_present && Self::reasoning_only_turn(&response) {
-                        warn!(
-                            provider = %provider_model.provider,
-                            model = %provider_model.model,
-                            finish_reason = ?response
-                                .choices
-                                .first()
-                                .and_then(|c| c.finish_reason.as_deref()),
-                            "Provider returned reasoning with no answer and no tool call; failing over"
-                        );
-                        cb.record_failure().await;
-                        self.metrics.record_provider_failure_with_reason(
-                            &provider_model.provider,
-                            Some(
-                                "Provider stopped after its reasoning block — no answer text and no tool call"
+                        // One-shot continuation nudge: the turn's thinking
+                        // announced an action ("let me ...") but stopped
+                        // before emitting it. Retry the same provider once
+                        // with the stalled turn echoed back plus a user-role
+                        // instruction to act, before failing over. The nudge
+                        // exists only in the resubmitted request — the
+                        // client never sees it.
+                        let revived = if !reasoning_nudge_done
+                            && Self::reasoning_states_intent(&response)
+                        {
+                            reasoning_nudge_done = true;
+                            info!(
+                                provider = %provider_model.provider,
+                                model = %provider_model.model,
+                                "Reasoning-only turn announces an action; retrying same provider with a continuation nudge"
+                            );
+                            self.nudge_reasoning_continuation(
+                                &provider_model,
+                                &prepared_request,
+                                &response,
+                                active.clone(),
+                                attempt_counter,
+                            )
+                            .await
+                        } else {
+                            None
+                        }
+                        .and_then(|mut resumed| {
+                            // Same repair pipeline as a first attempt so a
+                            // recovered tool call counts as real work.
+                            Self::split_think_tags(&mut resumed);
+                            if tools_present {
+                                Self::translate_xml_tool_calls(
+                                    &mut resumed,
+                                    &prepared_request,
+                                );
+                            }
+                            Self::repair_tool_calls(&mut resumed);
+                            (!Self::reasoning_only_turn(&resumed)
+                                && Self::response_has_content(&resumed))
+                                .then_some(resumed)
+                        });
+
+                        if let Some(resumed) = revived {
+                            info!(
+                                provider = %provider_model.provider,
+                                model = %provider_model.model,
+                                "Continuation nudge revived the reasoning-only turn"
+                            );
+                            response = resumed;
+                            // Fall through to the normal success path below.
+                        } else {
+                            warn!(
+                                provider = %provider_model.provider,
+                                model = %provider_model.model,
+                                finish_reason = ?response
+                                    .choices
+                                    .first()
+                                    .and_then(|c| c.finish_reason.as_deref()),
+                                "Provider returned reasoning with no answer and no tool call; failing over"
+                            );
+                            cb.record_failure().await;
+                            self.metrics.record_provider_failure_with_reason(
+                                &provider_model.provider,
+                                Some(
+                                    "Provider stopped after its reasoning block — no answer text and no tool call"
+                                        .to_string(),
+                                ),
+                                None,
+                            );
+                            attempts.push(ProviderAttempt::new(
+                                provider_model.provider.clone(),
+                                provider_model.model.clone(),
+                                "Provider returned reasoning only (no answer text, no tool call)"
                                     .to_string(),
-                            ),
-                            None,
-                        );
-                        attempts.push(ProviderAttempt::new(
-                            provider_model.provider.clone(),
-                            provider_model.model.clone(),
-                            "Provider returned reasoning only (no answer text, no tool call)"
-                                .to_string(),
-                            Some(200),
-                        ));
-                        // Annotate with the same gateway metadata the success
-                        // path attaches so the last-resort return below needs no
-                        // reprocessing.
-                        let mut candidate = response;
-                        let candidate_cost =
-                            compute_actual_cost(&provider_model, &candidate.usage);
-                        candidate.extra.insert(
-                            "gateway_provider".to_string(),
-                            serde_json::Value::String(provider_model.provider.clone()),
-                        );
-                        candidate.extra.insert(
-                            "gateway_responded_model".to_string(),
-                            serde_json::Value::String(provider_model.model.clone()),
-                        );
-                        candidate.extra.insert(
-                            "gateway_cost".to_string(),
-                            serde_json::json!(candidate_cost),
-                        );
-                        candidate.extra.insert(
-                            "gateway_compression".to_string(),
-                            serde_json::to_value(&compression)
-                                .expect("CompressionStats serialization must succeed"),
-                        );
-                        reasoning_only_candidates.push(candidate);
-                        continue;
+                                Some(200),
+                            ));
+                            // Annotate with the same gateway metadata the
+                            // success path attaches so the last-resort
+                            // return below needs no reprocessing.
+                            let mut candidate = response;
+                            let candidate_cost =
+                                compute_actual_cost(&provider_model, &candidate.usage);
+                            candidate.extra.insert(
+                                "gateway_provider".to_string(),
+                                serde_json::Value::String(provider_model.provider.clone()),
+                            );
+                            candidate.extra.insert(
+                                "gateway_responded_model".to_string(),
+                                serde_json::Value::String(provider_model.model.clone()),
+                            );
+                            candidate.extra.insert(
+                                "gateway_cost".to_string(),
+                                serde_json::json!(candidate_cost),
+                            );
+                            candidate.extra.insert(
+                                "gateway_compression".to_string(),
+                                serde_json::to_value(&compression)
+                                    .expect("CompressionStats serialization must succeed"),
+                            );
+                            reasoning_only_candidates.push(candidate);
+                            continue;
+                        }
                     }
 
                     // With no tools in play there is no agent loop to stall, so
@@ -5502,8 +5561,121 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
         let Some(text) = Self::reasoning_text(choice).map(str::to_string) else {
             return false;
         };
-        choice.message.content = serde_json::Value::String(text);
+ choice.message.content = serde_json::Value::String(text);
         true
+ }
+
+    /// Lowercase substrings that mark a reasoning block as having ended
+    /// mid-plan: the model announced an action it never emitted. Matched
+    /// only against the reasoning carrier of an already reasoning-only
+    /// turn, so a false positive costs one wasted nudge round-trip, not a
+    /// wrong response.
+    const REASONING_INTENT_MARKERS: &[&str] = &[
+        "let me",
+        "let's",
+        "i'll",
+        "i will",
+        "i am going",
+        "i'm going",
+        "i need to",
+        "i want to",
+        "i should",
+        "i must",
+        "i could",
+        "i can use",
+        "we need to",
+        "we should",
+        "we will",
+        "next step",
+    ];
+
+    const REASONING_CONTINUATION_NUDGE: &str = "Your previous turn ended inside your private \
+reasoning: you announced an action (for example \"let me ...\") but emitted no answer text and \
+no tool call. The user cannot see your reasoning, so nothing happened. Continue the original \
+task now: emit your next native tool call to act on your plan, or write the final answer as \
+visible content. Do not restate your plan and do not end your turn without doing one of the two.";
+
+    /// True when the response is a reasoning-only turn whose thinking
+    /// announces an action ("let me ...", "I'll ..."), i.e. the model
+    /// stopped mid-work rather than concluding.
+    fn reasoning_states_intent(response: &OpenAIResponse) -> bool {
+        let Some(choice) = response.choices.first() else {
+            return false;
+        };
+        let Some(text) = Self::reasoning_text(choice) else {
+            return false;
+        };
+        let lower = text.to_lowercase();
+        Self::REASONING_INTENT_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+    }
+
+    /// One-shot same-provider retry for a reasoning-only turn that
+    /// announced an action. Appends the stalled turn (its thinking echoed
+    /// as capped assistant content) and a user-role continuation
+    /// instruction to a clone of the prepared request, then resubmits
+    /// through the normal dispatch pipeline. Returns the provider's
+    /// response, or `None` on dispatch failure. Judging the revived turn
+    /// (repair pipeline + usability check) stays with the caller so it can
+    /// still fall back to the reasoning-only failover path.
+    async fn nudge_reasoning_continuation(
+        &self,
+        provider_model: &ProviderModel,
+        prepared_request: &OpenAIRequest,
+        reasoning_only: &OpenAIResponse,
+        active: Option<ActiveRequestHandle>,
+        attempt_counter: usize,
+    ) -> Option<OpenAIResponse> {
+        let mut nudged = prepared_request.clone();
+        if let Some(choice) = reasoning_only.choices.first() {
+            // Echo the stalled turn back as the assistant message, with the
+            // thinking carried as plain content: the reasoning-compat strip
+            // can remove `reasoning`/`reasoning_content` carriers from
+            // outgoing messages (and drop a message left empty by the
+            // strip), but plain assistant content survives to every
+            // provider. Capped so a long thinking block cannot balloon the
+            // resubmission.
+            let echo = Self::reasoning_text(choice)
+                .map(|text| text.chars().take(2000).collect::<String>())
+                .unwrap_or_default();
+            let content = if echo.trim().is_empty() {
+                choice.message.content.clone()
+            } else {
+                serde_json::Value::String(echo)
+            };
+            nudged.messages.push(Message {
+                role: "assistant".to_string(),
+                content,
+                extra: Default::default(),
+            });
+        }
+        nudged.messages.push(Message {
+            role: "user".to_string(),
+            content: serde_json::Value::String(Self::REASONING_CONTINUATION_NUDGE.to_string()),
+            extra: Default::default(),
+        });
+        match self
+            .attempt_with_retry(
+                &provider_model.provider,
+                &nudged,
+                provider_model,
+                active,
+                attempt_counter,
+            )
+            .await
+        {
+            Ok(response) => Some(response),
+            Err(err) => {
+                warn!(
+                    provider = %provider_model.provider,
+                    model = %provider_model.model,
+                    error = %err,
+                    "Reasoning continuation nudge failed; falling over"
+                );
+                None
+            }
+        }
     }
 
     /// Remove a gateway search tool call the gateway is not going to execute, and
@@ -9202,6 +9374,180 @@ async fn buffered_adapter_image_error_strips_and_retries() {
             serde_json::Value::Null,
             extras(&[])
         )));
+    }
+
+    #[test]
+    fn reasoning_states_intent_matches_announced_actions() {
+        // The field-report shape: thinking ends on "let me ...".
+        let thinking = extras(&[(
+            "reasoning_content",
+            serde_json::json!("Let me read the config file first."),
+        )]);
+        assert!(Router::reasoning_states_intent(&turn(
+            serde_json::Value::Null,
+            thinking
+        )));
+
+        // First-person variants.
+        for text in [
+            "I'll inspect the schema.",
+            "I will query the endpoint.",
+            "I need to check the logs.",
+            "First, I should look at the diff.",
+            "The next step is to open the file.",
+        ] {
+            let thinking = extras(&[("reasoning_content", serde_json::json!(text))]);
+            assert!(
+                Router::reasoning_states_intent(&turn(serde_json::Value::Null, thinking)),
+                "must match: {text}"
+            );
+        }
+
+        // Concluded thinking without an announced action: no nudge.
+        let done = extras(&[(
+            "reasoning_content",
+            serde_json::json!("The analysis is complete and consistent."),
+        )]);
+        assert!(!Router::reasoning_states_intent(&turn(
+            serde_json::Value::Null,
+            done
+        )));
+        // No reasoning carrier at all.
+        assert!(!Router::reasoning_states_intent(&turn(
+            serde_json::json!("answer"),
+            extras(&[])
+        )));
+    }
+
+    /// Serves a reasoning-only turn (whose thinking announces an action)
+    /// for the original request and a real tool call once the gateway's
+    /// continuation nudge arrives.
+    struct ReasoningThenToolCall;
+    impl wiremock::Respond for ReasoningThenToolCall {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body = String::from_utf8_lossy(request.body.as_slice());
+            if body.contains("private reasoning") {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-nudged",
+                    "object": "chat.completion",
+                    "created": 2,
+                    "model": "upstream-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\": \"config.yaml\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-stalled",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "upstream-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "reasoning_content": "Let me read the config file to check the setting."
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_intent_nudge_revives_stalled_turn() {
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ReasoningThenToolCall)
+            .mount(&server)
+            .await;
+
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.providers = vec![test_provider("first", server.uri())];
+        config.model_groups = vec![test_group(vec![test_model("first", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        // A tool-using request so the reasoning-only turn is judged as a
+        // stalled agent turn rather than promoted to content.
+        let mut request = compression_request(false);
+        request.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]),
+        );
+
+        let response = router.route_request(&request, None).await.unwrap();
+
+        // The nudge revived the turn into a real tool call.
+        let tool_calls = response
+            .choices
+            .first()
+            .unwrap()
+            .message
+            .extra
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .expect("revived turn must carry the tool call");
+        assert_eq!(
+            tool_calls[0]
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str()),
+            Some("read_file")
+        );
+
+        // Exactly two upstream hits: the stalled attempt + the nudge.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2, "nudge must retry the same provider once");
+        // The nudged request echoed the stalled assistant turn and ended
+        // with the user-role continuation instruction.
+        let nudged_body = String::from_utf8_lossy(&received[1].body);
+        let nudged: serde_json::Value = serde_json::from_str(&nudged_body).unwrap();
+        let messages = nudged["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert!(
+            last["content"]
+                .as_str()
+                .unwrap()
+                .contains("private reasoning")
+        );
+        let prev = &messages[messages.len() - 2];
+        assert_eq!(prev["role"], "assistant");
+        // The stalled thinking is echoed back as assistant content (the
+        // reasoning-compat strip would remove the `reasoning_content`
+        // carrier from the outgoing request).
+        assert!(prev["content"]
+            .as_str()
+            .unwrap()
+            .contains("Let me read"));
     }
 
     #[test]
