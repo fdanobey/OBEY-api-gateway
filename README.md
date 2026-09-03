@@ -48,7 +48,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **OpenAI OAuth login** — browser-based sign-in with your ChatGPT Plus/Pro subscription (PKCE flow, automatic token refresh)
 - **Responses API front door** — native `/v1/responses` endpoint that accepts the OpenAI Responses wire format (used by Codex CLI and the OpenAI SDK's `responses.create`) and bridges it to Chat-Completions-native providers; translates requests inbound, synthesizes Responses-shaped output (streaming + non-streaming), and offers stateful persistence via `store` / `previous_response_id` with retrieval, list, and delete endpoints (see [Responses API](#responses-api))
 - **Codex backend translation** — transparently routes OAuth-authenticated requests through the ChatGPT Codex backend, translating Chat Completions ↔ Responses API on the fly
-- **Codex web search** — automatic web-search tool injection available to every model group while a valid OpenAI OAuth token is active; the routed provider serves the completion while search calls execute server-side against the Codex search API (configurable timeout, max iterations, base URL, and chat output so results survive context compression)
+- **Codex web search** — automatic web-search tool injection available to every model group while a valid OpenAI OAuth token is active; the routed provider serves the completion while search calls execute server-side against the Codex search API (configurable timeout, max iterations, base URL, and chat output so results survive context compression) (see [Codex Web Search](#codex-web-search))
 - **Guardrail pipelines** — configurable pre-call and post-call policy enforcement with PII redaction/re-injection, regex scanning, Presidio NLP, OpenAI Moderation, Lakera, semantic prompt guard, and custom HTTP providers; includes refusal detection with automatic failover (see [Guardrail Pipelines](#guardrail-pipelines))
 - **Agent loop detection** — multi-signal confidence scorer detects repetitive agent behavior (tool-call repetition, content similarity, error cycling, response stagnation, token/cost velocity, context growth) and escalates through Warn → Throttle → Inject → Hard-Stop enforcement levels; per-virtual-key overrides, session admin API, and Prometheus histograms (see [Agent Loop Detection](#agent-loop-detection))
 - **Virtual key management** — issue per-caller API keys (`vk_…`) with independent USD/token budgets, rate limits, model-access restrictions, and expiry; authenticate callers without sharing real provider keys (see [Virtual Key Management](#virtual-key-management))
@@ -288,6 +288,30 @@ The gateway handles the full token lifecycle automatically:
 
 **Security:** Tokens are encrypted at rest with AES-256-GCM, the callback server binds exclusively to `127.0.0.1`, and token values are never logged at any level.
 
+Requests routed through an OAuth provider are translated to the ChatGPT Codex backend, which supplies its own system prompt. Set `codex_instructions_url` at the top level of the config to fetch that prompt from somewhere other than the built-in default (also editable in the admin panel).
+
+### Codex Web Search
+
+While a valid OpenAI OAuth token is active, the gateway injects `codex_search` and `codex_web` tool definitions into requests routed to **any** provider. The serving model does not have to be the Codex backend: when the model calls one of those tools, the gateway executes it server-side against the Codex search endpoint using the OAuth token, appends the result to the conversation, and resubmits — so the client only ever sees the model's real answer, never a tool it cannot run.
+
+```yaml
+codex_search:
+  enabled: true            # Default: on whenever a valid OAuth token is available
+  output_to_chat: true     # Append results to assistant content (default: true)
+  base_url: "https://chatgpt.com/backend-api/codex/alpha/search"
+  timeout_seconds: 15      # Per search HTTP call, 1–120 (default: 15)
+  max_iterations: 5        # Max search→resubmit round trips, 1–20 (default: 5)
+```
+
+Every field is editable in the admin panel under the Codex settings, and all are optional — omitting the `codex_search` section entirely leaves the feature enabled whenever a token exists.
+
+Behavior worth knowing:
+
+- **Streaming requests are served buffered while search is active.** Tool calls cannot be intercepted mid-relay, and without interception the model never gets the search result. The client still receives a normal SSE stream (keep-alive holds the connection during the loop), it just isn't a true pass-through.
+- **`output_to_chat` guards against context compression.** Results live in the assistant message content, not only in tool-call metadata, so downstream compression cannot strip the fact that a search already ran. Set it to `false` if you want results only in the `codex_search_tool_results` response field.
+- **Two independent limits bound the loop.** `max_iterations` caps the *number* of model round trips; a wall-clock budget caps their total *duration*. The budget is derived from the same ceiling as the [global request deadline](#global-request-deadline), because from the client's point of view the whole loop is one request. When the budget is spent the gateway returns the current turn rather than starting another round trip. Note that on streaming requests the global deadline middleware does not cover this work, which is exactly why the loop carries its own budget.
+- **Gateway tool calls never reach the client.** They are stripped on every exit path, including when the OAuth token expires mid-request. A client that received `codex_search` could not execute it or answer it, and would stall with no error.
+
 ### Bedrock Authentication
 
 AWS Bedrock supports two modes:
@@ -459,6 +483,44 @@ providers:
 ```
 
 If you see these 503s, raise `max_connections` for that provider, lower its `total_timeout_seconds`, or reduce concurrent load. Diagnostic tip: when `/ping` answers promptly but `/v1/*` requests stall, the bottleneck is provider slots or upstream latency rather than the gateway itself.
+
+### Retry & Circuit Breaker
+
+Two independent mechanisms. **Retry** re-attempts the *same* provider inline; **failover** moves to the next provider in the group; the **circuit breaker** takes a provider out of rotation after repeated failures so it stops being tried at all.
+
+```yaml
+retry:
+  max_retries_per_provider: 1        # Inline same-provider retries (default: 1)
+  backoff_sequence_seconds: [1, 2, 4] # Waits between those retries
+  jitter_enabled: true               # Randomize backoff to avoid thundering herds
+
+circuit_breaker:
+  failure_threshold: 3               # Consecutive failures before opening (default: 3)
+  backoff_sequence_seconds: [5, 10, 20, 40, 300]  # Escalating open durations
+  success_threshold: 1               # Successes in half-open before closing (default: 1)
+```
+
+Notes:
+
+- The breaker is keyed per `provider:model`, not per provider, so one failing model does not sideline a provider's other models.
+- `backoff_sequence_seconds` escalates with each successive open, ending at 300s — a provider that keeps failing is retried every 5 minutes rather than hammered.
+- **All breakers reset on config hot-reload** (`POST /admin/config/reload`), which is the fastest way to clear a stuck provider without a restart.
+- Streaming pass-through gets exactly one attempt per provider: a live SSE relay cannot be safely retried inline once bytes have arrived, so failover advances to the next provider instead. The buffered fallback still honors `max_retries_per_provider`.
+- Rate-limit cooldowns are separate from breaker backoff and are documented under [How Routing Works](#how-routing-works).
+
+### CORS
+
+Disabled by default. Enable it when browsers call the gateway directly:
+
+```yaml
+cors:
+  enabled: true
+  allowed_origins: ["https://app.example.com"]   # Default: ["*"]
+  allowed_methods: ["GET", "POST", "OPTIONS"]
+  allowed_headers: ["Content-Type", "Authorization"]
+```
+
+The `["*"]` origin default is convenient for local development but means any site can call the gateway from a user's browser. Since the gateway holds your provider keys, set an explicit origin allowlist before exposing it beyond localhost, and prefer [virtual keys](#virtual-key-management) over your real provider keys for browser-facing traffic.
 
 ### Environment Variables
 

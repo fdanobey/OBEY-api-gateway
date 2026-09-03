@@ -3056,19 +3056,51 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
         if !has_gateway_call {
             return Ok(response);
         }
+
+        // Past this point the response carries a gateway-injected search call the
+        // client never declared, so EVERY exit path must strip it. A client that
+        // receives `codex_search` cannot execute it and cannot produce the
+        // matching `role: tool` reply, so its agent loop deadlocks with no error
+        // to show — the request just stops.
+        //
+        // These two bail-outs are reachable in normal operation because readiness
+        // is evaluated independently at injection time and again here: an OAuth
+        // token that expires or starts refreshing during the provider round trip,
+        // or an `/admin/config/reload` that disables the feature mid-request,
+        // lands exactly here holding a call that was legitimately injected.
         let Some(search_cfg) = self.codex_search_ready().await else {
+            warn!(
+                provider = %provider_model.provider,
+                "Codex search became unavailable between tool injection and interception; stripping the gateway tool call the client cannot execute"
+            );
+            Self::discard_unexecutable_search_call(&mut response);
             return Ok(response);
         };
         let Some(oauth) = self.oauth_manager.clone() else {
+            warn!(
+                provider = %provider_model.provider,
+                "No OAuth manager attached to execute the gateway search call; stripping it rather than leaking it to the client"
+            );
+            Self::discard_unexecutable_search_call(&mut response);
             return Ok(response);
         };
-        let pool_config = {
+        let (pool_config, budget) = {
             let config = self.config.read().await;
-            config
+            let pool = config
                 .providers
                 .iter()
                 .find(|p| p.name == provider_model.provider)
-                .map(|p| p.connection_pool.clone())
+                .map(|p| p.connection_pool.clone());
+            // The search loop is a single request as far as the client is
+            // concerned, so it gets the same ceiling the gateway applies to any
+            // one request. It needs its own copy because on streaming requests
+            // the global deadline middleware does not cover this work at all —
+            // that middleware only bounds producing response headers, and the SSE
+            // handler returns its body handle before the router is ever called.
+            let budget = Duration::from_secs(
+                crate::runtime_limits::effective_request_timeout_seconds(&config),
+            );
+            (pool, budget)
         };
         let http = match pool_config {
             Some(pool) => self.get_or_create_http_client(&provider_model.provider, &pool)?,
@@ -3093,6 +3125,7 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
             executor,
             search_cfg.effective_max_iterations(),
             search_cfg.effective_output_to_chat(),
+            budget,
         );
         let resubmitter = SearchResubmitter {
             router: self,
@@ -3104,7 +3137,27 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
         let intercepted = interceptor
             .intercept(&resubmitter, request.clone(), response)
             .await?;
-        Ok(intercepted.response)
+        let mut final_response = intercepted.response;
+
+        // Safety net. The interceptor strips its own tool calls on the way out,
+        // which can empty the `tool_calls` array and leave a turn with no content
+        // either. `response_has_content` already ran *before* interception, so
+        // nothing downstream catches it, and the SSE synthesizer renders such a
+        // turn as a bare `finish_reason` chunk — which a harness reads as a
+        // finished, empty turn and stops on.
+        if Self::backfill_empty_turn(
+            &mut final_response,
+            "The gateway ran your web search, but this turn produced no answer text and no tool call. \
+             Continue the task with your own tools, or say what information you still need.",
+        ) {
+            warn!(
+                provider = %provider_model.provider,
+                model = %provider_model.model,
+                iteration_limit_reached = intercepted.iteration_limit_reached,
+                "Codex search interception left an empty assistant turn; backfilled an explanatory message so the client can continue"
+            );
+        }
+        Ok(final_response)
     }
 
     async fn dispatch_attempts_under_permit(
@@ -3166,6 +3219,12 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
             );
 
             let codex_search_config = config.codex_search.clone().unwrap_or_default();
+            // Wall-clock ceiling for the search agent loop — the same one the
+            // failover-layer interception uses. Read here while the config guard
+            // is still held, since the loop itself runs after it is dropped.
+            let codex_search_budget = Duration::from_secs(
+                crate::runtime_limits::effective_request_timeout_seconds(&config),
+            );
             // Drop config lock before making HTTP calls. The dispatch below
             // awaits the full upstream round-trip; holding the write-preferring
             // read guard across it lets any queued config writer (hot-reload,
@@ -3207,11 +3266,21 @@ let interceptor = crate::codex::search::interceptor::ToolInterceptor::new(
 executor,
 codex_search_config.effective_max_iterations(),
 codex_search_config.effective_output_to_chat(),
+codex_search_budget,
 );
                 let intercepted = interceptor
                     .intercept(&codex_client, codex_request, result.response)
                     .await?;
-                return Ok(intercepted.response);
+                let mut final_response = intercepted.response;
+                // Stripping the gateway's own tool calls can leave a turn with
+                // neither content nor tool calls, which clients read as a
+                // finished, empty reply and stop on.
+                Self::backfill_empty_turn(
+                    &mut final_response,
+                    "The gateway ran your web search, but this turn produced no answer text and no tool call. \
+                     Continue the task with your own tools, or say what information you still need.",
+                );
+                return Ok(final_response);
             }
 
             return Ok(result.response);
@@ -5434,6 +5503,47 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
             return false;
         };
         choice.message.content = serde_json::Value::String(text);
+        true
+    }
+
+    /// Remove a gateway search tool call the gateway is not going to execute, and
+    /// make sure a usable turn remains.
+    ///
+    /// Leaking `codex_search`/`codex_web` to a client that never declared them is
+    /// a hard stall rather than a visible failure: the harness cannot run the
+    /// tool, cannot produce the `role: tool` reply the protocol now demands, and
+    /// has no error to surface.
+    fn discard_unexecutable_search_call(response: &mut OpenAIResponse) {
+        crate::codex::search::interceptor::strip_gateway_tool_calls(response);
+        Self::backfill_empty_turn(
+            response,
+            "The gateway's web-search tool was requested but is currently unavailable, so no search ran this turn. \
+             Continue the task with your own tools, or say what information you still need.",
+        );
+    }
+
+    /// Give an otherwise-empty assistant turn something to say. Returns `true`
+    /// when `note` was written.
+    ///
+    /// A turn with neither content nor tool calls is rendered by the SSE
+    /// synthesizer as a lone terminal `finish_reason` chunk. Clients read that as
+    /// a completed but empty reply and stop — indistinguishable from the task
+    /// actually being finished. An explanation keeps the agent able to proceed.
+    fn backfill_empty_turn(response: &mut OpenAIResponse, note: &str) -> bool {
+        let Some(choice) = response.choices.first_mut() else {
+            return false;
+        };
+        let has_tool_calls = choice
+            .message
+            .extra
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|calls| !calls.is_empty());
+        if has_tool_calls || !Self::content_is_empty(&choice.message.content) {
+            return false;
+        }
+        choice.message.content = serde_json::Value::String(note.to_string());
+        choice.finish_reason = Some("stop".to_string());
         true
     }
 

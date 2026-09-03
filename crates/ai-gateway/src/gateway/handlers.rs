@@ -4716,6 +4716,27 @@ fn build_streaming_chunks(
             chunks.push(build_chunk_payload(response, delta, None));
         }
 
+        // Assistant text that accompanies a tool call must still reach the
+        // client. A model can legitimately return both, and the Codex search
+        // interceptor writes its results block into `content` when
+        // `output_to_chat` is enabled — silently dropping it here is why
+        // toggling that setting appeared to change nothing. Real provider
+        // streams emit content deltas ahead of tool-call deltas, so match that
+        // and keep the tool call as the last thing the client sees.
+        let content_is_emittable = match &content {
+            serde_json::Value::Null => false,
+            serde_json::Value::String(text) => !text.trim().is_empty(),
+            _ => true,
+        };
+        if content_is_emittable {
+            let mut delta = serde_json::json!({ "content": content });
+            if !role_emitted {
+                delta["role"] = serde_json::json!("assistant");
+                role_emitted = true;
+            }
+            chunks.push(build_chunk_payload(response, delta, None));
+        }
+
         let mut first_delta = serde_json::json!({
             "content": null,
             "tool_calls": [{
@@ -5815,6 +5836,105 @@ mod tests {
             chunks.last().unwrap()["choices"][0]["finish_reason"],
             "tool_calls"
         );
+    }
+
+    /// Regression: assistant text alongside a tool call used to be dropped
+    /// entirely. The Codex search interceptor writes its results block into
+    /// `content` when `output_to_chat` is on, so on a turn that also carries a
+    /// client tool call the whole block vanished — which is why toggling that
+    /// setting appeared to make no difference. Order must be reasoning → content
+    /// → tool calls, matching a real provider stream.
+    #[test]
+    fn streaming_chunks_emit_content_alongside_tool_calls() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "reasoning_content".to_string(),
+            serde_json::json!("deciding"),
+        );
+        extra.insert(
+            "tool_calls".to_string(),
+            serde_json::json!([{
+                "index": 0,
+                "id": "call_abc",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }]),
+        );
+        let response = base_response(Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("--- codex search results ---\nfindings"),
+            extra,
+        });
+
+        let chunks = streaming_chunks_from_response(&response);
+
+        let present = |key: &str| {
+            chunks
+                .iter()
+                .position(|c| c["choices"][0]["delta"].get(key).is_some())
+        };
+        let reasoning = present("reasoning_content").expect("reasoning emitted");
+        let tool = present("tool_calls").expect("tool call emitted");
+        // The leading reasoning chunk carries `content: null` (the OpenAI
+        // first-chunk shape), so only a non-empty string counts as real text.
+        let content = chunks
+            .iter()
+            .position(|c| {
+                c["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+            })
+            .expect("content must not be dropped");
+
+        assert!(
+            reasoning < content && content < tool,
+            "expected reasoning({reasoning}) < content({content}) < tool_calls({tool})"
+        );
+        assert_eq!(
+            chunks[content]["choices"][0]["delta"]["content"],
+            "--- codex search results ---\nfindings"
+        );
+        // Still exactly one role marker, still terminating on the tool call.
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|c| c["choices"][0]["delta"].get("role").is_some())
+                .count(),
+            1
+        );
+        assert_eq!(
+            chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+    }
+
+    /// Whitespace-only content next to a tool call stays suppressed — the first
+    /// tool-call delta already carries `content: null`.
+    #[test]
+    fn streaming_chunks_suppress_blank_content_alongside_tool_calls() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tool_calls".to_string(),
+            serde_json::json!([{
+                "index": 0,
+                "id": "call_abc",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }]),
+        );
+        let response = base_response(Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("   \n"),
+            extra,
+        });
+
+        let chunks = streaming_chunks_from_response(&response);
+
+        assert!(chunks.iter().all(|c| {
+            c["choices"][0]["delta"]
+                .get("content")
+                .is_none_or(|v| v.is_null())
+        }));
     }
 
     /// Same ordering guarantee on the early-event path, where the role marker

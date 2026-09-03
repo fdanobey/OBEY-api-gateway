@@ -6,7 +6,7 @@
 //! limit is reached.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -39,6 +39,17 @@ pub struct ToolInterceptor {
     executor: Arc<SearchExecutor>,
     max_iterations: u32,
     output_to_chat: bool,
+    /// Wall-clock ceiling for the whole loop.
+    ///
+    /// `max_iterations` alone bounds the *number* of model round trips, not
+    /// their duration: each resubmit runs through the normal retry path under
+    /// the provider's own `total_timeout_seconds`, so the worst case is
+    /// iterations × that timeout. From the client's point of view this is still
+    /// one request, and on a streaming request the global gateway deadline does
+    /// not apply (it only bounds producing response headers), so without this
+    /// budget the loop can outlive every configured limit and the connection
+    /// just sits there.
+    budget: Duration,
 }
 
 impl ToolInterceptor {
@@ -46,11 +57,13 @@ impl ToolInterceptor {
         executor: Arc<SearchExecutor>,
         max_iterations: u32,
         output_to_chat: bool,
+        budget: Duration,
     ) -> Self {
         Self {
             executor,
             max_iterations,
             output_to_chat,
+            budget,
         }
     }
 
@@ -88,7 +101,11 @@ impl ToolInterceptor {
  // sees it. Skipped when no search ran this turn, when the
  // nudge already fired, or when the iteration budget is spent
  // (the explicit limit branch handles that case).
- if !all_results.is_empty() && !nudged && iterations < self.max_iterations {
+ if !all_results.is_empty()
+ && !nudged
+ && iterations < self.max_iterations
+ && start.elapsed() < self.budget
+ {
  append_continuation_nudge(&mut request, &current_response);
  nudged = true;
  iterations += 1;
@@ -131,9 +148,31 @@ impl ToolInterceptor {
                 });
             }
 
-            if iterations >= self.max_iterations {
-                append_iteration_limit_message(&mut request);
-                let mut final_response = self.resubmit(provider, &request).await?;
+            // Stop looping when either budget is spent. The iteration limit gets
+            // one final resubmit so the model can answer with what it already
+            // has; a spent wall-clock budget does not, because another round
+            // trip is precisely what there is no time left for.
+            let iterations_spent = iterations >= self.max_iterations;
+            let time_spent = start.elapsed() >= self.budget;
+            if iterations_spent || time_spent {
+                let mut final_response = if time_spent {
+                    tracing::warn!(
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        budget_ms = self.budget.as_millis() as u64,
+                        iterations,
+                        "Codex search loop exceeded its wall-clock budget; returning current turn without another model round trip"
+                    );
+                    current_response
+                } else {
+                    append_iteration_limit_message(&mut request);
+                    // Drop the gateway tool definitions before the final turn so
+                    // the model cannot emit yet another search call. If it did,
+                    // `strip_gateway_tool_calls` below would delete it and leave
+                    // an assistant message with neither content nor tool calls,
+                    // which clients read as a finished-but-empty turn and stop on.
+                    remove_gateway_tools(&mut request);
+                    self.resubmit(provider, &request).await?
+                };
                 if self.output_to_chat {
                     append_results_to_chat(&mut final_response, &all_results);
                 }
@@ -287,6 +326,32 @@ fn build_tool_message(call_id: &str, result: &ToolResult) -> Message {
     }
 }
 
+/// Remove the gateway's own tool definitions from a request.
+///
+/// Used for the final, limit-reached resubmit so the model is not offered a tool
+/// whose call would immediately be stripped back out. The `tools` key is dropped
+/// entirely when nothing else remains, because several providers reject an empty
+/// `tools` array.
+fn remove_gateway_tools(request: &mut OpenAIRequest) {
+    let Some(tools) = request
+        .extra
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    tools.retain(|tool| {
+        tool.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .map(|name| !GATEWAY_TOOLS.contains(&name))
+            .unwrap_or(true)
+    });
+    if tools.is_empty() {
+        request.extra.remove("tools");
+    }
+}
+
 fn append_iteration_limit_message(request: &mut OpenAIRequest) {
  request.messages.push(Message {
  role: "system".to_string(),
@@ -381,7 +446,7 @@ fn format_results_block(results: &[Value]) -> String {
 /// server-side; leaking them back to the client causes harnesses to reject
 /// the response ("tried to call unavailable tool"). Client tool calls are
 /// preserved untouched.
-fn strip_gateway_tool_calls(response: &mut OpenAIResponse) {
+pub(crate) fn strip_gateway_tool_calls(response: &mut OpenAIResponse) {
     if let Some(choice) = response.choices.first_mut() {
         let should_remove = {
             let calls = choice
@@ -588,10 +653,26 @@ mod tests {
         }
     }
 
+/// Build an interceptor with a budget large enough never to fire, so the
+/// existing tests exercise the iteration limit rather than the clock. The
+/// budget itself is covered by `wall_clock_budget_stops_the_loop_without_another_round_trip`.
+fn test_interceptor(
+    executor: Arc<SearchExecutor>,
+    max_iterations: u32,
+    output_to_chat: bool,
+) -> ToolInterceptor {
+    ToolInterceptor::new(
+        executor,
+        max_iterations,
+        output_to_chat,
+        Duration::from_secs(3600),
+    )
+}
+
 #[tokio::test]
 async fn no_tool_calls_returns_immediately() {
     let executor = make_executor();
-    let interceptor = ToolInterceptor::new(executor, 5, false);
+    let interceptor = test_interceptor(executor, 5, false);
     let provider = MockProvider::new(vec![make_final_response("hello")]);
 
     let result = interceptor
@@ -607,7 +688,7 @@ async fn no_tool_calls_returns_immediately() {
 #[tokio::test]
 async fn iteration_limit_enforced() {
     let executor = make_executor();
-    let interceptor = ToolInterceptor::new(executor, 2, false);
+    let interceptor = test_interceptor(executor, 2, false);
         let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
         let provider = MockProvider::new(vec![
             make_response_with_tool_calls(vec![search_call.clone()]),
@@ -627,7 +708,7 @@ async fn iteration_limit_enforced() {
 #[tokio::test]
 async fn mixed_gateway_and_client_tools_stops_loop() {
     let executor = make_executor();
-    let interceptor = ToolInterceptor::new(executor, 5, false);
+    let interceptor = test_interceptor(executor, 5, false);
         let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
         let client_call = make_tool_call("call_2", "client_custom_tool", r#"{"x":1}"#);
         let provider = MockProvider::new(vec![]);
@@ -682,12 +763,85 @@ async fn mixed_gateway_and_client_tools_stops_loop() {
     );
 }
 
+/// `max_iterations` bounds the number of model round trips, not their duration.
+/// A zero budget must stop the loop immediately and, crucially, WITHOUT another
+/// resubmit — another round trip is exactly what there is no time for. The
+/// `MockProvider` is primed with no responses, so any resubmit attempt fails the
+/// test rather than silently passing.
+#[tokio::test]
+async fn wall_clock_budget_stops_the_loop_without_another_round_trip() {
+    let executor = make_executor();
+    let interceptor = ToolInterceptor::new(executor, 5, false, Duration::ZERO);
+    let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
+    let provider = MockProvider::new(vec![]);
+
+    let initial = make_response_with_tool_calls(vec![search_call]);
+    let result = interceptor
+        .intercept(&provider, make_request(), initial)
+        .await
+        .unwrap();
+
+    assert!(result.iteration_limit_reached, "loop terminated on a budget");
+    // The unexecutable gateway call must not survive to the client.
+    assert!(
+        result
+            .response
+            .choices
+            .first()
+            .and_then(|c| c.message.extra.get("tool_calls"))
+            .is_none(),
+        "gateway tool call stripped even on the budget path"
+    );
+}
+
+/// The final limit-reached resubmit must not offer the gateway tools again.
+/// Leaving them in lets the model emit another `codex_search` that the strip
+/// then deletes, leaving a turn with neither content nor tool calls — which
+/// clients read as a finished, empty turn and stop on.
+#[test]
+fn remove_gateway_tools_leaves_only_client_tools() {
+    let mut request = make_request();
+    request.extra.insert(
+        "tools".to_string(),
+        json!([
+            {"type": "function", "function": {"name": "client_custom_tool"}},
+            {"type": "function", "function": {"name": "codex_search"}},
+            {"type": "function", "function": {"name": "codex_web"}},
+        ]),
+    );
+
+    remove_gateway_tools(&mut request);
+
+    let names: Vec<&str> = request.extra["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(names, vec!["client_custom_tool"]);
+}
+
+/// When only gateway tools were injected, the key is removed rather than left as
+/// an empty array — several providers reject `tools: []`.
+#[test]
+fn remove_gateway_tools_drops_an_emptied_tools_key() {
+    let mut request = make_request();
+    request.extra.insert(
+        "tools".to_string(),
+        json!([{"type": "function", "function": {"name": "codex_search"}}]),
+    );
+
+    remove_gateway_tools(&mut request);
+
+    assert!(!request.extra.contains_key("tools"));
+}
+
 #[tokio::test]
 async fn gateway_only_calls_are_stripped_before_client_return() {
     let executor = make_executor();
     // output_to_chat = false keeps content assertions out of the way; the
     // strip must still happen on the client-tool return path.
-    let interceptor = ToolInterceptor::new(executor, 5, false);
+    let interceptor = test_interceptor(executor, 5, false);
     let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
     let client_call = make_tool_call("call_2", "client_custom_tool", r#"{"x":1}"#);
     let provider = MockProvider::new(vec![]);
@@ -717,7 +871,7 @@ async fn gateway_only_calls_are_stripped_before_client_return() {
 #[tokio::test]
 async fn single_tool_call_then_final_answer() {
  let executor = make_executor();
- let interceptor = ToolInterceptor::new(executor, 5, false);
+ let interceptor = test_interceptor(executor, 5, false);
  let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
  // First resubmit returns an interim text-only answer, which triggers
  // the one-shot continuation nudge; the second resubmit completes.
@@ -773,7 +927,7 @@ async fn single_tool_call_then_final_answer() {
 #[tokio::test]
 async fn output_to_chat_appends_results_to_content() {
     let executor = make_executor();
-    let interceptor = ToolInterceptor::new(executor, 5, true);
+    let interceptor = test_interceptor(executor, 5, true);
     let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"rust news"}"#);
     // Second response answers the one-shot continuation nudge so the
     // returned content is a genuine final answer.
@@ -813,7 +967,7 @@ async fn output_to_chat_appends_results_to_content() {
 #[tokio::test]
 async fn output_to_chat_appends_on_client_tool_stop() {
     let executor = make_executor();
-    let interceptor = ToolInterceptor::new(executor, 5, true);
+    let interceptor = test_interceptor(executor, 5, true);
     let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
     let client_call = make_tool_call("call_2", "client_custom_tool", r#"{"x":1}"#);
     let provider = MockProvider::new(vec![]);
@@ -837,7 +991,7 @@ async fn output_to_chat_appends_on_client_tool_stop() {
 #[tokio::test]
 async fn repeated_call_ids_are_deduplicated() {
     let executor = make_executor();
-    let interceptor = ToolInterceptor::new(executor, 5, false);
+    let interceptor = test_interceptor(executor, 5, false);
     // Same call ID echoed again after resubmit — must not duplicate results.
     let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
     let provider = MockProvider::new(vec![
@@ -867,7 +1021,7 @@ async fn repeated_call_ids_are_deduplicated() {
 #[tokio::test]
 async fn continuation_nudge_fires_once_after_text_stop() {
     let executor = make_executor();
-    let interceptor = ToolInterceptor::new(executor, 5, false);
+    let interceptor = test_interceptor(executor, 5, false);
     let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
     // The model keeps answering with text after the nudge: the stop is
     // accepted on the second text-only response (nudge is one-shot).
@@ -906,7 +1060,7 @@ async fn continuation_nudge_respects_iteration_budget() {
     // max_iterations=1: the single resubmit slot is consumed by the
     // search round-trip, so the following text-only stop must finalize
     // without a nudge.
-    let interceptor = ToolInterceptor::new(executor, 1, false);
+    let interceptor = test_interceptor(executor, 1, false);
     let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
     let provider = MockProvider::new(vec![make_final_response("answer")]);
 
@@ -929,7 +1083,7 @@ async fn continuation_nudge_respects_iteration_budget() {
 #[tokio::test]
 async fn continuation_nudge_revives_client_tool_call() {
     let executor = make_executor();
-    let interceptor = ToolInterceptor::new(executor, 5, false);
+    let interceptor = test_interceptor(executor, 5, false);
     let search_call = make_tool_call("call_1", "codex_search", r#"{"q":"test"}"#);
     let client_call = make_tool_call("call_2", "client_custom_tool", r#"{"x":1}"#);
     // After the nudge the model continues via a client tool: the loop
