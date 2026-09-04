@@ -533,6 +533,9 @@ where
             // Canonical discovery keys already revealed this session (namespace/grouping
             // only). Used so re-drills are reminded from session cache instead of being
             // silently re-resolved, strengthening multi-turn memory of disclosed tools.
+            // Set once the discovery tools have been pulled from the outbound
+            // request for the final turn — see the budget branch below.
+            let mut synthetic_tools_withdrawn = false;
             let mut already_disclosed: HashSet<String> = session_id
                 .as_ref()
                 .and_then(|sid| state.disclosure_targets.get(sid).map(|set| set.clone()))
@@ -555,46 +558,72 @@ where
                     }
                 };
 
-                // Budget exhausted: a synthetic call must still never be relayed, so
-                // answer it locally and terminate the turn instead of forwarding it.
                 if steps >= step_budget {
-                    match sanitize_synthetic_response(&resp_json, &original_tools, sse) {
-                        Some(sanitized) => {
-                            tracing::warn!(
-                                model_group = %model_group,
-                                steps,
-                                "Synthetic drill-down budget exhausted; answering locally instead of relaying the synthetic call to the client"
-                            );
-                            let mut parts = resp_parts;
-                            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-                            final_response = Response::from_parts(parts, Body::from(sanitized));
+                    if synthetic_tools_withdrawn {
+                        // The discovery tools are already gone from the outbound
+                        // request, so a synthetic call here should be impossible.
+                        // If one appears anyway it must still never be relayed —
+                        // the client cannot execute it. `sanitize_synthetic_response`
+                        // returns `None` when there is no synthetic call, which is
+                        // the normal exit and relays the model's real answer
+                        // untouched.
+                        match sanitize_synthetic_response(&resp_json, &original_tools, sse) {
+                            Some(sanitized) => {
+                                tracing::warn!(
+                                    model_group = %model_group,
+                                    steps,
+                                    "Model emitted a synthetic call after the discovery tools were withdrawn; answering locally rather than relaying a tool the client cannot execute"
+                                );
+                                let mut parts = resp_parts;
+                                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                                final_response =
+                                    Response::from_parts(parts, Body::from(sanitized));
+                            }
+                            None => {
+                                final_response =
+                                    Response::from_parts(resp_parts, Body::from(resp_bytes));
+                            }
                         }
-                        None => {
-                            final_response =
-                                Response::from_parts(resp_parts, Body::from(resp_bytes));
-                        }
+                        break;
                     }
-                    break;
+
+                    // Budget spent. Terminating here is what strands the client: a
+                    // gateway-authored assistant message reads as the final answer
+                    // and the agent stops mid-task. Instead withdraw the discovery
+                    // tools so the model cannot ask again, let the pending call
+                    // resolve below so it has the schemas, and give it one final
+                    // turn to either answer or call a real tool.
+                    tracing::debug!(
+                        model_group = %model_group,
+                        steps,
+                        "Synthetic drill-down budget exhausted; withdrawing the discovery tools for one final turn"
+                    );
+                    withdraw_synthetic_tools(&mut req_json, &original_tools);
+                    synthetic_tools_withdrawn = true;
                 }
 
-                // ─── Pre-resolution short-circuit for re-drills ───────────
-                // If all synthetic calls target namespaces/tools already disclosed
-                // AND callable this turn, answer locally and terminate instead of
-                // making another provider round-trip. This eliminates the residual
-                // cost of model re-drills even when the hint is ignored.
-                if let Some(redrill_resp) = check_redrill_short_circuit(
-                    &resp_json,
-                    &req_json,
-                    &original_tools,
-                    &already_disclosed,
-                    sse,
-                    &model_group,
-                    &feedback_loop,
-                ) {
-                    let mut parts = resp_parts;
-                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-                    final_response = Response::from_parts(parts, Body::from(redrill_resp));
-                    break;
+                // ─── Re-drill detection ───────────────────────────────────
+                // Every synthetic call this turn targets something already
+                // disclosed AND already callable. Record it so chronic
+                // re-drillers get their compression level stepped down, then fall
+                // through to normal resolution.
+                //
+                // This used to answer locally and terminate the turn with
+                // `finish_reason: "stop"` to save a provider round trip. That
+                // saving is not actually available: a tool call the gateway
+                // answers still needs a model turn to act on the answer. So
+                // terminating handed the client a gateway-authored assistant
+                // message ("Session cache hit: …") which harnesses render as the
+                // final reply and stop on — killing the agent's task mid-work to
+                // avoid one provider call. `resolve_synthetic_in_response` already
+                // appends the sharper `REDRILL_HINT` for disclosed targets, so the
+                // resubmit below carries the reminder that was the point.
+                if is_pure_redrill(&resp_json, &req_json, &original_tools, &already_disclosed) {
+                    feedback_loop.record_outcome(&model_group, true);
+                    tracing::debug!(
+                        model_group = %model_group,
+                        "Model re-drilled targets already disclosed and callable; resolving with the re-drill reminder instead of ending the turn"
+                    );
                 }
 
                 match resolver::resolve_synthetic_in_response(
@@ -967,31 +996,54 @@ fn sanitize_synthetic_response(
     }
 
     let content = format!(
-        "Tool discovery limit reached, so this was answered without another model turn. {} Call the listed tools directly by name.",
+        "Tool discovery could not be completed within the configured budget. {} Call the listed tools directly by name.",
         notes.join(" ")
     );
 
-    if sse {
-        let chunk = serde_json::json!({
-            "id": resp_json.get("id").and_then(|v| v.as_str()).unwrap_or("chatcmpl-tc"),
-            "object": "chat.completion.chunk",
-            "created": resp_json.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
-            "model": resp_json.get("model").and_then(|v| v.as_str()).unwrap_or(""),
-            "choices": [{
-                "index": 0,
-                "delta": {"role": "assistant", "content": content},
-                "finish_reason": "stop"
-            }]
+    frame_local_assistant_response(resp_json, &content, sse)
+}
+
+/// Withdraw the compression stages' synthetic drill-down tools from an outbound
+/// request body, so the model cannot ask for another disclosure.
+///
+/// Used for the final turn once the resolution budget is spent. If withdrawal would
+/// leave no tools at all — every real tool still hidden behind a namespace — the
+/// original definitions are restored instead: the budget is spent either way, and a
+/// final turn where the model can call a real tool beats one where it can only
+/// reply in prose. That trades the compression saving on this single turn for the
+/// agent being able to keep working.
+fn withdraw_synthetic_tools(req_json: &mut serde_json::Value, original_tools: &[ToolDefinition]) {
+    let Some(object) = req_json.as_object_mut() else {
+        return;
+    };
+    let emptied = {
+        let Some(tools) = object.get_mut("tools").and_then(|v| v.as_array_mut()) else {
+            return;
+        };
+        tools.retain(|tool| {
+            tool.pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .map(|name| {
+                    name != resolver::GET_TOOLS_IN_NAMESPACE
+                        && name != resolver::GET_TOOL_SCHEMA
+                        && !name.starts_with(resolver::NS_PREFIX)
+                })
+                .unwrap_or(true)
         });
-        Some(format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes())
-    } else {
-        let mut out = resp_json.clone();
-        out["choices"] = serde_json::json!([{
-            "index": 0,
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop"
-        }]);
-        serde_json::to_vec(&out).ok()
+        tools.is_empty()
+    };
+    if emptied {
+        if original_tools.is_empty() {
+            // Several providers reject `tools: []`.
+            object.remove("tools");
+        } else {
+            object.insert(
+                "tools".to_string(),
+                serde_json::Value::Array(
+                    original_tools.iter().map(|tool| tool.raw.clone()).collect(),
+                ),
+            );
+        }
     }
 }
 
@@ -1006,21 +1058,22 @@ fn sanitize_synthetic_response(
 /// chronic re-drillers get their compression level stepped down (fewer
 /// synthetic tools offered → fewer opportunities to re-drill).
 ///
-/// Returns the locally framed response body when the short-circuit applies,
-/// or `None` when the response carries no synthetic calls or any call needs
-/// a real resolution step.
-fn check_redrill_short_circuit(
+/// Returns `true` when the turn is nothing but re-drills, so the caller can
+/// record the wasted round trip. Resolution proceeds either way — the answer to a
+/// tool call only reaches the model on its next turn, so there is no way to
+/// "answer locally" without either resubmitting or ending the client's task.
+fn is_pure_redrill(
     resp_json: &serde_json::Value,
     req_json: &serde_json::Value,
     original_tools: &[ToolDefinition],
     already_disclosed: &HashSet<String>,
-    sse: bool,
-    model_group: &str,
-    feedback_loop: &FeedbackLoop,
-) -> Option<Vec<u8>> {
-    let calls = resp_json
+) -> bool {
+    let Some(calls) = resp_json
         .pointer("/choices/0/message/tool_calls")
-        .and_then(|v| v.as_array())?;
+        .and_then(|v| v.as_array())
+    else {
+        return false;
+    };
 
     // Names callable in the current (possibly re-injected) outbound request.
     let callable_names: HashSet<String> = req_json
@@ -1037,7 +1090,6 @@ fn check_redrill_short_circuit(
         })
         .unwrap_or_default();
 
-    let mut notes: Vec<String> = Vec::new();
     let mut saw_synthetic = false;
     let mut all_redrills = true;
 
@@ -1071,9 +1123,9 @@ fn check_redrill_short_circuit(
             continue;
         }
 
-        // Target was disclosed; the short-circuit only applies when every
-        // underlying tool is already callable this turn. Otherwise the normal
-        // resolution path must run to re-inject the missing schemas.
+        // Target was disclosed, but it only counts as a wasted re-drill when every
+        // underlying tool is already callable this turn. Otherwise the drill is
+        // doing real work: resolution still has schemas to re-inject.
         let members: Vec<String> = if let Some(ns) = key.strip_prefix("ns:") {
             resolver::tools_in_namespace(ns, original_tools)
                 .iter()
@@ -1090,30 +1142,10 @@ fn check_redrill_short_circuit(
         };
         if members.is_empty() || !members.iter().all(|m| callable_names.contains(m)) {
             all_redrills = false;
-            continue;
         }
-
-        notes.push(format!("{}: {}.", key, members.join(", ")));
     }
 
-    if !saw_synthetic || !all_redrills {
-        return None;
-    }
-
-    // Chronic re-drills waste provider turns; feed the FeedbackLoop so the
-    // compression level for this model group trends down over time.
-    feedback_loop.record_outcome(model_group, true);
-    tracing::debug!(
-        model_group = %model_group,
-        "Answered synthetic re-drill locally (tools already disclosed and callable)"
-    );
-
-    let content = format!(
-        "Session cache hit: you already retrieved these schemas earlier in this session and they remain valid and callable. {} Do NOT call the discovery tool for these targets again — call the listed tools directly by name.",
-        notes.join(" ")
-    );
-
-    frame_local_assistant_response(resp_json, &content, sse)
+    saw_synthetic && all_redrills
 }
 
 /// Frame a locally generated assistant message in the response shape the client
@@ -1862,10 +1894,16 @@ mod service_tests {
     }
 
     /// THE redrill regression: drilling the same namespace again on a later request
-    /// in the same session must be answered locally from session memory — no extra
-    /// provider follow-up turn, and the synthetic call must never reach the client.
+    /// in the same session must be resolved and resubmitted, exactly like a first
+    /// drill, so the model gets its (re-drill-flagged) answer and can keep working.
+    ///
+    /// This previously short-circuited into a gateway-authored assistant message
+    /// ("Session cache hit: …") with `finish_reason: "stop"` to save the provider
+    /// round trip. That saving does not exist — a tool call the gateway answers
+    /// still needs a model turn to act on the answer — and harnesses render the
+    /// synthetic message as the final reply and stop, ending the task mid-work.
     #[tokio::test]
-    async fn redrill_is_answered_locally_without_provider_followup() {
+    async fn redrill_is_resolved_and_resubmitted_not_answered_locally() {
         let config = test_config();
         let tc = config
             .try_read()
@@ -1883,6 +1921,9 @@ mod service_tests {
                     json_tool_call(resolver::GET_TOOLS_IN_NAMESPACE, r#"{"namespace":"fs"}"#),
                     "application/json",
                 ),
+                // The re-drill is resolved and resubmitted; this is the turn the
+                // model gets to actually continue on.
+                (json_text("continuing"), "application/json"),
             ]),
             calls: Arc::new(AtomicUsize::new(0)),
             seen_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1910,16 +1951,15 @@ mod service_tests {
         let mut svc1 = layer.layer(inner.clone());
         let _ = svc1.call(req()).await.unwrap();
 
-        // Request 2: model re-drills fs. The provider emits the synthetic call
-        // (inner call #3), but the middleware must answer it locally instead of
-        // making another provider round-trip (which would be call #4).
+        // Request 2: model re-drills fs (inner call #3). The middleware must resolve
+        // it and resubmit (call #4) rather than ending the turn locally.
         let mut svc2 = layer.layer(inner.clone());
         let resp = svc2.call(req()).await.unwrap();
         let body = body_string(resp).await;
 
         assert!(
-            body.contains("Session cache hit"),
-            "re-drill must be answered from session cache, got: {body}"
+            !body.contains("Session cache hit"),
+            "the gateway must not hand the client a synthetic assistant turn: {body}"
         );
         assert!(
             !body.contains(resolver::GET_TOOLS_IN_NAMESPACE),
@@ -1927,8 +1967,115 @@ mod service_tests {
         );
         assert_eq!(
             inner.calls.load(Ordering::SeqCst),
-            3,
-            "re-drill must not trigger a follow-up provider round-trip"
+            4,
+            "re-drill must be resolved and resubmitted so the model can continue"
+        );
+
+        // The resubmitted request carries the re-drill reminder as a tool result,
+        // which is the reminder the local short-circuit was trying to deliver.
+        let bodies = inner.seen_bodies.lock().unwrap().clone();
+        let last = bodies
+            .last()
+            .expect("a resubmitted body must exist")
+            .to_string();
+        assert!(
+            last.contains("Session cache"),
+            "resubmit must carry the re-drill reminder to the model"
+        );
+    }
+
+    /// Once the resolution budget is spent the middleware must withdraw the
+    /// discovery tools and take one final turn, not terminate with a
+    /// gateway-authored assistant message. The client's task has to be able to
+    /// continue.
+    #[tokio::test]
+    async fn exhausted_discovery_budget_withdraws_tools_and_takes_a_final_turn() {
+        let config = test_config();
+        let tc = config
+            .try_read()
+            .map(|c| c.tool_compression.clone())
+            .unwrap();
+        let state = Arc::new(ToolCompressionState::new(&tc));
+        // The model drills forever; the middleware must stop it and still end on a
+        // usable turn. Plenty of synthetic responses, then a real answer.
+        let drill = || {
+            (
+                json_tool_call(resolver::GET_TOOLS_IN_NAMESPACE, r#"{"namespace":"fs"}"#),
+                "application/json",
+            )
+        };
+        let inner = MockInner {
+            responses: Arc::new(vec![
+                drill(),
+                drill(),
+                drill(),
+                drill(),
+                drill(),
+                drill(),
+                drill(),
+                drill(),
+                (json_text("done"), "application/json"),
+            ]),
+            calls: Arc::new(AtomicUsize::new(0)),
+            seen_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let layer = ToolCompressionLayer::new(
+            Arc::clone(&config),
+            Arc::clone(&state),
+            Arc::new(Metrics::new()),
+            Arc::new(CompressionEventHub::new()),
+        );
+
+        let mut svc = layer.layer(inner.clone());
+        let resp = svc
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(HEADER_SESSION_ID, "sess-budget")
+                    .body(Body::from(
+                        serde_json::to_vec(&many_tools_body(false)).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_string(resp).await;
+
+        assert!(
+            !body.contains(resolver::GET_TOOLS_IN_NAMESPACE),
+            "synthetic call must never reach the client: {body}"
+        );
+        // The last outbound request must have had the discovery tools withdrawn, so
+        // the model physically cannot drill again on its final turn. Assert on the
+        // `tools` array specifically — the message history legitimately still
+        // mentions the synthetic name in the assistant's earlier tool_calls.
+        let bodies = inner.seen_bodies.lock().unwrap().clone();
+        let last = bodies.last().expect("a resubmitted body must exist").clone();
+        let offered: Vec<String> = last
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        t.pointer("/function/name")
+                            .and_then(|n| n.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !offered.iter().any(|name| name
+                == resolver::GET_TOOLS_IN_NAMESPACE
+                || name == resolver::GET_TOOL_SCHEMA
+                || name.starts_with(resolver::NS_PREFIX)),
+            "discovery tools must be withdrawn for the final turn, got: {offered:?}"
+        );
+        assert!(
+            !offered.is_empty(),
+            "the final turn must still offer real tools so the model can act"
         );
     }
 
