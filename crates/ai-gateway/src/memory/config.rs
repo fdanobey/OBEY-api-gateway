@@ -189,6 +189,16 @@ pub struct MemoryQdrantConfig {
     pub embedding_model: String,
     pub fts_weight: f32,
     pub vector_weight: f32,
+    /// Wall-clock ceiling for a single retrieval (embed + Qdrant search) on the
+    /// request-serving path. On timeout, retrieval falls back to the local FTS5
+    /// lexical results instead of blocking the request. Keeps a slow or
+    /// unreachable embedding provider from stalling routing. Range 1..=120s.
+    pub retrieval_timeout_seconds: u64,
+    /// Maximum number of characters of the concatenated conversation used to
+    /// build the retrieval embedding query. The query is truncated to the most
+    /// recent characters before embedding, so retrieval latency does not grow
+    /// unbounded with conversation length. `0` disables the cap.
+    pub retrieval_query_max_chars: usize,
     /// Manual override for the embedding vector dimension.
     /// When set, bypasses both the lookup table and the probe-on-first-store
     /// logic, using this value directly when creating or validating a Qdrant
@@ -206,6 +216,8 @@ impl Default for MemoryQdrantConfig {
             embedding_model: String::new(),
             fts_weight: 0.4,
             vector_weight: 0.6,
+            retrieval_timeout_seconds: 5,
+            retrieval_query_max_chars: 4096,
             vector_dimension: None,
         }
     }
@@ -267,6 +279,16 @@ impl MemoryQdrantConfig {
                     format!("has value {d}; expected a value in 1..=65536"),
                 ));
             }
+        }
+
+        if self.retrieval_timeout_seconds == 0 || self.retrieval_timeout_seconds > 120 {
+            errors.push(MemoryConfigError::new(
+                "qdrant.retrieval_timeout_seconds",
+                format!(
+                    "has value {}; expected a value in 1..=120",
+                    self.retrieval_timeout_seconds
+                ),
+            ));
         }
     }
 }
@@ -1012,6 +1034,8 @@ vector_weight: 0.6
         assert_eq!(defaults.embedding_model, "");
         assert!((defaults.fts_weight - 0.4).abs() < f32::EPSILON);
         assert!((defaults.vector_weight - 0.6).abs() < f32::EPSILON);
+        assert_eq!(defaults.retrieval_timeout_seconds, 5);
+        assert_eq!(defaults.retrieval_query_max_chars, 4096);
         assert_eq!(defaults.vector_dimension, None);
     }
 
@@ -1031,6 +1055,7 @@ vector_weight: 0.6
             fts_weight: 0.4,
             vector_weight: 0.6,
             vector_dimension: None,
+            ..MemoryQdrantConfig::default()
         };
         config.validate().unwrap();
     }

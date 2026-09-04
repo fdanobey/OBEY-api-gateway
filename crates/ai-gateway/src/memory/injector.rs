@@ -248,6 +248,7 @@ pub fn merge_retrieval_scores(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn retrieve_with_vector_fallback(
     store: &MemoryStore,
     tier: &dyn MemoryVectorTier,
@@ -256,11 +257,19 @@ pub async fn retrieve_with_vector_fallback(
     lexical: Vec<ScoredMemory>,
     fts_weight: f32,
     vector_weight: f32,
+    timeout: std::time::Duration,
 ) -> Vec<ScoredMemory> {
-    let matches = match tier.search(query, 50).await {
-        Ok(matches) => matches,
-        Err(error) => {
+    let matches = match tokio::time::timeout(timeout, tier.search(query, 50)).await {
+        Ok(Ok(matches)) => matches,
+        Ok(Err(error)) => {
             tracing::warn!(error = %error, "memory vector retrieval failed; using FTS5 results");
+            return lexical;
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis() as u64,
+                "memory vector retrieval timed out; using FTS5 results"
+            );
             return lexical;
         }
     };

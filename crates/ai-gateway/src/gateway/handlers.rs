@@ -744,7 +744,7 @@ async fn preprocess_memory_request(
     let model_group = state.router.find_model_group(&request.model).await.ok()?;
     let ordered = state.router.select_provider_order(&model_group).await;
     let provider_model = ordered.first().or_else(|| model_group.models.first())?;
-    let (effective, default_context_window) = {
+    let (effective, default_context_window, retrieval_query_max_chars) = {
         let config = state.config.read().await;
         let memory = config.memory.as_ref()?;
         let provider_override = config
@@ -755,6 +755,10 @@ async fn preprocess_memory_request(
         (
             memory.resolve(provider_override, model_group.memory.as_ref()),
             config.context.default_context_window,
+            memory
+                .qdrant
+                .as_ref()
+                .map_or(0, |qdrant| qdrant.retrieval_query_max_chars),
         )
     };
     if !effective.enabled {
@@ -762,13 +766,19 @@ async fn preprocess_memory_request(
     }
 
     let extraction_messages = extraction_messages(request);
-    let query = request
-        .messages
-        .iter()
-        .map(|message| message.content_as_text())
-        .filter(|content| !content.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let query = {
+        let full = request
+            .messages
+            .iter()
+            .map(|message| message.content_as_text())
+            .filter(|content| !content.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Cap the retrieval-embedding input so a growing conversation cannot
+        // make the embed call slower without bound. The tail is kept because
+        // the most recent turns are the most relevant retrieval context.
+        truncate_query_tail(full, retrieval_query_max_chars)
+    };
     let context_window = state
         .router
         .context_manager()
@@ -823,6 +833,17 @@ async fn preprocess_memory_request(
         injection: result.injection,
         extraction_messages,
     })
+}
+
+/// Truncate a retrieval query to at most `max_chars` characters, keeping the
+/// tail (most recent content). `max_chars == 0` disables the cap. Truncation
+/// respects char boundaries so the result is always valid UTF-8.
+fn truncate_query_tail(query: String, max_chars: usize) -> String {
+    if max_chars == 0 || query.chars().count() <= max_chars {
+        return query;
+    }
+    let skip = query.chars().count() - max_chars;
+    query.chars().skip(skip).collect()
 }
 
 fn extraction_messages(request: &OpenAIRequest) -> Vec<ExtractionMessage> {
@@ -916,6 +937,61 @@ async fn finalize_memory_response(
         )
     };
     (suffix, extraction)
+}
+
+/// Spawn memory extraction for the streaming path so it never blocks response
+/// delivery. Mirrors the work `finalize_memory_response` performs inline on the
+/// non-stream path — explicit (heuristic) extraction plus scheduling automatic
+/// (LLM) extraction — but runs entirely in a detached task after the response
+/// content is known. `response_content` is the assembled assistant text, which
+/// automatic extraction appends as the final turn before extracting.
+///
+/// The dashboard extraction event is still published from inside the task, so
+/// stored-memory activity remains observable even though the SSE feedback
+/// suffix (computed earlier from injection counts only) cannot reflect it.
+fn spawn_streaming_memory_extraction(
+    state: &AppState,
+    memory: &MemoryRequestContext,
+    response_content: String,
+    request_id: Option<uuid::Uuid>,
+) {
+    let system = memory.system.clone();
+    let extraction_messages = memory.extraction_messages.clone();
+    let namespace = memory.namespace.clone();
+    let memory_events = state.memory_events.clone();
+    tokio::spawn(async move {
+        match system
+            .extract_explicit_response(&extraction_messages, &namespace, request_id)
+            .await
+        {
+            Ok(extraction) => {
+                if extraction.stored > 0 {
+                    memory_events.publish(crate::dashboard::MemoryDashboardEvent::new(
+                        crate::dashboard::MemoryEventType::Extraction,
+                        namespace
+                            .context_scope
+                            .as_deref()
+                            .unwrap_or(&namespace.user_scope),
+                        extraction.stored,
+                    ));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "Streaming memory explicit extraction failed");
+            }
+        }
+        // Schedule automatic (LLM) extraction using the assembled response as
+        // the final assistant turn. `schedule_automatic_extraction` spawns its
+        // own bounded task; awaiting it here only queues the work.
+        let _automatic = system
+            .schedule_automatic_extraction(
+                &extraction_messages,
+                &response_content,
+                &namespace,
+                request_id,
+            )
+            .await;
+    });
 }
 
 fn memory_feedback_chunk(request: &OpenAIRequest, suffix: &str) -> serde_json::Value {
@@ -2058,35 +2134,29 @@ async fn chat_completions_stream(
     let memory_context =
         preprocess_memory_request(&state, &mut request, virtual_key_id.as_deref()).await;
 
-    let memory_extraction = if let Some(memory) = memory_context.as_ref() {
-        match memory
-            .system
-            .extract_explicit_response(
-                &memory.extraction_messages,
-                &memory.namespace,
-                uuid::Uuid::parse_str(&trace_id).ok(),
-            )
-            .await
-        {
-            Ok(extraction) => Some(extraction),
-            Err(error) => {
-                tracing::warn!(error = %error, "Streaming memory explicit extraction failed");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Memory extraction is deliberately kept OFF the pre-routing critical path.
+    // The previous implementation awaited `extract_explicit_response` here,
+    // before the request was even routed, so a slow memory store stalled the
+    // request while the dashboard showed it as `pending`. Extraction (explicit
+    // + automatic) is now spawned after the response is assembled, via
+    // `spawn_streaming_memory_extraction`, mirroring the non-stream
+    // `finalize_memory_response` ordering but without blocking delivery. The
+    // feedback suffix below is derived from injection counts only — the
+    // extraction-derived stored/rejected counts are surfaced through logs and
+    // dashboard events from the spawned task instead of being awaited inline.
     let memory_suffix = memory_context.as_ref().and_then(|memory| {
         if !memory.effective.show_feedback || requests_structured_output(&request) {
             return None;
         }
-        let extraction = memory_extraction.unwrap_or_default();
         let is_thread_start = request.messages.iter().filter(|m| m.role == "user").count() <= 1;
+        // Extraction runs asynchronously now, so the inline suffix reflects
+        // injection only. `stored`/`sensitive_rejected` are reported 0 here;
+        // per `format_feedback_suffix` this yields an injection-only feedback
+        // line at thread start and no mid-conversation noise otherwise.
         format_feedback_suffix(
             memory.injection.memories_injected,
-            extraction.stored,
-            extraction.sensitive_rejected,
+            0,
+            0,
             is_thread_start,
         )
     });
@@ -2309,6 +2379,23 @@ async fn chat_completions_stream(
                             let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
                             log_request(&state, &request, &log_context);
 
+                            // Non-blocking memory extraction now that the full
+                            // response content is known (parity with the
+                            // non-stream path, spawned so it never delays SSE).
+                            if let Some(memory) = memory_context.as_ref() {
+                                let response_content = response
+                                    .choices
+                                    .first()
+                                    .map(|choice| choice.message.content_as_text())
+                                    .unwrap_or_default();
+                                spawn_streaming_memory_extraction(
+                                    &state,
+                                    memory,
+                                    response_content,
+                                    uuid::Uuid::parse_str(&stream_trace_id).ok(),
+                                );
+                            }
+
                             // Req 1.5: continue emitting content chunks after the early
                             // event, reusing its id/created and skipping the duplicate
                             // role delta (task 2.2).
@@ -2444,6 +2531,15 @@ async fn chat_completions_stream(
                                 } else {
                                     None
                                 };
+                                let relay_memory_extraction = memory_context.as_ref().map(|memory| {
+                                    RelayMemoryExtraction {
+                                        system: memory.system.clone(),
+                                        extraction_messages: memory.extraction_messages.clone(),
+                                        namespace: memory.namespace.clone(),
+                                        memory_events: state.memory_events.clone(),
+                                        request_id: uuid::Uuid::parse_str(&stream_trace_id).ok(),
+                                    }
+                                });
                                 let relay = relay_passthrough_stream(
                                     current_stream,
                                     streaming_config_relay.clone(),
@@ -2455,6 +2551,7 @@ async fn chat_completions_stream(
                                     outcome.clone(),
                                     xml_detect,
                                     memory_suffix.clone(),
+                                    relay_memory_extraction,
                                 );
                                 // The relay emits its own terminal `[DONE]` (or a graceful
                                 // error event that appends one, or — on pre-content
@@ -2588,6 +2685,19 @@ async fn chat_completions_stream(
                                                 let duration_ms = start.elapsed().as_millis() as u64;
                                                 let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
                                                 log_request(&state, &request, &log_context);
+                                                if let Some(memory) = memory_context.as_ref() {
+                                                    let response_content = response
+                                                        .choices
+                                                        .first()
+                                                        .map(|choice| choice.message.content_as_text())
+                                                        .unwrap_or_default();
+                                                    spawn_streaming_memory_extraction(
+                                                        &state,
+                                                        memory,
+                                                        response_content,
+                                                        uuid::Uuid::parse_str(&stream_trace_id).ok(),
+                                                    );
+                                                }
                                                 for chunk in streaming_chunks_after_early_event(&response, &response_id, created) {
                                                     yield Ok(Event::default().data(chunk.to_string()));
                                                 }
@@ -2695,6 +2805,21 @@ async fn chat_completions_stream(
     let log_context =
         RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
     log_request(&state, &request, &log_context);
+
+    // Non-blocking memory extraction now that the full response is known.
+    if let Some(memory) = memory_context.as_ref() {
+        let response_content = response
+            .choices
+            .first()
+            .map(|choice| choice.message.content_as_text())
+            .unwrap_or_default();
+        spawn_streaming_memory_extraction(
+            &state,
+            memory,
+            response_content,
+            uuid::Uuid::parse_str(&trace_id).ok(),
+        );
+    }
 
     // Success — convert the complete response into SSE chunk format for the client.
     //
@@ -4254,6 +4379,63 @@ struct XmlToolDetect {
     model: String,
 }
 
+/// Everything the pass-through relay needs to fire non-blocking memory
+/// extraction once it has reassembled the streamed response. Cloned from the
+/// request's `MemoryRequestContext` before the relay starts, so the relay never
+/// touches `AppState` or the pre-routing memory path.
+struct RelayMemoryExtraction {
+    system: Arc<crate::memory::MemorySystem>,
+    extraction_messages: Vec<ExtractionMessage>,
+    namespace: ResolvedNamespace,
+    memory_events: Arc<crate::dashboard::MemoryEventHub>,
+    request_id: Option<uuid::Uuid>,
+}
+
+impl RelayMemoryExtraction {
+    /// Spawn explicit + automatic extraction against the reassembled response
+    /// content. Mirrors `spawn_streaming_memory_extraction` but is self-owned so
+    /// the relay does not depend on `AppState`.
+    fn spawn(self, response_content: String) {
+        let RelayMemoryExtraction {
+            system,
+            extraction_messages,
+            namespace,
+            memory_events,
+            request_id,
+        } = self;
+        tokio::spawn(async move {
+            match system
+                .extract_explicit_response(&extraction_messages, &namespace, request_id)
+                .await
+            {
+                Ok(extraction) => {
+                    if extraction.stored > 0 {
+                        memory_events.publish(crate::dashboard::MemoryDashboardEvent::new(
+                            crate::dashboard::MemoryEventType::Extraction,
+                            namespace
+                                .context_scope
+                                .as_deref()
+                                .unwrap_or(&namespace.user_scope),
+                            extraction.stored,
+                        ));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "Streaming memory explicit extraction failed");
+                }
+            }
+            let _automatic = system
+                .schedule_automatic_extraction(
+                    &extraction_messages,
+                    &response_content,
+                    &namespace,
+                    request_id,
+                )
+                .await;
+        });
+    }
+}
+
 fn relay_passthrough_stream(
     upstream: reqwest::Response,
     streaming_config: StreamingConfig,
@@ -4265,8 +4447,11 @@ fn relay_passthrough_stream(
     outcome: Arc<tokio::sync::Mutex<RelayOutcome>>,
     xml_detect: Option<XmlToolDetect>,
     memory_suffix: Option<String>,
+    memory_extraction: Option<RelayMemoryExtraction>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
+    // Rebound mutable so the single reassembly point can `.take()` it.
+    let mut memory_extraction = memory_extraction;
     let chunk_timeout = Duration::from_secs(streaming_config.chunk_timeout_seconds);
     let deadline = tokio::time::Instant::now() + total_timeout;
     let (
@@ -4568,6 +4753,17 @@ fn relay_passthrough_stream(
                                total_tokens = assembled.usage.total_tokens,
                                "Streaming pass-through completed; recorded usage"
                            );
+                           // Non-blocking memory extraction on the reassembled
+                           // pass-through response (parity with the buffered and
+                           // non-stream paths). Runs at most once per relay.
+                           if let Some(extraction) = memory_extraction.take() {
+                               let response_content = assembled
+                                   .choices
+                                   .first()
+                                   .map(|choice| choice.message.content_as_text())
+                                   .unwrap_or_default();
+                               extraction.spawn(response_content);
+                           }
                            // Req 3.10: cache only responses safe to replay (gate
                            // identical to the buffer-and-replay path).
                            if crate::router::router::Router::should_cache_response(&assembled) {
@@ -6279,6 +6475,7 @@ mod tests {
             mk_outcome(),
             None,
             None,
+            None,
         );
         let events: Vec<_> = stream.collect().await;
         // 2 forwarded chunks + 1 terminal [DONE]. Malformed + upstream [DONE] dropped.
@@ -6303,6 +6500,7 @@ mod tests {
             metrics,
             request,
             mk_outcome(),
+            None,
             None,
             None,
         );
@@ -6330,6 +6528,7 @@ mod tests {
             metrics,
             request.clone(),
             mk_outcome(),
+            None,
             None,
             None,
         );
@@ -6363,6 +6562,7 @@ mod tests {
             metrics,
             request.clone(),
             mk_outcome(),
+            None,
             None,
             None,
         );
@@ -6432,6 +6632,7 @@ mod tests {
             mk_outcome(),
             None,
             None,
+            None,
         );
 
         let text = relay_to_sse_text(stream).await;
@@ -6474,6 +6675,7 @@ mod tests {
             metrics,
             request,
             mk_outcome(),
+            None,
             None,
             None,
         );
@@ -6606,6 +6808,7 @@ mod tests {
             outcome.clone(),
             None,
             None,
+            None,
         );
         let events: Vec<_> = stream.collect().await;
         assert!(
@@ -6637,6 +6840,7 @@ mod tests {
             metrics,
             request,
             outcome.clone(),
+            None,
             None,
             None,
         );

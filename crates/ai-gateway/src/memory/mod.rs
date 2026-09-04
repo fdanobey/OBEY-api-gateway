@@ -515,6 +515,7 @@ impl MemorySystem {
                     lexical,
                     qdrant.fts_weight,
                     qdrant.vector_weight,
+                    std::time::Duration::from_secs(qdrant.retrieval_timeout_seconds),
                 )
                 .await
             } else {
@@ -1067,6 +1068,7 @@ mod tests {
             lexical.clone(),
             0.4,
             0.6,
+            std::time::Duration::from_secs(5),
         )
         .await;
         assert_eq!(returned, lexical);
