@@ -20,8 +20,9 @@ use crate::memory::{
 };
 use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
 use crate::providers::bedrock::{
-    apply_global_inference_prefix, apply_global_inference_profile, model_supports_reasoning,
-    normalize_mantle_chat_messages, sanitize_mantle_chat_request, BedrockProvider,
+    apply_global_inference_prefix, apply_global_inference_profile,
+    is_duplicate_compaction_trigger_error, model_supports_reasoning, normalize_mantle_chat_messages,
+    normalize_mantle_compaction_triggers, sanitize_mantle_chat_request, BedrockProvider,
 };
 use crate::providers::{ProviderClient, ProviderResponse};
 use crate::reasoning_compat::{self, AttemptReport};
@@ -2850,6 +2851,13 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
         // absent capabilities cache), strip the image parts and retry the
         // same provider once — mirroring the standard buffered retry loop.
         let mut image_strip_retry_done = false;
+        // One-shot backstop for the Bedrock Mantle single-trigger invariant: the
+        // `normalize_mantle_compaction_triggers` seam already de-dupes on every
+        // Mantle dispatch, but if a future client shape evades the seam and the
+        // provider rejects with "only one 'compaction_trigger' ...", re-run the
+        // seam and retry the same provider once. Guarded so it fires at most once
+        // and only for this specific rejection (clause 3.9).
+        let mut duplicate_trigger_retry_done = false;
         loop {
             match client.chat_completion(request.clone()).await {
                 Ok(response) => return Ok(response),
@@ -2878,6 +2886,36 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
                         );
                         continue;
                     }
+                    return Err(GatewayError::Provider {
+                        provider,
+                        message,
+                        status_code: Some(status_code),
+                    });
+                }
+                Err(GatewayError::Provider {
+                    provider,
+                    message,
+                    status_code: Some(status_code),
+                }) if !duplicate_trigger_retry_done
+                    && is_duplicate_compaction_trigger_error(status_code, &message) =>
+                {
+                    // Backstop for the Bedrock Mantle single-trigger invariant.
+                    // Re-run the shape-complete de-dup seam; retry the same
+                    // provider once only if it actually removed a trigger.
+                    let normalization = normalize_mantle_compaction_triggers(&mut request);
+                    if normalization.removed > 0 {
+                        duplicate_trigger_retry_done = true;
+                        info!(
+                            provider = %provider,
+                            model = %request.model,
+                            status = status_code,
+                            triggers_removed = normalization.removed,
+                            "Provider rejected duplicate compaction_trigger — normalized and retrying same provider"
+                        );
+                        continue;
+                    }
+                    // Nothing to repair: surface the original error unchanged so
+                    // outer failover behaves exactly as today (clause 3.9).
                     return Err(GatewayError::Provider {
                         provider,
                         message,
@@ -7268,7 +7306,6 @@ visible content. Do not restate your plan and do not end your turn without doing
     ///
     /// Requirements: 3.8
     // Wired into the streaming pass-through path by task 5.2.
-    #[allow(dead_code)]
     fn provider_needs_transformation(&self, provider: &Provider, _request: &OpenAIRequest) -> bool {
         // Bedrock requires format translation — cannot pass-through stream.
         if provider.provider_type == "bedrock" {
@@ -7808,6 +7845,16 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
         // (Bedrock / XML-tool rewrite / Kimi-Nano) likewise must buffer.
         let is_codex = provider_cfg.auth_method.as_deref() == Some("oauth")
             && provider_cfg.provider_type == "openai";
+        // INVARIANT: a Bedrock request must never be dispatched from the
+        // pass-through path. That path posts to `{base_url}/chat/completions`
+        // unconditionally and would send a `MantleApi::Responses` model to the
+        // wrong endpoint. Bedrock's own dispatch seam (dispatch_mantle /
+        // dispatch_mantle_stream) selects the endpoint per model and de-dupes
+        // compaction triggers, so Bedrock streams must always go through the
+        // buffered route (which calls `route_request` -> the Bedrock provider).
+        // This is enforced structurally by the `|| is_bedrock` gate below, not
+        // left to `provider_needs_transformation` returning true incidentally.
+        let is_bedrock = provider_cfg.provider_type == "bedrock";
         // A provider/model combo previously observed emitting XML-style tool
         // calls takes the buffer-and-translate path when the request carries
         // `tools`, so the XML can be rewritten into native `tool_calls`. Unknown
@@ -7823,6 +7870,7 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
         let known_degenerate_combo = tools_present
             && self.is_degenerate_stream_combo(&provider_model.provider, &provider_model.model);
         if is_codex
+            || is_bedrock
             || self.provider_needs_transformation(&provider_cfg, &prepared_request)
             || known_xml_combo
             || known_degenerate_combo
@@ -7838,8 +7886,6 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
         let api_key = provider_cfg.resolve_api_key().unwrap_or_default();
         let is_oauth_provider = provider_cfg.auth_method.as_deref() == Some("oauth");
         let provider_type = provider_cfg.provider_type.clone();
-        let custom_vpc_endpoint = provider_cfg.custom_vpc_endpoint;
-        let provider_region = provider_cfg.region.clone();
         let configured_base_url = provider_cfg.base_url.clone();
         let custom_headers = provider_cfg.custom_headers.clone();
         let pool_config = provider_cfg.connection_pool.clone();
@@ -7885,15 +7931,10 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
             ));
         }
 
-        // Base URL normalization — strip trailing '/', ensure '/v1'; Bedrock
-        // Mantle special-case kept for parity (Bedrock never reaches here).
-        let mut base_url =
-            if provider_type == "bedrock" && !api_key.is_empty() && !custom_vpc_endpoint {
-                let region = provider_region.as_deref().unwrap_or("us-east-1");
-                format!("https://bedrock-mantle.{}.api.aws/v1", region)
-} else {
-    configured_base_url.as_deref().unwrap_or_default().to_string()
-};
+        // Base URL normalization — strip trailing '/', ensure '/v1'. Bedrock
+        // never reaches this pass-through path (it takes the buffered gate
+        // above via `|| is_bedrock`), so no Mantle special-case is needed here.
+        let mut base_url = configured_base_url.as_deref().unwrap_or_default().to_string();
         base_url = base_url.trim_end_matches('/').to_string();
         if !base_url.ends_with("/v1") {
             base_url.push_str("/v1");
@@ -9237,6 +9278,199 @@ async fn buffered_adapter_image_error_strips_and_retries() {
     assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
+// ── Backstop: duplicate-compaction-trigger repair-and-retry (task 7.2) ──
+//
+// Mirrors the image-strip client pattern: a test ProviderClient that counts
+// calls, rejects the first attempt with the observed Bedrock Mantle 400 body,
+// and succeeds on the retry. Determinism comes from driving
+// `dispatch_buffered_with_context_retry` directly rather than fighting the
+// dispatch seam, which already de-dupes before the provider is reached.
+
+/// Count compaction-trigger sites in a chat request's message content arrays.
+/// Sufficient for these tests, whose duplicates live as content parts.
+fn count_trigger_content_parts(request: &OpenAIRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .filter_map(|msg| msg.content.as_array())
+        .flatten()
+        .filter(|part| {
+            part.get("type").and_then(|v| v.as_str()) == Some("compaction_trigger")
+        })
+        .count()
+}
+
+struct DuplicateTriggerThenSuccessClient {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ProviderClient for DuplicateTriggerThenSuccessClient {
+    async fn chat_completion(
+        &self,
+        request: OpenAIRequest,
+    ) -> Result<ProviderResponse, GatewayError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 {
+            assert!(
+                count_trigger_content_parts(&request) > 1,
+                "first call should carry more than one compaction_trigger"
+            );
+            return Err(GatewayError::Provider {
+                provider: "adapter".to_string(),
+                message: "Only one 'compaction_trigger' item may be provided.".to_string(),
+                status_code: Some(400),
+            });
+        }
+        assert_eq!(
+            count_trigger_content_parts(&request),
+            1,
+            "retry must carry exactly one compaction_trigger"
+        );
+        Ok(ProviderResponse {
+            response: serde_json::from_value(completion_response())
+                .expect("fixture should deserialize"),
+            provider_name: "adapter".to_string(),
+            latency_ms: 1,
+        })
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        _request: OpenAIRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        unreachable!()
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
+        Ok(Vec::new())
+    }
+
+    fn provider_name(&self) -> &str {
+        "adapter"
+    }
+}
+
+#[tokio::test]
+async fn buffered_adapter_duplicate_trigger_normalizes_and_retries() {
+    let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+    let client = DuplicateTriggerThenSuccessClient {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let mut request = compression_request(false);
+    request.model = "adapter-model".to_string();
+    // Two compaction-trigger content parts across two messages: the seam
+    // re-run inside the retry arm keeps the last and removes the first.
+    request.messages = vec![
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{"type": "compaction_trigger"}]),
+            extra: Default::default(),
+        },
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{"type": "compaction_trigger"}]),
+            extra: Default::default(),
+        },
+    ];
+
+    let response = router
+        .dispatch_buffered_with_context_retry(&client, request)
+        .await
+        .expect("shared wrapper should normalize triggers and retry");
+    assert_eq!(response.provider_name, "adapter");
+    // Exactly two upstream calls: the rejected first and the repaired retry.
+    assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+struct UnrelatedRejectClient {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ProviderClient for UnrelatedRejectClient {
+    async fn chat_completion(
+        &self,
+        _request: OpenAIRequest,
+    ) -> Result<ProviderResponse, GatewayError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(GatewayError::Provider {
+            provider: "adapter".to_string(),
+            message: "invalid request".to_string(),
+            status_code: Some(400),
+        })
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        _request: OpenAIRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        unreachable!()
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
+        Ok(Vec::new())
+    }
+
+    fn provider_name(&self) -> &str {
+        "adapter"
+    }
+}
+
+#[tokio::test]
+async fn buffered_adapter_unrelated_400_surfaces_without_extra_attempt() {
+    let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+    let client = UnrelatedRejectClient {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let mut request = compression_request(false);
+    request.model = "adapter-model".to_string();
+    // Even with duplicate triggers present, an unrelated 400 must not trip the
+    // duplicate-trigger arm — the guard requires the specific rejection phrase.
+    request.messages = vec![
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{"type": "compaction_trigger"}]),
+            extra: Default::default(),
+        },
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{"type": "compaction_trigger"}]),
+            extra: Default::default(),
+        },
+    ];
+
+    let error = router
+        .dispatch_buffered_with_context_retry(&client, request)
+        .await
+        .expect_err("unrelated 400 should surface, not be repaired");
+    match error {
+        GatewayError::Provider {
+            status_code: Some(400),
+            ..
+        } => {}
+        other => panic!("expected provider 400 to surface, got {other:?}"),
+    }
+    // Exactly one upstream call: no repair retry for an unrelated failure.
+    assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
     #[test]
     fn reasoning_only_response_is_promoted_to_content() {
         let mut response = OpenAIResponse {
@@ -10489,6 +10723,124 @@ reasoning_parameter: None,
             .map(str::trim)
             .collect::<Vec<_>>();
         assert_eq!(accept_encoding, vec!["identity"]);
+    }
+
+    // ------------------------------------------------------------------
+    // Task 9 preservation — non-Bedrock pass-through keeps every trigger
+    // (clause 3.3). On the live path a trigger-bearing request to an
+    // `openai`/`openai_compatible` provider never touches the Bedrock seam
+    // (`normalize_mantle_compaction_triggers` is only reached from the Bedrock
+    // dispatch). The provider-specific sanitizer is the only outgoing transform,
+    // and its `openai` arm is a no-op, so both triggers must survive.
+    // ------------------------------------------------------------------
+    #[test]
+    fn openai_sanitize_preserves_all_compaction_triggers() {
+        let mut outgoing = OpenAIRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{"type": "compaction_trigger"}]),
+                    extra: Default::default(),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "hi"},
+                        {"type": "compaction_trigger"}
+                    ]),
+                    extra: Default::default(),
+                },
+            ],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+        let before = serde_json::to_value(&outgoing).unwrap();
+
+        // The `openai` arm removes no fields and touches no triggers.
+        let removed = Router::sanitize_request_for_provider(&mut outgoing, "openai");
+        assert_eq!(removed, 0, "openai sanitize must remove nothing");
+
+        // Count triggers across content parts — both must survive intact.
+        let trigger_count: usize = outgoing
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_array())
+            .flatten()
+            .filter(|p| {
+                p.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
+            })
+            .count();
+        assert_eq!(trigger_count, 2, "both compaction triggers must pass through untouched");
+        assert_eq!(
+            serde_json::to_value(&outgoing).unwrap(),
+            before,
+            "openai pass-through must leave the request byte-identical"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Task 9 preservation — streaming transport decision for Bedrock
+    // (clause 3.6). A streaming request to a `bedrock` provider must take the
+    // buffered gate (task 8's structural `is_bedrock` early return), so it can
+    // NEVER resolve to a `PassThrough` relay. The companion non-Bedrock case
+    // (returns `PassThrough`) is `streaming_provider_receives_compressed_body_before_response`.
+    //
+    // The Bedrock buffered route dispatches through the real provider (the
+    // Mantle base URL is derived from the region, not the config, so it cannot
+    // be redirected to wiremock). The route therefore errors on the network,
+    // which `route_request_streaming` surfaces as `Err` — but the decisive fact
+    // is that the outcome is never `Ok(PassThrough { .. })`. That distinguishes
+    // the buffered gate from the pass-through path structurally.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn bedrock_streaming_request_takes_buffered_path() {
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        let mut provider = test_provider("bedrock-provider", "https://unused.example".to_string());
+        provider.provider_type = "bedrock".to_string();
+        provider.region = Some("us-east-1".to_string());
+        // A short total timeout bounds the buffered network attempt.
+        provider.total_timeout_seconds = Some(2);
+        provider.ttfb_timeout_seconds = Some(2);
+        config.providers = vec![provider];
+        config.model_groups = vec![test_group(vec![test_model_named(
+            "bedrock-provider",
+            "openai.gpt-oss-120b",
+            1,
+        )])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let request = OpenAIRequest {
+            model: "test-group".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+                extra: Default::default(),
+            }],
+            stream: true,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+
+        let outcome = router.route_request_streaming(&request, None).await;
+        // The buffered gate fired: the result is either a Buffered response (if
+        // the upstream somehow answered) or an Err from the buffered route — but
+        // NEVER a pass-through relay.
+        match outcome {
+            Ok(StreamingResponse::Buffered(_)) => {}
+            Ok(StreamingResponse::PassThrough { .. }) => {
+                panic!("Bedrock streaming must not use the pass-through relay")
+            }
+            Err(_) => {
+                // Buffered route attempted and failed on the network — the
+                // buffered gate was still taken (a pass-through would have
+                // returned Ok(PassThrough) before any buffered dispatch).
+            }
+        }
     }
 
     #[tokio::test]
