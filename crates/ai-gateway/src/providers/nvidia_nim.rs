@@ -19,31 +19,31 @@ pub struct NimFallbackModel {
 }
 
 // BEGIN NVIDIA NIM FALLBACK MODELS
-/// Probe provenance: catalog=https://integrate.api.nvidia.com/v1/models; probed=2026-07-19T00:00:00Z; git_rev=manual
+/// Probe provenance: catalog=https://integrate.api.nvidia.com/v1/models; probed=2026-09-07T12:44:22.0292924Z; git_rev=82f2c3d
 pub const NVIDIA_NIM_FALLBACK_MODELS: &[NimFallbackModel] = &[
     NimFallbackModel {
         id: "openai/gpt-oss-120b",
         owned_by: "openai",
         supports_vision: false,
-        context_window: Some(128_000),
+        context_window: Some(128000),
         max_completion_tokens: None,
         source_url: "https://build.nvidia.com/openai/gpt-oss-120b",
     },
     NimFallbackModel {
-        id: "meta/llama-3.1-70b-instruct",
-        owned_by: "meta",
-        supports_vision: false,
+        id: "moonshotai/kimi-k3",
+        owned_by: "moonshotai",
+        supports_vision: true,
         context_window: None,
         max_completion_tokens: None,
-        source_url: "https://build.nvidia.com/meta/llama-3.1-70b-instruct",
+        source_url: "https://build.nvidia.com/moonshotai/kimi-k3",
     },
     NimFallbackModel {
-        id: "nvidia/nemotron-3-nano",
-        owned_by: "nvidia",
+        id: "deepseek-ai/deepseek-v4-pro-0813",
+        owned_by: "deepseek-ai",
         supports_vision: false,
         context_window: None,
         max_completion_tokens: None,
-        source_url: "https://build.nvidia.com/nvidia/nemotron-3-nano",
+        source_url: "https://build.nvidia.com/deepseek-ai/deepseek-v4-pro-0813",
     },
 ];
 // END NVIDIA NIM FALLBACK MODELS
