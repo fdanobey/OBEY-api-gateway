@@ -1,4 +1,4 @@
-﻿//! Integration tests for the reasoning-state failover compatibility
+//! Integration tests for the reasoning-state failover compatibility
 //! feature (spec: reasoning-failover-compat, design "Integration Testing").
 //!
 //! Exercises the full gateway HTTP surface via `tower::ServiceExt::oneshot()`
@@ -110,6 +110,7 @@ fn provider(name: &str, uri: &str) -> Provider {
         max_connections: 10,
         rate_limit_per_minute: 0,
         custom_headers: Default::default(),
+        user_agent: None,
         connection_pool: ProviderConnectionPoolConfig::default(),
         budget: None,
         manual_models: vec![],

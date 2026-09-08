@@ -53,13 +53,21 @@ tls:
   key_path: "./key.pem"
 
 providers:
-  - name: "openai"
-    type: "openai"
-    base_url: "https://api.openai.com/v1"
-    api_key_env: "OPENAI_API_KEY"
-    timeout_seconds: 30
-    max_connections: 100
-    rate_limit_per_minute: 60
+- name: "openai"
+  type: "openai"
+  base_url: "https://api.openai.com/v1"
+  api_key_env: "OPENAI_API_KEY"
+  timeout_seconds: 30
+  max_connections: 100
+  rate_limit_per_minute: 60
+  # Optional: headers sent with every request to this provider.
+  # Values support ${ENV_VAR} substitution.
+  custom_headers:
+    X-Custom-Header: "static-value"
+    X-API-Token: "${MY_PROVIDER_TOKEN}"
+  # Optional: User-Agent string for this provider's requests
+  # (supports ${ENV_VAR}; ignored if custom_headers defines User-Agent)
+  user_agent: "my-app/1.0"
 
   - name: "ollama"
     type: "ollama"

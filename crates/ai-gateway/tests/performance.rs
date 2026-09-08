@@ -214,6 +214,7 @@ impl ProviderSelectionFixture {
                 max_connections: 10,
                 rate_limit_per_minute: 0,
                 custom_headers: Default::default(),
+                user_agent: None,
                 connection_pool: ProviderConnectionPoolConfig::default(),
                 budget: None,
                 manual_models: vec![],
@@ -677,6 +678,7 @@ fn test_config() -> Config {
             max_connections: 10,
             rate_limit_per_minute: 0,
             custom_headers: Default::default(),
+            user_agent: None,
             connection_pool: ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
@@ -1384,6 +1386,7 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
             max_connections: 10,
             rate_limit_per_minute: 0,
             custom_headers: Default::default(),
+            user_agent: None,
             connection_pool: ProviderConnectionPoolConfig::default(),
             budget: (i % 2 == 0).then(|| ProviderBudgetConfig {
                 limit_usd: 10.0,

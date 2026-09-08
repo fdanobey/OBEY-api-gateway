@@ -22,7 +22,6 @@ pub use validation::{
 
 /// Pre-compiled regex for environment variable substitution
 /// Compiled once at startup using LazyLock for thread-safe lazy initialization
-#[allow(dead_code)]
 static ENV_VAR_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"\$\{([A-Z_][A-Z0-9_]*)\}")
         .expect("Invalid regex pattern for environment variable substitution")
@@ -30,7 +29,6 @@ static ENV_VAR_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
 
 /// Resolve environment variable references in a string
 /// Supports ${ENV_VAR} syntax
-#[allow(dead_code)]
 fn resolve_env_var_in_string(value: &str) -> String {
     let mut result = value.to_string();
 
@@ -431,6 +429,11 @@ pub struct Provider {
     pub rate_limit_per_minute: u32,
     #[serde(default)]
     pub custom_headers: HashMap<String, String>,
+    /// Optional User-Agent string sent with every request to this provider.
+    /// Supports `${ENV_VAR}` substitution. Ignored when `custom_headers`
+    /// already defines a `User-Agent` header (case-insensitive).
+    #[serde(default)]
+    pub user_agent: Option<String>,
     #[serde(default)]
     pub connection_pool: ProviderConnectionPoolConfig,
     #[serde(default)]
@@ -612,7 +615,6 @@ impl Provider {
 
     /// Resolve custom headers with environment variable substitution
     /// Supports ${ENV_VAR} syntax in header values
-    #[allow(dead_code)]
     pub fn resolve_custom_headers(&self) -> HashMap<String, String> {
         self.custom_headers
             .iter()
@@ -621,6 +623,31 @@ impl Provider {
                 (key.clone(), resolved_value)
             })
             .collect()
+    }
+
+    /// Resolve the configured User-Agent with `${ENV_VAR}` substitution.
+    /// Returns None when unset or set to an empty string.
+    pub fn resolve_user_agent(&self) -> Option<String> {
+        self.user_agent
+            .as_deref()
+            .map(resolve_env_var_in_string)
+            .filter(|ua| !ua.is_empty())
+    }
+
+    /// Effective outgoing headers for this provider: custom headers with
+    /// env-var substitution, plus the configured `user_agent` injected as
+    /// `User-Agent` unless a custom header already defines one.
+    pub fn effective_custom_headers(&self) -> HashMap<String, String> {
+        let mut headers = self.resolve_custom_headers();
+        if let Some(user_agent) = self.resolve_user_agent() {
+            let has_user_agent = headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("user-agent"));
+            if !has_user_agent {
+                headers.insert("User-Agent".to_string(), user_agent);
+            }
+        }
+        headers
     }
 }
 
@@ -1628,6 +1655,7 @@ mod runtime_resolution_tests {
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
+            user_agent: None,
             connection_pool: ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
@@ -1669,6 +1697,7 @@ mod runtime_resolution_tests {
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
+            user_agent: None,
             connection_pool: ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
@@ -1714,6 +1743,7 @@ mod runtime_resolution_tests {
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: headers,
+            user_agent: None,
             connection_pool: ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
@@ -1730,12 +1760,80 @@ mod runtime_resolution_tests {
             max_rate_limit_cooldown_seconds: None,
         };
 
-        let resolved = provider.resolve_custom_headers();
-        assert_eq!(resolved.get("X-API-Key"), Some(&"token123".to_string()));
-        assert_eq!(resolved.get("X-Static"), Some(&"static-value".to_string()));
+    let resolved = provider.resolve_custom_headers();
+    assert_eq!(resolved.get("X-API-Key"), Some(&"token123".to_string()));
+    assert_eq!(resolved.get("X-Static"), Some(&"static-value".to_string()));
 
-        env::remove_var("CUSTOM_TOKEN");
-    }
+    env::remove_var("CUSTOM_TOKEN");
+}
+
+#[test]
+fn test_provider_effective_custom_headers_user_agent() {
+    env::set_var("TEST_UA_TOKEN", "ua-token");
+
+    let mut provider = Provider {
+        name: "test".to_string(),
+        provider_type: "openai".to_string(),
+        base_url: None,
+        api_key_env: None,
+        api_key_encrypted: None,
+        api_secret_env: None,
+        api_secret_encrypted: None,
+        auth_method: None,
+        resolved_api_key: None,
+        resolved_api_secret: None,
+        region: None,
+        timeout_seconds: 30,
+        ttfb_timeout_seconds: None,
+        total_timeout_seconds: None,
+        max_connections: 100,
+        rate_limit_per_minute: 0,
+        custom_headers: HashMap::new(),
+        user_agent: Some("my-app/1.0 (${TEST_UA_TOKEN})".to_string()),
+        connection_pool: ProviderConnectionPoolConfig::default(),
+        budget: None,
+        manual_models: vec![],
+        global_inference_profile: false,
+        cross_region_inference: false,
+        custom_vpc_endpoint: false,
+        prompt_caching: false,
+        compression: None,
+        memory: None,
+        reasoning: true,
+        codex_base_url_override: None,
+        codex_model_override: None,
+        instructions_override: None,
+        max_rate_limit_cooldown_seconds: None,
+    };
+
+    // Env substitution applies to the user agent.
+    assert_eq!(
+        provider.resolve_user_agent(),
+        Some("my-app/1.0 (ua-token)".to_string())
+    );
+    // UA is injected into the effective header set.
+    let effective = provider.effective_custom_headers();
+    assert_eq!(
+        effective.get("User-Agent"),
+        Some(&"my-app/1.0 (ua-token)".to_string())
+    );
+
+    // An explicit User-Agent custom header takes precedence.
+    provider
+        .custom_headers
+        .insert("user-agent".to_string(), "explicit/2.0".to_string());
+    let effective = provider.effective_custom_headers();
+    assert_eq!(effective.get("user-agent"), Some(&"explicit/2.0".to_string()));
+    assert_eq!(effective.get("User-Agent"), None);
+
+    // An empty user_agent resolves to None and injects nothing.
+    provider.user_agent = Some(String::new());
+    assert_eq!(provider.resolve_user_agent(), None);
+    provider.custom_headers.clear();
+    assert!(provider.effective_custom_headers().is_empty());
+
+    env::remove_var("TEST_UA_TOKEN");
+}
 
     #[test]
     fn test_provider_resolve_api_key_prefers_runtime_secret() {
@@ -1757,6 +1855,7 @@ mod runtime_resolution_tests {
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
+            user_agent: None,
             connection_pool: ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
@@ -1799,6 +1898,7 @@ mod runtime_resolution_tests {
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
+            user_agent: None,
             connection_pool: ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],

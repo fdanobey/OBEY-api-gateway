@@ -205,15 +205,10 @@ impl MemoryExtractionProvider for GatewayExtractionAdapter {
             .header("Content-Type", "application/json")
             .json(&body);
 
-        // Apply custom headers
-        for (key, value) in &provider.custom_headers {
-            let resolved = if value.trim().starts_with("${") && value.trim().ends_with('}') {
-                let var_name = &value.trim()[2..value.trim().len() - 1];
-                std::env::var(var_name).unwrap_or_else(|_| value.clone())
-            } else {
-                value.clone()
-            };
-            builder = builder.header(key.as_str(), resolved);
+        // Apply custom headers (with env-var substitution and the
+        // provider's configured User-Agent, if any)
+        for (key, value) in provider.effective_custom_headers() {
+            builder = builder.header(key.as_str(), value);
         }
 
         let response = builder

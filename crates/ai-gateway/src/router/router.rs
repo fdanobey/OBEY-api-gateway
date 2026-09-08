@@ -3341,10 +3341,10 @@ codex_search_budget,
                     .unwrap_or_else(|| "us-east-1".to_string()),
                 Some(api_key),
                 Some(provider_cfg.max_connections),
-                Some(provider_cfg.effective_total_timeout(&provider_model.model)),
-                provider_cfg.custom_headers.clone(),
-            )
-            .await?;
+            Some(provider_cfg.effective_total_timeout(&provider_model.model)),
+            provider_cfg.effective_custom_headers(),
+        )
+        .await?;
             return Ok(self
                 .dispatch_buffered_with_context_retry(&bedrock_client, bedrock_request)
                 .await?
@@ -3409,7 +3409,7 @@ codex_search_budget,
         tracing::info!(provider = provider_name, %url, model = %provider_model.model, ttfb_timeout_secs, total_timeout_secs, "Calling provider");
 
         let pool_config = provider_cfg.connection_pool.clone();
-        let custom_headers = provider_cfg.custom_headers.clone();
+        let custom_headers = provider_cfg.effective_custom_headers();
         let provider_type = provider_cfg.provider_type.clone();
         let cross_region_inference = provider_cfg.cross_region_inference;
         let global_inference_profile = provider_cfg.global_inference_profile;
@@ -7886,9 +7886,9 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
         let api_key = provider_cfg.resolve_api_key().unwrap_or_default();
         let is_oauth_provider = provider_cfg.auth_method.as_deref() == Some("oauth");
         let provider_type = provider_cfg.provider_type.clone();
-        let configured_base_url = provider_cfg.base_url.clone();
-        let custom_headers = provider_cfg.custom_headers.clone();
-        let pool_config = provider_cfg.connection_pool.clone();
+    let configured_base_url = provider_cfg.base_url.clone();
+    let custom_headers = provider_cfg.effective_custom_headers();
+    let pool_config = provider_cfg.connection_pool.clone();
         let ttfb_timeout_secs = provider_cfg.effective_ttfb_timeout(&provider_model.model);
         let ttfb_timeout = Duration::from_secs(ttfb_timeout_secs);
 
@@ -8301,9 +8301,9 @@ source_ref,
         if !api_key.is_empty() {
             request = request.bearer_auth(api_key);
         }
-        for (name, value) in provider.resolve_custom_headers() {
-            request = request.header(name, value);
-        }
+    for (name, value) in provider.effective_custom_headers() {
+        request = request.header(name, value);
+    }
 
         let timeout_seconds = provider.effective_total_timeout("");
         let upstream = tokio::time::timeout(Duration::from_secs(timeout_seconds), request.send())
@@ -8479,9 +8479,9 @@ source_ref,
         } else if !api_key.is_empty() {
             request = request.bearer_auth(api_key);
         }
-        for (name, value) in target.provider.resolve_custom_headers() {
-            request = request.header(name, value);
-        }
+    for (name, value) in target.provider.effective_custom_headers() {
+        request = request.header(name, value);
+    }
 
         let started = std::time::Instant::now();
         let timeout_seconds = target.provider.effective_total_timeout(model_name);
@@ -10128,8 +10128,9 @@ reasoning_compat: Default::default(),
             total_timeout_seconds: Some(5),
             max_connections: 10,
             rate_limit_per_minute: 0,
-            custom_headers: Default::default(),
-            connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+        custom_headers: Default::default(),
+        user_agent: None,
+        connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
             global_inference_profile: false,
@@ -10715,15 +10716,76 @@ reasoning_parameter: None,
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
-        let accept_encoding = requests[0]
-            .headers
-            .get_all(reqwest::header::ACCEPT_ENCODING)
-            .iter()
-            .flat_map(|value| value.to_str().unwrap().split(','))
-            .map(str::trim)
-            .collect::<Vec<_>>();
-        assert_eq!(accept_encoding, vec!["identity"]);
-    }
+    let accept_encoding = requests[0]
+        .headers
+        .get_all(reqwest::header::ACCEPT_ENCODING)
+        .iter()
+        .flat_map(|value| value.to_str().unwrap().split(','))
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    assert_eq!(accept_encoding, vec!["identity"]);
+}
+
+// ------------------------------------------------------------------
+// Provider-configured user_agent and custom headers must reach the
+// upstream request on the buffered dispatch path (chat completions).
+// ------------------------------------------------------------------
+#[tokio::test]
+async fn buffered_request_includes_user_agent_and_custom_headers() {
+    use wiremock::matchers::{header, method, path};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("User-Agent", "my-app/2.1"))
+        .and(header("X-Custom", "custom-value"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "upstream-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut config = create_test_config();
+    let provider_model = test_model("provider", 1);
+    let mut provider = test_provider("provider", server.uri());
+    provider.user_agent = Some("my-app/2.1".to_string());
+    provider
+        .custom_headers
+        .insert("X-Custom".to_string(), "custom-value".to_string());
+    config.providers = vec![provider];
+    config.model_groups = vec![test_group(vec![provider_model])];
+    let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+    let response = router
+        .route_request(
+            &OpenAIRequest {
+                model: "test-group".to_string(),
+                messages: vec![Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("hi"),
+                    extra: Default::default(),
+                }],
+                stream: false,
+                temperature: None,
+                max_tokens: None,
+                extra: Default::default(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.choices.len(), 1);
+    // wiremock `expect(1)` verifies both headers arrived on the single call.
+}
 
     // ------------------------------------------------------------------
     // Task 9 preservation — non-Bedrock pass-through keeps every trigger
@@ -11477,8 +11539,9 @@ reasoning_parameter: None,
             total_timeout_seconds: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
-            custom_headers: Default::default(),
-            connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+        custom_headers: Default::default(),
+        user_agent: None,
+        connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
             budget: Some(crate::config::ProviderBudgetConfig {
                 limit_usd: 1.0,
                 reset_policy: crate::config::BudgetResetPolicy::Manual,
@@ -12723,8 +12786,9 @@ use super::tests::{create_test_config, test_metrics};
             // Tight bucket so check_available() trivially returns false
             // after a single consume.
             rate_limit_per_minute: 1,
-            custom_headers: Default::default(),
-            connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+        custom_headers: Default::default(),
+        user_agent: None,
+        connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
             global_inference_profile: false,
@@ -12900,8 +12964,9 @@ use super::tests::{create_test_config, test_metrics};
             total_timeout_seconds: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
-            custom_headers: Default::default(),
-            connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+        custom_headers: Default::default(),
+        user_agent: None,
+        connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
             global_inference_profile: false,

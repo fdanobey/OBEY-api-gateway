@@ -1860,9 +1860,24 @@ async fn proxy_provider_models(
         .build()
         .unwrap_or_default();
 
+    // Apply the provider's custom headers / user agent (when the provider is
+    // resolvable by name) so discovery requests reach upstream with the same
+    // headers real traffic would send. Some providers reject model-list calls
+    // that lack a required header or user agent.
+    let mut effective_custom_headers = std::collections::HashMap::new();
+    if let Some(ref name) = params.provider_name {
+        let config = state.config.read().await;
+        if let Some(p) = config.providers.iter().find(|p| &p.name == name) {
+            effective_custom_headers = p.effective_custom_headers();
+        }
+    }
+
     let mut req = client.get(&models_url);
     if !effective_api_key.is_empty() {
         req = req.header("Authorization", format!("Bearer {}", effective_api_key));
+    }
+    for (name, value) in &effective_custom_headers {
+        req = req.header(name.as_str(), value.as_str());
     }
 
     match req.send().await {
@@ -2032,8 +2047,9 @@ mod tests {
                     total_timeout_seconds: None,
                     max_connections: max_conn,
                     rate_limit_per_minute: rate_limit,
-                    custom_headers: HashMap::new(),
-                    connection_pool: ProviderConnectionPoolConfig::default(),
+        custom_headers: HashMap::new(),
+        user_agent: None,
+        connection_pool: ProviderConnectionPoolConfig::default(),
                     budget: None,
                     manual_models: vec![],
                     global_inference_profile: false,
@@ -2516,8 +2532,9 @@ retry:
                 total_timeout_seconds: None,
                 max_connections: 10,
                 rate_limit_per_minute: 0,
-                custom_headers: Default::default(),
-                connection_pool: ProviderConnectionPoolConfig::default(),
+        custom_headers: Default::default(),
+        user_agent: None,
+        connection_pool: ProviderConnectionPoolConfig::default(),
                 budget: None,
                 manual_models: vec![],
                 global_inference_profile: false,

@@ -252,6 +252,9 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 .compression-override{margin-top:1rem;background:var(--bg)}
 .compression-override-fields{padding-top:.5rem}
 .compression-override-fields[hidden]{display:none}
+.prov-http-headers{margin-top:1rem;background:var(--bg)}
+.prov-http-headers>summary{cursor:pointer;font-weight:600;color:var(--primary);padding:.35rem 0;font-size:.9rem}
+.prov-header-row .form-group{margin:0}
 @media(max-width:700px){.compression-rule-grid,.compression-pre-row,.compression-pipeline-row{grid-template-columns:1fr}}
 </style>
 </head>
@@ -523,10 +526,21 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
           </div>
         </div>
         <div class="form-group" style="margin-top:.5rem">
-          <label>Manual Models (one per line, always included in model lists)</label>
-          <textarea class="prov-manual-models" rows="2" placeholder="model-name-1&#10;model-name-2" style="font-size:.8rem;font-family:monospace"></textarea>
-          <div class="hint">Optional override. Bedrock ships separate maintained fallbacks for Mantle Chat (API key) and Runtime/Converse (AWS SDK); NVIDIA NIM also has a maintained fallback.</div>
+            <label>Manual Models (one per line, always included in model lists)</label>
+            <textarea class="prov-manual-models" rows="2" placeholder="model-name-1&#10;model-name-2" style="font-size:.8rem;font-family:monospace"></textarea>
+            <div class="hint">Optional override. Bedrock ships separate maintained fallbacks for Mantle Chat (API key) and Runtime/Converse (AWS SDK); NVIDIA NIM also has a maintained fallback.</div>
         </div>
+        <details class="prov-http-headers">
+            <summary>Custom Headers &amp; User Agent</summary>
+            <div class="hint">Optional headers sent with every request to this provider (chat, streaming, model discovery, test connection). Values support <code>${ENV_VAR}</code> substitution.</div>
+            <div class="form-group" style="margin-top:.6rem">
+                <label>User Agent</label>
+                <input type="text" class="prov-user-agent" placeholder="my-app/1.0 (blank = default)" autocomplete="off">
+                <div class="hint">Sent as the User-Agent header. A User-Agent entry in the header list below overrides this field.</div>
+            </div>
+            <div class="prov-headers-list"></div>
+            <button type="button" class="btn btn-secondary btn-sm prov-add-header" style="margin-top:.4rem">+ Add Header</button>
+        </details>
         <div class="bedrock-fields">
           <div class="bedrock-title">AWS Bedrock Settings</div>
           <div class="form-row">
@@ -2412,8 +2426,21 @@ function refreshModelGroupModels() {
       if (!validatePositiveInt(maxConnIn, 'Max connections')) ok = false;
       if (!validatePositiveInt(poolMaxIdleIn, 'Pool max idle')) ok = false;
       if (!validatePositiveInt(poolIdleTimeoutIn, 'Pool idle timeout')) ok = false;
-      if (budgetLimitIn.value.trim() && !validatePositiveNum(budgetLimitIn, 'Budget limit')) ok = false;
-      if (!validateCompressionOverride(card, 'prov')) ok = false;
+        if (budgetLimitIn.value.trim() && !validatePositiveNum(budgetLimitIn, 'Budget limit')) ok = false;
+        if (!validateCompressionOverride(card, 'prov')) ok = false;
+
+        // Custom header rows need a name when a value is present
+        card.querySelectorAll('.prov-header-row').forEach(function(row) {
+            var nameIn = row.querySelector('.prov-header-name');
+            var valIn = row.querySelector('.prov-header-value');
+            if (valIn.value.trim() && !nameIn.value.trim()) {
+                showError(nameIn, 'Header name is required when a value is set');
+                ok = false;
+            } else {
+                clearError(nameIn);
+            }
+        });
+
 
       // --- Bedrock-specific validation (Req 9.1, 9.2, 9.3, 9.4) ---
       var isBedrock = typeIn.value === 'bedrock';
@@ -2783,7 +2810,48 @@ function refreshModelGroupModels() {
     statusEl.textContent = 'No API key configured.';
   }
 
-  function addProviderCard(data) {
+  function addProviderHeaderRow(listEl, key, value) {
+    var row = document.createElement('div');
+    row.className = 'form-row prov-header-row';
+    var nameGroup = document.createElement('div');
+    nameGroup.className = 'form-group';
+    var nameLabel = document.createElement('label');
+    nameLabel.textContent = 'Header Name';
+    var nameIn = document.createElement('input');
+    nameIn.type = 'text';
+    nameIn.className = 'prov-header-name';
+    nameIn.placeholder = 'X-Custom-Header';
+    nameIn.autocomplete = 'off';
+    nameIn.value = key || '';
+    nameGroup.appendChild(nameLabel);
+    nameGroup.appendChild(nameIn);
+    var valGroup = document.createElement('div');
+    valGroup.className = 'form-group';
+    var valLabel = document.createElement('label');
+    valLabel.textContent = 'Value';
+    var valIn = document.createElement('input');
+    valIn.type = 'text';
+    valIn.className = 'prov-header-value';
+    valIn.placeholder = 'value or ${ENV_VAR}';
+    valIn.autocomplete = 'off';
+    valIn.value = value || '';
+    valGroup.appendChild(valLabel);
+    valGroup.appendChild(valIn);
+    var btnGroup = document.createElement('div');
+    btnGroup.className = 'form-group';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-danger btn-sm prov-header-remove';
+    btn.textContent = 'Remove';
+    btn.addEventListener('click', function() { row.remove(); });
+    btnGroup.appendChild(btn);
+    row.appendChild(nameGroup);
+    row.appendChild(valGroup);
+    row.appendChild(btnGroup);
+    listEl.appendChild(row);
+}
+
+function addProviderCard(data) {
     var clone = provTpl.content.cloneNode(true);
     var card = clone.querySelector('.item-card');
     var nameInput = card.querySelector('.prov-name');
@@ -2808,8 +2876,15 @@ function refreshModelGroupModels() {
       card.querySelector('.prov-pool-idle-timeout').value = (data.connection_pool && data.connection_pool.idle_timeout_seconds) || 90;
       card.querySelector('.prov-budget-limit').value = (data.budget && data.budget.limit_usd != null) ? data.budget.limit_usd : '';
       card.querySelector('.prov-budget-reset').value = (data.budget && data.budget.reset_policy) || 'manual';
-      card.querySelector('.prov-manual-models').value = (data.manual_models || []).join('\n');
-      populateCompressionOverride(card, data.compression, 'prov');
+        card.querySelector('.prov-manual-models').value = (data.manual_models || []).join('\n');
+        card.querySelector('.prov-user-agent').value = data.user_agent || '';
+        var headerList = card.querySelector('.prov-headers-list');
+        if (data.custom_headers) {
+            Object.keys(data.custom_headers).forEach(function(k) {
+                addProviderHeaderRow(headerList, k, data.custom_headers[k]);
+            });
+        }
+        populateCompressionOverride(card, data.compression, 'prov');
       // Restore Bedrock-specific checkbox values (Req 8.2, 8.4)
       if (data.type === 'bedrock') {
         card.querySelector('.prov-global-inference').checked = !!data.global_inference_profile;
@@ -2823,6 +2898,9 @@ function refreshModelGroupModels() {
     wireCompressionOverride(card, 'prov');
     nameInput.addEventListener('input', function() { titleEl.textContent = this.value || 'New Provider'; populateProviderSelects(); });
     keyInput.addEventListener('input', function() { renderProviderKeyStatus(card); });
+    card.querySelector('.prov-add-header').addEventListener('click', function() {
+        addProviderHeaderRow(card.querySelector('.prov-headers-list'), '', '');
+    });
     card.querySelector('.remove-provider').addEventListener('click', function() { card.remove(); populateProviderSelects(); });
 
     // --- Bedrock visibility toggle & region-URL binding (Req 1.1, 1.2, 2.1, 2.2, 2.3) ---
@@ -3803,7 +3881,7 @@ var csIter=parseInt(document.getElementById('codex-search-iterations').value,10)
 cfg.codex_search=csSearch;
     cfg.exact_cache={enabled:document.getElementById('ecache-enabled').checked,max_entries:parseInt(document.getElementById('ecache-max-entries').value,10)||5000,ttl_seconds:parseInt(document.getElementById('ecache-ttl').value,10)||3600,temperature_threshold:parseFloat(document.getElementById('ecache-temp-threshold').value)||0.15};
     var originalProviders = (config && config.providers) || [];
-    cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
+    cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}var uaVal=card.querySelector('.prov-user-agent').value.trim();if(uaVal)p.user_agent=uaVal;else delete p.user_agent;var hdrMap={};card.querySelectorAll('.prov-header-row').forEach(function(row){var hk=row.querySelector('.prov-header-name').value.trim();var hv=row.querySelector('.prov-header-value').value;if(hk)hdrMap[hk]=hv;});if(Object.keys(hdrMap).length)p.custom_headers=hdrMap;else delete p.custom_headers;p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
     var originalGroups = (config && config.model_groups) || [];
     cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container > .form-row').forEach(function(row,modelIndex){var originalModel=(originalGroup&&originalGroup.models&&originalGroup.models[modelIndex])||{};var m=JSON.parse(JSON.stringify(originalModel));Object.assign(m,{provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});var mdlCacheReadVal=(row.querySelector('.mdl-cache-read')||{}).value;var mdlCacheWriteVal=(row.querySelector('.mdl-cache-write')||{}).value;var mdlCacheMinVal=(row.querySelector('.mdl-cache-min-tokens')||{}).value;var mdlCacheSupportVal=(row.querySelector('.mdl-cache-support')||{}).value||'none';m.cost_per_million_cache_read_input_tokens=mdlCacheReadVal!==''?parseFloat(mdlCacheReadVal):null;m.cost_per_million_cache_creation_input_tokens=mdlCacheWriteVal!==''?parseFloat(mdlCacheWriteVal):null;m.cache_min_tokens=mdlCacheMinVal!==''?parseInt(mdlCacheMinVal,10):null;m.cache_support=mdlCacheSupportVal==='explicit'?{type:'explicit',max_breakpoints:parseInt((row.querySelector('.mdl-cache-max-bp')||{}).value||'4',10)}:(mdlCacheSupportVal==='automatic'?{type:'automatic'}:null);var mdlReasoningFamilyVal=(row.querySelector('.mdl-reasoning-family')||{}).value||'';var mdlReasoningParamVal=(row.querySelector('.mdl-reasoning-param')||{}).value||'';var mdlReasoningCostVal=(row.querySelector('.mdl-reasoning-cost')||{}).value;m.reasoning_family=mdlReasoningFamilyVal!==''?mdlReasoningFamilyVal:null;m.reasoning_parameter=mdlReasoningParamVal!==''?mdlReasoningParamVal:null;m.cost_per_million_reasoning_tokens=mdlReasoningCostVal!==''?parseFloat(mdlReasoningCostVal):null;g.models.push(m);});cfg.model_groups.push(g);});
     var retryMax=parseInt(document.getElementById('retry-max').value,10);

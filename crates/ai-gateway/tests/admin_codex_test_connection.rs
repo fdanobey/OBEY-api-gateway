@@ -46,6 +46,7 @@ fn codex_test_config() -> Config {
             max_connections: 10,
             rate_limit_per_minute: 0,
             custom_headers: Default::default(),
+            user_agent: None,
             connection_pool: ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
