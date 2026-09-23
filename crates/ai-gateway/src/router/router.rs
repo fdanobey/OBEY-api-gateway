@@ -2112,6 +2112,123 @@ impl Router {
         false
     }
 
+    /// Substrings that indicate a tool-definition schema references image
+    /// input. Matched case-insensitively against the serialized `tools`
+    /// array. Kept deliberately narrow: a bare `image` would false-positive
+    /// on tools like `generate_image`, so only image *input* markers are
+    /// listed.
+    const TOOL_SCHEMA_IMAGE_MARKERS: [&'static str; 6] = [
+        "image_url",
+        "input_image",
+        "image_file",
+        "input_image_url",
+        "\"type\":\"image\"",
+        "\"type\": \"image\"",
+    ];
+
+    /// Whether the outgoing `tools` array contains any image-input marker.
+    /// Used only for diagnostics — it does not mutate the request. Scans the
+    /// serialized form so it catches markers regardless of nesting depth or
+    /// whitespace.
+    fn tools_contain_image_marker(request: &OpenAIRequest) -> bool {
+        let Some(tools) = request.extra.get("tools") else {
+            return false;
+        };
+        let serialized = tools.to_string().to_ascii_lowercase();
+        Self::TOOL_SCHEMA_IMAGE_MARKERS
+            .iter()
+            .any(|marker| serialized.contains(&marker.to_ascii_lowercase()))
+    }
+
+    /// Last-resort scrub of image-input references from tool-definition
+    /// schemas, used only reactively after a provider rejects a request for
+    /// image inputs when the messages carry no strippable image content.
+    ///
+    /// Some clients define tools whose parameter schemas mention image inputs
+    /// (a property literally named `image_url`, or a `{"type":"image"}`
+    /// enum/const). Aggregators that scan the whole request body — not just
+    /// message content — can reject these as "image inputs" even on a
+    /// text-only turn. This removes object properties keyed by an image
+    /// marker and array/enum entries whose `type` is in the image family,
+    /// recursively across the `tools` array. Returns the number of nodes
+    /// removed.
+    ///
+    /// This deliberately alters the tool contract (the offending parameter
+    /// disappears), which is why it is gated behind an actual provider
+    /// rejection and bounded to one shot per request — it is strictly better
+    /// than failing the turn over to another provider with the same body.
+    fn strip_image_fields_from_tools(request: &mut OpenAIRequest) -> usize {
+        let Some(tools) = request.extra.get_mut("tools") else {
+            return 0;
+        };
+        Self::strip_image_fields_from_value(tools)
+    }
+
+    /// Recursively remove image-input references from an arbitrary JSON value
+    /// (a tool schema fragment). Returns the number of removed nodes.
+    fn strip_image_fields_from_value(value: &mut serde_json::Value) -> usize {
+        let mut removed = 0;
+        match value {
+            serde_json::Value::Object(map) => {
+                // Drop object entries whose KEY is an image-input marker
+                // (e.g. a schema property named `image_url`).
+                let image_keys: Vec<String> = map
+                    .keys()
+                    .filter(|k| {
+                        let lower = k.to_ascii_lowercase();
+                        matches!(
+                            lower.as_str(),
+                            "image_url" | "input_image" | "image_file" | "input_image_url"
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                for key in image_keys {
+                    map.remove(&key);
+                    removed += 1;
+                }
+                // Recurse into the remaining values.
+                for child in map.values_mut() {
+                    removed += Self::strip_image_fields_from_value(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                // Drop array entries that are image-typed objects (e.g. a
+                // oneOf/enum branch `{"type":"image", ...}`) or bare
+                // "image_url"/"input_image" string literals in a type enum.
+                let before = items.len();
+                items.retain(|item| !Self::value_is_image_schema_node(item));
+                removed += before.saturating_sub(items.len());
+                // Recurse into survivors.
+                for child in items.iter_mut() {
+                    removed += Self::strip_image_fields_from_value(child);
+                }
+            }
+            _ => {}
+        }
+        removed
+    }
+
+    /// Whether a schema node itself denotes an image-input variant that
+    /// should be dropped from an array (a `{"type":"image"...}` object or a
+    /// bare image-marker string in a type enum).
+    fn value_is_image_schema_node(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(s) => {
+                let lower = s.to_ascii_lowercase();
+                matches!(
+                    lower.as_str(),
+                    "image_url" | "input_image" | "image_file" | "input_image_url"
+                )
+            }
+            serde_json::Value::Object(map) => matches!(
+                map.get("type").and_then(|v| v.as_str()),
+                Some("image_url") | Some("image") | Some("input_image") | Some("image_file")
+            ),
+            _ => false,
+        }
+    }
+
     /// Recursively remove image content parts from a `content` array and
     /// from nested arrays inside surviving parts (e.g.
     /// `{"type":"tool_result","content":[{"type":"image_url",...}]}` or a
@@ -3034,12 +3151,29 @@ impl Router {
                     && Self::is_unsupported_image_error(status_code, &message) =>
                 {
                     let model = request.model.clone();
-                    let removed = Self::strip_image_content_if_unsupported(
+                    let mut removed = Self::strip_image_content_if_unsupported(
                         &mut request,
                         false,
                         &provider,
                         &model,
                     );
+                    // Nothing in message content, but the provider still
+                    // rejected for images: the marker is likely in the tool
+                    // schemas (aggregators that scan the whole body). Scrub
+                    // those as a last resort before giving up.
+                    if removed == 0 {
+                        let tools_removed = Self::strip_image_fields_from_tools(&mut request);
+                        if tools_removed > 0 {
+                            warn!(
+                                provider = %provider,
+                                model = %model,
+                                status = status_code,
+                                tool_schema_fields_removed = tools_removed,
+                                "Provider rejected image inputs with no image content in messages — scrubbed image references from tool schemas and retrying same provider"
+                            );
+                        }
+                        removed += tools_removed;
+                    }
                     if removed > 0 {
                         image_strip_retry_done = true;
                         info!(
@@ -4043,12 +4177,25 @@ impl Router {
                                 if !image_strip_retry_done
                                     && Self::is_unsupported_image_phrasing(&body_text)
                                 {
-                                    let removed = Self::strip_image_content_if_unsupported(
+                                    let mut removed = Self::strip_image_content_if_unsupported(
                                         &mut outgoing,
                                         false,
                                         provider_name,
                                         &provider_model.model,
                                     );
+                                    if removed == 0 {
+                                        let tools_removed =
+                                            Self::strip_image_fields_from_tools(&mut outgoing);
+                                        if tools_removed > 0 {
+                                            warn!(
+                                                provider = provider_name,
+                                                model = %provider_model.model,
+                                                tool_schema_fields_removed = tools_removed,
+                                                "Provider rejected image inputs (HTTP 200 envelope) with no image content in messages — scrubbed image references from tool schemas and retrying same provider"
+                                            );
+                                        }
+                                        removed += tools_removed;
+                                    }
                                     if removed > 0 {
                                         image_strip_retry_done = true;
                                         skip_next_backoff = true;
@@ -4271,12 +4418,43 @@ impl Router {
                         if !image_strip_retry_done
                             && Self::is_unsupported_image_error(status_code, &body_text)
                         {
-                            let removed = Self::strip_image_content_if_unsupported(
+                            let mut removed = Self::strip_image_content_if_unsupported(
                                 &mut outgoing,
                                 false,
                                 provider_name,
                                 &provider_model.model,
                             );
+                            // No strippable image content in messages, yet the
+                            // provider rejected for images: the marker is
+                            // likely in the tool schemas. Scrub those as a last
+                            // resort before failing over.
+                            if removed == 0 {
+                                let tools_had_marker =
+                                    Self::tools_contain_image_marker(&outgoing);
+                                let tools_removed =
+                                    Self::strip_image_fields_from_tools(&mut outgoing);
+                                if tools_removed > 0 {
+                                    warn!(
+                                        provider = provider_name,
+                                        model = %provider_model.model,
+                                        status = status_code,
+                                        tool_schema_fields_removed = tools_removed,
+                                        "Provider rejected image inputs with no image content in messages — scrubbed image references from tool schemas and retrying same provider"
+                                    );
+                                } else {
+                                    // Neither messages nor tool schemas carried a
+                                    // recognizable image marker. Log the mystery so
+                                    // the trigger can be identified from the field.
+                                    warn!(
+                                        provider = provider_name,
+                                        model = %provider_model.model,
+                                        status = status_code,
+                                        tools_had_image_marker = tools_had_marker,
+                                        "Provider rejected image inputs but nothing image-shaped was found in messages or tool schemas — unable to auto-remediate"
+                                    );
+                                }
+                                removed += tools_removed;
+                            }
                             if removed > 0 {
                                 image_strip_retry_done = true;
                                 skip_next_backoff = true;
@@ -8353,12 +8531,30 @@ visible content. Do not restate your plan and do not end your turn without doing
             // shot the buffered retry loop enforces per provider.
             if Self::is_unsupported_image_error(status_code, &body_text) {
                 let mut stripped_request = request.clone();
-                let removed = Self::strip_image_content_if_unsupported(
+                let mut removed = Self::strip_image_content_if_unsupported(
                     &mut stripped_request,
                     false,
                     &provider_model.provider,
                     &provider_model.model,
                 );
+                // No strippable image content in messages: the marker is
+                // likely in the tool schemas that some aggregators scan as
+                // part of the whole body. Scrub those before the buffered
+                // retry so the fallback isn't re-sending the same trigger.
+                if removed == 0 {
+                    let tools_removed =
+                        Self::strip_image_fields_from_tools(&mut stripped_request);
+                    if tools_removed > 0 {
+                        warn!(
+                            provider = %provider_model.provider,
+                            model = %provider_model.model,
+                            status = status_code,
+                            tool_schema_fields_removed = tools_removed,
+                            "Provider rejected image inputs (streaming) with no image content in messages — scrubbed image references from tool schemas and retrying via buffered path"
+                        );
+                    }
+                    removed += tools_removed;
+                }
                 if removed > 0 {
                     info!(
                         provider = %provider_model.provider,
@@ -12165,6 +12361,126 @@ mod tests {
         let nested = parts[0]["parts"].as_array().unwrap();
         assert_eq!(nested.len(), 1);
         assert_eq!(nested[0]["type"], serde_json::json!("text"));
+    }
+
+    fn request_with_tools(tools: serde_json::Value) -> OpenAIRequest {
+        let mut extra = serde_json::Map::new();
+        extra.insert("tools".to_string(), tools);
+        OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra,
+        }
+    }
+
+    #[test]
+    fn test_strip_image_fields_from_tools_removes_image_url_property() {
+        // A tool whose parameter schema defines a property named `image_url`
+        // gets that property (and its required entry) reachable for scrubbing.
+        let mut request = request_with_tools(serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "attach",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "note": {"type": "string"},
+                            "image_url": {"type": "string"}
+                        }
+                    }
+                }
+            }
+        ]));
+
+        assert!(Router::tools_contain_image_marker(&request));
+        let removed = Router::strip_image_fields_from_tools(&mut request);
+        assert_eq!(removed, 1);
+        // The image_url property is gone; the sibling text property survives.
+        let props = &request.extra["tools"][0]["function"]["parameters"]["properties"];
+        assert!(props.get("image_url").is_none());
+        assert!(props.get("note").is_some());
+        assert!(!Router::tools_contain_image_marker(&request));
+    }
+
+    #[test]
+    fn test_strip_image_fields_from_tools_drops_image_typed_enum_branch() {
+        // A oneOf/anyOf branch that is an image-typed object is dropped, and a
+        // bare "image_url" string inside a type enum is removed.
+        let mut request = request_with_tools(serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "content",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "part": {
+                                "oneOf": [
+                                    {"type": "text"},
+                                    {"type": "image", "image_url": {"type": "string"}}
+                                ]
+                            },
+                            "kind": {"enum": ["text", "image_url"]}
+                        }
+                    }
+                }
+            }
+        ]));
+
+        let removed = Router::strip_image_fields_from_tools(&mut request);
+        // one oneOf branch + one enum string.
+        assert_eq!(removed, 2);
+        let one_of = request.extra["tools"][0]["function"]["parameters"]["properties"]["part"]
+            ["oneOf"]
+            .as_array()
+            .unwrap();
+        assert_eq!(one_of.len(), 1);
+        assert_eq!(one_of[0]["type"], serde_json::json!("text"));
+        let kind_enum = request.extra["tools"][0]["function"]["parameters"]["properties"]["kind"]
+            ["enum"]
+            .as_array()
+            .unwrap();
+        assert_eq!(kind_enum, &vec![serde_json::json!("text")]);
+    }
+
+    #[test]
+    fn test_strip_image_fields_from_tools_noop_without_markers() {
+        let mut request = request_with_tools(serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "run",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}}
+                    }
+                }
+            }
+        ]));
+        assert!(!Router::tools_contain_image_marker(&request));
+        assert_eq!(Router::strip_image_fields_from_tools(&mut request), 0);
+    }
+
+    #[test]
+    fn test_strip_image_fields_from_tools_absent_tools_is_zero() {
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+        assert_eq!(Router::strip_image_fields_from_tools(&mut request), 0);
+        assert!(!Router::tools_contain_image_marker(&request));
     }
 
     #[test]
