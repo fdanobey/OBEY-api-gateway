@@ -50,7 +50,11 @@ fn is_compaction_trigger(value: &serde_json::Value) -> bool {
 /// marker shape that `is_compaction_trigger` (which inspects a standalone JSON
 /// value) does not see, because the marker lives in `Message.extra`.
 fn message_extra_is_trigger(message: &Message) -> bool {
-    message.extra.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
+    message
+        .extra
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        == Some("compaction_trigger")
 }
 
 /// Outcome of a single normalization scan over every compaction-trigger site in
@@ -76,6 +80,14 @@ pub(crate) struct TriggerNormalization {
 enum TriggerSite {
     /// Item at `index` inside the `extra["input"]` array.
     InputArray { index: usize },
+    /// Part at `part_index` inside the `content` array of the `extra["input"]`
+    /// item at `item_index`. This is the nested carrier a Codex client emits
+    /// when a compaction trigger rides inside a replayed message item, e.g.
+    /// `{"type":"message","content":[{"type":"compaction_trigger"}]}`.
+    InputArrayItemContent {
+        item_index: usize,
+        part_index: usize,
+    },
     /// Part at `part_index` inside `messages[message_index].content` array.
     ContentPart {
         message_index: usize,
@@ -126,6 +138,21 @@ pub(crate) fn normalize_mantle_compaction_triggers(
                 if is_compaction_trigger(item) {
                     sites.push(TriggerSite::InputArray { index });
                 }
+                // Descend into the item's own `content` array: a Codex client
+                // can nest a trigger inside a replayed message item, e.g.
+                // `{"type":"message","content":[{"type":"compaction_trigger"}]}`.
+                // These are invisible to the top-level `is_compaction_trigger`
+                // check above and to the Responses adapter's top-level `retain`.
+                if let Some(parts) = item.get("content").and_then(serde_json::Value::as_array) {
+                    for (part_index, part) in parts.iter().enumerate() {
+                        if is_compaction_trigger(part) {
+                            sites.push(TriggerSite::InputArrayItemContent {
+                                item_index: index,
+                                part_index,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -154,7 +181,10 @@ pub(crate) fn normalize_mantle_compaction_triggers(
     // The survivor is the LAST site in document order.
     let survivor_index = sites.len() - 1;
     let survivor_site = &sites[survivor_index];
-    let survivor_from_input_array = matches!(survivor_site, TriggerSite::InputArray { .. });
+    let survivor_from_input_array = matches!(
+        survivor_site,
+        TriggerSite::InputArray { .. } | TriggerSite::InputArrayItemContent { .. }
+    );
     let survivor = capture_survivor(request, survivor_site);
     let removed = sites.len() - 1;
 
@@ -172,6 +202,23 @@ pub(crate) fn normalize_mantle_compaction_triggers(
                 {
                     if *index < items.len() {
                         items.remove(*index);
+                    }
+                }
+            }
+            TriggerSite::InputArrayItemContent {
+                item_index,
+                part_index,
+            } => {
+                if let Some(parts) = request
+                    .extra
+                    .get_mut("input")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .and_then(|items| items.get_mut(*item_index))
+                    .and_then(|item| item.get_mut("content"))
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    if *part_index < parts.len() {
+                        parts.remove(*part_index);
                     }
                 }
             }
@@ -202,7 +249,7 @@ pub(crate) fn normalize_mantle_compaction_triggers(
     let survivor_message_index = match survivor_site {
         TriggerSite::ContentPart { message_index, .. }
         | TriggerSite::MessageMarker { message_index } => Some(*message_index),
-        TriggerSite::InputArray { .. } => None,
+        TriggerSite::InputArray { .. } | TriggerSite::InputArrayItemContent { .. } => None,
     };
     for message_index in (0..request.messages.len()).rev() {
         if Some(message_index) == survivor_message_index {
@@ -235,16 +282,25 @@ pub(crate) fn normalize_mantle_compaction_triggers(
 }
 
 /// Clone the surviving trigger's JSON value from its site, for later placement.
-fn capture_survivor(
-    request: &OpenAIRequest,
-    site: &TriggerSite,
-) -> Option<serde_json::Value> {
+fn capture_survivor(request: &OpenAIRequest, site: &TriggerSite) -> Option<serde_json::Value> {
     match site {
         TriggerSite::InputArray { index } => request
             .extra
             .get("input")
             .and_then(serde_json::Value::as_array)
             .and_then(|items| items.get(*index))
+            .cloned(),
+        TriggerSite::InputArrayItemContent {
+            item_index,
+            part_index,
+        } => request
+            .extra
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| items.get(*item_index))
+            .and_then(|item| item.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|parts| parts.get(*part_index))
             .cloned(),
         TriggerSite::ContentPart {
             message_index,
@@ -1858,68 +1914,68 @@ impl BedrockProvider {
         })
     }
 
-fn mantle_responses_input(
-    request: OpenAIRequest,
-) -> (
-    String,
-    Option<f32>,
-    u32,
-    serde_json::Map<String, serde_json::Value>,
-    serde_json::Value,
-    usize,
-) {
-    let OpenAIRequest {
-        model,
-        messages,
-        temperature,
-        max_tokens,
-        mut extra,
-        ..
-    } = request;
-    // Compaction-trigger de-duplication is owned by the single seam
-    // `normalize_mantle_compaction_triggers`, which runs before this adapter and
-    // has already reduced `extra["input"]` and message content to at most one
-    // trigger. This builder no longer performs any trigger normalization, so the
-    // trigger-removal count is always zero here; the tuple arity is kept stable
-    // for the caller's logging.
-    let normalized = 0;
+    fn mantle_responses_input(
+        request: OpenAIRequest,
+    ) -> (
+        String,
+        Option<f32>,
+        u32,
+        serde_json::Map<String, serde_json::Value>,
+        serde_json::Value,
+        usize,
+    ) {
+        let OpenAIRequest {
+            model,
+            messages,
+            temperature,
+            max_tokens,
+            mut extra,
+            ..
+        } = request;
+        // Compaction-trigger de-duplication is owned by the single seam
+        // `normalize_mantle_compaction_triggers`, which runs before this adapter and
+        // has already reduced `extra["input"]` and message content to at most one
+        // trigger. This builder no longer performs any trigger normalization, so the
+        // trigger-removal count is always zero here; the tuple arity is kept stable
+        // for the caller's logging.
+        let normalized = 0;
 
-    let input = match extra.remove("input") {
-        Some(serde_json::Value::Array(input)) => serde_json::Value::Array(input),
-        Some(other) => {
-            // Non-array `input` values (e.g., string "auto" from previous session continuation)
-            // are passed through as-is. The Responses API only validates compaction_trigger
-            // counts inside arrays of input items, not scalar values.
-            other
-        }
-        None => {
-            // Build input from OpenAI-style messages. Flatten each message's content
-            // to text because the Responses API input items don't support multi-part
-            // content arrays. compaction_triggers were already normalized by the seam.
-            // Any remaining compaction_trigger (at most one) in content arrays will
-            // be filtered out by content_as_text which only extracts text parts.
-            serde_json::Value::Array(
-                messages
-                    .iter()
-                    .map(|message| {
-                        serde_json::json!({
-                            "role": message.role,
-                            "content": message.content_as_text()
+        let input = match extra.remove("input") {
+            Some(serde_json::Value::Array(input)) => serde_json::Value::Array(input),
+            Some(other) => {
+                // Non-array `input` values (e.g., string "auto" from previous session continuation)
+                // are passed through as-is. The Responses API only validates compaction_trigger
+                // counts inside arrays of input items, not scalar values.
+                other
+            }
+            None => {
+                // Build input from OpenAI-style messages. Flatten each message's content
+                // to text because the Responses API input items don't support multi-part
+                // content arrays. compaction_triggers were already normalized by the seam.
+                // Any remaining compaction_trigger (at most one) in content arrays will
+                // be filtered out by content_as_text which only extracts text parts.
+                serde_json::Value::Array(
+                    messages
+                        .iter()
+                        .map(|message| {
+                            serde_json::json!({
+                                "role": message.role,
+                                "content": message.content_as_text()
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        }
-    };
-    (
-        model,
-        temperature,
-        max_tokens.unwrap_or(2048),
-        extra,
-        input,
-        normalized,
-    )
-}
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+        (
+            model,
+            temperature,
+            max_tokens.unwrap_or(2048),
+            extra,
+            input,
+            normalized,
+        )
+    }
 
     /// Reachable only through [`Self::dispatch_mantle`] /
     /// [`Self::dispatch_mantle_stream`]. See `normalization` note on
@@ -1952,7 +2008,18 @@ fn mantle_responses_input(
         // survivor cannot be placed there, which is only possible for degenerate
         // requests that also carry a scalar `input`.
         if let serde_json::Value::Array(items) = &mut input {
+            // Strip triggers at BOTH levels: top-level input items AND items
+            // nested inside another input item's `content` array (the Codex
+            // replay carrier). Stripping only the top level would leave a nested
+            // survivor in place and then append it again terminally, producing
+            // the duplicate Bedrock rejects.
             items.retain(|item| !is_compaction_trigger(item));
+            for item in items.iter_mut() {
+                if let Some(parts) = item.get_mut("content").and_then(serde_json::Value::as_array_mut)
+                {
+                    parts.retain(|part| !is_compaction_trigger(part));
+                }
+            }
             if let Some(survivor) = &normalization.survivor {
                 items.push(survivor.clone());
             }
@@ -2496,14 +2563,8 @@ impl ProviderClient for BedrockProvider {
                 base_url,
                 custom_headers,
             } => {
-                self.dispatch_mantle_stream(
-                    request,
-                    http_client,
-                    api_key,
-                    base_url,
-                    custom_headers,
-                )
-                .await
+                self.dispatch_mantle_stream(request, http_client, api_key, base_url, custom_headers)
+                    .await
             }
             BedrockAuthMode::AwsSdk { client, .. } => {
                 // Bedrock-translated providers use the gateway's buffer-and-
@@ -4000,6 +4061,64 @@ mod compaction_trigger_bug_exploration {
     }
 
     // ------------------------------------------------------------------
+    // Case 7 — native `input` array on a Responses-family model, with a trigger
+    // NESTED inside an input item's `content` array (the live openai.gpt-5.6-sol
+    // carrier).
+    //
+    // A Codex client continuing a Responses conversation resubmits prior turns as
+    // native `input` items. A compaction trigger can ride inside a message item's
+    // `content` array — `{"type":"message","content":[{"type":"compaction_trigger"}]}`
+    // — in addition to a standalone top-level trigger item.
+    //
+    // EXPECT FAIL on unfixed code: the seam's `is_compaction_trigger` only tests
+    // each input item's TOP-LEVEL `type` (here `"message"`), and the Responses
+    // adapter's `retain` strips only top-level trigger items. The nested trigger
+    // is never seen, so it survives AND the seam-recorded survivor is appended,
+    // leaving TWO triggers on the wire — exactly the body Bedrock Mantle rejects
+    // with "Only one 'compaction_trigger' item may be provided.".
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn case7_responses_family_nested_content_trigger_keeps_one() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "input".to_string(),
+            serde_json::json!([
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "earlier turn"},
+                        {"type": "compaction_trigger"}
+                    ]
+                },
+                {"type": "compaction_trigger"}
+            ]),
+        );
+
+        let request = OpenAIRequest {
+            model: "openai.gpt-5.6-sol".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("continue".to_string()),
+                extra: Default::default(),
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra,
+        };
+
+        let body = capture_upstream_body("", request).await;
+        assert_eq!(
+            count_trigger_sites(&body),
+            1,
+            "Case 7: expected exactly one trigger after de-dup across the nested \
+             content site and the top-level item, got body: {}",
+            body
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Observed UNFIXED-code baselines (recorded from the runs below).
     //
     // Task 9's preservation tests MUST compare the fixed code against these
@@ -4021,12 +4140,10 @@ mod compaction_trigger_bug_exploration {
     // ------------------------------------------------------------------
 
     /// Serialized zero-trigger Chat body observed on unfixed code (task 9 case 1).
-    const BASELINE_ZERO_TRIGGER_CHAT_BODY: &str =
-        r#"{"messages":[{"content":"hello","role":"user"}],"model":"openai.gpt-oss-120b","stream":false}"#;
+    const BASELINE_ZERO_TRIGGER_CHAT_BODY: &str = r#"{"messages":[{"content":"hello","role":"user"}],"model":"openai.gpt-oss-120b","stream":false}"#;
 
     /// Serialized single-trigger Chat body observed on unfixed code (task 9 case 2).
-    const BASELINE_SINGLE_TRIGGER_CHAT_BODY: &str =
-        r#"{"messages":[{"content":[{"text":"keep me","type":"text"},{"type":"compaction_trigger"}],"role":"user"}],"model":"openai.gpt-oss-120b","stream":false}"#;
+    const BASELINE_SINGLE_TRIGGER_CHAT_BODY: &str = r#"{"messages":[{"content":[{"text":"keep me","type":"text"},{"type":"compaction_trigger"}],"role":"user"}],"model":"openai.gpt-oss-120b","stream":false}"#;
 
     // ------------------------------------------------------------------
     // Baselines for task 9 preservation checks — captured on UNFIXED code.
@@ -4170,8 +4287,16 @@ mod compaction_trigger_bug_exploration {
         let body = capture_upstream_body("", request).await;
         assert_responses_input_terminal_trigger(&body);
         // The most recent survivor (id "latest") is the one kept and placed last.
-        let last = body.get("input").and_then(serde_json::Value::as_array).unwrap().last().unwrap();
-        assert_eq!(last.get("id").and_then(serde_json::Value::as_str), Some("latest"));
+        let last = body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(
+            last.get("id").and_then(serde_json::Value::as_str),
+            Some("latest")
+        );
     }
 
     /// Responses placement — a content-part survivor becomes terminal (the
@@ -4284,8 +4409,15 @@ mod compaction_trigger_bug_exploration {
         );
         // The original message content ("continue") must be preserved as text,
         // and `extra["input"]` must have been stripped by sanitization.
-        assert!(body.get("input").is_none(), "input key must be stripped, got: {}", body);
-        let messages = body.get("messages").and_then(serde_json::Value::as_array).unwrap();
+        assert!(
+            body.get("input").is_none(),
+            "input key must be stripped, got: {}",
+            body
+        );
+        let messages = body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
         let joined_text: String = messages
             .iter()
             .filter_map(|m| m.get("content").and_then(serde_json::Value::as_array))
@@ -4324,7 +4456,10 @@ mod compaction_trigger_bug_exploration {
             "Messages no-op body must carry no triggers, got: {}",
             body
         );
-        let messages = body.get("messages").and_then(serde_json::Value::as_array).unwrap();
+        let messages = body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
         assert_eq!(
             messages
                 .iter()
@@ -4424,10 +4559,7 @@ mod compaction_trigger_bug_exploration {
 
     #[test]
     fn normalize_mantle_compaction_triggers_one_marker_message_unchanged() {
-        let mut request = req(vec![
-            msg("user", serde_json::json!("hi")),
-            marker_message(),
-        ]);
+        let mut request = req(vec![msg("user", serde_json::json!("hi")), marker_message()]);
         let before = serde_json::to_value(&request).unwrap();
         let result = normalize_mantle_compaction_triggers(&mut request);
         assert_eq!(result.removed, 0);
@@ -4450,10 +4582,7 @@ mod compaction_trigger_bug_exploration {
         assert!(!result.survivor_from_input_array);
         // Survivor stays in the LAST message; first message's trigger removed.
         assert!(request.messages[0].content.as_array().unwrap().is_empty());
-        assert_eq!(
-            request.messages[1].content.as_array().unwrap().len(),
-            1
-        );
+        assert_eq!(request.messages[1].content.as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -4467,8 +4596,10 @@ mod compaction_trigger_bug_exploration {
         assert_eq!(request.messages.len(), 1);
         assert!(message_extra_is_trigger(&request.messages[0]));
         // No emitted message carries an empty role.
-        assert!(request.messages.iter().all(|m| !m.role.is_empty()
-            || message_extra_is_trigger(m)));
+        assert!(request
+            .messages
+            .iter()
+            .all(|m| !m.role.is_empty() || message_extra_is_trigger(m)));
     }
 
     #[test]
@@ -4525,10 +4656,7 @@ mod compaction_trigger_bug_exploration {
     fn normalize_mantle_compaction_triggers_mixed_shapes_survivor_by_document_order() {
         // Document order: input-array item (a), then content part (b),
         // then message marker (c). The LAST site — the message marker — survives.
-        let mut request = req(vec![
-            msg("user", trigger_content_part()),
-            marker_message(),
-        ]);
+        let mut request = req(vec![msg("user", trigger_content_part()), marker_message()]);
         request.extra.insert(
             "input".to_string(),
             serde_json::json!([{"type": "compaction_trigger", "id": "a"}]),
@@ -4583,10 +4711,7 @@ mod compaction_trigger_bug_exploration {
         // Only one trigger overall (the content part), so nothing removed and
         // the non-array `input` is left byte-identical.
         assert_eq!(result.removed, 0);
-        assert_eq!(
-            request.extra.get("input"),
-            Some(&serde_json::json!("auto"))
-        );
+        assert_eq!(request.extra.get("input"), Some(&serde_json::json!("auto")));
         assert_eq!(serde_json::to_value(&request).unwrap(), before);
     }
 
@@ -4606,10 +4731,7 @@ mod compaction_trigger_bug_exploration {
         assert!(!result.survivor_from_input_array);
         assert_eq!(count_sites(&request), 1);
         // `input: "auto"` untouched.
-        assert_eq!(
-            request.extra.get("input"),
-            Some(&serde_json::json!("auto"))
-        );
+        assert_eq!(request.extra.get("input"), Some(&serde_json::json!("auto")));
     }
 
     // ------------------------------------------------------------------
@@ -5219,9 +5341,11 @@ mod preservation {
             .prop_flat_map(|total| {
                 (Just(total), 0..=total).prop_flat_map(|(total, input_count)| {
                     let remaining = total - input_count;
-                    (Just(input_count), 0..=remaining).prop_map(move |(input_count, content_count)| {
-                        (input_count, content_count, remaining - content_count)
-                    })
+                    (Just(input_count), 0..=remaining).prop_map(
+                        move |(input_count, content_count)| {
+                            (input_count, content_count, remaining - content_count)
+                        },
+                    )
                 })
             })
             .prop_flat_map(|(input_count, content_count, marker_count)| {
@@ -5229,12 +5353,7 @@ mod preservation {
                 // ordinary messages surround it so document order is non-trivial.
                 let carrier = arb_message(content_count);
                 let extra_msgs = prop::collection::vec(arb_message(0), 0..2);
-                (
-                    Just(input_count),
-                    Just(marker_count),
-                    carrier,
-                    extra_msgs,
-                )
+                (Just(input_count), Just(marker_count), carrier, extra_msgs)
             })
             .prop_map(|(input_count, marker_count, carrier, mut extra_msgs)| {
                 let mut messages = vec![carrier];

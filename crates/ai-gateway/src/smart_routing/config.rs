@@ -23,6 +23,14 @@ const MAX_OPTIMIZER_INTERVAL_SECS: u64 = 604_800;
 const MAX_TRAINING_BATCH_SIZE: usize = 4096;
 const MAX_TRAINING_EPOCHS: usize = 1000;
 const WEIGHT_SUM_TOLERANCE: f64 = 1.0e-6;
+const MAX_JEV_URL_CHARS: usize = 2048;
+const MAX_JEV_TIMEOUT_MS: u16 = 2_000;
+const MIN_JEV_TIMEOUT_MS: u16 = 250;
+const MIN_JEV_CHAR_BUDGET: usize = 256;
+const MAX_JEV_CHAR_BUDGET: usize = 65_536;
+const MAX_JEV_DISCOVERY_TTL_SECS: u64 = 86_400;
+const DEFAULT_JEV_BASE_URL: &str = "https://api.typesafe.ai";
+const JEV_AUTO_MODEL: &str = "auto";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -35,6 +43,8 @@ pub struct SmartRoutingConfig {
     pub ml_model_path: Option<String>,
     #[serde(default)]
     pub classifier_model: Option<String>,
+    #[serde(default)]
+    pub jev: Option<JevConfig>,
     #[serde(default = "default_cost_quality_threshold")]
     pub cost_quality_threshold: f64,
     #[serde(default)]
@@ -78,6 +88,7 @@ impl Default for SmartRoutingConfig {
             classifier: ClassifierMode::Heuristic,
             ml_model_path: None,
             classifier_model: None,
+            jev: None,
             cost_quality_threshold: default_cost_quality_threshold(),
             cascade: CascadeConfig::default(),
             tier_boundaries: TierBoundaries::default(),
@@ -106,6 +117,26 @@ impl SmartRoutingConfig {
         RoutingPolicySnapshot::from(self).validate_into("", &mut errors);
         self.training.validate_into("training", &mut errors);
 
+        if let Some(jev) = &self.jev {
+            jev.validate_into("jev", &mut errors);
+        }
+        if matches!(self.classifier, ClassifierMode::Jev) {
+            let key_missing = self
+                .jev
+                .as_ref()
+                .is_none_or(|jev| !jev.has_api_key_configured());
+            if key_missing {
+                errors.push(SmartRoutingConfigError::new(
+                    "jev.api_key",
+                    "is required when classifier is jev (set jev.api_key or jev.api_key_env)",
+                ));
+            }
+        }
+        let jev_ready = self
+            .jev
+            .as_ref()
+            .is_some_and(JevConfig::has_api_key_configured);
+
         for (group, limits) in &self.budget_limits {
             validate_map_key("budget_limits", group, &mut errors);
             limits.validate_into(&format!("budget_limits.{group}"), &mut errors);
@@ -113,11 +144,25 @@ impl SmartRoutingConfig {
 
         if let Some(ab_test) = &self.ab_test {
             ab_test.validate_into("ab_test", &mut errors);
+            for (arm, policy) in [("control", &ab_test.control), ("variant", &ab_test.variant)] {
+                if matches!(policy.classifier, ClassifierMode::Jev) && !jev_ready {
+                    errors.push(SmartRoutingConfigError::new(
+                        format!("ab_test.{arm}.classifier"),
+                        "is jev but no Jev API key is configured",
+                    ));
+                }
+            }
         }
 
         for (group, config_override) in &self.model_group_overrides {
             validate_map_key("model_group_overrides", group, &mut errors);
             let effective = self.effective_for_group(group);
+            if matches!(effective.classifier, ClassifierMode::Jev) && !jev_ready {
+                errors.push(SmartRoutingConfigError::new(
+                    format!("model_group_overrides.{group}.classifier"),
+                    "is jev but no Jev API key is configured",
+                ));
+            }
             RoutingPolicySnapshot::from(&effective)
                 .validate_into(&format!("model_group_overrides.{group}"), &mut errors);
             effective.training.validate_into(
@@ -173,6 +218,12 @@ impl SmartRoutingConfig {
         if let Some(value) = &config_override.composite_weights {
             effective.composite_weights = Some(value.clone());
         }
+        if let Some(value) = &config_override.jev_trust {
+            let jev = effective.jev.get_or_insert_with(JevConfig::default);
+            jev.min_confidence = value.min_confidence;
+            jev.min_task_confidence = value.min_task_confidence;
+            jev.fallback_policy = value.fallback_policy;
+        }
         if let Some(value) = config_override.streaming_cascade_mode {
             effective.streaming_cascade_mode = value;
         }
@@ -212,6 +263,7 @@ pub enum ClassifierMode {
     Ml,
     Llm,
     Composite,
+    Jev,
 }
 
 impl Default for ClassifierMode {
@@ -379,6 +431,409 @@ impl CompositeWeights {
     }
 }
 
+/// Trust thresholds for Jev classification, snapshot/override-safe.
+///
+/// Endpoints, credentials, and rubric weights deliberately live only on the
+/// global `JevConfig` so A/B arms and per-group overrides can tune trust
+/// without duplicating secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JevTrustOverride {
+    #[serde(default = "default_jev_min_confidence")]
+    pub min_confidence: f64,
+    #[serde(default = "default_jev_min_task_confidence")]
+    pub min_task_confidence: f64,
+    #[serde(default)]
+    pub fallback_policy: JevFallbackPolicy,
+}
+
+impl Default for JevTrustOverride {
+    fn default() -> Self {
+        Self {
+            min_confidence: default_jev_min_confidence(),
+            min_task_confidence: default_jev_min_task_confidence(),
+            fallback_policy: JevFallbackPolicy::default(),
+        }
+    }
+}
+
+impl JevTrustOverride {
+    fn validate_into(&self, scope: &str, errors: &mut Vec<SmartRoutingConfigError>) {
+        validate_finite_closed_unit(&field(scope, "min_confidence"), self.min_confidence, errors);
+        validate_finite_closed_unit(
+            &field(scope, "min_task_confidence"),
+            self.min_task_confidence,
+            errors,
+        );
+    }
+}
+
+/// Action taken when the Jev composite confidence is below `min_confidence`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JevFallbackPolicy {
+    /// Use the configured heuristic/ML/LLM fallback chain (default).
+    Fallback,
+    /// Blend the Jev score with the heuristic score proportionally to the
+    /// confidence distance above zero. Kept opt-in; fallback is safer.
+    Blend,
+}
+
+impl Default for JevFallbackPolicy {
+    fn default() -> Self {
+        Self::Fallback
+    }
+}
+
+/// Retry policy for Jev classification and discovery calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JevRetryConfig {
+    /// Maximum retry attempts after the initial request (bounded 0..=2).
+    #[serde(default = "default_jev_retry_max_attempts")]
+    pub max_attempts: u8,
+    /// Base delay for exponential backoff in milliseconds.
+    #[serde(default = "default_jev_retry_backoff_ms")]
+    pub backoff_ms: u16,
+}
+
+impl Default for JevRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_jev_retry_max_attempts(),
+            backoff_ms: default_jev_retry_backoff_ms(),
+        }
+    }
+}
+
+impl JevRetryConfig {
+    fn validate_into(&self, scope: &str, errors: &mut Vec<SmartRoutingConfigError>) {
+        if self.max_attempts > 2 {
+            errors.push(SmartRoutingConfigError::new(
+                field(scope, "max_attempts"),
+                format!("is {}; expected an integer in 0..=2", self.max_attempts),
+            ));
+        }
+        if self.backoff_ms == 0 || self.backoff_ms > 10_000 {
+            errors.push(SmartRoutingConfigError::new(
+                field(scope, "backoff_ms"),
+                format!("is {}; expected an integer in 1..=10000", self.backoff_ms),
+            ));
+        }
+    }
+}
+
+/// Per-dimension weights for the Jev composite complexity score.
+///
+/// Weights are finite, non-negative, and must not all be zero; the composite
+/// computation normalizes them to sum to one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DimensionWeights {
+    #[serde(default = "default_jev_dimension_weight")]
+    pub reasoning_depth: f64,
+    #[serde(default = "default_jev_dimension_weight")]
+    pub tool_coupling: f64,
+    #[serde(default = "default_jev_dimension_weight")]
+    pub context_synthesis: f64,
+    #[serde(default = "default_jev_dimension_weight")]
+    pub output_precision: f64,
+    #[serde(default = "default_jev_dimension_weight")]
+    pub domain_load: f64,
+    #[serde(default = "default_jev_dimension_weight")]
+    pub ambiguity: f64,
+}
+
+impl Default for DimensionWeights {
+    fn default() -> Self {
+        Self {
+            reasoning_depth: default_jev_dimension_weight(),
+            tool_coupling: default_jev_dimension_weight(),
+            context_synthesis: default_jev_dimension_weight(),
+            output_precision: default_jev_dimension_weight(),
+            domain_load: default_jev_dimension_weight(),
+            ambiguity: default_jev_dimension_weight(),
+        }
+    }
+}
+
+impl DimensionWeights {
+    /// Six (dimension name, weight) pairs in stable rubric order.
+    pub fn as_slice(&self) -> [(&'static str, f64); 6] {
+        [
+            ("reasoning_depth", self.reasoning_depth),
+            ("tool_coupling", self.tool_coupling),
+            ("context_synthesis", self.context_synthesis),
+            ("output_precision", self.output_precision),
+            ("domain_load", self.domain_load),
+            ("ambiguity", self.ambiguity),
+        ]
+    }
+
+    fn validate_into(&self, scope: &str, errors: &mut Vec<SmartRoutingConfigError>) {
+        let pairs = self.as_slice();
+        let mut all_valid = true;
+        let mut total = 0.0;
+        for (name, value) in pairs {
+            if !value.is_finite() || value < 0.0 {
+                all_valid = false;
+                errors.push(SmartRoutingConfigError::new(
+                    field(scope, name),
+                    format!("is {value}; expected a finite non-negative weight"),
+                ));
+            } else {
+                total += value;
+            }
+        }
+        if all_valid && total <= 0.0 {
+            errors.push(SmartRoutingConfigError::new(
+                scope,
+                format!("weights sum to {total}; expected a positive total (not all zero)"),
+            ));
+        }
+    }
+}
+
+/// Configuration for the Jev (System One) complexity classifier.
+///
+/// `base_url` points at any provider serving the System One evaluation
+/// endpoint; the default is TypeSafe. `model` is either `auto` (discover and
+/// select the latest Jev-capable model at the configured URL) or a concrete
+/// model identifier used verbatim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JevConfig {
+    /// Plaintext API key. Prefer `api_key_env`; stored encrypted at rest by
+    /// the admin mutation path when written through the admin API.
+    #[serde(default, skip_serializing)]
+    pub api_key: Option<String>,
+    /// Encrypted API key persisted by admin mutation paths.
+    #[serde(default)]
+    pub api_key_encrypted: Option<String>,
+    /// Environment variable name holding the API key, or a literal key when
+    /// no matching environment variable exists (provider `api_key_env`
+    /// semantics).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// System One endpoint base URL. TLS is required.
+    #[serde(default = "default_jev_base_url")]
+    pub base_url: String,
+    /// `auto` (default) or a concrete Jev model identifier.
+    #[serde(default = "default_jev_model")]
+    pub model: String,
+    /// Per-call timeout in milliseconds (250..=2000).
+    #[serde(default = "default_jev_timeout_ms")]
+    pub timeout_ms: u16,
+    #[serde(default = "default_jev_min_confidence")]
+    pub min_confidence: f64,
+    #[serde(default = "default_jev_min_task_confidence")]
+    pub min_task_confidence: f64,
+    #[serde(default)]
+    pub retry: JevRetryConfig,
+    /// Character budget for state assembly sent to the endpoint.
+    #[serde(default = "default_jev_char_budget")]
+    pub char_budget: usize,
+    /// TTL for model-discovery results in seconds.
+    #[serde(default = "default_jev_discovery_ttl_secs")]
+    pub discovery_ttl_secs: u64,
+    #[serde(default)]
+    pub dimension_weights: DimensionWeights,
+    #[serde(default)]
+    pub fallback_policy: JevFallbackPolicy,
+}
+
+impl Default for JevConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            api_key_encrypted: None,
+            api_key_env: None,
+            base_url: default_jev_base_url(),
+            model: default_jev_model(),
+            timeout_ms: default_jev_timeout_ms(),
+            min_confidence: default_jev_min_confidence(),
+            min_task_confidence: default_jev_min_task_confidence(),
+            retry: JevRetryConfig::default(),
+            char_budget: default_jev_char_budget(),
+            discovery_ttl_secs: default_jev_discovery_ttl_secs(),
+            dimension_weights: DimensionWeights::default(),
+            fallback_policy: JevFallbackPolicy::default(),
+        }
+    }
+}
+
+impl JevConfig {
+    /// Resolve the API key: explicit `api_key` first, then `api_key_env` as
+    /// an environment variable name, then `api_key_env` as a literal value.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Some(key) = self.api_key.as_deref() {
+            if !key.trim().is_empty() {
+                return Some(key.trim().to_string());
+            }
+        }
+        if let Some(encrypted) = self.api_key_encrypted.as_deref() {
+            if let Ok(key) = crate::secrets::decrypt_provider_secret(encrypted) {
+                if !key.trim().is_empty() {
+                    return Some(key.trim().to_string());
+                }
+            }
+        }
+        let reference = self.api_key_env.as_deref()?.trim();
+        if reference.is_empty() {
+            return None;
+        }
+        if crate::secrets::is_env_var_reference(reference) {
+            std::env::var(reference)
+                .ok()
+                .or_else(|| Some(reference.to_string()))
+        } else {
+            Some(reference.to_string())
+        }
+    }
+
+    pub fn has_encrypted_api_key(&self) -> bool {
+        self.api_key_encrypted
+            .as_deref()
+            .is_some_and(crate::secrets::is_encrypted_secret)
+    }
+
+    /// True when any API-key input is configured.
+    pub fn has_api_key_configured(&self) -> bool {
+        self.api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+            || self.has_encrypted_api_key()
+            || self
+                .api_key_env
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    pub fn trust_override(&self) -> JevTrustOverride {
+        JevTrustOverride {
+            min_confidence: self.min_confidence,
+            min_task_confidence: self.min_task_confidence,
+            fallback_policy: self.fallback_policy,
+        }
+    }
+
+    fn validate_into(&self, scope: &str, errors: &mut Vec<SmartRoutingConfigError>) {
+        validate_optional_text(
+            &field(scope, "base_url"),
+            &self.base_url,
+            MAX_JEV_URL_CHARS,
+            errors,
+        );
+        if let Some(url_error) = validate_jev_base_url(&self.base_url) {
+            errors.push(SmartRoutingConfigError::new(
+                field(scope, "base_url"),
+                url_error,
+            ));
+        }
+        validate_optional_text(
+            &field(scope, "model"),
+            &self.model,
+            MAX_MODEL_NAME_CHARS,
+            errors,
+        );
+        if self.timeout_ms < MIN_JEV_TIMEOUT_MS || self.timeout_ms > MAX_JEV_TIMEOUT_MS {
+            errors.push(SmartRoutingConfigError::new(
+                field(scope, "timeout_ms"),
+                format!(
+                    "is {}; expected an integer in {MIN_JEV_TIMEOUT_MS}..={MAX_JEV_TIMEOUT_MS}",
+                    self.timeout_ms
+                ),
+            ));
+        }
+        validate_finite_closed_unit(&field(scope, "min_confidence"), self.min_confidence, errors);
+        validate_finite_closed_unit(
+            &field(scope, "min_task_confidence"),
+            self.min_task_confidence,
+            errors,
+        );
+        self.retry.validate_into(&field(scope, "retry"), errors);
+        if self.char_budget < MIN_JEV_CHAR_BUDGET || self.char_budget > MAX_JEV_CHAR_BUDGET {
+            errors.push(SmartRoutingConfigError::new(
+                field(scope, "char_budget"),
+                format!(
+                    "is {}; expected an integer in {MIN_JEV_CHAR_BUDGET}..={MAX_JEV_CHAR_BUDGET}",
+                    self.char_budget
+                ),
+            ));
+        }
+        if self.discovery_ttl_secs == 0 || self.discovery_ttl_secs > MAX_JEV_DISCOVERY_TTL_SECS {
+            errors.push(SmartRoutingConfigError::new(
+                field(scope, "discovery_ttl_secs"),
+                format!(
+                    "is {}; expected an integer in 1..={MAX_JEV_DISCOVERY_TTL_SECS}",
+                    self.discovery_ttl_secs
+                ),
+            ));
+        }
+        self.dimension_weights
+            .validate_into(&field(scope, "dimension_weights"), errors);
+    }
+}
+
+/// Validate a Jev base URL: must parse as http(s), must be TLS, must not
+/// carry a query or fragment. Returns a description when invalid.
+fn validate_jev_base_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let parsed = reqwest::Url::parse(trimmed).ok()?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            return Some(format!(
+                "uses insecure scheme http; TLS (https) is required"
+            ))
+        }
+        scheme => return Some(format!("uses unsupported scheme {scheme}; expected https")),
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Some("must not include a query or fragment".to_string());
+    }
+    None
+}
+
+fn default_jev_base_url() -> String {
+    DEFAULT_JEV_BASE_URL.to_string()
+}
+
+fn default_jev_model() -> String {
+    JEV_AUTO_MODEL.to_string()
+}
+
+fn default_jev_timeout_ms() -> u16 {
+    1_000
+}
+
+fn default_jev_min_confidence() -> f64 {
+    0.60
+}
+
+fn default_jev_min_task_confidence() -> f64 {
+    0.50
+}
+
+fn default_jev_retry_max_attempts() -> u8 {
+    2
+}
+
+fn default_jev_retry_backoff_ms() -> u16 {
+    200
+}
+
+fn default_jev_char_budget() -> usize {
+    1_024
+}
+
+fn default_jev_discovery_ttl_secs() -> u64 {
+    600
+}
+
+fn default_jev_dimension_weight() -> f64 {
+    1.0 / 6.0
+}
 /// Per-model-group partial routing settings.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -401,6 +856,8 @@ pub struct SmartRoutingOverride {
     pub heuristic_weights: Option<HeuristicWeights>,
     #[serde(default)]
     pub composite_weights: Option<CompositeWeights>,
+    #[serde(default)]
+    pub jev_trust: Option<JevTrustOverride>,
     #[serde(default)]
     pub streaming_cascade_mode: Option<StreamingCascadeMode>,
     #[serde(default)]
@@ -630,6 +1087,8 @@ pub struct RoutingPolicySnapshot {
     pub ml_model_path: Option<String>,
     #[serde(default)]
     pub classifier_model: Option<String>,
+    #[serde(default)]
+    pub jev_trust: Option<JevTrustOverride>,
     #[serde(default = "default_cost_quality_threshold")]
     pub cost_quality_threshold: f64,
     #[serde(default)]
@@ -657,6 +1116,7 @@ impl Default for RoutingPolicySnapshot {
             classifier: ClassifierMode::Heuristic,
             ml_model_path: None,
             classifier_model: None,
+            jev_trust: None,
             cost_quality_threshold: default_cost_quality_threshold(),
             cascade: CascadeConfig::default(),
             tier_boundaries: TierBoundaries::default(),
@@ -677,6 +1137,11 @@ impl From<&SmartRoutingConfig> for RoutingPolicySnapshot {
             classifier: config.classifier,
             ml_model_path: config.ml_model_path.clone(),
             classifier_model: config.classifier_model.clone(),
+            jev_trust: config.jev.as_ref().map(|jev| JevTrustOverride {
+                min_confidence: jev.min_confidence,
+                min_task_confidence: jev.min_task_confidence,
+                fallback_policy: jev.fallback_policy,
+            }),
             cost_quality_threshold: config.cost_quality_threshold,
             cascade: config.cascade.clone(),
             tier_boundaries: config.tier_boundaries.clone(),
@@ -752,6 +1217,10 @@ impl RoutingPolicySnapshot {
         }
         if let Some(weights) = &self.composite_weights {
             weights.validate_into(&field(scope, "composite_weights"), errors);
+        }
+
+        if let Some(jev_trust) = &self.jev_trust {
+            jev_trust.validate_into(&field(scope, "jev_trust"), errors);
         }
         self.online_optimizer
             .validate_into(&field(scope, "online_optimizer"), errors);
@@ -1914,5 +2383,221 @@ ab_test:
             &invalid.validate().unwrap_err(),
             "ab_test.variant_percentage",
         );
+    }
+    #[test]
+    fn jev_mode_without_key_is_rejected() {
+        let mut config = SmartRoutingConfig::default();
+        config.enabled = true;
+        config.classifier = ClassifierMode::Jev;
+        assert_has_field(&config.validate().unwrap_err(), "jev.api_key");
+    }
+
+    #[test]
+    fn jev_mode_with_key_and_defaults_is_accepted() {
+        let mut config = SmartRoutingConfig::default();
+        config.enabled = true;
+        config.classifier = ClassifierMode::Jev;
+        let mut jev = JevConfig::default();
+        jev.api_key_env = Some("JEV_API_KEY".to_string());
+        config.jev = Some(jev);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn jev_base_url_must_be_tls() {
+        let mut config = SmartRoutingConfig::default();
+        let mut jev = JevConfig::default();
+        jev.base_url = "http://api.typesafe.ai".to_string();
+        config.jev = Some(jev);
+        assert_has_field(&config.validate().unwrap_err(), "jev.base_url");
+
+        config.jev.as_mut().unwrap().base_url = "ftp://api.typesafe.ai".to_string();
+        assert_has_field(&config.validate().unwrap_err(), "jev.base_url");
+
+        config.jev.as_mut().unwrap().base_url = "https://api.typesafe.ai?token=1".to_string();
+        assert_has_field(&config.validate().unwrap_err(), "jev.base_url");
+
+        config.jev.as_mut().unwrap().base_url = "https://openrouter.ai/api".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn jev_timeout_and_budget_bounds_are_enforced() {
+        let mut config = SmartRoutingConfig::default();
+        config.jev = Some(JevConfig::default());
+
+        config.jev.as_mut().unwrap().timeout_ms = 100;
+        assert_has_field(&config.validate().unwrap_err(), "jev.timeout_ms");
+
+        config.jev.as_mut().unwrap().timeout_ms = 5_000;
+        assert_has_field(&config.validate().unwrap_err(), "jev.timeout_ms");
+
+        config.jev.as_mut().unwrap().timeout_ms = 1_000;
+        config.jev.as_mut().unwrap().char_budget = 10;
+        assert_has_field(&config.validate().unwrap_err(), "jev.char_budget");
+
+        config.jev.as_mut().unwrap().char_budget = 1_024;
+        config.jev.as_mut().unwrap().discovery_ttl_secs = 0;
+        assert_has_field(&config.validate().unwrap_err(), "jev.discovery_ttl_secs");
+
+        config.jev.as_mut().unwrap().discovery_ttl_secs = 600;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn jev_all_zero_dimension_weights_are_rejected() {
+        let mut config = SmartRoutingConfig::default();
+        let mut jev = JevConfig::default();
+        jev.dimension_weights = DimensionWeights {
+            reasoning_depth: 0.0,
+            tool_coupling: 0.0,
+            context_synthesis: 0.0,
+            output_precision: 0.0,
+            domain_load: 0.0,
+            ambiguity: 0.0,
+        };
+        config.jev = Some(jev);
+        assert_has_field(&config.validate().unwrap_err(), "jev.dimension_weights");
+    }
+
+    #[test]
+    fn jev_trust_override_merges_into_effective_config() {
+        let mut config = SmartRoutingConfig::default();
+        config.classifier = ClassifierMode::Jev;
+        let mut jev = JevConfig::default();
+        jev.api_key_env = Some("JEV_API_KEY".to_string());
+        jev.min_confidence = 0.7;
+        config.jev = Some(jev);
+
+        config.model_group_overrides.insert(
+            "trusted-group".to_string(),
+            SmartRoutingOverride {
+                jev_trust: Some(JevTrustOverride {
+                    min_confidence: 0.9,
+                    min_task_confidence: 0.8,
+                    fallback_policy: JevFallbackPolicy::Blend,
+                }),
+                ..Default::default()
+            },
+        );
+
+        let effective = config.effective_for_group("trusted-group");
+        let effective_jev = effective.jev.as_ref().unwrap();
+        assert_eq!(effective_jev.min_confidence, 0.9);
+        assert_eq!(effective_jev.min_task_confidence, 0.8);
+        assert_eq!(effective_jev.fallback_policy, JevFallbackPolicy::Blend);
+        assert_eq!(effective_jev.base_url, "https://api.typesafe.ai");
+
+        let other = config.effective_for_group("other-group");
+        assert_eq!(other.jev.as_ref().unwrap().min_confidence, 0.7);
+    }
+
+    #[test]
+    fn jev_policy_snapshot_carries_trust_without_secrets() {
+        let mut config = SmartRoutingConfig::default();
+        let mut jev = JevConfig::default();
+        jev.api_key = Some("literal-secret".to_string());
+        jev.min_confidence = 0.75;
+        config.jev = Some(jev);
+
+        let snapshot = RoutingPolicySnapshot::from(&config);
+        let trust = snapshot.jev_trust.as_ref().unwrap();
+        assert_eq!(trust.min_confidence, 0.75);
+        assert!(snapshot.jev_trust.is_some());
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("literal-secret"));
+        assert!(!json.contains("api_key"));
+    }
+
+    #[test]
+    fn override_jev_classifier_requires_global_credentials() {
+        let mut config = SmartRoutingConfig::default();
+        config.enabled = true;
+        config.model_group_overrides.insert(
+            "code".to_string(),
+            SmartRoutingOverride {
+                classifier: Some(ClassifierMode::Jev),
+                ..Default::default()
+            },
+        );
+
+        assert_has_field(
+            &config.validate().unwrap_err(),
+            "model_group_overrides.code.classifier",
+        );
+
+        config.jev = Some({
+            let mut jev = JevConfig::default();
+            jev.api_key_env = Some("JEV_API_KEY".to_string());
+            jev
+        });
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn ab_test_jev_arm_requires_global_credentials() {
+        let mut config = SmartRoutingConfig::default();
+        config.enabled = true;
+        config.ab_test = Some(ABTestConfig {
+            variant: RoutingPolicySnapshot {
+                classifier: ClassifierMode::Jev,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        assert_has_field(
+            &config.validate().unwrap_err(),
+            "ab_test.variant.classifier",
+        );
+
+        config.jev = Some({
+            let mut jev = JevConfig::default();
+            jev.api_key_env = Some("JEV_API_KEY".to_string());
+            jev
+        });
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn encrypted_jev_key_resolves_and_counts_as_configured() {
+        let plaintext = "jev-literal-key";
+        let encrypted = crate::secrets::encrypt_provider_secret(plaintext).unwrap();
+
+        let mut jev = JevConfig::default();
+        jev.api_key_encrypted = Some(encrypted.clone());
+        assert!(jev.has_api_key_configured());
+        assert_eq!(jev.resolve_api_key().as_deref(), Some(plaintext));
+
+        // Serialized config keeps the encrypted field and never the literal.
+        let yaml = serde_yaml::to_string(&jev).unwrap();
+        assert!(yaml.contains("api_key_encrypted"));
+        assert!(!yaml.contains(plaintext));
+
+        // Round-trip preserves the encrypted key.
+        let restored: JevConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            restored.api_key_encrypted.as_deref(),
+            Some(encrypted.as_str())
+        );
+        assert_eq!(restored.resolve_api_key().as_deref(), Some(plaintext));
+    }
+
+    #[test]
+    fn jev_config_serde_round_trip_preserves_defaults() {
+        let jev: JevConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(jev.base_url, "https://api.typesafe.ai");
+        assert_eq!(jev.model, "auto");
+        assert_eq!(jev.timeout_ms, 1_000);
+        assert_eq!(jev.min_confidence, 0.60);
+        assert_eq!(jev.min_task_confidence, 0.50);
+        assert_eq!(jev.char_budget, 1_024);
+        assert_eq!(jev.discovery_ttl_secs, 600);
+        assert_eq!(jev.retry.max_attempts, 2);
+        assert_eq!(jev.fallback_policy, JevFallbackPolicy::Fallback);
+
+        let yaml = serde_yaml::to_string(&jev).unwrap();
+        assert!(!yaml.contains("literal-secret"));
+        assert!(!yaml.contains("api_key: some"));
     }
 }

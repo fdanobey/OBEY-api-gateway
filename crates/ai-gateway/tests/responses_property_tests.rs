@@ -15,11 +15,9 @@ use serde_json::{json, Value};
 use ai_gateway::models::openai::OpenAIRequest;
 use ai_gateway::responses::{
     translate, EasyInputContent, EasyInputMessage, FunctionCall, FunctionCallOutput,
-    FunctionCallOutputContent, InputItem, ResponsesInput, ResponsesRequest,
-    ResponsesSseEvent, ResponsesStreamTranslator, ResponsesUsage, TranslationContext,
-    TypedInputItem,
+    FunctionCallOutputContent, InputItem, ResponsesInput, ResponsesRequest, ResponsesSseEvent,
+    ResponsesStreamTranslator, ResponsesUsage, TranslationContext, TypedInputItem,
 };
-
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -90,25 +88,63 @@ fn event_type(event: &ResponsesSseEvent) -> &'static str {
 
 fn sequence_number(event: &ResponsesSseEvent) -> u64 {
     match event {
-        ResponsesSseEvent::Created { sequence_number, .. }
-        | ResponsesSseEvent::InProgress { sequence_number, .. }
-        | ResponsesSseEvent::Queued { sequence_number, .. }
-        | ResponsesSseEvent::Completed { sequence_number, .. }
-        | ResponsesSseEvent::Failed { sequence_number, .. }
-        | ResponsesSseEvent::Incomplete { sequence_number, .. }
-        | ResponsesSseEvent::OutputItemAdded { sequence_number, .. }
-        | ResponsesSseEvent::OutputItemDone { sequence_number, .. }
-        | ResponsesSseEvent::ContentPartAdded { sequence_number, .. }
-        | ResponsesSseEvent::ContentPartDone { sequence_number, .. }
-        | ResponsesSseEvent::OutputTextDelta { sequence_number, .. }
-        | ResponsesSseEvent::OutputTextDone { sequence_number, .. }
-        | ResponsesSseEvent::RefusalDelta { sequence_number, .. }
-        | ResponsesSseEvent::RefusalDone { sequence_number, .. }
-        | ResponsesSseEvent::FunctionCallArgumentsDelta { sequence_number, .. }
-        | ResponsesSseEvent::FunctionCallArgumentsDone { sequence_number, .. }
-        | ResponsesSseEvent::ReasoningSummaryPartAdded { sequence_number, .. }
-        | ResponsesSseEvent::ReasoningSummaryTextDelta { sequence_number, .. }
-        | ResponsesSseEvent::ReasoningTextDelta { sequence_number, .. } => *sequence_number,
+        ResponsesSseEvent::Created {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::InProgress {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::Queued {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::Completed {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::Failed {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::Incomplete {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::OutputItemAdded {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::OutputItemDone {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::ContentPartAdded {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::ContentPartDone {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::OutputTextDelta {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::OutputTextDone {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::RefusalDelta {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::RefusalDone {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::FunctionCallArgumentsDelta {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::FunctionCallArgumentsDone {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::ReasoningSummaryPartAdded {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::ReasoningSummaryTextDelta {
+            sequence_number, ..
+        }
+        | ResponsesSseEvent::ReasoningTextDelta {
+            sequence_number, ..
+        } => *sequence_number,
     }
 }
 
@@ -154,10 +190,7 @@ fn build_sse_body(text: &str) -> String {
 /// Parse a raw SSE fragment, extracting complete `data: {json}` lines.
 ///
 /// Returns the parsed JSON values and the leftover (incomplete) buffer.
-fn parse_sse_fragment(
-    buffer: &mut String,
-    fragment: &str,
-) -> Vec<Value> {
+fn parse_sse_fragment(buffer: &mut String, fragment: &str) -> Vec<Value> {
     buffer.push_str(fragment);
     let mut chunks = Vec::new();
     while let Some(pos) = buffer.find("\n\n") {
@@ -373,7 +406,11 @@ proptest! {
 fn split_at_zero_recovers_all_chunks() {
     let body = build_sse_body("Hello world from the gateway");
     let chunks = split_and_parse_sse(&body, 0);
-    assert_eq!(chunks.len(), 3, "should parse 3 chat chunks (role, content, finish)");
+    assert_eq!(
+        chunks.len(),
+        3,
+        "should parse 3 chat chunks (role, content, finish)"
+    );
 }
 
 #[test]

@@ -494,9 +494,7 @@ impl OptionalClassifier for OnnxMlAdapter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match classifier.score(&text) {
-            Ok(score) => Ok(ClassifierOutput {
-                score: f64::from(score.value()),
-            }),
+            Ok(score) => Ok(ClassifierOutput::score(f64::from(score.value()))),
             Err(error) => {
                 tracing::warn!(error = %error, "ML classifier inference failed");
                 Err(ClassifierFailure::Backend)

@@ -93,8 +93,8 @@ impl ReasoningCompatConfig {
     /// - every budget in the effort map is >= 1024
     /// - a custom effort map is complete (all five efforts present)
     /// - `per_provider` override keys reference known provider names
-/// - per-provider override effort maps satisfy the same budget rules
-pub fn validate(&self, known_providers: &[&str]) -> Result<(), Vec<String>> {
+    /// - per-provider override effort maps satisfy the same budget rules
+    pub fn validate(&self, known_providers: &[&str]) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         if let Err(map_errors) = self.effort_budget_map.validate() {
@@ -125,9 +125,7 @@ pub fn validate(&self, known_providers: &[&str]) -> Result<(), Vec<String>> {
 }
 
 /// Reasoning effort level (OpenAI-style `reasoning_effort` values).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
     Minimal,
@@ -199,7 +197,12 @@ pub struct EffortBudgetMap(pub HashMap<Effort, u32>);
 
 impl Default for EffortBudgetMap {
     fn default() -> Self {
-        Self(Effort::ALL.iter().map(|&e| (e, e.default_budget())).collect())
+        Self(
+            Effort::ALL
+                .iter()
+                .map(|&e| (e, e.default_budget()))
+                .collect(),
+        )
     }
 }
 
@@ -207,11 +210,14 @@ impl EffortBudgetMap {
     /// Budget for an effort, falling back to the effort's default when the
     /// entry is absent.
     pub fn budget_for(&self, effort: Effort) -> u32 {
-        self.0.get(&effort).copied().unwrap_or_else(|| effort.default_budget())
+        self.0
+            .get(&effort)
+            .copied()
+            .unwrap_or_else(|| effort.default_budget())
     }
 
-/// Validate: complete (all five efforts) and every budget >= 1024.
-pub fn validate(&self) -> Result<(), Vec<String>> {
+    /// Validate: complete (all five efforts) and every budget >= 1024.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         for effort in Effort::ALL {
@@ -254,8 +260,8 @@ pub struct ProviderReasoningOverride {
 }
 
 impl ProviderReasoningOverride {
-/// Validate the override's effort map when present.
-pub fn validate(&self) -> Result<(), Vec<String>> {
+    /// Validate the override's effort map when present.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
         match &self.effort_budget_map {
             Some(map) => map.validate(),
             None => Ok(()),
@@ -358,14 +364,19 @@ mod tests {
 
     #[test]
     fn incomplete_effort_map_is_rejected() {
-        let config: ReasoningCompatConfig = serde_yaml::from_str(
-            "effort_budget_map:\n  minimal: 2048\n  high: 16384\n",
-        )
-        .expect("partial map parses at the serde layer");
+        let config: ReasoningCompatConfig =
+            serde_yaml::from_str("effort_budget_map:\n  minimal: 2048\n  high: 16384\n")
+                .expect("partial map parses at the serde layer");
         let errors = config.validate(&[]).unwrap_err();
-        assert!(errors.iter().any(|e| e.contains("missing required effort 'low'")));
-        assert!(errors.iter().any(|e| e.contains("missing required effort 'medium'")));
-        assert!(errors.iter().any(|e| e.contains("missing required effort 'xhigh'")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("missing required effort 'low'")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("missing required effort 'medium'")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("missing required effort 'xhigh'")));
     }
 
     #[test]
@@ -382,10 +393,9 @@ mod tests {
 
     #[test]
     fn unknown_provider_override_is_rejected() {
-        let config: ReasoningCompatConfig = serde_yaml::from_str(
-            "per_provider:\n  ghost:\n    strip_on_model_change: false\n",
-        )
-        .expect("override parses at the serde layer");
+        let config: ReasoningCompatConfig =
+            serde_yaml::from_str("per_provider:\n  ghost:\n    strip_on_model_change: false\n")
+                .expect("override parses at the serde layer");
         let errors = config.validate(&["openai", "anthropic"]).unwrap_err();
         assert!(errors
             .iter()
@@ -402,7 +412,11 @@ mod tests {
         let override_config = config.per_provider.get("openai").unwrap();
         assert_eq!(override_config.strip_on_model_change, Some(false));
         assert_eq!(
-            override_config.effort_budget_map.as_ref().unwrap().budget_for(Effort::XHigh),
+            override_config
+                .effort_budget_map
+                .as_ref()
+                .unwrap()
+                .budget_for(Effort::XHigh),
             65536
         );
     }
@@ -460,7 +474,10 @@ mod tests {
         let shapes = [
             (ReasoningParamShape::ThinkingBudget, "thinking_budget"),
             (ReasoningParamShape::Adaptive, "adaptive"),
-            (ReasoningParamShape::ReasoningMaxTokens, "reasoning_max_tokens"),
+            (
+                ReasoningParamShape::ReasoningMaxTokens,
+                "reasoning_max_tokens",
+            ),
             (ReasoningParamShape::ReasoningEffort, "reasoning_effort"),
             (ReasoningParamShape::None, "none"),
         ];

@@ -232,3 +232,39 @@ tray:
 #   passthrough_enabled: true         # true token-by-token streaming for compatible providers
 #   chunk_timeout_seconds: 60         # max gap between provider SSE chunks
 #   retry_on_truncation: true         # fail over when a response is truncated (finish_reason=length)
+
+# Smart model routing (optional). Jev is a calibrated System One classifier
+# optimized for fast typed decisions. TypeSafe is the default endpoint, but
+# any compatible provider such as OpenRouter may be used.
+# smart_routing:
+#   enabled: true
+#   classifier: jev
+#   cost_quality_threshold: 0.5
+#   tier_boundaries:
+#     fast_max: 0.33
+#     balanced_max: 0.66
+#   jev:
+#     api_key_env: JEV_API_KEY
+#     base_url: "https://api.typesafe.ai"
+#     # Third-party example (provider must expose /v1/models + /v1/systemone):
+#     # base_url: "https://openrouter.ai/api"
+#     model: auto # discovers and selects the latest Jev-capable model
+#     timeout_ms: 1000
+#     min_confidence: 0.60
+#     min_task_confidence: 0.50
+#     fallback_policy: fallback # fallback | blend
+#     char_budget: 1024
+#     discovery_ttl_secs: 600
+#     retry:
+#       max_attempts: 2
+#       backoff_ms: 200
+#     dimension_weights:
+#       reasoning_depth: 0.1666666667
+#       tool_coupling: 0.1666666667
+#       context_synthesis: 0.1666666667
+#       output_precision: 0.1666666667
+#       domain_load: 0.1666666667
+#       ambiguity: 0.1666666667
+#   cascade:
+#     enabled: true
+#     max_escalations: 2

@@ -243,7 +243,10 @@ async fn post_chat_json(
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 /// JSON bodies the mock provider received, in order.
@@ -411,7 +414,8 @@ async fn cross_model_failover_strips_thinking() {
         "unexpected actions payload: {actions}"
     );
     assert!(
-        actions.contains(r#""thinking_blocks":1"#) && actions.contains(r#""redacted_thinking_blocks":1"#),
+        actions.contains(r#""thinking_blocks":1"#)
+            && actions.contains(r#""redacted_thinking_blocks":1"#),
         "carrier counts must be recorded: {actions}"
     );
 }
@@ -482,7 +486,13 @@ async fn same_model_preserves_thinking_verbatim() {
     config.providers = vec![provider("manual-only", &upstream.uri())];
     config.model_groups = vec![group(
         "compat-group",
-        vec![reasoning_model("manual-only", "claude-4-5-sonnet", 1, None, None)],
+        vec![reasoning_model(
+            "manual-only",
+            "claude-4-5-sonnet",
+            1,
+            None,
+            None,
+        )],
     )];
     common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -570,7 +580,11 @@ async fn same_model_via_affinity_preserves() {
     sticky.verify().await;
 
     let bodies = received_bodies(&sticky).await;
-    assert_eq!(bodies.len(), 2, "both turns must be served by the sticky provider");
+    assert_eq!(
+        bodies.len(),
+        2,
+        "both turns must be served by the sticky provider"
+    );
     for (index, body) in bodies.iter().enumerate() {
         assert_eq!(body["model"], "claude-4-5-sonnet", "turn {index}");
         let content = &body["messages"][2]["content"];
@@ -598,7 +612,13 @@ async fn reasoning_effort_normalized_for_anthropic_manual() {
     config.providers = vec![provider("manual-name-only", &upstream.uri())];
     config.model_groups = vec![group(
         "compat-group",
-        vec![reasoning_model("manual-name-only", "claude-4-5-sonnet", 1, None, None)],
+        vec![reasoning_model(
+            "manual-name-only",
+            "claude-4-5-sonnet",
+            1,
+            None,
+            None,
+        )],
     )];
     common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -635,7 +655,13 @@ async fn reasoning_effort_adaptive_for_47() {
     config.providers = vec![provider("adaptive-name-only", &upstream.uri())];
     config.model_groups = vec![group(
         "compat-group",
-        vec![reasoning_model("adaptive-name-only", "claude-4-7-sonnet", 1, None, None)],
+        vec![reasoning_model(
+            "adaptive-name-only",
+            "claude-4-7-sonnet",
+            1,
+            None,
+            None,
+        )],
     )];
     common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -669,7 +695,13 @@ async fn reasoning_effort_kept_for_openai_reasoning() {
     config.providers = vec![provider("openai-reasoning-name", &upstream.uri())];
     config.model_groups = vec![group(
         "compat-group",
-        vec![reasoning_model("openai-reasoning-name", "o3", 1, None, None)],
+        vec![reasoning_model(
+            "openai-reasoning-name",
+            "o3",
+            1,
+            None,
+            None,
+        )],
     )];
     common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -716,7 +748,13 @@ async fn budget_replaces_bedrock_hardcode() {
     config.providers = vec![bedrock_provider("bedrock-mock", &upstream.uri())];
     config.model_groups = vec![group(
         "compat-group",
-        vec![reasoning_model("bedrock-mock", "claude-4-5-sonnet", 1, None, None)],
+        vec![reasoning_model(
+            "bedrock-mock",
+            "claude-4-5-sonnet",
+            1,
+            None,
+            None,
+        )],
     )];
     common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -768,7 +806,13 @@ async fn bedrock_legacy_hardcode_when_compat_disabled() {
     config.providers = vec![bedrock_provider("bedrock-mock", &upstream.uri())];
     config.model_groups = vec![group(
         "compat-group",
-        vec![reasoning_model("bedrock-mock", "claude-4-5-sonnet", 1, None, None)],
+        vec![reasoning_model(
+            "bedrock-mock",
+            "claude-4-5-sonnet",
+            1,
+            None,
+            None,
+        )],
     )];
     common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -887,7 +931,11 @@ async fn thinking_400_triggers_aggressive_strip_retry() {
     mount_success(&upstream, plain_usage(), 1).await;
 
     let (status, _) = post_chat_json(app, thinking_history_request("follow up")).await;
-    assert_eq!(status, StatusCode::OK, "aggressive strip retry must succeed");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "aggressive strip retry must succeed"
+    );
 
     let bodies = received_bodies(&upstream).await;
     assert_eq!(bodies.len(), 2, "exactly two attempts on the same provider");

@@ -561,10 +561,7 @@ mod tests {
             classify_family("claude-opus-4-1"),
             ReasoningFamily::AnthropicManual
         );
-        assert_eq!(
-            classify_family("o3-mini"),
-            ReasoningFamily::OpenAIReasoning
-        );
+        assert_eq!(classify_family("o3-mini"), ReasoningFamily::OpenAIReasoning);
         assert_eq!(classify_family("deepseek-chat"), ReasoningFamily::DeepSeek);
         assert_eq!(classify_family("gemini-2.0"), ReasoningFamily::Gemini);
         assert_eq!(classify_family("grok-3"), ReasoningFamily::XAI);
@@ -573,20 +570,56 @@ mod tests {
 
     #[test]
     fn classify_family_extended_matrix() {
-        assert_eq!(classify_family("claude-3-5-sonnet-20241022-v2:0"), ReasoningFamily::AnthropicManual);
-        assert_eq!(classify_family("claude-sonnet-4-5"), ReasoningFamily::AnthropicManual);
-        assert_eq!(classify_family("claude-sonnet-4-7"), ReasoningFamily::AnthropicAdaptive);
-        assert_eq!(classify_family("claude-opus-4-7"), ReasoningFamily::AnthropicAdaptive);
-        assert_eq!(classify_family("claude-4.7-sonnet"), ReasoningFamily::AnthropicAdaptive);
-        assert_eq!(classify_family("claude-5-sonnet"), ReasoningFamily::AnthropicAdaptive);
-        assert_eq!(classify_family("claude-opus-5"), ReasoningFamily::AnthropicAdaptive);
-        assert_eq!(classify_family("anthropic.claude-4-7-sonnet-v1:0"), ReasoningFamily::AnthropicAdaptive);
-        assert_eq!(classify_family("openrouter/anthropic/claude-3.5-sonnet"), ReasoningFamily::OpenRouter);
-        assert_eq!(classify_family("o1-preview"), ReasoningFamily::OpenAIReasoning);
+        assert_eq!(
+            classify_family("claude-3-5-sonnet-20241022-v2:0"),
+            ReasoningFamily::AnthropicManual
+        );
+        assert_eq!(
+            classify_family("claude-sonnet-4-5"),
+            ReasoningFamily::AnthropicManual
+        );
+        assert_eq!(
+            classify_family("claude-sonnet-4-7"),
+            ReasoningFamily::AnthropicAdaptive
+        );
+        assert_eq!(
+            classify_family("claude-opus-4-7"),
+            ReasoningFamily::AnthropicAdaptive
+        );
+        assert_eq!(
+            classify_family("claude-4.7-sonnet"),
+            ReasoningFamily::AnthropicAdaptive
+        );
+        assert_eq!(
+            classify_family("claude-5-sonnet"),
+            ReasoningFamily::AnthropicAdaptive
+        );
+        assert_eq!(
+            classify_family("claude-opus-5"),
+            ReasoningFamily::AnthropicAdaptive
+        );
+        assert_eq!(
+            classify_family("anthropic.claude-4-7-sonnet-v1:0"),
+            ReasoningFamily::AnthropicAdaptive
+        );
+        assert_eq!(
+            classify_family("openrouter/anthropic/claude-3.5-sonnet"),
+            ReasoningFamily::OpenRouter
+        );
+        assert_eq!(
+            classify_family("o1-preview"),
+            ReasoningFamily::OpenAIReasoning
+        );
         assert_eq!(classify_family("o4-mini"), ReasoningFamily::OpenAIReasoning);
-        assert_eq!(classify_family("gpt-5-mini"), ReasoningFamily::OpenAIReasoning);
+        assert_eq!(
+            classify_family("gpt-5-mini"),
+            ReasoningFamily::OpenAIReasoning
+        );
         assert_eq!(classify_family("deepseek-r1"), ReasoningFamily::DeepSeek);
-        assert_eq!(classify_family("gemini-2.0-flash-thinking"), ReasoningFamily::Gemini);
+        assert_eq!(
+            classify_family("gemini-2.0-flash-thinking"),
+            ReasoningFamily::Gemini
+        );
         assert_eq!(classify_family("grok-4"), ReasoningFamily::XAI);
         assert_eq!(classify_family("gpt-4-turbo"), ReasoningFamily::None);
         assert_eq!(classify_family("llama-3-1-70b"), ReasoningFamily::None);

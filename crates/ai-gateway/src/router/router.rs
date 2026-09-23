@@ -8,8 +8,8 @@ use crate::compression::{
     CompressiblePayload, CompressionContext,
 };
 use crate::config::{
-    CacheAwareRouting, Config, ContextConfig, ModelGroup, Provider, ProviderModel,
-    PromptCacheSupport,
+    CacheAwareRouting, Config, ContextConfig, ModelGroup, PromptCacheSupport, Provider,
+    ProviderModel,
 };
 use crate::context::ContextManager;
 use crate::dashboard::CompressionEventHub;
@@ -21,8 +21,9 @@ use crate::memory::{
 use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
 use crate::providers::bedrock::{
     apply_global_inference_prefix, apply_global_inference_profile,
-    is_duplicate_compaction_trigger_error, model_supports_reasoning, normalize_mantle_chat_messages,
-    normalize_mantle_compaction_triggers, sanitize_mantle_chat_request, BedrockProvider,
+    is_duplicate_compaction_trigger_error, model_supports_reasoning,
+    normalize_mantle_chat_messages, normalize_mantle_compaction_triggers,
+    sanitize_mantle_chat_request, BedrockProvider,
 };
 use crate::providers::{ProviderClient, ProviderResponse};
 use crate::reasoning_compat::{self, AttemptReport};
@@ -41,8 +42,6 @@ use tracing::{debug, info, warn};
 
 const PRECOMPRESSED_CACHE_MARKER_KEY: &str = "cache_control";
 const PRECOMPRESSED_CACHE_MARKER_TYPE: &str = "obey_precompressed_context";
-
-
 
 /// Adapter that lets the Codex Search agent loop resubmit through the
 /// normal dispatch pipeline (`attempt_with_retry`) for any provider.
@@ -85,7 +84,9 @@ impl ProviderClient for SearchResubmitter<'_> {
         _request: OpenAIRequest,
     ) -> Result<
         std::pin::Pin<
-            Box<dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>> + Send>,
+            Box<
+                dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>> + Send,
+            >,
         >,
         GatewayError,
     > {
@@ -243,10 +244,10 @@ use super::{CircuitBreaker, LatencyTracker, RateLimiter};
 /// request would have cost with zero cache. Can be negative when a
 /// cache-creation premium exceeds the read discount.
 fn cache_savings_cents(model: &ProviderModel, usage: &Usage, actual_cost: f64) -> i64 {
-let baseline_cost = (usage.prompt_tokens as f64 * model.cost_per_million_input_tokens
-+ usage.completion_tokens as f64 * model.cost_per_million_output_tokens)
-/ 1_000_000.0;
-((baseline_cost - actual_cost) * 100.0).round() as i64
+    let baseline_cost = (usage.prompt_tokens as f64 * model.cost_per_million_input_tokens
+        + usage.completion_tokens as f64 * model.cost_per_million_output_tokens)
+        / 1_000_000.0;
+    ((baseline_cost - actual_cost) * 100.0).round() as i64
 }
 
 /// Records prompt-cache token telemetry for a provider response
@@ -254,17 +255,17 @@ let baseline_cost = (usage.prompt_tokens as f64 * model.cost_per_million_input_t
 /// versus the uncached baseline. Keeps the success-path call sites
 /// one-liners.
 fn record_cache_usage(
-metrics: &crate::metrics::Metrics,
-provider: &str,
-model: &ProviderModel,
-usage: &Usage,
-actual_cost: f64,
+    metrics: &crate::metrics::Metrics,
+    provider: &str,
+    model: &ProviderModel,
+    usage: &Usage,
+    actual_cost: f64,
 ) {
-metrics.add_cache_usage(
-provider,
-extract_cache_usage(usage),
-cache_savings_cents(model, usage, actual_cost),
-);
+    metrics.add_cache_usage(
+        provider,
+        extract_cache_usage(usage),
+        cache_savings_cents(model, usage, actual_cost),
+    );
 }
 
 fn smart_routing_tier_name(tier: crate::smart_routing::tier::SmartRoutingTier) -> &'static str {
@@ -283,6 +284,7 @@ fn smart_routing_classifier_name(
         crate::smart_routing::tier::ClassifierUsed::Ml => "ml",
         crate::smart_routing::tier::ClassifierUsed::Llm => "llm",
         crate::smart_routing::tier::ClassifierUsed::Composite => "composite",
+        crate::smart_routing::tier::ClassifierUsed::Jev => "jev",
     }
 }
 
@@ -334,14 +336,14 @@ pub struct Router {
     oauth_usage_tracker: Option<Arc<crate::oauth::UsageTracker>>,
     /// Codex Search Prometheus metrics (tool executions + latency).
     search_metrics: Arc<crate::codex::search::metrics::SearchMetrics>,
-/// Adaptively learned set of `provider::model` combinations whose model
-/// emits XML-style tool calls (instead of native `tool_calls`). Populated
-/// at runtime when a response is detected to contain XML tool use.
-/// Subsequent tool requests for a learned combo take the buffer-and-
-/// translate path and receive the tool-calling hint. Entries are sticky
-/// for the process lifetime: un-marking a combo mid-session would make
-/// the hint appear and disappear between turns, which models flag as a
-/// prompt-injection pattern. In-memory only — resets on process restart.
+    /// Adaptively learned set of `provider::model` combinations whose model
+    /// emits XML-style tool calls (instead of native `tool_calls`). Populated
+    /// at runtime when a response is detected to contain XML tool use.
+    /// Subsequent tool requests for a learned combo take the buffer-and-
+    /// translate path and receive the tool-calling hint. Entries are sticky
+    /// for the process lifetime: un-marking a combo mid-session would make
+    /// the hint appear and disappear between turns, which models flag as a
+    /// prompt-injection pattern. In-memory only — resets on process restart.
     xml_tool_combos: Arc<std::sync::RwLock<HashSet<String>>>,
 
     /// `provider::model` combos observed ending a *streamed* turn with reasoning
@@ -419,14 +421,14 @@ struct ProviderPassThroughTarget {
 impl Router {
     fn build_smart_router(
         smart_routing_config: crate::smart_routing::config::SmartRoutingConfig,
+        metrics: &Arc<crate::metrics::Metrics>,
     ) -> Option<Arc<SmartRouter>> {
         if !smart_routing_config.enabled {
             return None;
         }
         SmartRouter::new(smart_routing_config.clone())
             .map(|router| {
-        #[cfg_attr(not(feature = "ml-router"), allow(unused_mut))]
-        let mut router = router;
+                let mut router = router.with_metrics(metrics.clone());
         #[cfg(feature = "ml-router")]
                 if matches!(
                     smart_routing_config.classifier,
@@ -453,7 +455,50 @@ impl Router {
                         }
                     }
                 }
+                if matches!(
+                    smart_routing_config.classifier,
+                    crate::smart_routing::config::ClassifierMode::Jev
+                ) {
+                    match smart_routing_config
+                        .jev
+                        .as_ref()
+                        .and_then(|jev| {
+                            jev.resolve_api_key()
+                                .map(|key| (jev, key))
+                        })
+                        .map(|(jev, key)| {
+                            crate::smart_routing::jev::classifier::JevClassifier::new(
+                                crate::smart_routing::config::JevConfig {
+                                    api_key: Some(key),
+                                    ..jev.clone()
+                                },
+                            )
+                        })
+                    {
+                        Some(Ok(classifier)) => {
+                            classifier.prime_discovery();
+                            router = router.with_jev_classifier(Arc::new(classifier));
+                            tracing::info!(
+                                base_url = %smart_routing_config.jev.as_ref().map(|jev| jev.base_url.as_str()).unwrap_or(""),
+                                model = %smart_routing_config.jev.as_ref().map(|jev| jev.model.as_str()).unwrap_or(""),
+                                "Smart-routing Jev classifier loaded"
+                            );
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                error = ?error,
+                                "Smart-routing Jev classifier unavailable; falling back to heuristic"
+                            );
+                        }
+                        None => {
+                            tracing::warn!(
+                                "Smart-routing Jev classifier API key unresolvable; falling back to heuristic"
+                            );
+                        }
+                    }
+                }
                 if smart_routing_config.budget_limits.is_empty() {
+
                     return router;
                 }
                 let state_path = smart_routing_config
@@ -481,7 +526,7 @@ impl Router {
         config: crate::smart_routing::config::SmartRoutingConfig,
     ) -> Result<(), String> {
         let replacement = if config.enabled {
-            Self::build_smart_router(config.clone())
+            Self::build_smart_router(config.clone(), &self.metrics)
                 .ok_or_else(|| "failed to initialize Smart Router replacement".to_string())?
                 .into()
         } else {
@@ -504,40 +549,48 @@ impl Router {
             .clone()
     }
 
-/// Create a new Router with the given configuration
-/// Builds the sticky-routing cache from the effective cache-aware
-/// routing config. A disabled feature (or a zero stickiness TTL)
-/// produces a zero-TTL cache whose lookups always miss (Req 1.4).
-/// The reasoning-compat conversation-model-affinity feature (Task 6)
-/// rides the same prefix→provider entries, so it also needs a live
-/// TTL; `stickiness_ttl_seconds` (default 300) is the shared knob.
-fn sticky_cache_from_config(
-cache_aware_routing: &CacheAwareRouting,
-reasoning_compat: &reasoning_compat::ReasoningCompatConfig,
-) -> StickyCache {
-let affinity_enabled =
-reasoning_compat.enabled && reasoning_compat.conversation_model_affinity;
-if (cache_aware_routing.enabled || affinity_enabled)
-&& cache_aware_routing.stickiness_ttl_seconds > 0
-{
-StickyCache::new(Duration::from_secs(cache_aware_routing.stickiness_ttl_seconds))
-} else {
-StickyCache::new(Duration::ZERO)
-}
-}
+    /// Create a new Router with the given configuration
+    /// Builds the sticky-routing cache from the effective cache-aware
+    /// routing config. A disabled feature (or a zero stickiness TTL)
+    /// produces a zero-TTL cache whose lookups always miss (Req 1.4).
+    /// The reasoning-compat conversation-model-affinity feature (Task 6)
+    /// rides the same prefix→provider entries, so it also needs a live
+    /// TTL; `stickiness_ttl_seconds` (default 300) is the shared knob.
+    fn sticky_cache_from_config(
+        cache_aware_routing: &CacheAwareRouting,
+        reasoning_compat: &reasoning_compat::ReasoningCompatConfig,
+    ) -> StickyCache {
+        let affinity_enabled =
+            reasoning_compat.enabled && reasoning_compat.conversation_model_affinity;
+        if (cache_aware_routing.enabled || affinity_enabled)
+            && cache_aware_routing.stickiness_ttl_seconds > 0
+        {
+            StickyCache::new(Duration::from_secs(
+                cache_aware_routing.stickiness_ttl_seconds,
+            ))
+        } else {
+            StickyCache::new(Duration::ZERO)
+        }
+    }
 
-pub fn new(config: Arc<RwLock<Config>>, metrics: Arc<crate::metrics::Metrics>) -> Self {
-let (context_config, compression_config, smart_routing_config, cache_aware_routing, reasoning_compat) = {
-let cfg = config.try_read().expect("config lock");
-(
-cfg.context.clone(),
-cfg.compression.clone(),
-cfg.smart_routing.clone(),
-cfg.cache_aware_routing.clone(),
-cfg.reasoning_compat.clone(),
-)
-};
-        let smart_router = Self::build_smart_router(smart_routing_config.clone());
+    pub fn new(config: Arc<RwLock<Config>>, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        let (
+            context_config,
+            compression_config,
+            smart_routing_config,
+            cache_aware_routing,
+            reasoning_compat,
+        ) = {
+            let cfg = config.try_read().expect("config lock");
+            (
+                cfg.context.clone(),
+                cfg.compression.clone(),
+                cfg.smart_routing.clone(),
+                cfg.cache_aware_routing.clone(),
+                cfg.reasoning_compat.clone(),
+            )
+        };
+        let smart_router = Self::build_smart_router(smart_routing_config.clone(), &metrics);
         if smart_routing_config.enabled {
             metrics.enable_smart_routing();
         }
@@ -563,27 +616,27 @@ cfg.reasoning_compat.clone(),
             search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
-}
-}
+            sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
+        }
+    }
 
-/// Create a new Router with explicit context configuration
-#[allow(dead_code)]
-pub fn with_context_config(
-config: Arc<RwLock<Config>>,
-context_config: ContextConfig,
-metrics: Arc<crate::metrics::Metrics>,
-) -> Self {
-let (compression_config, smart_routing_config, cache_aware_routing, reasoning_compat) = {
-let cfg = config.try_read().expect("config lock");
-(
-cfg.compression.clone(),
-cfg.smart_routing.clone(),
-cfg.cache_aware_routing.clone(),
-cfg.reasoning_compat.clone(),
-)
-};
-        let smart_router = Self::build_smart_router(smart_routing_config.clone());
+    /// Create a new Router with explicit context configuration
+    #[allow(dead_code)]
+    pub fn with_context_config(
+        config: Arc<RwLock<Config>>,
+        context_config: ContextConfig,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Self {
+        let (compression_config, smart_routing_config, cache_aware_routing, reasoning_compat) = {
+            let cfg = config.try_read().expect("config lock");
+            (
+                cfg.compression.clone(),
+                cfg.smart_routing.clone(),
+                cfg.cache_aware_routing.clone(),
+                cfg.reasoning_compat.clone(),
+            )
+        };
+        let smart_router = Self::build_smart_router(smart_routing_config.clone(), &metrics);
         if smart_routing_config.enabled {
             metrics.enable_smart_routing();
         }
@@ -606,14 +659,14 @@ cfg.reasoning_compat.clone(),
             oauth_manager: None,
             instructions_store: None,
             oauth_usage_tracker: None,
-search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
+            search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
-}
-}
+            sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
+        }
+    }
 
-/// Attach an [`OAuthManager`](crate::oauth::OAuthManager) so providers
+    /// Attach an [`OAuthManager`](crate::oauth::OAuthManager) so providers
     /// configured with `auth_method: oauth` can resolve a Bearer access token
     /// per request. Called once during gateway startup (task 14.1).
     pub fn set_oauth_manager(&mut self, manager: Arc<crate::oauth::OAuthManager>) {
@@ -1204,51 +1257,55 @@ sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_co
         stats.savings_percent > 50.0
     }
 
-/// Get the instructions store (used by admin test-connection endpoint).
-pub fn instructions_store(&self) -> Option<Arc<crate::codex::InstructionsStore>> {
-self.instructions_store.clone()
-}
+    /// Get the instructions store (used by admin test-connection endpoint).
+    pub fn instructions_store(&self) -> Option<Arc<crate::codex::InstructionsStore>> {
+        self.instructions_store.clone()
+    }
 
-/// Get the OAuth manager (used by Responses API Codex native dispatch).
-pub fn oauth_manager(&self) -> Option<Arc<crate::oauth::OAuthManager>> {
-self.oauth_manager.clone()
-}
+    /// Get the OAuth manager (used by Responses API Codex native dispatch).
+    pub fn oauth_manager(&self) -> Option<Arc<crate::oauth::OAuthManager>> {
+        self.oauth_manager.clone()
+    }
 
-/// Get the OAuth usage tracker (used by Responses API Codex native dispatch).
-pub fn oauth_usage_tracker(&self) -> Option<Arc<crate::oauth::UsageTracker>> {
-self.oauth_usage_tracker.clone()
-}
+    /// Get the OAuth usage tracker (used by Responses API Codex native dispatch).
+    pub fn oauth_usage_tracker(&self) -> Option<Arc<crate::oauth::UsageTracker>> {
+        self.oauth_usage_tracker.clone()
+    }
 
-/// Get or create an HTTP client for a provider.
-pub fn get_http_client(&self, provider_name: &str, config: &crate::config::ProviderConnectionPoolConfig) -> Result<reqwest::Client, GatewayError> {
-self.get_or_create_http_client(provider_name, config)
-}
+    /// Get or create an HTTP client for a provider.
+    pub fn get_http_client(
+        &self,
+        provider_name: &str,
+        config: &crate::config::ProviderConnectionPoolConfig,
+    ) -> Result<reqwest::Client, GatewayError> {
+        self.get_or_create_http_client(provider_name, config)
+    }
 
-/// Resolve the first candidate provider for a model group.
-/// Returns `(provider_config, provider_model)` if found.
-/// Used by the Responses API handler to detect Codex providers.
-pub async fn first_provider_for_model(
-&self,
-model: &str,
-) -> Result<Option<(Provider, ProviderModel)>, GatewayError> {
-let model_group = self.find_model_group(model).await?;
-let candidates = self.select_provider_order(&model_group).await;
+    /// Resolve the first candidate provider for a model group.
+    /// Returns `(provider_config, provider_model)` if found.
+    /// Used by the Responses API handler to detect Codex providers.
+    pub async fn first_provider_for_model(
+        &self,
+        model: &str,
+    ) -> Result<Option<(Provider, ProviderModel)>, GatewayError> {
+        let model_group = self.find_model_group(model).await?;
+        let candidates = self.select_provider_order(&model_group).await;
 
-let Some(first) = candidates.into_iter().next() else {
-return Ok(None);
-};
+        let Some(first) = candidates.into_iter().next() else {
+            return Ok(None);
+        };
 
-let config = self.config.read().await;
-let provider_cfg = config
-.providers
-.iter()
-.find(|p| p.name == first.provider)
-.cloned();
+        let config = self.config.read().await;
+        let provider_cfg = config
+            .providers
+            .iter()
+            .find(|p| p.name == first.provider)
+            .cloned();
 
-Ok(provider_cfg.map(|p| (p, first)))
-}
+        Ok(provider_cfg.map(|p| (p, first)))
+    }
 
-/// Find the model group containing the requested model
+    /// Find the model group containing the requested model
     ///
     /// Returns the model group if found, or an error if the model is not configured
     pub async fn find_model_group(&self, model: &str) -> Result<ModelGroup, GatewayError> {
@@ -1465,20 +1522,19 @@ Ok(provider_cfg.map(|p| (p, first)))
         candidates
     }
 
-/// Whether sticky/affinity routing is active right now: the cache-aware
-/// feature flag must be enabled with a positive stickiness TTL
-/// (`stickiness_ttl_seconds: 0` disables stickiness, Req 1.4), OR the
-/// reasoning-compat conversation-model-affinity feature must be on
-/// (Task 6) — it records and consults the same prefix→provider entries
-/// for source-model attribution in strip/preserve decisions.
-async fn sticky_routing_enabled(&self) -> bool {
-let config = self.config.read().await;
-let cache_cfg = &config.cache_aware_routing;
-let reasoning_cfg = &config.reasoning_compat;
-(cache_cfg.enabled
-|| (reasoning_cfg.enabled && reasoning_cfg.conversation_model_affinity))
-&& cache_cfg.stickiness_ttl_seconds > 0
-}
+    /// Whether sticky/affinity routing is active right now: the cache-aware
+    /// feature flag must be enabled with a positive stickiness TTL
+    /// (`stickiness_ttl_seconds: 0` disables stickiness, Req 1.4), OR the
+    /// reasoning-compat conversation-model-affinity feature must be on
+    /// (Task 6) — it records and consults the same prefix→provider entries
+    /// for source-model attribution in strip/preserve decisions.
+    async fn sticky_routing_enabled(&self) -> bool {
+        let config = self.config.read().await;
+        let cache_cfg = &config.cache_aware_routing;
+        let reasoning_cfg = &config.reasoning_compat;
+        (cache_cfg.enabled || (reasoning_cfg.enabled && reasoning_cfg.conversation_model_affinity))
+            && cache_cfg.stickiness_ttl_seconds > 0
+    }
 
     /// Promotes the sticky provider for `request`'s conversation prefix to
     /// the head of `candidates` (Req 1.2).
@@ -1547,43 +1603,43 @@ let reasoning_cfg = &config.reasoning_compat;
         if !self.sticky_routing_enabled().await {
             return;
         }
-let prefix_hash = StickyCache::compute_prefix_hash(request);
-self.sticky_cache.insert(
-prefix_hash,
-provider.to_string(),
-model.to_string(),
-Some(extract_cache_usage(usage)),
-);
-debug!(provider = %provider, model = %model, prefix_hash, "sticky_recorded");
-}
+        let prefix_hash = StickyCache::compute_prefix_hash(request);
+        self.sticky_cache.insert(
+            prefix_hash,
+            provider.to_string(),
+            model.to_string(),
+            Some(extract_cache_usage(usage)),
+        );
+        debug!(provider = %provider, model = %model, prefix_hash, "sticky_recorded");
+    }
 
-/// Source-model attribution for the reasoning-compat strip/preserve
-/// policy (reasoning-failover-compat spec, Req 6.4): resolves the
-/// conversation-prefix affinity entry to a policy
-/// [`ModelRef`](reasoning_compat::policy::ModelRef) describing the
-/// provider + model that last served this conversation.
-///
-/// Returns `None` when the affinity feature is off (zero overhead: no
-/// prefix hash, no lookup) or when no fresh affinity entry exists for
-/// this prefix (first turn, TTL expired, or config hot-reload cleared
-/// the cache) — the policy then falls back to family matching.
-/// Synchronous and lock-free: a single DashMap read.
-fn model_affinity_source(
-&self,
-request: &OpenAIRequest,
-reasoning_compat_cfg: &reasoning_compat::ReasoningCompatConfig,
-) -> Option<reasoning_compat::policy::ModelRef> {
-if !reasoning_compat_cfg.conversation_model_affinity {
-return None;
-}
-let prefix_hash = StickyCache::compute_prefix_hash(request);
-let (provider, model) = self.sticky_cache.get_model_affinity(prefix_hash)?;
-Some(reasoning_compat::policy::ModelRef {
-provider,
-family: reasoning_compat::detect::classify_family(&model),
-model,
-})
-}
+    /// Source-model attribution for the reasoning-compat strip/preserve
+    /// policy (reasoning-failover-compat spec, Req 6.4): resolves the
+    /// conversation-prefix affinity entry to a policy
+    /// [`ModelRef`](reasoning_compat::policy::ModelRef) describing the
+    /// provider + model that last served this conversation.
+    ///
+    /// Returns `None` when the affinity feature is off (zero overhead: no
+    /// prefix hash, no lookup) or when no fresh affinity entry exists for
+    /// this prefix (first turn, TTL expired, or config hot-reload cleared
+    /// the cache) — the policy then falls back to family matching.
+    /// Synchronous and lock-free: a single DashMap read.
+    fn model_affinity_source(
+        &self,
+        request: &OpenAIRequest,
+        reasoning_compat_cfg: &reasoning_compat::ReasoningCompatConfig,
+    ) -> Option<reasoning_compat::policy::ModelRef> {
+        if !reasoning_compat_cfg.conversation_model_affinity {
+            return None;
+        }
+        let prefix_hash = StickyCache::compute_prefix_hash(request);
+        let (provider, model) = self.sticky_cache.get_model_affinity(prefix_hash)?;
+        Some(reasoning_compat::policy::ModelRef {
+            provider,
+            family: reasoning_compat::detect::classify_family(&model),
+            model,
+        })
+    }
 
     /// Applies prompt-cache decorations to an outgoing provider request:
     /// gateway-computed `cache_control` breakpoints for explicit-cache
@@ -1613,7 +1669,8 @@ model,
                 .insert("session_id".to_string(), serde_json::json!(session_id));
             debug!(session_id = %session_id, prefix_hash, "openrouter_session_id_attached");
         }
-        if let Some(PromptCacheSupport::Explicit { max_breakpoints }) = &provider_model.cache_support
+        if let Some(PromptCacheSupport::Explicit { max_breakpoints }) =
+            &provider_model.cache_support
         {
             let cache_min_tokens = provider_model
                 .cache_min_tokens
@@ -1855,44 +1912,40 @@ model,
         // no cache fields.
         {
             let config = self.config.read().await;
-            let model_entry = config
-                .model_groups
-                .iter()
-                .find_map(|group| {
-                    group
-                        .models
-                        .iter()
-                        .find(|m| m.provider == provider && m.model == model)
-                });
-        match model_entry {
-            Some(model_entry) => {
-                let cost = compute_actual_cost(model_entry, usage);
-                self.metrics.add_cost(provider, cost);
-                record_cache_usage(&self.metrics, provider, model_entry, usage, cost);
-                // Reasoning-token attribution (Req 4.7) for pass-through
-                // streams: the relay's reassembled usage carries the
-                // provider's reasoning-token field; price it at the
-                // dedicated (or output-fallback) rate when attribution is
-                // enabled. No response object exists here, so there are no
-                // gateway_* extras to attach — metrics only.
-                let reasoning_usage =
-                    reasoning_compat::cost::extract_reasoning_usage(usage);
-                if reasoning_usage.reasoning_tokens > 0
-                    && config.reasoning_compat.attribute_reasoning_cost
-                {
-                    let reasoning_cost = reasoning_compat::cost::reasoning_cost(
-                        model_entry,
-                        reasoning_usage.reasoning_tokens,
-                    );
-                    self.metrics.add_reasoning_usage(
-                        provider,
-                        u64::from(reasoning_usage.reasoning_tokens),
-                        reasoning_cost,
-                    );
+            let model_entry = config.model_groups.iter().find_map(|group| {
+                group
+                    .models
+                    .iter()
+                    .find(|m| m.provider == provider && m.model == model)
+            });
+            match model_entry {
+                Some(model_entry) => {
+                    let cost = compute_actual_cost(model_entry, usage);
+                    self.metrics.add_cost(provider, cost);
+                    record_cache_usage(&self.metrics, provider, model_entry, usage, cost);
+                    // Reasoning-token attribution (Req 4.7) for pass-through
+                    // streams: the relay's reassembled usage carries the
+                    // provider's reasoning-token field; price it at the
+                    // dedicated (or output-fallback) rate when attribution is
+                    // enabled. No response object exists here, so there are no
+                    // gateway_* extras to attach — metrics only.
+                    let reasoning_usage = reasoning_compat::cost::extract_reasoning_usage(usage);
+                    if reasoning_usage.reasoning_tokens > 0
+                        && config.reasoning_compat.attribute_reasoning_cost
+                    {
+                        let reasoning_cost = reasoning_compat::cost::reasoning_cost(
+                            model_entry,
+                            reasoning_usage.reasoning_tokens,
+                        );
+                        self.metrics.add_reasoning_usage(
+                            provider,
+                            u64::from(reasoning_usage.reasoning_tokens),
+                            reasoning_cost,
+                        );
+                    }
                 }
+                None => self.metrics.record_provider_unknown_cost(provider),
             }
-            None => self.metrics.record_provider_unknown_cost(provider),
-        }
         }
 
         // Cache-aware sticky routing (Req 1.1): upsert the prefix→provider
@@ -1902,126 +1955,130 @@ model,
             .await;
     }
 
-/// Detect and strip image content parts from messages when the target
-/// model does not support vision inputs.
-///
-/// OpenAI-style messages can carry `content` as an array of parts
-/// including `{ "type": "image_url", "image_url": { ... } }`. Many
-/// providers respond with HTTP 400 if such parts reach a non-vision
-/// model. This method removes those parts and logs that fact.
-///
-/// Recognizes the common image part type spellings across client
-/// libraries (`image_url`, `image`, `input_image`) at every nesting
-/// depth — including image parts inside a `tool_result` part's own
-/// `content` array, which clients send when a tool returned an image.
-/// When stripping empties a content array entirely (top-level or
-/// nested), a short text placeholder is inserted so the provider never
-/// sees an empty content array.
-fn strip_image_content_if_unsupported(
-    request: &mut OpenAIRequest,
-    supports_vision: bool,
-    provider_name: &str,
-    model: &str,
-) -> usize {
-    if supports_vision {
-        return 0;
-    }
-
-    let mut stripped_total: usize = 0;
-    for (idx, msg) in request.messages.iter_mut().enumerate() {
-        if let serde_json::Value::Array(parts) = &mut msg.content {
-            let removed = Self::strip_image_parts_recursive(parts, idx, provider_name, model);
-            if removed > 0 && parts.is_empty() {
-                parts.push(serde_json::json!({
-                    "type": "text",
-                    "text": "[image content removed: model does not support image inputs]"
-                }));
-            }
-            stripped_total += removed;
+    /// Detect and strip image content parts from messages when the target
+    /// model does not support vision inputs.
+    ///
+    /// OpenAI-style messages can carry `content` as an array of parts
+    /// including `{ "type": "image_url", "image_url": { ... } }`. Many
+    /// providers respond with HTTP 400 if such parts reach a non-vision
+    /// model. This method removes those parts and logs that fact.
+    ///
+    /// Recognizes the common image part type spellings across client
+    /// libraries (`image_url`, `image`, `input_image`) at every nesting
+    /// depth — including image parts inside a `tool_result` part's own
+    /// `content` array, which clients send when a tool returned an image.
+    /// When stripping empties a content array entirely (top-level or
+    /// nested), a short text placeholder is inserted so the provider never
+    /// sees an empty content array.
+    fn strip_image_content_if_unsupported(
+        request: &mut OpenAIRequest,
+        supports_vision: bool,
+        provider_name: &str,
+        model: &str,
+    ) -> usize {
+        if supports_vision {
+            return 0;
         }
-    }
-    stripped_total
-}
 
-/// Recursively remove image content parts from a `content` array and
-/// from nested `content` arrays inside surviving parts (e.g.
-/// `{"type":"tool_result","content":[{"type":"image_url",...}]}`).
-/// Returns the total number of image parts removed at every depth.
-fn strip_image_parts_recursive(
-    parts: &mut Vec<serde_json::Value>,
-    message_index: usize,
-    provider_name: &str,
-    model: &str,
-) -> usize {
-    let mut stripped: usize = 0;
-
-    // First recurse into nested `content` arrays so images buried inside
-    // non-image parts (tool results, custom part shapes) are removed too.
-    for part in parts.iter_mut() {
-        if let Some(nested_value) = part.get_mut("content") {
-            if let serde_json::Value::Array(nested) = nested_value {
-                let nested_removed =
-                    Self::strip_image_parts_recursive(nested, message_index, provider_name, model);
-                if nested_removed > 0 && nested.is_empty() {
-                    nested.push(serde_json::json!({
+        let mut stripped_total: usize = 0;
+        for (idx, msg) in request.messages.iter_mut().enumerate() {
+            if let serde_json::Value::Array(parts) = &mut msg.content {
+                let removed = Self::strip_image_parts_recursive(parts, idx, provider_name, model);
+                if removed > 0 && parts.is_empty() {
+                    parts.push(serde_json::json!({
                         "type": "text",
                         "text": "[image content removed: model does not support image inputs]"
                     }));
                 }
-                stripped += nested_removed;
+                stripped_total += removed;
             }
         }
+        stripped_total
     }
 
-    // Then remove image parts at this level.
-    let before = parts.len();
-    parts.retain(|part| {
-        !matches!(
-            part.get("type").and_then(|v| v.as_str()),
-            Some("image_url") | Some("image") | Some("input_image")
-        )
-    });
-    let removed = before.saturating_sub(parts.len());
-    if removed > 0 {
-        warn!(
-            provider = provider_name,
-            model = %model,
-            message_index = message_index,
-            images_removed = removed,
-            "Stripped image content parts from message for non-vision model"
-        );
+    /// Recursively remove image content parts from a `content` array and
+    /// from nested `content` arrays inside surviving parts (e.g.
+    /// `{"type":"tool_result","content":[{"type":"image_url",...}]}`).
+    /// Returns the total number of image parts removed at every depth.
+    fn strip_image_parts_recursive(
+        parts: &mut Vec<serde_json::Value>,
+        message_index: usize,
+        provider_name: &str,
+        model: &str,
+    ) -> usize {
+        let mut stripped: usize = 0;
+
+        // First recurse into nested `content` arrays so images buried inside
+        // non-image parts (tool results, custom part shapes) are removed too.
+        for part in parts.iter_mut() {
+            if let Some(nested_value) = part.get_mut("content") {
+                if let serde_json::Value::Array(nested) = nested_value {
+                    let nested_removed = Self::strip_image_parts_recursive(
+                        nested,
+                        message_index,
+                        provider_name,
+                        model,
+                    );
+                    if nested_removed > 0 && nested.is_empty() {
+                        nested.push(serde_json::json!({
+                            "type": "text",
+                            "text": "[image content removed: model does not support image inputs]"
+                        }));
+                    }
+                    stripped += nested_removed;
+                }
+            }
+        }
+
+        // Then remove image parts at this level.
+        let before = parts.len();
+        parts.retain(|part| {
+            !matches!(
+                part.get("type").and_then(|v| v.as_str()),
+                Some("image_url") | Some("image") | Some("input_image")
+            )
+        });
+        let removed = before.saturating_sub(parts.len());
+        if removed > 0 {
+            warn!(
+                provider = provider_name,
+                model = %model,
+                message_index = message_index,
+                images_removed = removed,
+                "Stripped image content parts from message for non-vision model"
+            );
+        }
+        stripped + removed
     }
-    stripped + removed
-}
 
-/// Check whether an upstream rejection is caused by image content the
-/// model cannot accept, regardless of what the capabilities cache
-/// believed.
-///
-/// Providers phrase this differently ("This model does not support
-/// image inputs", "invalid content type: image", "does not support
-/// vision", …) and always with a 4xx status. A case-insensitive
-/// substring check over the body keeps the detection tolerant of the
-/// varied error envelopes.
-fn is_unsupported_image_error(status_code: u16, body: &str) -> bool {
-    (400..500).contains(&status_code) && Self::is_unsupported_image_phrasing(body)
-}
+    /// Check whether an upstream rejection is caused by image content the
+    /// model cannot accept, regardless of what the capabilities cache
+    /// believed.
+    ///
+    /// Providers phrase this differently ("This model does not support
+    /// image inputs", "invalid content type: image", "does not support
+    /// vision", …) and always with a 4xx status. A case-insensitive
+    /// substring check over the body keeps the detection tolerant of the
+    /// varied error envelopes.
+    fn is_unsupported_image_error(status_code: u16, body: &str) -> bool {
+        (400..500).contains(&status_code) && Self::is_unsupported_image_phrasing(body)
+    }
 
-/// Phrase-level detection of "model cannot accept image inputs" error
-/// text, independent of the HTTP status. Used for real 4xx rejections
-/// and for the error-inside-HTTP-200 envelopes some providers return.
-fn is_unsupported_image_phrasing(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    lower.contains("does not support image")
-        || lower.contains("not support image inputs")
-        || lower.contains("unsupported image")
-        || lower.contains("image inputs")
-        || lower.contains("image content")
-        || lower.contains("input_image")
-        || lower.contains("does not support vision")
-        || lower.contains("vision is not supported")
-        || lower.contains("not a vision model")
-        || lower.contains("only supports text")
+    /// Phrase-level detection of "model cannot accept image inputs" error
+    /// text, independent of the HTTP status. Used for real 4xx rejections
+    /// and for the error-inside-HTTP-200 envelopes some providers return.
+    fn is_unsupported_image_phrasing(body: &str) -> bool {
+        let lower = body.to_ascii_lowercase();
+        lower.contains("does not support image")
+            || lower.contains("not support image inputs")
+            || lower.contains("unsupported image")
+            || lower.contains("image inputs")
+            || lower.contains("image content")
+            || lower.contains("input_image")
+            || lower.contains("does not support vision")
+            || lower.contains("vision is not supported")
+            || lower.contains("not a vision model")
+            || lower.contains("only supports text")
     }
 
     /// Check whether an upstream 400 is an Anthropic-style thinking/budget
@@ -3300,12 +3357,12 @@ fn is_unsupported_image_phrasing(body: &str) -> bool {
                     codex_search_config.effective_base_url(),
                     codex_search_config.effective_timeout(),
                 ));
-let interceptor = crate::codex::search::interceptor::ToolInterceptor::new(
-executor,
-codex_search_config.effective_max_iterations(),
-codex_search_config.effective_output_to_chat(),
-codex_search_budget,
-);
+                let interceptor = crate::codex::search::interceptor::ToolInterceptor::new(
+                    executor,
+                    codex_search_config.effective_max_iterations(),
+                    codex_search_config.effective_output_to_chat(),
+                    codex_search_budget,
+                );
                 let intercepted = interceptor
                     .intercept(&codex_client, codex_request, result.response)
                     .await?;
@@ -3341,10 +3398,10 @@ codex_search_budget,
                     .unwrap_or_else(|| "us-east-1".to_string()),
                 Some(api_key),
                 Some(provider_cfg.max_connections),
-            Some(provider_cfg.effective_total_timeout(&provider_model.model)),
-            provider_cfg.effective_custom_headers(),
-        )
-        .await?;
+                Some(provider_cfg.effective_total_timeout(&provider_model.model)),
+                provider_cfg.effective_custom_headers(),
+            )
+            .await?;
             return Ok(self
                 .dispatch_buffered_with_context_retry(&bedrock_client, bedrock_request)
                 .await?
@@ -3413,9 +3470,9 @@ codex_search_budget,
         let provider_type = provider_cfg.provider_type.clone();
         let cross_region_inference = provider_cfg.cross_region_inference;
         let global_inference_profile = provider_cfg.global_inference_profile;
-let prompt_caching = provider_cfg.prompt_caching;
-let reasoning = provider_cfg.reasoning;
-let reasoning_compat_cfg = config.reasoning_compat.clone();
+        let prompt_caching = provider_cfg.prompt_caching;
+        let reasoning = provider_cfg.reasoning;
+        let reasoning_compat_cfg = config.reasoning_compat.clone();
         let provider_region = provider_cfg.region.clone();
         let is_oauth_provider = provider_cfg.auth_method.as_deref() == Some("oauth");
         let jitter_enabled = config.retry.jitter_enabled;
@@ -3451,19 +3508,19 @@ let reasoning_compat_cfg = config.reasoning_compat.clone();
         // attempt is transformed against its own target. `enabled: false`
         // skips everything (exact passthrough, Bedrock legacy block below
         // unchanged) and only emits a debug note when carriers were seen.
-let mut reasoning_report: Option<AttemptReport> = None;
-if reasoning_compat_cfg.enabled {
-// Source-model attribution (Task 6): the provider + model that
-// last served this conversation prefix, from the sticky cache.
-// None on a miss — the policy then falls back to family matching.
-let source_ref = self.model_affinity_source(request, &reasoning_compat_cfg);
-let report = reasoning_compat::prepare_attempt(
-&mut outgoing,
-request,
-source_ref,
-provider_model,
-&reasoning_compat_cfg,
-);
+        let mut reasoning_report: Option<AttemptReport> = None;
+        if reasoning_compat_cfg.enabled {
+            // Source-model attribution (Task 6): the provider + model that
+            // last served this conversation prefix, from the sticky cache.
+            // None on a miss — the policy then falls back to family matching.
+            let source_ref = self.model_affinity_source(request, &reasoning_compat_cfg);
+            let report = reasoning_compat::prepare_attempt(
+                &mut outgoing,
+                request,
+                source_ref,
+                provider_model,
+                &reasoning_compat_cfg,
+            );
             if report.strip.messages_touched > 0 || report.strip.thinking_blocks > 0 {
                 reasoning_compat::policy::log_strip_action(
                     &report.strip,
@@ -3615,22 +3672,22 @@ provider_model,
             Self::reverse_translate_tool_history(&mut outgoing.messages);
         }
 
-// Conditionally inject the tool-calling guide.
-//
-// Goal: make native OpenAI-style tool use clear for models that were
-// primarily trained on XML/pseudo-XML agent formats — without taxing
-// every capable model with uncached prompt tokens (and guidance that
-// conflicts with parallel tool calling).
-//
-// Injection targets **learned XML combos only** — models actually
-// observed emitting XML-style tool use — so models that call tools
-// natively never see unexplained instructions. Learned combos keep the
-// hint for the process lifetime; toggling it mid-session is the context
-// mutation that models flag as prompt injection. The hint is inserted
-// directly after the client's system prompt (see
-// [`Self::insert_tool_calling_hint`]) — not appended at the tail, where
-// a system message after user/tool content reads as an injection
-// attempt.
+        // Conditionally inject the tool-calling guide.
+        //
+        // Goal: make native OpenAI-style tool use clear for models that were
+        // primarily trained on XML/pseudo-XML agent formats — without taxing
+        // every capable model with uncached prompt tokens (and guidance that
+        // conflicts with parallel tool calling).
+        //
+        // Injection targets **learned XML combos only** — models actually
+        // observed emitting XML-style tool use — so models that call tools
+        // natively never see unexplained instructions. Learned combos keep the
+        // hint for the process lifetime; toggling it mid-session is the context
+        // mutation that models flag as prompt injection. The hint is inserted
+        // directly after the client's system prompt (see
+        // [`Self::insert_tool_calling_hint`]) — not appended at the tail, where
+        // a system message after user/tool content reads as an injection
+        // attempt.
         let inject_tool_hint =
             has_tools && self.should_inject_tool_hint(provider_name, &provider_model.model);
         if inject_tool_hint {
@@ -3659,11 +3716,11 @@ provider_model,
             &cache_aware_routing_cfg,
         );
 
-let mut last_error = None;
-// One-shot reactive image strip: when the provider rejects the request
-// with an "image inputs not supported" error despite the proactive
-// strip pass (stale/incorrect capabilities), remove the images and
-// retry the same provider once without waiting through backoff.
+        let mut last_error = None;
+        // One-shot reactive image strip: when the provider rejects the request
+        // with an "image inputs not supported" error despite the proactive
+        // strip pass (stale/incorrect capabilities), remove the images and
+        // retry the same provider once without waiting through backoff.
         let mut image_strip_retry_done = false;
         // One-shot reasoning-compat 400 recovery (see the 4xx branch
         // below): an Anthropic-style thinking/budget_tokens validation 400
@@ -3671,32 +3728,32 @@ let mut last_error = None;
         let mut reasoning_strip_retry_done = false;
         let mut skip_next_backoff = false;
 
-for attempt in 0..=max_retries {
-    let skip_backoff_this_attempt = skip_next_backoff;
-    skip_next_backoff = false;
-    if attempt > 0 && !skip_backoff_this_attempt {
-        // Defense-in-depth: never burn backoff time on a
-        // rate-limit-class error from the previous attempt. The
-        // explicit branches above already short-circuit, but if a
-        // future change adds another rate-limit code path this
-        // guard ensures we don't accidentally sleep through it.
-        if let Some(GatewayError::Provider {
-            status_code: Some(code),
-            message: prev_msg,
-            ..
-        }) = &last_error
-        {
-            if Self::is_rate_limited(*code, prev_msg) {
-                debug!(
-                    provider = provider_name,
-                    status = *code,
-                    "Skipping retry backoff for rate-limit-class error"
-                );
-                break;
-            }
-        }
+        for attempt in 0..=max_retries {
+            let skip_backoff_this_attempt = skip_next_backoff;
+            skip_next_backoff = false;
+            if attempt > 0 && !skip_backoff_this_attempt {
+                // Defense-in-depth: never burn backoff time on a
+                // rate-limit-class error from the previous attempt. The
+                // explicit branches above already short-circuit, but if a
+                // future change adds another rate-limit code path this
+                // guard ensures we don't accidentally sleep through it.
+                if let Some(GatewayError::Provider {
+                    status_code: Some(code),
+                    message: prev_msg,
+                    ..
+                }) = &last_error
+                {
+                    if Self::is_rate_limited(*code, prev_msg) {
+                        debug!(
+                            provider = provider_name,
+                            status = *code,
+                            "Skipping retry backoff for rate-limit-class error"
+                        );
+                        break;
+                    }
+                }
 
-        let backoff_secs = backoff_sequence
+                let backoff_secs = backoff_sequence
                     .get((attempt - 1) as usize)
                     .copied()
                     .unwrap_or(4);
@@ -3871,44 +3928,44 @@ for attempt in 0..=max_retries {
                                     });
                                 }
 
-			// Image-input rejection inside a 200 envelope: same rescue
-			// as the 4xx branch below — strip image parts (including
-			// nested ones) and retry the same provider once instead of
-			// failing over with images still attached.
-			if !image_strip_retry_done
-				&& Self::is_unsupported_image_phrasing(&body_text)
-			{
-				let removed = Self::strip_image_content_if_unsupported(
-					&mut outgoing,
-					false,
-					provider_name,
-					&provider_model.model,
-				);
-				if removed > 0 {
-					image_strip_retry_done = true;
-					skip_next_backoff = true;
-					info!(
-						provider = provider_name,
-						model = %provider_model.model,
-						images_removed = removed,
-						"Provider rejected image inputs (in HTTP 200 envelope) — stripped images and retrying same provider"
-					);
-					continue;
-				}
-			}
+                                // Image-input rejection inside a 200 envelope: same rescue
+                                // as the 4xx branch below — strip image parts (including
+                                // nested ones) and retry the same provider once instead of
+                                // failing over with images still attached.
+                                if !image_strip_retry_done
+                                    && Self::is_unsupported_image_phrasing(&body_text)
+                                {
+                                    let removed = Self::strip_image_content_if_unsupported(
+                                        &mut outgoing,
+                                        false,
+                                        provider_name,
+                                        &provider_model.model,
+                                    );
+                                    if removed > 0 {
+                                        image_strip_retry_done = true;
+                                        skip_next_backoff = true;
+                                        info!(
+                                            provider = provider_name,
+                                            model = %provider_model.model,
+                                            images_removed = removed,
+                                            "Provider rejected image inputs (in HTTP 200 envelope) — stripped images and retrying same provider"
+                                        );
+                                        continue;
+                                    }
+                                }
 
-			warn!(
-				provider = provider_name,
-				attempt,
-				error = %err_msg,
-				"Provider returned error inside HTTP 200 — treating as retryable"
-			);
-			last_error = Some(GatewayError::Provider {
-				provider: provider_name.to_string(),
-				message: format!("Error in 200 response: {}", err_msg),
-				status_code: Some(status_code),
-			});
-			continue;
+                                warn!(
+                                    provider = provider_name,
+                                    attempt,
+                                    error = %err_msg,
+                                    "Provider returned error inside HTTP 200 — treating as retryable"
+                                );
+                                last_error = Some(GatewayError::Provider {
+                                    provider: provider_name.to_string(),
+                                    message: format!("Error in 200 response: {}", err_msg),
+                                    status_code: Some(status_code),
+                                });
+                                continue;
                             }
                         }
 
@@ -3916,85 +3973,90 @@ for attempt in 0..=max_retries {
                         if let Ok(mut openai_response) =
                             serde_json::from_str::<OpenAIResponse>(&body_text)
                         {
-// Diagnostic: detect whether the model used native tool_calls
-// or fell back to XML-style tool use in plain text content.
-// This is the buffered-path feed of the same adaptive signal the
-// streaming relay uses: XML output marks the combo (hint +
-// buffer-and-translate). Native tool_calls need no action —
-// learned combos are intentionally sticky so the injected hint
-// never appears/disappears between turns of a conversation.
-if let Some(choice) = openai_response.choices.first() {
-    let has_native_tc = choice.message.extra.contains_key("tool_calls");
-    let content_text = choice.message.content_as_text();
-    // XML tool use can land in a reasoning carrier rather than `content`
-    // (GLM emits `reasoning_content`), so scan both or the combo is never
-    // learned and every turn for it keeps losing the tool call.
-    let reasoning_text = Self::reasoning_text(choice).unwrap_or_default();
-    let has_xml_tool_use = Self::looks_like_xml_tool_use(&content_text)
-        || Self::looks_like_xml_tool_use(reasoning_text);
-    if has_native_tc {
-        debug!(
-            provider = provider_name,
-            model = %provider_model.model,
-            finish_reason = ?choice.finish_reason,
-            "Provider returned native tool_calls"
-        );
-    }
-    if has_xml_tool_use {
-        warn!(
-            provider = provider_name,
-            model = %provider_model.model,
-            content_preview = %content_text.chars().take(200).collect::<String>(),
-            has_tools_in_request = has_tools,
-            "Model output XML-style tool use as plain text instead of native tool_calls"
-        );
-    }
-    if has_tools && has_xml_tool_use {
-        self.mark_xml_tool_combo(provider_name, &provider_model.model);
-    }
-}
+                            // Diagnostic: detect whether the model used native tool_calls
+                            // or fell back to XML-style tool use in plain text content.
+                            // This is the buffered-path feed of the same adaptive signal the
+                            // streaming relay uses: XML output marks the combo (hint +
+                            // buffer-and-translate). Native tool_calls need no action —
+                            // learned combos are intentionally sticky so the injected hint
+                            // never appears/disappears between turns of a conversation.
+                            if let Some(choice) = openai_response.choices.first() {
+                                let has_native_tc = choice.message.extra.contains_key("tool_calls");
+                                let content_text = choice.message.content_as_text();
+                                // XML tool use can land in a reasoning carrier rather than `content`
+                                // (GLM emits `reasoning_content`), so scan both or the combo is never
+                                // learned and every turn for it keeps losing the tool call.
+                                let reasoning_text =
+                                    Self::reasoning_text(choice).unwrap_or_default();
+                                let has_xml_tool_use = Self::looks_like_xml_tool_use(&content_text)
+                                    || Self::looks_like_xml_tool_use(reasoning_text);
+                                if has_native_tc {
+                                    debug!(
+                                        provider = provider_name,
+                                        model = %provider_model.model,
+                                        finish_reason = ?choice.finish_reason,
+                                        "Provider returned native tool_calls"
+                                    );
+                                }
+                                if has_xml_tool_use {
+                                    warn!(
+                                        provider = provider_name,
+                                        model = %provider_model.model,
+                                        content_preview = %content_text.chars().take(200).collect::<String>(),
+                                        has_tools_in_request = has_tools,
+                                        "Model output XML-style tool use as plain text instead of native tool_calls"
+                                    );
+                                }
+                                if has_tools && has_xml_tool_use {
+                                    self.mark_xml_tool_combo(provider_name, &provider_model.model);
+                                }
+                            }
                             if has_tools {
-            openai_response.extra.insert(
-                "gateway_tool_hint_injected".to_string(),
-                serde_json::json!(inject_tool_hint),
-            );
-        }
-        // Reasoning-compat log telemetry (Req 4.6): attach the compat
-        // stage's actions (counts/families only) where the report exists;
-        // the failover success path and the handler pass it through and
-        // strip it before the client sees the response.
-        if let Some(actions) = reasoning_report.and_then(AttemptReport::actions_json) {
-            openai_response.extra.insert(
-                "gateway_reasoning_compat_actions".to_string(),
-                serde_json::Value::String(actions),
-            );
-        }
-        return Ok(openai_response);
-        }
+                                openai_response.extra.insert(
+                                    "gateway_tool_hint_injected".to_string(),
+                                    serde_json::json!(inject_tool_hint),
+                                );
+                            }
+                            // Reasoning-compat log telemetry (Req 4.6): attach the compat
+                            // stage's actions (counts/families only) where the report exists;
+                            // the failover success path and the handler pass it through and
+                            // strip it before the client sees the response.
+                            if let Some(actions) =
+                                reasoning_report.and_then(AttemptReport::actions_json)
+                            {
+                                openai_response.extra.insert(
+                                    "gateway_reasoning_compat_actions".to_string(),
+                                    serde_json::Value::String(actions),
+                                );
+                            }
+                            return Ok(openai_response);
+                        }
 
-        // Provider may have ignored stream:false and returned SSE chunks.
-        // Parse the SSE stream and reconstruct a single OpenAIResponse.
-        if body_text.starts_with("data: ") {
-            tracing::debug!(
-                provider = provider_name,
-                "Provider returned SSE despite stream:false, reassembling"
-            );
-            match Self::reassemble_sse_response(&body_text) {
-                Ok(mut response) => {
-                    if has_tools {
-                        response.extra.insert(
-                            "gateway_tool_hint_injected".to_string(),
-                            serde_json::json!(inject_tool_hint),
-                        );
-                    }
-                    if let Some(actions) = reasoning_report.and_then(AttemptReport::actions_json) {
-                        response.extra.insert(
-                            "gateway_reasoning_compat_actions".to_string(),
-                            serde_json::Value::String(actions),
-                        );
-                    }
-                    return Ok(response);
-                }
+                        // Provider may have ignored stream:false and returned SSE chunks.
+                        // Parse the SSE stream and reconstruct a single OpenAIResponse.
+                        if body_text.starts_with("data: ") {
+                            tracing::debug!(
+                                provider = provider_name,
+                                "Provider returned SSE despite stream:false, reassembling"
+                            );
+                            match Self::reassemble_sse_response(&body_text) {
+                                Ok(mut response) => {
+                                    if has_tools {
+                                        response.extra.insert(
+                                            "gateway_tool_hint_injected".to_string(),
+                                            serde_json::json!(inject_tool_hint),
+                                        );
+                                    }
+                                    if let Some(actions) =
+                                        reasoning_report.and_then(AttemptReport::actions_json)
+                                    {
+                                        response.extra.insert(
+                                            "gateway_reasoning_compat_actions".to_string(),
+                                            serde_json::Value::String(actions),
+                                        );
+                                    }
+                                    return Ok(response);
+                                }
                                 Err(e) => {
                                     tracing::error!(provider = provider_name, error = %e, body = %body_text.chars().take(500).collect::<String>(), "Failed to reassemble SSE response");
                                     return Err(GatewayError::Provider {
@@ -4090,81 +4152,83 @@ if let Some(choice) = openai_response.choices.first() {
                         }
                     }
 
-// Don't retry 4xx errors except 408 (timeout)
-// 429 (rate limit) should fail over to next provider, not retry same one
-// 503 (service unavailable) signals provider is down — fail over immediately
-if status_code >= 400 && status_code < 500 && status_code != 408 {
-    // Image-input rejection: the provider refused image content even
-    // though the proactive strip pass believed it safe (stale or
-    // incorrect capabilities cache). Strip every image part and retry
-    // the same provider immediately — bounded to one shot per request.
-    if !image_strip_retry_done && Self::is_unsupported_image_error(status_code, &body_text) {
-        let removed = Self::strip_image_content_if_unsupported(
-            &mut outgoing,
-            false,
-            provider_name,
-            &provider_model.model,
-        );
-                    if removed > 0 {
-                        image_strip_retry_done = true;
-                        skip_next_backoff = true;
-                        info!(
-                            provider = provider_name,
-                            model = %provider_model.model,
-                            status = status_code,
-                            images_removed = removed,
-                            "Provider rejected image inputs — stripped images and retrying same provider"
-                        );
-                        last_error = Some(err);
-                        continue;
-                    }
-                }
+                    // Don't retry 4xx errors except 408 (timeout)
+                    // 429 (rate limit) should fail over to next provider, not retry same one
+                    // 503 (service unavailable) signals provider is down — fail over immediately
+                    if status_code >= 400 && status_code < 500 && status_code != 408 {
+                        // Image-input rejection: the provider refused image content even
+                        // though the proactive strip pass believed it safe (stale or
+                        // incorrect capabilities cache). Strip every image part and retry
+                        // the same provider immediately — bounded to one shot per request.
+                        if !image_strip_retry_done
+                            && Self::is_unsupported_image_error(status_code, &body_text)
+                        {
+                            let removed = Self::strip_image_content_if_unsupported(
+                                &mut outgoing,
+                                false,
+                                provider_name,
+                                &provider_model.model,
+                            );
+                            if removed > 0 {
+                                image_strip_retry_done = true;
+                                skip_next_backoff = true;
+                                info!(
+                                    provider = provider_name,
+                                    model = %provider_model.model,
+                                    status = status_code,
+                                    images_removed = removed,
+                                    "Provider rejected image inputs — stripped images and retrying same provider"
+                                );
+                                last_error = Some(err);
+                                continue;
+                            }
+                        }
 
-                // Reasoning-compat 400 recovery (reasoning-failover-compat
-                // spec, Req 6.2): an Anthropic-style thinking/budget_tokens
-                // validation 400 means the request carried reasoning state
-                // or params the target rejected. Classify as non-retryable
-                // in-provider (fail over) with a `reasoning_compat` tagged
-                // diagnostic, but first one-shot an aggressive strip of
-                // every reasoning carrier and retry the same provider
-                // without backoff.
-                if reasoning_compat_cfg.enabled
-                    && !reasoning_strip_retry_done
-                    && Self::is_thinking_validation_error(status_code, &body_text)
-                {
-                    let strip_report = reasoning_compat::policy::apply(
-                        &mut outgoing,
-                        reasoning_compat::policy::StripDecision::StripAll,
-                    );
-                    if strip_report.messages_touched > 0 {
-                        reasoning_strip_retry_done = true;
-                        skip_next_backoff = true;
-                        info!(
-                            provider = provider_name,
-                            model = %provider_model.model,
-                            status = status_code,
-                            thinking_blocks = strip_report.thinking_blocks,
-                            redacted_thinking_blocks = strip_report.redacted_thinking_blocks,
-                            fields_removed = strip_report.fields_removed,
-                            "[reasoning_compat] thinking validation 400 — aggressively stripped reasoning carriers, retrying same provider"
-                        );
-                        last_error = Some(GatewayError::Provider {
-                            provider: provider_name.to_string(),
-                            message: format!(
+                        // Reasoning-compat 400 recovery (reasoning-failover-compat
+                        // spec, Req 6.2): an Anthropic-style thinking/budget_tokens
+                        // validation 400 means the request carried reasoning state
+                        // or params the target rejected. Classify as non-retryable
+                        // in-provider (fail over) with a `reasoning_compat` tagged
+                        // diagnostic, but first one-shot an aggressive strip of
+                        // every reasoning carrier and retry the same provider
+                        // without backoff.
+                        if reasoning_compat_cfg.enabled
+                            && !reasoning_strip_retry_done
+                            && Self::is_thinking_validation_error(status_code, &body_text)
+                        {
+                            let strip_report = reasoning_compat::policy::apply(
+                                &mut outgoing,
+                                reasoning_compat::policy::StripDecision::StripAll,
+                            );
+                            if strip_report.messages_touched > 0 {
+                                reasoning_strip_retry_done = true;
+                                skip_next_backoff = true;
+                                info!(
+                                    provider = provider_name,
+                                    model = %provider_model.model,
+                                    status = status_code,
+                                    thinking_blocks = strip_report.thinking_blocks,
+                                    redacted_thinking_blocks = strip_report.redacted_thinking_blocks,
+                                    fields_removed = strip_report.fields_removed,
+                                    "[reasoning_compat] thinking validation 400 — aggressively stripped reasoning carriers, retrying same provider"
+                                );
+                                last_error = Some(GatewayError::Provider {
+                                    provider: provider_name.to_string(),
+                                    message: format!(
                                 "[reasoning_compat] HTTP {}: thinking-parameter validation failed",
                                 status_code
                             ),
-                            status_code: Some(status_code),
-                        });
-                        continue;
-                    }
-                }
+                                    status_code: Some(status_code),
+                                });
+                                continue;
+                            }
+                        }
 
-    // For rate-limit signals, parse Retry-After /
-    // retry_after_ms and put the provider in a
-    // bounded cooldown window so subsequent requests
-    // skip it via select_provider_order without
-    // re-issuing.
+                        // For rate-limit signals, parse Retry-After /
+                        // retry_after_ms and put the provider in a
+                        // bounded cooldown window so subsequent requests
+                        // skip it via select_provider_order without
+                        // re-issuing.
                         if Self::is_rate_limited(status_code, &body_text) {
                             let cooldown = self
                                 .parse_rate_limit_cooldown(
@@ -4194,29 +4258,29 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                                 cooldown_ms = cooldown.as_millis() as u64,
                                 "Rate limited, failing over and cooling down provider"
                             );
-                } else {
-                    warn!(
-                        provider = provider_name,
-                        status = status_code,
-                        "Non-retryable client error, failing over"
-                    );
-                }
-                // Tag thinking-validation 400s with the reasoning_compat
-                // diagnostic so the aggregated per-attempt record shows why
-                // the provider was skipped (Req 6.2).
-                if reasoning_compat_cfg.enabled
-                    && Self::is_thinking_validation_error(status_code, &body_text)
-                {
-                    return Err(GatewayError::Provider {
-                        provider: provider_name.to_string(),
-                        message: format!(
-                            "[reasoning_compat] HTTP {}: {}",
-                            status_code, body_text
-                        ),
-                        status_code: Some(status_code),
-                    });
-                }
-                return Err(err);
+                        } else {
+                            warn!(
+                                provider = provider_name,
+                                status = status_code,
+                                "Non-retryable client error, failing over"
+                            );
+                        }
+                        // Tag thinking-validation 400s with the reasoning_compat
+                        // diagnostic so the aggregated per-attempt record shows why
+                        // the provider was skipped (Req 6.2).
+                        if reasoning_compat_cfg.enabled
+                            && Self::is_thinking_validation_error(status_code, &body_text)
+                        {
+                            return Err(GatewayError::Provider {
+                                provider: provider_name.to_string(),
+                                message: format!(
+                                    "[reasoning_compat] HTTP {}: {}",
+                                    status_code, body_text
+                                ),
+                                status_code: Some(status_code),
+                            });
+                        }
+                        return Err(err);
                     }
                     if status_code == 503 {
                         warn!(
@@ -4403,10 +4467,9 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                             for tc_delta in tc_arr {
                                 let idx = match tc_delta.get("index").and_then(|v| v.as_u64()) {
                                     Some(explicit) => explicit,
-                                    None => Self::implicit_tool_call_index(
-                                        &tool_calls_map,
-                                        tc_delta,
-                                    ),
+                                    None => {
+                                        Self::implicit_tool_call_index(&tool_calls_map, tc_delta)
+                                    }
                                 };
                                 let entry = tool_calls_map.entry(idx).or_insert_with(|| {
                                     serde_json::json!({
@@ -4646,14 +4709,14 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
         // client cannot act on them, but they are kept so a request where every
         // provider stops after thinking still returns something rather than a
         // hard error.
- let mut reasoning_only_candidates: Vec<OpenAIResponse> = Vec::new();
- // One-shot guard for the reasoning continuation nudge (see the
- // reasoning-only branch in the success arm below): per request, a
- // single stalled turn whose thinking announces an action ("let me
- // ...") is retried on the same provider with a nudge before
- // failover gives up on it.
- let mut reasoning_nudge_done = false;
- let config = self.config.read().await;
+        let mut reasoning_only_candidates: Vec<OpenAIResponse> = Vec::new();
+        // One-shot guard for the reasoning continuation nudge (see the
+        // reasoning-only branch in the success arm below): per request, a
+        // single stalled turn whose thinking announces an action ("let me
+        // ...") is retried on the same provider with a nudge before
+        // failover gives up on it.
+        let mut reasoning_nudge_done = false;
+        let config = self.config.read().await;
         let provider_budgets: std::collections::HashMap<String, f64> = config
             .providers
             .iter()
@@ -4666,16 +4729,16 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
             .collect();
         // Effective truncation-retry setting (Req 6.4). Defaults to true when
         // no `streaming` section is configured.
-    let retry_on_truncation = config
-        .streaming
-        .clone()
-        .unwrap_or_default()
-        .retry_on_truncation;
-    // Reasoning-compat knobs for the buffered success path below (Req 4.6/
-    // 4.7). Cloned before the guard is dropped, mirroring the other
-    // snapshots.
-    let reasoning_compat_cfg = config.reasoning_compat.clone();
-    drop(config);
+        let retry_on_truncation = config
+            .streaming
+            .clone()
+            .unwrap_or_default()
+            .retry_on_truncation;
+        // Reasoning-compat knobs for the buffered success path below (Req 4.6/
+        // 4.7). Cloned before the guard is dropped, mirroring the other
+        // snapshots.
+        let reasoning_compat_cfg = config.reasoning_compat.clone();
+        drop(config);
 
         for provider_model in providers {
             let start = std::time::Instant::now();
@@ -4975,34 +5038,34 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                             ),
                             None,
                         );
-                attempts.push(ProviderAttempt::new(
-                    provider_model.provider.clone(),
-                    provider_model.model.clone(),
-                    "Provider returned empty response with no assistant content"
-                        .to_string(),
-                    Some(200),
-                ));
-                continue;
-            }
+                        attempts.push(ProviderAttempt::new(
+                            provider_model.provider.clone(),
+                            provider_model.model.clone(),
+                            "Provider returned empty response with no assistant content"
+                                .to_string(),
+                            Some(200),
+                        ));
+                        continue;
+                    }
 
-            // --- Codex Search agent loop (any provider) ---
-            // When the buffered response contains gateway-injected search
-            // tool calls, execute them against the Codex search endpoint
-            // with the gateway's OpenAI OAuth token and resubmit through
-            // the normal dispatch pipeline until the model produces a
-            // final answer. No-ops for Codex providers (intercepted during
-            // Codex dispatch) and for responses without search tool calls.
-            response = self
-                .maybe_intercept_search_tools(
-                    &provider_model,
-                    &prepared_request,
-                    response,
-                    active.clone(),
-                    attempt_counter,
-                )
-                .await?;
+                    // --- Codex Search agent loop (any provider) ---
+                    // When the buffered response contains gateway-injected search
+                    // tool calls, execute them against the Codex search endpoint
+                    // with the gateway's OpenAI OAuth token and resubmit through
+                    // the normal dispatch pipeline until the model produces a
+                    // final answer. No-ops for Codex providers (intercepted during
+                    // Codex dispatch) and for responses without search tool calls.
+                    response = self
+                        .maybe_intercept_search_tools(
+                            &provider_model,
+                            &prepared_request,
+                            response,
+                            active.clone(),
+                            attempt_counter,
+                        )
+                        .await?;
 
-            // --- Truncation detection and retry (Req 6.1, 6.3, 6.4) ---
+                    // --- Truncation detection and retry (Req 6.1, 6.3, 6.4) ---
                     // A provider can return HTTP 200 with finish_reason="length"
                     // yet stop well short of the client's requested max_tokens —
                     // a sign it hit an internal cap rather than the legitimate
@@ -5048,12 +5111,12 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                         // if every provider truncates. Annotate it with the same
                         // gateway metadata + cost the success path attaches, so it
                         // can be returned directly without reprocessing.
-        let mut candidate = response;
-        // Cache-aware actual cost (Req 3.5/3.7): the partial
-        // response's usage already carries the provider's cache
-        // token split, so price it with the same formula as the
-        // success path. Base-price identical when no cache fields.
-        let candidate_cost = compute_actual_cost(&provider_model, &candidate.usage);
+                        let mut candidate = response;
+                        // Cache-aware actual cost (Req 3.5/3.7): the partial
+                        // response's usage already carries the provider's cache
+                        // token split, so price it with the same formula as the
+                        // success path. Base-price identical when no cache fields.
+                        let candidate_cost = compute_actual_cost(&provider_model, &candidate.usage);
                         candidate.extra.insert(
                             "gateway_provider".to_string(),
                             serde_json::Value::String(provider_model.provider.clone()),
@@ -5101,61 +5164,64 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                     self.metrics
                         .clear_provider_cooldown(&provider_model.provider);
 
-        // Cache-aware actual cost (Req 3.5): price the response's usage
-        // split (uncached / cache-read / cache-creation) at the model's
-        // per-million rates. Bit-identical to the previous base-price
-        // formula when the usage carries no cache fields, so providers
-        // that never report cache telemetry are unaffected.
-        let usage_known = response.usage.total_tokens > 0
-            || response.usage.prompt_tokens > 0
-            || response.usage.completion_tokens > 0;
-    let total_cost = if usage_known {
-        let cost = compute_actual_cost(&provider_model, &response.usage);
-        if cost > 0.0 {
-            self.metrics.add_cost(&provider_model.provider, cost);
-        }
-        record_cache_usage(
-            &self.metrics,
-            &provider_model.provider,
-            &provider_model,
-            &response.usage,
-            cost,
-        );
-        cost
-    } else {
-        self.metrics
-            .record_provider_unknown_cost(&provider_model.provider);
-        0.0
-    };
+                    // Cache-aware actual cost (Req 3.5): price the response's usage
+                    // split (uncached / cache-read / cache-creation) at the model's
+                    // per-million rates. Bit-identical to the previous base-price
+                    // formula when the usage carries no cache fields, so providers
+                    // that never report cache telemetry are unaffected.
+                    let usage_known = response.usage.total_tokens > 0
+                        || response.usage.prompt_tokens > 0
+                        || response.usage.completion_tokens > 0;
+                    let total_cost = if usage_known {
+                        let cost = compute_actual_cost(&provider_model, &response.usage);
+                        if cost > 0.0 {
+                            self.metrics.add_cost(&provider_model.provider, cost);
+                        }
+                        record_cache_usage(
+                            &self.metrics,
+                            &provider_model.provider,
+                            &provider_model,
+                            &response.usage,
+                            cost,
+                        );
+                        cost
+                    } else {
+                        self.metrics
+                            .record_provider_unknown_cost(&provider_model.provider);
+                        0.0
+                    };
 
-    // Reasoning-token attribution (Req 4.7): extract the reasoning /
-    // thinking token count (any carrier shape, never double-counted) and
-    // accrue the provider metric + dedicated reasoning cost when the
-    // attribution knob is on.
-    let reasoning_usage = reasoning_compat::cost::extract_reasoning_usage(&response.usage);
-    if reasoning_usage.reasoning_tokens > 0 && reasoning_compat_cfg.attribute_reasoning_cost {
-        let reasoning_cost = reasoning_compat::cost::reasoning_cost(
-            &provider_model,
-            reasoning_usage.reasoning_tokens,
-        );
-        self.metrics.add_reasoning_usage(
-            &provider_model.provider,
-            u64::from(reasoning_usage.reasoning_tokens),
-            reasoning_cost,
-        );
-    }
+                    // Reasoning-token attribution (Req 4.7): extract the reasoning /
+                    // thinking token count (any carrier shape, never double-counted) and
+                    // accrue the provider metric + dedicated reasoning cost when the
+                    // attribution knob is on.
+                    let reasoning_usage =
+                        reasoning_compat::cost::extract_reasoning_usage(&response.usage);
+                    if reasoning_usage.reasoning_tokens > 0
+                        && reasoning_compat_cfg.attribute_reasoning_cost
+                    {
+                        let reasoning_cost = reasoning_compat::cost::reasoning_cost(
+                            &provider_model,
+                            reasoning_usage.reasoning_tokens,
+                        );
+                        self.metrics.add_reasoning_usage(
+                            &provider_model.provider,
+                            u64::from(reasoning_usage.reasoning_tokens),
+                            reasoning_cost,
+                        );
+                    }
 
-        // Cache-aware sticky routing (Req 1.1): remember which provider
-        // served this conversation prefix so the next turn is promoted back
-        // to it. The hash is computed from the original client request
-        // (`request`), not the provider-mutated outgoing copy.
-        self.record_sticky_success(
-            request,
-            &provider_model.provider,
-            &provider_model.model,
-            &response.usage,
-        )
-        .await;
+                    // Cache-aware sticky routing (Req 1.1): remember which provider
+                    // served this conversation prefix so the next turn is promoted back
+                    // to it. The hash is computed from the original client request
+                    // (`request`), not the provider-mutated outgoing copy.
+                    self.record_sticky_success(
+                        request,
+                        &provider_model.provider,
+                        &provider_model.model,
+                        &response.usage,
+                    )
+                    .await;
 
                     // Translate XML-style tool use to native tool_calls.
                     // Models that don't support the OpenAI tools parameter
@@ -5181,56 +5247,58 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
                         "gateway_responded_model".to_string(),
                         serde_json::Value::String(provider_model.model.clone()),
                     );
-        response
-            .extra
-            .insert("gateway_cost".to_string(), serde_json::json!(total_cost));
-        // Prompt-cache log telemetry (Req 4.3): attach the cache token
-        // split, realized savings, and the prefix affinity hash so the
-        // request logger can persist them. Only present when the provider
-        // actually reported cached tokens.
-        {
-            let cache_usage = extract_cache_usage(&response.usage);
-            if cache_usage.cache_read_input_tokens > 0 || cache_usage.cache_creation_input_tokens > 0
-            {
-                let prefix_hash = StickyCache::compute_prefix_hash(request);
-                let savings = cache_savings_cents(&provider_model, &response.usage, total_cost);
-                response.extra.insert(
-                    "gateway_cache_read_tokens".to_string(),
-                    serde_json::json!(cache_usage.cache_read_input_tokens as i64),
-                );
-                response.extra.insert(
-                    "gateway_cache_creation_tokens".to_string(),
-                    serde_json::json!(cache_usage.cache_creation_input_tokens as i64),
-                );
-                response.extra.insert(
-                    "gateway_cache_savings_cents".to_string(),
-                    serde_json::json!(savings),
-                );
-                response.extra.insert(
-                    "gateway_prefix_hash".to_string(),
-                    serde_json::json!(crate::logger::encode_prefix_hash(prefix_hash)),
-                );
-            }
-        }
-        response.extra.insert(
-            "gateway_compression".to_string(),
-            serde_json::to_value(&compression)
-                .expect("CompressionStats serialization must succeed"),
-        );
-        // Reasoning-compat log telemetry (Req 4.6/4.7): expose the
-        // per-request reasoning-token count so the request logger can
-        // persist it. The compat stage's actions JSON
-        // (`gateway_reasoning_compat_actions`) is attached by the
-        // per-attempt dispatch right where the report exists. The handler
-        // strips both keys before returning the response to the client.
-        if reasoning_usage.reasoning_tokens > 0 {
-            response.extra.insert(
-                "gateway_reasoning_tokens".to_string(),
-                serde_json::json!(reasoning_usage.reasoning_tokens),
-            );
-        }
+                    response
+                        .extra
+                        .insert("gateway_cost".to_string(), serde_json::json!(total_cost));
+                    // Prompt-cache log telemetry (Req 4.3): attach the cache token
+                    // split, realized savings, and the prefix affinity hash so the
+                    // request logger can persist them. Only present when the provider
+                    // actually reported cached tokens.
+                    {
+                        let cache_usage = extract_cache_usage(&response.usage);
+                        if cache_usage.cache_read_input_tokens > 0
+                            || cache_usage.cache_creation_input_tokens > 0
+                        {
+                            let prefix_hash = StickyCache::compute_prefix_hash(request);
+                            let savings =
+                                cache_savings_cents(&provider_model, &response.usage, total_cost);
+                            response.extra.insert(
+                                "gateway_cache_read_tokens".to_string(),
+                                serde_json::json!(cache_usage.cache_read_input_tokens as i64),
+                            );
+                            response.extra.insert(
+                                "gateway_cache_creation_tokens".to_string(),
+                                serde_json::json!(cache_usage.cache_creation_input_tokens as i64),
+                            );
+                            response.extra.insert(
+                                "gateway_cache_savings_cents".to_string(),
+                                serde_json::json!(savings),
+                            );
+                            response.extra.insert(
+                                "gateway_prefix_hash".to_string(),
+                                serde_json::json!(crate::logger::encode_prefix_hash(prefix_hash)),
+                            );
+                        }
+                    }
+                    response.extra.insert(
+                        "gateway_compression".to_string(),
+                        serde_json::to_value(&compression)
+                            .expect("CompressionStats serialization must succeed"),
+                    );
+                    // Reasoning-compat log telemetry (Req 4.6/4.7): expose the
+                    // per-request reasoning-token count so the request logger can
+                    // persist it. The compat stage's actions JSON
+                    // (`gateway_reasoning_compat_actions`) is attached by the
+                    // per-attempt dispatch right where the report exists. The handler
+                    // strips both keys before returning the response to the client.
+                    if reasoning_usage.reasoning_tokens > 0 {
+                        response.extra.insert(
+                            "gateway_reasoning_tokens".to_string(),
+                            serde_json::json!(reasoning_usage.reasoning_tokens),
+                        );
+                    }
 
-        return Ok(response);
+                    return Ok(response);
                 }
                 Err(e) => {
                     // Record failure — except rate-limit-class errors (HTTP 429
@@ -5539,10 +5607,7 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
             if !has_id {
                 object.insert(
                     "id".to_string(),
-                    serde_json::Value::String(format!(
-                        "call_{}",
-                        uuid::Uuid::new_v4().simple()
-                    )),
+                    serde_json::Value::String(format!("call_{}", uuid::Uuid::new_v4().simple())),
                 );
                 repaired = true;
             }
@@ -5599,9 +5664,9 @@ if status_code >= 400 && status_code < 500 && status_code != 408 {
         let Some(text) = Self::reasoning_text(choice).map(str::to_string) else {
             return false;
         };
- choice.message.content = serde_json::Value::String(text);
+        choice.message.content = serde_json::Value::String(text);
         true
- }
+    }
 
     /// Lowercase substrings that mark a reasoning block as having ended
     /// mid-plan: the model announced an action it never emitted. Matched
@@ -7336,15 +7401,15 @@ visible content. Do not restate your plan and do not end your turn without doing
             .unwrap_or(false)
     }
 
-/// Record a `provider`/`model` combo as one that emits XML-style tool calls.
-/// Idempotent. Called from the streaming relay and the buffered-response
-/// diagnostic when XML tool use is detected. Combos are sticky for the
-/// process lifetime — see [`Self::is_xml_tool_combo`].
-pub fn mark_xml_tool_combo(&self, provider: &str, model: &str) {
-    if let Ok(mut set) = self.xml_tool_combos.write() {
-        set.insert(Self::xml_combo_key(provider, model));
+    /// Record a `provider`/`model` combo as one that emits XML-style tool calls.
+    /// Idempotent. Called from the streaming relay and the buffered-response
+    /// diagnostic when XML tool use is detected. Combos are sticky for the
+    /// process lifetime — see [`Self::is_xml_tool_combo`].
+    pub fn mark_xml_tool_combo(&self, provider: &str, model: &str) {
+        if let Ok(mut set) = self.xml_tool_combos.write() {
+            set.insert(Self::xml_combo_key(provider, model));
+        }
     }
-}
 
     /// True if this `provider`/`model` combo has been observed ending a streamed
     /// turn with reasoning only. Such combos take the buffer-and-retry path when
@@ -7366,21 +7431,21 @@ pub fn mark_xml_tool_combo(&self, provider: &str, model: &str) {
         }
     }
 
-/// True when the tool-calling system hint should be injected for a
-/// tools-bearing request to this combo.
-///
-/// Only **learned combos** — combos observed emitting XML-style tool use
-/// (streaming relay or buffered diagnostic) — get the hint, and it stays
-/// enabled for the process lifetime: toggling guidance on and off
-/// mid-conversation is exactly the context mutation that makes models
-/// flag injected instructions as a prompt-injection attack in their
-/// reasoning. Everything else (including known XML-prone families)
-/// starts clean; a first XML-flavored response is repaired transparently
-/// by `translate_xml_tool_calls` and marks the combo for subsequent
-/// requests.
-pub(crate) fn should_inject_tool_hint(&self, provider: &str, model: &str) -> bool {
-    self.is_xml_tool_combo(provider, model)
-}
+    /// True when the tool-calling system hint should be injected for a
+    /// tools-bearing request to this combo.
+    ///
+    /// Only **learned combos** — combos observed emitting XML-style tool use
+    /// (streaming relay or buffered diagnostic) — get the hint, and it stays
+    /// enabled for the process lifetime: toggling guidance on and off
+    /// mid-conversation is exactly the context mutation that makes models
+    /// flag injected instructions as a prompt-injection attack in their
+    /// reasoning. Everything else (including known XML-prone families)
+    /// starts clean; a first XML-flavored response is repaired transparently
+    /// by `translate_xml_tool_calls` and marks the combo for subsequent
+    /// requests.
+    pub(crate) fn should_inject_tool_hint(&self, provider: &str, model: &str) -> bool {
+        self.is_xml_tool_combo(provider, model)
+    }
 
     /// Heuristic: does `text` contain XML/pseudo-XML tool-call markers that some
     /// models emit instead of native OpenAI `tool_calls`? Shared by the
@@ -7566,48 +7631,48 @@ pub(crate) fn should_inject_tool_hint(&self, provider: &str, model: &str) -> boo
         Ok(response)
     }
 
-/// Build the native tool-calling system hint inserted into outgoing
-/// requests that carry `tools` for learned XML combos. Shared by the
-/// buffered ([`Self::attempt_with_retry`]) and streaming pass-through
-/// ([`Self::route_request_streaming`]) paths so both send identical
-/// guidance to the provider.
-///
-/// The text is deliberately short, attributed (`[gateway]`), and
-/// positively framed, and it contains no XML tag examples: long
-/// anonymous imperative blocks — especially ones enumerating forbidden
-/// markup — match the fingerprints models associate with prompt-injection
-/// payloads and get flagged in reasoning output, eroding user trust.
-fn tool_calling_system_hint() -> Message {
-    Message {
-        role: "system".to_string(),
-        content: serde_json::Value::String(
-            "[gateway] Tools on this endpoint are available through the \
+    /// Build the native tool-calling system hint inserted into outgoing
+    /// requests that carry `tools` for learned XML combos. Shared by the
+    /// buffered ([`Self::attempt_with_retry`]) and streaming pass-through
+    /// ([`Self::route_request_streaming`]) paths so both send identical
+    /// guidance to the provider.
+    ///
+    /// The text is deliberately short, attributed (`[gateway]`), and
+    /// positively framed, and it contains no XML tag examples: long
+    /// anonymous imperative blocks — especially ones enumerating forbidden
+    /// markup — match the fingerprints models associate with prompt-injection
+    /// payloads and get flagged in reasoning output, eroding user trust.
+    fn tool_calling_system_hint() -> Message {
+        Message {
+            role: "system".to_string(),
+            content: serde_json::Value::String(
+                "[gateway] Tools on this endpoint are available through the \
              API's native function-calling interface. When a tool would \
              help, emit a native `tool_calls` payload using the exact \
              names and argument schemas from the provided tools list. \
              When no tool is needed, reply with plain text."
-                .to_string(),
-        ),
-        extra: serde_json::Map::new(),
+                    .to_string(),
+            ),
+            extra: serde_json::Map::new(),
+        }
     }
-}
 
-/// Insert the tool-calling hint directly after the last system message
-/// so it reads as operator guidance in the trusted system region of the
-/// prompt. A system message appended at the tail — after user and tool
-/// content, immediately before generation — is the canonical
-/// prompt-injection position and is what reasoning models flag as
-/// suspicious. When the conversation has no system message, the hint
-/// becomes the first message. Positioning right after the system block
-/// also keeps the prefix stable for provider prompt caching.
-fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
-    let hint = Self::tool_calling_system_hint();
-    let pos = messages
-        .iter()
-        .rposition(|message| message.role == "system")
-        .map_or(0, |index| index + 1);
-    messages.insert(pos, hint);
-}
+    /// Insert the tool-calling hint directly after the last system message
+    /// so it reads as operator guidance in the trusted system region of the
+    /// prompt. A system message appended at the tail — after user and tool
+    /// content, immediately before generation — is the canonical
+    /// prompt-injection position and is what reasoning models flag as
+    /// suspicious. When the conversation has no system message, the hint
+    /// becomes the first message. Positioning right after the system block
+    /// also keeps the prefix stable for provider prompt caching.
+    fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
+        let hint = Self::tool_calling_system_hint();
+        let pos = messages
+            .iter()
+            .rposition(|message| message.role == "system")
+            .map_or(0, |index| index + 1);
+        messages.insert(pos, hint);
+    }
 
     /// Route a streaming request, returning a [`StreamingResponse`].
     ///
@@ -7791,41 +7856,41 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
             handle.set_target(&provider_model.provider, &provider_model.model, phase);
         }
 
-    // Codex Search is active → route to the buffered path BEFORE running
-    // compression. Streaming pass-through cannot intercept tool calls to
-    // execute search server-side, and without injection the model never
-    // sees the codex_search/codex_web tools. The buffered path injects the
-    // tool definitions after its own compression and intercepts/executes
-    // any search tool calls before returning the final response. Checking
-    // here avoids burning a compression pass that the buffered path will
-    // redo anyway.
-    if self.codex_search_ready().await.is_some() {
-        debug!(
-            provider = %provider_model.provider,
-            "Codex search active — routing streaming request through buffered path for tool-call interception"
-        );
-        drop(concurrency_permit);
-        return Ok(StreamingResponse::Buffered(
-            self.route_request(request, active.clone()).await?,
-        ));
-    }
+        // Codex Search is active → route to the buffered path BEFORE running
+        // compression. Streaming pass-through cannot intercept tool calls to
+        // execute search server-side, and without injection the model never
+        // sees the codex_search/codex_web tools. The buffered path injects the
+        // tool definitions after its own compression and intercepts/executes
+        // any search tool calls before returning the final response. Checking
+        // here avoids burning a compression pass that the buffered path will
+        // redo anyway.
+        if self.codex_search_ready().await.is_some() {
+            debug!(
+                provider = %provider_model.provider,
+                "Codex search active — routing streaming request through buffered path for tool-call interception"
+            );
+            drop(concurrency_permit);
+            return Ok(StreamingResponse::Buffered(
+                self.route_request(request, active.clone()).await?,
+            ));
+        }
 
-    // Compression is provider-specific and completes before model rewrite,
-    // sanitization, or the upstream streaming request starts.
-    let request_id = format!("stream-{}", uuid::Uuid::new_v4());
-    let (compressed_request, compression) = self
-        .prepare_compressed_request_with_stats(
-            &prepared_request,
-            &model_group,
-            &provider_model,
-            &request_id,
-        )
-        .await;
+        // Compression is provider-specific and completes before model rewrite,
+        // sanitization, or the upstream streaming request starts.
+        let request_id = format!("stream-{}", uuid::Uuid::new_v4());
+        let (compressed_request, compression) = self
+            .prepare_compressed_request_with_stats(
+                &prepared_request,
+                &model_group,
+                &provider_model,
+                &request_id,
+            )
+            .await;
 
-    // Inspect the chosen provider config. Clone every field needed for the
-    // outgoing request before dropping the config guard — the guard must
-    // not be held across the network `.await`.
-    let provider_cfg = {
+        // Inspect the chosen provider config. Clone every field needed for the
+        // outgoing request before dropping the config guard — the guard must
+        // not be held across the network `.await`.
+        let provider_cfg = {
             let config = self.config.read().await;
             config
                 .providers
@@ -7886,9 +7951,9 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
         let api_key = provider_cfg.resolve_api_key().unwrap_or_default();
         let is_oauth_provider = provider_cfg.auth_method.as_deref() == Some("oauth");
         let provider_type = provider_cfg.provider_type.clone();
-    let configured_base_url = provider_cfg.base_url.clone();
-    let custom_headers = provider_cfg.effective_custom_headers();
-    let pool_config = provider_cfg.connection_pool.clone();
+        let configured_base_url = provider_cfg.base_url.clone();
+        let custom_headers = provider_cfg.effective_custom_headers();
+        let pool_config = provider_cfg.connection_pool.clone();
         let ttfb_timeout_secs = provider_cfg.effective_ttfb_timeout(&provider_model.model);
         let ttfb_timeout = Duration::from_secs(ttfb_timeout_secs);
 
@@ -7934,7 +7999,10 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
         // Base URL normalization — strip trailing '/', ensure '/v1'. Bedrock
         // never reaches this pass-through path (it takes the buffered gate
         // above via `|| is_bedrock`), so no Mantle special-case is needed here.
-        let mut base_url = configured_base_url.as_deref().unwrap_or_default().to_string();
+        let mut base_url = configured_base_url
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
         base_url = base_url.trim_end_matches('/').to_string();
         if !base_url.ends_with("/v1") {
             base_url.push_str("/v1");
@@ -7946,23 +8014,23 @@ fn insert_tool_calling_hint(messages: &mut Vec<Message>) {
         let mut outgoing = compressed_request;
         outgoing.model = provider_model.model.clone();
         outgoing.stream = true;
-// Reasoning-compat per-attempt stage (reasoning-failover-compat
-// spec, Req 6.1/6.2), mirroring the buffered dispatch path: detect
-// carriers on the original request, strip/preserve for this
-// target, normalize reasoning params. Source-model attribution
-// (Task 6) comes from the sticky prefix affinity; None on a miss.
-// Pass-through streams carry no response object, so the report is
-// only logged here; usage metrics land in `record_streaming_success`.
-let reasoning_compat_cfg = self.config.read().await.reasoning_compat.clone();
-if reasoning_compat_cfg.enabled {
-let source_ref = self.model_affinity_source(request, &reasoning_compat_cfg);
-let report = reasoning_compat::prepare_attempt(
-&mut outgoing,
-request,
-source_ref,
-&provider_model,
-&reasoning_compat_cfg,
-);
+        // Reasoning-compat per-attempt stage (reasoning-failover-compat
+        // spec, Req 6.1/6.2), mirroring the buffered dispatch path: detect
+        // carriers on the original request, strip/preserve for this
+        // target, normalize reasoning params. Source-model attribution
+        // (Task 6) comes from the sticky prefix affinity; None on a miss.
+        // Pass-through streams carry no response object, so the report is
+        // only logged here; usage metrics land in `record_streaming_success`.
+        let reasoning_compat_cfg = self.config.read().await.reasoning_compat.clone();
+        if reasoning_compat_cfg.enabled {
+            let source_ref = self.model_affinity_source(request, &reasoning_compat_cfg);
+            let report = reasoning_compat::prepare_attempt(
+                &mut outgoing,
+                request,
+                source_ref,
+                &provider_model,
+                &reasoning_compat_cfg,
+            );
             if report.strip.messages_touched > 0 || report.strip.thinking_blocks > 0 {
                 reasoning_compat::policy::log_strip_action(
                     &report.strip,
@@ -8132,47 +8200,48 @@ source_ref,
                         .await?,
                 ));
             }
-    // Non-rate-limit failure: the body was drained above so the
-    // connection can be reused; fall back to the buffered path
-    // which has full multi-provider failover.
-    // Context-length errors: attempt truncation before falling back.
-    if self.is_context_length_error(status_code, &body_text) {
-        let mut truncated_request = request.clone();
-        match self.context_manager.handle_context_error(
-            &mut truncated_request,
-            0,
-            Some(&body_text),
-        ) {
-            Ok(result) => {
-                info!(
-                    provider = %provider_model.provider,
-                    model = %provider_model.model,
-                    original_tokens = result.original_tokens,
-                    final_tokens = result.final_tokens,
-                    messages_removed = result.messages_removed,
-                    "Context-length error on streaming pass-through, truncated request and retrying via buffered path"
-                );
-                drop(concurrency_permit);
-                return Ok(StreamingResponse::Buffered(
-                    self.route_request(&truncated_request, active.clone()).await?,
-                ));
+            // Non-rate-limit failure: the body was drained above so the
+            // connection can be reused; fall back to the buffered path
+            // which has full multi-provider failover.
+            // Context-length errors: attempt truncation before falling back.
+            if self.is_context_length_error(status_code, &body_text) {
+                let mut truncated_request = request.clone();
+                match self.context_manager.handle_context_error(
+                    &mut truncated_request,
+                    0,
+                    Some(&body_text),
+                ) {
+                    Ok(result) => {
+                        info!(
+                            provider = %provider_model.provider,
+                            model = %provider_model.model,
+                            original_tokens = result.original_tokens,
+                            final_tokens = result.final_tokens,
+                            messages_removed = result.messages_removed,
+                            "Context-length error on streaming pass-through, truncated request and retrying via buffered path"
+                        );
+                        drop(concurrency_permit);
+                        return Ok(StreamingResponse::Buffered(
+                            self.route_request(&truncated_request, active.clone())
+                                .await?,
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(
+                            provider = %provider_model.provider,
+                            model = %provider_model.model,
+                            error = %e,
+                            "Context-length error on streaming pass-through but truncation cannot continue"
+                        );
+                    }
+                }
             }
-            Err(e) => {
-                warn!(
-                    provider = %provider_model.provider,
-                    model = %provider_model.model,
-                    error = %e,
-                    "Context-length error on streaming pass-through but truncation cannot continue"
-                );
-            }
+            warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
+            drop(concurrency_permit);
+            return Ok(StreamingResponse::Buffered(
+                self.route_request(request, active.clone()).await?,
+            ));
         }
-    }
-    warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
-    drop(concurrency_permit);
-    return Ok(StreamingResponse::Buffered(
-        self.route_request(request, active.clone()).await?,
-    ));
-}
 
         // Success — hand the live streaming body and permit to the caller.
         // The handler keeps both alive until the relay finishes or is dropped.
@@ -8301,9 +8370,9 @@ source_ref,
         if !api_key.is_empty() {
             request = request.bearer_auth(api_key);
         }
-    for (name, value) in provider.effective_custom_headers() {
-        request = request.header(name, value);
-    }
+        for (name, value) in provider.effective_custom_headers() {
+            request = request.header(name, value);
+        }
 
         let timeout_seconds = provider.effective_total_timeout("");
         let upstream = tokio::time::timeout(Duration::from_secs(timeout_seconds), request.send())
@@ -8479,9 +8548,9 @@ source_ref,
         } else if !api_key.is_empty() {
             request = request.bearer_auth(api_key);
         }
-    for (name, value) in target.provider.effective_custom_headers() {
-        request = request.header(name, value);
-    }
+        for (name, value) in target.provider.effective_custom_headers() {
+            request = request.header(name, value);
+        }
 
         let started = std::time::Instant::now();
         let timeout_seconds = target.provider.effective_total_timeout(model_name);
@@ -8801,8 +8870,7 @@ mod tests {
     #[tokio::test]
     async fn saturated_provider_is_rejected_with_503() {
         let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
-        let mut provider_cfg =
-            test_provider("electron", "http://localhost:1/v1".to_string());
+        let mut provider_cfg = test_provider("electron", "http://localhost:1/v1".to_string());
         // Saturate the single slot, then force a short wait window so the
         // rejection path runs without a long test delay.
         provider_cfg.max_connections = 1;
@@ -8837,8 +8905,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_slot_wait_is_derived_from_the_provider_total_timeout() {
-        let mut provider_cfg =
-            test_provider("electron", "http://localhost:1/v1".to_string());
+        let mut provider_cfg = test_provider("electron", "http://localhost:1/v1".to_string());
 
         provider_cfg.total_timeout_seconds = Some(800);
         assert_eq!(
@@ -9178,298 +9245,294 @@ mod tests {
             },
         ];
 
-    let response = router
-        .dispatch_buffered_with_context_retry(&client, request)
-        .await
-        .expect("shared wrapper should truncate and retry");
-    assert_eq!(response.provider_name, "adapter");
-    assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-}
+        let response = router
+            .dispatch_buffered_with_context_retry(&client, request)
+            .await
+            .expect("shared wrapper should truncate and retry");
+        assert_eq!(response.provider_name, "adapter");
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
-struct ImageRejectThenSuccessClient {
-    calls: std::sync::atomic::AtomicUsize,
-}
+    struct ImageRejectThenSuccessClient {
+        calls: std::sync::atomic::AtomicUsize,
+    }
 
-#[async_trait::async_trait]
-impl ProviderClient for ImageRejectThenSuccessClient {
-    async fn chat_completion(
-        &self,
-        request: OpenAIRequest,
-    ) -> Result<ProviderResponse, GatewayError> {
-        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let carries_images = request.messages.iter().any(|msg| {
-            msg.content
-                .as_array()
-                .map(|parts| {
-                    parts.iter().any(|part| {
-                        matches!(
-                            part.get("type").and_then(|v| v.as_str()),
-                            Some("image_url") | Some("image") | Some("input_image")
-                        )
+    #[async_trait::async_trait]
+    impl ProviderClient for ImageRejectThenSuccessClient {
+        async fn chat_completion(
+            &self,
+            request: OpenAIRequest,
+        ) -> Result<ProviderResponse, GatewayError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let carries_images = request.messages.iter().any(|msg| {
+                msg.content
+                    .as_array()
+                    .map(|parts| {
+                        parts.iter().any(|part| {
+                            matches!(
+                                part.get("type").and_then(|v| v.as_str()),
+                                Some("image_url") | Some("image") | Some("input_image")
+                            )
+                        })
                     })
-                })
-                .unwrap_or(false)
-        });
-        if call == 0 {
-            assert!(carries_images, "first call should carry image parts");
-            return Err(GatewayError::Provider {
+                    .unwrap_or(false)
+            });
+            if call == 0 {
+                assert!(carries_images, "first call should carry image parts");
+                return Err(GatewayError::Provider {
                 provider: "adapter".to_string(),
                 message: r#"Upstream HTTP 400: {"error":{"message":"This model does not support image inputs."}}"#.to_string(),
                 status_code: Some(400),
             });
+            }
+            assert!(!carries_images, "retry must not carry image parts");
+            Ok(ProviderResponse {
+                response: serde_json::from_value(completion_response())
+                    .expect("fixture should deserialize"),
+                provider_name: "adapter".to_string(),
+                latency_ms: 1,
+            })
         }
-        assert!(!carries_images, "retry must not carry image parts");
-        Ok(ProviderResponse {
-            response: serde_json::from_value(completion_response())
-                .expect("fixture should deserialize"),
-            provider_name: "adapter".to_string(),
-            latency_ms: 1,
-        })
-    }
 
-    async fn chat_completion_stream(
-        &self,
-        _request: OpenAIRequest,
-    ) -> Result<
-        std::pin::Pin<
-            Box<
-                dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>>
-                    + Send,
+        async fn chat_completion_stream(
+            &self,
+            _request: OpenAIRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>>
+                        + Send,
+                >,
             >,
-        >,
-        GatewayError,
-    > {
-        unreachable!()
+            GatewayError,
+        > {
+            unreachable!()
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
+            Ok(Vec::new())
+        }
+
+        fn provider_name(&self) -> &str {
+            "adapter"
+        }
     }
 
-    async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
-        Ok(Vec::new())
-    }
-
-    fn provider_name(&self) -> &str {
-        "adapter"
-    }
-}
-
-#[tokio::test]
-async fn buffered_adapter_image_error_strips_and_retries() {
-    let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
-    let client = ImageRejectThenSuccessClient {
-        calls: std::sync::atomic::AtomicUsize::new(0),
-    };
-    let mut request = compression_request(false);
-    request.model = "adapter-model".to_string();
-    request.messages = vec![
-        Message {
+    #[tokio::test]
+    async fn buffered_adapter_image_error_strips_and_retries() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+        let client = ImageRejectThenSuccessClient {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut request = compression_request(false);
+        request.model = "adapter-model".to_string();
+        request.messages = vec![Message {
             role: "user".to_string(),
             content: serde_json::json!([
                 {"type": "text", "text": "what is in this picture?"},
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
             ]),
             extra: Default::default(),
-        },
-    ];
+        }];
 
-    let response = router
-        .dispatch_buffered_with_context_retry(&client, request)
-        .await
-        .expect("shared wrapper should strip images and retry");
-    assert_eq!(response.provider_name, "adapter");
-    assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-}
+        let response = router
+            .dispatch_buffered_with_context_retry(&client, request)
+            .await
+            .expect("shared wrapper should strip images and retry");
+        assert_eq!(response.provider_name, "adapter");
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
-// ── Backstop: duplicate-compaction-trigger repair-and-retry (task 7.2) ──
-//
-// Mirrors the image-strip client pattern: a test ProviderClient that counts
-// calls, rejects the first attempt with the observed Bedrock Mantle 400 body,
-// and succeeds on the retry. Determinism comes from driving
-// `dispatch_buffered_with_context_retry` directly rather than fighting the
-// dispatch seam, which already de-dupes before the provider is reached.
+    // ── Backstop: duplicate-compaction-trigger repair-and-retry (task 7.2) ──
+    //
+    // Mirrors the image-strip client pattern: a test ProviderClient that counts
+    // calls, rejects the first attempt with the observed Bedrock Mantle 400 body,
+    // and succeeds on the retry. Determinism comes from driving
+    // `dispatch_buffered_with_context_retry` directly rather than fighting the
+    // dispatch seam, which already de-dupes before the provider is reached.
 
-/// Count compaction-trigger sites in a chat request's message content arrays.
-/// Sufficient for these tests, whose duplicates live as content parts.
-fn count_trigger_content_parts(request: &OpenAIRequest) -> usize {
-    request
-        .messages
-        .iter()
-        .filter_map(|msg| msg.content.as_array())
-        .flatten()
-        .filter(|part| {
-            part.get("type").and_then(|v| v.as_str()) == Some("compaction_trigger")
-        })
-        .count()
-}
+    /// Count compaction-trigger sites in a chat request's message content arrays.
+    /// Sufficient for these tests, whose duplicates live as content parts.
+    fn count_trigger_content_parts(request: &OpenAIRequest) -> usize {
+        request
+            .messages
+            .iter()
+            .filter_map(|msg| msg.content.as_array())
+            .flatten()
+            .filter(|part| part.get("type").and_then(|v| v.as_str()) == Some("compaction_trigger"))
+            .count()
+    }
 
-struct DuplicateTriggerThenSuccessClient {
-    calls: std::sync::atomic::AtomicUsize,
-}
+    struct DuplicateTriggerThenSuccessClient {
+        calls: std::sync::atomic::AtomicUsize,
+    }
 
-#[async_trait::async_trait]
-impl ProviderClient for DuplicateTriggerThenSuccessClient {
-    async fn chat_completion(
-        &self,
-        request: OpenAIRequest,
-    ) -> Result<ProviderResponse, GatewayError> {
-        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if call == 0 {
-            assert!(
-                count_trigger_content_parts(&request) > 1,
-                "first call should carry more than one compaction_trigger"
+    #[async_trait::async_trait]
+    impl ProviderClient for DuplicateTriggerThenSuccessClient {
+        async fn chat_completion(
+            &self,
+            request: OpenAIRequest,
+        ) -> Result<ProviderResponse, GatewayError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                assert!(
+                    count_trigger_content_parts(&request) > 1,
+                    "first call should carry more than one compaction_trigger"
+                );
+                return Err(GatewayError::Provider {
+                    provider: "adapter".to_string(),
+                    message: "Only one 'compaction_trigger' item may be provided.".to_string(),
+                    status_code: Some(400),
+                });
+            }
+            assert_eq!(
+                count_trigger_content_parts(&request),
+                1,
+                "retry must carry exactly one compaction_trigger"
             );
-            return Err(GatewayError::Provider {
-                provider: "adapter".to_string(),
-                message: "Only one 'compaction_trigger' item may be provided.".to_string(),
-                status_code: Some(400),
-            });
+            Ok(ProviderResponse {
+                response: serde_json::from_value(completion_response())
+                    .expect("fixture should deserialize"),
+                provider_name: "adapter".to_string(),
+                latency_ms: 1,
+            })
         }
-        assert_eq!(
-            count_trigger_content_parts(&request),
-            1,
-            "retry must carry exactly one compaction_trigger"
-        );
-        Ok(ProviderResponse {
-            response: serde_json::from_value(completion_response())
-                .expect("fixture should deserialize"),
-            provider_name: "adapter".to_string(),
-            latency_ms: 1,
-        })
-    }
 
-    async fn chat_completion_stream(
-        &self,
-        _request: OpenAIRequest,
-    ) -> Result<
-        std::pin::Pin<
-            Box<
-                dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>>
-                    + Send,
+        async fn chat_completion_stream(
+            &self,
+            _request: OpenAIRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>>
+                        + Send,
+                >,
             >,
-        >,
-        GatewayError,
-    > {
-        unreachable!()
+            GatewayError,
+        > {
+            unreachable!()
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
+            Ok(Vec::new())
+        }
+
+        fn provider_name(&self) -> &str {
+            "adapter"
+        }
     }
 
-    async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
-        Ok(Vec::new())
+    #[tokio::test]
+    async fn buffered_adapter_duplicate_trigger_normalizes_and_retries() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+        let client = DuplicateTriggerThenSuccessClient {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut request = compression_request(false);
+        request.model = "adapter-model".to_string();
+        // Two compaction-trigger content parts across two messages: the seam
+        // re-run inside the retry arm keeps the last and removes the first.
+        request.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!([{"type": "compaction_trigger"}]),
+                extra: Default::default(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!([{"type": "compaction_trigger"}]),
+                extra: Default::default(),
+            },
+        ];
+
+        let response = router
+            .dispatch_buffered_with_context_retry(&client, request)
+            .await
+            .expect("shared wrapper should normalize triggers and retry");
+        assert_eq!(response.provider_name, "adapter");
+        // Exactly two upstream calls: the rejected first and the repaired retry.
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
-    fn provider_name(&self) -> &str {
-        "adapter"
-    }
-}
-
-#[tokio::test]
-async fn buffered_adapter_duplicate_trigger_normalizes_and_retries() {
-    let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
-    let client = DuplicateTriggerThenSuccessClient {
-        calls: std::sync::atomic::AtomicUsize::new(0),
-    };
-    let mut request = compression_request(false);
-    request.model = "adapter-model".to_string();
-    // Two compaction-trigger content parts across two messages: the seam
-    // re-run inside the retry arm keeps the last and removes the first.
-    request.messages = vec![
-        Message {
-            role: "user".to_string(),
-            content: serde_json::json!([{"type": "compaction_trigger"}]),
-            extra: Default::default(),
-        },
-        Message {
-            role: "user".to_string(),
-            content: serde_json::json!([{"type": "compaction_trigger"}]),
-            extra: Default::default(),
-        },
-    ];
-
-    let response = router
-        .dispatch_buffered_with_context_retry(&client, request)
-        .await
-        .expect("shared wrapper should normalize triggers and retry");
-    assert_eq!(response.provider_name, "adapter");
-    // Exactly two upstream calls: the rejected first and the repaired retry.
-    assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-}
-
-struct UnrelatedRejectClient {
-    calls: std::sync::atomic::AtomicUsize,
-}
-
-#[async_trait::async_trait]
-impl ProviderClient for UnrelatedRejectClient {
-    async fn chat_completion(
-        &self,
-        _request: OpenAIRequest,
-    ) -> Result<ProviderResponse, GatewayError> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(GatewayError::Provider {
-            provider: "adapter".to_string(),
-            message: "invalid request".to_string(),
-            status_code: Some(400),
-        })
+    struct UnrelatedRejectClient {
+        calls: std::sync::atomic::AtomicUsize,
     }
 
-    async fn chat_completion_stream(
-        &self,
-        _request: OpenAIRequest,
-    ) -> Result<
-        std::pin::Pin<
-            Box<
-                dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>>
-                    + Send,
+    #[async_trait::async_trait]
+    impl ProviderClient for UnrelatedRejectClient {
+        async fn chat_completion(
+            &self,
+            _request: OpenAIRequest,
+        ) -> Result<ProviderResponse, GatewayError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(GatewayError::Provider {
+                provider: "adapter".to_string(),
+                message: "invalid request".to_string(),
+                status_code: Some(400),
+            })
+        }
+
+        async fn chat_completion_stream(
+            &self,
+            _request: OpenAIRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>>
+                        + Send,
+                >,
             >,
-        >,
-        GatewayError,
-    > {
-        unreachable!()
+            GatewayError,
+        > {
+            unreachable!()
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
+            Ok(Vec::new())
+        }
+
+        fn provider_name(&self) -> &str {
+            "adapter"
+        }
     }
 
-    async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
-        Ok(Vec::new())
-    }
+    #[tokio::test]
+    async fn buffered_adapter_unrelated_400_surfaces_without_extra_attempt() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+        let client = UnrelatedRejectClient {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut request = compression_request(false);
+        request.model = "adapter-model".to_string();
+        // Even with duplicate triggers present, an unrelated 400 must not trip the
+        // duplicate-trigger arm — the guard requires the specific rejection phrase.
+        request.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!([{"type": "compaction_trigger"}]),
+                extra: Default::default(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!([{"type": "compaction_trigger"}]),
+                extra: Default::default(),
+            },
+        ];
 
-    fn provider_name(&self) -> &str {
-        "adapter"
+        let error = router
+            .dispatch_buffered_with_context_retry(&client, request)
+            .await
+            .expect_err("unrelated 400 should surface, not be repaired");
+        match error {
+            GatewayError::Provider {
+                status_code: Some(400),
+                ..
+            } => {}
+            other => panic!("expected provider 400 to surface, got {other:?}"),
+        }
+        // Exactly one upstream call: no repair retry for an unrelated failure.
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
-}
-
-#[tokio::test]
-async fn buffered_adapter_unrelated_400_surfaces_without_extra_attempt() {
-    let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
-    let client = UnrelatedRejectClient {
-        calls: std::sync::atomic::AtomicUsize::new(0),
-    };
-    let mut request = compression_request(false);
-    request.model = "adapter-model".to_string();
-    // Even with duplicate triggers present, an unrelated 400 must not trip the
-    // duplicate-trigger arm — the guard requires the specific rejection phrase.
-    request.messages = vec![
-        Message {
-            role: "user".to_string(),
-            content: serde_json::json!([{"type": "compaction_trigger"}]),
-            extra: Default::default(),
-        },
-        Message {
-            role: "user".to_string(),
-            content: serde_json::json!([{"type": "compaction_trigger"}]),
-            extra: Default::default(),
-        },
-    ];
-
-    let error = router
-        .dispatch_buffered_with_context_retry(&client, request)
-        .await
-        .expect_err("unrelated 400 should surface, not be repaired");
-    match error {
-        GatewayError::Provider {
-            status_code: Some(400),
-            ..
-        } => {}
-        other => panic!("expected provider 400 to surface, got {other:?}"),
-    }
-    // Exactly one upstream call: no repair retry for an unrelated failure.
-    assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-}
 
     #[test]
     fn reasoning_only_response_is_promoted_to_content() {
@@ -9767,21 +9830,16 @@ async fn buffered_adapter_unrelated_400_surfaces_without_extra_attempt() {
         let messages = nudged["messages"].as_array().unwrap();
         let last = messages.last().unwrap();
         assert_eq!(last["role"], "user");
-        assert!(
-            last["content"]
-                .as_str()
-                .unwrap()
-                .contains("private reasoning")
-        );
+        assert!(last["content"]
+            .as_str()
+            .unwrap()
+            .contains("private reasoning"));
         let prev = &messages[messages.len() - 2];
         assert_eq!(prev["role"], "assistant");
         // The stalled thinking is echoed back as assistant content (the
         // reasoning-compat strip would remove the `reasoning_content`
         // carrier from the outgoing request).
-        assert!(prev["content"]
-            .as_str()
-            .unwrap()
-            .contains("Let me read"));
+        assert!(prev["content"].as_str().unwrap().contains("Let me read"));
     }
 
     #[test]
@@ -9936,7 +9994,9 @@ async fn buffered_adapter_unrelated_400_surfaces_without_extra_attempt() {
 
         let response = Router::reassemble_sse_response(body).unwrap();
 
-        assert!(Router::content_is_empty(&response.choices[0].message.content));
+        assert!(Router::content_is_empty(
+            &response.choices[0].message.content
+        ));
         assert_eq!(
             response.choices[0].message.extra.get("reasoning_content"),
             Some(&serde_json::json!("thinking hard"))
@@ -10102,13 +10162,13 @@ async fn buffered_adapter_unrelated_400_surfaces_without_extra_attempt() {
             tool_compression: Default::default(),
             smart_routing: Default::default(),
             memory: None,
-xhigh_models_allowlist: Default::default(),
-reasoning_models_allowlist: Default::default(),
-codex_search: None,
-cache_aware_routing: Default::default(),
-reasoning_compat: Default::default(),
-}
-}
+            xhigh_models_allowlist: Default::default(),
+            reasoning_models_allowlist: Default::default(),
+            codex_search: None,
+            cache_aware_routing: Default::default(),
+            reasoning_compat: Default::default(),
+        }
+    }
 
     fn test_provider(name: &str, base_url: String) -> crate::config::Provider {
         crate::config::Provider {
@@ -10128,9 +10188,9 @@ reasoning_compat: Default::default(),
             total_timeout_seconds: Some(5),
             max_connections: 10,
             rate_limit_per_minute: 0,
-        custom_headers: Default::default(),
-        user_agent: None,
-        connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+            custom_headers: Default::default(),
+            user_agent: None,
+            connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
             global_inference_profile: false,
@@ -10147,30 +10207,30 @@ reasoning_compat: Default::default(),
         }
     }
 
-fn test_model(provider: &str, priority: u32) -> ProviderModel {
-test_model_named(provider, "upstream-model", priority)
-}
+    fn test_model(provider: &str, priority: u32) -> ProviderModel {
+        test_model_named(provider, "upstream-model", priority)
+    }
 
-fn test_model_named(provider: &str, model: &str, priority: u32) -> ProviderModel {
-ProviderModel {
-provider: provider.to_string(),
-model: model.to_string(),
-cost_per_million_input_tokens: 0.0,
-cost_per_million_output_tokens: 0.0,
-priority,
-structured_output_passthrough: None,
-tier: None,
-context_window: 0,
-specializations: vec![],
-cache_min_tokens: None,
-cache_support: None,
-cost_per_million_cache_read_input_tokens: None,
-cost_per_million_cache_creation_input_tokens: None,
-cost_per_million_reasoning_tokens: None,
-reasoning_family: None,
-reasoning_parameter: None,
-}
-}
+    fn test_model_named(provider: &str, model: &str, priority: u32) -> ProviderModel {
+        ProviderModel {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            cost_per_million_input_tokens: 0.0,
+            cost_per_million_output_tokens: 0.0,
+            priority,
+            structured_output_passthrough: None,
+            tier: None,
+            context_window: 0,
+            specializations: vec![],
+            cache_min_tokens: None,
+            cache_support: None,
+            cost_per_million_cache_read_input_tokens: None,
+            cost_per_million_cache_creation_input_tokens: None,
+            cost_per_million_reasoning_tokens: None,
+            reasoning_family: None,
+            reasoning_parameter: None,
+        }
+    }
 
     fn test_group(models: Vec<ProviderModel>) -> ModelGroup {
         ModelGroup {
@@ -10716,76 +10776,76 @@ reasoning_parameter: None,
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
-    let accept_encoding = requests[0]
-        .headers
-        .get_all(reqwest::header::ACCEPT_ENCODING)
-        .iter()
-        .flat_map(|value| value.to_str().unwrap().split(','))
-        .map(str::trim)
-        .collect::<Vec<_>>();
-    assert_eq!(accept_encoding, vec!["identity"]);
-}
+        let accept_encoding = requests[0]
+            .headers
+            .get_all(reqwest::header::ACCEPT_ENCODING)
+            .iter()
+            .flat_map(|value| value.to_str().unwrap().split(','))
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        assert_eq!(accept_encoding, vec!["identity"]);
+    }
 
-// ------------------------------------------------------------------
-// Provider-configured user_agent and custom headers must reach the
-// upstream request on the buffered dispatch path (chat completions).
-// ------------------------------------------------------------------
-#[tokio::test]
-async fn buffered_request_includes_user_agent_and_custom_headers() {
-    use wiremock::matchers::{header, method, path};
+    // ------------------------------------------------------------------
+    // Provider-configured user_agent and custom headers must reach the
+    // upstream request on the buffered dispatch path (chat completions).
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn buffered_request_includes_user_agent_and_custom_headers() {
+        use wiremock::matchers::{header, method, path};
 
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("User-Agent", "my-app/2.1"))
-        .and(header("X-Custom", "custom-value"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-test",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "upstream-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "ok"},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let mut config = create_test_config();
-    let provider_model = test_model("provider", 1);
-    let mut provider = test_provider("provider", server.uri());
-    provider.user_agent = Some("my-app/2.1".to_string());
-    provider
-        .custom_headers
-        .insert("X-Custom".to_string(), "custom-value".to_string());
-    config.providers = vec![provider];
-    config.model_groups = vec![test_group(vec![provider_model])];
-    let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
-
-    let response = router
-        .route_request(
-            &OpenAIRequest {
-                model: "test-group".to_string(),
-                messages: vec![Message {
-                    role: "user".to_string(),
-                    content: serde_json::json!("hi"),
-                    extra: Default::default(),
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("User-Agent", "my-app/2.1"))
+            .and(header("X-Custom", "custom-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "upstream-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
                 }],
-                stream: false,
-                temperature: None,
-                max_tokens: None,
-                extra: Default::default(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.choices.len(), 1);
-    // wiremock `expect(1)` verifies both headers arrived on the single call.
-}
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        let provider_model = test_model("provider", 1);
+        let mut provider = test_provider("provider", server.uri());
+        provider.user_agent = Some("my-app/2.1".to_string());
+        provider
+            .custom_headers
+            .insert("X-Custom".to_string(), "custom-value".to_string());
+        config.providers = vec![provider];
+        config.model_groups = vec![test_group(vec![provider_model])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let response = router
+            .route_request(
+                &OpenAIRequest {
+                    model: "test-group".to_string(),
+                    messages: vec![Message {
+                        role: "user".to_string(),
+                        content: serde_json::json!("hi"),
+                        extra: Default::default(),
+                    }],
+                    stream: false,
+                    temperature: None,
+                    max_tokens: None,
+                    extra: Default::default(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.choices.len(), 1);
+        // wiremock `expect(1)` verifies both headers arrived on the single call.
+    }
 
     // ------------------------------------------------------------------
     // Task 9 preservation — non-Bedrock pass-through keeps every trigger
@@ -10835,7 +10895,10 @@ async fn buffered_request_includes_user_agent_and_custom_headers() {
                 p.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
             })
             .count();
-        assert_eq!(trigger_count, 2, "both compaction triggers must pass through untouched");
+        assert_eq!(
+            trigger_count, 2,
+            "both compaction triggers must pass through untouched"
+        );
         assert_eq!(
             serde_json::to_value(&outgoing).unwrap(),
             before,
@@ -11539,9 +11602,9 @@ async fn buffered_request_includes_user_agent_and_custom_headers() {
             total_timeout_seconds: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
-        custom_headers: Default::default(),
-        user_agent: None,
-        connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+            custom_headers: Default::default(),
+            user_agent: None,
+            connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
             budget: Some(crate::config::ProviderBudgetConfig {
                 limit_usd: 1.0,
                 reset_policy: crate::config::BudgetResetPolicy::Manual,
@@ -11659,46 +11722,46 @@ async fn buffered_request_includes_user_agent_and_custom_headers() {
             extra: Default::default(),
         };
 
-    let removed = Router::strip_image_content_if_unsupported(
-        &mut request,
-        true,
-        "test-provider",
-        "vision",
-    );
-    assert_eq!(removed, 0);
-    let parts = request.messages[0].content.as_array().unwrap();
-    assert_eq!(parts.len(), 2);
-}
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            true,
+            "test-provider",
+            "vision",
+        );
+        assert_eq!(removed, 0);
+        let parts = request.messages[0].content.as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+    }
 
-#[test]
-fn test_strip_image_content_if_unsupported_inserts_placeholder_for_image_only_message() {
-    let mut request = OpenAIRequest {
-        model: "no-vision".to_string(),
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: serde_json::json!([
-                {"type": "image_url", "image_url": {"url": "https://x.example/p.png"}},
-            ]),
+    #[test]
+    fn test_strip_image_content_if_unsupported_inserts_placeholder_for_image_only_message() {
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "image_url", "image_url": {"url": "https://x.example/p.png"}},
+                ]),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
             extra: Default::default(),
-        }],
-        temperature: None,
-        max_tokens: None,
-        stream: false,
-        extra: Default::default(),
-    };
+        };
 
-    let removed = Router::strip_image_content_if_unsupported(
-        &mut request,
-        false,
-        "test-provider",
-        "no-vision",
-    );
-    assert_eq!(removed, 1);
-    let parts = request.messages[0].content.as_array().unwrap();
-    assert_eq!(parts.len(), 1);
-    assert_eq!(parts[0]["type"], serde_json::json!("text"));
-    assert!(parts[0]["text"].as_str().unwrap().contains("image"));
-}
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        let parts = request.messages[0].content.as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], serde_json::json!("text"));
+        assert!(parts[0]["text"].as_str().unwrap().contains("image"));
+    }
 
     #[test]
     fn test_strip_image_content_if_unsupported_removes_variant_image_part_types() {
@@ -11838,224 +11901,220 @@ fn test_strip_image_content_if_unsupported_inserts_placeholder_for_image_only_me
         assert!(Router::is_unsupported_image_phrasing(
             r#"{"error":{"message":"This model does not support image inputs."}}"#
         ));
-assert!(!Router::is_unsupported_image_phrasing(
-"invalid model identifier"
-));
-}
+        assert!(!Router::is_unsupported_image_phrasing(
+            "invalid model identifier"
+        ));
+    }
 
-// --- Reasoning-compat conversation-model affinity (Task 6) ---
+    // --- Reasoning-compat conversation-model affinity (Task 6) ---
 
-fn affinity_router(reasoning_compat: crate::reasoning_compat::ReasoningCompatConfig) -> Router {
-let mut config = create_test_config();
-config.reasoning_compat = reasoning_compat;
-Router::new(Arc::new(RwLock::new(config)), test_metrics())
-}
+    fn affinity_router(reasoning_compat: crate::reasoning_compat::ReasoningCompatConfig) -> Router {
+        let mut config = create_test_config();
+        config.reasoning_compat = reasoning_compat;
+        Router::new(Arc::new(RwLock::new(config)), test_metrics())
+    }
 
-fn affinity_conversation() -> OpenAIRequest {
-OpenAIRequest {
-model: "test-group".to_string(),
-messages: vec![
-Message {
-role: "assistant".to_string(),
-content: serde_json::json!([
-{"type": "thinking", "thinking": "deep", "signature": "sig"},
-{"type": "text", "text": "partial answer"}
-]),
-extra: Default::default(),
-},
-Message {
-role: "user".to_string(),
-content: serde_json::json!("continue"),
-extra: Default::default(),
-},
-],
-stream: false,
-temperature: None,
-max_tokens: None,
-extra: Default::default(),
-}
-}
+    fn affinity_conversation() -> OpenAIRequest {
+        OpenAIRequest {
+            model: "test-group".to_string(),
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                    {"type": "thinking", "thinking": "deep", "signature": "sig"},
+                    {"type": "text", "text": "partial answer"}
+                    ]),
+                    extra: Default::default(),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("continue"),
+                    extra: Default::default(),
+                },
+            ],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        }
+    }
 
-#[test]
-fn model_affinity_source_resolves_entry_to_model_ref() {
-let router = affinity_router(Default::default());
-let request = affinity_conversation();
-let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
+    #[test]
+    fn model_affinity_source_resolves_entry_to_model_ref() {
+        let router = affinity_router(Default::default());
+        let request = affinity_conversation();
+        let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
 
-let prefix_hash = StickyCache::compute_prefix_hash(&request);
-router.sticky_cache.insert(
-prefix_hash,
-"anthropic".to_string(),
-"claude-sonnet-4-5".to_string(),
-None,
-);
+        let prefix_hash = StickyCache::compute_prefix_hash(&request);
+        router.sticky_cache.insert(
+            prefix_hash,
+            "anthropic".to_string(),
+            "claude-sonnet-4-5".to_string(),
+            None,
+        );
 
-let source = router
-.model_affinity_source(&request, &cfg)
-.expect("fresh affinity entry resolves to a source ModelRef");
-assert_eq!(source.provider, "anthropic");
-assert_eq!(source.model, "claude-sonnet-4-5");
-assert_eq!(
-source.family,
-crate::reasoning_compat::detect::classify_family("claude-sonnet-4-5")
-);
-}
+        let source = router
+            .model_affinity_source(&request, &cfg)
+            .expect("fresh affinity entry resolves to a source ModelRef");
+        assert_eq!(source.provider, "anthropic");
+        assert_eq!(source.model, "claude-sonnet-4-5");
+        assert_eq!(
+            source.family,
+            crate::reasoning_compat::detect::classify_family("claude-sonnet-4-5")
+        );
+    }
 
-#[test]
-fn model_affinity_source_is_none_on_miss_or_disabled() {
-let request = affinity_conversation();
-let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
+    #[test]
+    fn model_affinity_source_is_none_on_miss_or_disabled() {
+        let request = affinity_conversation();
+        let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
 
-// No entry for this prefix → miss → None (no source attribution).
-let router = affinity_router(Default::default());
-assert!(router.model_affinity_source(&request, &cfg).is_none());
+        // No entry for this prefix → miss → None (no source attribution).
+        let router = affinity_router(Default::default());
+        assert!(router.model_affinity_source(&request, &cfg).is_none());
 
-// Affinity flag off → no lookup at all, even with a fresh entry.
-let router = affinity_router(crate::reasoning_compat::ReasoningCompatConfig {
-conversation_model_affinity: false,
-..Default::default()
-});
-let prefix_hash = StickyCache::compute_prefix_hash(&request);
-router.sticky_cache.insert(
-prefix_hash,
-"anthropic".to_string(),
-"claude-sonnet-4-5".to_string(),
-None,
-);
-assert!(router.model_affinity_source(&request, &cfg).is_none());
-}
+        // Affinity flag off → no lookup at all, even with a fresh entry.
+        let router = affinity_router(crate::reasoning_compat::ReasoningCompatConfig {
+            conversation_model_affinity: false,
+            ..Default::default()
+        });
+        let prefix_hash = StickyCache::compute_prefix_hash(&request);
+        router.sticky_cache.insert(
+            prefix_hash,
+            "anthropic".to_string(),
+            "claude-sonnet-4-5".to_string(),
+            None,
+        );
+        assert!(router.model_affinity_source(&request, &cfg).is_none());
+    }
 
-#[test]
-fn affinity_hit_same_model_preserves_reasoning_state() {
-let router = affinity_router(Default::default());
-let request = affinity_conversation();
-let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
+    #[test]
+    fn affinity_hit_same_model_preserves_reasoning_state() {
+        let router = affinity_router(Default::default());
+        let request = affinity_conversation();
+        let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
 
-let prefix_hash = StickyCache::compute_prefix_hash(&request);
-router.sticky_cache.insert(
-prefix_hash,
-"anthropic".to_string(),
-"claude-sonnet-4-5".to_string(),
-None,
-);
-let source = router.model_affinity_source(&request, &cfg).unwrap();
+        let prefix_hash = StickyCache::compute_prefix_hash(&request);
+        router.sticky_cache.insert(
+            prefix_hash,
+            "anthropic".to_string(),
+            "claude-sonnet-4-5".to_string(),
+            None,
+        );
+        let source = router.model_affinity_source(&request, &cfg).unwrap();
 
-// Same resolved provider + model (mid-tool-loop continuation): the
-// signed thinking blocks must survive verbatim.
-let target = test_model_named("anthropic", "claude-sonnet-4-5", 1);
-let mut outgoing = request.clone();
-let report = reasoning_compat::prepare_attempt(
-&mut outgoing,
-&request,
-Some(source),
-&target,
-&cfg,
-);
-assert_eq!(
-report.decision,
-reasoning_compat::policy::StripDecision::Preserve
-);
-assert_eq!(report.strip, reasoning_compat::policy::StripReport::default());
-assert_eq!(
-serde_json::to_value(&outgoing.messages).unwrap(),
-serde_json::to_value(&request.messages).unwrap()
-);
-}
+        // Same resolved provider + model (mid-tool-loop continuation): the
+        // signed thinking blocks must survive verbatim.
+        let target = test_model_named("anthropic", "claude-sonnet-4-5", 1);
+        let mut outgoing = request.clone();
+        let report =
+            reasoning_compat::prepare_attempt(&mut outgoing, &request, Some(source), &target, &cfg);
+        assert_eq!(
+            report.decision,
+            reasoning_compat::policy::StripDecision::Preserve
+        );
+        assert_eq!(
+            report.strip,
+            reasoning_compat::policy::StripReport::default()
+        );
+        assert_eq!(
+            serde_json::to_value(&outgoing.messages).unwrap(),
+            serde_json::to_value(&request.messages).unwrap()
+        );
+    }
 
-#[test]
-fn affinity_hit_cross_family_strips_all_reasoning_state() {
-let router = affinity_router(Default::default());
-let request = affinity_conversation();
-let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
+    #[test]
+    fn affinity_hit_cross_family_strips_all_reasoning_state() {
+        let router = affinity_router(Default::default());
+        let request = affinity_conversation();
+        let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
 
-let prefix_hash = StickyCache::compute_prefix_hash(&request);
-router.sticky_cache.insert(
-prefix_hash,
-"anthropic".to_string(),
-"claude-sonnet-4-5".to_string(),
-None,
-);
-let source = router.model_affinity_source(&request, &cfg).unwrap();
+        let prefix_hash = StickyCache::compute_prefix_hash(&request);
+        router.sticky_cache.insert(
+            prefix_hash,
+            "anthropic".to_string(),
+            "claude-sonnet-4-5".to_string(),
+            None,
+        );
+        let source = router.model_affinity_source(&request, &cfg).unwrap();
 
-let target = test_model_named("deepseek", "deepseek-reasoner", 1);
-let mut outgoing = request.clone();
-let report = reasoning_compat::prepare_attempt(
-&mut outgoing,
-&request,
-Some(source),
-&target,
-&cfg,
-);
-assert_eq!(
-report.decision,
-reasoning_compat::policy::StripDecision::StripAll
-);
-assert_eq!(report.strip.thinking_blocks, 1);
-assert!(outgoing.messages[0]
-.content
-.as_array()
-.unwrap()
-.iter()
-.all(|block| block["type"] != "thinking"));
-}
+        let target = test_model_named("deepseek", "deepseek-reasoner", 1);
+        let mut outgoing = request.clone();
+        let report =
+            reasoning_compat::prepare_attempt(&mut outgoing, &request, Some(source), &target, &cfg);
+        assert_eq!(
+            report.decision,
+            reasoning_compat::policy::StripDecision::StripAll
+        );
+        assert_eq!(report.strip.thinking_blocks, 1);
+        assert!(outgoing.messages[0]
+            .content
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["type"] != "thinking"));
+    }
 
-#[test]
-fn affinity_miss_cross_family_strips_with_unknown_attribution() {
-let router = affinity_router(Default::default());
-let request = affinity_conversation();
-let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
+    #[test]
+    fn affinity_miss_cross_family_strips_with_unknown_attribution() {
+        let router = affinity_router(Default::default());
+        let request = affinity_conversation();
+        let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
 
-// No affinity entry: attribution unknown, conservative strip on a
-// cross-family target.
-assert!(router.model_affinity_source(&request, &cfg).is_none());
-let target = test_model_named("deepseek", "deepseek-reasoner", 1);
-let mut outgoing = request.clone();
-let report =
-reasoning_compat::prepare_attempt(&mut outgoing, &request, None, &target, &cfg);
-assert_eq!(
-report.decision,
-reasoning_compat::policy::StripDecision::StripAttributionUnknown
-);
-assert_eq!(report.strip.thinking_blocks, 1);
-}
+        // No affinity entry: attribution unknown, conservative strip on a
+        // cross-family target.
+        assert!(router.model_affinity_source(&request, &cfg).is_none());
+        let target = test_model_named("deepseek", "deepseek-reasoner", 1);
+        let mut outgoing = request.clone();
+        let report =
+            reasoning_compat::prepare_attempt(&mut outgoing, &request, None, &target, &cfg);
+        assert_eq!(
+            report.decision,
+            reasoning_compat::policy::StripDecision::StripAttributionUnknown
+        );
+        assert_eq!(report.strip.thinking_blocks, 1);
+    }
 
-#[tokio::test]
-async fn sticky_routing_gate_widens_to_reasoning_affinity() {
-// Reasoning affinity on, cache-aware routing off (its default): the
-// gate is active and successes record affinity entries.
-let router = affinity_router(Default::default());
-assert!(router.sticky_routing_enabled().await);
-assert!(!router.config.read().await.cache_aware_routing.enabled);
+    #[tokio::test]
+    async fn sticky_routing_gate_widens_to_reasoning_affinity() {
+        // Reasoning affinity on, cache-aware routing off (its default): the
+        // gate is active and successes record affinity entries.
+        let router = affinity_router(Default::default());
+        assert!(router.sticky_routing_enabled().await);
+        assert!(!router.config.read().await.cache_aware_routing.enabled);
 
-let request = affinity_conversation();
-let usage = crate::models::openai::Usage::default();
-router
-.record_sticky_success(&request, "anthropic", "claude-sonnet-4-5", &usage)
-.await;
-let prefix_hash = StickyCache::compute_prefix_hash(&request);
-assert_eq!(
-router.sticky_cache.get_model_affinity(prefix_hash),
-Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string()))
-);
+        let request = affinity_conversation();
+        let usage = crate::models::openai::Usage::default();
+        router
+            .record_sticky_success(&request, "anthropic", "claude-sonnet-4-5", &usage)
+            .await;
+        let prefix_hash = StickyCache::compute_prefix_hash(&request);
+        assert_eq!(
+            router.sticky_cache.get_model_affinity(prefix_hash),
+            Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string()))
+        );
 
-// Both features off: gate closed, zero-TTL cache, nothing recorded.
-let router = affinity_router(crate::reasoning_compat::ReasoningCompatConfig {
-enabled: false,
-conversation_model_affinity: false,
-..Default::default()
-});
-assert!(!router.sticky_routing_enabled().await);
-router
-.record_sticky_success(&request, "anthropic", "claude-sonnet-4-5", &usage)
-.await;
-let prefix_hash = StickyCache::compute_prefix_hash(&request);
-assert!(router.sticky_cache.get_model_affinity(prefix_hash).is_none());
-}
+        // Both features off: gate closed, zero-TTL cache, nothing recorded.
+        let router = affinity_router(crate::reasoning_compat::ReasoningCompatConfig {
+            enabled: false,
+            conversation_model_affinity: false,
+            ..Default::default()
+        });
+        assert!(!router.sticky_routing_enabled().await);
+        router
+            .record_sticky_success(&request, "anthropic", "claude-sonnet-4-5", &usage)
+            .await;
+        let prefix_hash = StickyCache::compute_prefix_hash(&request);
+        assert!(router
+            .sticky_cache
+            .get_model_affinity(prefix_hash)
+            .is_none());
+    }
 }
 
 #[cfg(test)]
 mod property_tests {
-use super::tests::{create_test_config, test_metrics};
+    use super::tests::{create_test_config, test_metrics};
     use super::*;
     use proptest::prelude::*;
 
@@ -12786,9 +12845,9 @@ use super::tests::{create_test_config, test_metrics};
             // Tight bucket so check_available() trivially returns false
             // after a single consume.
             rate_limit_per_minute: 1,
-        custom_headers: Default::default(),
-        user_agent: None,
-        connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+            custom_headers: Default::default(),
+            user_agent: None,
+            connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
             global_inference_profile: false,
@@ -12964,9 +13023,9 @@ use super::tests::{create_test_config, test_metrics};
             total_timeout_seconds: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
-        custom_headers: Default::default(),
-        user_agent: None,
-        connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+            custom_headers: Default::default(),
+            user_agent: None,
+            connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
             budget: None,
             manual_models: vec![],
             global_inference_profile: false,
@@ -13056,82 +13115,86 @@ use super::tests::{create_test_config, test_metrics};
         ));
     }
 
-#[test]
-fn test_tool_hint_injection_targets_learned_combos_only() {
-    let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+    #[test]
+    fn test_tool_hint_injection_targets_learned_combos_only() {
+        let router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
 
-    // Unknown models never see the hint: zero prompt overhead, no
-    // unexplained instructions for models that call tools natively.
-    assert!(!router.should_inject_tool_hint("openai-main", "gpt-4o"));
-    assert!(!router.should_inject_tool_hint("lite", "claude-sonnet-4-5"));
-    assert!(!router.should_inject_tool_hint("local", "llama3.1-8b"));
+        // Unknown models never see the hint: zero prompt overhead, no
+        // unexplained instructions for models that call tools natively.
+        assert!(!router.should_inject_tool_hint("openai-main", "gpt-4o"));
+        assert!(!router.should_inject_tool_hint("lite", "claude-sonnet-4-5"));
+        assert!(!router.should_inject_tool_hint("local", "llama3.1-8b"));
 
-    // Former built-in XML-prone families also start clean now — the
-    // hint is demoted to learned combos only, with
-    // `translate_xml_tool_calls` repairing any first XML-flavored
-    // response transparently.
-    assert!(!router.should_inject_tool_hint("x", "Kimi-K2-Instruct"));
-    assert!(!router.should_inject_tool_hint("x", "qwen2.5-72b-instruct"));
-    assert!(!router.should_inject_tool_hint("x", "glm-4.6"));
-    assert!(!router.should_inject_tool_hint("x", "deepseek-v3"));
+        // Former built-in XML-prone families also start clean now — the
+        // hint is demoted to learned combos only, with
+        // `translate_xml_tool_calls` repairing any first XML-flavored
+        // response transparently.
+        assert!(!router.should_inject_tool_hint("x", "Kimi-K2-Instruct"));
+        assert!(!router.should_inject_tool_hint("x", "qwen2.5-72b-instruct"));
+        assert!(!router.should_inject_tool_hint("x", "glm-4.6"));
+        assert!(!router.should_inject_tool_hint("x", "deepseek-v3"));
 
-    // Learned combos get it regardless of family — and stay learned:
-    // the hint must not appear/disappear between conversation turns.
-    router.mark_xml_tool_combo("weird-provider", "some-model");
-    assert!(router.should_inject_tool_hint("weird-provider", "some-model"));
-    assert!(router.is_xml_tool_combo("weird-provider", "some-model"));
-}
-
-#[test]
-fn test_tool_hint_text_is_attributed_and_xml_free() {
-    // The hint must read as attributed infrastructure guidance, not an
-    // anonymous imperative block: attributed, positively framed, and
-    // free of the XML tag litany that matches prompt-injection
-    // fingerprints (and would trip `looks_like_xml_tool_use`).
-    let content = match Router::tool_calling_system_hint().content {
-        serde_json::Value::String(text) => text,
-        other => panic!("hint content must be a string, got: {other:?}"),
-    };
-    assert!(content.starts_with("[gateway]"));
-    assert!(!content.contains('<'));
-    assert!(!Router::looks_like_xml_tool_use(&content));
-    assert!(content.len() < 500, "hint should stay short, got {} bytes", content.len());
-}
-
-#[test]
-fn test_insert_tool_calling_hint_positions_after_system_block() {
-    let msg = |role: &str| Message {
-        role: role.to_string(),
-        content: serde_json::Value::String(format!("{role} content")),
-        extra: serde_json::Map::new(),
-    };
-
-    // With a system prompt present, the hint lands directly after the
-    // last system message — never at the tail after user/tool content.
-    let mut messages = vec![msg("system"), msg("user"), msg("assistant"), msg("user")];
-    Router::insert_tool_calling_hint(&mut messages);
-    assert_eq!(messages.len(), 5);
-    assert_eq!(messages[1].role, "system");
-    assert_eq!(messages[2].role, "user");
-    assert_eq!(messages[4].role, "user");
-    match messages[1].content {
-        serde_json::Value::String(ref text) => assert!(text.starts_with("[gateway]")),
-        ref other => panic!("hint content must be a string, got: {other:?}"),
+        // Learned combos get it regardless of family — and stay learned:
+        // the hint must not appear/disappear between conversation turns.
+        router.mark_xml_tool_combo("weird-provider", "some-model");
+        assert!(router.should_inject_tool_hint("weird-provider", "some-model"));
+        assert!(router.is_xml_tool_combo("weird-provider", "some-model"));
     }
 
-    // Multiple system messages: insert after the last one.
-    let mut messages = vec![msg("system"), msg("system"), msg("user")];
-    Router::insert_tool_calling_hint(&mut messages);
-    assert_eq!(messages[2].role, "system");
-    assert!(match messages[2].content {
-        serde_json::Value::String(ref text) => text.starts_with("[gateway]"),
-        ref other => panic!("hint content must be a string, got: {other:?}"),
-    });
+    #[test]
+    fn test_tool_hint_text_is_attributed_and_xml_free() {
+        // The hint must read as attributed infrastructure guidance, not an
+        // anonymous imperative block: attributed, positively framed, and
+        // free of the XML tag litany that matches prompt-injection
+        // fingerprints (and would trip `looks_like_xml_tool_use`).
+        let content = match Router::tool_calling_system_hint().content {
+            serde_json::Value::String(text) => text,
+            other => panic!("hint content must be a string, got: {other:?}"),
+        };
+        assert!(content.starts_with("[gateway]"));
+        assert!(!content.contains('<'));
+        assert!(!Router::looks_like_xml_tool_use(&content));
+        assert!(
+            content.len() < 500,
+            "hint should stay short, got {} bytes",
+            content.len()
+        );
+    }
 
-// No system message at all: the hint becomes the first message.
-let mut messages = vec![msg("user"), msg("assistant")];
-Router::insert_tool_calling_hint(&mut messages);
-assert_eq!(messages[0].role, "system");
-assert_eq!(messages[1].role, "user");
-}
+    #[test]
+    fn test_insert_tool_calling_hint_positions_after_system_block() {
+        let msg = |role: &str| Message {
+            role: role.to_string(),
+            content: serde_json::Value::String(format!("{role} content")),
+            extra: serde_json::Map::new(),
+        };
+
+        // With a system prompt present, the hint lands directly after the
+        // last system message — never at the tail after user/tool content.
+        let mut messages = vec![msg("system"), msg("user"), msg("assistant"), msg("user")];
+        Router::insert_tool_calling_hint(&mut messages);
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1].role, "system");
+        assert_eq!(messages[2].role, "user");
+        assert_eq!(messages[4].role, "user");
+        match messages[1].content {
+            serde_json::Value::String(ref text) => assert!(text.starts_with("[gateway]")),
+            ref other => panic!("hint content must be a string, got: {other:?}"),
+        }
+
+        // Multiple system messages: insert after the last one.
+        let mut messages = vec![msg("system"), msg("system"), msg("user")];
+        Router::insert_tool_calling_hint(&mut messages);
+        assert_eq!(messages[2].role, "system");
+        assert!(match messages[2].content {
+            serde_json::Value::String(ref text) => text.starts_with("[gateway]"),
+            ref other => panic!("hint content must be a string, got: {other:?}"),
+        });
+
+        // No system message at all: the hint becomes the first message.
+        let mut messages = vec![msg("user"), msg("assistant")];
+        Router::insert_tool_calling_hint(&mut messages);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+    }
 }

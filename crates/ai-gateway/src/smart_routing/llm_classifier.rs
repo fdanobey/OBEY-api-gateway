@@ -323,7 +323,7 @@ impl OptionalClassifier for LlmClassifier {
     ) -> Result<ClassifierOutput, ClassifierFailure> {
         let fingerprint = request_fingerprint(input.request);
         if let Some(score) = self.cache.get(fingerprint) {
-            return Ok(ClassifierOutput { score });
+            return Ok(ClassifierOutput::score(score));
         }
 
         let request = self.classifier_request(input.request);
@@ -333,7 +333,7 @@ impl OptionalClassifier for LlmClassifier {
             .map_err(ClassifierFailure::from)?;
         let score = response.label.score();
         self.cache.insert(fingerprint, score);
-        Ok(ClassifierOutput { score })
+        Ok(ClassifierOutput::score(score))
     }
 }
 
@@ -565,6 +565,7 @@ mod tests {
             pinned_context,
             heuristic_score: ComplexityScore::new(0.5),
             heuristic_task_type: TaskType::General,
+            jev_trust: None,
         }
     }
 

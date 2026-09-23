@@ -404,6 +404,25 @@ fn redact_config_for_response(config: &Config) -> serde_json::Value {
         }
     }
 
+    if let Some(smart_routing) = body
+        .get_mut("smart_routing")
+        .and_then(|v| v.as_object_mut())
+    {
+        let jev_configured = config
+            .smart_routing
+            .jev
+            .as_ref()
+            .is_some_and(|jev| jev.has_api_key_configured());
+        if let Some(jev) = smart_routing.get_mut("jev").and_then(|v| v.as_object_mut()) {
+            jev.remove("api_key");
+            jev.remove("api_key_encrypted");
+            jev.insert(
+                "api_key_configured".to_string(),
+                serde_json::Value::Bool(jev_configured),
+            );
+        }
+    }
+
     body
 }
 
@@ -585,7 +604,70 @@ fn normalize_config_for_storage(
         }
     }
 
+    normalize_smart_routing_credentials(
+        &mut config.smart_routing,
+        existing_config.map(|config| &config.smart_routing),
+    )?;
+
     Ok(config)
+}
+
+/// Normalize Jev classifier credentials for storage, mirroring the provider
+/// api_key handling: plaintext keys are encrypted, encrypted keys are
+/// preserved when the client sends no replacement, and env-var references
+/// are kept verbatim.
+fn normalize_smart_routing_credentials(
+    smart_routing: &mut crate::smart_routing::config::SmartRoutingConfig,
+    existing: Option<&crate::smart_routing::config::SmartRoutingConfig>,
+) -> Result<(), String> {
+    let Some(jev) = smart_routing.jev.as_mut() else {
+        return Ok(());
+    };
+    let existing_jev = existing.and_then(|config| config.jev.as_ref());
+
+    // A literal plaintext key always wins and is encrypted before storage.
+    if let Some(literal) = jev.api_key.as_deref().map(str::trim) {
+        if !literal.is_empty() {
+            jev.api_key_encrypted = Some(
+                secrets::encrypt_provider_secret(literal)
+                    .map_err(|error| format!("Failed to encrypt Jev API key: {error}"))?,
+            );
+            jev.api_key_env = None;
+            jev.api_key = None;
+            return Ok(());
+        }
+    }
+    jev.api_key = None;
+
+    // An env-var reference stays verbatim and clears any stale encrypted key.
+    if let Some(reference) = jev.api_key_env.as_deref().map(str::trim) {
+        if !reference.is_empty() {
+            if secrets::looks_like_plaintext_secret(reference)
+                && !secrets::is_env_var_reference(reference)
+            {
+                // Plaintext typed into the env field: encrypt it too.
+                jev.api_key_encrypted = Some(
+                    secrets::encrypt_provider_secret(reference)
+                        .map_err(|error| format!("Failed to encrypt Jev API key: {error}"))?,
+                );
+                jev.api_key_env = None;
+            } else {
+                jev.api_key_encrypted = None;
+            }
+            return Ok(());
+        }
+    }
+    jev.api_key_env = None;
+
+    // No new input: preserve an existing encrypted key so GET→PUT round
+    // trips never destroy a stored credential.
+    if jev.api_key_encrypted.is_none() {
+        if let Some(existing) = existing_jev {
+            jev.api_key_encrypted = existing.api_key_encrypted.clone();
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -684,7 +766,22 @@ struct SmartRoutingSimulationRequest {
 
 async fn get_smart_routing_config(State(state): State<AppState>) -> Response {
     let config = state.config.read().await;
-    (StatusCode::OK, Json(config.smart_routing.clone())).into_response()
+    let mut body = serde_json::to_value(config.smart_routing.clone())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let jev_configured = config
+        .smart_routing
+        .jev
+        .as_ref()
+        .is_some_and(|jev| jev.has_api_key_configured());
+    if let Some(jev) = body.get_mut("jev").and_then(|v| v.as_object_mut()) {
+        jev.remove("api_key");
+        jev.remove("api_key_encrypted");
+        jev.insert(
+            "api_key_configured".to_string(),
+            serde_json::Value::Bool(jev_configured),
+        );
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 async fn update_smart_routing_config(
@@ -699,7 +796,18 @@ async fn update_smart_routing_config(
             .into_response();
     }
     let mut candidate = state.config.read().await.clone();
+    let existing_smart_routing = candidate.smart_routing.clone();
     candidate.smart_routing = smart_routing;
+    if let Err(error) = normalize_smart_routing_credentials(
+        &mut candidate.smart_routing,
+        Some(&existing_smart_routing),
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"type":"encryption_error","message":error}})),
+        )
+            .into_response();
+    }
     if let Err(errors) = candidate.validate() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1238,11 +1346,7 @@ async fn get_circuit_breaker_states(State(state): State<AppState>) -> Response {
         .iter()
         .map(|(key, st)| json!({ "provider": key, "state": st }))
         .collect();
-    (
-        StatusCode::OK,
-        Json(json!({ "states": entries })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(json!({ "states": entries }))).into_response()
 }
 
 /// POST /admin/circuit-breaker/reset ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â reset circuit breaker(s).
@@ -2047,9 +2151,9 @@ mod tests {
                     total_timeout_seconds: None,
                     max_connections: max_conn,
                     rate_limit_per_minute: rate_limit,
-        custom_headers: HashMap::new(),
-        user_agent: None,
-        connection_pool: ProviderConnectionPoolConfig::default(),
+                    custom_headers: HashMap::new(),
+                    user_agent: None,
+                    connection_pool: ProviderConnectionPoolConfig::default(),
                     budget: None,
                     manual_models: vec![],
                     global_inference_profile: false,
@@ -2087,11 +2191,11 @@ mod tests {
                 structured_output_passthrough: None,
                 tier: None,
                 context_window: 0,
-specializations: vec![],
-cost_per_million_reasoning_tokens: None,
-reasoning_family: None,
-reasoning_parameter: None,
-})
+                specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
+            })
     }
 
     fn arb_model_group(provider_name: String) -> impl Strategy<Value = ModelGroup> {
@@ -2146,9 +2250,9 @@ reasoning_parameter: None,
                     memory: None,
                     xhigh_models_allowlist: Default::default(),
                     reasoning_models_allowlist: Default::default(),
-codex_search: None,
-reasoning_compat: Default::default(),
-})
+                    codex_search: None,
+                    reasoning_compat: Default::default(),
+                })
             })
         })
     }
@@ -2413,6 +2517,90 @@ retry:
     }
 
     #[test]
+    fn test_redact_config_for_response_hides_jev_credentials() {
+        let mut config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
+        config.smart_routing.jev = Some({
+            let mut jev = crate::smart_routing::config::JevConfig::default();
+            jev.api_key = Some("sk-jev-literal-secret".to_string());
+            jev.api_key_encrypted = Some("enc-v1:nonce:data".to_string());
+            jev
+        });
+
+        let redacted = redact_config_for_response(&config);
+        let jev = &redacted["smart_routing"]["jev"];
+        assert!(jev.get("api_key").is_none());
+        assert!(jev.get("api_key_encrypted").is_none());
+        assert_eq!(jev["api_key_configured"], true);
+        assert!(!serde_json::to_string(&redacted)
+            .unwrap()
+            .contains("sk-jev-literal-secret"));
+    }
+
+    #[test]
+    fn test_normalize_smart_routing_credentials_encrypts_literal_key() {
+        let mut smart_routing = crate::smart_routing::config::SmartRoutingConfig::default();
+        smart_routing.jev = Some({
+            let mut jev = crate::smart_routing::config::JevConfig::default();
+            jev.api_key = Some("sk-jev-plain-secret".to_string());
+            jev
+        });
+
+        normalize_smart_routing_credentials(&mut smart_routing, None).unwrap();
+        let jev = smart_routing.jev.as_ref().unwrap();
+        assert!(jev.api_key.is_none());
+        assert!(jev.api_key_env.is_none());
+        assert!(jev
+            .api_key_encrypted
+            .as_deref()
+            .is_some_and(secrets::is_encrypted_secret));
+        assert_eq!(
+            jev.resolve_api_key().as_deref(),
+            Some("sk-jev-plain-secret")
+        );
+    }
+
+    #[test]
+    fn test_normalize_smart_routing_credentials_preserves_stored_key_when_blank() {
+        let mut existing = crate::smart_routing::config::SmartRoutingConfig::default();
+        existing.jev = Some({
+            let mut jev = crate::smart_routing::config::JevConfig::default();
+            jev.api_key_encrypted =
+                Some(secrets::encrypt_provider_secret("sk-jev-stored").unwrap());
+            jev
+        });
+
+        let mut incoming = existing.clone();
+        incoming.jev.as_mut().unwrap().api_key_encrypted = None;
+
+        normalize_smart_routing_credentials(&mut incoming, Some(&existing)).unwrap();
+        let jev = incoming.jev.as_ref().unwrap();
+        assert!(jev
+            .api_key_encrypted
+            .as_deref()
+            .is_some_and(secrets::is_encrypted_secret));
+        assert_eq!(jev.resolve_api_key().as_deref(), Some("sk-jev-stored"));
+    }
+
+    #[test]
+    fn test_normalize_smart_routing_credentials_env_name_clears_encrypted() {
+        let mut smart_routing = crate::smart_routing::config::SmartRoutingConfig::default();
+        smart_routing.jev = Some({
+            let mut jev = crate::smart_routing::config::JevConfig::default();
+            jev.api_key_env = Some("JEV_API_KEY".to_string());
+            jev.api_key_encrypted = Some("enc-v1:nonce:data".to_string());
+            jev
+        });
+
+        normalize_smart_routing_credentials(&mut smart_routing, None).unwrap();
+        let jev = smart_routing.jev.as_ref().unwrap();
+        assert_eq!(jev.api_key_env.as_deref(), Some("JEV_API_KEY"));
+        assert!(jev.api_key_encrypted.is_none());
+    }
+
+    #[test]
     fn test_normalize_config_for_storage_encrypts_plaintext_key() {
         let mut config = arb_config()
             .new_tree(&mut proptest::test_runner::TestRunner::default())
@@ -2532,9 +2720,9 @@ retry:
                 total_timeout_seconds: None,
                 max_connections: 10,
                 rate_limit_per_minute: 0,
-        custom_headers: Default::default(),
-        user_agent: None,
-        connection_pool: ProviderConnectionPoolConfig::default(),
+                custom_headers: Default::default(),
+                user_agent: None,
+                connection_pool: ProviderConnectionPoolConfig::default(),
                 budget: None,
                 manual_models: vec![],
                 global_inference_profile: false,
@@ -2569,9 +2757,9 @@ retry:
                     tier: None,
                     context_window: 0,
                     specializations: vec![],
-                cost_per_million_reasoning_tokens: None,
-                reasoning_family: None,
-                reasoning_parameter: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -2595,10 +2783,10 @@ retry:
             memory: None,
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
-codex_search: None,
-reasoning_compat: Default::default(),
-};
-config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
+            codex_search: None,
+            reasoning_compat: Default::default(),
+        };
+        config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
         config.virtual_keys.database_path =
             storage_dir.join("keys.db").to_string_lossy().into_owned();
         config

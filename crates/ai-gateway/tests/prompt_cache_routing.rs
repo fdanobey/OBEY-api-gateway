@@ -135,8 +135,8 @@ fn model(
         structured_output_passthrough: None,
         tier: None,
         context_window: 0,
-specializations: vec![],
-cost_per_million_reasoning_tokens: None,
+        specializations: vec![],
+        cost_per_million_reasoning_tokens: None,
         reasoning_family: None,
         reasoning_parameter: None,
     }
@@ -172,7 +172,10 @@ async fn post_chat(app: axum::Router, group: &str, turn: &str) -> (StatusCode, s
     let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 /// Mount a mock chat-completions endpoint returning `usage` JSON.
@@ -215,7 +218,10 @@ async fn same_prefix_requests_stick_to_serving_provider() {
     let backup = MockServer::start().await; // priority 2
 
     let mut config = cache_config(cache_aware(true));
-    config.providers = vec![provider("primary", &primary.uri()), provider("backup", &backup.uri())];
+    config.providers = vec![
+        provider("primary", &primary.uri()),
+        provider("backup", &backup.uri()),
+    ];
     config.model_groups = vec![ModelGroup {
         name: "cache-group".to_string(),
         version_fallback_enabled: false,
@@ -303,7 +309,16 @@ async fn cache_aware_cost_sort_prefers_read_discounted_provider() {
         memory: None,
         structured_output: None,
         models: vec![
-            model("discounted", "m-discounted", 1, 3.0, 0.0, Some(0.30), None, None),
+            model(
+                "discounted",
+                "m-discounted",
+                1,
+                3.0,
+                0.0,
+                Some(0.30),
+                None,
+                None,
+            ),
             model("flat", "m-flat", 1, 1.50, 0.0, None, None, None),
         ],
     }];
@@ -339,7 +354,16 @@ async fn disabled_cache_sort_keeps_base_price_order() {
         memory: None,
         structured_output: None,
         models: vec![
-            model("discounted", "m-discounted", 1, 3.0, 0.0, Some(0.30), None, None),
+            model(
+                "discounted",
+                "m-discounted",
+                1,
+                3.0,
+                0.0,
+                Some(0.30),
+                None,
+                None,
+            ),
             model("flat", "m-flat", 1, 1.50, 0.0, None, None, None),
         ],
     }];
@@ -382,9 +406,7 @@ async fn explicit_cache_provider_receives_breakpoint_markers() {
             15.0,
             Some(0.30),
             Some(3.75),
-            Some(PromptCacheSupport::Explicit {
-                max_breakpoints: 4,
-            }),
+            Some(PromptCacheSupport::Explicit { max_breakpoints: 4 }),
         )],
     }];
     common::isolate_databases(&mut config);

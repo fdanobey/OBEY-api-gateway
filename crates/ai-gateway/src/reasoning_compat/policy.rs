@@ -106,8 +106,8 @@ pub fn decide(
 
     match source {
         Some(source) => {
-            let same_resolved_model = source.provider == target.provider
-                && source.model == target.model;
+            let same_resolved_model =
+                source.provider == target.provider && source.model == target.model;
             if same_resolved_model && source.family == target.family {
                 StripDecision::Preserve
             } else {
@@ -320,10 +320,7 @@ mod tests {
     fn anthropic_conversation() -> Vec<Message> {
         vec![
             user(json!("hi")),
-            assistant(
-                json!([thinking_block(), text_block()]),
-                Map::new(),
-            ),
+            assistant(json!([thinking_block(), text_block()]), Map::new()),
         ]
     }
 
@@ -391,12 +388,9 @@ mod tests {
     fn cross_family_strip_removes_reasoning_content_extra() {
         let messages = vec![assistant(
             json!("answer"),
-            [(
-                "reasoning_content".to_string(),
-                json!("chain of thought"),
-            )]
-            .into_iter()
-            .collect(),
+            [("reasoning_content".to_string(), json!("chain of thought"))]
+                .into_iter()
+                .collect(),
         )];
         let footprint = detect(&messages);
         let cfg = ReasoningCompatConfig::default();
@@ -489,7 +483,10 @@ mod tests {
         let report = apply(&mut outgoing, StripDecision::StripAll);
         assert_eq!(report.thinking_blocks, 1);
         assert_eq!(outgoing.messages.len(), 1);
-        assert_eq!(outgoing.messages[0].extra.get("tool_calls"), Some(&tool_calls));
+        assert_eq!(
+            outgoing.messages[0].extra.get("tool_calls"),
+            Some(&tool_calls)
+        );
     }
 
     #[test]
@@ -536,8 +533,18 @@ mod tests {
         // Mixed non-Anthropic field carriers stay unclassified (family None)
         // — must never preserve on an unclassified match.
         let messages = vec![
-            assistant(json!("a"), [("reasoning_content".to_string(), json!("r"))].into_iter().collect()),
-            assistant(json!("b"), [("reasoning".to_string(), json!("r"))].into_iter().collect()),
+            assistant(
+                json!("a"),
+                [("reasoning_content".to_string(), json!("r"))]
+                    .into_iter()
+                    .collect(),
+            ),
+            assistant(
+                json!("b"),
+                [("reasoning".to_string(), json!("r"))]
+                    .into_iter()
+                    .collect(),
+            ),
         ];
         let footprint = detect(&messages);
         assert_eq!(footprint.source_family, ReasoningFamily::None);
@@ -673,9 +680,12 @@ mod tests {
             user(json!("hi")),
             assistant(json!([thinking_block(), text_block()]), Map::new()),
             assistant(json!([redacted_block(), text_block()]), Map::new()),
-            assistant(json!("plain"), [("reasoning".to_string(), json!("r"))]
-                .into_iter()
-                .collect()),
+            assistant(
+                json!("plain"),
+                [("reasoning".to_string(), json!("r"))]
+                    .into_iter()
+                    .collect(),
+            ),
         ];
         let mut outgoing = request(messages);
         let report = apply(&mut outgoing, StripDecision::StripAll);
@@ -688,10 +698,7 @@ mod tests {
 
     #[test]
     fn untouched_messages_are_never_dropped() {
-        let messages = vec![
-            user(json!("")),
-            assistant(json!([]), Map::new()),
-        ];
+        let messages = vec![user(json!("")), assistant(json!([]), Map::new())];
         let mut outgoing = request(messages);
         let report = apply(&mut outgoing, StripDecision::StripAll);
         assert_eq!(report, StripReport::default());

@@ -1,4 +1,4 @@
-﻿//! Guardrail pipelines: configurable, opt-in policy enforcement for the gateway.
+//! Guardrail pipelines: configurable, opt-in policy enforcement for the gateway.
 //!
 //! This module tree adds pre-call and post-call policy evaluation to the
 //! request lifecycle. It is organized as:
@@ -471,9 +471,12 @@ impl GuardrailEngine {
                 .scan_json_content;
             let slots = collect_tool_result_slots(&request.messages, scan_json);
             let run = self
-                .execute_stage_on_slots(stage, slots, |addr, text| {
-                    set_request_slot(request, addr, text)
-                }, trace_id)
+                .execute_stage_on_slots(
+                    stage,
+                    slots,
+                    |addr, text| set_request_slot(request, addr, text),
+                    trace_id,
+                )
                 .await;
 
             let latency_ms = duration_ms(stage_start.elapsed());
@@ -512,9 +515,12 @@ impl GuardrailEngine {
                 let stage_start = Instant::now();
                 let slots = collect_tool_call_slots_request(&request.messages);
                 let run = self
-                    .execute_stage_on_slots(stage, slots, |addr, text| {
-                        set_request_slot(request, addr, text)
-                    }, trace_id)
+                    .execute_stage_on_slots(
+                        stage,
+                        slots,
+                        |addr, text| set_request_slot(request, addr, text),
+                        trace_id,
+                    )
                     .await;
 
                 let latency_ms = duration_ms(stage_start.elapsed());
@@ -739,9 +745,12 @@ impl GuardrailEngine {
             let stage_start = Instant::now();
             let slots = collect_tool_call_slots_response(response);
             let run = self
-                .execute_stage_on_slots(stage, slots, |addr, text| {
-                    set_response_slot(response, addr, text)
-                }, trace_id)
+                .execute_stage_on_slots(
+                    stage,
+                    slots,
+                    |addr, text| set_response_slot(response, addr, text),
+                    trace_id,
+                )
                 .await;
 
             let latency_ms = duration_ms(stage_start.elapsed());
@@ -1125,7 +1134,13 @@ impl GuardrailEngine {
                 PolicyAction::Redact => FieldEffect::Modified(redact_by_category(&text, &findings)),
                 PolicyAction::ReplaceWithPolicyMessage => {
                     if phase == StagePhase::ToolCall
-                        && matches!(addr, SlotAddress::ToolCall { field: ToolCallField::Arguments, .. })
+                        && matches!(
+                            addr,
+                            SlotAddress::ToolCall {
+                                field: ToolCallField::Arguments,
+                                ..
+                            }
+                        )
                     {
                         // Req 3.4: rewrite the offending call's arguments.
                         replaced = true;
@@ -1354,10 +1369,7 @@ enum SlotAddress {
 /// Collect `role:"tool"` content slots: string content, `{"type":"text"}`
 /// array parts, and — gated by `scan_json` — the compact-JSON serialization
 /// of non-string/non-array content (Req 1.2, 1.6).
-fn collect_tool_result_slots(
-    messages: &[Message],
-    scan_json: bool,
-) -> Vec<(SlotAddress, String)> {
+fn collect_tool_result_slots(messages: &[Message], scan_json: bool) -> Vec<(SlotAddress, String)> {
     let mut slots = Vec::new();
     for (index, message) in messages.iter().enumerate() {
         if message.role != "tool" {
@@ -1365,17 +1377,17 @@ fn collect_tool_result_slots(
         }
         match &message.content {
             Value::String(s) => {
-                slots.push((
-                    SlotAddress::MessageContent { index, part: None },
-                    s.clone(),
-                ));
+                slots.push((SlotAddress::MessageContent { index, part: None }, s.clone()));
             }
             Value::Array(parts) => {
                 for (i, part) in parts.iter().enumerate() {
                     if part.get("type").and_then(|t| t.as_str()) == Some("text") {
                         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                             slots.push((
-                                SlotAddress::MessageContent { index, part: Some(i) },
+                                SlotAddress::MessageContent {
+                                    index,
+                                    part: Some(i),
+                                },
                                 text.to_string(),
                             ));
                         }
@@ -1386,10 +1398,7 @@ fn collect_tool_result_slots(
             // to every stage: serialize compactly and scan (Req 1.6).
             other @ (Value::Object(_) | Value::Number(_) | Value::Bool(_)) => {
                 if scan_json {
-                    slots.push((
-                        SlotAddress::MessageContentJson { index },
-                        other.to_string(),
-                    ));
+                    slots.push((SlotAddress::MessageContentJson { index }, other.to_string()));
                 }
             }
             Value::Null => {}
@@ -1494,10 +1503,7 @@ fn set_tool_call_field(
     let Some(call) = tool_calls.get_mut(call_index) else {
         return;
     };
-    let Some(function) = call
-        .get_mut("function")
-        .and_then(|f| f.as_object_mut())
-    else {
+    let Some(function) = call.get_mut("function").and_then(|f| f.as_object_mut()) else {
         return;
     };
     let key = match field {

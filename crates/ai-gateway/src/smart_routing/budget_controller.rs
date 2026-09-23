@@ -784,9 +784,9 @@ mod tests {
             tier: Some(SmartRoutingTier::Powerful),
             context_window: 100_000,
             specializations: vec![],
-        cost_per_million_reasoning_tokens: None,
-        reasoning_family: None,
-        reasoning_parameter: None,
+            cost_per_million_reasoning_tokens: None,
+            reasoning_family: None,
+            reasoning_parameter: None,
         }
     }
 
@@ -815,6 +815,8 @@ mod tests {
             task_type: TaskType::General,
             classifier: ClassifierUsed::Heuristic,
             token_estimate: tokens,
+            confidence: None,
+            resolved_model: None,
         }
     }
 

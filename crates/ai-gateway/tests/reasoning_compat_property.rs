@@ -15,9 +15,7 @@ use proptest::prelude::*;
 
 use ai_gateway::config::ProviderModel;
 use ai_gateway::models::openai::{Message, OpenAIRequest, Usage};
-use ai_gateway::reasoning_compat::config::{
-    Effort, ReasoningCompatConfig, ReasoningFamily,
-};
+use ai_gateway::reasoning_compat::config::{Effort, ReasoningCompatConfig, ReasoningFamily};
 use ai_gateway::reasoning_compat::cost::{extract_reasoning_usage, reasoning_cost};
 use ai_gateway::reasoning_compat::detect::detect;
 use ai_gateway::reasoning_compat::normalize::{emit_for_target, read_client_spec, ReasoningSpec};
@@ -31,16 +29,16 @@ use serde_json::{json, Map, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CarrierType {
- ThinkingWithSignature,
- ThinkingWithoutSignature,
- RedactedThinking,
- ReasoningContent,
- ReasoningField,
- ResponsesReasoning,
- #[allow(dead_code)]
- PlainText,
- #[allow(dead_code)]
- ToolCalls,
+    ThinkingWithSignature,
+    ThinkingWithoutSignature,
+    RedactedThinking,
+    ReasoningContent,
+    ReasoningField,
+    ResponsesReasoning,
+    #[allow(dead_code)]
+    PlainText,
+    #[allow(dead_code)]
+    ToolCalls,
 }
 
 // ---------------------------------------------------------------------------
@@ -392,7 +390,13 @@ fn count_carriers_in_json(messages: &[Message]) -> (usize, usize, usize, usize, 
         }
     }
 
-    (thinking_blocks, redacted_blocks, reasoning_content_count, reasoning_field_count, responses_reasoning)
+    (
+        thinking_blocks,
+        redacted_blocks,
+        reasoning_content_count,
+        reasoning_field_count,
+        responses_reasoning,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +633,25 @@ proptest! {
         let (thinking, redacted, reasoning_content, reasoning_field, responses_reasoning) =
             count_carriers_in_json(&messages);
 
+        // `detect()` records one INDEX per message that carries at least one
+        // Responses-style `reasoning` block, while `responses_reasoning` above
+        // counts every such block (a single message may hold several). Compare
+        // `responses_items.len()` against the per-message presence count so the
+        // two quantities are commensurate; the per-block total is checked via
+        // `block_counts` below.
+        let responses_reasoning_msgs = messages
+            .iter()
+            .filter(|msg| {
+                msg.content
+                    .as_array()
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block.get("type").and_then(Value::as_str) == Some("reasoning")
+                        })
+                    })
+            })
+            .count();
+
         prop_assert_eq!(
             footprint.has_thinking_blocks,
             thinking > 0,
@@ -651,8 +674,8 @@ proptest! {
         );
         prop_assert_eq!(
             footprint.responses_items.len(),
-            responses_reasoning,
-            "responses_items count must match actual reasoning blocks"
+            responses_reasoning_msgs,
+            "responses_items count must match the number of messages carrying a reasoning block"
         );
 
         let total_blocks = thinking + redacted + responses_reasoning;
@@ -751,7 +774,10 @@ fn anthropic_manual_budget_clamping() {
         extra: Map::new(),
     };
 
-    outgoing.extra.insert("thinking".to_string(), json!({"type": "enabled", "budget_tokens": 500}));
+    outgoing.extra.insert(
+        "thinking".to_string(),
+        json!({"type": "enabled", "budget_tokens": 500}),
+    );
 
     let spec = read_client_spec(&outgoing);
     let target = make_provider_model("claude-4-5-sonnet", ReasoningFamily::AnthropicManual);
@@ -762,7 +788,10 @@ fn anthropic_manual_budget_clamping() {
     assert!(report.clamped, "budget below 1024 should be clamped");
 
     if let Some(thinking) = outgoing.extra.get("thinking").and_then(Value::as_object) {
-        let budget = thinking.get("budget_tokens").and_then(Value::as_u64).unwrap();
+        let budget = thinking
+            .get("budget_tokens")
+            .and_then(Value::as_u64)
+            .unwrap();
         assert!(budget >= 1024, "clamped budget must be >= 1024");
     }
 }
@@ -778,7 +807,9 @@ fn adaptive_target_with_budget_spec_emits_adaptive() {
         extra: Map::new(),
     };
 
-    outgoing.extra.insert("reasoning".to_string(), json!({"max_tokens": 8192}));
+    outgoing
+        .extra
+        .insert("reasoning".to_string(), json!({"max_tokens": 8192}));
 
     let spec = read_client_spec(&outgoing);
     let target = make_provider_model("claude-4-7-sonnet", ReasoningFamily::AnthropicAdaptive);
@@ -788,8 +819,15 @@ fn adaptive_target_with_budget_spec_emits_adaptive() {
 
     assert_eq!(report.emitted_shape, "thinking_adaptive");
 
-    let thinking = outgoing.extra.get("thinking").and_then(Value::as_object).unwrap();
-    assert_eq!(thinking.get("type").and_then(Value::as_str), Some("adaptive"));
+    let thinking = outgoing
+        .extra
+        .get("thinking")
+        .and_then(Value::as_object)
+        .unwrap();
+    assert_eq!(
+        thinking.get("type").and_then(Value::as_str),
+        Some("adaptive")
+    );
 }
 
 #[test]
@@ -814,5 +852,8 @@ fn cost_uses_output_price_when_reasoning_unset() {
     };
 
     let cost = reasoning_cost(&model, 1_000_000);
-    assert!((cost - 10.0).abs() < 1e-9, "cost should fall back to output price");
+    assert!(
+        (cost - 10.0).abs() < 1e-9,
+        "cost should fall back to output price"
+    );
 }

@@ -64,7 +64,12 @@ fn responses_request_text(model: &str, input: &str, stream: bool) -> Value {
     })
 }
 
-fn responses_request_with_previous(model: &str, input: &str, previous_id: &str, stream: bool) -> Value {
+fn responses_request_with_previous(
+    model: &str,
+    input: &str,
+    previous_id: &str,
+    stream: bool,
+) -> Value {
     json!({
         "model": model,
         "input": input,
@@ -232,7 +237,10 @@ fn event_type(event: &Value) -> &str {
 }
 
 fn sequence_number(event: &Value) -> u64 {
-    event.get("sequence_number").and_then(|s| s.as_u64()).unwrap_or(0)
+    event
+        .get("sequence_number")
+        .and_then(|s| s.as_u64())
+        .unwrap_or(0)
 }
 
 async fn start_streaming_mock_with_sse(sse_body: String) -> MockServer {
@@ -291,7 +299,8 @@ async fn test_streaming_event_order_and_monotonicity() {
     let server = start_streaming_mock_with_sse(sse_body).await;
     let app = build_app(&server.uri()).await;
 
-    let (status, body) = post_responses_stream(app.app, &responses_request_text("test-group", "hi", true)).await;
+    let (status, body) =
+        post_responses_stream(app.app, &responses_request_text("test-group", "hi", true)).await;
     assert_eq!(status, StatusCode::OK);
 
     let events = parse_sse_events(&body);
@@ -299,16 +308,33 @@ async fn test_streaming_event_order_and_monotonicity() {
 
     let types: Vec<&str> = events.iter().map(event_type).collect();
 
-    let created_idx = types.iter().position(|&t| t == "response.created").expect("created event");
-    let in_progress_idx = types.iter().position(|&t| t == "response.in_progress").expect("in_progress event");
-    let completed_idx = types.iter().position(|&t| t == "response.completed").expect("completed event");
+    let created_idx = types
+        .iter()
+        .position(|&t| t == "response.created")
+        .expect("created event");
+    let in_progress_idx = types
+        .iter()
+        .position(|&t| t == "response.in_progress")
+        .expect("in_progress event");
+    let completed_idx = types
+        .iter()
+        .position(|&t| t == "response.completed")
+        .expect("completed event");
 
     assert!(created_idx < in_progress_idx, "created before in_progress");
-    assert!(in_progress_idx < completed_idx, "in_progress before completed");
+    assert!(
+        in_progress_idx < completed_idx,
+        "in_progress before completed"
+    );
 
     let seqs: Vec<u64> = events.iter().map(sequence_number).collect();
     for i in 1..seqs.len() {
-        assert!(seqs[i] > seqs[i - 1], "sequence_number must be strictly increasing, got {:?} at index {}", seqs, i);
+        assert!(
+            seqs[i] > seqs[i - 1],
+            "sequence_number must be strictly increasing, got {:?} at index {}",
+            seqs,
+            i
+        );
     }
 }
 
@@ -372,7 +398,11 @@ async fn test_parallel_tool_call_streaming() {
     let server = start_streaming_mock_with_sse(sse_body).await;
     let app = build_app(&server.uri()).await;
 
-    let (status, body) = post_responses_stream(app.app, &responses_request_text("test-group", "check weather", true)).await;
+    let (status, body) = post_responses_stream(
+        app.app,
+        &responses_request_text("test-group", "check weather", true),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     let events = parse_sse_events(&body);
@@ -381,7 +411,10 @@ async fn test_parallel_tool_call_streaming() {
         .filter(|e| event_type(e) == "response.output_item.added")
         .collect();
 
-    assert!(output_item_added.len() >= 2, "Expected at least 2 output_item.added events for parallel tool calls");
+    assert!(
+        output_item_added.len() >= 2,
+        "Expected at least 2 output_item.added events for parallel tool calls"
+    );
 
     let fc_deltas: Vec<&Value> = events
         .iter()
@@ -389,7 +422,10 @@ async fn test_parallel_tool_call_streaming() {
         .collect();
 
     for delta in &fc_deltas {
-        assert!(delta.get("item_id").is_some(), "function_call_arguments.delta must have item_id");
+        assert!(
+            delta.get("item_id").is_some(),
+            "function_call_arguments.delta must have item_id"
+        );
     }
 }
 
@@ -419,7 +455,11 @@ async fn test_refusal_streaming() {
     let server = start_streaming_mock_with_sse(sse_body).await;
     let app = build_app(&server.uri()).await;
 
-    let (status, body) = post_responses_stream(app.app, &responses_request_text("test-group", "do something bad", true)).await;
+    let (status, body) = post_responses_stream(
+        app.app,
+        &responses_request_text("test-group", "do something bad", true),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     let events = parse_sse_events(&body);
@@ -428,7 +468,10 @@ async fn test_refusal_streaming() {
         .filter(|e| event_type(e) == "response.refusal.delta")
         .collect();
 
-    assert!(!refusal_deltas.is_empty(), "Expected response.refusal.delta events for refusal streaming");
+    assert!(
+        !refusal_deltas.is_empty(),
+        "Expected response.refusal.delta events for refusal streaming"
+    );
 }
 
 #[tokio::test]
@@ -463,30 +506,47 @@ async fn test_reasoning_delta_synthesis() {
     let server = start_streaming_mock_with_sse(sse_body).await;
     let app = build_app(&server.uri()).await;
 
-    let (status, body) = post_responses_stream(app.app, &responses_request_text("test-group", "what is the answer?", true)).await;
+    let (status, body) = post_responses_stream(
+        app.app,
+        &responses_request_text("test-group", "what is the answer?", true),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     let events = parse_sse_events(&body);
     let types: Vec<&str> = events.iter().map(event_type).collect();
 
-    let reasoning_idx = types.iter().position(|&t| t == "response.reasoning_text.delta");
-    let text_idx = types.iter().position(|&t| t == "response.output_text.delta");
+    let reasoning_idx = types
+        .iter()
+        .position(|&t| t == "response.reasoning_text.delta");
+    let text_idx = types
+        .iter()
+        .position(|&t| t == "response.output_text.delta");
 
     if let (Some(r_idx), Some(t_idx)) = (reasoning_idx, text_idx) {
-        assert!(r_idx < t_idx, "reasoning events must come before text events");
+        assert!(
+            r_idx < t_idx,
+            "reasoning events must come before text events"
+        );
     }
 }
 
 #[tokio::test]
 async fn test_previous_response_id_chaining() {
-    use wiremock::{Mock, ResponseTemplate};
     use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
 
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path(PROVIDER_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_response("chatcmpl-1", "gpt-4", "Hello!")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_completion_response(
+                "chatcmpl-1",
+                "gpt-4",
+                "Hello!",
+            )),
+        )
         .mount(&server)
         .await;
 
@@ -505,18 +565,24 @@ async fn test_previous_response_id_chaining() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-let first_response: Value = serde_json::from_slice(&body).unwrap();
-let first_id = first_response["id"].as_str().expect("response id");
+    let first_response: Value = serde_json::from_slice(&body).unwrap();
+    let first_id = first_response["id"].as_str().expect("response id");
 
-server.reset().await;
+    server.reset().await;
 
-Mock::given(method("POST"))
-.and(path(PROVIDER_PATH))
-.respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_response("chatcmpl-2", "gpt-4", "Hello again!")))
-.mount(&server)
-.await;
+    Mock::given(method("POST"))
+        .and(path(PROVIDER_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_completion_response(
+                "chatcmpl-2",
+                "gpt-4",
+                "Hello again!",
+            )),
+        )
+        .mount(&server)
+        .await;
 
-let (status, _body) = post_responses(
+    let (status, _body) = post_responses(
         app.app,
         &serde_json::json!({
             "model": "test-group",
@@ -531,7 +597,8 @@ let (status, _body) = post_responses(
 
 #[tokio::test]
 async fn test_previous_response_id_not_found() {
-    let server = start_buffered_mock(chat_completion_response("chatcmpl-1", "gpt-4", "Hello!")).await;
+    let server =
+        start_buffered_mock(chat_completion_response("chatcmpl-1", "gpt-4", "Hello!")).await;
     let app = build_app(&server.uri()).await;
 
     let (status, body) = post_responses(
@@ -542,19 +609,28 @@ async fn test_previous_response_id_not_found() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     let error: Value = serde_json::from_slice(&body).unwrap();
-    assert!(error.get("error").is_some(), "Expected error object in response");
+    assert!(
+        error.get("error").is_some(),
+        "Expected error object in response"
+    );
 }
 
 #[tokio::test]
 async fn test_instructions_non_carryover() {
-    use wiremock::{Mock, ResponseTemplate};
     use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
 
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path(PROVIDER_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_response("chatcmpl-1", "gpt-4", "Brief.")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_completion_response(
+                "chatcmpl-1",
+                "gpt-4",
+                "Brief.",
+            )),
+        )
         .mount(&server)
         .await;
 
@@ -580,7 +656,13 @@ async fn test_instructions_non_carryover() {
 
     Mock::given(method("POST"))
         .and(path(PROVIDER_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_response("chatcmpl-2", "gpt-4", "Verbose response here.")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(chat_completion_response(
+                "chatcmpl-2",
+                "gpt-4",
+                "Verbose response here.",
+            )),
+        )
         .mount(&server)
         .await;
 

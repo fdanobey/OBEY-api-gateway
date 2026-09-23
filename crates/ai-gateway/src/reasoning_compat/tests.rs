@@ -322,14 +322,24 @@ fn detection_to_policy_matrix_same_family_vs_cross_family() {
         // Attribution unknown + target family matches the inferred source
         // family → preserve (the carriers may be native to the target).
         assert_eq!(
-            decide(&footprint, None, &target_model_ref(&same_family_target), &cfg),
+            decide(
+                &footprint,
+                None,
+                &target_model_ref(&same_family_target),
+                &cfg
+            ),
             StripDecision::Preserve,
             "same-family target: {label}"
         );
 
         // Attribution unknown + cross-family target → conservative strip.
         assert_eq!(
-            decide(&footprint, None, &target_model_ref(&cross_family_target), &cfg),
+            decide(
+                &footprint,
+                None,
+                &target_model_ref(&cross_family_target),
+                &cfg
+            ),
             StripDecision::StripAttributionUnknown,
             "cross-family target: {label}"
         );
@@ -358,10 +368,7 @@ fn known_source_different_model_same_family_strips_model_bound_state() {
     assert_eq!(report.thinking_blocks, 1);
     assert_eq!(report.redacted_thinking_blocks, 1);
     assert!(outgoing.messages.iter().all(|message| {
-        message
-            .content
-            .as_array()
-            .map_or(true, |blocks| {
+        message.content.as_array().map_or(true, |blocks| {
             blocks.iter().all(|block| {
                 let block_type = block.get("type").and_then(Value::as_str);
                 block_type != Some("thinking") && block_type != Some("redacted_thinking")
@@ -378,7 +385,9 @@ fn known_source_different_model_same_family_strips_model_bound_state() {
 fn cross_model_strip_then_manual_target_emits_budget_and_drops_sampling() {
     let cfg = ReasoningCompatConfig::default();
     let mut request = req(vec![msg_with_thinking(true)]);
-    request.extra.insert("reasoning_effort".to_string(), json!("high"));
+    request
+        .extra
+        .insert("reasoning_effort".to_string(), json!("high"));
     request.temperature = Some(0.7);
     request.extra.insert("top_p".to_string(), json!(0.9));
     request.extra.insert("top_k".to_string(), json!(40));

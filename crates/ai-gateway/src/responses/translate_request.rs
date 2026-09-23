@@ -14,9 +14,9 @@ use crate::models::openai::{Message, OpenAIRequest};
 use crate::responses::{
     EasyInputContent, EasyInputMessage, FunctionCall, FunctionCallOutput,
     FunctionCallOutputContent, InputContentPart, InputImage, InputItem,
-    Message as ResponsesMessage, OutputContentPart, OutputFunctionCall, OutputItem,
-    OutputMessage, ResponsesInput, ResponsesRequest,
-    ResponsesTranslationError, TextFormat, ToolChoice, ToolDefinition, TypedInputItem,
+    Message as ResponsesMessage, OutputContentPart, OutputFunctionCall, OutputItem, OutputMessage,
+    ResponsesInput, ResponsesRequest, ResponsesTranslationError, TextFormat, ToolChoice,
+    ToolDefinition, TypedInputItem,
 };
 
 /// Stored conversation history for `previous_response_id` replay.
@@ -110,10 +110,7 @@ pub fn translate(
 
     if req.stream {
         extra.insert("stream".to_string(), json!(true));
-        extra.insert(
-            "stream_options".to_string(),
-            json!({"include_usage": true}),
-        );
+        extra.insert("stream_options".to_string(), json!({"include_usage": true}));
     }
 
     for (k, v) in &req.extra {
@@ -255,7 +252,10 @@ fn reject_typed_input_item(item: &TypedInputItem) -> Result<(), ResponsesTransla
     Ok(())
 }
 
-fn translate_input(input: &ResponsesInput, messages: &mut Vec<Message>) -> Result<(), ResponsesTranslationError> {
+fn translate_input(
+    input: &ResponsesInput,
+    messages: &mut Vec<Message>,
+) -> Result<(), ResponsesTranslationError> {
     match input {
         ResponsesInput::Text(text) => {
             messages.push(Message {
@@ -273,7 +273,10 @@ fn translate_input(input: &ResponsesInput, messages: &mut Vec<Message>) -> Resul
     Ok(())
 }
 
-fn translate_input_item(item: &InputItem, messages: &mut Vec<Message>) -> Result<(), ResponsesTranslationError> {
+fn translate_input_item(
+    item: &InputItem,
+    messages: &mut Vec<Message>,
+) -> Result<(), ResponsesTranslationError> {
     match item {
         InputItem::Easy(easy) => {
             translate_easy_message(easy, messages);
@@ -304,7 +307,10 @@ fn translate_easy_message(easy: &EasyInputMessage, messages: &mut Vec<Message>) 
     });
 }
 
-fn translate_typed_input_item(item: &TypedInputItem, messages: &mut Vec<Message>) -> Result<(), ResponsesTranslationError> {
+fn translate_typed_input_item(
+    item: &TypedInputItem,
+    messages: &mut Vec<Message>,
+) -> Result<(), ResponsesTranslationError> {
     match item {
         TypedInputItem::Message(msg) => {
             translate_message(msg, messages);
@@ -458,10 +464,7 @@ fn translate_text_format(format: &TextFormat) -> Value {
 }
 
 fn translate_tools(tools: &[ToolDefinition]) -> Value {
-    let converted: Vec<Value> = tools
-        .iter()
-        .map(|t| translate_tool(t))
-        .collect();
+    let converted: Vec<Value> = tools.iter().map(|t| translate_tool(t)).collect();
     Value::Array(converted)
 }
 
@@ -506,7 +509,10 @@ fn translate_tool_choice(tc: &ToolChoice) -> Value {
     }
 }
 
-fn replay_history(stored: &StoredConversation, messages: &mut Vec<Message>) -> Result<(), ResponsesTranslationError> {
+fn replay_history(
+    stored: &StoredConversation,
+    messages: &mut Vec<Message>,
+) -> Result<(), ResponsesTranslationError> {
     for item in &stored.input_items {
         replay_input_item(item, messages)?;
     }
@@ -518,7 +524,10 @@ fn replay_history(stored: &StoredConversation, messages: &mut Vec<Message>) -> R
     Ok(())
 }
 
-fn replay_input_item(item: &InputItem, messages: &mut Vec<Message>) -> Result<(), ResponsesTranslationError> {
+fn replay_input_item(
+    item: &InputItem,
+    messages: &mut Vec<Message>,
+) -> Result<(), ResponsesTranslationError> {
     match item {
         InputItem::Easy(easy) => {
             translate_easy_message(easy, messages);
@@ -530,7 +539,10 @@ fn replay_input_item(item: &InputItem, messages: &mut Vec<Message>) -> Result<()
     Ok(())
 }
 
-fn replay_typed_input_item(item: &TypedInputItem, messages: &mut Vec<Message>) -> Result<(), ResponsesTranslationError> {
+fn replay_typed_input_item(
+    item: &TypedInputItem,
+    messages: &mut Vec<Message>,
+) -> Result<(), ResponsesTranslationError> {
     match item {
         TypedInputItem::Message(msg) => {
             translate_message(msg, messages);
@@ -551,7 +563,10 @@ fn replay_typed_input_item(item: &TypedInputItem, messages: &mut Vec<Message>) -
     Ok(())
 }
 
-fn replay_output_item(item: &OutputItem, messages: &mut Vec<Message>) -> Result<(), ResponsesTranslationError> {
+fn replay_output_item(
+    item: &OutputItem,
+    messages: &mut Vec<Message>,
+) -> Result<(), ResponsesTranslationError> {
     match item {
         OutputItem::Message(msg) => {
             replay_output_message(msg, messages);
@@ -710,7 +725,12 @@ mod tests {
 
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.messages[0].role, "assistant");
-        let tool_calls = result.messages[0].extra.get("tool_calls").unwrap().as_array().unwrap();
+        let tool_calls = result.messages[0]
+            .extra
+            .get("tool_calls")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0]["id"], json!("call_123"));
         assert_eq!(tool_calls[0]["function"]["name"], json!("get_weather"));
@@ -733,7 +753,10 @@ mod tests {
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.messages[0].role, "tool");
         assert_eq!(result.messages[0].content, json!("Sunny, 22°C"));
-        assert_eq!(result.messages[0].extra.get("tool_call_id").unwrap(), &json!("call_123"));
+        assert_eq!(
+            result.messages[0].extra.get("tool_call_id").unwrap(),
+            &json!("call_123")
+        );
     }
 
     #[test]
@@ -832,7 +855,10 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], json!("function"));
         assert_eq!(tools[0]["function"]["name"], json!("get_weather"));
-        assert_eq!(tools[0]["function"]["parameters"], json!({"type": "object"}));
+        assert_eq!(
+            tools[0]["function"]["parameters"],
+            json!({"type": "object"})
+        );
     }
 
     #[test]
@@ -876,7 +902,9 @@ mod tests {
         let result = translate(&req, None, &ctx(false));
         assert!(matches!(
             result,
-            Err(ResponsesTranslationError::UnsupportedField { field: "input_audio" })
+            Err(ResponsesTranslationError::UnsupportedField {
+                field: "input_audio"
+            })
         ));
     }
 
@@ -897,7 +925,9 @@ mod tests {
         let result = translate(&req, None, &ctx(false));
         assert!(matches!(
             result,
-            Err(ResponsesTranslationError::UnsupportedField { field: "input_file" })
+            Err(ResponsesTranslationError::UnsupportedField {
+                field: "input_file"
+            })
         ));
     }
 
@@ -928,19 +958,24 @@ mod tests {
         let result = translate(&req, None, &ctx(false));
         assert!(matches!(
             result,
-            Err(ResponsesTranslationError::UnsupportedField { field: "background" })
+            Err(ResponsesTranslationError::UnsupportedField {
+                field: "background"
+            })
         ));
     }
 
     #[test]
     fn reject_conversation_param() {
         let mut req = make_request(ResponsesInput::Text("Test".to_string()));
-        req.extra.insert("conversation".to_string(), json!({"id": "conv_123"}));
+        req.extra
+            .insert("conversation".to_string(), json!({"id": "conv_123"}));
 
         let result = translate(&req, None, &ctx(false));
         assert!(matches!(
             result,
-            Err(ResponsesTranslationError::UnsupportedField { field: "conversation" })
+            Err(ResponsesTranslationError::UnsupportedField {
+                field: "conversation"
+            })
         ));
     }
 
@@ -956,7 +991,9 @@ mod tests {
         let result = translate(&req, None, &ctx(false));
         assert!(matches!(
             result,
-            Err(ResponsesTranslationError::UnsupportedField { field: "item_reference" })
+            Err(ResponsesTranslationError::UnsupportedField {
+                field: "item_reference"
+            })
         ));
     }
 
@@ -1013,7 +1050,10 @@ mod tests {
         assert_eq!(result.messages.len(), 1);
         let content = result.messages[0].content.as_array().unwrap();
         assert_eq!(content[0]["type"], json!("image_url"));
-        assert_eq!(content[0]["image_url"]["url"], json!("https://example.com/image.png"));
+        assert_eq!(
+            content[0]["image_url"]["url"],
+            json!("https://example.com/image.png")
+        );
         assert_eq!(content[0]["image_url"]["detail"], json!("high"));
     }
 

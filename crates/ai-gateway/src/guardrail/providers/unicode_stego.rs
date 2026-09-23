@@ -266,7 +266,11 @@ fn tokenize_alphanumeric(content: &str) -> impl Iterator<Item = (&str, usize)> {
                 .unwrap_or(false)
         {
             // Advance one full UTF-8 character.
-            let ch_len = content[cursor..].chars().next().map(char::len_utf8).unwrap_or(1);
+            let ch_len = content[cursor..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
             cursor += ch_len;
         }
         if cursor >= bytes.len() {
@@ -280,7 +284,11 @@ fn tokenize_alphanumeric(content: &str) -> impl Iterator<Item = (&str, usize)> {
                 .map(char::is_alphanumeric)
                 .unwrap_or(false)
         {
-            let ch_len = content[cursor..].chars().next().map(char::len_utf8).unwrap_or(1);
+            let ch_len = content[cursor..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
             cursor += ch_len;
         }
         Some((&content[start..cursor], start))
@@ -292,32 +300,120 @@ fn tokenize_alphanumeric(content: &str) -> impl Iterator<Item = (&str, usize)> {
 /// attacks). Maps a confusable char to its Latin prototype.
 const CONFUSABLES: &[(char, char)] = &[
     // Cyrillic lookalikes.
-    ('а', 'a'), ('е', 'e'), ('о', 'o'), ('р', 'p'), ('с', 'c'), ('у', 'y'),
-    ('х', 'x'), ('і', 'i'), ('ј', 'j'), ('ѕ', 's'), ('ԁ', 'd'), ('һ', 'h'),
-    ('қ', 'k'), ('м', 'm'), ('т', 't'), ('в', 'b'), ('н', 'h'), ('г', 'r'),
+    ('а', 'a'),
+    ('е', 'e'),
+    ('о', 'o'),
+    ('р', 'p'),
+    ('с', 'c'),
+    ('у', 'y'),
+    ('х', 'x'),
+    ('і', 'i'),
+    ('ј', 'j'),
+    ('ѕ', 's'),
+    ('ԁ', 'd'),
+    ('һ', 'h'),
+    ('қ', 'k'),
+    ('м', 'm'),
+    ('т', 't'),
+    ('в', 'b'),
+    ('н', 'h'),
+    ('г', 'r'),
     // Greek lookalikes.
-    ('ο', 'o'), ('α', 'a'), ('ε', 'e'), ('ι', 'i'), ('ν', 'v'), ('ρ', 'p'),
-    ('τ', 't'), ('υ', 'u'), ('κ', 'k'), ('μ', 'm'), ('ω', 'w'), ('ς', 's'),
+    ('ο', 'o'),
+    ('α', 'a'),
+    ('ε', 'e'),
+    ('ι', 'i'),
+    ('ν', 'v'),
+    ('ρ', 'p'),
+    ('τ', 't'),
+    ('υ', 'u'),
+    ('κ', 'k'),
+    ('μ', 'm'),
+    ('ω', 'w'),
+    ('ς', 's'),
     // Fullwidth forms.
-    ('ａ', 'a'), ('ｂ', 'b'), ('ｃ', 'c'), ('ｄ', 'd'), ('ｅ', 'e'), ('ｆ', 'f'),
-    ('ｇ', 'g'), ('ｈ', 'h'), ('ｉ', 'i'), ('ｊ', 'j'), ('ｋ', 'k'), ('ｌ', 'l'),
-    ('ｍ', 'm'), ('ｎ', 'n'), ('ｏ', 'o'), ('ｐ', 'p'), ('ｑ', 'q'), ('ｒ', 'r'),
-    ('ｓ', 's'), ('ｔ', 't'), ('ｕ', 'u'), ('ｖ', 'v'), ('ｗ', 'w'), ('ｘ', 'x'),
-    ('ｙ', 'y'), ('ｚ', 'z'),
+    ('ａ', 'a'),
+    ('ｂ', 'b'),
+    ('ｃ', 'c'),
+    ('ｄ', 'd'),
+    ('ｅ', 'e'),
+    ('ｆ', 'f'),
+    ('ｇ', 'g'),
+    ('ｈ', 'h'),
+    ('ｉ', 'i'),
+    ('ｊ', 'j'),
+    ('ｋ', 'k'),
+    ('ｌ', 'l'),
+    ('ｍ', 'm'),
+    ('ｎ', 'n'),
+    ('ｏ', 'o'),
+    ('ｐ', 'p'),
+    ('ｑ', 'q'),
+    ('ｒ', 'r'),
+    ('ｓ', 's'),
+    ('ｔ', 't'),
+    ('ｕ', 'u'),
+    ('ｖ', 'v'),
+    ('ｗ', 'w'),
+    ('ｘ', 'x'),
+    ('ｙ', 'y'),
+    ('ｚ', 'z'),
     // Common symbol/digit lookalikes.
-    ('Ɩ', 'l'), ('ｌ', 'l'), ('0', 'o'), ('１', '1'), ('５', '5'),
+    ('Ɩ', 'l'),
+    ('ｌ', 'l'),
+    ('0', 'o'),
+    ('１', '1'),
+    ('５', '5'),
 ];
 
 /// Vendored security-sensitive Latin skeleton set (~word list): commands,
 /// credential artifacts, and instruction verbs most commonly targeted by
 /// homoglyph obfuscation in prompt-injection payloads. Sorted for `contains`.
 const SENSITIVE_SKELETONS: &[&str] = &[
-    "admin", "allow", "api", "authenticate", "bash", "chmod", "chown", "cmd",
-    "config", "credential", "curl", "delete", "disable", "download", "eval",
-    "exec", "execute", "forget", "grant", "ignore", "import", "instruction",
-    "instructions", "key", "login", "override", "passcode", "password",
-    "payload", "permit", "print", "prompt", "read", "remove", "root", "rm",
-    "run", "secret", "shell", "sudo", "system", "token", "upload", "wget",
+    "admin",
+    "allow",
+    "api",
+    "authenticate",
+    "bash",
+    "chmod",
+    "chown",
+    "cmd",
+    "config",
+    "credential",
+    "curl",
+    "delete",
+    "disable",
+    "download",
+    "eval",
+    "exec",
+    "execute",
+    "forget",
+    "grant",
+    "ignore",
+    "import",
+    "instruction",
+    "instructions",
+    "key",
+    "login",
+    "override",
+    "passcode",
+    "password",
+    "payload",
+    "permit",
+    "print",
+    "prompt",
+    "read",
+    "remove",
+    "root",
+    "rm",
+    "run",
+    "secret",
+    "shell",
+    "sudo",
+    "system",
+    "token",
+    "upload",
+    "wget",
     "write",
 ];
 
@@ -521,7 +617,10 @@ mod tests {
         let content = format!("\u{200B}\u{200B}\u{200B}\u{200B}xx\u{200B}\u{200B}\u{200B}\u{200B}");
         let findings = provider().scan(&content);
         assert_eq!(
-            findings.iter().filter(|f| f.entity_label == LABEL_ZERO_WIDTH).count(),
+            findings
+                .iter()
+                .filter(|f| f.entity_label == LABEL_ZERO_WIDTH)
+                .count(),
             2
         );
     }
@@ -549,9 +648,7 @@ mod tests {
             ..Default::default()
         };
         let p = UnicodeStegoProvider::new(&settings);
-        let content = format!(
-            "\u{E007F}\u{200B}\u{200B}\u{200B}\u{200B}\u{202E}p\u{0430}ssword"
-        );
+        let content = format!("\u{E007F}\u{200B}\u{200B}\u{200B}\u{200B}\u{202E}p\u{0430}ssword");
         assert!(p.scan(&content).is_empty());
     }
 

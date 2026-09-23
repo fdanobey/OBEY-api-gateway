@@ -117,13 +117,13 @@ pub fn synthesize(chat: &OpenAIResponse, ctx: &SynthesisContext<'_>) -> Response
         incomplete_details,
         instructions: ctx.request_instructions.map(str::to_string),
         metadata: ctx.request_metadata.cloned(),
-    model: {
-        if chat.model.is_empty() {
-            ctx.request_model.to_string()
-        } else {
-            chat.model.clone()
-        }
-    },
+        model: {
+            if chat.model.is_empty() {
+                ctx.request_model.to_string()
+            } else {
+                chat.model.clone()
+            }
+        },
         output,
         parallel_tool_calls: ctx.request_parallel_tool_calls,
         previous_response_id: ctx.request_previous_response_id.map(str::to_string),
@@ -141,7 +141,9 @@ pub fn synthesize(chat: &OpenAIResponse, ctx: &SynthesisContext<'_>) -> Response
 }
 
 /// Map a chat `finish_reason` to a Responses status + incomplete details.
-fn status_from_finish_reason(finish_reason: Option<&str>) -> (&'static str, Option<IncompleteDetails>) {
+fn status_from_finish_reason(
+    finish_reason: Option<&str>,
+) -> (&'static str, Option<IncompleteDetails>) {
     match finish_reason {
         Some("length") => (
             "incomplete",
@@ -397,7 +399,9 @@ mod tests {
             let resp = synthesize(&chat, &ctx());
             assert_eq!(resp.status, status, "finish_reason={finish_reason}");
             assert_eq!(
-                resp.incomplete_details.as_ref().and_then(|d| d.reason.clone()),
+                resp.incomplete_details
+                    .as_ref()
+                    .and_then(|d| d.reason.clone()),
                 reason.map(str::to_string),
                 "finish_reason={finish_reason}"
             );
@@ -423,9 +427,18 @@ mod tests {
         }));
 
         let usage = synthesize(&chat, &ctx()).usage.expect("usage");
-        assert_eq!(usage.input_tokens_details.expect("input details").cached_tokens, 40);
         assert_eq!(
-            usage.output_tokens_details.expect("output details").reasoning_tokens,
+            usage
+                .input_tokens_details
+                .expect("input details")
+                .cached_tokens,
+            40
+        );
+        assert_eq!(
+            usage
+                .output_tokens_details
+                .expect("output details")
+                .reasoning_tokens,
             25
         );
     }
@@ -470,7 +483,10 @@ mod tests {
         };
         assert!(reasoning.id.starts_with("rs_"));
         assert_eq!(reasoning.summary.len(), 1);
-        assert_eq!(reasoning.summary[0].text.as_deref(), Some("thinking about 2+2"));
+        assert_eq!(
+            reasoning.summary[0].text.as_deref(),
+            Some("thinking about 2+2")
+        );
         assert!(matches!(&resp.output[1], OutputItem::Message(_)));
     }
 
@@ -564,8 +580,12 @@ mod tests {
             panic!("expected message");
         };
         assert_eq!(msg.content.len(), 2);
-        assert!(matches!(&msg.content[0], OutputContentPart::OutputText { text, .. } if text == "partial"));
-        assert!(matches!(&msg.content[1], OutputContentPart::Refusal { refusal } if refusal == "no more"));
+        assert!(
+            matches!(&msg.content[0], OutputContentPart::OutputText { text, .. } if text == "partial")
+        );
+        assert!(
+            matches!(&msg.content[1], OutputContentPart::Refusal { refusal } if refusal == "no more")
+        );
     }
 
     #[test]
@@ -584,7 +604,10 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         let resp = synthesize(&chat, &ctx());
-        assert!(resp.created_at >= before, "created_at should be a fresh timestamp");
+        assert!(
+            resp.created_at >= before,
+            "created_at should be a fresh timestamp"
+        );
 
         let chat = chat_from(serde_json::json!({
             "model": "m",

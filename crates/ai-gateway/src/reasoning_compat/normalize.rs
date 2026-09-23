@@ -402,7 +402,9 @@ fn drop_sampling_params(outgoing: &mut OpenAIRequest) -> bool {
 /// Read the request's `max_tokens` — the typed field first, then a
 /// `max_tokens` entry in `extra`.
 fn read_max_tokens(outgoing: &OpenAIRequest) -> Option<u32> {
-    outgoing.max_tokens.or_else(|| json_u32(outgoing.extra.get("max_tokens")))
+    outgoing
+        .max_tokens
+        .or_else(|| json_u32(outgoing.extra.get("max_tokens")))
 }
 
 /// Write `max_tokens` back to wherever it was read from, so serialization
@@ -440,7 +442,11 @@ mod tests {
         }
     }
 
-    fn target(model: &str, family: Option<ReasoningFamily>, shape: Option<ReasoningParamShape>) -> ProviderModel {
+    fn target(
+        model: &str,
+        family: Option<ReasoningFamily>,
+        shape: Option<ReasoningParamShape>,
+    ) -> ProviderModel {
         ProviderModel {
             provider: "test-provider".to_string(),
             model: model.to_string(),
@@ -654,10 +660,7 @@ mod tests {
         let report = emit_for_target(&mut req, spec, &target, &ReasoningCompatConfig::default());
 
         assert_eq!(report.emitted_shape, "reasoning_effort");
-        assert_eq!(
-            req.extra.get("reasoning_effort"),
-            Some(&json!("high"))
-        );
+        assert_eq!(req.extra.get("reasoning_effort"), Some(&json!("high")));
         assert!(!req.extra.contains_key("thinking"));
         assert!(!req.extra.contains_key("reasoning"));
     }
@@ -836,7 +839,11 @@ mod tests {
         req.extra
             .insert("output_config".to_string(), json!({"effort": "high"}));
         req.temperature = Some(0.7);
-        let target = target("some-model", Some(ReasoningFamily::None), Some(ReasoningParamShape::None));
+        let target = target(
+            "some-model",
+            Some(ReasoningFamily::None),
+            Some(ReasoningParamShape::None),
+        );
         let report = emit_for_target(&mut req, spec, &target, &ReasoningCompatConfig::default());
 
         assert_eq!(report, NormalizeReport::none());
@@ -899,11 +906,7 @@ mod tests {
     #[test]
     fn explicit_family_beats_model_id_classification() {
         let (mut req, spec) = effort_spec("high");
-        let target = target(
-            "gpt-5.1",
-            Some(ReasoningFamily::AnthropicAdaptive),
-            None,
-        );
+        let target = target("gpt-5.1", Some(ReasoningFamily::AnthropicAdaptive), None);
         let report = emit_for_target(&mut req, spec, &target, &ReasoningCompatConfig::default());
 
         assert_eq!(report.emitted_shape, "thinking_adaptive");
@@ -921,13 +924,20 @@ mod tests {
             ("claude-opus-5", "thinking_adaptive"),
             ("o3-mini", "reasoning_effort"),
             ("grok-4", "reasoning_effort"),
-            ("openrouter/anthropic/claude-sonnet-4", "reasoning_max_tokens"),
+            (
+                "openrouter/anthropic/claude-sonnet-4",
+                "reasoning_max_tokens",
+            ),
             ("deepseek-r1", "none"),
         ] {
             let mut cloned = req.clone();
             let target = target(model, None, None);
-            let report =
-                emit_for_target(&mut cloned, spec, &target, &ReasoningCompatConfig::default());
+            let report = emit_for_target(
+                &mut cloned,
+                spec,
+                &target,
+                &ReasoningCompatConfig::default(),
+            );
             assert_eq!(report.emitted_shape, expected, "model {model}");
         }
     }

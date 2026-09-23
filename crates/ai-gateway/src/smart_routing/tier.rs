@@ -82,6 +82,12 @@ pub struct RoutingDecision {
     pub cache_hit: bool,
     pub budget_downgraded: bool,
     pub context_filtered: bool,
+    /// Jev composite confidence, when the Jev classifier was consulted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_confidence: Option<f64>,
+    /// Model id that served the Jev classification, when resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
 }
 
 /// Classifier backend that produced a routing decision.
@@ -92,6 +98,7 @@ pub enum ClassifierUsed {
     Ml,
     Llm,
     Composite,
+    Jev,
 }
 
 /// Detected task category used for specialist routing.
@@ -245,5 +252,53 @@ mod tests {
             TaskType::detect(&[message("Hello there")]),
             TaskType::General
         );
+    }
+    #[test]
+    fn decision_serialization_is_byte_identical_without_jev_fields() {
+        let decision = RoutingDecision {
+            score: ComplexityScore::new(0.42),
+            adjusted_score: ComplexityScore::new(0.42),
+            tier: SmartRoutingTier::Balanced,
+            task_type: TaskType::General,
+            classifier: ClassifierUsed::Heuristic,
+            escalated: false,
+            escalation_count: 0,
+            cache_hit: false,
+            budget_downgraded: false,
+            context_filtered: false,
+            classifier_confidence: None,
+            resolved_model: None,
+        };
+
+        let serialized = serde_json::to_string(&decision).unwrap();
+        let value: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&serialized).unwrap();
+        let expected_keys = [
+            "score",
+            "adjusted_score",
+            "tier",
+            "task_type",
+            "classifier",
+            "escalated",
+            "escalation_count",
+            "cache_hit",
+            "budget_downgraded",
+            "context_filtered",
+        ];
+        assert_eq!(value.len(), expected_keys.len());
+        for key in expected_keys {
+            assert!(value.contains_key(key), "missing {key}");
+        }
+
+        let with_jev = RoutingDecision {
+            classifier_confidence: Some(0.87),
+            resolved_model: Some("jev-1.13.0".to_string()),
+            ..decision
+        };
+        let serialized = serde_json::to_string(&with_jev).unwrap();
+        assert!(serialized.contains("classifier_confidence"));
+        assert!(serialized.contains("jev-1.13.0"));
+        let round_trip: RoutingDecision = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(round_trip, with_jev);
     }
 }

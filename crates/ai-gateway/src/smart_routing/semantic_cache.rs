@@ -1028,6 +1028,8 @@ mod tests {
             cache_hit: false,
             budget_downgraded: false,
             context_filtered: false,
+            classifier_confidence: None,
+            resolved_model: None,
         }
     }
 
@@ -1146,9 +1148,9 @@ mod tests {
                 tier: Some(SmartRoutingTier::Balanced),
                 context_window: 16_384,
                 specializations: Vec::new(),
-            cost_per_million_reasoning_tokens: None,
-            reasoning_family: None,
-            reasoning_parameter: None,
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
             }],
         }
     }

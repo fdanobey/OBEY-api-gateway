@@ -8,6 +8,7 @@ pub mod context_filter;
 pub mod decision_engine;
 pub mod evaluation;
 pub mod heuristic;
+pub mod jev;
 pub mod llm_classifier;
 #[cfg(feature = "ml-router")]
 pub mod ml_classifier;
@@ -28,8 +29,8 @@ use crate::models::openai::OpenAIRequest;
 
 use self::cascade::CascadeEvaluator;
 use self::config::{
-    BudgetLimits, ClassifierMode, CompositeWeights, RoutingPolicySnapshot, SmartRoutingConfig,
-    SmartRoutingConfigError,
+    BudgetLimits, ClassifierMode, CompositeWeights, JevConfig, JevTrustOverride,
+    RoutingPolicySnapshot, SmartRoutingConfig, SmartRoutingConfigError,
 };
 use self::context_filter::{
     filter_by_context_capacity, ContextFilterResult, ContextRequirement, NoSafeCandidate,
@@ -61,18 +62,36 @@ pub struct PinnedRoutingContext {
 }
 
 /// Successful classification, including context-planning metadata.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Classification {
     pub score: ComplexityScore,
     pub task_type: TaskType,
     pub classifier: ClassifierUsed,
     pub token_estimate: u64,
+    pub confidence: Option<f64>,
+    pub resolved_model: Option<String>,
 }
 
 /// Validated output returned by an optional classifier implementation.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClassifierOutput {
     pub score: f64,
+    pub task_type: Option<TaskType>,
+    pub confidence: Option<f64>,
+    pub resolved_model: Option<String>,
+    pub discovery_refreshed: bool,
+}
+
+impl ClassifierOutput {
+    pub const fn score(score: f64) -> Self {
+        Self {
+            score,
+            task_type: None,
+            confidence: None,
+            resolved_model: None,
+            discovery_refreshed: false,
+        }
+    }
 }
 
 /// Bounded failure categories; classifier implementations cannot attach prompts or responses.
@@ -82,15 +101,18 @@ pub enum ClassifierFailure {
     Timeout,
     InvalidOutput,
     Backend,
+    LowConfidence,
+    NoJevAtEndpoint,
 }
 
-/// Input available to an optional ML or LLM classifier.
+/// Input available to an optional classifier implementation.
 pub struct ClassifierInput<'a> {
     pub request: &'a OpenAIRequest,
     pub model_group: &'a ModelGroup,
     pub pinned_context: &'a PinnedRoutingContext,
     pub heuristic_score: ComplexityScore,
     pub heuristic_task_type: TaskType,
+    pub jev_trust: Option<JevTrustOverride>,
 }
 
 /// Object-safe boundary for future ML and LLM classifier implementations.
@@ -188,6 +210,11 @@ pub trait SmartRoutingMetrics: Send + Sync {
     fn classifier_fallback(&self, _event: ClassifierFallbackEvent) {}
     fn cache_lookup(&self, _event: CacheLookupEvent) {}
     fn budget_decision(&self, _decision: BudgetDecision) {}
+    fn jev_consult(&self, _group: &str) {}
+    fn jev_fallback(&self, _reason: ClassifierFailure) {}
+    fn jev_confidence(&self, _confidence: f64) {}
+    fn jev_latency(&self, _latency_ms: f64) {}
+    fn jev_discovery_refresh(&self, _status: &'static str) {}
 }
 
 #[derive(Debug, Default)]
@@ -295,6 +322,7 @@ pub struct SmartRouter {
     heuristic: HeuristicScorer,
     ml: Option<Arc<dyn OptionalClassifier>>,
     llm: Option<Arc<dyn OptionalClassifier>>,
+    jev: Option<Arc<dyn OptionalClassifier>>,
     decision_engine: DecisionEngine,
     cascade_evaluator: CascadeEvaluator,
     quality_evaluator: Option<Arc<dyn QualityEvaluatorHook>>,
@@ -322,6 +350,7 @@ impl SmartRouter {
             config,
             ml: None,
             llm: None,
+            jev: None,
             quality_evaluator: None,
             optimizer: None,
             budget: None,
@@ -346,6 +375,11 @@ impl SmartRouter {
 
     pub fn with_llm_classifier(mut self, classifier: Arc<dyn OptionalClassifier>) -> Self {
         self.llm = Some(classifier);
+        self
+    }
+
+    pub fn with_jev_classifier(mut self, classifier: Arc<dyn OptionalClassifier>) -> Self {
+        self.jev = Some(classifier);
         self
     }
 
@@ -427,7 +461,7 @@ impl SmartRouter {
                     request: input.request,
                     model_group: input.model_group,
                     pinned_context: input.pinned_context,
-                    classification,
+                    classification: classification.clone(),
                     configured_limits: self.config.budget_limits.get(&input.model_group.name),
                 })
                 .await
@@ -523,6 +557,8 @@ impl SmartRouter {
             cache_hit: false,
             budget_downgraded,
             context_filtered: excluded_for_context > 0,
+            classifier_confidence: classification.confidence,
+            resolved_model: classification.resolved_model.clone(),
         };
         if let Some(evaluator) = &self.quality_evaluator {
             evaluator.observe_plan(&decision);
@@ -561,6 +597,8 @@ impl SmartRouter {
                 task_type: assessment.task_type,
                 classifier: ClassifierUsed::Heuristic,
                 token_estimate: assessment.token_estimate() as u64,
+                confidence: None,
+                resolved_model: None,
             },
             Err(reason) => {
                 self.metrics.classifier_fallback(ClassifierFallbackEvent {
@@ -572,6 +610,8 @@ impl SmartRouter {
                     task_type: TaskType::General,
                     classifier: ClassifierUsed::Heuristic,
                     token_estimate: 0,
+                    confidence: None,
+                    resolved_model: None,
                 }
             }
         };
@@ -584,8 +624,8 @@ impl SmartRouter {
                     self.ml.as_deref(),
                     ClassifierUsed::Ml,
                     input,
-                    heuristic_classification,
-                    policy.classifier,
+                    heuristic_classification.clone(),
+                    policy,
                 )
                 .await
                 .unwrap_or(heuristic_classification),
@@ -594,8 +634,18 @@ impl SmartRouter {
                     self.llm.as_deref(),
                     ClassifierUsed::Llm,
                     input,
-                    heuristic_classification,
-                    policy.classifier,
+                    heuristic_classification.clone(),
+                    policy,
+                )
+                .await
+                .unwrap_or(heuristic_classification),
+            ClassifierMode::Jev => self
+                .classify_optional(
+                    self.jev.as_deref(),
+                    ClassifierUsed::Jev,
+                    input,
+                    heuristic_classification.clone(),
+                    policy,
                 )
                 .await
                 .unwrap_or(heuristic_classification),
@@ -605,8 +655,8 @@ impl SmartRouter {
                         self.ml.as_deref(),
                         ClassifierUsed::Ml,
                         input,
-                        heuristic_classification,
-                        policy.classifier,
+                        heuristic_classification.clone(),
+                        policy,
                     )
                     .await
                 else {
@@ -618,6 +668,8 @@ impl SmartRouter {
                     task_type: heuristic_classification.task_type,
                     classifier: ClassifierUsed::Composite,
                     token_estimate: heuristic_classification.token_estimate,
+                    confidence: ml.confidence,
+                    resolved_model: ml.resolved_model,
                 }
             }
         }
@@ -642,45 +694,73 @@ impl SmartRouter {
         classifier_used: ClassifierUsed,
         input: &SmartRoutingInput<'_>,
         heuristic: Classification,
-        configured: ClassifierMode,
+        policy: &SmartRoutingConfig,
     ) -> Option<Classification> {
+        let is_jev = classifier_used == ClassifierUsed::Jev;
+        let configured = policy.classifier;
+        if is_jev {
+            self.metrics.jev_consult(&input.model_group.name);
+        }
         let Some(classifier) = classifier else {
-            self.metrics.classifier_fallback(ClassifierFallbackEvent {
-                configured,
-                reason: ClassifierFailure::Unavailable,
-            });
+            let reason = ClassifierFailure::Unavailable;
+            self.metrics
+                .classifier_fallback(ClassifierFallbackEvent { configured, reason });
+            if is_jev {
+                self.metrics.jev_fallback(reason);
+            }
             return None;
         };
-        let output = match classifier
+        let started_at = std::time::Instant::now();
+        let result = classifier
             .classify(ClassifierInput {
                 request: input.request,
                 model_group: input.model_group,
                 pinned_context: input.pinned_context,
                 heuristic_score: heuristic.score,
                 heuristic_task_type: heuristic.task_type,
+                jev_trust: policy.jev.as_ref().map(JevConfig::trust_override),
             })
-            .await
-        {
+            .await;
+        if is_jev {
+            self.metrics
+                .jev_latency(started_at.elapsed().as_secs_f64() * 1_000.0);
+        }
+        let output = match result {
             Ok(output) if output.score.is_finite() && (0.0..=1.0).contains(&output.score) => output,
             Ok(_) => {
-                self.metrics.classifier_fallback(ClassifierFallbackEvent {
-                    configured,
-                    reason: ClassifierFailure::InvalidOutput,
-                });
+                let reason = ClassifierFailure::InvalidOutput;
+                self.metrics
+                    .classifier_fallback(ClassifierFallbackEvent { configured, reason });
+                if is_jev {
+                    self.metrics.jev_fallback(reason);
+                }
                 return None;
             }
             Err(reason) => {
                 self.metrics
                     .classifier_fallback(ClassifierFallbackEvent { configured, reason });
+                if is_jev {
+                    self.metrics.jev_fallback(reason);
+                }
                 return None;
             }
         };
+        if is_jev {
+            if let Some(confidence) = output.confidence {
+                self.metrics.jev_confidence(confidence);
+            }
+            if output.discovery_refreshed {
+                self.metrics.jev_discovery_refresh("success");
+            }
+        }
 
         Some(Classification {
             score: ComplexityScore::new(output.score),
-            task_type: heuristic.task_type,
+            task_type: output.task_type.unwrap_or(heuristic.task_type),
             classifier: classifier_used,
             token_estimate: heuristic.token_estimate,
+            confidence: output.confidence,
+            resolved_model: output.resolved_model,
         })
     }
 }
@@ -846,6 +926,12 @@ fn apply_policy_snapshot(config: &mut SmartRoutingConfig, policy: RoutingPolicyS
     config.tier_boundaries = policy.tier_boundaries;
     config.heuristic_weights = policy.heuristic_weights;
     config.composite_weights = policy.composite_weights;
+    if let Some(trust) = policy.jev_trust {
+        let jev = config.jev.get_or_insert_with(JevConfig::default);
+        jev.min_confidence = trust.min_confidence;
+        jev.min_task_confidence = trust.min_task_confidence;
+        jev.fallback_policy = trust.fallback_policy;
+    }
     config.streaming_cascade_mode = policy.streaming_cascade_mode;
     config.online_optimizer = policy.online_optimizer;
     config.semantic_cache = policy.semantic_cache;
@@ -871,7 +957,7 @@ mod tests {
             &self,
             _input: ClassifierInput<'_>,
         ) -> Result<ClassifierOutput, ClassifierFailure> {
-            self.0
+            self.0.clone()
         }
     }
 
@@ -941,9 +1027,9 @@ mod tests {
             tier: Some(tier),
             context_window,
             specializations: Vec::new(),
-        cost_per_million_reasoning_tokens: None,
-        reasoning_family: None,
-        reasoning_parameter: None,
+            cost_per_million_reasoning_tokens: None,
+            reasoning_family: None,
+            reasoning_parameter: None,
         }
     }
 
@@ -966,9 +1052,9 @@ mod tests {
             tier,
             context_window: 8_192 + index as u32 * 1_024,
             specializations,
-        cost_per_million_reasoning_tokens: None,
-        reasoning_family: None,
-        reasoning_parameter: None,
+            cost_per_million_reasoning_tokens: None,
+            reasoning_family: None,
+            reasoning_parameter: None,
         }
     }
 
@@ -1085,9 +1171,7 @@ mod tests {
             .await;
         let success = SmartRouter::new(config(ClassifierMode::Composite))
             .unwrap()
-            .with_ml_classifier(Arc::new(FixedClassifier(Ok(ClassifierOutput {
-                score: 0.9,
-            }))));
+            .with_ml_classifier(Arc::new(FixedClassifier(Ok(ClassifierOutput::score(0.9)))));
 
         let composite = success.classify(&smart_input).await;
         let weights = CompositeWeights::default();
@@ -1129,7 +1213,7 @@ mod tests {
     async fn budget_downgrade_caps_tier_and_reject_stays_typed() {
         let mut routing_config = config(ClassifierMode::Ml);
         routing_config.cost_quality_threshold = 1.0;
-        let high_classifier = Arc::new(FixedClassifier(Ok(ClassifierOutput { score: 1.0 })));
+        let high_classifier = Arc::new(FixedClassifier(Ok(ClassifierOutput::score(1.0))));
         let request = request("route this");
         let group = group(vec![candidate("safe", 10_000, SmartRoutingTier::Balanced)]);
         let pinned = PinnedRoutingContext::default();
@@ -1451,9 +1535,7 @@ mod tests {
                     if generated_score.is_finite() && (0.0..=1.0).contains(&generated_score) {
                         Err(failure)
                     } else {
-                        Ok(ClassifierOutput {
-                            score: generated_score,
-                        })
+                        Ok(ClassifierOutput::score(generated_score))
                     },
                 )));
             let request = request(&content);

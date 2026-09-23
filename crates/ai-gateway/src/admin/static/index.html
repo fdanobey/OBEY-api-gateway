@@ -1033,12 +1033,44 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 <fieldset><legend>Core Routing Policy</legend>
 <div class="form-check"><input type="checkbox" id="smart-enabled"><label for="smart-enabled">Enable Smart Routing</label></div>
 <div class="form-row">
-<div class="form-group"><label for="smart-classifier">Classifier</label><select id="smart-classifier"><option value="heuristic">Heuristic</option><option value="llm">LLM</option><option value="ml">ONNX ML</option><option value="composite">Composite</option></select><div class="hint">ML and composite modes require the optional <code>ml-router</code> build feature and a valid ONNX artifact.</div></div>
+<div class="form-group"><label for="smart-classifier">Classifier</label><select id="smart-classifier"><option value="heuristic">Heuristic</option><option value="llm">LLM</option><option value="ml">ONNX ML</option><option value="composite">Composite</option><option value="jev">Jev (System One)</option></select><div class="hint">Jev uses a calibrated decision-model endpoint; ML and composite modes require the optional <code>ml-router</code> build feature.</div></div>
 <div class="form-group"><label for="smart-threshold">Cost / Quality Threshold</label><input type="number" id="smart-threshold" min="0" max="1" step="0.01"><div class="hint">0 favors cost; 1 favors quality.</div></div>
 </div>
 <div class="form-row">
 <div class="form-group"><label for="smart-ml-path">ONNX Artifact Directory</label><input type="text" id="smart-ml-path" placeholder="./models/smart-routing"><div class="hint">Contains manifest.json, model.onnx, tokenizer.json, and .onnxruntime/.</div></div>
 <div class="form-group"><label for="smart-llm-model">LLM Classifier Model</label><input type="text" id="smart-llm-model" placeholder="optional internal classifier model"></div>
+</div>
+</fieldset>
+
+<fieldset><legend>Jev Classifier</legend>
+<p class="hint" style="margin-bottom:.75rem">Provider-neutral System One classifier. TypeSafe is the default; OpenRouter or any compatible endpoint may be used. <code>auto</code> selects the latest available Jev model.</p>
+<div class="form-row">
+<div class="form-group"><label for="smart-jev-base-url">Base URL</label><input type="url" id="smart-jev-base-url" placeholder="https://api.typesafe.ai"><div class="hint">HTTPS required.</div></div>
+<div class="form-group"><label for="smart-jev-model">Model</label><input type="text" id="smart-jev-model" placeholder="auto"><div class="hint">Use <code>auto</code> or pin a concrete model id.</div></div>
+<div class="form-group"><label for="smart-jev-api-key-env">API Key / Env Name</label><input type="password" id="smart-jev-api-key-env" autocomplete="new-password" placeholder="JEV_API_KEY"><div class="hint">Masked; use an environment variable name when possible. Leave blank to keep a stored key.</div></div>
+</div>
+<div class="form-row">
+<div class="form-group"><label for="smart-jev-timeout">Timeout (ms)</label><input type="number" id="smart-jev-timeout" min="250" max="2000" step="50"></div>
+<div class="form-group"><label for="smart-jev-confidence">Minimum Confidence</label><input type="number" id="smart-jev-confidence" min="0" max="1" step="0.01"></div>
+<div class="form-group"><label for="smart-jev-task-confidence">Task Confidence</label><input type="number" id="smart-jev-task-confidence" min="0" max="1" step="0.01"></div>
+<div class="form-group"><label for="smart-jev-fallback">Low-confidence Policy</label><select id="smart-jev-fallback"><option value="fallback">Fallback chain</option><option value="blend">Blend with heuristic</option></select></div>
+</div>
+<div class="form-row">
+<div class="form-group"><label for="smart-jev-char-budget">State Character Budget</label><input type="number" id="smart-jev-char-budget" min="256" max="65536" step="128"></div>
+<div class="form-group"><label for="smart-jev-discovery-ttl">Discovery TTL (seconds)</label><input type="number" id="smart-jev-discovery-ttl" min="1" max="86400" step="1"></div>
+<div class="form-group"><label for="smart-jev-retries">Maximum Retries</label><input type="number" id="smart-jev-retries" min="0" max="2" step="1"></div>
+<div class="form-group"><label for="smart-jev-backoff">Retry Backoff (ms)</label><input type="number" id="smart-jev-backoff" min="1" max="10000" step="10"></div>
+</div>
+<p class="hint">Complexity dimension weights (finite, non-negative, not all zero).</p>
+<div class="form-row">
+<div class="form-group"><label for="smart-jev-weight-reasoning">Reasoning Depth</label><input type="number" id="smart-jev-weight-reasoning" min="0" max="1" step="0.01"></div>
+<div class="form-group"><label for="smart-jev-weight-tools">Tool Coupling</label><input type="number" id="smart-jev-weight-tools" min="0" max="1" step="0.01"></div>
+<div class="form-group"><label for="smart-jev-weight-context">Context Synthesis</label><input type="number" id="smart-jev-weight-context" min="0" max="1" step="0.01"></div>
+<div class="form-group"><label for="smart-jev-weight-precision">Output Precision</label><input type="number" id="smart-jev-weight-precision" min="0" max="1" step="0.01"></div>
+</div>
+<div class="form-row">
+<div class="form-group"><label for="smart-jev-weight-domain">Domain Load</label><input type="number" id="smart-jev-weight-domain" min="0" max="1" step="0.01"></div>
+<div class="form-group"><label for="smart-jev-weight-ambiguity">Ambiguity</label><input type="number" id="smart-jev-weight-ambiguity" min="0" max="1" step="0.01"></div>
 </div>
 </fieldset>
 
@@ -3843,6 +3875,26 @@ document.getElementById('smart-optimizer-enabled').checked=!!optimizer.enabled;
 document.getElementById('smart-optimizer-alpha').value=Number.isFinite(Number(optimizer.alpha))?optimizer.alpha:0.1;
 document.getElementById('smart-budget-limits').value=JSON.stringify(v.budget_limits||{},null,2);
 document.getElementById('smart-budget-error').textContent='';
+var jev=v.jev||{};
+var jevWeights=jev.dimension_weights||{};
+document.getElementById('smart-jev-base-url').value=jev.base_url||'';
+document.getElementById('smart-jev-model').value=jev.model||'';
+document.getElementById('smart-jev-api-key-env').value='';
+document.getElementById('smart-jev-api-key-env').placeholder=(jev.api_key_configured||jev.api_key_env)?'Configured (leave blank to keep)':'JEV_API_KEY';
+document.getElementById('smart-jev-timeout').value=jev.timeout_ms!=null?jev.timeout_ms:1000;
+document.getElementById('smart-jev-confidence').value=Number.isFinite(Number(jev.min_confidence))?jev.min_confidence:0.6;
+document.getElementById('smart-jev-task-confidence').value=Number.isFinite(Number(jev.min_task_confidence))?jev.min_task_confidence:0.5;
+document.getElementById('smart-jev-fallback').value=jev.fallback_policy||'fallback';
+document.getElementById('smart-jev-char-budget').value=jev.char_budget!=null?jev.char_budget:1024;
+document.getElementById('smart-jev-discovery-ttl').value=jev.discovery_ttl_secs!=null?jev.discovery_ttl_secs:600;
+document.getElementById('smart-jev-retries').value=(jev.retry&&jev.retry.max_attempts!==undefined?jev.retry.max_attempts:2);
+document.getElementById('smart-jev-backoff').value=(jev.retry&&jev.retry.backoff_ms!==undefined?jev.retry.backoff_ms:200);
+document.getElementById('smart-jev-weight-reasoning').value=Number.isFinite(Number(jevWeights.reasoning_depth))?jevWeights.reasoning_depth:(1/6);
+document.getElementById('smart-jev-weight-tools').value=Number.isFinite(Number(jevWeights.tool_coupling))?jevWeights.tool_coupling:(1/6);
+document.getElementById('smart-jev-weight-context').value=Number.isFinite(Number(jevWeights.context_synthesis))?jevWeights.context_synthesis:(1/6);
+document.getElementById('smart-jev-weight-precision').value=Number.isFinite(Number(jevWeights.output_precision))?jevWeights.output_precision:(1/6);
+document.getElementById('smart-jev-weight-domain').value=Number.isFinite(Number(jevWeights.domain_load))?jevWeights.domain_load:(1/6);
+document.getElementById('smart-jev-weight-ambiguity').value=Number.isFinite(Number(jevWeights.ambiguity))?jevWeights.ambiguity:(1/6);
 }
 function collectSmartRouting(){
 var prior=(config&&config.smart_routing)?JSON.parse(JSON.stringify(config.smart_routing)):{};var cascade=prior.cascade||{};var quality=prior.quality_evaluator||{};var cache=prior.semantic_cache||{};var optimizer=prior.online_optimizer||{};
@@ -3851,6 +3903,30 @@ prior.tier_boundaries={fast_max:parseFloat(document.getElementById('smart-fast-m
 cascade.enabled=document.getElementById('smart-cascade-enabled').checked;cascade.max_escalations=parseInt(document.getElementById('smart-max-escalations').value,10);cascade.early_signal_tokens=parseInt(document.getElementById('smart-early-signal-tokens').value,10);prior.cascade=cascade;prior.streaming_cascade_mode=document.getElementById('smart-streaming-mode').value;
 quality.enabled=document.getElementById('smart-quality-enabled').checked;quality.threshold=parseFloat(document.getElementById('smart-quality-threshold').value);prior.quality_evaluator=quality;cache.enabled=document.getElementById('smart-semcache-enabled').checked;cache.similarity_threshold=parseFloat(document.getElementById('smart-semcache-threshold').value);prior.semantic_cache=cache;optimizer.enabled=document.getElementById('smart-optimizer-enabled').checked;optimizer.alpha=parseFloat(document.getElementById('smart-optimizer-alpha').value);prior.online_optimizer=optimizer;
 try{prior.budget_limits=JSON.parse(document.getElementById('smart-budget-limits').value||'{}');document.getElementById('smart-budget-error').textContent='';}catch(error){document.getElementById('smart-budget-error').textContent='Invalid JSON: '+error.message;throw error;}
+var jev=prior.jev||{};
+delete jev.api_key_configured;
+jev.base_url=document.getElementById('smart-jev-base-url').value.trim()||'https://api.typesafe.ai';
+jev.model=document.getElementById('smart-jev-model').value.trim()||'auto';
+var jevKeyInput=document.getElementById('smart-jev-api-key-env').value.trim();
+jev.api_key_env=jevKeyInput||null;
+delete jev.api_key;
+jev.timeout_ms=parseInt(document.getElementById('smart-jev-timeout').value,10)||1000;
+jev.min_confidence=parseFloat(document.getElementById('smart-jev-confidence').value);
+jev.min_task_confidence=parseFloat(document.getElementById('smart-jev-task-confidence').value);
+jev.fallback_policy=document.getElementById('smart-jev-fallback').value;
+jev.char_budget=parseInt(document.getElementById('smart-jev-char-budget').value,10)||1024;
+jev.discovery_ttl_secs=parseInt(document.getElementById('smart-jev-discovery-ttl').value,10)||600;
+jev.retry=jev.retry||{};
+jev.retry.max_attempts=parseInt(document.getElementById('smart-jev-retries').value,10);
+jev.retry.backoff_ms=parseInt(document.getElementById('smart-jev-backoff').value,10);
+jev.dimension_weights=jev.dimension_weights||{};
+jev.dimension_weights.reasoning_depth=parseFloat(document.getElementById('smart-jev-weight-reasoning').value);
+jev.dimension_weights.tool_coupling=parseFloat(document.getElementById('smart-jev-weight-tools').value);
+jev.dimension_weights.context_synthesis=parseFloat(document.getElementById('smart-jev-weight-context').value);
+jev.dimension_weights.output_precision=parseFloat(document.getElementById('smart-jev-weight-precision').value);
+jev.dimension_weights.domain_load=parseFloat(document.getElementById('smart-jev-weight-domain').value);
+jev.dimension_weights.ambiguity=parseFloat(document.getElementById('smart-jev-weight-ambiguity').value);
+prior.jev=jev;
 return prior;
 }
 function smartRoutingRequest(path,options){return fetch(apiUrl('smart-routing'+path),options||{}).then(function(response){return response.text().then(function(text){var body={};try{body=text?JSON.parse(text):{};}catch(_){}if(!response.ok)throw new Error((body.error&&body.error.message)||text||('HTTP '+response.status));return body;});});}
