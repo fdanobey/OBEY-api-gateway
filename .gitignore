@@ -20,6 +20,7 @@ id_*
 config.yaml
 
 # Build/test log artifacts
+*.log
 *.out
 *.err
 cargo_*.txt
