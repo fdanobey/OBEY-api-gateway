@@ -2025,6 +2025,16 @@ impl Router {
                             serde_json::Value::Array(vec![Self::image_removed_placeholder()]);
                         Self::warn_image_stripped(provider_name, model, idx, 1);
                         stripped_total += 1;
+                    } else if let Some(removed) =
+                        Self::strip_image_from_json_string(&mut msg.content)
+                    {
+                        // The string was a JSON-serialized content structure
+                        // (common for tool results that embed content parts as
+                        // text). Image parts inside it were stripped in place
+                        // and the string re-serialized. Plain text that merely
+                        // mentions an image marker is left untouched.
+                        Self::warn_image_stripped(provider_name, model, idx, removed);
+                        stripped_total += removed;
                     }
                 }
                 _ => {}
@@ -2039,6 +2049,72 @@ impl Router {
             "type": "text",
             "text": "[image content removed: model does not support image inputs]"
         })
+    }
+
+    /// Strip image parts from a message whose `content` is a STRING that is
+    /// actually a JSON-serialized content structure (an array or object of
+    /// content parts). Tool results frequently carry their payload this way —
+    /// e.g. `content: "[{\"type\":\"image_url\",\"image_url\":{...}}]"` — which
+    /// the array/object branches never see because the value is a string.
+    ///
+    /// Behavior:
+    /// - If `content` does not parse as JSON, or parses to a scalar (plain
+    ///   quoted text), returns `None` and leaves the value untouched. This
+    ///   protects legitimate prose that merely mentions `image_url`.
+    /// - If it parses to an array/object, image parts are removed recursively.
+    ///   When something was removed, the value is re-serialized back to a JSON
+    ///   string (preserving the tool-result wire shape) and the removed count
+    ///   is returned. When nothing was removed, returns `None` (value
+    ///   unchanged).
+    fn strip_image_from_json_string(content: &mut serde_json::Value) -> Option<usize> {
+        let serde_json::Value::String(raw) = content else {
+            return None;
+        };
+        let mut parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+        // A serialized single image object collapses to a placeholder array.
+        // Checked up front to avoid overlapping borrows in the match below.
+        if parsed.is_object() && Self::content_value_is_image(&parsed) {
+            *content = serde_json::Value::String(
+                serde_json::Value::Array(vec![Self::image_removed_placeholder()]).to_string(),
+            );
+            return Some(1);
+        }
+        // Only treat arrays/objects as serialized content structures. A bare
+        // JSON string/number/bool that happens to contain a marker substring
+        // is plain data, not a content-part container.
+        let removed = match &mut parsed {
+            serde_json::Value::Array(parts) => {
+                let n = Self::strip_image_parts_recursive(parts, usize::MAX, "", "");
+                if n > 0 && parts.is_empty() {
+                    parts.push(Self::image_removed_placeholder());
+                }
+                n
+            }
+            serde_json::Value::Object(map) => {
+                // Not itself an image part: recurse into any nested content
+                // arrays (e.g. `{"content":[{image...}]}`), the same way the
+                // array branch treats nested parts.
+                let mut n = 0;
+                for child in map.values_mut() {
+                    if let serde_json::Value::Array(nested) = child {
+                        let removed =
+                            Self::strip_image_parts_recursive(nested, usize::MAX, "", "");
+                        if removed > 0 && nested.is_empty() {
+                            nested.push(Self::image_removed_placeholder());
+                        }
+                        n += removed;
+                    }
+                }
+                n
+            }
+            _ => return None,
+        };
+        if removed == 0 {
+            return None;
+        }
+        // Re-serialize so the tool result keeps its string-encoded shape.
+        *content = serde_json::Value::String(parsed.to_string());
+        Some(removed)
     }
 
     fn warn_image_stripped(
@@ -12412,6 +12488,134 @@ mod tests {
         let nested = parts[0]["parts"].as_array().unwrap();
         assert_eq!(nested.len(), 1);
         assert_eq!(nested[0]["type"], serde_json::json!("text"));
+    }
+
+    #[test]
+    fn test_strip_image_content_from_json_serialized_tool_result_string() {
+        // A tool-role message whose content is a STRING containing a
+        // JSON-serialized content array with an image part (the real
+        // Electron Hub trigger: message[4] role=tool). The image part is
+        // stripped and the string re-serialized.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "tool".to_string(),
+                content: serde_json::Value::String(
+                    r#"[{"type":"text","text":"result"},{"type":"image_url","image_url":{"url":"https://x/p.png"}}]"#
+                        .to_string(),
+                ),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        // Still a string, re-serialized, with the image part gone.
+        let s = request.messages[0].content.as_str().unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(s).unwrap();
+        let arr = reparsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], serde_json::json!("text"));
+        assert!(!s.contains("image_url"));
+    }
+
+    #[test]
+    fn test_strip_image_content_leaves_plain_text_mentioning_image_url() {
+        // Prose that merely mentions `image_url` (not JSON) must be left
+        // exactly as-is — stripping it would corrupt legitimate content.
+        let original = "To attach an image, set the image_url field in the request.";
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "tool".to_string(),
+                content: serde_json::Value::String(original.to_string()),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 0);
+        assert_eq!(request.messages[0].content.as_str().unwrap(), original);
+    }
+
+    #[test]
+    fn test_strip_image_content_from_json_string_that_is_single_image_object() {
+        // A string that is a serialized single image object becomes a
+        // placeholder-only array.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "tool".to_string(),
+                content: serde_json::Value::String(
+                    r#"{"type":"image_url","image_url":{"url":"https://x/p.png"}}"#.to_string(),
+                ),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        let s = request.messages[0].content.as_str().unwrap();
+        assert!(!s.contains("image_url"));
+        let reparsed: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert_eq!(reparsed.as_array().unwrap()[0]["type"], serde_json::json!("text"));
+    }
+
+    #[test]
+    fn test_strip_image_content_leaves_bare_json_string_scalar() {
+        // A JSON string scalar (quoted text) that mentions a marker is data,
+        // not a content container — left untouched.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "tool".to_string(),
+                content: serde_json::Value::String("\"see image_url docs\"".to_string()),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 0);
+        assert_eq!(
+            request.messages[0].content.as_str().unwrap(),
+            "\"see image_url docs\""
+        );
     }
 
     fn request_with_tools(tools: serde_json::Value) -> OpenAIRequest {
