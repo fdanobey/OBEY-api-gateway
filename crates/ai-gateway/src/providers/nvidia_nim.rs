@@ -45,6 +45,14 @@ pub const NVIDIA_NIM_FALLBACK_MODELS: &[NimFallbackModel] = &[
         max_completion_tokens: None,
         source_url: "https://build.nvidia.com/nvidia/nemotron-3-nano",
     },
+    NimFallbackModel {
+        id: "moonshotai/kimi-k3",
+        owned_by: "moonshotai",
+        supports_vision: true,
+        context_window: Some(1_000_000),
+        max_completion_tokens: None,
+        source_url: "https://build.nvidia.com/moonshotai/kimi-k3",
+    },
 ];
 // END NVIDIA NIM FALLBACK MODELS
 
@@ -203,10 +211,22 @@ mod tests {
                 "openai/gpt-oss-120b",
                 "meta/llama-3.1-70b-instruct",
                 "nvidia/nemotron-3-nano",
+                "moonshotai/kimi-k3",
             ]
         );
-        assert!(models.iter().all(|model| !model.supports_vision));
         assert_eq!(models[0].context_window, Some(128_000));
+
+        // Kimi K3 is the only vision-capable entry (native multimodal, 1M context).
+        let kimi = models
+            .iter()
+            .find(|model| model.id == "moonshotai/kimi-k3")
+            .expect("kimi-k3 present in fallback catalog");
+        assert!(kimi.supports_vision);
+        assert_eq!(kimi.context_window, Some(1_000_000));
+        assert!(models
+            .iter()
+            .filter(|model| model.id != "moonshotai/kimi-k3")
+            .all(|model| !model.supports_vision));
     }
 
     #[tokio::test]

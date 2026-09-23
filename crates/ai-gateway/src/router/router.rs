@@ -1964,12 +1964,16 @@ impl Router {
     /// model. This method removes those parts and logs that fact.
     ///
     /// Recognizes the common image part type spellings across client
-    /// libraries (`image_url`, `image`, `input_image`) at every nesting
-    /// depth — including image parts inside a `tool_result` part's own
-    /// `content` array, which clients send when a tool returned an image.
-    /// When stripping empties a content array entirely (top-level or
-    /// nested), a short text placeholder is inserted so the provider never
-    /// sees an empty content array.
+    /// libraries (`image_url`, `image`, `input_image`, `image_file`,
+    /// `input_image_url`) at every nesting depth — including image parts
+    /// inside a `tool_result` part's own `content` array, which clients send
+    /// when a tool returned an image. It also catches shapes that carry no
+    /// recognized `type` but still embed an image (an `image_url`/`source`
+    /// field, or a `data:image/...;base64,` URL inside a text part), and
+    /// handles `content` that arrives as a bare object or string instead of
+    /// the usual array of parts. When stripping empties a content array
+    /// entirely (top-level or nested), a short text placeholder is inserted
+    /// so the provider never sees an empty content array.
     fn strip_image_content_if_unsupported(
         request: &mut OpenAIRequest,
         supports_vision: bool,
@@ -1982,24 +1986,137 @@ impl Router {
 
         let mut stripped_total: usize = 0;
         for (idx, msg) in request.messages.iter_mut().enumerate() {
-            if let serde_json::Value::Array(parts) = &mut msg.content {
-                let removed = Self::strip_image_parts_recursive(parts, idx, provider_name, model);
-                if removed > 0 && parts.is_empty() {
-                    parts.push(serde_json::json!({
-                        "type": "text",
-                        "text": "[image content removed: model does not support image inputs]"
-                    }));
+            match &mut msg.content {
+                // Standard shape: an array of content parts.
+                serde_json::Value::Array(parts) => {
+                    let removed =
+                        Self::strip_image_parts_recursive(parts, idx, provider_name, model);
+                    if removed > 0 && parts.is_empty() {
+                        parts.push(Self::image_removed_placeholder());
+                    }
+                    stripped_total += removed;
                 }
-                stripped_total += removed;
+                // Non-array shapes some clients send directly to
+                // `/v1/chat/completions`: a single content object, or a raw
+                // string that may be an image data URL. These bypass the
+                // array-based stripper above, so handle them explicitly.
+                serde_json::Value::Object(_) => {
+                    if Self::content_value_is_image(&msg.content) {
+                        msg.content =
+                            serde_json::Value::Array(vec![Self::image_removed_placeholder()]);
+                        Self::warn_image_stripped(provider_name, model, idx, 1);
+                        stripped_total += 1;
+                    } else if let Some(nested) = msg
+                        .content
+                        .get_mut("content")
+                        .and_then(|c| c.as_array_mut())
+                    {
+                        let removed =
+                            Self::strip_image_parts_recursive(nested, idx, provider_name, model);
+                        if removed > 0 && nested.is_empty() {
+                            nested.push(Self::image_removed_placeholder());
+                        }
+                        stripped_total += removed;
+                    }
+                }
+                serde_json::Value::String(s) => {
+                    if Self::looks_like_image_data_url(s) {
+                        msg.content =
+                            serde_json::Value::Array(vec![Self::image_removed_placeholder()]);
+                        Self::warn_image_stripped(provider_name, model, idx, 1);
+                        stripped_total += 1;
+                    }
+                }
+                _ => {}
             }
         }
         stripped_total
     }
 
+    /// Text placeholder inserted where image content was removed.
+    fn image_removed_placeholder() -> serde_json::Value {
+        serde_json::json!({
+            "type": "text",
+            "text": "[image content removed: model does not support image inputs]"
+        })
+    }
+
+    fn warn_image_stripped(
+        provider_name: &str,
+        model: &str,
+        message_index: usize,
+        removed: usize,
+    ) {
+        warn!(
+            provider = provider_name,
+            model = %model,
+            message_index = message_index,
+            images_removed = removed,
+            "Stripped image content parts from message for non-vision model"
+        );
+    }
+
+    /// Whether a `data:` URL points at image bytes (case-insensitive,
+    /// tolerant of leading whitespace).
+    fn looks_like_image_data_url(value: &str) -> bool {
+        value.trim_start().to_ascii_lowercase().starts_with("data:image/")
+    }
+
+    /// Whether a single content-part value represents an image, regardless of
+    /// how the discriminator is spelled. Matches recognized `type` strings, a
+    /// present `image_url` / `image_file` / `source` field, or a text part
+    /// whose text is itself an image data URL.
+    fn content_value_is_image(part: &serde_json::Value) -> bool {
+        let Some(obj) = part.as_object() else {
+            return false;
+        };
+
+        let type_str = obj.get("type").and_then(|v| v.as_str());
+        if matches!(
+            type_str,
+            Some("image_url")
+                | Some("image")
+                | Some("input_image")
+                | Some("image_file")
+                | Some("input_image_url")
+        ) {
+            return true;
+        }
+
+        // Some clients omit or misspell `type` but still carry an image
+        // payload under a well-known key.
+        if type_str != Some("text")
+            && (obj.contains_key("image_url")
+                || obj.contains_key("image_file")
+                || obj.contains_key("input_image")
+                || (obj.contains_key("source")
+                    && obj
+                        .get("source")
+                        .and_then(|s| s.get("type"))
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.eq_ignore_ascii_case("base64") || t.eq_ignore_ascii_case("url"))
+                        .unwrap_or(false)))
+        {
+            return true;
+        }
+
+        // A text part whose text is a bare image data URL.
+        if type_str == Some("text") {
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                if Self::looks_like_image_data_url(text) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Recursively remove image content parts from a `content` array and
-    /// from nested `content` arrays inside surviving parts (e.g.
-    /// `{"type":"tool_result","content":[{"type":"image_url",...}]}`).
-    /// Returns the total number of image parts removed at every depth.
+    /// from nested arrays inside surviving parts (e.g.
+    /// `{"type":"tool_result","content":[{"type":"image_url",...}]}` or a
+    /// custom `{"parts":[...]}` shape). Returns the total number of image
+    /// parts removed at every depth.
     fn strip_image_parts_recursive(
         parts: &mut Vec<serde_json::Value>,
         message_index: usize,
@@ -2008,45 +2125,36 @@ impl Router {
     ) -> usize {
         let mut stripped: usize = 0;
 
-        // First recurse into nested `content` arrays so images buried inside
-        // non-image parts (tool results, custom part shapes) are removed too.
+        // First recurse into nested arrays so images buried inside non-image
+        // parts (tool results, custom part shapes) are removed too. Descend
+        // into any array-valued child field, not just one literally named
+        // `content`, since clients nest under `content`, `parts`, etc.
         for part in parts.iter_mut() {
-            if let Some(nested_value) = part.get_mut("content") {
-                if let serde_json::Value::Array(nested) = nested_value {
-                    let nested_removed = Self::strip_image_parts_recursive(
-                        nested,
-                        message_index,
-                        provider_name,
-                        model,
-                    );
-                    if nested_removed > 0 && nested.is_empty() {
-                        nested.push(serde_json::json!({
-                            "type": "text",
-                            "text": "[image content removed: model does not support image inputs]"
-                        }));
+            if let serde_json::Value::Object(map) = part {
+                for (_key, child) in map.iter_mut() {
+                    if let serde_json::Value::Array(nested) = child {
+                        let nested_removed = Self::strip_image_parts_recursive(
+                            nested,
+                            message_index,
+                            provider_name,
+                            model,
+                        );
+                        if nested_removed > 0 && nested.is_empty() {
+                            nested.push(Self::image_removed_placeholder());
+                        }
+                        stripped += nested_removed;
                     }
-                    stripped += nested_removed;
                 }
             }
         }
 
-        // Then remove image parts at this level.
+        // Then remove image parts at this level, matched by the tolerant
+        // `content_value_is_image` predicate rather than a fixed type list.
         let before = parts.len();
-        parts.retain(|part| {
-            !matches!(
-                part.get("type").and_then(|v| v.as_str()),
-                Some("image_url") | Some("image") | Some("input_image")
-            )
-        });
+        parts.retain(|part| !Self::content_value_is_image(part));
         let removed = before.saturating_sub(parts.len());
         if removed > 0 {
-            warn!(
-                provider = provider_name,
-                model = %model,
-                message_index = message_index,
-                images_removed = removed,
-                "Stripped image content parts from message for non-vision model"
-            );
+            Self::warn_image_stripped(provider_name, model, message_index, removed);
         }
         stripped + removed
     }
@@ -8236,6 +8344,35 @@ visible content. Do not restate your plan and do not end your turn without doing
                     }
                 }
             }
+            // Image-input rejection on the streaming pass-through: the
+            // provider refused image content the proactive strip didn't
+            // remove (unrecognized shape or stale capability belief). Strip
+            // images from a cloned request and retry via the buffered path so
+            // the fallback does not re-send the images and burn another 4xx.
+            // Mirrors the buffered path's reactive strip; bounded to the one
+            // shot the buffered retry loop enforces per provider.
+            if Self::is_unsupported_image_error(status_code, &body_text) {
+                let mut stripped_request = request.clone();
+                let removed = Self::strip_image_content_if_unsupported(
+                    &mut stripped_request,
+                    false,
+                    &provider_model.provider,
+                    &provider_model.model,
+                );
+                if removed > 0 {
+                    info!(
+                        provider = %provider_model.provider,
+                        model = %provider_model.model,
+                        status = status_code,
+                        images_removed = removed,
+                        "Provider rejected image inputs (streaming) — stripped images and retrying via buffered path"
+                    );
+                    drop(concurrency_permit);
+                    return Ok(StreamingResponse::Buffered(
+                        self.route_request(&stripped_request, active.clone()).await?,
+                    ));
+                }
+            }
             warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
             drop(concurrency_permit);
             return Ok(StreamingResponse::Buffered(
@@ -11863,6 +12000,170 @@ mod tests {
         let parts = request.messages[0].content.as_array().unwrap();
         let nested = parts[0]["content"].as_array().unwrap();
         assert_eq!(nested.len(), 1, "placeholder inserted into nested array");
+        assert_eq!(nested[0]["type"], serde_json::json!("text"));
+    }
+
+    #[test]
+    fn test_strip_image_content_if_unsupported_handles_content_as_single_object() {
+        // A client that sends `content` as a single image object (not wrapped
+        // in an array) must still have the image stripped. The old array-only
+        // guard skipped this shape, letting a 400 through.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!(
+                    {"type": "image_url", "image_url": {"url": "https://x.example/p.png"}}
+                ),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        let parts = request.messages[0]
+            .content
+            .as_array()
+            .expect("content normalized to array with placeholder");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], serde_json::json!("text"));
+    }
+
+    #[test]
+    fn test_strip_image_content_if_unsupported_handles_content_string_data_url() {
+        // `content` as a bare string that is an image data URL must be
+        // neutralized to a text placeholder.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("data:image/png;base64,aGVsbG8="),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        let parts = request.messages[0].content.as_array().unwrap();
+        assert_eq!(parts[0]["type"], serde_json::json!("text"));
+    }
+
+    #[test]
+    fn test_strip_image_content_if_unsupported_removes_data_url_inside_text_part() {
+        // A data-URL image smuggled inside a text part must be removed; a
+        // sibling real text part is preserved.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "describe this"},
+                    {"type": "text", "text": "data:image/jpeg;base64,/9j/4AAQ"},
+                ]),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        let parts = request.messages[0].content.as_array().unwrap();
+        assert_eq!(parts.len(), 1, "the real text part survives");
+        assert_eq!(parts[0]["text"], serde_json::json!("describe this"));
+    }
+
+    #[test]
+    fn test_strip_image_content_if_unsupported_removes_untyped_and_extra_variants() {
+        // Image parts with no recognized `type` but a well-known image field,
+        // plus additional discriminator spellings (image_file), are stripped.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "keep me"},
+                    {"image_url": {"url": "https://x.example/a.png"}},
+                    {"type": "image_file", "image_file": {"file_id": "f-1"}},
+                    {"type": "image", "source": {"type": "base64", "data": "aGk="}},
+                ]),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 3);
+        let parts = request.messages[0].content.as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], serde_json::json!("keep me"));
+    }
+
+    #[test]
+    fn test_strip_image_content_if_unsupported_recurses_into_non_content_arrays() {
+        // Images nested under a key other than `content` (e.g. a custom
+        // `parts` array) are reached by the generalized recursion.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "custom", "parts": [
+                        {"type": "text", "text": "hi"},
+                        {"type": "image_url", "image_url": {"url": "https://x.example/p.png"}}
+                    ]},
+                ]),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        let parts = request.messages[0].content.as_array().unwrap();
+        let nested = parts[0]["parts"].as_array().unwrap();
+        assert_eq!(nested.len(), 1);
         assert_eq!(nested[0]["type"], serde_json::json!("text"));
     }
 

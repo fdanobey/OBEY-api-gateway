@@ -612,6 +612,14 @@ pub const BEDROCK_MANTLE_CHAT_FALLBACK: &[BedrockFallbackModel] = &[
         max_completion_tokens: None,
         source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html",
     },
+    BedrockFallbackModel {
+        id: "moonshotai.kimi-k3",
+        owned_by: "moonshotai",
+        supports_vision: true,
+        context_window: Some(1_000_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k3.html",
+    },
 ];
 // END BEDROCK MANTLE CHAT FALLBACK MODELS
 
@@ -839,6 +847,14 @@ pub const BEDROCK_RUNTIME_FALLBACK: &[BedrockFallbackModel] = &[
         context_window: None,
         max_completion_tokens: None,
         source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-qwen-qwen3-32b.html",
+    },
+    BedrockFallbackModel {
+        id: "moonshotai.kimi-k3",
+        owned_by: "moonshotai",
+        supports_vision: true,
+        context_window: Some(1_000_000),
+        max_completion_tokens: None,
+        source_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k3.html",
     },
 ];
 // END BEDROCK RUNTIME FALLBACK MODELS
