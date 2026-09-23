@@ -67,7 +67,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Hot config reload** — change settings through the admin UI without restarting
 - **Dynamic request body limit** — configurable `max_request_size_mb` (default 10 MB) enforced per-request; adjustable via admin UI or hot-reload without restart, rejects oversized payloads with HTTP 413 before forwarding
 - **Smart timeouts** — split TTFB / total timeouts with auto-detection of thinking models (o1, o3, DeepSeek-R1, Claude), plus a gateway-wide request deadline derived from the longest configured provider timeout that catches stalls no provider timeout covers (see [Global request deadline](#global-request-deadline))
-- **Smart model routing** — complexity-aware tier selection (Fast / Balanced / Powerful) with heuristic, ML (ONNX), LLM, or composite classifiers; cascade escalation, online optimization, A/B testing, budget limits, semantic routing cache, and per-model-group overrides (see [Smart Model Routing](#smart-model-routing))
+- **Smart model routing** — complexity-aware tier selection (Fast / Balanced / Powerful) with heuristic, ML (ONNX), LLM, JEV (TypeSafe "System One" typed decision model), or composite classifiers; cascade escalation, online optimization, A/B testing, budget limits, semantic routing cache, and per-model-group overrides (see [Smart Model Routing](#smart-model-routing))
 - **Prompt-cache-aware routing** — prefix-hash sticky provider selection, automatic Anthropic-style `cache_control` breakpoint injection and advancement, cached-token-aware cost sorting and billing, and per-provider cache hit-rate telemetry with OpenRouter session affinity (see [Prompt-Cache-Aware Routing](#prompt-cache-aware-routing))
 
 ## Quick Start
@@ -1168,6 +1168,7 @@ model_groups:
 | `heuristic` (default) | Weighted signal analysis (message count, tokens, code blocks, tool calls, math, reasoning keywords) |
 | `ml` | ONNX model inference (requires `ml-router` build feature) |
 | `llm` | Delegates classification to a configured LLM |
+| `jev` | TypeSafe AI "System One" decision model — returns typed multi-dimension complexity scores (reasoning depth, tool coupling, synthesis, output precision, specialist load, ambiguity) with confidence in a single call; provider-neutral `base_url` (TypeSafe or OpenRouter-compatible), see [Smart Routing with Jev wiki page](https://github.com/fdanobey/OBEY-api-gateway/wiki/Smart-Routing-Jev-Classifier) |
 | `composite` | Weighted blend of heuristic + ML |
 
 ### Configuration
@@ -1536,7 +1537,7 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 │           ├── compression/          # Token compression engines & pipelines
 │           ├── tool_compression/     # Tool definition compression: 12-stage pipeline, provider-aware middleware
 │           ├── structured_output/    # JSON Schema response validation with retry
-│           ├── smart_routing/       # Smart model routing: complexity classification, tier selection, cascade, A/B testing
+│           ├── smart_routing/       # Smart model routing: complexity classification (heuristic/ML/LLM/JEV), tier selection, cascade, A/B testing
 │           ├── assistants/          # OpenAI Assistants API: local SQLite-backed CRUD for assistants, threads, messages, runs, files
 │           ├── active_requests.rs   # Live in-flight request registry for dashboard phase tracking
 │           ├── request_body_limit.rs # Dynamic per-request body size enforcement (hot-reloadable)
