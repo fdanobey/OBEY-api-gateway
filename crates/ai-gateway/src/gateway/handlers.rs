@@ -2468,6 +2468,13 @@ async fn chat_completions_stream(
                             // total failure surfaces every provider, not just the last.
                             let mut streaming_attempts: Vec<ProviderAttempt> = Vec::new();
                             let mut failover_attempts: usize = 0;
+                            // Pre-content stream-truncation retry (transient `unexpected
+                            // EOF` etc.): track which `provider:model` keys have already
+                            // been given their ONE same-provider retry so a repeatedly
+                            // truncating provider is excluded and failover advances.
+                            let retry_on_stream_truncation =
+                                streaming_config.retry_on_stream_truncation;
+                            let mut stream_truncation_retried: Vec<String> = Vec::new();
                                 let mut _current_concurrency_permit = Some(concurrency_permit);
                                 let mut current_stream = byte_stream;
                             let mut current_provider = provider;
@@ -2636,13 +2643,117 @@ async fn chat_completions_stream(
                                                 Some(reason.clone()),
                                             )
                                             .await;
+
+                                        let current_key =
+                                            format!("{}:{}", current_provider, current_model);
+
+                                        // Transient stream-truncation retry: the upstream
+                                        // dropped the connection mid-body before any
+                                        // content reached the client (e.g. `unexpected EOF
+                                        // during chunk size line`). These transport
+                                        // failures are non-deterministic, so give the SAME
+                                        // provider ONE more attempt before excluding it and
+                                        // advancing. Gated by `retry_on_stream_truncation`
+                                        // and bounded to one retry per provider:model via
+                                        // `stream_truncation_retried`. The defensive
+                                        // `max_failover_attempts` cap still bounds the loop.
+                                        if retry_on_stream_truncation
+                                            && is_transient_stream_truncation(&reason)
+                                            && !stream_truncation_retried.contains(&current_key)
+                                        {
+                                            stream_truncation_retried.push(current_key.clone());
+                                            tracing::warn!(
+                                                trace_id = %stream_trace_id,
+                                                provider = %current_provider,
+                                                model = %current_model,
+                                                reason = %reason,
+                                                "Streaming provider truncated before any content; retrying same provider once (transient transport failure)"
+                                            );
+                                            // Record the attempt for the aggregated error in
+                                            // case everything ultimately fails (Req 4.3).
+                                            streaming_attempts.push(ProviderAttempt::new(
+                                                current_provider.clone(),
+                                                current_model.clone(),
+                                                reason.clone(),
+                                                None,
+                                            ));
+                                            drop(_current_concurrency_permit.take());
+
+                                            // Re-request WITHOUT excluding the current
+                                            // provider so the router can hand back the same
+                                            // provider:model for a fresh connection.
+                                            match state
+                                                .router
+                                                .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
+                                                .await
+                                            {
+                                                Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit }) => {
+                                                    _current_concurrency_permit = Some(concurrency_permit);
+                                                    current_stream = byte_stream;
+                                                    current_provider = provider;
+                                                    current_model = model;
+                                                    current_compression = compression;
+                                                    continue 'failover;
+                                                }
+                                                // No eligible pass-through provider (e.g. the
+                                                // provider is now circuit-broken from the
+                                                // failure we just recorded) — replay the
+                                                // buffered fallback after the early event.
+                                                Ok(StreamingResponse::Buffered(response)) => {
+                                                    if crate::router::router::Router::should_cache_response(&response) {
+                                                        if let Ok(json) = serde_json::to_string(&response) {
+                                                            state.exact_cache.set(&request, json);
+                                                        }
+                                                    }
+                                                    let duration_ms = start.elapsed().as_millis() as u64;
+                                                    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                                                    log_request(&state, &request, &log_context);
+                                                    if let Some(memory) = memory_context.as_ref() {
+                                                        let response_content = response
+                                                            .choices
+                                                            .first()
+                                                            .map(|choice| choice.message.content_as_text())
+                                                            .unwrap_or_default();
+                                                        spawn_streaming_memory_extraction(
+                                                            &state,
+                                                            memory,
+                                                            response_content,
+                                                            uuid::Uuid::parse_str(&stream_trace_id).ok(),
+                                                        );
+                                                    }
+                                                    for chunk in streaming_chunks_after_early_event(&response, &response_id, created) {
+                                                        yield Ok(Event::default().data(chunk.to_string()));
+                                                    }
+                                                    if let Some(suffix) = memory_suffix.as_deref() {
+                                                        yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+                                                    }
+                                                    yield Ok(Event::default().data("[DONE]"));
+                                                    break 'failover;
+                                                }
+                                                Err(e) => {
+                                                    let aggregated = merge_streaming_attempts(
+                                                        std::mem::take(&mut streaming_attempts),
+                                                        e,
+                                                    );
+                                                    let duration_ms = start.elapsed().as_millis() as u64;
+                                                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
+                                                    log_request(&state, &request, &log_context);
+                                                    let (error_type, message) = classify_stream_error(&aggregated);
+                                                    for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
+                                                        yield Ok(event);
+                                                    }
+                                                    break 'failover;
+                                                }
+                                            }
+                                        }
+
                                         tracing::warn!(
                                             trace_id = %stream_trace_id,
                                             provider = %current_provider,
                                             reason = %reason,
                                             "Streaming provider failed before any content; attempting pre-content failover"
                                         );
-                                        tried_providers.push(format!("{}:{}", current_provider, current_model));
+                                        tried_providers.push(current_key);
                                         // Req 4.3: record this pre-content failure for the
                                         // aggregated error in case every provider fails.
                                         streaming_attempts.push(ProviderAttempt::new(
@@ -4292,6 +4403,40 @@ fn reqwest_error_chain(error: &reqwest::Error) -> String {
     messages.join(": ")
 }
 
+/// Classify a pre-content [`RelayOutcome::FailedBeforeContent`] reason as a
+/// *transient stream truncation* — the upstream closed the connection partway
+/// through the (chunked) response body before any content reached the client.
+///
+/// These are transport-level, non-deterministic failures (idle-timeout on an
+/// intermediary, a backend restart mid-generation, a brief network blip), so a
+/// single same-provider retry is very likely to succeed. This is distinct from
+/// a deterministic pre-content error frame (auth, quota, bad request), which
+/// would fail identically on retry and must fall straight through to the next
+/// provider.
+///
+/// Matching is done on the human-readable reason string produced by
+/// [`reqwest_error_chain`] (via `"Stream error: {chain}"`) plus the synthetic
+/// "ended without sending any content" reason. Substrings are matched
+/// case-insensitively and cover the common reqwest/hyper truncation phrasings:
+/// - `unexpected EOF during chunk size line` / `unexpected end of file`
+/// - `error reading a body from connection`
+/// - `IncompleteMessage` / `incomplete` bodies
+/// - `connection reset` / `connection closed` before content
+fn is_transient_stream_truncation(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    const TRANSIENT_MARKERS: [&str; 8] = [
+        "unexpected eof",
+        "unexpected end of file",
+        "error reading a body from connection",
+        "incompletemessage",
+        "incomplete message",
+        "connection reset",
+        "connection closed before message completed",
+        "ended without sending any content",
+    ];
+    TRANSIENT_MARKERS.iter().any(|m| r.contains(m))
+}
+
 fn upstream_stream_metadata(
     upstream: &reqwest::Response,
 ) -> (reqwest::Version, String, String, Option<u64>) {
@@ -5098,7 +5243,8 @@ mod tests {
         json_model, memory_feedback_chunk, multipart_model, openai_json_response,
         prepare_response_for_client, provider_pass_through_response, rechunk_structured_response,
         relay_passthrough_stream, requests_structured_output, should_cache_eager_structured,
-        smart_routing_headers, sse_error_payload, streaming_chunks_after_early_event,
+        is_transient_stream_truncation, smart_routing_headers, sse_error_payload,
+        streaming_chunks_after_early_event,
         streaming_chunks_from_response, structured_stream_overflow_events,
         upstream_stream_metadata, RelayLineAction, RelayOutcome, RequestCompleteGuard,
         RequestLogContext, ValidationResponseStatus,
@@ -6723,6 +6869,38 @@ mod tests {
             !chunk_carries_content("not json"),
             "malformed is not content"
         );
+    }
+
+    /// Pre-content stream-truncation classifier: transient transport
+    /// truncations (the `unexpected EOF` family) are retryable, while
+    /// deterministic pre-content error frames (auth/quota/bad request) are not.
+    #[test]
+    fn is_transient_stream_truncation_matches_truncation_family_only() {
+        // The exact reason from the reported incident.
+        assert!(is_transient_stream_truncation(
+            "Stream error: error decoding response body: error reading a body from connection: unexpected EOF during chunk size line"
+        ));
+        // Other transient transport phrasings.
+        assert!(is_transient_stream_truncation(
+            "Stream error: connection reset by peer"
+        ));
+        assert!(is_transient_stream_truncation(
+            "Stream error: hyper::Error(IncompleteMessage)"
+        ));
+        assert!(is_transient_stream_truncation(
+            "Provider stream ended without sending any content"
+        ));
+        // Case-insensitive.
+        assert!(is_transient_stream_truncation("Stream error: Unexpected EOF"));
+
+        // Deterministic pre-content failures must NOT be treated as transient.
+        assert!(!is_transient_stream_truncation(
+            "Mid-stream error (invalid_api_key): authentication failed"
+        ));
+        assert!(!is_transient_stream_truncation(
+            "Provider signaled a mid-stream error (finish_reason=error)"
+        ));
+        assert!(!is_transient_stream_truncation("Stream error: 429 rate limit"));
     }
 
     /// `chunk_carries_answer` is deliberately stricter than

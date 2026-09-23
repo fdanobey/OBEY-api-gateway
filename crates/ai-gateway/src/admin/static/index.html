@@ -1551,6 +1551,11 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         <label for="stream-retry-truncation">Retry on truncated responses</label>
       </div>
       <div class="hint" style="margin-top:-.5rem;margin-bottom:1rem;margin-left:1.5rem">When a provider returns <code>finish_reason: "length"</code> well short of max_tokens, fail over to the next provider. If all truncate, returns the longest partial.</div>
+      <div class="form-check">
+        <input type="checkbox" id="stream-retry-stream-truncation" checked>
+        <label for="stream-retry-stream-truncation">Retry on pre-content stream truncation</label>
+      </div>
+      <div class="hint" style="margin-top:-.5rem;margin-bottom:1rem;margin-left:1.5rem">When the upstream drops the connection mid-body before any content is sent (e.g. <code>unexpected EOF during chunk size line</code>), retry the same provider once before failing over. Handles transient transport failures.</div>
     </fieldset>
     <div class="actions">
       <button class="btn btn-primary" data-action="save">Save</button>
@@ -3837,7 +3842,7 @@ if(cfg.cors){document.getElementById('cors-enabled').checked=!!cfg.cors.enabled;
     if(cfg.semantic_cache){document.getElementById('cache-enabled').checked=!!cfg.semantic_cache.enabled; document.getElementById('cache-qdrant-url').value=cfg.semantic_cache.qdrant_url||''; document.getElementById('cache-collection').value=cfg.semantic_cache.collection_name||'ai_gateway_cache'; document.getElementById('cache-threshold').value=cfg.semantic_cache.similarity_threshold||0.95; document.getElementById('cache-ttl').value=cfg.semantic_cache.ttl_seconds||3600; document.getElementById('cache-max-entries').value=cfg.semantic_cache.max_cache_size||10000;}
     if(cfg.context){document.getElementById('context-enabled').checked=!!cfg.context.enabled; document.getElementById('context-strategy').value=cfg.context.truncation_strategy||'remove_oldest'; document.getElementById('context-window-size').value=cfg.context.sliding_window_size||10; document.getElementById('context-cache-ttl').value=cfg.context.capabilities_cache_ttl_seconds||3600; document.getElementById('context-max-retries').value=cfg.context.max_truncation_retries||3;}
     populateCompression(cfg.compression || COMPRESSION_DEFAULTS);
-    var sc=cfg.streaming||{};document.getElementById('stream-early-event').checked=sc.emit_early_event!==false;document.getElementById('stream-keepalive').value=sc.keepalive_interval_seconds!=null?sc.keepalive_interval_seconds:5;document.getElementById('stream-passthrough').checked=sc.passthrough_enabled!==false;document.getElementById('stream-chunk-timeout').value=sc.chunk_timeout_seconds||60;document.getElementById('stream-retry-truncation').checked=sc.retry_on_truncation!==false;
+    var sc=cfg.streaming||{};document.getElementById('stream-early-event').checked=sc.emit_early_event!==false;document.getElementById('stream-keepalive').value=sc.keepalive_interval_seconds!=null?sc.keepalive_interval_seconds:5;document.getElementById('stream-passthrough').checked=sc.passthrough_enabled!==false;document.getElementById('stream-chunk-timeout').value=sc.chunk_timeout_seconds||60;document.getElementById('stream-retry-truncation').checked=sc.retry_on_truncation!==false;document.getElementById('stream-retry-stream-truncation').checked=sc.retry_on_stream_truncation!==false;
     populateLoopDetection(cfg.loop_detection||LOOP_DEFAULTS);
     populateProviderSelects();
     if(cfg.semantic_cache&&cfg.semantic_cache.embedding_provider){
@@ -3975,7 +3980,7 @@ cfg.reasoning_compat=collectReasoningCompat();
     cfg.compression=collectCompression();
     cfg.tool_compression=collectToolCompression();
     cfg.memory=collectMemory();
-    cfg.streaming={emit_early_event:document.getElementById('stream-early-event').checked,keepalive_interval_seconds:parseInt(document.getElementById('stream-keepalive').value,10),passthrough_enabled:document.getElementById('stream-passthrough').checked,chunk_timeout_seconds:parseInt(document.getElementById('stream-chunk-timeout').value,10),retry_on_truncation:document.getElementById('stream-retry-truncation').checked};
+    cfg.streaming={emit_early_event:document.getElementById('stream-early-event').checked,keepalive_interval_seconds:parseInt(document.getElementById('stream-keepalive').value,10),passthrough_enabled:document.getElementById('stream-passthrough').checked,chunk_timeout_seconds:parseInt(document.getElementById('stream-chunk-timeout').value,10),retry_on_truncation:document.getElementById('stream-retry-truncation').checked,retry_on_stream_truncation:document.getElementById('stream-retry-stream-truncation').checked};
     cfg.loop_detection=collectLoopDetection();
     cfg.guardrails=collectGuardrails();
     if(document.getElementById('so-enabled').checked || (config && config.structured_output)){cfg.structured_output=collectStructuredOutput();}else{delete cfg.structured_output;}

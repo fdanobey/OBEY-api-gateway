@@ -1183,6 +1183,14 @@ pub struct StreamingConfig {
     /// response appears truncated.
     #[serde(default = "default_true")]
     pub retry_on_truncation: bool,
+
+    /// Retry a pre-content stream truncation (the upstream dropped the
+    /// connection mid-body before any content reached the client — e.g.
+    /// `unexpected EOF during chunk size line`). When enabled, the gateway
+    /// makes one same-provider retry for such transient transport failures
+    /// before excluding the provider and failing over to the next one.
+    #[serde(default = "default_true")]
+    pub retry_on_stream_truncation: bool,
 }
 
 impl Default for StreamingConfig {
@@ -1193,6 +1201,7 @@ impl Default for StreamingConfig {
             passthrough_enabled: true,
             chunk_timeout_seconds: default_chunk_timeout(),
             retry_on_truncation: true,
+            retry_on_stream_truncation: true,
         }
     }
 }
@@ -1271,6 +1280,7 @@ keepalive_interval_seconds: 10
 passthrough_enabled: false
 chunk_timeout_seconds: 30
 retry_on_truncation: false
+retry_on_stream_truncation: false
 "#;
         let cfg: StreamingConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
@@ -1281,6 +1291,7 @@ retry_on_truncation: false
                 passthrough_enabled: false,
                 chunk_timeout_seconds: 30,
                 retry_on_truncation: false,
+                retry_on_stream_truncation: false,
             }
         );
     }
@@ -1295,6 +1306,7 @@ retry_on_truncation: false
         assert!(cfg.passthrough_enabled);
         assert_eq!(cfg.chunk_timeout_seconds, 60);
         assert!(cfg.retry_on_truncation);
+        assert!(cfg.retry_on_stream_truncation);
     }
 
     #[test]
@@ -1307,6 +1319,7 @@ retry_on_truncation: false
         assert!(cfg.passthrough_enabled);
         assert_eq!(cfg.chunk_timeout_seconds, 60);
         assert!(cfg.retry_on_truncation);
+        assert!(cfg.retry_on_stream_truncation);
     }
 
     #[test]
