@@ -2035,6 +2035,16 @@ impl Router {
                         // mentions an image marker is left untouched.
                         Self::warn_image_stripped(provider_name, model, idx, removed);
                         stripped_total += removed;
+                    } else if let serde_json::Value::String(text) = &mut msg.content {
+                        // Last resort for plain-text content (e.g. a tool
+                        // result that read a source file literally containing a
+                        // base64 image): redact any embedded `data:image/...`
+                        // runs in place, preserving the surrounding text.
+                        let redacted = Self::redact_embedded_image_data_urls(text);
+                        if redacted > 0 {
+                            Self::warn_image_stripped(provider_name, model, idx, redacted);
+                            stripped_total += redacted;
+                        }
                     }
                 }
                 _ => {}
@@ -2136,6 +2146,87 @@ impl Router {
     /// tolerant of leading whitespace).
     fn looks_like_image_data_url(value: &str) -> bool {
         value.trim_start().to_ascii_lowercase().starts_with("data:image/")
+    }
+
+    /// Placeholder substituted for a redacted inline image data URL.
+    const IMAGE_DATA_URL_PLACEHOLDER: &'static str = "[image data URL removed]";
+
+    /// Redact any `data:image/<type>;base64,<payload>` runs embedded ANYWHERE
+    /// inside a plain-text string, replacing each with a short placeholder
+    /// while preserving all surrounding text.
+    ///
+    /// This is the catch-all for image bytes that are neither a structured
+    /// content part nor valid JSON — e.g. a tool result that read a source
+    /// file which literally contains a base64 image on some line. Aggregators
+    /// that scan the whole request body reject these as "image inputs" even
+    /// though the enclosing content is legitimate text, so the surrounding
+    /// text must survive. Returns the number of data URLs redacted.
+    fn redact_embedded_image_data_urls(text: &mut String) -> usize {
+        // Fast path: nothing to do.
+        if !text.to_ascii_lowercase().contains("data:image/") {
+            return 0;
+        }
+
+        let lower = text.to_ascii_lowercase();
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0usize;
+        let mut redacted = 0usize;
+
+        while let Some(rel) = lower[cursor..].find("data:image/") {
+            let start = cursor + rel;
+            // Copy everything up to the data URL verbatim.
+            out.push_str(&text[cursor..start]);
+
+            // Find the `;base64,` (or `,`) separator that begins the payload.
+            // Only redact base64 data URLs; a `data:image/...` without base64
+            // is left as-is (rare, and not the reported trigger).
+            let after_prefix = &lower[start..];
+            let Some(comma_rel) = after_prefix.find("base64,") else {
+                // No base64 payload marker: emit the prefix token literally and
+                // continue scanning after it to avoid an infinite loop.
+                let advance = "data:image/".len();
+                out.push_str(&text[start..start + advance]);
+                cursor = start + advance;
+                continue;
+            };
+            let payload_start = start + comma_rel + "base64,".len();
+
+            // Consume the contiguous base64 payload: [A-Za-z0-9+/=]. Stops at
+            // the first character outside that set (quote, newline, space,
+            // brace, etc.), preserving whatever text follows.
+            let mut end = payload_start;
+            while end < bytes.len() {
+                let c = bytes[end];
+                let is_b64 = c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'=';
+                if !is_b64 {
+                    break;
+                }
+                end += 1;
+            }
+
+            out.push_str(Self::IMAGE_DATA_URL_PLACEHOLDER);
+            redacted += 1;
+            cursor = end;
+        }
+
+        // Trailing remainder after the last match.
+        out.push_str(&text[cursor..]);
+
+        if redacted > 0 {
+            *text = out;
+        }
+        redacted
+    }
+
+    /// Apply [`Self::redact_embedded_image_data_urls`] to a `&mut Value` when
+    /// it is a string, returning the number of data URLs redacted.
+    fn redact_data_urls_in_value(value: &mut serde_json::Value) -> usize {
+        if let serde_json::Value::String(s) = value {
+            let n = Self::redact_embedded_image_data_urls(s);
+            return n;
+        }
+        0
     }
 
     /// Whether a single content-part value represents an image, regardless of
@@ -2436,6 +2527,11 @@ impl Router {
                         serde_json::Value::String(_) => {
                             if let Some(n) = Self::strip_image_from_json_string(child) {
                                 stripped += n;
+                            } else {
+                                // Plain-text field (e.g. a text part's `text`)
+                                // that embeds a base64 image data URL: redact it
+                                // in place, preserving surrounding text.
+                                stripped += Self::redact_data_urls_in_value(child);
                             }
                         }
                         _ => {}
@@ -12452,9 +12548,12 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_image_content_if_unsupported_removes_data_url_inside_text_part() {
-        // A data-URL image smuggled inside a text part must be removed; a
-        // sibling real text part is preserved.
+    fn test_strip_image_content_if_unsupported_redacts_data_url_inside_text_part() {
+        // A data-URL image inside a text part is neutralized. The redaction
+        // pass runs first and replaces the data URL in place (preserving the
+        // part structure) rather than deleting the whole part — a sibling real
+        // text part is untouched. This preserves message shape for providers
+        // that are strict about content-part arrays.
         let mut request = OpenAIRequest {
             model: "no-vision".to_string(),
             messages: vec![Message {
@@ -12479,8 +12578,11 @@ mod tests {
         );
         assert_eq!(removed, 1);
         let parts = request.messages[0].content.as_array().unwrap();
-        assert_eq!(parts.len(), 1, "the real text part survives");
+        assert_eq!(parts.len(), 2, "both parts survive; the data URL is redacted in place");
         assert_eq!(parts[0]["text"], serde_json::json!("describe this"));
+        let redacted = parts[1]["text"].as_str().unwrap();
+        assert!(!redacted.contains("data:image/"));
+        assert!(redacted.contains("[image data URL removed]"));
     }
 
     #[test]
@@ -12688,6 +12790,97 @@ mod tests {
         assert!(!inner_text.contains("image_url"));
         let reparsed: serde_json::Value = serde_json::from_str(inner_text).unwrap();
         assert_eq!(reparsed.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_redacts_embedded_data_url_in_plain_text_tool_result() {
+        // The real Electron Hub trigger: a tool-role message whose content is
+        // plain text (a file listing) that literally contains a base64 image
+        // data URL on one line. Not JSON, not a structured part. The data URL
+        // must be redacted while the surrounding file text is preserved.
+        let file_text = "data.bak (2).js:\n Line 11: \"image\": \"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAJY=\"\n Line 12: end";
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "tool".to_string(),
+                content: serde_json::Value::String(file_text.to_string()),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        let out = request.messages[0].content.as_str().unwrap();
+        // Data URL gone, surrounding text intact.
+        assert!(!out.contains("data:image/"));
+        assert!(!out.contains("iVBORw0KGgo"));
+        assert!(out.contains("data.bak (2).js:"));
+        assert!(out.contains("Line 11:"));
+        assert!(out.contains("Line 12: end"));
+        assert!(out.contains("[image data URL removed]"));
+    }
+
+    #[test]
+    fn test_redacts_multiple_embedded_data_urls_preserving_text() {
+        let mut s = String::from(
+            "before data:image/jpeg;base64,/9j/4AAQ mid data:image/gif;base64,R0lGODdh after",
+        );
+        let n = Router::redact_embedded_image_data_urls(&mut s);
+        assert_eq!(n, 2);
+        assert!(s.starts_with("before "));
+        assert!(s.contains(" mid "));
+        assert!(s.ends_with(" after"));
+        assert!(!s.contains("data:image/"));
+    }
+
+    #[test]
+    fn test_redacts_data_url_inside_text_part_of_array() {
+        // Same trigger nested inside a `{"type":"text","text":...}` part.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "tool".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "logo bytes: data:image/png;base64,iVBORw0KGgo= done"}
+                ]),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        let text = request.messages[0].content.as_array().unwrap()[0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(!text.contains("data:image/"));
+        assert!(text.contains("logo bytes:"));
+        assert!(text.contains("done"));
+    }
+
+    #[test]
+    fn test_redact_leaves_text_without_data_urls_untouched() {
+        let mut s = String::from("This mentions data URLs in general but has none embedded.");
+        let n = Router::redact_embedded_image_data_urls(&mut s);
+        assert_eq!(n, 0);
+        assert_eq!(s, "This mentions data URLs in general but has none embedded.");
     }
 
     #[test]
