@@ -2140,6 +2140,47 @@ impl Router {
             .any(|marker| serialized.contains(&marker.to_ascii_lowercase()))
     }
 
+    /// Diagnostic: locate which region(s) of the outgoing request carry an
+    /// image-input marker when a provider rejected the request for images but
+    /// neither the message-content strip nor the tool-schema scrub found
+    /// anything. Returns a compact, content-free label list (e.g.
+    /// `message[7].extra`, `top_level.extra.metadata`) so the trigger can be
+    /// pinpointed from logs without dumping prompt text. Scans serialized
+    /// forms case-insensitively against the broad phrasing set.
+    fn locate_image_markers(request: &OpenAIRequest) -> Vec<String> {
+        fn has_marker(value: &serde_json::Value) -> bool {
+            let s = value.to_string().to_ascii_lowercase();
+            s.contains("image_url")
+                || s.contains("input_image")
+                || s.contains("image_file")
+                || s.contains("\"type\":\"image\"")
+                || s.contains("\"type\": \"image\"")
+                || s.contains("data:image/")
+        }
+
+        let mut locations = Vec::new();
+        for (i, msg) in request.messages.iter().enumerate() {
+            if has_marker(&msg.content) {
+                locations.push(format!("message[{i}].content(role={})", msg.role));
+            }
+            for (key, value) in &msg.extra {
+                if has_marker(value) {
+                    locations.push(format!("message[{i}].extra.{key}(role={})", msg.role));
+                }
+            }
+        }
+        for (key, value) in &request.extra {
+            // `tools` is reported separately by the caller; skip to avoid noise.
+            if key == "tools" {
+                continue;
+            }
+            if has_marker(value) {
+                locations.push(format!("top_level.extra.{key}"));
+            }
+        }
+        locations
+    }
+
     /// Last-resort scrub of image-input references from tool-definition
     /// schemas, used only reactively after a provider rejects a request for
     /// image inputs when the messages carry no strippable image content.
@@ -4445,11 +4486,21 @@ impl Router {
                                     // Neither messages nor tool schemas carried a
                                     // recognizable image marker. Log the mystery so
                                     // the trigger can be identified from the field.
+                                    // Locate any image marker anywhere in the
+                                    // outgoing body (message extras / reasoning
+                                    // carriers / top-level fields) and surface the
+                                    // provider's own short error text so the real
+                                    // trigger is identifiable without dumping
+                                    // prompt content.
+                                    let marker_locations =
+                                        Self::locate_image_markers(&outgoing);
                                     warn!(
                                         provider = provider_name,
                                         model = %provider_model.model,
                                         status = status_code,
                                         tools_had_image_marker = tools_had_marker,
+                                        image_marker_locations = ?marker_locations,
+                                        provider_error = %body_text.chars().take(300).collect::<String>(),
                                         "Provider rejected image inputs but nothing image-shaped was found in messages or tool schemas — unable to auto-remediate"
                                     );
                                 }
