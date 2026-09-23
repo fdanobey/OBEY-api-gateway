@@ -2234,14 +2234,65 @@ impl Router {
                 || s.contains("data:image/")
         }
 
+        // Classify the JSON kind of a content value so logs reveal whether the
+        // marker sits in a string / array / object (drives which strip branch
+        // should have caught it).
+        fn kind(value: &serde_json::Value) -> &'static str {
+            match value {
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+            }
+        }
+
+        // A short, secret-conscious window around the first marker occurrence
+        // in the serialized value, so the exact shape is identifiable without
+        // dumping the whole prompt. Only structural marker tokens are used to
+        // anchor; the window is capped tightly.
+        fn marker_window(value: &serde_json::Value) -> Option<String> {
+            let s = value.to_string();
+            let lower = s.to_ascii_lowercase();
+            let anchors = [
+                "image_url",
+                "input_image",
+                "image_file",
+                "\"type\":\"image\"",
+                "\"type\": \"image\"",
+                "data:image/",
+            ];
+            let pos = anchors
+                .iter()
+                .filter_map(|a| lower.find(a))
+                .min()?;
+            let start = pos.saturating_sub(40);
+            let end = (pos + 60).min(s.len());
+            // Respect char boundaries.
+            let start = (0..=start).rev().find(|i| s.is_char_boundary(*i)).unwrap_or(0);
+            let end = (end..=s.len()).find(|i| s.is_char_boundary(*i)).unwrap_or(s.len());
+            Some(s[start..end].to_string())
+        }
+
         let mut locations = Vec::new();
         for (i, msg) in request.messages.iter().enumerate() {
             if has_marker(&msg.content) {
-                locations.push(format!("message[{i}].content(role={})", msg.role));
+                let window = marker_window(&msg.content).unwrap_or_default();
+                locations.push(format!(
+                    "message[{i}].content(role={},kind={},near=`{}`)",
+                    msg.role,
+                    kind(&msg.content),
+                    window
+                ));
             }
             for (key, value) in &msg.extra {
                 if has_marker(value) {
-                    locations.push(format!("message[{i}].extra.{key}(role={})", msg.role));
+                    locations.push(format!(
+                        "message[{i}].extra.{key}(role={},kind={})",
+                        msg.role,
+                        kind(value)
+                    ));
                 }
             }
         }
@@ -2251,7 +2302,7 @@ impl Router {
                 continue;
             }
             if has_marker(value) {
-                locations.push(format!("top_level.extra.{key}"));
+                locations.push(format!("top_level.extra.{key}(kind={})", kind(value)));
             }
         }
         locations
@@ -2362,21 +2413,32 @@ impl Router {
         // First recurse into nested arrays so images buried inside non-image
         // parts (tool results, custom part shapes) are removed too. Descend
         // into any array-valued child field, not just one literally named
-        // `content`, since clients nest under `content`, `parts`, etc.
+        // `content`, since clients nest under `content`, `parts`, etc. Also
+        // handle string-valued fields (e.g. a `text` part, or a tool-result
+        // `content` string) that are themselves JSON-serialized content
+        // structures embedding image parts.
         for part in parts.iter_mut() {
             if let serde_json::Value::Object(map) = part {
                 for (_key, child) in map.iter_mut() {
-                    if let serde_json::Value::Array(nested) = child {
-                        let nested_removed = Self::strip_image_parts_recursive(
-                            nested,
-                            message_index,
-                            provider_name,
-                            model,
-                        );
-                        if nested_removed > 0 && nested.is_empty() {
-                            nested.push(Self::image_removed_placeholder());
+                    match child {
+                        serde_json::Value::Array(nested) => {
+                            let nested_removed = Self::strip_image_parts_recursive(
+                                nested,
+                                message_index,
+                                provider_name,
+                                model,
+                            );
+                            if nested_removed > 0 && nested.is_empty() {
+                                nested.push(Self::image_removed_placeholder());
+                            }
+                            stripped += nested_removed;
                         }
-                        stripped += nested_removed;
+                        serde_json::Value::String(_) => {
+                            if let Some(n) = Self::strip_image_from_json_string(child) {
+                                stripped += n;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -12586,6 +12648,46 @@ mod tests {
         assert!(!s.contains("image_url"));
         let reparsed: serde_json::Value = serde_json::from_str(s).unwrap();
         assert_eq!(reparsed.as_array().unwrap()[0]["type"], serde_json::json!("text"));
+    }
+
+    #[test]
+    fn test_strip_image_content_from_text_part_with_serialized_json_image() {
+        // A content ARRAY whose element is a `text` part whose text value is
+        // itself JSON-serialized content embedding an image part. This is a
+        // real tool-result wrapping shape that the top-level array scan misses
+        // unless the recursion also descends into serialized string fields.
+        let mut request = OpenAIRequest {
+            model: "no-vision".to_string(),
+            messages: vec![Message {
+                role: "tool".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "text",
+                        "text": "[{\"type\":\"text\",\"text\":\"ok\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://x/p.png\"}}]"
+                    }
+                ]),
+                extra: Default::default(),
+            }],
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            extra: Default::default(),
+        };
+
+        let removed = Router::strip_image_content_if_unsupported(
+            &mut request,
+            false,
+            "test-provider",
+            "no-vision",
+        );
+        assert_eq!(removed, 1);
+        // The embedded serialized image is gone; the outer array/text shape
+        // is preserved with re-serialized inner JSON.
+        let outer = request.messages[0].content.as_array().unwrap();
+        let inner_text = outer[0]["text"].as_str().unwrap();
+        assert!(!inner_text.contains("image_url"));
+        let reparsed: serde_json::Value = serde_json::from_str(inner_text).unwrap();
+        assert_eq!(reparsed.as_array().unwrap().len(), 1);
     }
 
     #[test]
