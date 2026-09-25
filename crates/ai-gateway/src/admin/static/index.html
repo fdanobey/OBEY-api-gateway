@@ -84,6 +84,10 @@ font-size:.875rem;font-weight:500;cursor:pointer;transition:background .15s}
   background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:.75rem;margin-bottom:.5rem}
   .models-container .form-row .mdl-priority{display:none}
 .models-container .form-row .mdl-cache-details{grid-column:1 / -1}
+.models-container .form-row .mdl-reasoning-details{grid-column:1 / -1}
+.models-container .form-row .mdl-smart-routing-details{grid-column:1 / -1}
+.models-container .form-row .mdl-smart-routing-details .mdl-tier{min-width:200px}
+.models-container .form-row .mdl-smart-routing-details .mdl-context-window{min-width:160px}
 .models-container .form-row > .remove-model{grid-column:7;grid-row:1}
 .mdl-cache-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.5rem;margin-top:.5rem}
 .mdl-cache-bp-group[hidden]{display:none}
@@ -807,8 +811,8 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 </details>
 <details class="mdl-smart-routing-details">
 <summary>Smart Routing</summary>
-<div class="hint" style="margin:.25rem 0 .6rem">Used only when Smart Routing is enabled. Leave the tier unset to keep this model on classic priority/cost routing.</div>
-<div class="form-row" style="flex-wrap:wrap;row-gap:.5rem">
+<div class="hint" style="margin:.4rem 0 .7rem">Used only when Smart Routing is enabled. Leave the tier unset to keep this model on classic priority/cost routing.</div>
+<div class="form-row" style="flex-wrap:wrap;gap:.5rem 1rem">
 <div class="form-group" style="margin:0">
 <label>Capability Tier</label>
 <select class="mdl-tier">
