@@ -544,6 +544,14 @@ fn responses_tool_choice_from_chat(tool_choice: &serde_json::Value) -> serde_jso
 /// Default pool idle timeout in seconds
 const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 
+/// Minimum `max_output_tokens` the Bedrock Mantle Responses API requires when a
+/// request carries a `compaction_trigger`. AWS rejects a smaller value with
+/// "'compaction_trigger' requires 'max_output_tokens' to be at least 20000 when
+/// specified." (the value may be omitted, but the gateway always sets one, so we
+/// raise it to this floor instead). See the OpenAI/Bedrock Responses guidance on
+/// server-side compaction.
+const MANTLE_COMPACTION_MIN_OUTPUT_TOKENS: u32 = 20_000;
+
 /// Supported AWS Bedrock regions.
 pub const BEDROCK_REGIONS: &[&str] = &[
     "us-east-1",
@@ -2086,6 +2094,27 @@ impl BedrockProvider {
                 "Normalized Bedrock Mantle Responses compaction triggers"
             );
         }
+        // When a compaction_trigger survives into the request, Bedrock Mantle
+        // requires `max_output_tokens` >= 20000, otherwise it rejects the call
+        // with "'compaction_trigger' requires 'max_output_tokens' to be at least
+        // 20000 when specified." The gateway's default (2048) and typical client
+        // values are well below that floor, so raise it whenever a trigger is
+        // present. Requests without a trigger keep the caller's value untouched.
+        let max_output_tokens = if normalization.survivor.is_some() {
+            let raised = max_output_tokens.max(MANTLE_COMPACTION_MIN_OUTPUT_TOKENS);
+            if raised != max_output_tokens {
+                tracing::debug!(
+                    provider = %self.name,
+                    model = %model,
+                    from = max_output_tokens,
+                    to = raised,
+                    "Raised max_output_tokens to satisfy Bedrock Mantle compaction_trigger floor"
+                );
+            }
+            raised
+        } else {
+            max_output_tokens
+        };
         let mut body = serde_json::json!({
             "model": model.clone(),
             "input": input,
@@ -3971,6 +4000,71 @@ mod compaction_trigger_bug_exploration {
             1,
             "Responses body must carry exactly one compaction_trigger at any depth, got: {}",
             body
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Responses family: a compaction_trigger forces max_output_tokens >= 20000.
+    // Bedrock Mantle rejects a compaction_trigger request whose max_output_tokens
+    // is below 20000. A small client value (here 64) must be raised to the floor.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn responses_compaction_trigger_raises_max_output_tokens_floor() {
+        let mut request = OpenAIRequest {
+            model: "openai.gpt-5.6-sol".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("say ready".to_string()),
+                extra: Default::default(),
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: Some(64),
+            extra: Default::default(),
+        };
+        request.extra.insert(
+            "input".to_string(),
+            serde_json::json!([{ "type": "compaction_trigger" }]),
+        );
+
+        let body = capture_upstream_body("/v1", request).await;
+        let mot = body
+            .get("max_output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .expect("max_output_tokens present");
+        assert!(
+            mot >= 20_000,
+            "compaction_trigger request must raise max_output_tokens to >= 20000, got {} (body: {})",
+            mot,
+            body
+        );
+    }
+
+    // Without a compaction_trigger, the caller's max_output_tokens is untouched.
+    #[tokio::test]
+    async fn responses_without_trigger_keeps_caller_max_output_tokens() {
+        let request = OpenAIRequest {
+            model: "openai.gpt-5.6-sol".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("say ready".to_string()),
+                extra: Default::default(),
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: Some(64),
+            extra: Default::default(),
+        };
+
+        let body = capture_upstream_body("/v1", request).await;
+        let mot = body
+            .get("max_output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .expect("max_output_tokens present");
+        assert_eq!(
+            mot, 64,
+            "no-trigger request must keep the caller's max_output_tokens, got {} (body: {})",
+            mot, body
         );
     }
 
