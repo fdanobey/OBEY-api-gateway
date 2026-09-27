@@ -91,27 +91,64 @@ fn is_compaction_item(value: &serde_json::Value) -> bool {
         || value.get("encrypted_content").is_some()
 }
 
-/// Keep at most one compaction item in a Responses `input` array, retaining the
-/// LAST (most recent) one — that is the valid replacement context per the
-/// compaction protocol; older ones are stale and cause the "only one" 400.
-/// Returns the number of stale compaction items removed. Only scans the
-/// top-level items of the array (where compaction items live in `input`).
+/// Count every compaction item at any depth in a JSON value.
+fn count_compaction_items(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(items) => {
+            items.iter().filter(|v| is_compaction_item(v)).count()
+                + items.iter().map(count_compaction_items).sum::<usize>()
+        }
+        serde_json::Value::Object(map) => map.values().map(count_compaction_items).sum(),
+        _ => 0,
+    }
+}
+
+/// Keep at most one compaction item anywhere within a Responses `input` value,
+/// retaining the LAST (most recent) one in document order — that is the valid
+/// replacement context per the compaction protocol; older ones are stale and
+/// cause the "only one 'compaction_trigger' item" 400. Scans RECURSIVELY so a
+/// compaction item nested inside a message item's `content` (or deeper) is also
+/// de-duplicated, not just top-level `input` items. Returns the number removed.
 fn dedupe_compaction_items(input: &mut serde_json::Value) -> usize {
-    let serde_json::Value::Array(items) = input else {
+    let total = count_compaction_items(input);
+    if total <= 1 {
         return 0;
-    };
-    let last_idx = items.iter().rposition(is_compaction_item);
-    let Some(last_idx) = last_idx else {
-        return 0;
-    };
-    let before = items.len();
-    let mut idx = 0;
-    items.retain(|item| {
-        let keep = !is_compaction_item(item) || idx == last_idx;
-        idx += 1;
-        keep
-    });
-    before - items.len()
+    }
+    // Remove all but the last: walk in document order, and drop a compaction
+    // item unless it is the final (total-th) one encountered.
+    let mut seen = 0usize;
+    let keep_after = total - 1; // keep only the item whose index == total-1
+    fn walk(value: &mut serde_json::Value, seen: &mut usize, keep_index: usize) -> usize {
+        let mut removed = 0;
+        match value {
+            serde_json::Value::Array(items) => {
+                let mut i = 0;
+                while i < items.len() {
+                    if is_compaction_item(&items[i]) {
+                        if *seen == keep_index {
+                            *seen += 1;
+                            i += 1;
+                        } else {
+                            *seen += 1;
+                            items.remove(i);
+                            removed += 1;
+                        }
+                    } else {
+                        removed += walk(&mut items[i], seen, keep_index);
+                        i += 1;
+                    }
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for child in map.values_mut() {
+                    removed += walk(child, seen, keep_index);
+                }
+            }
+            _ => {}
+        }
+        removed
+    }
+    walk(input, &mut seen, keep_after)
 }
 
 /// Non-mutating recursive count of every `compaction_trigger` at any depth in a
@@ -2453,8 +2490,7 @@ impl BedrockProvider {
         // `compaction_trigger` items (which `trigger_count` covers).
         let compaction_item_count = body
             .get("input")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| items.iter().filter(|v| is_compaction_item(v)).count())
+            .map(count_compaction_items)
             .unwrap_or(0);
         let max_output_tokens = body
             .get("max_output_tokens")
@@ -2495,12 +2531,43 @@ impl BedrockProvider {
             // WARN with the FULL upstream body and the outgoing request shape:
             // this is the single line that tells us exactly why Bedrock rejected
             // the call (validation message, quota, empty body, etc.).
+            // When the upstream error mentions compaction but our structured
+            // counters saw none at the shapes we scan, dump every "compaction"
+            // occurrence in the OUTGOING body with surrounding context so the
+            // exact (possibly deeply nested) carrier shape is visible in one log
+            // line — without dumping the whole 400KB payload.
+            let compaction_contexts: Vec<String> =
+                if text.to_ascii_lowercase().contains("compaction") {
+                    let body_str = body.to_string();
+                    let mut out = Vec::new();
+                    let mut from = 0;
+                    while let Some(rel) = body_str[from..].find("compaction") {
+                        let at = from + rel;
+                        let start = at.saturating_sub(80);
+                        let end = (at + 120).min(body_str.len());
+                        // Respect char boundaries.
+                        let s = body_str
+                            .get(start..end)
+                            .unwrap_or("")
+                            .to_string();
+                        out.push(s);
+                        from = at + "compaction".len();
+                        if out.len() >= 8 {
+                            break;
+                        }
+                    }
+                    out
+                } else {
+                    Vec::new()
+                };
             tracing::warn!(
                 provider = %self.name,
                 %url,
                 status = status.as_u16(),
                 compaction_triggers = trigger_count,
                 compaction_items = compaction_item_count,
+                compaction_occurrences_in_body = compaction_contexts.len(),
+                compaction_contexts = ?compaction_contexts,
                 ?max_output_tokens,
                 body_bytes,
                 upstream_body = %text,
@@ -4339,6 +4406,30 @@ mod compaction_trigger_bug_exploration {
             "the most recent compaction item is retained"
         );
         assert_eq!(items.len(), 3, "the two non-compaction messages are preserved");
+    }
+
+    #[test]
+    fn dedupe_compaction_items_recurses_into_nested_content() {
+        // Compaction items nested inside message items' `content` arrays (the
+        // shape a Codex chat-completions replay packs them in) must also be
+        // de-duplicated, keeping the most recent in document order.
+        let mut input = serde_json::json!([
+            { "type": "message", "role": "user", "content": [
+                { "type": "input_text", "text": "a" },
+                { "type": "compaction", "id": "cmp_old", "encrypted_content": "smry_old" }
+            ]},
+            { "type": "message", "role": "assistant", "content": [
+                { "type": "compaction", "id": "cmp_new", "encrypted_content": "smry_new" }
+            ]}
+        ]);
+        assert_eq!(count_compaction_items(&input), 2);
+        let removed = dedupe_compaction_items(&mut input);
+        assert_eq!(removed, 1, "one nested stale compaction item removed");
+        assert_eq!(count_compaction_items(&input), 1, "one compaction item remains anywhere");
+        // The retained one is the most recent (cmp_new).
+        let body = input.to_string();
+        assert!(body.contains("cmp_new"), "keeps most recent");
+        assert!(!body.contains("cmp_old"), "drops stale");
     }
 
     #[test]
