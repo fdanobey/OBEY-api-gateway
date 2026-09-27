@@ -1835,7 +1835,15 @@ impl BedrockProvider {
         normalization: &TriggerNormalization,
     ) -> Result<ProviderResponse, GatewayError> {
         let start = Instant::now();
-        let url = format!("{}/chat/completions", base_url);
+        // AWS serves the OpenAI-compatible Chat Completions surface under the
+        // `/openai/v1` prefix on the Mantle endpoint (see each model card's
+        // "Programmatic Access" table, e.g. google.gemma-4-31b →
+        // `https://bedrock-mantle.{region}.api.aws/openai/v1`). Strip any
+        // configured `/v1` suffix and target `/openai/v1/chat/completions` so
+        // newer open-weight models resolve; the legacy bare `/v1/chat/completions`
+        // alias only answered for a subset (e.g. zai.glm-5).
+        let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+        let url = format!("{}/openai/v1/chat/completions", root);
         // Survivor placement (task 5): when the surviving trigger came from a
         // native `extra["input"]` list, it would be lost because
         // `sanitize_mantle_chat_request` deletes `input` wholesale (the key is
@@ -2135,8 +2143,13 @@ impl BedrockProvider {
         // `content_as_text()`. The normalization outcome is intentionally unused.
         let _ = normalization;
         let start = Instant::now();
+        // AWS serves the Anthropic Messages surface under the `/anthropic/v1`
+        // prefix on the Mantle endpoint (see the Claude model cards'
+        // "Programmatic Access" table:
+        // `https://bedrock-mantle.{region}.api.aws/anthropic/v1/messages`).
+        // The bare `/v1/messages` path returns 404.
         let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
-        let url = format!("{}/v1/messages", root);
+        let url = format!("{}/anthropic/v1/messages", root);
         let system = request
             .messages
             .iter()
@@ -2291,7 +2304,11 @@ impl BedrockProvider {
         // TODO(task5): Chat-family survivor placement (native `extra["input"]`
         // awareness); the seam has already removed earlier sites.
         let _ = normalization;
-        let url = format!("{}/chat/completions", base_url);
+        // Mantle Chat Completions lives under `/openai/v1` (see the
+        // non-streaming adapter for the rationale); strip a configured `/v1`
+        // suffix before appending the OpenAI-compatible path.
+        let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+        let url = format!("{}/openai/v1/chat/completions", root);
 
         // Build request with Bearer token and custom headers
         let mut req_builder = http_client
@@ -3189,7 +3206,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/openai/v1/chat/completions"))
             .and(header("Authorization", "Bearer test-api-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "chatcmpl-test",
@@ -3234,7 +3251,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/openai/v1/chat/completions"))
             .and(header("Authorization", "Bearer bad-key"))
             .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
             .expect(1)
@@ -3609,7 +3626,7 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/messages"))
+            .and(path("/anthropic/v1/messages"))
             .and(header("Authorization", "Bearer test-api-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "msg_test",
@@ -3648,7 +3665,7 @@ mod tests {
         );
 
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/openai/v1/chat/completions"))
             .and(header("Authorization", "Bearer test-api-key"))
             .respond_with(
                 ResponseTemplate::new(200)
