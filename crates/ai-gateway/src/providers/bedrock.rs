@@ -2179,11 +2179,77 @@ impl BedrockProvider {
                     })
             })
             .unwrap_or_default();
+        // Server-side compaction: when a request carries a compaction_trigger,
+        // Bedrock may return a COMPACTION-ONLY response — the `output` holds a
+        // summary block with `encrypted_content` (a `smry_...` token) and NO
+        // answer `text`. That is a SUCCESSFUL turn (status "completed",
+        // error null): the client must replay the summary block on the next
+        // request to continue with compacted context. Extracting nothing here
+        // made the router treat it as an empty turn and fail the whole group
+        // over. Detect the summary block(s) and carry them through so the
+        // response is non-empty and the client receives the compaction state.
+        let compaction_summaries: Vec<serde_json::Value> = value
+            .get("output")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item.get("encrypted_content").is_some())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let usage = value.get("usage");
+        let prompt_tokens = usage
+            .and_then(|value| value.get("input_tokens"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as u32;
+        let completion_tokens = usage
+            .and_then(|value| value.get("output_tokens"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as u32;
+
+        if content.trim().is_empty() && !compaction_summaries.is_empty() {
+            // Compaction-only success: build a response that carries the summary
+            // block(s) so the client can replay them, and mark it so the router
+            // does not treat it as an empty/dead turn.
+            tracing::info!(
+                provider = %self.name,
+                model = %model,
+                summary_blocks = compaction_summaries.len(),
+                "Bedrock Mantle Responses: compaction-only response, surfacing summary block(s)"
+            );
+            let mut response = self.openai_response_from_text(
+                &model,
+                String::new(),
+                prompt_tokens,
+                completion_tokens,
+                "stop",
+            );
+            if let Some(choice) = response.choices.first_mut() {
+                choice.message.extra.insert(
+                    "compaction".to_string(),
+                    serde_json::Value::Array(compaction_summaries.clone()),
+                );
+            }
+            // Preserve the raw output array at the top level too, so the
+            // Responses front door can round-trip the summary items verbatim.
+            response.extra.insert(
+                "compaction_output".to_string(),
+                serde_json::Value::Array(compaction_summaries),
+            );
+            return Ok(ProviderResponse {
+                response,
+                provider_name: self.name.clone(),
+                latency_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
         if content.trim().is_empty() {
-            // 2xx from Mantle but no extractable answer text. Log the top-level
-            // response keys and a bounded snippet so the "empty response" failure
-            // reason can be traced to the actual Responses payload shape (e.g. a
-            // status like "incomplete", a refusal, or a tool-call-only output).
+            // 2xx from Mantle but no extractable answer text AND no compaction
+            // block. Log the top-level response keys and a bounded snippet so the
+            // "empty response" failure reason can be traced to the actual payload
+            // shape (e.g. a status like "incomplete", a refusal, or tool-only).
             let keys: Vec<&str> = value
                 .as_object()
                 .map(|m| m.keys().map(String::as_str).collect())
@@ -2200,19 +2266,12 @@ impl BedrockProvider {
                 "Bedrock Mantle Responses: 2xx but no extractable content (empty response)"
             );
         }
-        let usage = value.get("usage");
         Ok(ProviderResponse {
             response: self.openai_response_from_text(
                 &model,
                 content,
-                usage
-                    .and_then(|value| value.get("input_tokens"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0) as u32,
-                usage
-                    .and_then(|value| value.get("output_tokens"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0) as u32,
+                prompt_tokens,
+                completion_tokens,
                 "stop",
             ),
             provider_name: self.name.clone(),
@@ -3728,6 +3787,55 @@ mod tests {
             "response adapter works"
         );
         assert_eq!(response.usage.total_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn test_responses_compaction_only_surfaces_summary_block() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Real shape observed in production: a 2xx "completed" Responses reply
+        // whose `output` is a single compaction summary block with
+        // `encrypted_content` (a `smry_...` token) and NO answer text. The
+        // adapter must treat this as a successful turn and carry the summary
+        // through in `message.extra["compaction"]`, not report empty content.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_compaction",
+                "object": "response",
+                "status": "completed",
+                "error": null,
+                "output": [
+                    { "encrypted_content": "smry_pUPh16to4VKYDgJAPymbEAIF", "type": "summary" }
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 0}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = create_api_key_mode_provider_for_base_url(
+            "bedrock-test",
+            format!("{}/v1", server.uri()),
+            "test-api-key",
+        );
+        let mut request = create_test_chat_request(false);
+        request.model = "openai.gpt-5.6-sol".to_string();
+        let response = provider.chat_completion(request).await.unwrap().response;
+
+        let compaction = response.choices[0]
+            .message
+            .extra
+            .get("compaction")
+            .and_then(serde_json::Value::as_array)
+            .expect("compaction summary block present in message.extra");
+        assert_eq!(compaction.len(), 1, "one summary block carried through");
+        assert_eq!(
+            compaction[0].get("encrypted_content").and_then(|v| v.as_str()),
+            Some("smry_pUPh16to4VKYDgJAPymbEAIF"),
+            "the encrypted_content summary token is preserved"
+        );
     }
 
     #[tokio::test]

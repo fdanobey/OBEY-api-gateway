@@ -6408,6 +6408,21 @@ visible content. Do not restate your plan and do not end your turn without doing
             return false;
         };
 
+        // Server-side compaction turn: a Bedrock Mantle compaction_trigger
+        // request can return a successful COMPACTION-ONLY response — a summary
+        // block (carried in `message.extra["compaction"]`) with no answer text.
+        // This is a real, useful turn the client must replay to continue with
+        // compacted context, so it counts as content and must NOT fail over.
+        if choice
+            .message
+            .extra
+            .get("compaction")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|blocks| !blocks.is_empty())
+        {
+            return true;
+        }
+
         // tool_calls present → validate structure before accepting
         if let Some(tool_calls) = choice.message.extra.get("tool_calls") {
             if let Some(arr) = tool_calls.as_array() {
@@ -10182,6 +10197,39 @@ mod tests {
             "reasoning fallback"
         );
         assert!(Router::response_has_content(&response));
+    }
+
+    #[test]
+    fn compaction_only_turn_counts_as_content() {
+        // A Bedrock Mantle compaction-only response: empty answer text, but a
+        // summary block carried in message.extra["compaction"]. This is a
+        // successful turn the client must replay, so it must NOT be treated as
+        // an empty response that triggers failover.
+        let response = turn(
+            serde_json::Value::String(String::new()),
+            extras(&[(
+                "compaction",
+                serde_json::json!([{ "encrypted_content": "smry_abc123" }]),
+            )]),
+        );
+        assert!(
+            Router::response_has_content(&response),
+            "compaction-only turn must count as content"
+        );
+    }
+
+    #[test]
+    fn empty_compaction_array_does_not_count_as_content() {
+        // An empty compaction array is not a real summary block, so a turn with
+        // no text and an empty compaction array is still hollow.
+        let response = turn(
+            serde_json::Value::String(String::new()),
+            extras(&[("compaction", serde_json::json!([]))]),
+        );
+        assert!(
+            !Router::response_has_content(&response),
+            "empty compaction array with no text is still an empty turn"
+        );
     }
 
     // ── Degenerate turns: reasoning with no answer and no tool call ──
