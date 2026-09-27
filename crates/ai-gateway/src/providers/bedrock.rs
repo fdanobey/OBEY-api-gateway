@@ -77,6 +77,43 @@ fn is_compaction_trigger(value: &serde_json::Value) -> bool {
     value.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
 }
 
+/// True when a JSON value is a server-emitted **compaction item** — the
+/// summary/replacement-context block the Responses API returns after a
+/// compaction pass. It is shaped `{"type":"compaction","id":"cmp_...",
+/// "encrypted_content":"..."}`. A client (Codex) appends this returned item to
+/// the next request's `input`; the Responses API allows AT MOST ONE compaction
+/// item in the input and rejects a second with
+/// "Only one 'compaction_trigger' item may be provided." (param `input`).
+/// We match either the explicit `type == "compaction"` or the presence of an
+/// `encrypted_content` field, since the block is identified by both.
+fn is_compaction_item(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+        || value.get("encrypted_content").is_some()
+}
+
+/// Keep at most one compaction item in a Responses `input` array, retaining the
+/// LAST (most recent) one — that is the valid replacement context per the
+/// compaction protocol; older ones are stale and cause the "only one" 400.
+/// Returns the number of stale compaction items removed. Only scans the
+/// top-level items of the array (where compaction items live in `input`).
+fn dedupe_compaction_items(input: &mut serde_json::Value) -> usize {
+    let serde_json::Value::Array(items) = input else {
+        return 0;
+    };
+    let last_idx = items.iter().rposition(is_compaction_item);
+    let Some(last_idx) = last_idx else {
+        return 0;
+    };
+    let before = items.len();
+    let mut idx = 0;
+    items.retain(|item| {
+        let keep = !is_compaction_item(item) || idx == last_idx;
+        idx += 1;
+        keep
+    });
+    before - items.len()
+}
+
 /// Non-mutating recursive count of every `compaction_trigger` at any depth in a
 /// JSON value. Used for diagnostics on the outgoing Mantle body.
 fn count_compaction_triggers(value: &serde_json::Value) -> usize {
@@ -2157,6 +2194,28 @@ impl BedrockProvider {
                 };
             }
         }
+
+        // Compaction-item de-duplication (the real "Only one 'compaction_trigger'
+        // item may be provided." cause). Server-side compaction returns a
+        // `{"type":"compaction","encrypted_content":"..."}` item; the client
+        // (Codex) replays it in the next request's `input`. When a new compaction
+        // then fires, the input holds the replayed prior compaction item PLUS the
+        // new one, and Bedrock/OpenAI reject anything with more than one. These
+        // are NOT `compaction_trigger` items — the earlier trigger de-dup and the
+        // `compaction_triggers=0` diagnostic never saw them. Keep only the most
+        // recent compaction item in the outgoing `input`.
+        if let Some(input_val) = body.get_mut("input") {
+            let removed = dedupe_compaction_items(input_val);
+            if removed > 0 {
+                tracing::info!(
+                    provider = %self.name,
+                    model = %model,
+                    stale_compaction_items_removed = removed,
+                    "Bedrock Mantle Responses: removed stale compaction item(s), keeping the most recent"
+                );
+            }
+        }
+
         let value = self
             .post_mantle_json(http_client, api_key, &url, custom_headers, &body)
             .await?;
@@ -2387,6 +2446,16 @@ impl BedrockProvider {
         // and body size. No secrets: the body carries no credentials (the bearer
         // token lives only in the Authorization header, which is not logged).
         let trigger_count = count_compaction_triggers(body);
+        // Also count server-emitted compaction ITEMS (type "compaction" /
+        // encrypted_content) in the input — the shape behind the "Only one
+        // 'compaction_trigger' item may be provided." 400 when a replayed prior
+        // compaction item collides with a new one. Distinct from
+        // `compaction_trigger` items (which `trigger_count` covers).
+        let compaction_item_count = body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.iter().filter(|v| is_compaction_item(v)).count())
+            .unwrap_or(0);
         let max_output_tokens = body
             .get("max_output_tokens")
             .and_then(serde_json::Value::as_u64);
@@ -2395,6 +2464,7 @@ impl BedrockProvider {
             provider = %self.name,
             %url,
             compaction_triggers = trigger_count,
+            compaction_items = compaction_item_count,
             ?max_output_tokens,
             body_bytes,
             "Bedrock Mantle request: dispatching"
@@ -2430,6 +2500,7 @@ impl BedrockProvider {
                 %url,
                 status = status.as_u16(),
                 compaction_triggers = trigger_count,
+                compaction_items = compaction_item_count,
                 ?max_output_tokens,
                 body_bytes,
                 upstream_body = %text,
@@ -4227,6 +4298,103 @@ mod compaction_trigger_bug_exploration {
             "compaction_trigger request must raise max_output_tokens to >= 20000, got {} (body: {})",
             mot,
             body
+        );
+    }
+
+    #[test]
+    fn is_compaction_item_detects_both_shapes() {
+        assert!(is_compaction_item(&serde_json::json!({
+            "type": "compaction", "id": "cmp_1", "encrypted_content": "smry_x"
+        })));
+        // encrypted_content alone is enough.
+        assert!(is_compaction_item(&serde_json::json!({
+            "encrypted_content": "smry_x"
+        })));
+        // type alone is enough.
+        assert!(is_compaction_item(&serde_json::json!({ "type": "compaction" })));
+        // Not a compaction item.
+        assert!(!is_compaction_item(&serde_json::json!({ "type": "message" })));
+        assert!(!is_compaction_item(&serde_json::json!({
+            "type": "compaction_trigger"
+        })));
+    }
+
+    #[test]
+    fn dedupe_compaction_items_keeps_only_last() {
+        let mut input = serde_json::json!([
+            { "type": "message", "role": "user", "content": [] },
+            { "type": "compaction", "id": "cmp_old", "encrypted_content": "smry_old" },
+            { "type": "message", "role": "assistant", "content": [] },
+            { "type": "compaction", "id": "cmp_new", "encrypted_content": "smry_new" }
+        ]);
+        let removed = dedupe_compaction_items(&mut input);
+        assert_eq!(removed, 1, "one stale compaction item removed");
+        let items = input.as_array().unwrap();
+        let compactions: Vec<&serde_json::Value> =
+            items.iter().filter(|v| is_compaction_item(v)).collect();
+        assert_eq!(compactions.len(), 1, "exactly one compaction item remains");
+        assert_eq!(
+            compactions[0].get("id").and_then(|v| v.as_str()),
+            Some("cmp_new"),
+            "the most recent compaction item is retained"
+        );
+        assert_eq!(items.len(), 3, "the two non-compaction messages are preserved");
+    }
+
+    #[test]
+    fn dedupe_compaction_items_noop_when_zero_or_one() {
+        let mut none = serde_json::json!([{ "type": "message" }]);
+        assert_eq!(dedupe_compaction_items(&mut none), 0);
+        let mut one = serde_json::json!([
+            { "type": "message" },
+            { "type": "compaction", "encrypted_content": "smry_x" }
+        ]);
+        assert_eq!(dedupe_compaction_items(&mut one), 0);
+        assert_eq!(one.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn responses_input_dedupes_replayed_compaction_items() {
+        // The real production failure: extra["input"] carries a replayed prior
+        // compaction item AND a new one. The outgoing /openai/v1/responses body
+        // must contain exactly one compaction item (the most recent).
+        let mut request = OpenAIRequest {
+            model: "openai.gpt-5.6-sol".to_string(),
+            messages: vec![],
+            stream: false,
+            temperature: None,
+            max_tokens: Some(32000),
+            extra: Default::default(),
+        };
+        request.extra.insert(
+            "input".to_string(),
+            serde_json::json!([
+                { "type": "message", "role": "user",
+                  "content": [{ "type": "input_text", "text": "hello" }] },
+                { "type": "compaction", "id": "cmp_old", "encrypted_content": "smry_old" },
+                { "type": "message", "role": "assistant",
+                  "content": [{ "type": "output_text", "text": "hi" }] },
+                { "type": "compaction", "id": "cmp_new", "encrypted_content": "smry_new" }
+            ]),
+        );
+
+        let body = capture_upstream_body("/v1", request).await;
+        let items = body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .expect("input array present");
+        let compactions: Vec<&serde_json::Value> =
+            items.iter().filter(|v| is_compaction_item(v)).collect();
+        assert_eq!(
+            compactions.len(),
+            1,
+            "exactly one compaction item on the wire, got body: {}",
+            body
+        );
+        assert_eq!(
+            compactions[0].get("id").and_then(|v| v.as_str()),
+            Some("cmp_new"),
+            "the most recent compaction item is kept"
         );
     }
 
