@@ -41,6 +41,38 @@ fn mantle_api_for_model(model_id: &str) -> MantleApi {
     }
 }
 
+/// Recursively remove every `compaction_trigger` occurrence from a JSON value,
+/// at any nesting depth. Returns the number of triggers removed.
+///
+/// The Bedrock Mantle Responses API rejects a request that carries more than one
+/// `compaction_trigger` item. A Codex client can nest a trigger arbitrarily deep
+/// inside an `input` item (e.g. `content[]`, or a replayed message item whose own
+/// `content[]` holds one), and the shallow one-level `retain` the Responses
+/// adapter used to run could miss those, leaving a residual trigger that then
+/// collided with the survivor appended terminally — producing the exact duplicate
+/// Bedrock rejects. Stripping at every depth makes the adapter's post-strip state
+/// deterministically trigger-free so exactly one survivor can be re-appended.
+fn strip_all_compaction_triggers(value: &mut serde_json::Value) -> usize {
+    let mut removed = 0;
+    match value {
+        serde_json::Value::Array(items) => {
+            let before = items.len();
+            items.retain(|item| !is_compaction_trigger(item));
+            removed += before - items.len();
+            for item in items.iter_mut() {
+                removed += strip_all_compaction_triggers(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_key, child) in map.iter_mut() {
+                removed += strip_all_compaction_triggers(child);
+            }
+        }
+        _ => {}
+    }
+    removed
+}
+
 fn is_compaction_trigger(value: &serde_json::Value) -> bool {
     value.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
 }
@@ -2031,20 +2063,18 @@ impl BedrockProvider {
         // A non-array `input` (e.g. "auto") is left untouched (clause 3.7); a
         // survivor cannot be placed there, which is only possible for degenerate
         // requests that also carry a scalar `input`.
-        if let serde_json::Value::Array(items) = &mut input {
-            // Strip triggers at BOTH levels: top-level input items AND items
-            // nested inside another input item's `content` array (the Codex
-            // replay carrier). Stripping only the top level would leave a nested
-            // survivor in place and then append it again terminally, producing
-            // the duplicate Bedrock rejects.
-            items.retain(|item| !is_compaction_trigger(item));
-            for item in items.iter_mut() {
-                if let Some(parts) = item.get_mut("content").and_then(serde_json::Value::as_array_mut)
-                {
-                    parts.retain(|part| !is_compaction_trigger(part));
-                }
-            }
-            if let Some(survivor) = &normalization.survivor {
+        if let serde_json::Value::Array(_) = &input {
+            // Strip EVERY compaction_trigger at any depth (top-level input items,
+            // their `content` arrays, and any deeper nesting a Codex replay item
+            // can carry), then append the recorded survivor exactly once as the
+            // terminal element. The shallow one/two-level strip this replaced
+            // could miss a deeply nested trigger and then re-append the survivor
+            // on top of it, producing the two-trigger body Bedrock Mantle rejects
+            // with "Only one 'compaction_trigger' item may be provided."
+            strip_all_compaction_triggers(&mut input);
+            if let (serde_json::Value::Array(items), Some(survivor)) =
+                (&mut input, &normalization.survivor)
+            {
                 items.push(survivor.clone());
             }
         }
@@ -3876,6 +3906,70 @@ mod compaction_trigger_bug_exploration {
             count_trigger_sites(&body),
             1,
             "Case 1: expected exactly one compaction_trigger in the Chat body, got body: {}",
+            body
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Case 1b — Responses family, DEEPLY NESTED input triggers.
+    // A native `input` array carrying a top-level trigger AND a trigger nested
+    // inside a replayed message item's `content`. The Responses adapter must
+    // strip every trigger at any depth and re-append exactly one survivor, so
+    // the built `/openai/v1/responses` body carries a single trigger. This is
+    // the shape that produced Bedrock's "Only one 'compaction_trigger' item may
+    // be provided." rejection before recursive stripping.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn responses_family_deeply_nested_input_triggers_keep_one() {
+        // Recursive trigger count at any depth (the shared count_trigger_sites
+        // helper only inspects top-level input items and one content level).
+        fn count_deep(value: &serde_json::Value) -> usize {
+            match value {
+                serde_json::Value::Array(items) => {
+                    items.iter().map(count_deep).sum::<usize>()
+                        + items
+                            .iter()
+                            .filter(|v| {
+                                v.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("compaction_trigger")
+                            })
+                            .count()
+                }
+                serde_json::Value::Object(map) => {
+                    map.values().map(count_deep).sum()
+                }
+                _ => 0,
+            }
+        }
+
+        let mut request = OpenAIRequest {
+            model: "openai.gpt-5.6-sol".to_string(),
+            messages: vec![],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+        request.extra.insert(
+            "input".to_string(),
+            serde_json::json!([
+                { "type": "compaction_trigger" },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "hello" },
+                        { "type": "compaction_trigger" }
+                    ]
+                }
+            ]),
+        );
+
+        let body = capture_upstream_body("/v1", request).await;
+        assert_eq!(
+            count_deep(&body.get("input").cloned().unwrap_or(serde_json::Value::Null)),
+            1,
+            "Responses body must carry exactly one compaction_trigger at any depth, got: {}",
             body
         );
     }
