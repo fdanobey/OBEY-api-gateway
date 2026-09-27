@@ -615,6 +615,147 @@ fn responses_tools_from_chat(tools: &serde_json::Value) -> serde_json::Value {
     )
 }
 
+/// Convert OpenAI Chat Completions messages into valid Responses API `input`
+/// items for the Bedrock Mantle `/openai/v1/responses` endpoint.
+///
+/// A plain `{"role", "content": text}` rebuild is not enough for agentic
+/// traffic: it drops assistant `tool_calls` and emits `role: "tool"` items,
+/// which are not valid Responses input. Bedrock's validator reports such items
+/// with the misleading "The 'compaction_trigger' item must be the final input
+/// item." / "Only one 'compaction_trigger' item may be provided." errors even
+/// when the body carries no compaction item at all. Mapping (mirrors the
+/// proven Codex converter in `codex::translate_request`):
+///   - system / developer / user → easy message (`role` + text content); user
+///     messages carrying images become a typed message with
+///     `input_text` / `input_image` parts
+///   - assistant → easy message for non-empty text, then one `function_call`
+///     item per tool call
+///   - tool → `function_call_output` when its `tool_call_id` matches an emitted
+///     call, otherwise an orphan user message (Responses rejects outputs with
+///     no matching call)
+///   - blank-role/blank-content residue and empty turns are skipped; any other
+///     role is sent as `user`
+fn chat_messages_to_responses_input(messages: &[Message]) -> Vec<serde_json::Value> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut synthetic_ids = 0usize;
+
+    for message in messages {
+        let role = message.role.trim();
+        let text = message.content_as_text();
+        match role {
+            "assistant" => {
+                if !text.trim().is_empty() {
+                    out.push(serde_json::json!({ "role": "assistant", "content": text }));
+                }
+                let calls = message
+                    .extra
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array);
+                for call in calls.into_iter().flatten() {
+                    let function = call.get("function");
+                    let name = function
+                        .and_then(|f| f.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let call_id = match call.get("id").and_then(serde_json::Value::as_str) {
+                        Some(id) if !id.is_empty() => id.to_string(),
+                        _ => {
+                            synthetic_ids += 1;
+                            format!("call_gw_{synthetic_ids}")
+                        }
+                    };
+                    let arguments = match function.and_then(|f| f.get("arguments")) {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(serde_json::Value::Null) | None => "{}".to_string(),
+                        Some(other) => other.to_string(),
+                    };
+                    call_ids.insert(call_id.clone());
+                    out.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": arguments,
+                    }));
+                }
+            }
+            "tool" => {
+                let call_id = message
+                    .extra
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if !call_id.is_empty() && call_ids.contains(call_id) {
+                    out.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": text,
+                    }));
+                } else if !text.trim().is_empty() {
+                    out.push(serde_json::json!({ "role": "user", "content": text }));
+                }
+            }
+            "" if text.trim().is_empty() => {
+                // Blank residue (e.g. a stripped standalone trigger marker).
+            }
+            other => {
+                let role = match other {
+                    "system" | "developer" | "user" => other,
+                    _ => "user",
+                };
+                if let Some(parts) = responses_user_parts_with_images(&message.content) {
+                    out.push(serde_json::json!({
+                        "type": "message",
+                        "role": role,
+                        "content": parts,
+                    }));
+                } else if !text.trim().is_empty() {
+                    out.push(serde_json::json!({ "role": role, "content": text }));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// When a chat content array carries at least one image, return Responses
+/// `input_text` / `input_image` parts preserving order; otherwise `None` so the
+/// caller can use the plain text form.
+fn responses_user_parts_with_images(content: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    let parts = content.as_array()?;
+    let has_image = parts.iter().any(|part| {
+        part.get("type").and_then(serde_json::Value::as_str) == Some("image_url")
+    });
+    if !has_image {
+        return None;
+    }
+    let converted = parts
+        .iter()
+        .filter_map(|part| match part.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") | Some("input_text") => part
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| serde_json::json!({ "type": "input_text", "text": text })),
+            Some("image_url") => {
+                let image = part.get("image_url")?;
+                let url = image
+                    .as_str()
+                    .or_else(|| image.get("url").and_then(serde_json::Value::as_str))?;
+                let mut item = serde_json::json!({ "type": "input_image", "image_url": url });
+                if let Some(detail) = image.get("detail") {
+                    item["detail"] = detail.clone();
+                }
+                Some(item)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    Some(converted)
+}
+
 fn responses_tool_choice_from_chat(tool_choice: &serde_json::Value) -> serde_json::Value {
     let Some(function) = tool_choice
         .get("function")
@@ -2102,22 +2243,9 @@ impl BedrockProvider {
                 other
             }
             None => {
-                // Build input from OpenAI-style messages. Flatten each message's content
-                // to text because the Responses API input items don't support multi-part
-                // content arrays. compaction_triggers were already normalized by the seam.
-                // Any remaining compaction_trigger (at most one) in content arrays will
-                // be filtered out by content_as_text which only extracts text parts.
-                serde_json::Value::Array(
-                    messages
-                        .iter()
-                        .map(|message| {
-                            serde_json::json!({
-                                "role": message.role,
-                                "content": message.content_as_text()
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                )
+                // Build input from OpenAI-style chat messages. compaction_triggers were
+                // already normalized by the seam; content_as_text drops any trigger part.
+                serde_json::Value::Array(chat_messages_to_responses_input(&messages))
             }
         };
         (
@@ -3780,6 +3908,110 @@ mod tests {
         assert_eq!(input[0]["content"], "hello");
     }
 
+    fn chat_msg(role: &str, content: serde_json::Value, extra: serde_json::Value) -> Message {
+        Message {
+            role: role.to_string(),
+            content,
+            extra: extra.as_object().cloned().unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn responses_input_maps_tool_history_to_function_items() {
+        // The shape that produced Bedrock's misleading compaction_trigger 400:
+        // assistant tool_calls + a `tool` result. They must become
+        // function_call / function_call_output items, never role "tool".
+        let messages = vec![
+            chat_msg("system", serde_json::json!("be brief"), serde_json::json!({})),
+            chat_msg("user", serde_json::json!("List the files."), serde_json::json!({})),
+            chat_msg(
+                "assistant",
+                serde_json::Value::Null,
+                serde_json::json!({"tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "list_files", "arguments": "{\"path\":\".\"}"}
+                }]}),
+            ),
+            chat_msg(
+                "tool",
+                serde_json::json!("a.txt\nb.txt"),
+                serde_json::json!({"tool_call_id": "call_1"}),
+            ),
+            chat_msg("user", serde_json::json!("Say ready."), serde_json::json!({})),
+        ];
+
+        let input = chat_messages_to_responses_input(&messages);
+
+        assert_eq!(input.len(), 5, "got: {:?}", input);
+        assert_eq!(input[0], serde_json::json!({"role": "system", "content": "be brief"}));
+        assert_eq!(input[1], serde_json::json!({"role": "user", "content": "List the files."}));
+        assert_eq!(
+            input[2],
+            serde_json::json!({
+                "type": "function_call", "call_id": "call_1",
+                "name": "list_files", "arguments": "{\"path\":\".\"}"
+            })
+        );
+        assert_eq!(
+            input[3],
+            serde_json::json!({
+                "type": "function_call_output", "call_id": "call_1", "output": "a.txt\nb.txt"
+            })
+        );
+        assert!(
+            input.iter().all(|item| item.get("role").and_then(|r| r.as_str()) != Some("tool")),
+            "no role:tool items may reach the Responses API"
+        );
+    }
+
+    #[test]
+    fn responses_input_orphan_tool_result_becomes_user_message() {
+        let messages = vec![
+            chat_msg("user", serde_json::json!("hi"), serde_json::json!({})),
+            chat_msg(
+                "tool",
+                serde_json::json!("result"),
+                serde_json::json!({"tool_call_id": "call_missing"}),
+            ),
+        ];
+        let input = chat_messages_to_responses_input(&messages);
+        assert_eq!(input[1], serde_json::json!({"role": "user", "content": "result"}));
+    }
+
+    #[test]
+    fn responses_input_skips_blank_residue_and_empty_turns() {
+        let messages = vec![
+            chat_msg("", serde_json::json!(""), serde_json::json!({})),
+            chat_msg("assistant", serde_json::Value::Null, serde_json::json!({})),
+            chat_msg("user", serde_json::json!("hello"), serde_json::json!({})),
+        ];
+        let input = chat_messages_to_responses_input(&messages);
+        assert_eq!(input, vec![serde_json::json!({"role": "user", "content": "hello"})]);
+    }
+
+    #[test]
+    fn responses_input_preserves_user_images() {
+        let messages = vec![chat_msg(
+            "user",
+            serde_json::json!([
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA", "detail": "low"}}
+            ]),
+            serde_json::json!({}),
+        )];
+        let input = chat_messages_to_responses_input(&messages);
+        assert_eq!(
+            input[0],
+            serde_json::json!({
+                "type": "message", "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "what is this?"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAA", "detail": "low"}
+                ]
+            })
+        );
+    }
+
     #[test]
     fn test_mantle_message_normalizer_converts_responses_content_parts() {
         let mut request = create_test_chat_request(false);
@@ -4486,6 +4718,70 @@ mod compaction_trigger_bug_exploration {
             compactions[0].get("id").and_then(|v| v.as_str()),
             Some("cmp_new"),
             "the most recent compaction item is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_body_from_chat_tool_history_has_no_tool_role_items() {
+        // End-to-end through the real dispatch seam: an agentic chat request
+        // (the live failure shape) must reach /openai/v1/responses with
+        // function_call / function_call_output items and no role "tool".
+        let mut assistant_extra = serde_json::Map::new();
+        assistant_extra.insert(
+            "tool_calls".to_string(),
+            serde_json::json!([{
+                "id": "call_1", "type": "function",
+                "function": {"name": "list_files", "arguments": "{}"}
+            }]),
+        );
+        let mut tool_extra = serde_json::Map::new();
+        tool_extra.insert("tool_call_id".to_string(), serde_json::json!("call_1"));
+        let request = OpenAIRequest {
+            model: "openai.gpt-5.6-sol".to_string(),
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("List the files."),
+                    extra: Default::default(),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::Null,
+                    extra: assistant_extra,
+                },
+                Message {
+                    role: "tool".to_string(),
+                    content: serde_json::json!("a.txt"),
+                    extra: tool_extra,
+                },
+            ],
+            stream: false,
+            temperature: None,
+            max_tokens: Some(64),
+            extra: Default::default(),
+        };
+
+        let body = capture_upstream_body("/v1", request).await;
+        let items = body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .expect("input array present");
+        assert!(
+            items.iter().all(|i| i.get("role").and_then(|r| r.as_str()) != Some("tool")),
+            "no role:tool items on the wire, got: {}",
+            body
+        );
+        assert!(
+            items.iter().any(|i| i.get("type").and_then(|t| t.as_str()) == Some("function_call")),
+            "function_call item present, got: {}",
+            body
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.get("type").and_then(|t| t.as_str()) == Some("function_call_output")),
+            "function_call_output item present, got: {}",
+            body
         );
     }
 
