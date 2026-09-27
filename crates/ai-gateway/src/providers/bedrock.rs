@@ -77,6 +77,21 @@ fn is_compaction_trigger(value: &serde_json::Value) -> bool {
     value.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
 }
 
+/// Non-mutating recursive count of every `compaction_trigger` at any depth in a
+/// JSON value. Used for diagnostics on the outgoing Mantle body.
+fn count_compaction_triggers(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(items) => {
+            items.iter().filter(|v| is_compaction_trigger(v)).count()
+                + items.iter().map(count_compaction_triggers).sum::<usize>()
+        }
+        serde_json::Value::Object(map) => {
+            map.values().map(count_compaction_triggers).sum()
+        }
+        _ => 0,
+    }
+}
+
 /// True when a message carries a compaction trigger via its flattened `extra`
 /// map — i.e. `extra["type"] == "compaction_trigger"`. This is the message-level
 /// marker shape that `is_compaction_trigger` (which inspects a standalone JSON
@@ -2164,6 +2179,27 @@ impl BedrockProvider {
                     })
             })
             .unwrap_or_default();
+        if content.trim().is_empty() {
+            // 2xx from Mantle but no extractable answer text. Log the top-level
+            // response keys and a bounded snippet so the "empty response" failure
+            // reason can be traced to the actual Responses payload shape (e.g. a
+            // status like "incomplete", a refusal, or a tool-call-only output).
+            let keys: Vec<&str> = value
+                .as_object()
+                .map(|m| m.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            let snippet = {
+                let s = value.to_string();
+                if s.len() > 800 { s[..800].to_string() } else { s }
+            };
+            tracing::warn!(
+                provider = %self.name,
+                model = %model,
+                response_keys = ?keys,
+                response_snippet = %snippet,
+                "Bedrock Mantle Responses: 2xx but no extractable content (empty response)"
+            );
+        }
         let usage = value.get("usage");
         Ok(ProviderResponse {
             response: self.openai_response_from_text(
@@ -2286,6 +2322,25 @@ impl BedrockProvider {
         custom_headers: &HashMap<String, String>,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, GatewayError> {
+        // Diagnostics: summarize the outgoing Mantle body so a failure can be
+        // root-caused from the console log without persisting full payloads.
+        // Counts every compaction_trigger at any depth, reports max_output_tokens
+        // and body size. No secrets: the body carries no credentials (the bearer
+        // token lives only in the Authorization header, which is not logged).
+        let trigger_count = count_compaction_triggers(body);
+        let max_output_tokens = body
+            .get("max_output_tokens")
+            .and_then(serde_json::Value::as_u64);
+        let body_bytes = serde_json::to_vec(body).map(|v| v.len()).unwrap_or(0);
+        tracing::debug!(
+            provider = %self.name,
+            %url,
+            compaction_triggers = trigger_count,
+            ?max_output_tokens,
+            body_bytes,
+            "Bedrock Mantle request: dispatching"
+        );
+
         let mut request = http_client
             .post(url)
             .header("Authorization", format!("Bearer {}", api_key))
@@ -2295,11 +2350,32 @@ impl BedrockProvider {
             request = request.header(key.as_str(), resolve_header_value(value));
         }
         let response = request.send().await.map_err(|error| {
+            tracing::warn!(
+                provider = %self.name,
+                %url,
+                compaction_triggers = trigger_count,
+                ?max_output_tokens,
+                error = %error,
+                "Bedrock Mantle request: transport error (no HTTP response)"
+            );
             GatewayError::Network(format!("Request to {} failed: {}", url, error))
         })?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
+            // WARN with the FULL upstream body and the outgoing request shape:
+            // this is the single line that tells us exactly why Bedrock rejected
+            // the call (validation message, quota, empty body, etc.).
+            tracing::warn!(
+                provider = %self.name,
+                %url,
+                status = status.as_u16(),
+                compaction_triggers = trigger_count,
+                ?max_output_tokens,
+                body_bytes,
+                upstream_body = %text,
+                "Bedrock Mantle request: rejected by upstream"
+            );
             return Err(GatewayError::Provider {
                 provider: self.name.clone(),
                 message: format!("HTTP {}: {}", status.as_u16(), text),
@@ -2307,6 +2383,12 @@ impl BedrockProvider {
             });
         }
         response.json().await.map_err(|error| {
+            tracing::warn!(
+                provider = %self.name,
+                %url,
+                error = %error,
+                "Bedrock Mantle request: 2xx but response body failed to parse as JSON"
+            );
             GatewayError::Network(format!("Failed to parse response from {}: {}", url, error))
         })
     }
