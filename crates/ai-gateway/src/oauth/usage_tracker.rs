@@ -121,17 +121,30 @@ impl UsageTracker {
     /// Compute a fallback cooldown duration from the tracked headers when
     /// the provider returns 429 but no `Retry-After` header.
     ///
-    /// Uses the longest reset across both the short and weekly windows
-    /// (requests and tokens). Returns `None` if no reset data is available.
+    /// When a window is known to be exhausted (`remaining == 0`), uses the
+    /// longest reset among exhausted windows, so a spent 5h window does not
+    /// cause a multi-day pause while the weekly window still has headroom.
+    /// With no window known to be exhausted, uses the longest reset across
+    /// all windows. Returns `None` if no reset data is available.
     pub async fn fallback_cooldown_secs(&self) -> Option<u64> {
         let state = self.state.read().await;
-        let resets = [
-            state.short.requests.reset_in_secs(),
-            state.short.tokens.reset_in_secs(),
-            state.weekly.requests.reset_in_secs(),
-            state.weekly.tokens.reset_in_secs(),
+        let windows = [
+            &state.short.requests,
+            &state.short.tokens,
+            &state.weekly.requests,
+            &state.weekly.tokens,
         ];
-        resets.into_iter().flatten().max()
+        let exhausted = windows
+            .iter()
+            .filter(|window| window.remaining == Some(0))
+            .filter_map(|window| window.reset_in_secs())
+            .max();
+        exhausted.or_else(|| {
+            windows
+                .iter()
+                .filter_map(|window| window.reset_in_secs())
+                .max()
+        })
     }
 }
 
@@ -569,5 +582,35 @@ mod tests {
         assert!(cooldown.is_some());
         // 3d = 259200s, should be > 1h = 3600s
         assert!(cooldown.unwrap() > 200_000);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_cooldown_prefers_exhausted_short_window_over_weekly_headroom() {
+        // Observed Codex state: the 5h window is spent (100% used) while the
+        // weekly window still has headroom. The pause must follow the 5h reset,
+        // not the multi-day weekly reset.
+        let tracker = UsageTracker::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        headers.insert(
+            "x-codex-primary-reset-at",
+            (now + 3_600).to_string().parse().unwrap(),
+        );
+        headers.insert("x-codex-secondary-used-percent", "16".parse().unwrap());
+        headers.insert(
+            "x-codex-secondary-reset-at",
+            (now + 5 * 86_400).to_string().parse().unwrap(),
+        );
+        tracker.update_from_headers(&headers).await;
+
+        let cooldown = tracker.fallback_cooldown_secs().await.expect("cooldown");
+        assert!(
+            cooldown <= 3_600,
+            "expected the ~1h short-window reset, got {cooldown}s"
+        );
     }
 }

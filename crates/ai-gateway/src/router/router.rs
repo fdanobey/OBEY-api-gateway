@@ -3257,8 +3257,22 @@ impl Router {
     }
 
     fn cooldown_from_body(body: &str) -> Option<Duration> {
-        let json = serde_json::from_str::<serde_json::Value>(body).ok()?;
+        // Error messages often wrap the upstream JSON in a prefix, e.g. the
+        // Codex client's "Upstream HTTP 429: {...}". Fall back to the
+        // outermost `{...}` span when the whole string is not JSON.
+        let json = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .or_else(|| {
+                let start = body.find('{')?;
+                let end = body.rfind('}')?;
+                serde_json::from_str::<serde_json::Value>(body.get(start..=end)?).ok()
+            })?;
         let err = json.get("error").unwrap_or(&json);
+
+        // Relative reset in seconds (Codex usage_limit_reached bodies).
+        if let Some(secs) = err.get("resets_in_seconds").and_then(|v| v.as_u64()) {
+            return Some(Duration::from_secs(secs));
+        }
 
         for field in ["retry_after_ms", "retry-after-ms"] {
             if let Some(ms) = err.get(field).and_then(|v| v.as_u64()) {
@@ -5908,10 +5922,19 @@ impl Router {
                         let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
                         let already_cooled = rate_limiter.cooldown_remaining().await.is_some();
                         if !already_cooled {
-                            // Use the OAuth usage tracker's reset window as
-                            // the cooldown source when available; otherwise
-                            // fall back to the configured default.
-                            let cooldown = if let Some(tracker) = &self.oauth_usage_tracker {
+                            // Prefer the reset the 429 body names itself (the
+                            // Codex backend reports `error.resets_at` /
+                            // `resets_in_seconds` for the window that was
+                            // actually hit). Otherwise use the OAuth usage
+                            // tracker's reset window, then the configured default.
+                            let cooldown = if Self::cooldown_from_body(&raw_message).is_some() {
+                                self.parse_rate_limit_cooldown(
+                                    &provider_model.provider,
+                                    None,
+                                    &raw_message,
+                                )
+                                .await
+                            } else if let Some(tracker) = &self.oauth_usage_tracker {
                                 let secs = tracker.fallback_cooldown_secs().await;
                                 match secs {
                                     Some(s) if s > 0 => Duration::from_secs(s),
@@ -13873,6 +13896,22 @@ mod property_tests {
             24 * 60 * 60,
         );
         assert_eq!(cooldown, Duration::from_secs(12));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_cooldown_from_prefixed_codex_usage_limit_body() {
+        // The Codex client wraps the upstream JSON in a prefix. The 5h window
+        // reset it names must win, not a multi-day weekly reset.
+        let body = r#"Upstream HTTP 429: {"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"team","resets_at":4102444800,"limit_window_minutes":300,"resets_in_seconds":1369}}"#;
+        assert!(Router::cooldown_from_body(body).is_some());
+        let cooldown = Router::compute_rate_limit_cooldown(
+            None,
+            body,
+            Duration::from_secs(30),
+            None,
+            7 * 24 * 60 * 60,
+        );
+        assert_eq!(cooldown, Duration::from_secs(1369));
     }
 
     #[test]
