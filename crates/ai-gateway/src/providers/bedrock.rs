@@ -41,6 +41,29 @@ fn mantle_api_for_model(model_id: &str) -> MantleApi {
     }
 }
 
+/// Mantle serves OpenAI-compatible Chat Completions under two path prefixes.
+/// `/v1` is the documented default (e.g. the `zai.glm-5` model card), while a
+/// few models are only served under `/openai/v1` (the Gemma 4 model cards call
+/// this out). A model sent to the wrong prefix is rejected with
+/// `400 ... isn't supported on this route`, so the preferred URL comes first and
+/// the alternate is tried once on exactly that error.
+fn mantle_chat_completions_urls(base_url: &str, model_id: &str) -> [String; 2] {
+    let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+    let default_route = format!("{}/v1/chat/completions", root);
+    let openai_route = format!("{}/openai/v1/chat/completions", root);
+    if model_id.to_ascii_lowercase().starts_with("google.gemma-4") {
+        [openai_route, default_route]
+    } else {
+        [default_route, openai_route]
+    }
+}
+
+/// True when Mantle rejected a request only because the model is not served on
+/// the requested path prefix, as opposed to a genuine validation failure.
+fn is_mantle_route_mismatch(status: u16, body: &str) -> bool {
+    status == 400 && body.contains("supported on this route")
+}
+
 /// Recursively remove every `compaction_trigger` occurrence from a JSON value,
 /// at any nesting depth. Returns the number of triggers removed.
 ///
@@ -2088,6 +2111,94 @@ impl BedrockProvider {
         Ok(parsed.data)
     }
 
+    /// Map a non-success Mantle HTTP status and body to a provider error.
+    fn mantle_http_error(&self, status: u16, error_text: String) -> GatewayError {
+        let message = if status == 401 || status == 403 {
+            format!(
+                "Bedrock API key authentication failed: HTTP {}: {}",
+                status, error_text
+            )
+        } else {
+            format!("HTTP {}: {}", status, error_text)
+        };
+        GatewayError::Provider {
+            provider: self.name.clone(),
+            message,
+            status_code: Some(status),
+        }
+    }
+
+    /// POST one Chat Completions body to a Mantle URL. The outer error is a
+    /// transport failure; the inner error carries a non-success status and body.
+    async fn send_mantle_chat(
+        &self,
+        url: &str,
+        request: &OpenAIRequest,
+        http_client: &Client,
+        api_key: &str,
+        custom_headers: &HashMap<String, String>,
+    ) -> Result<Result<reqwest::Response, (u16, String)>, GatewayError> {
+        let mut req_builder = http_client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json");
+
+        // Apply custom headers with environment variable resolution
+        for (key, value) in custom_headers {
+            let resolved = resolve_header_value(value);
+            req_builder = req_builder.header(key.as_str(), resolved);
+        }
+
+        let response = req_builder
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| GatewayError::Network(format!("Request to {} failed: {}", url, e)))?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(Ok(response));
+        }
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        Ok(Err((status.as_u16(), error_text)))
+    }
+
+    /// Send a Chat Completions request to Mantle on the model's preferred route,
+    /// falling back to the alternate route once when Mantle reports the model is
+    /// not served there (see [`mantle_chat_completions_urls`]).
+    async fn post_mantle_chat_completions(
+        &self,
+        request: &OpenAIRequest,
+        http_client: &Client,
+        api_key: &str,
+        base_url: &str,
+        custom_headers: &HashMap<String, String>,
+    ) -> Result<reqwest::Response, GatewayError> {
+        let [preferred, alternate] = mantle_chat_completions_urls(base_url, &request.model);
+        match self
+            .send_mantle_chat(&preferred, request, http_client, api_key, custom_headers)
+            .await?
+        {
+            Ok(response) => return Ok(response),
+            Err((status, body)) if is_mantle_route_mismatch(status, &body) => {
+                tracing::warn!(
+                    provider = %self.name,
+                    model = %request.model,
+                    rejected_url = %preferred,
+                    retry_url = %alternate,
+                    "Bedrock Mantle does not serve this model on the preferred Chat Completions route; retrying the alternate route"
+                );
+            }
+            Err((status, body)) => return Err(self.mantle_http_error(status, body)),
+        }
+        self.send_mantle_chat(&alternate, request, http_client, api_key, custom_headers)
+            .await?
+            .map_err(|(status, body)| self.mantle_http_error(status, body))
+    }
+
     /// Perform chat completion using API key authentication via HTTP.
     /// Sends request to the Bedrock Mantle endpoint which is OpenAI-compatible.
     ///
@@ -2105,15 +2216,6 @@ impl BedrockProvider {
         normalization: &TriggerNormalization,
     ) -> Result<ProviderResponse, GatewayError> {
         let start = Instant::now();
-        // AWS serves the OpenAI-compatible Chat Completions surface under the
-        // `/openai/v1` prefix on the Mantle endpoint (see each model card's
-        // "Programmatic Access" table, e.g. google.gemma-4-31b →
-        // `https://bedrock-mantle.{region}.api.aws/openai/v1`). Strip any
-        // configured `/v1` suffix and target `/openai/v1/chat/completions` so
-        // newer open-weight models resolve; the legacy bare `/v1/chat/completions`
-        // alias only answered for a subset (e.g. zai.glm-5).
-        let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
-        let url = format!("{}/openai/v1/chat/completions", root);
         // Survivor placement (task 5): when the surviving trigger came from a
         // native `extra["input"]` list, it would be lost because
         // `sanitize_mantle_chat_request` deletes `input` wholesale (the key is
@@ -2147,53 +2249,11 @@ impl BedrockProvider {
             );
         }
 
-        // Build request with Bearer token and custom headers
-        let mut req_builder = http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json");
-
-        // Apply custom headers with environment variable resolution
-        for (key, value) in custom_headers {
-            let resolved = resolve_header_value(value);
-            req_builder = req_builder.header(key.as_str(), resolved);
-        }
-
         // Send request (OpenAI format - no translation needed for Mantle endpoint)
-        let response = req_builder
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| GatewayError::Network(format!("Request to {} failed: {}", url, e)))?;
-
-        let status = response.status();
+        let response = self
+            .post_mantle_chat_completions(&request, http_client, api_key, base_url, custom_headers)
+            .await?;
         let latency_ms = start.elapsed().as_millis() as u64;
-
-        if !status.is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            // Handle authentication failures specifically
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                return Err(GatewayError::Provider {
-                    provider: self.name.clone(),
-                    message: format!(
-                        "Bedrock API key authentication failed: HTTP {}: {}",
-                        status.as_u16(),
-                        error_text
-                    ),
-                    status_code: Some(status.as_u16()),
-                });
-            }
-
-            return Err(GatewayError::Provider {
-                provider: self.name.clone(),
-                message: format!("HTTP {}: {}", status.as_u16(), error_text),
-                status_code: Some(status.as_u16()),
-            });
-        }
 
         // Parse response as OpenAI format (no translation needed)
         let openai_response: OpenAIResponse = response
@@ -2770,58 +2830,11 @@ impl BedrockProvider {
         // TODO(task5): Chat-family survivor placement (native `extra["input"]`
         // awareness); the seam has already removed earlier sites.
         let _ = normalization;
-        // Mantle Chat Completions lives under `/openai/v1` (see the
-        // non-streaming adapter for the rationale); strip a configured `/v1`
-        // suffix before appending the OpenAI-compatible path.
-        let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
-        let url = format!("{}/openai/v1/chat/completions", root);
-
-        // Build request with Bearer token and custom headers
-        let mut req_builder = http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json");
-
-        // Apply custom headers with environment variable resolution
-        for (key, value) in custom_headers {
-            let resolved = resolve_header_value(value);
-            req_builder = req_builder.header(key.as_str(), resolved);
-        }
 
         // Send request (OpenAI format - no translation needed for Mantle endpoint)
-        let response = req_builder
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| GatewayError::Network(format!("Request to {} failed: {}", url, e)))?;
-
-        let status = response.status();
-
-        if !status.is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            // Handle authentication failures specifically
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                return Err(GatewayError::Provider {
-                    provider: self.name.clone(),
-                    message: format!(
-                        "Bedrock API key authentication failed: HTTP {}: {}",
-                        status.as_u16(),
-                        error_text
-                    ),
-                    status_code: Some(status.as_u16()),
-                });
-            }
-
-            return Err(GatewayError::Provider {
-                provider: self.name.clone(),
-                message: format!("HTTP {}: {}", status.as_u16(), error_text),
-                status_code: Some(status.as_u16()),
-            });
-        }
+        let response = self
+            .post_mantle_chat_completions(&request, http_client, api_key, base_url, custom_headers)
+            .await?;
 
         // Get the byte stream from the response
         let mut stream = response.bytes_stream();
@@ -3672,7 +3685,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/openai/v1/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .and(header("Authorization", "Bearer test-api-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "chatcmpl-test",
@@ -3717,7 +3730,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/openai/v1/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .and(header("Authorization", "Bearer bad-key"))
             .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
             .expect(1)
@@ -3741,6 +3754,121 @@ mod tests {
                 assert_eq!(provider, "bedrock-test");
                 assert_eq!(status_code, Some(401));
                 assert!(message.contains("authentication failed"));
+            }
+            other => panic!("Expected provider error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mantle_chat_route_prefers_v1_except_gemma_4() {
+        let base = "https://bedrock-mantle.us-east-2.api.aws/v1";
+        let [preferred, alternate] = mantle_chat_completions_urls(base, "zai.glm-5");
+        assert_eq!(
+            preferred,
+            "https://bedrock-mantle.us-east-2.api.aws/v1/chat/completions"
+        );
+        assert_eq!(
+            alternate,
+            "https://bedrock-mantle.us-east-2.api.aws/openai/v1/chat/completions"
+        );
+
+        let [preferred, _] = mantle_chat_completions_urls(base, "google.gemma-4-31b");
+        assert_eq!(
+            preferred,
+            "https://bedrock-mantle.us-east-2.api.aws/openai/v1/chat/completions"
+        );
+    }
+
+    /// Observed live: Mantle answers `zai.glm-5` on `/openai/v1` with
+    /// `400 model ... isn't supported on this route`. The adapter must retry
+    /// the alternate route once instead of failing the provider.
+    #[tokio::test]
+    async fn test_api_key_chat_retries_alternate_route_on_route_mismatch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {
+                    "code": "validation_error",
+                    "message": "model `google.gemma-4-31b` isn't supported on this route",
+                    "param": null,
+                    "type": "invalid_request_error"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1234567890i64,
+                "model": "google.gemma-4-31b",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "pong"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = create_api_key_mode_provider_for_base_url(
+            "bedrock-test",
+            mock_server.uri(),
+            "test-api-key",
+        );
+        let mut request = create_test_chat_request(false);
+        request.model = "google.gemma-4-31b".to_string();
+
+        let response = provider
+            .chat_completion(request)
+            .await
+            .expect("route mismatch should fall back to the alternate route");
+        assert_eq!(
+            response.response.choices[0].message.content_as_text(),
+            "pong"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_key_chat_does_not_retry_other_validation_errors() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("{\"error\":{\"message\":\"bad input\"}}"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let provider = create_api_key_mode_provider_for_base_url(
+            "bedrock-test",
+            mock_server.uri(),
+            "test-api-key",
+        );
+        let mut request = create_test_chat_request(false);
+        request.model = "zai.glm-5".to_string();
+
+        match provider.chat_completion(request).await {
+            Err(GatewayError::Provider { status_code, .. }) => {
+                assert_eq!(status_code, Some(400));
             }
             other => panic!("Expected provider error, got {:?}", other),
         }
@@ -4284,7 +4412,7 @@ mod tests {
         );
 
         Mock::given(method("POST"))
-            .and(path("/openai/v1/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .and(header("Authorization", "Bearer test-api-key"))
             .respond_with(
                 ResponseTemplate::new(200)
