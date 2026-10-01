@@ -178,6 +178,7 @@ impl ModelsDiscovery {
     /// Check if a model ID is relevant for Codex usage.
     fn is_codex_relevant(&self, model_id: &str) -> bool {
         let dominated_by_codex = model_id.contains("codex")
+            || model_id.starts_with("gpt-6")
             || model_id.starts_with("gpt-5")
             || model_id.starts_with("gpt-4.1")
             || model_id.starts_with("o1")
@@ -207,6 +208,10 @@ impl ModelsDiscovery {
     /// Static fallback model list derived from known Codex-compatible models.
     fn static_fallback(&self) -> Vec<CodexModel> {
         let static_models = [
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6",
             "gpt-5.5",
             "gpt-5.5-pro",
             "gpt-5.4",
@@ -279,6 +284,9 @@ mod tests {
         assert!(disc.is_codex_relevant("o4-mini"));
         assert!(disc.is_codex_relevant("gpt-4.1"));
         assert!(disc.is_codex_relevant("gpt-4.1-mini"));
+        assert!(disc.is_codex_relevant("gpt-6-astra"));
+        assert!(disc.is_codex_relevant("gpt-6-sol"));
+        assert!(disc.is_codex_relevant("gpt-6-luna"));
     }
 
     #[test]

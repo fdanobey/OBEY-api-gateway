@@ -160,7 +160,12 @@ impl SemanticCache {
     /// Concatenates model name and message contents to produce a deterministic
     /// text representation of the request's semantic meaning.
     pub fn serialize_request(&self, request: &OpenAIRequest) -> String {
-        let mut parts = Vec::with_capacity(request.messages.len() + 1);
+        // Cap the pre-allocation so a request with a pathological message count
+        // cannot drive an unbounded up-front allocation. The vector still grows
+        // on demand if a legitimate request exceeds the hint.
+        const SERIALIZE_CAPACITY_CAP: usize = 1_024;
+        let capacity = request.messages.len().saturating_add(1).min(SERIALIZE_CAPACITY_CAP);
+        let mut parts = Vec::with_capacity(capacity);
         parts.push(format!("model:{}", request.model));
         for msg in &request.messages {
             parts.push(format!("{}:{}", msg.role, msg.content_as_text()));

@@ -86,8 +86,9 @@ impl fmt::Debug for JevClient {
 }
 
 impl JevClient {
-    /// Build a client. `base_url` must already be validated (TLS, no query
-    /// or fragment) by configuration validation.
+    /// Build a client. `base_url` should already be validated (no query or
+    /// fragment) by configuration validation; this constructor additionally
+    /// enforces that the scheme is HTTPS and rejects any other transport.
     pub fn new(
         base_url: &str,
         api_key: &str,
@@ -95,6 +96,19 @@ impl JevClient {
         max_retries: u8,
         backoff: Duration,
     ) -> Result<Self, JevCallError> {
+        // Defense in depth: the Bearer credential travels on every request, so
+        // the transport must be TLS. Configuration validation already rejects
+        // non-HTTPS endpoints; enforcing it here keeps the invariant local and
+        // guarantees the token can never be sent over cleartext.
+        match reqwest::Url::parse(base_url.trim()) {
+            Ok(url) if url.scheme() == "https" => {}
+            _ => {
+                return Err(JevCallError::Unavailable {
+                    reason: "endpoint base URL must use https (TLS)".to_owned(),
+                });
+            }
+        }
+
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(timeout.min(Duration::from_secs(10)))

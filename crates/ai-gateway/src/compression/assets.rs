@@ -524,10 +524,19 @@ fn model_parent(model_path: &Path) -> PathBuf {
 
 fn validate_model_path(path: &Path) -> Result<(), OnnxAssetError> {
     if path.as_os_str().is_empty() || path.to_string_lossy().contains('\0') {
-        Err(OnnxAssetError::InvalidModelPath)
-    } else {
-        Ok(())
+        return Err(OnnxAssetError::InvalidModelPath);
     }
+    // Reject `..` traversal components. The model path is reachable from the
+    // admin API (query parameter and request body), so a caller must not be
+    // able to escape the configured model directory into arbitrary filesystem
+    // locations via parent-directory references.
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(OnnxAssetError::InvalidModelPath);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
