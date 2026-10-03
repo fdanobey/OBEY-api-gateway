@@ -293,7 +293,10 @@ fn smart_routing_tier_label(value: &str) -> String {
 
 #[allow(dead_code)]
 fn smart_routing_classifier_label(value: &str) -> String {
-    smart_routing_enum_label(value, &["heuristic", "ml", "llm", "composite", "jev"])
+    smart_routing_enum_label(
+        value,
+        &["heuristic", "ml", "llm", "composite", "jev", "laya"],
+    )
 }
 
 #[allow(dead_code)]
@@ -2502,6 +2505,13 @@ fn smart_routing_jev_metrics_render_with_bounded_labels() {
     // Family label is bounded: no unknown family series.
     assert!(!out.contains("family=\"other\""));
 }
+
+    #[test]
+    fn smart_routing_classifier_label_includes_laya() {
+        assert_eq!(smart_routing_classifier_label("laya"), "laya");
+        assert_eq!(smart_routing_classifier_label("Jev"), "jev");
+        assert_eq!(smart_routing_classifier_label("unknown"), "other");
+    }
 
     #[test]
     fn test_metrics_initialization() {
