@@ -1536,11 +1536,12 @@ reasoning_compat: Default::default(),
             .filter_map(|model| model["id"].as_str())
             .collect();
 
-        assert_eq!(ids.len(), 3);
-        assert!(ids.contains("openai/gpt-oss-120b"));
-        assert!(ids.contains("meta/llama-3.1-70b-instruct"));
-        assert!(ids.contains("nvidia/nemotron-3-nano"));
-    }
+    assert_eq!(ids.len(), 4);
+    assert!(ids.contains("openai/gpt-oss-120b"));
+    assert!(ids.contains("meta/llama-3.1-70b-instruct"));
+    assert!(ids.contains("nvidia/nemotron-3-nano"));
+    assert!(ids.contains("moonshotai/kimi-k3"));
+}
 
     fn config_with_size_limit(max_mb: u64) -> Config {
         let mut cfg = minimal_config();

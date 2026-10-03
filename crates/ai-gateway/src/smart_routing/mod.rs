@@ -9,12 +9,14 @@ pub mod decision_engine;
 pub mod evaluation;
 pub mod heuristic;
 pub mod jev;
+pub mod laya;
 pub mod llm_classifier;
 #[cfg(feature = "ml-router")]
 pub mod ml_classifier;
 pub mod online_optimizer;
 pub mod quality_evaluator;
 pub mod semantic_cache;
+pub mod systemone;
 pub mod tier;
 #[cfg(feature = "ml-router")]
 pub mod training;
@@ -29,7 +31,7 @@ use crate::models::openai::OpenAIRequest;
 
 use self::cascade::CascadeEvaluator;
 use self::config::{
-    BudgetLimits, ClassifierMode, CompositeWeights, JevConfig, JevTrustOverride,
+    BudgetLimits, ClassifierMode, CompositeWeights, JevConfig, JevTrustOverride, LayaConfig,
     RoutingPolicySnapshot, SmartRoutingConfig, SmartRoutingConfigError,
 };
 use self::context_filter::{
@@ -206,15 +208,19 @@ pub enum CacheLookupEvent {
 }
 
 /// Narrow metrics surface that cannot receive request or response content.
+///
+/// The System One (`jev_*`) hooks carry the family label (`"jev"` or
+/// `"laya"`) so both classifier families share one metric family with
+/// bounded label cardinality.
 pub trait SmartRoutingMetrics: Send + Sync {
     fn classifier_fallback(&self, _event: ClassifierFallbackEvent) {}
     fn cache_lookup(&self, _event: CacheLookupEvent) {}
     fn budget_decision(&self, _decision: BudgetDecision) {}
-    fn jev_consult(&self, _group: &str) {}
-    fn jev_fallback(&self, _reason: ClassifierFailure) {}
-    fn jev_confidence(&self, _confidence: f64) {}
-    fn jev_latency(&self, _latency_ms: f64) {}
-    fn jev_discovery_refresh(&self, _status: &'static str) {}
+    fn jev_consult(&self, _group: &str, _family: &str) {}
+    fn jev_fallback(&self, _reason: ClassifierFailure, _family: &str) {}
+    fn jev_confidence(&self, _confidence: f64, _family: &str) {}
+    fn jev_latency(&self, _latency_ms: f64, _family: &str) {}
+    fn jev_discovery_refresh(&self, _status: &'static str, _family: &str) {}
 }
 
 #[derive(Debug, Default)]
@@ -322,7 +328,9 @@ pub struct SmartRouter {
     heuristic: HeuristicScorer,
     ml: Option<Arc<dyn OptionalClassifier>>,
     llm: Option<Arc<dyn OptionalClassifier>>,
-    jev: Option<Arc<dyn OptionalClassifier>>,
+    /// The System One family classifier (Jev or Laya); one slot because the
+    /// configured classifier mode activates exactly one family.
+    systemone: Option<Arc<dyn OptionalClassifier>>,
     decision_engine: DecisionEngine,
     cascade_evaluator: CascadeEvaluator,
     quality_evaluator: Option<Arc<dyn QualityEvaluatorHook>>,
@@ -350,7 +358,7 @@ impl SmartRouter {
             config,
             ml: None,
             llm: None,
-            jev: None,
+            systemone: None,
             quality_evaluator: None,
             optimizer: None,
             budget: None,
@@ -378,8 +386,18 @@ impl SmartRouter {
         self
     }
 
+    /// Attach a Jev (System One) family classifier. Retained for backward
+    /// compatibility; equivalent to `with_systemone_classifier`.
     pub fn with_jev_classifier(mut self, classifier: Arc<dyn OptionalClassifier>) -> Self {
-        self.jev = Some(classifier);
+        self.systemone = Some(classifier);
+        self
+    }
+
+    /// Attach a System One family classifier (Jev or Laya). One slot serves
+    /// both families because the configured classifier mode activates
+    /// exactly one at a time.
+    pub fn with_systemone_classifier(mut self, classifier: Arc<dyn OptionalClassifier>) -> Self {
+        self.systemone = Some(classifier);
         self
     }
 
@@ -639,16 +657,26 @@ impl SmartRouter {
                 )
                 .await
                 .unwrap_or(heuristic_classification),
-            ClassifierMode::Jev => self
-                .classify_optional(
-                    self.jev.as_deref(),
-                    ClassifierUsed::Jev,
-                    input,
-                    heuristic_classification.clone(),
-                    policy,
-                )
-                .await
-                .unwrap_or(heuristic_classification),
+        ClassifierMode::Jev => self
+            .classify_optional(
+                self.systemone.as_deref(),
+                ClassifierUsed::Jev,
+                input,
+                heuristic_classification.clone(),
+                policy,
+            )
+            .await
+            .unwrap_or(heuristic_classification),
+        ClassifierMode::Laya => self
+            .classify_optional(
+                self.systemone.as_deref(),
+                ClassifierUsed::Laya,
+                input,
+                heuristic_classification.clone(),
+                policy,
+            )
+            .await
+            .unwrap_or(heuristic_classification),
             ClassifierMode::Composite => {
                 let Some(ml) = self
                     .classify_optional(
@@ -696,17 +724,24 @@ impl SmartRouter {
         heuristic: Classification,
         policy: &SmartRoutingConfig,
     ) -> Option<Classification> {
-        let is_jev = classifier_used == ClassifierUsed::Jev;
+        // Both System One families share the Jev trust-override plumbing
+        // and the jev_* metric families; the family label distinguishes
+        // them with bounded cardinality.
+        let family = match classifier_used {
+            ClassifierUsed::Laya => "laya",
+            _ => "jev",
+        };
+        let is_systemone = matches!(classifier_used, ClassifierUsed::Jev | ClassifierUsed::Laya);
         let configured = policy.classifier;
-        if is_jev {
-            self.metrics.jev_consult(&input.model_group.name);
+        if is_systemone {
+            self.metrics.jev_consult(&input.model_group.name, family);
         }
         let Some(classifier) = classifier else {
             let reason = ClassifierFailure::Unavailable;
             self.metrics
                 .classifier_fallback(ClassifierFallbackEvent { configured, reason });
-            if is_jev {
-                self.metrics.jev_fallback(reason);
+            if is_systemone {
+                self.metrics.jev_fallback(reason, family);
             }
             return None;
         };
@@ -718,12 +753,16 @@ impl SmartRouter {
                 pinned_context: input.pinned_context,
                 heuristic_score: heuristic.score,
                 heuristic_task_type: heuristic.task_type,
-                jev_trust: policy.jev.as_ref().map(JevConfig::trust_override),
+                jev_trust: policy
+                    .jev
+                    .as_ref()
+                    .map(JevConfig::trust_override)
+                    .or_else(|| policy.laya.as_ref().map(LayaConfig::trust_override)),
             })
             .await;
-        if is_jev {
+        if is_systemone {
             self.metrics
-                .jev_latency(started_at.elapsed().as_secs_f64() * 1_000.0);
+                .jev_latency(started_at.elapsed().as_secs_f64() * 1_000.0, family);
         }
         let output = match result {
             Ok(output) if output.score.is_finite() && (0.0..=1.0).contains(&output.score) => output,
@@ -731,26 +770,26 @@ impl SmartRouter {
                 let reason = ClassifierFailure::InvalidOutput;
                 self.metrics
                     .classifier_fallback(ClassifierFallbackEvent { configured, reason });
-                if is_jev {
-                    self.metrics.jev_fallback(reason);
+                if is_systemone {
+                    self.metrics.jev_fallback(reason, family);
                 }
                 return None;
             }
             Err(reason) => {
                 self.metrics
                     .classifier_fallback(ClassifierFallbackEvent { configured, reason });
-                if is_jev {
-                    self.metrics.jev_fallback(reason);
+                if is_systemone {
+                    self.metrics.jev_fallback(reason, family);
                 }
                 return None;
             }
         };
-        if is_jev {
+        if is_systemone {
             if let Some(confidence) = output.confidence {
-                self.metrics.jev_confidence(confidence);
+                self.metrics.jev_confidence(confidence, family);
             }
             if output.discovery_refreshed {
-                self.metrics.jev_discovery_refresh("success");
+                self.metrics.jev_discovery_refresh("success", family);
             }
         }
 

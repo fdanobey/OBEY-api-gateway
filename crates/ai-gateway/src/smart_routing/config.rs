@@ -45,6 +45,8 @@ pub struct SmartRoutingConfig {
     pub classifier_model: Option<String>,
     #[serde(default)]
     pub jev: Option<JevConfig>,
+    #[serde(default)]
+    pub laya: Option<LayaConfig>,
     #[serde(default = "default_cost_quality_threshold")]
     pub cost_quality_threshold: f64,
     #[serde(default)]
@@ -89,6 +91,7 @@ impl Default for SmartRoutingConfig {
             ml_model_path: None,
             classifier_model: None,
             jev: None,
+            laya: None,
             cost_quality_threshold: default_cost_quality_threshold(),
             cascade: CascadeConfig::default(),
             tier_boundaries: TierBoundaries::default(),
@@ -120,6 +123,9 @@ impl SmartRoutingConfig {
         if let Some(jev) = &self.jev {
             jev.validate_into("jev", &mut errors);
         }
+        if let Some(laya) = &self.laya {
+            laya.validate_into("laya", &mut errors);
+        }
         if matches!(self.classifier, ClassifierMode::Jev) {
             let key_missing = self
                 .jev
@@ -132,10 +138,26 @@ impl SmartRoutingConfig {
                 ));
             }
         }
+        if matches!(self.classifier, ClassifierMode::Laya) {
+            let key_missing = self
+                .laya
+                .as_ref()
+                .is_none_or(|laya| !laya.has_api_key_configured());
+            if key_missing {
+                errors.push(SmartRoutingConfigError::new(
+                    "laya.api_key",
+                    "is required when classifier is laya (set laya.api_key or laya.api_key_env)",
+                ));
+            }
+        }
         let jev_ready = self
             .jev
             .as_ref()
             .is_some_and(JevConfig::has_api_key_configured);
+        let laya_ready = self
+            .laya
+            .as_ref()
+            .is_some_and(LayaConfig::has_api_key_configured);
 
         for (group, limits) in &self.budget_limits {
             validate_map_key("budget_limits", group, &mut errors);
@@ -151,6 +173,12 @@ impl SmartRoutingConfig {
                         "is jev but no Jev API key is configured",
                     ));
                 }
+                if matches!(policy.classifier, ClassifierMode::Laya) && !laya_ready {
+                    errors.push(SmartRoutingConfigError::new(
+                        format!("ab_test.{arm}.classifier"),
+                        "is laya but no Laya API key is configured",
+                    ));
+                }
             }
         }
 
@@ -161,6 +189,12 @@ impl SmartRoutingConfig {
                 errors.push(SmartRoutingConfigError::new(
                     format!("model_group_overrides.{group}.classifier"),
                     "is jev but no Jev API key is configured",
+                ));
+            }
+            if matches!(effective.classifier, ClassifierMode::Laya) && !laya_ready {
+                errors.push(SmartRoutingConfigError::new(
+                    format!("model_group_overrides.{group}.classifier"),
+                    "is laya but no Laya API key is configured",
                 ));
             }
             RoutingPolicySnapshot::from(&effective)
@@ -218,12 +252,18 @@ impl SmartRoutingConfig {
         if let Some(value) = &config_override.composite_weights {
             effective.composite_weights = Some(value.clone());
         }
-        if let Some(value) = &config_override.jev_trust {
-            let jev = effective.jev.get_or_insert_with(JevConfig::default);
-            jev.min_confidence = value.min_confidence;
-            jev.min_task_confidence = value.min_task_confidence;
-            jev.fallback_policy = value.fallback_policy;
-        }
+    if let Some(value) = &config_override.jev_trust {
+        let jev = effective.jev.get_or_insert_with(JevConfig::default);
+        jev.min_confidence = value.min_confidence;
+        jev.min_task_confidence = value.min_task_confidence;
+        jev.fallback_policy = value.fallback_policy;
+        // The trust override applies to whichever System One family is
+        // active, so the Laya block tracks the same thresholds.
+        let laya = effective.laya.get_or_insert_with(LayaConfig::default);
+        laya.min_confidence = value.min_confidence;
+        laya.min_task_confidence = value.min_task_confidence;
+        laya.fallback_policy = value.fallback_policy;
+    }
         if let Some(value) = config_override.streaming_cascade_mode {
             effective.streaming_cascade_mode = value;
         }
@@ -264,6 +304,7 @@ pub enum ClassifierMode {
     Llm,
     Composite,
     Jev,
+    Laya,
 }
 
 impl Default for ClassifierMode {
@@ -775,16 +816,18 @@ impl JevConfig {
     }
 }
 
-/// Validate a Jev base URL: must parse as http(s), must be TLS, must not
-/// carry a query or fragment. Returns a description when invalid.
+/// Validate a System One endpoint base URL: must parse as http(s), must be
+/// TLS unless the host is loopback/private (self-hosted deployments), and
+/// must not carry a query or fragment. Returns a description when invalid.
 fn validate_jev_base_url(url: &str) -> Option<String> {
     let trimmed = url.trim();
     let parsed = reqwest::Url::parse(trimmed).ok()?;
     match parsed.scheme() {
         "https" => {}
+        "http" if base_url_host_is_private(&parsed) => {}
         "http" => {
             return Some(format!(
-                "uses insecure scheme http; TLS (https) is required"
+                "uses insecure scheme http; TLS (https) is required (plain http is allowed only for localhost/private self-hosted endpoints)"
             ))
         }
         scheme => return Some(format!("uses unsupported scheme {scheme}; expected https")),
@@ -793,6 +836,24 @@ fn validate_jev_base_url(url: &str) -> Option<String> {
         return Some("must not include a query or fragment".to_string());
     }
     None
+}
+
+/// True when the URL host is loopback or a private-network address, where
+/// plain-HTTP self-hosted System One endpoints are permitted.
+fn base_url_host_is_private(url: &reqwest::Url) -> bool {
+    use std::net::IpAddr;
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
+        Ok(IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 fn default_jev_base_url() -> String {
@@ -834,6 +895,200 @@ fn default_jev_discovery_ttl_secs() -> u64 {
 fn default_jev_dimension_weight() -> f64 {
     1.0 / 6.0
 }
+
+const DEFAULT_LAYA_BASE_URL: &str = "https://api.laya-ai.com";
+const LAYA_AUTO_MODEL: &str = "auto";
+
+fn default_laya_base_url() -> String {
+    DEFAULT_LAYA_BASE_URL.to_string()
+}
+
+fn default_laya_model() -> String {
+    LAYA_AUTO_MODEL.to_string()
+}
+
+fn default_laya_timeout_ms() -> u16 {
+    800
+}
+
+fn default_laya_min_confidence() -> f64 {
+    0.55
+}
+
+fn default_laya_min_task_confidence() -> f64 {
+    0.50
+}
+
+/// Configuration for the Laya (System One) complexity classifier.
+///
+/// Field-compatible with [`JevConfig`]; Laya differences are the defaults:
+/// hosted base URL `https://api.laya-ai.com`, an 800 ms timeout, and a
+/// Laya-tuned `min_confidence` gate applied to `answer_confidence`.
+/// `model` is `auto` (discover and select the latest Laya-capable model at
+/// the configured URL; `typed-decisions` is pinned when the endpoint exposes
+/// no listing) or a concrete checkpoint name (`english`, `multilingual`,
+/// `typed-decisions`) used verbatim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayaConfig {
+    /// Plaintext API key. Prefer `api_key_env`; stored encrypted at rest by
+    /// the admin mutation path when written through the admin API.
+    #[serde(default, skip_serializing)]
+    pub api_key: Option<String>,
+    /// Encrypted API key persisted by admin mutation paths.
+    #[serde(default)]
+    pub api_key_encrypted: Option<String>,
+    /// Environment variable name holding the API key, or a literal key when
+    /// no matching environment variable exists (provider `api_key_env`
+    /// semantics).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// System One endpoint base URL. TLS is required except for explicit
+    /// localhost/private-address self-hosted deployments.
+    #[serde(default = "default_laya_base_url")]
+    pub base_url: String,
+    /// `auto` (default) or a concrete Laya checkpoint name.
+    #[serde(default = "default_laya_model")]
+    pub model: String,
+    /// Per-call timeout in milliseconds (250..=2000).
+    #[serde(default = "default_laya_timeout_ms")]
+    pub timeout_ms: u16,
+    #[serde(default = "default_laya_min_confidence")]
+    pub min_confidence: f64,
+    #[serde(default = "default_laya_min_task_confidence")]
+    pub min_task_confidence: f64,
+    #[serde(default)]
+    pub retry: JevRetryConfig,
+    /// Character budget for state assembly sent to the endpoint.
+    #[serde(default = "default_jev_char_budget")]
+    pub char_budget: usize,
+    /// TTL for model-discovery results in seconds.
+    #[serde(default = "default_jev_discovery_ttl_secs")]
+    pub discovery_ttl_secs: u64,
+    #[serde(default)]
+    pub dimension_weights: DimensionWeights,
+    #[serde(default)]
+    pub fallback_policy: JevFallbackPolicy,
+}
+
+impl Default for LayaConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            api_key_encrypted: None,
+            api_key_env: None,
+            base_url: default_laya_base_url(),
+            model: default_laya_model(),
+            timeout_ms: default_laya_timeout_ms(),
+            min_confidence: default_laya_min_confidence(),
+            min_task_confidence: default_laya_min_task_confidence(),
+            retry: JevRetryConfig::default(),
+            char_budget: default_jev_char_budget(),
+            discovery_ttl_secs: default_jev_discovery_ttl_secs(),
+            dimension_weights: DimensionWeights::default(),
+            fallback_policy: JevFallbackPolicy::default(),
+        }
+    }
+}
+
+impl LayaConfig {
+    /// Resolve the API key with the same precedence as `JevConfig`:
+    /// explicit `api_key`, then `api_key_encrypted`, then `api_key_env` as
+    /// an environment variable name, then `api_key_env` as a literal value.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        JevConfig {
+            api_key: self.api_key.clone(),
+            api_key_encrypted: self.api_key_encrypted.clone(),
+            api_key_env: self.api_key_env.clone(),
+            ..JevConfig::default()
+        }
+        .resolve_api_key()
+    }
+
+    pub fn has_encrypted_api_key(&self) -> bool {
+        self.api_key_encrypted
+            .as_deref()
+            .is_some_and(crate::secrets::is_encrypted_secret)
+    }
+
+    /// True when any API-key input is configured.
+    pub fn has_api_key_configured(&self) -> bool {
+        self.api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+            || self.has_encrypted_api_key()
+            || self
+                .api_key_env
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    pub fn trust_override(&self) -> JevTrustOverride {
+        JevTrustOverride {
+            min_confidence: self.min_confidence,
+            min_task_confidence: self.min_task_confidence,
+            fallback_policy: self.fallback_policy,
+        }
+    }
+
+    fn validate_into(&self, scope: &str, errors: &mut Vec<SmartRoutingConfigError>) {
+        validate_optional_text(
+            &field(scope, "base_url"),
+            &self.base_url,
+            MAX_JEV_URL_CHARS,
+            errors,
+        );
+        if let Some(url_error) = validate_jev_base_url(&self.base_url) {
+            errors.push(SmartRoutingConfigError::new(
+                field(scope, "base_url"),
+                url_error,
+            ));
+        }
+        validate_optional_text(
+            &field(scope, "model"),
+            &self.model,
+            MAX_MODEL_NAME_CHARS,
+            errors,
+        );
+        if self.timeout_ms < MIN_JEV_TIMEOUT_MS || self.timeout_ms > MAX_JEV_TIMEOUT_MS {
+            errors.push(SmartRoutingConfigError::new(
+                field(scope, "timeout_ms"),
+                format!(
+                    "is {}; expected an integer in {MIN_JEV_TIMEOUT_MS}..={MAX_JEV_TIMEOUT_MS}",
+                    self.timeout_ms
+                ),
+            ));
+        }
+        validate_finite_closed_unit(&field(scope, "min_confidence"), self.min_confidence, errors);
+        validate_finite_closed_unit(
+            &field(scope, "min_task_confidence"),
+            self.min_task_confidence,
+            errors,
+        );
+        self.retry.validate_into(&field(scope, "retry"), errors);
+        if self.char_budget < MIN_JEV_CHAR_BUDGET || self.char_budget > MAX_JEV_CHAR_BUDGET {
+            errors.push(SmartRoutingConfigError::new(
+                field(scope, "char_budget"),
+                format!(
+                    "is {}; expected an integer in {MIN_JEV_CHAR_BUDGET}..={MAX_JEV_CHAR_BUDGET}",
+                    self.char_budget
+                ),
+            ));
+        }
+        if self.discovery_ttl_secs == 0 || self.discovery_ttl_secs > MAX_JEV_DISCOVERY_TTL_SECS {
+            errors.push(SmartRoutingConfigError::new(
+                field(scope, "discovery_ttl_secs"),
+                format!(
+                    "is {}; expected an integer in 1..={MAX_JEV_DISCOVERY_TTL_SECS}",
+                    self.discovery_ttl_secs
+                ),
+            ));
+        }
+        self.dimension_weights
+            .validate_into(&field(scope, "dimension_weights"), errors);
+    }
+}
+
 /// Per-model-group partial routing settings.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

@@ -285,6 +285,7 @@ fn smart_routing_classifier_name(
         crate::smart_routing::tier::ClassifierUsed::Llm => "llm",
         crate::smart_routing::tier::ClassifierUsed::Composite => "composite",
         crate::smart_routing::tier::ClassifierUsed::Jev => "jev",
+        crate::smart_routing::tier::ClassifierUsed::Laya => "laya",
     }
 }
 
@@ -455,48 +456,90 @@ impl Router {
                         }
                     }
                 }
-                if matches!(
-                    smart_routing_config.classifier,
-                    crate::smart_routing::config::ClassifierMode::Jev
-                ) {
-                    match smart_routing_config
-                        .jev
-                        .as_ref()
-                        .and_then(|jev| {
-                            jev.resolve_api_key()
-                                .map(|key| (jev, key))
-                        })
-                        .map(|(jev, key)| {
-                            crate::smart_routing::jev::classifier::JevClassifier::new(
-                                crate::smart_routing::config::JevConfig {
-                                    api_key: Some(key),
-                                    ..jev.clone()
-                                },
-                            )
-                        })
-                    {
-                        Some(Ok(classifier)) => {
-                            classifier.prime_discovery();
-                            router = router.with_jev_classifier(Arc::new(classifier));
-                            tracing::info!(
-                                base_url = %smart_routing_config.jev.as_ref().map(|jev| jev.base_url.as_str()).unwrap_or(""),
-                                model = %smart_routing_config.jev.as_ref().map(|jev| jev.model.as_str()).unwrap_or(""),
-                                "Smart-routing Jev classifier loaded"
-                            );
-                        }
-                        Some(Err(error)) => {
-                            tracing::warn!(
-                                error = ?error,
-                                "Smart-routing Jev classifier unavailable; falling back to heuristic"
-                            );
-                        }
-                        None => {
-                            tracing::warn!(
-                                "Smart-routing Jev classifier API key unresolvable; falling back to heuristic"
-                            );
-                        }
-                    }
+        if matches!(
+            smart_routing_config.classifier,
+            crate::smart_routing::config::ClassifierMode::Jev
+        ) {
+            match smart_routing_config
+                .jev
+                .as_ref()
+                .and_then(|jev| {
+                    jev.resolve_api_key()
+                        .map(|key| (jev, key))
+                })
+                .map(|(jev, key)| {
+                    crate::smart_routing::jev::classifier::JevClassifier::new(
+                        crate::smart_routing::config::JevConfig {
+                            api_key: Some(key),
+                            ..jev.clone()
+                        },
+                    )
+                })
+            {
+                Some(Ok(classifier)) => {
+                    classifier.prime_discovery();
+                    router = router.with_systemone_classifier(Arc::new(classifier));
+                    tracing::info!(
+                        base_url = %smart_routing_config.jev.as_ref().map(|jev| jev.base_url.as_str()).unwrap_or(""),
+                        model = %smart_routing_config.jev.as_ref().map(|jev| jev.model.as_str()).unwrap_or(""),
+                        "Smart-routing Jev classifier loaded"
+                    );
                 }
+                Some(Err(error)) => {
+                    tracing::warn!(
+                        error = ?error,
+                        "Smart-routing Jev classifier unavailable; falling back to heuristic"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        "Smart-routing Jev classifier API key unresolvable; falling back to heuristic"
+                    );
+                }
+            }
+        }
+        if matches!(
+            smart_routing_config.classifier,
+            crate::smart_routing::config::ClassifierMode::Laya
+        ) {
+            match smart_routing_config
+                .laya
+                .as_ref()
+                .and_then(|laya| {
+                    laya.resolve_api_key()
+                        .map(|key| (laya, key))
+                })
+                .map(|(laya, key)| {
+                    crate::smart_routing::laya::classifier::LayaClassifier::new(
+                        crate::smart_routing::config::LayaConfig {
+                            api_key: Some(key),
+                            ..laya.clone()
+                        },
+                    )
+                })
+            {
+                Some(Ok(classifier)) => {
+                    classifier.prime_discovery();
+                    router = router.with_systemone_classifier(Arc::new(classifier));
+                    tracing::info!(
+                        base_url = %smart_routing_config.laya.as_ref().map(|laya| laya.base_url.as_str()).unwrap_or(""),
+                        model = %smart_routing_config.laya.as_ref().map(|laya| laya.model.as_str()).unwrap_or(""),
+                        "Smart-routing Laya classifier loaded"
+                    );
+                }
+                Some(Err(error)) => {
+                    tracing::warn!(
+                        error = ?error,
+                        "Smart-routing Laya classifier unavailable; falling back to heuristic"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        "Smart-routing Laya classifier API key unresolvable; falling back to heuristic"
+                    );
+                }
+            }
+        }
                 if smart_routing_config.budget_limits.is_empty() {
 
                     return router;

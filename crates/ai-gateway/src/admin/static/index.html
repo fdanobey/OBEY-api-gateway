@@ -1069,7 +1069,7 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 <fieldset><legend>Core Routing Policy</legend>
 <div class="form-check"><input type="checkbox" id="smart-enabled"><label for="smart-enabled">Enable Smart Routing</label></div>
 <div class="form-row">
-<div class="form-group"><label for="smart-classifier">Classifier</label><select id="smart-classifier"><option value="heuristic">Heuristic</option><option value="llm">LLM</option><option value="ml">ONNX ML</option><option value="composite">Composite</option><option value="jev">Jev (System One)</option></select><div class="hint">Jev uses a calibrated decision-model endpoint; ML and composite modes require the optional <code>ml-router</code> build feature.</div></div>
+<div class="form-group"><label for="smart-classifier">Classifier</label><select id="smart-classifier"><option value="heuristic">Heuristic</option><option value="llm">LLM</option><option value="ml">ONNX ML</option><option value="composite">Composite</option><option value="jev">Jev (System One)</option><option value="laya">Laya (System One)</option></select><div class="hint">Jev and Laya use calibrated decision-model endpoints; ML and composite modes require the optional <code>ml-router</code> build feature.</div></div>
 <div class="form-group"><label for="smart-threshold">Cost / Quality Threshold</label><input type="number" id="smart-threshold" min="0" max="1" step="0.01"><div class="hint">0 favors cost; 1 favors quality.</div></div>
 </div>
 <div class="form-row">
@@ -1107,6 +1107,38 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 <div class="form-row">
 <div class="form-group"><label for="smart-jev-weight-domain">Domain Load</label><input type="number" id="smart-jev-weight-domain" min="0" max="1" step="0.01"></div>
 <div class="form-group"><label for="smart-jev-weight-ambiguity">Ambiguity</label><input type="number" id="smart-jev-weight-ambiguity" min="0" max="1" step="0.01"></div>
+</div>
+</fieldset>
+
+<fieldset><legend>Laya Classifier</legend>
+<p class="hint" style="margin-bottom:.75rem">Laya (Convai Innovations) System One classifier — wire-compatible with Jev. Hosted default is <code>https://api.laya-ai.com</code>; a self-hosted <code>laya-serve</code> endpoint may be used (HTTPS required except localhost/private addresses). Confidence gating reads <code>answer_confidence</code>, falling back to <code>confidence</code>.</p>
+<div class="form-row">
+<div class="form-group"><label for="smart-laya-base-url">Base URL</label><input type="url" id="smart-laya-base-url" placeholder="https://api.laya-ai.com"><div class="hint">HTTPS required (localhost/private self-host excepted).</div></div>
+<div class="form-group"><label for="smart-laya-model">Model</label><input type="text" id="smart-laya-model" placeholder="auto"><div class="hint">Use <code>auto</code>, or pin a checkpoint: <code>english</code>, <code>multilingual</code>, <code>typed-decisions</code>. <code>auto</code> pins <code>typed-decisions</code> when the endpoint exposes no listing.</div></div>
+<div class="form-group"><label for="smart-laya-api-key-env">API Key / Env Name</label><input type="password" id="smart-laya-api-key-env" autocomplete="new-password" placeholder="LAYA_API_KEY"><div class="hint">Masked; use an environment variable name when possible. Leave blank to keep a stored key.</div></div>
+</div>
+<div class="form-row">
+<div class="form-group"><label for="smart-laya-timeout">Timeout (ms)</label><input type="number" id="smart-laya-timeout" min="250" max="2000" step="50"></div>
+<div class="form-group"><label for="smart-laya-confidence">Minimum Confidence</label><input type="number" id="smart-laya-confidence" min="0" max="1" step="0.01"><div class="hint">Applied to <code>answer_confidence</code>. Default 0.55.</div></div>
+<div class="form-group"><label for="smart-laya-task-confidence">Task Confidence</label><input type="number" id="smart-laya-task-confidence" min="0" max="1" step="0.01"></div>
+<div class="form-group"><label for="smart-laya-fallback">Low-confidence Policy</label><select id="smart-laya-fallback"><option value="fallback">Fallback chain</option><option value="blend">Blend with heuristic</option></select></div>
+</div>
+<div class="form-row">
+<div class="form-group"><label for="smart-laya-char-budget">State Character Budget</label><input type="number" id="smart-laya-char-budget" min="256" max="65536" step="128"><div class="hint">Halved down to 256 after a 413 payload-limit response.</div></div>
+<div class="form-group"><label for="smart-laya-discovery-ttl">Discovery TTL (seconds)</label><input type="number" id="smart-laya-discovery-ttl" min="1" max="86400" step="1"></div>
+<div class="form-group"><label for="smart-laya-retries">Maximum Retries</label><input type="number" id="smart-laya-retries" min="0" max="2" step="1"><div class="hint">Retries 429/529/503 honoring <code>Retry-After</code>.</div></div>
+<div class="form-group"><label for="smart-laya-backoff">Retry Backoff (ms)</label><input type="number" id="smart-laya-backoff" min="1" max="10000" step="10"></div>
+</div>
+<p class="hint">Complexity dimension weights (finite, non-negative, not all zero).</p>
+<div class="form-row">
+<div class="form-group"><label for="smart-laya-weight-reasoning">Reasoning Depth</label><input type="number" id="smart-laya-weight-reasoning" min="0" max="1" step="0.01"></div>
+<div class="form-group"><label for="smart-laya-weight-tools">Tool Coupling</label><input type="number" id="smart-laya-weight-tools" min="0" max="1" step="0.01"></div>
+<div class="form-group"><label for="smart-laya-weight-context">Context Synthesis</label><input type="number" id="smart-laya-weight-context" min="0" max="1" step="0.01"></div>
+<div class="form-group"><label for="smart-laya-weight-precision">Output Precision</label><input type="number" id="smart-laya-weight-precision" min="0" max="1" step="0.01"></div>
+</div>
+<div class="form-row">
+<div class="form-group"><label for="smart-laya-weight-domain">Domain Load</label><input type="number" id="smart-laya-weight-domain" min="0" max="1" step="0.01"></div>
+<div class="form-group"><label for="smart-laya-weight-ambiguity">Ambiguity</label><input type="number" id="smart-laya-weight-ambiguity" min="0" max="1" step="0.01"></div>
 </div>
 </fieldset>
 
@@ -3942,6 +3974,26 @@ document.getElementById('smart-jev-weight-context').value=Number.isFinite(Number
 document.getElementById('smart-jev-weight-precision').value=Number.isFinite(Number(jevWeights.output_precision))?jevWeights.output_precision:(1/6);
 document.getElementById('smart-jev-weight-domain').value=Number.isFinite(Number(jevWeights.domain_load))?jevWeights.domain_load:(1/6);
 document.getElementById('smart-jev-weight-ambiguity').value=Number.isFinite(Number(jevWeights.ambiguity))?jevWeights.ambiguity:(1/6);
+var laya=v.laya||{};
+var layaWeights=laya.dimension_weights||{};
+document.getElementById('smart-laya-base-url').value=laya.base_url||'';
+document.getElementById('smart-laya-model').value=laya.model||'';
+document.getElementById('smart-laya-api-key-env').value='';
+document.getElementById('smart-laya-api-key-env').placeholder=(laya.api_key_configured||laya.api_key_env)?'Configured (leave blank to keep)':'LAYA_API_KEY';
+document.getElementById('smart-laya-timeout').value=laya.timeout_ms!=null?laya.timeout_ms:800;
+document.getElementById('smart-laya-confidence').value=Number.isFinite(Number(laya.min_confidence))?laya.min_confidence:0.55;
+document.getElementById('smart-laya-task-confidence').value=Number.isFinite(Number(laya.min_task_confidence))?laya.min_task_confidence:0.5;
+document.getElementById('smart-laya-fallback').value=laya.fallback_policy||'fallback';
+document.getElementById('smart-laya-char-budget').value=laya.char_budget!=null?laya.char_budget:1024;
+document.getElementById('smart-laya-discovery-ttl').value=laya.discovery_ttl_secs!=null?laya.discovery_ttl_secs:600;
+document.getElementById('smart-laya-retries').value=(laya.retry&&laya.retry.max_attempts!==undefined?laya.retry.max_attempts:2);
+document.getElementById('smart-laya-backoff').value=(laya.retry&&laya.retry.backoff_ms!==undefined?laya.retry.backoff_ms:200);
+document.getElementById('smart-laya-weight-reasoning').value=Number.isFinite(Number(layaWeights.reasoning_depth))?layaWeights.reasoning_depth:(1/6);
+document.getElementById('smart-laya-weight-tools').value=Number.isFinite(Number(layaWeights.tool_coupling))?layaWeights.tool_coupling:(1/6);
+document.getElementById('smart-laya-weight-context').value=Number.isFinite(Number(layaWeights.context_synthesis))?layaWeights.context_synthesis:(1/6);
+document.getElementById('smart-laya-weight-precision').value=Number.isFinite(Number(layaWeights.output_precision))?layaWeights.output_precision:(1/6);
+document.getElementById('smart-laya-weight-domain').value=Number.isFinite(Number(layaWeights.domain_load))?layaWeights.domain_load:(1/6);
+document.getElementById('smart-laya-weight-ambiguity').value=Number.isFinite(Number(layaWeights.ambiguity))?layaWeights.ambiguity:(1/6);
 }
 function collectSmartRouting(){
 var prior=(config&&config.smart_routing)?JSON.parse(JSON.stringify(config.smart_routing)):{};var cascade=prior.cascade||{};var quality=prior.quality_evaluator||{};var cache=prior.semantic_cache||{};var optimizer=prior.online_optimizer||{};
@@ -3974,6 +4026,30 @@ jev.dimension_weights.output_precision=parseFloat(document.getElementById('smart
 jev.dimension_weights.domain_load=parseFloat(document.getElementById('smart-jev-weight-domain').value);
 jev.dimension_weights.ambiguity=parseFloat(document.getElementById('smart-jev-weight-ambiguity').value);
 prior.jev=jev;
+var laya=prior.laya||{};
+delete laya.api_key_configured;
+laya.base_url=document.getElementById('smart-laya-base-url').value.trim()||'https://api.laya-ai.com';
+laya.model=document.getElementById('smart-laya-model').value.trim()||'auto';
+var layaKeyInput=document.getElementById('smart-laya-api-key-env').value.trim();
+laya.api_key_env=layaKeyInput||null;
+delete laya.api_key;
+laya.timeout_ms=parseInt(document.getElementById('smart-laya-timeout').value,10)||800;
+laya.min_confidence=parseFloat(document.getElementById('smart-laya-confidence').value);
+laya.min_task_confidence=parseFloat(document.getElementById('smart-laya-task-confidence').value);
+laya.fallback_policy=document.getElementById('smart-laya-fallback').value;
+laya.char_budget=parseInt(document.getElementById('smart-laya-char-budget').value,10)||1024;
+laya.discovery_ttl_secs=parseInt(document.getElementById('smart-laya-discovery-ttl').value,10)||600;
+laya.retry=laya.retry||{};
+laya.retry.max_attempts=parseInt(document.getElementById('smart-laya-retries').value,10);
+laya.retry.backoff_ms=parseInt(document.getElementById('smart-laya-backoff').value,10);
+laya.dimension_weights=laya.dimension_weights||{};
+laya.dimension_weights.reasoning_depth=parseFloat(document.getElementById('smart-laya-weight-reasoning').value);
+laya.dimension_weights.tool_coupling=parseFloat(document.getElementById('smart-laya-weight-tools').value);
+laya.dimension_weights.context_synthesis=parseFloat(document.getElementById('smart-laya-weight-context').value);
+laya.dimension_weights.output_precision=parseFloat(document.getElementById('smart-laya-weight-precision').value);
+laya.dimension_weights.domain_load=parseFloat(document.getElementById('smart-laya-weight-domain').value);
+laya.dimension_weights.ambiguity=parseFloat(document.getElementById('smart-laya-weight-ambiguity').value);
+prior.laya=laya;
 return prior;
 }
 function smartRoutingRequest(path,options){return fetch(apiUrl('smart-routing'+path),options||{}).then(function(response){return response.text().then(function(text){var body={};try{body=text?JSON.parse(text):{};}catch(_){}if(!response.ok)throw new Error((body.error&&body.error.message)||text||('HTTP '+response.status));return body;});});}

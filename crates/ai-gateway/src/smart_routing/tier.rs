@@ -82,10 +82,11 @@ pub struct RoutingDecision {
     pub cache_hit: bool,
     pub budget_downgraded: bool,
     pub context_filtered: bool,
-    /// Jev composite confidence, when the Jev classifier was consulted.
+    /// System One composite confidence, when a remote classifier was
+    /// consulted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classifier_confidence: Option<f64>,
-    /// Model id that served the Jev classification, when resolved.
+    /// Model id that served the System One classification, when resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_model: Option<String>,
 }
@@ -99,6 +100,7 @@ pub enum ClassifierUsed {
     Llm,
     Composite,
     Jev,
+    Laya,
 }
 
 /// Detected task category used for specialist routing.

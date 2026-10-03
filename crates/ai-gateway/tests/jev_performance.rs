@@ -25,6 +25,7 @@ fn answers() -> HashMap<String, Answer> {
             Answer::Score {
                 score: 1.5,
                 confidence: 0.9,
+                answer_confidence: None,
                 probabilities: HashMap::new(),
                 legend: HashMap::new(),
             },
@@ -36,6 +37,7 @@ fn answers() -> HashMap<String, Answer> {
             choice: "general".to_string(),
             probabilities: HashMap::new(),
             confidence: 0.9,
+            answer_confidence: None,
         },
     );
     answers

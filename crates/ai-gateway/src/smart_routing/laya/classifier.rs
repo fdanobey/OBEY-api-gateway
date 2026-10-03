@@ -1,11 +1,10 @@
-//! The Jev classifier facade: the shared `SystemOneClassifier` bound to the
-//! Jev family, constructed from [`JevConfig`]. All behavior lives in the
-//! shared `systemone` core; this module preserves the historical
-//! `JevClassifier::new(JevConfig)` constructor and detail type.
+//! The Laya classifier facade: the shared `SystemOneClassifier` bound to the
+//! Laya family, constructed from [`LayaConfig`]. All behavior lives in the
+//! shared `systemone` core.
 
 use std::sync::Arc;
 
-use crate::smart_routing::config::JevConfig;
+use crate::smart_routing::config::LayaConfig;
 use crate::smart_routing::systemone::classifier::{
     SystemOneClassificationDetail, SystemOneClassifier, SystemOneEndpointSettings,
 };
@@ -13,16 +12,15 @@ use crate::smart_routing::{ClassifierFailure, OptionalClassifier};
 
 use super::FAMILY;
 
-/// The Jev-bound System One classifier facade.
-pub struct JevClassifier {
+/// The Laya-bound System One classifier facade.
+pub struct LayaClassifier {
     inner: SystemOneClassifier,
 }
 
-/// Extra detail produced by a successful Jev classification, consumed by the
-/// orchestrator for telemetry and decision records.
-pub type JevClassificationDetail = SystemOneClassificationDetail;
+/// Extra detail produced by a successful Laya classification.
+pub type LayaClassificationDetail = SystemOneClassificationDetail;
 
-impl std::ops::Deref for JevClassifier {
+impl std::ops::Deref for LayaClassifier {
     type Target = SystemOneClassifier;
 
     fn deref(&self) -> &Self::Target {
@@ -30,10 +28,10 @@ impl std::ops::Deref for JevClassifier {
     }
 }
 
-impl JevClassifier {
-    /// Build from validated Jev configuration. The API key must already be
+impl LayaClassifier {
+    /// Build from validated Laya configuration. The API key must already be
     /// resolved (empty keys are rejected by config validation).
-    pub fn new(config: JevConfig) -> Result<Self, ClassifierFailure> {
+    pub fn new(config: LayaConfig) -> Result<Self, ClassifierFailure> {
         let api_key = config
             .resolve_api_key()
             .ok_or(ClassifierFailure::Unavailable)?;
@@ -68,7 +66,7 @@ impl JevClassifier {
     ) -> Result<
         (
             crate::smart_routing::ClassifierOutput,
-            JevClassificationDetail,
+            LayaClassificationDetail,
         ),
         ClassifierFailure,
     > {
@@ -76,14 +74,14 @@ impl JevClassifier {
     }
 }
 
-impl From<JevClassifier> for Arc<dyn OptionalClassifier> {
-    fn from(classifier: JevClassifier) -> Self {
+impl From<LayaClassifier> for Arc<dyn OptionalClassifier> {
+    fn from(classifier: LayaClassifier) -> Self {
         Arc::new(classifier)
     }
 }
 
 #[async_trait::async_trait]
-impl OptionalClassifier for JevClassifier {
+impl OptionalClassifier for LayaClassifier {
     async fn classify(
         &self,
         input: crate::smart_routing::ClassifierInput<'_>,

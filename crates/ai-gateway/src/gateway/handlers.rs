@@ -403,6 +403,7 @@ fn smart_routing_classifier_value(classifier: ClassifierUsed) -> &'static str {
         ClassifierUsed::Llm => "llm",
         ClassifierUsed::Composite => "composite",
         ClassifierUsed::Jev => "jev",
+        ClassifierUsed::Laya => "laya",
     }
 }
 

@@ -148,12 +148,12 @@ struct SmartRoutingMetricState {
     quality: DashMap<String, CompressionHistogram>,
     semantic_cache: DashMap<String, AtomicU64>,
     context_filtered: DashMap<String, AtomicU64>,
-    // Jev classifier instruments.
-    jev_consults: DashMap<String, AtomicU64>,
-    jev_fallbacks: DashMap<String, AtomicU64>,
+    // System One classifier instruments (family label: `jev` | `laya`).
+    jev_consults: DashMap<(String, String), AtomicU64>,
+    jev_fallbacks: DashMap<(String, String), AtomicU64>,
     jev_confidence: DashMap<String, CompressionHistogram>,
     jev_latency: DashMap<String, CompressionHistogram>,
-    jev_discovery_refreshes: DashMap<String, AtomicU64>,
+    jev_discovery_refreshes: DashMap<(String, String), AtomicU64>,
 }
 
 impl SmartRoutingMetricState {
@@ -269,6 +269,17 @@ fn escape_prometheus_label(value: &str) -> String {
 fn smart_routing_enum_label(value: &str, allowed: &[&str]) -> String {
     let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
     if allowed.contains(&normalized.as_str()) {
+        normalized
+    } else {
+        "other".to_owned()
+    }
+}
+
+/// Bounded System One family label: `jev` or `laya`; anything else becomes
+/// `other`, keeping series cardinality fixed.
+fn smart_routing_family_label(family: &str) -> String {
+    let normalized = family.trim().to_ascii_lowercase();
+    if normalized == "jev" || normalized == "laya" {
         normalized
     } else {
         "other".to_owned()
@@ -696,21 +707,24 @@ impl Metrics {
         );
     }
 
-    pub fn record_jev_consult(&self, group: &str) {
+    pub fn record_jev_consult(&self, group: &str, family: &str) {
         let Some(state) = self.smart_routing_state() else {
             return;
         };
         saturating_atomic_add(
             state
                 .jev_consults
-                .entry(smart_routing_group_label(group))
+                .entry((
+                    smart_routing_group_label(group),
+                    smart_routing_family_label(family),
+                ))
                 .or_insert_with(|| AtomicU64::new(0))
                 .value(),
             1,
         );
     }
 
-    pub fn record_jev_fallback(&self, reason: &str) {
+    pub fn record_jev_fallback(&self, reason: &str, family: &str) {
         let Some(state) = self.smart_routing_state() else {
             return;
         };
@@ -728,36 +742,36 @@ impl Metrics {
         saturating_atomic_add(
             state
                 .jev_fallbacks
-                .entry(label)
+                .entry((label, smart_routing_family_label(family)))
                 .or_insert_with(|| AtomicU64::new(0))
                 .value(),
             1,
         );
     }
 
-    pub fn record_jev_confidence(&self, confidence: f64) {
+    pub fn record_jev_confidence(&self, confidence: f64, family: &str) {
         let Some(state) = self.smart_routing_state() else {
             return;
         };
         state
             .jev_confidence
-            .entry("jev".into())
+            .entry(smart_routing_family_label(family))
             .or_insert_with(|| CompressionHistogram::new(SMART_ROUTING_SCORE_BUCKETS.len()))
             .observe(confidence.clamp(0.0, 1.0), &SMART_ROUTING_SCORE_BUCKETS);
     }
 
-    pub fn record_jev_latency(&self, latency_ms: f64) {
+    pub fn record_jev_latency(&self, latency_ms: f64, family: &str) {
         let Some(state) = self.smart_routing_state() else {
             return;
         };
         state
             .jev_latency
-            .entry("jev".into())
+            .entry(smart_routing_family_label(family))
             .or_insert_with(|| CompressionHistogram::new(SMART_ROUTING_LATENCY_BUCKETS_MS.len()))
             .observe(latency_ms, &SMART_ROUTING_LATENCY_BUCKETS_MS);
     }
 
-    pub fn record_jev_discovery_refresh(&self, status: &str) {
+    pub fn record_jev_discovery_refresh(&self, status: &str, family: &str) {
         let Some(state) = self.smart_routing_state() else {
             return;
         };
@@ -765,7 +779,7 @@ impl Metrics {
         saturating_atomic_add(
             state
                 .jev_discovery_refreshes
-                .entry(label)
+                .entry((label, smart_routing_family_label(family)))
                 .or_insert_with(|| AtomicU64::new(0))
                 .value(),
             1,
@@ -1858,44 +1872,44 @@ Total unicode_stego provider detections by category and phase\n",
             "filtered",
             &state.context_filtered,
         );
-        write_smart_routing_counter1(
-            out,
-            "obey_api_smart_routing_jev_consults_total",
-            "Total Jev classifier consultations",
-            "group",
-            &state.jev_consults,
-        );
-        write_smart_routing_counter1(
-            out,
-            "obey_api_smart_routing_jev_fallbacks_total",
-            "Total Jev classifier fallbacks by bounded reason",
-            "reason",
-            &state.jev_fallbacks,
-        );
-        write_smart_routing_histogram1(
-            out,
-            "obey_api_smart_routing_jev_confidence",
-            "Jev composite confidence",
-            "classifier",
-            &state.jev_confidence,
-            &SMART_ROUTING_SCORE_BUCKETS,
-        );
-        write_smart_routing_histogram1(
-            out,
-            "obey_api_smart_routing_jev_latency_ms",
-            "Jev classifier latency in milliseconds",
-            "classifier",
-            &state.jev_latency,
-            &SMART_ROUTING_LATENCY_BUCKETS_MS,
-        );
-        write_smart_routing_counter1(
-            out,
-            "obey_api_smart_routing_jev_discovery_refreshes_total",
-            "Jev model discovery refreshes by bounded status",
-            "status",
-            &state.jev_discovery_refreshes,
-        );
-    }
+    write_smart_routing_counter2(
+        out,
+        "obey_api_smart_routing_jev_consults_total",
+        "Total System One classifier consultations by family",
+        ["group", "family"],
+        &state.jev_consults,
+    );
+    write_smart_routing_counter2(
+        out,
+        "obey_api_smart_routing_jev_fallbacks_total",
+        "Total System One classifier fallbacks by bounded reason and family",
+        ["reason", "family"],
+        &state.jev_fallbacks,
+    );
+    write_smart_routing_histogram1(
+        out,
+        "obey_api_smart_routing_jev_confidence",
+        "System One composite confidence by family",
+        "family",
+        &state.jev_confidence,
+        &SMART_ROUTING_SCORE_BUCKETS,
+    );
+    write_smart_routing_histogram1(
+        out,
+        "obey_api_smart_routing_jev_latency_ms",
+        "System One classifier latency in milliseconds by family",
+        "family",
+        &state.jev_latency,
+        &SMART_ROUTING_LATENCY_BUCKETS_MS,
+    );
+    write_smart_routing_counter2(
+        out,
+        "obey_api_smart_routing_jev_discovery_refreshes_total",
+        "System One model discovery refreshes by bounded status and family",
+        ["status", "family"],
+        &state.jev_discovery_refreshes,
+    );
+}
 
     pub fn write_compression_prometheus(&self, out: &mut String) {
         self.write_smart_routing_prometheus(out);
@@ -2202,10 +2216,10 @@ Total unicode_stego provider detections by category and phase\n",
 /// fallback/cache/budget hooks have no Prometheus series yet and remain
 /// default no-ops.
 impl crate::smart_routing::SmartRoutingMetrics for Metrics {
-    fn jev_consult(&self, group: &str) {
-        self.record_jev_consult(group);
+    fn jev_consult(&self, group: &str, family: &str) {
+        self.record_jev_consult(group, family);
     }
-    fn jev_fallback(&self, reason: crate::smart_routing::ClassifierFailure) {
+    fn jev_fallback(&self, reason: crate::smart_routing::ClassifierFailure, family: &str) {
         let label = match reason {
             crate::smart_routing::ClassifierFailure::Unavailable => "model_unavailable",
             crate::smart_routing::ClassifierFailure::Timeout => "timeout",
@@ -2214,16 +2228,16 @@ impl crate::smart_routing::SmartRoutingMetrics for Metrics {
             crate::smart_routing::ClassifierFailure::LowConfidence => "low_confidence",
             crate::smart_routing::ClassifierFailure::NoJevAtEndpoint => "no_jev_at_endpoint",
         };
-        self.record_jev_fallback(label);
+        self.record_jev_fallback(label, family);
     }
-    fn jev_confidence(&self, confidence: f64) {
-        self.record_jev_confidence(confidence);
+    fn jev_confidence(&self, confidence: f64, family: &str) {
+        self.record_jev_confidence(confidence, family);
     }
-    fn jev_latency(&self, latency_ms: f64) {
-        self.record_jev_latency(latency_ms);
+    fn jev_latency(&self, latency_ms: f64, family: &str) {
+        self.record_jev_latency(latency_ms, family);
     }
-    fn jev_discovery_refresh(&self, status: &'static str) {
-        self.record_jev_discovery_refresh(status);
+    fn jev_discovery_refresh(&self, status: &'static str, family: &str) {
+        self.record_jev_discovery_refresh(status, family);
     }
 }
 
@@ -2463,28 +2477,31 @@ mod tests {
     }
 
     #[test]
-    fn smart_routing_jev_metrics_render_with_bounded_labels() {
-        let metrics = Metrics::new();
-        metrics.enable_smart_routing();
-        metrics.record_jev_consult("private-group");
-        metrics.record_jev_fallback("no_jev_at_endpoint");
-        metrics.record_jev_confidence(0.87);
-        metrics.record_jev_latency(123.0);
-        metrics.record_jev_discovery_refresh("success");
+fn smart_routing_jev_metrics_render_with_bounded_labels() {
+    let metrics = Metrics::new();
+    metrics.enable_smart_routing();
+    metrics.record_jev_consult("private-group", "jev");
+    metrics.record_jev_consult("private-group", "laya");
+    metrics.record_jev_fallback("no_jev_at_endpoint", "jev");
+    metrics.record_jev_confidence(0.87, "laya");
+    metrics.record_jev_latency(123.0, "jev");
+    metrics.record_jev_discovery_refresh("success", "laya");
 
-        let mut out = String::new();
-        metrics.write_smart_routing_prometheus(&mut out);
+    let mut out = String::new();
+    metrics.write_smart_routing_prometheus(&mut out);
 
-        assert!(out.contains("obey_api_smart_routing_jev_consults_total"));
-        assert!(out.contains(
-            "obey_api_smart_routing_jev_fallbacks_total{reason=\"no_jev_at_endpoint\"} 1"
-        ));
-        assert!(out.contains("obey_api_smart_routing_jev_confidence_bucket"));
-        assert!(out.contains("obey_api_smart_routing_jev_latency_ms_bucket"));
-        assert!(out.contains(
-            "obey_api_smart_routing_jev_discovery_refreshes_total{status=\"success\"} 1"
-        ));
-    }
+    assert!(out.contains("obey_api_smart_routing_jev_consults_total"));
+    assert!(out.contains(
+        "obey_api_smart_routing_jev_fallbacks_total{reason=\"no_jev_at_endpoint\",family=\"jev\"} 1"
+    ));
+    assert!(out.contains("obey_api_smart_routing_jev_confidence_bucket"));
+    assert!(out.contains("obey_api_smart_routing_jev_latency_ms_bucket"));
+    assert!(out.contains(
+        "obey_api_smart_routing_jev_discovery_refreshes_total{status=\"success\",family=\"laya\"} 1"
+    ));
+    // Family label is bounded: no unknown family series.
+    assert!(!out.contains("family=\"other\""));
+}
 
     #[test]
     fn test_metrics_initialization() {
