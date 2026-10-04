@@ -11,9 +11,9 @@ The gateway operates in two streaming modes depending on provider capabilities:
 | Mode | When Used | Behavior |
 |------|-----------|----------|
 | **True Pass-Through** | OpenAI-compatible providers | Upstream SSE chunks relayed in real time |
-| **Buffer-and-Replay** | Bedrock, XML tool rewrite, Codex OAuth, token sanitization | Response buffered, transformed, then re-chunked as SSE |
+| **Buffer-and-Replay** | Bedrock, XML tool rewrite, Codex OAuth, token sanitization, Smart Routing when Streaming Reliability (early event and keep-alive) is disabled | Response buffered, transformed, then re-chunked as SSE |
 
-Pass-through delivers the lowest latency; buffer-and-replay is used when the response needs transformation before delivery.
+Pass-through delivers the lowest latency; buffer-and-replay is used when the response needs transformation before delivery. With Streaming Reliability enabled, Smart Routing requests stream via pass-through over the Smart Routing provider order (tier candidates, then overflow); cascade escalation applies only to buffered responses.
 
 ---
 

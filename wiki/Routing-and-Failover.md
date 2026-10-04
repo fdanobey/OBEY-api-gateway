@@ -165,6 +165,10 @@ models:
     priority: 2      # Cheaper fallback
 ```
 
+### Smart Routing Tier Overflow
+
+When Smart Routing selects a tier, the models in that tier are tried first. If they are all unavailable (circuit open, cooldown) or fail, the rest of the group's context-safe models (untiered, other tiers, non-specialists) are tried next, in the same priority/cost/latency order. Models whose context window is too small for the request are never added. Pinned requests are unaffected.
+
 ---
 
 ## Context Window Management

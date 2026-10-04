@@ -381,9 +381,34 @@ pub enum StreamingResponse {
         model: String,
         compression: CompressionStats,
         concurrency_permit: ProviderConcurrencyPermit,
+        /// Smart Routing decision when Smart Routing applied (not bypassed);
+        /// `None` otherwise. Response cascade never runs for pass-through.
+        smart_routing: Option<crate::smart_routing::tier::RoutingDecision>,
     },
     /// Buffer-and-replay fallback: a complete response the handler re-chunks.
     Buffered(OpenAIResponse),
+}
+
+/// Attempt order plus Smart Routing context resolved for one request.
+struct RoutedProviders {
+    /// Group used for compression/failover (models = tier candidates when
+    /// Smart Routing applied).
+    model_group: ModelGroup,
+    /// Health-gated attempt order: tier candidates (sticky-promoted), then
+    /// context-safe overflow.
+    providers: Vec<ProviderModel>,
+    decision: Option<crate::smart_routing::tier::RoutingDecision>,
+    bypassed: bool,
+}
+
+/// Smart Routing forces buffer-and-replay only when Streaming Reliability
+/// (early SSE event / keep-alive) is disabled; pass-through disabled globally
+/// always buffers.
+fn streaming_requires_buffering(
+    streaming: &crate::config::StreamingConfig,
+    smart_routing_applied: bool,
+) -> bool {
+    !streaming.passthrough_enabled || (smart_routing_applied && !streaming.reliability_enabled())
 }
 
 /// OpenAI-compatible provider endpoint handled without request/response translation.
@@ -1416,6 +1441,87 @@ impl Router {
             )),
             Err(RoutingPlanningError::DisabledForModelGroup) => Ok(None),
         }
+    }
+
+    /// Resolve the provider attempt order for `request` (buffered and
+    /// streaming share this so ordering cannot drift).
+    ///
+    /// When Smart Routing applies, the tier-selected candidates come first,
+    /// followed by the plan's context-safe overflow (untiered models, other
+    /// tiers, non-specialists) as a soft tier fallback. Both lists are
+    /// health-gated and sorted by [`Self::select_provider_order`]; sticky
+    /// promotion applies only within the tier list so an overflow model is
+    /// never promoted ahead of tier candidates. Entries are de-duplicated by
+    /// `provider:model`.
+    async fn resolve_routed_providers(
+        &self,
+        request: &OpenAIRequest,
+        model_group: ModelGroup,
+    ) -> Result<RoutedProviders, GatewayError> {
+        let (tier_group, overflow, decision, bypassed) =
+            match self.smart_routing_plan(request, &model_group).await? {
+                Some(plan) => {
+                    let mut tier_group = model_group.clone();
+                    tier_group.models = plan.candidates;
+                    let overflow = if plan.bypassed {
+                        Vec::new()
+                    } else {
+                        plan.overflow
+                    };
+                    (tier_group, overflow, Some(plan.decision), plan.bypassed)
+                }
+                None => (model_group.clone(), Vec::new(), None, true),
+            };
+
+        let mut providers = self.select_provider_order(&tier_group).await;
+        // Cache-aware sticky routing (Req 1.2): promote the provider that
+        // last served this conversation prefix to the head of the list.
+        // Applied after `select_provider_order`'s health gates so an
+        // unhealthy sticky provider falls through to normal routing.
+        self.promote_sticky_provider(request, &mut providers).await;
+
+        if !overflow.is_empty() {
+            let mut overflow_group = model_group;
+            overflow_group.models = overflow;
+            let extra = self.select_provider_order(&overflow_group).await;
+            let mut seen: HashSet<String> = providers
+                .iter()
+                .map(|pm| format!("{}:{}", pm.provider, pm.model))
+                .collect();
+            providers.extend(
+                extra
+                    .into_iter()
+                    .filter(|pm| seen.insert(format!("{}:{}", pm.provider, pm.model))),
+            );
+        }
+
+        Ok(RoutedProviders {
+            model_group: tier_group,
+            providers,
+            decision,
+            bypassed,
+        })
+    }
+
+    /// Record the Smart Routing decision metric (no new labels).
+    fn record_smart_routing_decision_metric(
+        &self,
+        group: &str,
+        decision: &crate::smart_routing::tier::RoutingDecision,
+    ) {
+        self.metrics
+            .record_smart_routing_decision(crate::metrics::SmartRoutingDecisionMetric {
+                tier: smart_routing_tier_name(decision.tier),
+                classifier: smart_routing_classifier_name(decision.classifier),
+                group,
+                score: decision.score.value(),
+                estimated_cost_usd: 0.0,
+                classifier_latency_ms: 0.0,
+                task_type: smart_routing_task_name(decision.task_type),
+                quality: 0.0,
+                context_filtered: decision.context_filtered,
+                experiment: None,
+            });
     }
 
     /// Select provider order based on priority, cost, latency, and availability
@@ -8149,25 +8255,16 @@ visible content. Do not restate your plan and do not end your turn without doing
             handle.set_group(&model_group.name);
         }
 
-        let (model_group, mut routing_decision, routing_bypassed) = if let Some(plan) = self
-            .smart_routing_plan(&prepared_request, &model_group)
-            .await?
-        {
-            let mut filtered_group = model_group.clone();
-            filtered_group.models = plan.candidates;
-            (filtered_group, Some(plan.decision), plan.bypassed)
-        } else {
-            (model_group, None, true)
-        };
-
-        // Select provider order
-        let mut providers = self.select_provider_order(&model_group).await;
-        // Cache-aware sticky routing (Req 1.2): promote the provider that
-        // last served this conversation prefix to the head of the list.
-        // Applied after `select_provider_order`'s health gates so an
-        // unhealthy sticky provider falls through to normal routing.
-        self.promote_sticky_provider(&prepared_request, &mut providers)
-            .await;
+        // Provider order: Smart Routing tier candidates (sticky-promoted),
+        // then context-safe overflow; plain health-gated order otherwise.
+        let RoutedProviders {
+            model_group,
+            providers,
+            decision: mut routing_decision,
+            bypassed: routing_bypassed,
+        } = self
+            .resolve_routed_providers(&prepared_request, model_group)
+            .await?;
         // Drop explicitly excluded provider:model entries (streaming 429
         // fallback — see `route_request_streaming_excluding`).
         let providers = if exclude.is_empty() {
@@ -8260,20 +8357,7 @@ visible content. Do not restate your plan and do not end your turn without doing
             }
         }
         if let Some(decision) = routing_decision.filter(|_| !routing_bypassed) {
-            self.metrics.record_smart_routing_decision(
-                crate::metrics::SmartRoutingDecisionMetric {
-                    tier: smart_routing_tier_name(decision.tier),
-                    classifier: smart_routing_classifier_name(decision.classifier),
-                    group: &model_group.name,
-                    score: decision.score.value(),
-                    estimated_cost_usd: 0.0,
-                    classifier_latency_ms: 0.0,
-                    task_type: smart_routing_task_name(decision.task_type),
-                    quality: 0.0,
-                    context_filtered: decision.context_filtered,
-                    experiment: None,
-                },
-            );
+            self.record_smart_routing_decision_metric(&model_group.name, &decision);
             response.extra.insert(
                 "gateway_smart_routing".to_string(),
                 serde_json::to_value(decision).unwrap_or(serde_json::Value::Null),
@@ -8333,6 +8417,10 @@ visible content. Do not restate your plan and do not end your turn without doing
     ///
     /// - When `streaming.passthrough_enabled` is false → buffer the whole
     ///   request via [`Self::route_request`] (`Buffered`).
+    /// - When Smart Routing applies (not bypassed) and Streaming Reliability
+    ///   (early event / keep-alive) is disabled → buffer (`Buffered`). With
+    ///   Streaming Reliability enabled, pass-through walks the Smart Routing
+    ///   order (tier candidates, then context-safe overflow).
     /// - When the first eligible provider needs response transformation
     ///   (Bedrock / XML-tool rewrite / Kimi-Nano sanitization) or is a Codex
     ///   OAuth provider → buffer the whole request (`Buffered`).
@@ -8392,33 +8480,30 @@ visible content. Do not restate your plan and do not end your turn without doing
         if let Some(handle) = &active {
             handle.set_group(&model_group.name);
         }
-        let routing_plan = self
-            .smart_routing_plan(&prepared_request, &model_group)
+        // Same ordering as the buffered path: Smart Routing tier candidates
+        // (sticky-promoted) then context-safe overflow.
+        let RoutedProviders {
+            model_group,
+            providers,
+            decision: routing_decision,
+            bypassed: routing_bypassed,
+        } = self
+            .resolve_routed_providers(&prepared_request, model_group)
             .await?;
-        let (model_group, routing_decision, routing_bypassed) = if let Some(plan) = routing_plan {
-            let mut filtered_group = model_group.clone();
-            filtered_group.models = plan.candidates;
-            (filtered_group, Some(plan.decision), plan.bypassed)
-        } else {
-            (model_group, None, true)
-        };
-        let mut providers = self.select_provider_order(&model_group).await;
-        // Cache-aware sticky routing (Req 1.2): promote the sticky provider
-        // for this prefix after the health gates inside
-        // `select_provider_order` (mirrors the buffered path).
-        self.promote_sticky_provider(&prepared_request, &mut providers)
-            .await;
         if providers.is_empty() {
             return Err(GatewayError::InvalidRequest(
                 "No available providers for model".to_string(),
             ));
         }
 
-        // Pass-through disabled globally → buffer the whole request.
-        if !streaming_config.passthrough_enabled
-            || (routing_decision.is_some() && !routing_bypassed)
-        {
-            debug!("Streaming pass-through disabled, using buffered path");
+        // Pass-through disabled globally, or Smart Routing applied without
+        // Streaming Reliability → buffer the whole request.
+        let smart_routing_applied = routing_decision.is_some() && !routing_bypassed;
+        if streaming_requires_buffering(&streaming_config, smart_routing_applied) {
+            debug!(
+                smart_routing_applied,
+                "Streaming pass-through disabled or Smart Routing without Streaming Reliability, using buffered path"
+            );
             return Ok(StreamingResponse::Buffered(
                 self.route_request(request, active.clone()).await?,
             ));
@@ -8944,12 +9029,21 @@ visible content. Do not restate your plan and do not end your turn without doing
 
         // Success — hand the live streaming body and permit to the caller.
         // The handler keeps both alive until the relay finishes or is dropped.
+        // The Smart Routing metric is recorded only on the primary attempt so
+        // pre-content failover re-plans do not double count.
+        let smart_routing = routing_decision.filter(|_| !routing_bypassed);
+        if exclude.is_empty() {
+            if let Some(decision) = smart_routing.as_ref() {
+                self.record_smart_routing_decision_metric(&model_group.name, decision);
+            }
+        }
         Ok(StreamingResponse::PassThrough {
             byte_stream: response,
             provider: provider_model.provider.clone(),
             model: provider_model.model.clone(),
             compression,
             concurrency_permit,
+            smart_routing,
         })
     }
 
@@ -12164,6 +12258,278 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(direct, router.select_provider_order(&group).await);
+    }
+
+    /// Model with an explicit Smart Routing tier and context window.
+    fn sr_model(
+        provider: &str,
+        model: &str,
+        priority: u32,
+        tier: Option<crate::smart_routing::tier::SmartRoutingTier>,
+        context_window: u32,
+    ) -> ProviderModel {
+        let mut pm = test_model_named(provider, model, priority);
+        pm.tier = tier;
+        pm.context_window = context_window;
+        pm
+    }
+
+    const POWERFUL: Option<crate::smart_routing::tier::SmartRoutingTier> =
+        Some(crate::smart_routing::tier::SmartRoutingTier::Powerful);
+
+    /// Smart Routing enabled; only `Powerful` is tagged in each test group so
+    /// adjacent-tier fallback always lands on it regardless of the score.
+    fn smart_routing_config() -> Config {
+        let mut config = create_test_config();
+        config.smart_routing.enabled = true;
+        config.retry.max_retries_per_provider = 0;
+        config
+    }
+
+    fn smart_routing_request(stream: bool) -> OpenAIRequest {
+        OpenAIRequest {
+            model: "test-group".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+                extra: Default::default(),
+            }],
+            stream,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn sse_done_mock() -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string("data: [DONE]\n\n")
+    }
+
+    #[test]
+    fn streaming_requires_buffering_gate_table() {
+        let reliable = crate::config::StreamingConfig::default();
+        let unreliable = crate::config::StreamingConfig {
+            emit_early_event: false,
+            keepalive_interval_seconds: 0,
+            ..crate::config::StreamingConfig::default()
+        };
+        let no_passthrough = crate::config::StreamingConfig {
+            passthrough_enabled: false,
+            ..crate::config::StreamingConfig::default()
+        };
+        assert!(streaming_requires_buffering(&no_passthrough, true));
+        assert!(streaming_requires_buffering(&no_passthrough, false));
+        assert!(!streaming_requires_buffering(&reliable, true));
+        assert!(streaming_requires_buffering(&unreliable, true));
+        assert!(!streaming_requires_buffering(&unreliable, false));
+    }
+
+    #[tokio::test]
+    async fn smart_routing_untiered_models_only_overflow_after_tier_candidates() {
+        let mut config = smart_routing_config();
+        let group = test_group(vec![
+            sr_model("cheap", "m-cheap", 1, None, 200_000),
+            sr_model("tier", "m-tier", 50, POWERFUL, 200_000),
+            sr_model("backup", "m-backup", 10, None, 200_000),
+        ]);
+        config.model_groups = vec![group.clone()];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let routed = router
+            .resolve_routed_providers(&smart_routing_request(false), group)
+            .await
+            .unwrap();
+        let order: Vec<&str> = routed.providers.iter().map(|pm| pm.provider.as_str()).collect();
+        assert_eq!(order, vec!["tier", "cheap", "backup"]);
+        assert!(routed.decision.is_some());
+        assert!(!routed.bypassed);
+        // Failover group stays the tier-selected set (decision tier unchanged).
+        assert_eq!(routed.model_group.models.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn smart_routing_overflow_excludes_context_unsafe_models() {
+        let mut config = smart_routing_config();
+        let group = test_group(vec![
+            sr_model("tier", "m-tier", 1, POWERFUL, 200_000),
+            sr_model("tiny", "m-tiny", 2, None, 100),
+            sr_model("unknown", "m-unknown", 3, None, 0),
+            sr_model("safe", "m-safe", 4, None, 200_000),
+        ]);
+        config.model_groups = vec![group.clone()];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let routed = router
+            .resolve_routed_providers(&smart_routing_request(false), group)
+            .await
+            .unwrap();
+        let order: Vec<&str> = routed.providers.iter().map(|pm| pm.provider.as_str()).collect();
+        assert_eq!(order, vec!["tier", "safe"]);
+    }
+
+    #[tokio::test]
+    async fn smart_routing_overflow_serves_request_when_tier_candidates_unavailable() {
+        use wiremock::matchers::{body_string_contains, method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"m-overflow-first\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = smart_routing_config();
+        config.circuit_breaker.failure_threshold = 1;
+        config.providers = ["tier-cooled", "tier-open", "overflow-first", "overflow-second"]
+            .into_iter()
+            .map(|name| test_provider(name, server.uri()))
+            .collect();
+        config.model_groups = vec![test_group(vec![
+            sr_model("tier-cooled", "m-tier-cooled", 1, POWERFUL, 200_000),
+            sr_model("tier-open", "m-tier-open", 2, POWERFUL, 200_000),
+            sr_model("overflow-second", "m-overflow-second", 20, None, 200_000),
+            sr_model("overflow-first", "m-overflow-first", 10, None, 200_000),
+        ])];
+        let metrics = test_metrics();
+        let router = Router::new(Arc::new(RwLock::new(config)), metrics.clone());
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        metrics.set_provider_cooldown("tier-cooled", "rate limited".to_string(), now_secs + 300);
+        router
+            .get_circuit_breaker("tier-open:m-tier-open")
+            .await
+            .record_failure()
+            .await;
+
+        let response = router
+            .route_request(&smart_routing_request(false), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("overflow-first"))
+        );
+        assert_eq!(
+            response.extra["gateway_smart_routing"]["tier"],
+            serde_json::json!("powerful")
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn smart_routing_streaming_passthrough_when_reliability_enabled() {
+        use wiremock::matchers::{body_string_contains, method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"stream\":true"))
+            .respond_with(sse_done_mock())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = smart_routing_config();
+        config.providers = vec![test_provider("tier", server.uri())];
+        config.model_groups = vec![test_group(vec![sr_model(
+            "tier", "m-tier", 1, POWERFUL, 200_000,
+        )])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let response = router
+            .route_request_streaming(&smart_routing_request(true), None)
+            .await
+            .unwrap();
+        let StreamingResponse::PassThrough {
+            smart_routing: Some(decision),
+            ..
+        } = response
+        else {
+            panic!("Smart Routing with Streaming Reliability must use pass-through");
+        };
+        assert_eq!(decision.tier, POWERFUL.unwrap());
+    }
+
+    #[tokio::test]
+    async fn smart_routing_streaming_buffers_when_reliability_disabled() {
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = smart_routing_config();
+        config.streaming = Some(crate::config::StreamingConfig {
+            emit_early_event: false,
+            keepalive_interval_seconds: 0,
+            ..Default::default()
+        });
+        config.providers = vec![test_provider("tier", server.uri())];
+        config.model_groups = vec![test_group(vec![sr_model(
+            "tier", "m-tier", 1, POWERFUL, 200_000,
+        )])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let response = router
+            .route_request_streaming(&smart_routing_request(true), None)
+            .await
+            .unwrap();
+        let StreamingResponse::Buffered(response) = response else {
+            panic!("Smart Routing without Streaming Reliability must buffer");
+        };
+        assert!(response.extra.contains_key("gateway_smart_routing"));
+    }
+
+    #[tokio::test]
+    async fn smart_routing_streaming_passthrough_reaches_overflow_candidate() {
+        use wiremock::matchers::{body_string_contains, method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"m-overflow\""))
+            .respond_with(sse_done_mock())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = smart_routing_config();
+        config.providers = vec![
+            test_provider("tier-cooled", server.uri()),
+            test_provider("overflow", server.uri()),
+        ];
+        config.model_groups = vec![test_group(vec![
+            sr_model("tier-cooled", "m-tier-cooled", 1, POWERFUL, 200_000),
+            sr_model("overflow", "m-overflow", 10, None, 200_000),
+        ])];
+        let metrics = test_metrics();
+        let router = Router::new(Arc::new(RwLock::new(config)), metrics.clone());
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        metrics.set_provider_cooldown("tier-cooled", "rate limited".to_string(), now_secs + 300);
+
+        let response = router
+            .route_request_streaming(&smart_routing_request(true), None)
+            .await
+            .unwrap();
+        let StreamingResponse::PassThrough {
+            provider,
+            smart_routing,
+            ..
+        } = response
+        else {
+            panic!("overflow candidate must be reachable via pass-through");
+        };
+        assert_eq!(provider, "overflow");
+        assert!(smart_routing.is_some());
     }
 
     #[tokio::test]

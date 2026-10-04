@@ -1206,6 +1206,14 @@ impl Default for StreamingConfig {
     }
 }
 
+impl StreamingConfig {
+    /// Streaming Reliability is active when the early synthetic SSE event or a
+    /// custom keep-alive interval is enabled (`0` = axum default = disabled).
+    pub fn reliability_enabled(&self) -> bool {
+        self.emit_early_event || self.keepalive_interval_seconds > 0
+    }
+}
+
 fn default_keepalive_interval() -> u64 {
     5
 }
@@ -1268,6 +1276,21 @@ fn default_keys_db_path() -> String {
 #[cfg(test)]
 mod streaming_config_tests {
     use super::*;
+
+    #[test]
+    fn streaming_reliability_enabled_reflects_early_event_and_keepalive() {
+        assert!(StreamingConfig::default().reliability_enabled());
+        for (emit_early_event, keepalive_interval_seconds, expected) in
+            [(false, 0, false), (false, 10, true), (true, 0, true)]
+        {
+            let cfg = StreamingConfig {
+                emit_early_event,
+                keepalive_interval_seconds,
+                ..StreamingConfig::default()
+            };
+            assert_eq!(cfg.reliability_enabled(), expected);
+        }
+    }
 
     // Streaming Reliability, Task 1.3: StreamingConfig deserialization
     // **Validates: Requirements 7.3**

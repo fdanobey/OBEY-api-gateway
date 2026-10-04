@@ -253,6 +253,9 @@ pub trait AbRoutingHook: Send + Sync {
 pub struct CandidatePlan {
     pub decision: RoutingDecision,
     pub candidates: Vec<ProviderModel>,
+    /// Context-safe group models not selected by tier filtering, in group order.
+    /// Tried after `candidates` (soft tier fallback). Empty when bypassed.
+    pub overflow: Vec<ProviderModel>,
     pub excluded_for_context: usize,
     pub estimated_context_tokens: u64,
     pub bypassed: bool,
@@ -563,6 +566,20 @@ impl SmartRouter {
                 input.pinned_context,
             );
         }
+        let overflow = if tier_filter.bypassed {
+            Vec::new()
+        } else {
+            let mut seen: std::collections::HashSet<(String, String)> = candidates
+                .iter()
+                .map(|candidate| (candidate.provider.clone(), candidate.model.clone()))
+                .collect();
+            context_safe_group
+                .models
+                .iter()
+                .filter(|model| seen.insert((model.provider.clone(), model.model.clone())))
+                .cloned()
+                .collect()
+        };
 
         let decision = RoutingDecision {
             score: selected.score,
@@ -585,6 +602,7 @@ impl SmartRouter {
         Ok(RoutingPlanOutcome::Route(CandidatePlan {
             decision,
             candidates,
+            overflow,
             excluded_for_context,
             estimated_context_tokens,
             bypassed: tier_filter.bypassed,
@@ -1163,6 +1181,62 @@ mod tests {
             model_group: group,
             pinned_context: pinned,
         }
+    }
+
+    fn overflow_group() -> ModelGroup {
+        let mut untiered = candidate("untiered", 200_000, SmartRoutingTier::Powerful);
+        untiered.tier = None;
+        let mut too_small = candidate("too-small", 100, SmartRoutingTier::Powerful);
+        too_small.tier = None;
+        group(vec![
+            candidate("tier-pick", 200_000, SmartRoutingTier::Powerful),
+            untiered,
+            too_small,
+        ])
+    }
+
+    fn model_names(models: &[ProviderModel]) -> Vec<&str> {
+        models.iter().map(|model| model.model.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn plan_overflow_lists_context_safe_non_candidates() {
+        let router = SmartRouter::new(config(ClassifierMode::Heuristic)).unwrap();
+        let request = request("hello");
+        let group = overflow_group();
+        let pinned = PinnedRoutingContext::default();
+
+        let RoutingPlanOutcome::Route(plan) = router
+            .plan(&input(&request, &group, &pinned))
+            .await
+            .unwrap()
+        else {
+            panic!("routing should continue");
+        };
+        assert!(!plan.bypassed);
+        assert_eq!(model_names(&plan.candidates), vec!["tier-pick"]);
+        assert_eq!(model_names(&plan.overflow), vec!["untiered"]);
+    }
+
+    #[tokio::test]
+    async fn plan_overflow_is_empty_when_bypassed() {
+        let router = SmartRouter::new(config(ClassifierMode::Heuristic)).unwrap();
+        let request = request("hello");
+        let group = overflow_group();
+        let pinned = PinnedRoutingContext {
+            model: Some("tier-pick".to_string()),
+            ..Default::default()
+        };
+
+        let RoutingPlanOutcome::Route(plan) = router
+            .plan(&input(&request, &group, &pinned))
+            .await
+            .unwrap()
+        else {
+            panic!("routing should continue");
+        };
+        assert!(plan.bypassed);
+        assert!(plan.overflow.is_empty());
     }
 
     #[tokio::test]

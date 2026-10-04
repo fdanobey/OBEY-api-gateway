@@ -2404,7 +2404,7 @@ async fn chat_completions_stream(
                             }
                             yield Ok(Event::default().data("[DONE]"));
                         }
-                        Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit }) => {
+                        Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit, .. }) => {
                             // True streaming pass-through (Req 3.1, 3.2). The early event
                             // above already reset the client idle timer; now relay the
                             // upstream chunks verbatim.
@@ -2688,7 +2688,7 @@ async fn chat_completions_stream(
                                                 .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
                                                 .await
                                             {
-                                                Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit }) => {
+                                                Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit, .. }) => {
                                                     _current_concurrency_permit = Some(concurrency_permit);
                                                     current_stream = byte_stream;
                                                     current_provider = provider;
@@ -2773,7 +2773,7 @@ async fn chat_completions_stream(
                                             // Another eligible provider — relay it,
                                             // reusing the SAME early-event id (Req 4.4:
                                             // do NOT emit a second role event).
-        Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit }) => {
+        Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit, .. }) => {
         _current_concurrency_permit = Some(concurrency_permit);
         current_stream = byte_stream;
                                                 current_provider = provider;
@@ -3438,6 +3438,7 @@ async fn stream_eager_structured_output(
             model,
             compression,
             concurrency_permit,
+            smart_routing,
         }) => {
             let _concurrency_permit = concurrency_permit;
             let mut buffer = guardrail_stream::SseBuffer::with_default_cap();
@@ -3549,6 +3550,14 @@ async fn stream_eager_structured_output(
                 serde_json::to_value(compression)
                     .expect("CompressionStats serialization must succeed"),
             );
+            // Pass-through carries the Smart Routing decision so the existing
+            // `smart_routing_headers` call below emits headers here too.
+            if let Some(decision) = smart_routing {
+                response.extra.insert(
+                    "gateway_smart_routing".to_owned(),
+                    serde_json::to_value(decision).unwrap_or(serde_json::Value::Null),
+                );
+            }
             response
         }
         Err(error) => {
@@ -9909,6 +9918,7 @@ async fn responses_create_stream(
             model,
             compression: _,
             concurrency_permit: _,
+            smart_routing: _,
         }) => {
             let store = request.store;
             let request_model = request.model.clone();
