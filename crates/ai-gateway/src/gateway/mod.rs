@@ -434,10 +434,11 @@ impl GatewayServer {
         ));
 
         // --- Admin panel (Req 13.1-13.18) ---
-        let (admin_enabled, admin_path, dashboard_enabled, dashboard_path, prometheus_cfg) = {
+        let (admin_enabled, admin_auth_enabled, admin_path, dashboard_enabled, dashboard_path, prometheus_cfg) = {
             let cfg = self.state.config.try_read().expect("config lock");
             (
                 cfg.admin.enabled,
+                cfg.admin.auth.enabled,
                 cfg.admin.path.clone(),
                 cfg.dashboard.enabled,
                 cfg.dashboard.path.clone(),
@@ -462,6 +463,9 @@ impl GatewayServer {
         if admin_enabled {
             tracing::info!(path = %admin_path, "Mounting admin routes");
             router = router.nest(&admin_path, admin::admin_routes(self.state.clone()));
+            if let Some(message) = admin_auth_warning(admin_enabled, admin_auth_enabled) {
+                tracing::warn!("{}", message);
+            }
         } else {
             tracing::warn!("Admin routes are disabled by configuration");
         }
@@ -728,6 +732,27 @@ impl GatewayServer {
             .allow_origin(origins)
             .allow_methods(methods)
             .allow_headers(headers)
+    }
+}
+
+/// Returns the startup WARN message when the admin panel is mounted but its
+/// authentication is disabled, otherwise `None`. Config defaults are left
+/// unchanged (back-compat for existing deployments that rely on open admin);
+/// this surfaces the open-access risk at startup instead of silently serving
+/// unauthenticated admin endpoints.
+pub(crate) fn admin_auth_warning(
+    admin_enabled: bool,
+    admin_auth_enabled: bool,
+) -> Option<&'static str> {
+    if admin_enabled && !admin_auth_enabled {
+        Some(
+            "Admin panel is ENABLED but admin.auth.enabled is false: the admin \
+             endpoints are UNAUTHENTICATED and reachable by anyone who can reach \
+             the port. Set admin.auth.enabled = true with admin.auth.username_env \
+             and admin.auth.password_env to secure them.",
+        )
+    } else {
+        None
     }
 }
 
@@ -1012,6 +1037,27 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use proptest::prelude::*;
     use tower::ServiceExt;
+
+    #[test]
+    fn admin_auth_warning_present_when_disabled() {
+        let msg = admin_auth_warning(true, false);
+        assert!(msg.is_some(), "warning returned when admin auth is disabled");
+        let text = msg.unwrap();
+        assert!(
+            text.contains("UNAUTHENTICATED"),
+            "warning names the unauthenticated risk"
+        );
+    }
+
+    #[test]
+    fn admin_auth_warning_absent_when_enabled() {
+        assert!(admin_auth_warning(true, true).is_none());
+    }
+
+    #[test]
+    fn admin_auth_warning_absent_when_admin_disabled() {
+        assert!(admin_auth_warning(false, false).is_none());
+    }
 
     fn minimal_config() -> Config {
         Config {
