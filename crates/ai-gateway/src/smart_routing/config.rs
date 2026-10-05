@@ -313,6 +313,20 @@ impl Default for ClassifierMode {
     }
 }
 
+impl ClassifierMode {
+    /// Config spelling, used as a content-free log label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Heuristic => "heuristic",
+            Self::Ml => "ml",
+            Self::Llm => "llm",
+            Self::Composite => "composite",
+            Self::Jev => "jev",
+            Self::Laya => "laya",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TierBoundaries {

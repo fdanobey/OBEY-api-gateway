@@ -75,6 +75,9 @@ pub struct ActiveRequestInfo {
     /// Epoch milliseconds when the request started.
     pub started_at_ms: i64,
     pub kind: RequestKind,
+    /// The per-request Smart Routing decision line was already logged.
+    #[serde(skip)]
+    pub smart_routing_logged: bool,
 }
 
 impl ActiveRequestInfo {
@@ -128,6 +131,16 @@ impl ActiveRequestHandle {
         if let Ok(mut info) = self.0.lock() {
             info.last_error = Some(error.to_string());
         }
+    }
+
+    /// Returns the trace id the first time it is called for this request and
+    /// `None` afterwards, so re-plans do not log the routing decision twice.
+    pub fn claim_smart_routing_log(&self) -> Option<String> {
+        let mut info = self.0.lock().ok()?;
+        if std::mem::replace(&mut info.smart_routing_logged, true) {
+            return None;
+        }
+        Some(info.trace_id.clone())
     }
 }
 
@@ -223,7 +236,16 @@ mod tests {
                 .unwrap()
                 .as_millis() as i64,
             kind: RequestKind::Chat,
+            smart_routing_logged: false,
         }
+    }
+
+    #[test]
+    fn smart_routing_log_is_claimed_once_per_request() {
+        let handle = ActiveRequestRegistry::new().register(sample_info("trace-4"));
+        assert_eq!(handle.claim_smart_routing_log().as_deref(), Some("trace-4"));
+        assert_eq!(handle.claim_smart_routing_log(), None);
+        assert_eq!(handle.clone().claim_smart_routing_log(), None);
     }
 
     #[test]

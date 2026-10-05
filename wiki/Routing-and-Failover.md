@@ -169,6 +169,16 @@ models:
 
 When Smart Routing selects a tier, the models in that tier are tried first. If they are all unavailable (circuit open, cooldown) or fail, the rest of the group's context-safe models (untiered, other tiers, non-specialists) are tried next, in the same priority/cost/latency order. Models whose context window is too small for the request are never added. Pinned requests are unaffected.
 
+### Smart Routing Decision Log
+
+Each completed request with a (non-bypassed) Smart Routing decision logs one content-free INFO line, at most once per request even when a streaming request fails over and is re-planned, so `journalctl -u obey-api-gateway -f` shows why a tier was chosen:
+
+```
+INFO Smart routing decision trace_id=... group=coding tier=balanced score=0.412 classifier_configured=jev classifier_used=heuristic task_type=code_generation blended=false fallback_reason=low_confidence candidates=2 overflow=3 context_filtered=false escalated=false classifier_latency_ms=184.0
+```
+
+`fallback_reason` appears when the configured classifier fell back to the heuristic: `low_confidence`, `timeout`, `backend` (HTTP/auth/transport), `unavailable` (classifier or model not reachable), `invalid_output`, or `no_jev_at_endpoint`. With `fallback_policy: blend`, a low-confidence System One score is mixed with the heuristic instead: `classifier_used=jev blended=true confidence=...`. Failures other than low confidence also log a WARN (`Smart routing classifier failed`) at most once per 60 s per classifier and reason. A System One HTTP failure logs a second rate-limited WARN (`System One classifier call failed`) with the error class and HTTP status. With `fallback_policy: fallback`, the confidence that missed the threshold is logged at DEBUG (`System One low confidence; using heuristic`). Pinned and bypassed requests log no decision line. Requests that fail on every provider log no line, the same as the decision metric.
+
 ---
 
 ## Context Window Management

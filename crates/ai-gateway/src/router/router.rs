@@ -29,7 +29,8 @@ use crate::providers::{ProviderClient, ProviderResponse};
 use crate::reasoning_compat::{self, AttemptReport};
 use crate::smart_routing::budget_controller::BudgetController;
 use crate::smart_routing::{
-    PinnedRoutingContext, RoutingPlanOutcome, RoutingPlanningError, SmartRouter, SmartRoutingInput,
+    PinnedRoutingContext, RoutingDiagnostics, RoutingPlanOutcome, RoutingPlanningError,
+    SmartRouter, SmartRoutingInput,
 };
 use dashmap::DashMap;
 use std::collections::HashSet;
@@ -399,6 +400,83 @@ struct RoutedProviders {
     providers: Vec<ProviderModel>,
     decision: Option<crate::smart_routing::tier::RoutingDecision>,
     bypassed: bool,
+    /// Decision-log facts; default when Smart Routing did not plan.
+    diagnostics: RoutingDiagnostics,
+}
+
+/// Content-free fields of the per-request `Smart routing decision` INFO line
+/// (no request/response text, no user identifiers).
+#[derive(Debug, PartialEq)]
+struct SmartRoutingDecisionLog {
+    tier: &'static str,
+    score: f64,
+    classifier_configured: &'static str,
+    classifier_used: &'static str,
+    task_type: &'static str,
+    confidence: Option<f64>,
+    blended: bool,
+    fallback_reason: Option<&'static str>,
+    candidates: usize,
+    overflow: usize,
+    context_filtered: bool,
+    escalated: bool,
+    classifier_latency_ms: Option<f64>,
+}
+
+impl SmartRoutingDecisionLog {
+    fn new(
+        decision: &crate::smart_routing::tier::RoutingDecision,
+        diagnostics: &RoutingDiagnostics,
+    ) -> Self {
+        let round3 = |value: f64| (value * 1_000.0).round() / 1_000.0;
+        Self {
+            tier: smart_routing_tier_name(decision.tier),
+            score: round3(decision.score.value()),
+            classifier_configured: diagnostics.classifier_configured.as_str(),
+            classifier_used: smart_routing_classifier_name(decision.classifier),
+            task_type: smart_routing_task_name(decision.task_type),
+            confidence: decision.classifier_confidence.map(round3),
+            blended: diagnostics.blended,
+            fallback_reason: diagnostics.fallback_reason.map(|reason| reason.as_str()),
+            candidates: diagnostics.candidates,
+            overflow: diagnostics.overflow,
+            context_filtered: decision.context_filtered,
+            escalated: decision.escalated,
+            classifier_latency_ms: diagnostics.classifier_latency_ms.map(f64::round),
+        }
+    }
+
+    fn emit(&self, group: &str, active: Option<&ActiveRequestHandle>) {
+        // Once per request: a streaming re-plan that lands on the buffered
+        // path (or re-streams) must not log a second, possibly different line.
+        let trace_id = match active {
+            Some(handle) => match handle.claim_smart_routing_log() {
+                Some(trace_id) => Some(trace_id),
+                None => return,
+            },
+            None => None,
+        };
+        // Display (unquoted) string values match the gateway's key=value
+        // style; `None` options are omitted from the line.
+        info!(
+            trace_id = trace_id.as_deref().map(tracing::field::display),
+            group = %group,
+            tier = %self.tier,
+            score = self.score,
+            classifier_configured = %self.classifier_configured,
+            classifier_used = %self.classifier_used,
+            task_type = %self.task_type,
+            confidence = self.confidence,
+            blended = self.blended,
+            fallback_reason = self.fallback_reason.map(tracing::field::display),
+            candidates = self.candidates,
+            overflow = self.overflow,
+            context_filtered = self.context_filtered,
+            escalated = self.escalated,
+            classifier_latency_ms = self.classifier_latency_ms,
+            "Smart routing decision"
+        );
+    }
 }
 
 /// Smart Routing forces buffer-and-replay only when Streaming Reliability
@@ -1458,7 +1536,7 @@ impl Router {
         request: &OpenAIRequest,
         model_group: ModelGroup,
     ) -> Result<RoutedProviders, GatewayError> {
-        let (tier_group, overflow, decision, bypassed) =
+        let (tier_group, overflow, decision, bypassed, diagnostics) =
             match self.smart_routing_plan(request, &model_group).await? {
                 Some(plan) => {
                     let mut tier_group = model_group.clone();
@@ -1468,9 +1546,21 @@ impl Router {
                     } else {
                         plan.overflow
                     };
-                    (tier_group, overflow, Some(plan.decision), plan.bypassed)
+                    (
+                        tier_group,
+                        overflow,
+                        Some(plan.decision),
+                        plan.bypassed,
+                        plan.diagnostics,
+                    )
                 }
-                None => (model_group.clone(), Vec::new(), None, true),
+                None => (
+                    model_group.clone(),
+                    Vec::new(),
+                    None,
+                    true,
+                    RoutingDiagnostics::default(),
+                ),
             };
 
         let mut providers = self.select_provider_order(&tier_group).await;
@@ -1500,6 +1590,7 @@ impl Router {
             providers,
             decision,
             bypassed,
+            diagnostics,
         })
     }
 
@@ -8262,6 +8353,7 @@ visible content. Do not restate your plan and do not end your turn without doing
             providers,
             decision: mut routing_decision,
             bypassed: routing_bypassed,
+            diagnostics: routing_diagnostics,
         } = self
             .resolve_routed_providers(&prepared_request, model_group)
             .await?;
@@ -8358,6 +8450,8 @@ visible content. Do not restate your plan and do not end your turn without doing
         }
         if let Some(decision) = routing_decision.filter(|_| !routing_bypassed) {
             self.record_smart_routing_decision_metric(&model_group.name, &decision);
+            SmartRoutingDecisionLog::new(&decision, &routing_diagnostics)
+                .emit(&model_group.name, active.as_ref());
             response.extra.insert(
                 "gateway_smart_routing".to_string(),
                 serde_json::to_value(decision).unwrap_or(serde_json::Value::Null),
@@ -8487,6 +8581,7 @@ visible content. Do not restate your plan and do not end your turn without doing
             providers,
             decision: routing_decision,
             bypassed: routing_bypassed,
+            diagnostics: routing_diagnostics,
         } = self
             .resolve_routed_providers(&prepared_request, model_group)
             .await?;
@@ -9035,6 +9130,8 @@ visible content. Do not restate your plan and do not end your turn without doing
         if exclude.is_empty() {
             if let Some(decision) = smart_routing.as_ref() {
                 self.record_smart_routing_decision_metric(&model_group.name, decision);
+                SmartRoutingDecisionLog::new(decision, &routing_diagnostics)
+                    .emit(&model_group.name, active.as_ref());
             }
         }
         Ok(StreamingResponse::PassThrough {
@@ -11890,6 +11987,7 @@ mod tests {
             virtual_key_id: None,
             started_at_ms: 0,
             kind: crate::active_requests::RequestKind::Chat,
+            smart_routing_logged: false,
         })));
         let result = router
             .route_request(&compression_request(false), Some(handle.clone()))
@@ -12347,6 +12445,61 @@ mod tests {
         assert!(!routed.bypassed);
         // Failover group stays the tier-selected set (decision tier unchanged).
         assert_eq!(routed.model_group.models.len(), 1);
+        assert_eq!(
+            (routed.diagnostics.candidates, routed.diagnostics.overflow),
+            (1, 2)
+        );
+    }
+
+    #[test]
+    fn smart_routing_decision_log_fields_are_rounded_and_labeled() {
+        use crate::smart_routing::config::ClassifierMode;
+        use crate::smart_routing::tier::{
+            ClassifierUsed, ComplexityScore, RoutingDecision, SmartRoutingTier, TaskType,
+        };
+        use crate::smart_routing::ClassifierFailure;
+
+        let decision = RoutingDecision {
+            score: ComplexityScore::new(0.123_456),
+            adjusted_score: ComplexityScore::new(0.123_456),
+            tier: SmartRoutingTier::Balanced,
+            task_type: TaskType::CodeGeneration,
+            classifier: ClassifierUsed::Heuristic,
+            escalated: false,
+            escalation_count: 0,
+            cache_hit: false,
+            budget_downgraded: false,
+            context_filtered: true,
+            classifier_confidence: Some(0.456_789),
+            resolved_model: None,
+        };
+        let diagnostics = RoutingDiagnostics {
+            classifier_configured: ClassifierMode::Jev,
+            fallback_reason: Some(ClassifierFailure::LowConfidence),
+            blended: false,
+            classifier_latency_ms: Some(41.6),
+            candidates: 2,
+            overflow: 3,
+        };
+
+        assert_eq!(
+            SmartRoutingDecisionLog::new(&decision, &diagnostics),
+            SmartRoutingDecisionLog {
+                tier: "balanced",
+                score: 0.123,
+                classifier_configured: "jev",
+                classifier_used: "heuristic",
+                task_type: "code_generation",
+                confidence: Some(0.457),
+                blended: false,
+                fallback_reason: Some("low_confidence"),
+                candidates: 2,
+                overflow: 3,
+                context_filtered: true,
+                escalated: false,
+                classifier_latency_ms: Some(42.0),
+            }
+        );
     }
 
     #[tokio::test]
@@ -12439,9 +12592,25 @@ mod tests {
             "tier", "m-tier", 1, POWERFUL, 200_000,
         )])];
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let handle = crate::active_requests::ActiveRequestRegistry::new().register(
+            crate::active_requests::ActiveRequestInfo {
+                trace_id: "sr-trace".to_string(),
+                requested_model: "test-group".to_string(),
+                model_group: None,
+                provider: None,
+                model: None,
+                attempt: 0,
+                phase: ActivePhase::Pending,
+                last_error: None,
+                virtual_key_id: None,
+                started_at_ms: 0,
+                kind: crate::active_requests::RequestKind::Stream,
+                smart_routing_logged: false,
+            },
+        );
 
         let response = router
-            .route_request_streaming(&smart_routing_request(true), None)
+            .route_request_streaming(&smart_routing_request(true), Some(handle.clone()))
             .await
             .unwrap();
         let StreamingResponse::PassThrough {
@@ -12452,6 +12621,9 @@ mod tests {
             panic!("Smart Routing with Streaming Reliability must use pass-through");
         };
         assert_eq!(decision.tier, POWERFUL.unwrap());
+        // The primary pass-through claimed the decision line, so a later
+        // re-plan on this request (streaming or buffered) logs nothing.
+        assert_eq!(handle.claim_smart_routing_log(), None);
     }
 
     #[tokio::test]

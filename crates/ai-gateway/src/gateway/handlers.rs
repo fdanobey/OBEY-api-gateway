@@ -1223,6 +1223,7 @@ fn build_active_request_info(
         virtual_key_id: virtual_key_id.map(|s| s.to_string()),
         started_at_ms,
         kind,
+        smart_routing_logged: false,
     }
 }
 

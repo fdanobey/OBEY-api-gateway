@@ -18,7 +18,7 @@ use crate::models::openai::OpenAIRequest;
 use crate::smart_routing::config::{JevFallbackPolicy, JevTrustOverride};
 use crate::smart_routing::tier::TaskType;
 use crate::smart_routing::{
-    ClassifierFailure, ClassifierInput, ClassifierOutput, OptionalClassifier,
+    ClassifierFailure, ClassifierInput, ClassifierOutput, OptionalClassifier, WarnRateLimiter,
 };
 
 use super::client::SystemOneClient;
@@ -104,6 +104,7 @@ struct CachedClassification {
     score: f64,
     task_type: TaskType,
     confidence: f64,
+    blended: bool,
 }
 
 impl ScoreCache {
@@ -203,6 +204,7 @@ pub struct SystemOneClassifier {
     /// Char budget reduced after a payload-limit response (413); bounded
     /// below by [`MIN_CHAR_BUDGET`].
     effective_char_budget: Mutex<usize>,
+    call_failure_warnings: WarnRateLimiter,
 }
 
 impl SystemOneClassifier {
@@ -251,6 +253,7 @@ impl SystemOneClassifier {
             trust,
             timeout,
             effective_char_budget,
+            call_failure_warnings: WarnRateLimiter::default(),
         })
     }
 
@@ -344,6 +347,7 @@ impl SystemOneClassifier {
                     confidence: Some(cached.confidence),
                     resolved_model: self.resolved_model(),
                     discovery_refreshed: false,
+                    blended: cached.blended,
                 },
                 SystemOneClassificationDetail {
                     task_type: cached.task_type,
@@ -382,7 +386,27 @@ impl SystemOneClassifier {
                 );
                 return Err(ClassifierFailure::Backend);
             }
-            Err(other) => return Err(map_call_failure(other)),
+            Err(other) => {
+                // Content-free: error class and HTTP status only.
+                if self
+                    .call_failure_warnings
+                    .allow(self.family.name, other.class())
+                {
+                    let status = match &other {
+                        super::client::SystemOneCallError::Transient { status }
+                        | super::client::SystemOneCallError::Auth { status }
+                        | super::client::SystemOneCallError::BadRequest { status } => Some(*status),
+                        _ => None,
+                    };
+                    tracing::warn!(
+                        family = %self.family.name,
+                        error_class = %other.class(),
+                        status,
+                        "System One classifier call failed (rate-limited, 60s)"
+                    );
+                }
+                return Err(map_call_failure(other));
+            }
         };
 
         let result = compose::compose(
@@ -407,6 +431,7 @@ impl SystemOneClassifier {
                         score: score.value(),
                         task_type,
                         confidence,
+                        blended: false,
                     },
                 );
                 Ok((
@@ -416,6 +441,7 @@ impl SystemOneClassifier {
                         confidence: Some(confidence),
                         resolved_model: Some(resolved.model),
                         discovery_refreshed,
+                        blended: false,
                     },
                     detail,
                 ))
@@ -443,6 +469,7 @@ impl SystemOneClassifier {
                                 score: blended.value(),
                                 task_type: input.heuristic_task_type,
                                 confidence,
+                                blended: true,
                             },
                         );
                         Ok((
@@ -452,11 +479,22 @@ impl SystemOneClassifier {
                                 confidence: Some(confidence),
                                 resolved_model: Some(resolved.model),
                                 discovery_refreshed,
+                                blended: true,
                             },
                             detail,
                         ))
                     }
-                    JevFallbackPolicy::Fallback => Err(ClassifierFailure::LowConfidence),
+                    JevFallbackPolicy::Fallback => {
+                        // The failure enum carries no value; surface the
+                        // score that missed the threshold for tuning.
+                        tracing::debug!(
+                            family = %self.family.name,
+                            confidence,
+                            min_confidence = trust.min_confidence,
+                            "System One low confidence; using heuristic"
+                        );
+                        Err(ClassifierFailure::LowConfidence)
+                    }
                 }
             }
             ComposeResult::Invalid => Err(ClassifierFailure::InvalidOutput),
@@ -653,6 +691,7 @@ mod tests {
             score,
             task_type: TaskType::General,
             confidence: 0.9,
+            blended: false,
         };
         let now = Instant::now();
         let mut state = cache.lock();

@@ -408,3 +408,59 @@ async fn laya_classifier_low_answer_confidence_falls_back() {
         Err(ai_gateway::smart_routing::ClassifierFailure::LowConfidence)
     ));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn laya_classifier_low_confidence_blend_policy_flags_blended_output() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(full_laya_response(3.0, 0.10)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut config = laya_config(&server, "typed-decisions", 0.55);
+    config.fallback_policy = JevFallbackPolicy::Blend;
+    let classifier = LayaClassifier::new(config).unwrap();
+    let request = ai_gateway::models::openai::OpenAIRequest {
+        model: "g".to_string(),
+        messages: vec![ai_gateway::models::openai::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("hi"),
+            extra: Default::default(),
+        }],
+        stream: false,
+        temperature: None,
+        max_tokens: None,
+        extra: Default::default(),
+    };
+    let model_group = ai_gateway::config::ModelGroup {
+        name: "group".to_string(),
+        version_fallback_enabled: false,
+        compression: None,
+        memory: None,
+        structured_output: None,
+        models: Vec::new(),
+    };
+    let pinned_context = ai_gateway::smart_routing::PinnedRoutingContext::default();
+    let input = || ai_gateway::smart_routing::ClassifierInput {
+        request: &request,
+        model_group: &model_group,
+        pinned_context: &pinned_context,
+        heuristic_score: ai_gateway::smart_routing::tier::ComplexityScore::new(0.5),
+        heuristic_task_type: ai_gateway::smart_routing::tier::TaskType::General,
+        jev_trust: None,
+    };
+
+    // The second call is served from the score cache (the mock expects one
+    // evaluation) and must keep the blended flag.
+    for _ in 0..2 {
+        let output = classifier.classify(input()).await.unwrap();
+        assert!(output.blended);
+        assert_eq!(output.confidence, Some(0.10));
+        assert_eq!(
+            output.task_type,
+            Some(ai_gateway::smart_routing::tier::TaskType::General)
+        );
+    }
+}

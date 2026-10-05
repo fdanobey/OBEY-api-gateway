@@ -72,6 +72,12 @@ pub struct Classification {
     pub token_estimate: u64,
     pub confidence: Option<f64>,
     pub resolved_model: Option<String>,
+    /// Why the configured optional classifier fell back to the heuristic.
+    pub fallback_reason: Option<ClassifierFailure>,
+    /// The score blends a low-confidence classifier score with the heuristic.
+    pub blended: bool,
+    /// Wall-clock time spent in the optional classifier, when consulted.
+    pub classifier_latency_ms: Option<f64>,
 }
 
 /// Validated output returned by an optional classifier implementation.
@@ -82,6 +88,8 @@ pub struct ClassifierOutput {
     pub confidence: Option<f64>,
     pub resolved_model: Option<String>,
     pub discovery_refreshed: bool,
+    /// The score blends a low-confidence result with the heuristic score.
+    pub blended: bool,
 }
 
 impl ClassifierOutput {
@@ -92,6 +100,7 @@ impl ClassifierOutput {
             confidence: None,
             resolved_model: None,
             discovery_refreshed: false,
+            blended: false,
         }
     }
 }
@@ -105,6 +114,57 @@ pub enum ClassifierFailure {
     Backend,
     LowConfidence,
     NoJevAtEndpoint,
+}
+
+impl ClassifierFailure {
+    /// Stable, content-free label for logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Timeout => "timeout",
+            Self::InvalidOutput => "invalid_output",
+            Self::Backend => "backend",
+            Self::LowConfidence => "low_confidence",
+            Self::NoJevAtEndpoint => "no_jev_at_endpoint",
+        }
+    }
+}
+
+/// Minimum interval between repeated classifier-failure warnings per key.
+const FALLBACK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Allows one warning per `(family, reason)` per interval so a failing
+/// classifier backend cannot flood operator logs.
+#[derive(Debug, Default)]
+pub(crate) struct WarnRateLimiter {
+    last: std::sync::Mutex<
+        std::collections::HashMap<(&'static str, &'static str), std::time::Instant>,
+    >,
+}
+
+impl WarnRateLimiter {
+    pub(crate) fn allow(&self, family: &'static str, reason: &'static str) -> bool {
+        self.allow_at(family, reason, std::time::Instant::now())
+    }
+
+    fn allow_at(
+        &self,
+        family: &'static str,
+        reason: &'static str,
+        now: std::time::Instant,
+    ) -> bool {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match last.get(&(family, reason)) {
+            Some(at) if now.saturating_duration_since(*at) < FALLBACK_WARN_INTERVAL => false,
+            _ => {
+                last.insert((family, reason), now);
+                true
+            }
+        }
+    }
 }
 
 /// Input available to an optional classifier implementation.
@@ -259,6 +319,18 @@ pub struct CandidatePlan {
     pub excluded_for_context: usize,
     pub estimated_context_tokens: u64,
     pub bypassed: bool,
+    pub diagnostics: RoutingDiagnostics,
+}
+
+/// Content-free facts for the per-request decision log line; not serialized.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RoutingDiagnostics {
+    pub classifier_configured: ClassifierMode,
+    pub fallback_reason: Option<ClassifierFailure>,
+    pub blended: bool,
+    pub classifier_latency_ms: Option<f64>,
+    pub candidates: usize,
+    pub overflow: usize,
 }
 
 /// A cache hit short-circuits routing; a budget rejection is mapped by the caller.
@@ -342,6 +414,7 @@ pub struct SmartRouter {
     cache: Option<Arc<dyn SemanticRoutingCache>>,
     ab_test: Option<Arc<dyn AbRoutingHook>>,
     metrics: Arc<dyn SmartRoutingMetrics>,
+    fallback_warnings: WarnRateLimiter,
 }
 
 impl SmartRouter {
@@ -368,6 +441,7 @@ impl SmartRouter {
             cache: None,
             ab_test: None,
             metrics: Arc::new(NoopSmartRoutingMetrics),
+            fallback_warnings: WarnRateLimiter::default(),
         })
     }
 
@@ -599,6 +673,14 @@ impl SmartRouter {
             evaluator.observe_plan(&decision);
         }
 
+        let diagnostics = RoutingDiagnostics {
+            classifier_configured: policy.classifier,
+            fallback_reason: classification.fallback_reason,
+            blended: classification.blended,
+            classifier_latency_ms: classification.classifier_latency_ms,
+            candidates: candidates.len(),
+            overflow: overflow.len(),
+        };
         Ok(RoutingPlanOutcome::Route(CandidatePlan {
             decision,
             candidates,
@@ -606,6 +688,7 @@ impl SmartRouter {
             excluded_for_context,
             estimated_context_tokens,
             bypassed: tier_filter.bypassed,
+            diagnostics,
         }))
     }
 
@@ -635,6 +718,9 @@ impl SmartRouter {
                 token_estimate: assessment.token_estimate() as u64,
                 confidence: None,
                 resolved_model: None,
+                fallback_reason: None,
+                blended: false,
+                classifier_latency_ms: None,
             },
             Err(reason) => {
                 self.metrics.classifier_fallback(ClassifierFallbackEvent {
@@ -648,6 +734,9 @@ impl SmartRouter {
                     token_estimate: 0,
                     confidence: None,
                     resolved_model: None,
+                    fallback_reason: Some(reason),
+                    blended: false,
+                    classifier_latency_ms: None,
                 }
             }
         };
@@ -660,43 +749,39 @@ impl SmartRouter {
                     self.ml.as_deref(),
                     ClassifierUsed::Ml,
                     input,
-                    heuristic_classification.clone(),
+                    heuristic_classification,
                     policy,
                 )
-                .await
-                .unwrap_or(heuristic_classification),
+                .await,
             ClassifierMode::Llm => self
                 .classify_optional(
                     self.llm.as_deref(),
                     ClassifierUsed::Llm,
                     input,
-                    heuristic_classification.clone(),
+                    heuristic_classification,
                     policy,
                 )
-                .await
-                .unwrap_or(heuristic_classification),
+                .await,
         ClassifierMode::Jev => self
             .classify_optional(
                 self.systemone.as_deref(),
                 ClassifierUsed::Jev,
                 input,
-                heuristic_classification.clone(),
+                heuristic_classification,
                 policy,
             )
-            .await
-            .unwrap_or(heuristic_classification),
+            .await,
         ClassifierMode::Laya => self
             .classify_optional(
                 self.systemone.as_deref(),
                 ClassifierUsed::Laya,
                 input,
-                heuristic_classification.clone(),
+                heuristic_classification,
                 policy,
             )
-            .await
-            .unwrap_or(heuristic_classification),
+            .await,
             ClassifierMode::Composite => {
-                let Some(ml) = self
+                let ml = self
                     .classify_optional(
                         self.ml.as_deref(),
                         ClassifierUsed::Ml,
@@ -704,10 +789,10 @@ impl SmartRouter {
                         heuristic_classification.clone(),
                         policy,
                     )
-                    .await
-                else {
-                    return heuristic_classification;
-                };
+                    .await;
+                if ml.fallback_reason.is_some() {
+                    return ml;
+                }
                 let weights = policy.composite_weights.clone().unwrap_or_default();
                 Classification {
                     score: composite_score(heuristic_classification.score, ml.score, &weights),
@@ -716,6 +801,9 @@ impl SmartRouter {
                     token_estimate: heuristic_classification.token_estimate,
                     confidence: ml.confidence,
                     resolved_model: ml.resolved_model,
+                    fallback_reason: None,
+                    blended: ml.blended,
+                    classifier_latency_ms: ml.classifier_latency_ms,
                 }
             }
         }
@@ -741,7 +829,7 @@ impl SmartRouter {
         input: &SmartRoutingInput<'_>,
         heuristic: Classification,
         policy: &SmartRoutingConfig,
-    ) -> Option<Classification> {
+    ) -> Classification {
         // Both System One families share the Jev trust-override plumbing
         // and the jev_* metric families; the family label distinguishes
         // them with bounded cardinality.
@@ -750,18 +838,14 @@ impl SmartRouter {
             _ => "jev",
         };
         let is_systemone = matches!(classifier_used, ClassifierUsed::Jev | ClassifierUsed::Laya);
+        let systemone_family = is_systemone.then_some(family);
         let configured = policy.classifier;
         if is_systemone {
             self.metrics.jev_consult(&input.model_group.name, family);
         }
         let Some(classifier) = classifier else {
             let reason = ClassifierFailure::Unavailable;
-            self.metrics
-                .classifier_fallback(ClassifierFallbackEvent { configured, reason });
-            if is_systemone {
-                self.metrics.jev_fallback(reason, family);
-            }
-            return None;
+            return self.fall_back(heuristic, configured, systemone_family, reason, None);
         };
         let started_at = std::time::Instant::now();
         let result = classifier
@@ -778,28 +862,16 @@ impl SmartRouter {
                     .or_else(|| policy.laya.as_ref().map(LayaConfig::trust_override)),
             })
             .await;
+        let latency_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
         if is_systemone {
-            self.metrics
-                .jev_latency(started_at.elapsed().as_secs_f64() * 1_000.0, family);
+            self.metrics.jev_latency(latency_ms, family);
         }
         let output = match result {
             Ok(output) if output.score.is_finite() && (0.0..=1.0).contains(&output.score) => output,
-            Ok(_) => {
-                let reason = ClassifierFailure::InvalidOutput;
-                self.metrics
-                    .classifier_fallback(ClassifierFallbackEvent { configured, reason });
-                if is_systemone {
-                    self.metrics.jev_fallback(reason, family);
-                }
-                return None;
-            }
-            Err(reason) => {
-                self.metrics
-                    .classifier_fallback(ClassifierFallbackEvent { configured, reason });
-                if is_systemone {
-                    self.metrics.jev_fallback(reason, family);
-                }
-                return None;
+            failed => {
+                let reason = failed.err().unwrap_or(ClassifierFailure::InvalidOutput);
+                let latency = Some(latency_ms);
+                return self.fall_back(heuristic, configured, systemone_family, reason, latency);
             }
         };
         if is_systemone {
@@ -811,14 +883,55 @@ impl SmartRouter {
             }
         }
 
-        Some(Classification {
+        Classification {
             score: ComplexityScore::new(output.score),
             task_type: output.task_type.unwrap_or(heuristic.task_type),
             classifier: classifier_used,
             token_estimate: heuristic.token_estimate,
             confidence: output.confidence,
             resolved_model: output.resolved_model,
-        })
+            fallback_reason: None,
+            blended: output.blended,
+            classifier_latency_ms: Some(latency_ms),
+        }
+    }
+
+    /// Record a classifier fallback and return the heuristic classification
+    /// annotated with the reason. Non-low-confidence failures also emit a
+    /// rate-limited WARN (content-free: family and reason only).
+    fn fall_back(
+        &self,
+        mut heuristic: Classification,
+        configured: ClassifierMode,
+        systemone_family: Option<&'static str>,
+        reason: ClassifierFailure,
+        latency_ms: Option<f64>,
+    ) -> Classification {
+        self.metrics
+            .classifier_fallback(ClassifierFallbackEvent { configured, reason });
+        if let Some(family) = systemone_family {
+            self.metrics.jev_fallback(reason, family);
+        }
+        // Low confidence is expected behavior; a missing family model is
+        // already warned (rate-limited) by model discovery.
+        let warn = !matches!(
+            reason,
+            ClassifierFailure::LowConfidence | ClassifierFailure::NoJevAtEndpoint
+        );
+        if warn
+            && self
+                .fallback_warnings
+                .allow(configured.as_str(), reason.as_str())
+        {
+            tracing::warn!(
+                family = %configured.as_str(),
+                reason = %reason.as_str(),
+                "Smart routing classifier failed; using heuristic (rate-limited, 60s)"
+            );
+        }
+        heuristic.fallback_reason = Some(reason);
+        heuristic.classifier_latency_ms = latency_ms;
+        heuristic
     }
 }
 
@@ -1046,6 +1159,10 @@ mod tests {
                 .then(|| "configured-model.onnx".to_string()),
             classifier_model: matches!(classifier, ClassifierMode::Llm)
                 .then(|| "configured-llm".to_string()),
+            jev: matches!(classifier, ClassifierMode::Jev).then(|| JevConfig {
+                api_key: Some("test-key".to_string()),
+                ..JevConfig::default()
+            }),
             ..SmartRoutingConfig::default()
         }
     }
@@ -1292,6 +1409,8 @@ mod tests {
         assert_eq!(composite.classifier, ClassifierUsed::Composite);
         assert!((composite.score.value() - expected).abs() < 1.0e-12);
         assert_eq!(composite.task_type, heuristic.task_type);
+        assert_eq!(composite.fallback_reason, None);
+        assert!(composite.classifier_latency_ms.is_some());
 
         let failure = SmartRouter::new(config(ClassifierMode::Composite))
             .unwrap()
@@ -1299,6 +1418,7 @@ mod tests {
         let fallback = failure.classify(&smart_input).await;
         assert_eq!(fallback.classifier, ClassifierUsed::Heuristic);
         assert_eq!(fallback.score, heuristic.score);
+        assert_eq!(fallback.fallback_reason, Some(ClassifierFailure::Backend));
     }
 
     #[tokio::test]
@@ -1390,6 +1510,80 @@ mod tests {
                 reason: ClassifierFailure::Unavailable,
             }]
         );
+    }
+
+    async fn plan_diagnostics(router: SmartRouter) -> (RoutingDecision, RoutingDiagnostics) {
+        let request = request("route this");
+        let group = group(vec![candidate("safe", 10_000, SmartRoutingTier::Fast)]);
+        let pinned = PinnedRoutingContext::default();
+        let RoutingPlanOutcome::Route(plan) = router
+            .plan(&input(&request, &group, &pinned))
+            .await
+            .unwrap()
+        else {
+            panic!("expected route");
+        };
+        (plan.decision, plan.diagnostics)
+    }
+
+    #[tokio::test]
+    async fn plan_carries_configured_classifier_fallback_reason() {
+        for reason in [
+            ClassifierFailure::Timeout,
+            ClassifierFailure::Backend,
+            ClassifierFailure::LowConfidence,
+        ] {
+            let metrics = Arc::new(CapturingMetrics::default());
+            let router = SmartRouter::new(config(ClassifierMode::Jev))
+                .unwrap()
+                .with_metrics(metrics.clone())
+                .with_jev_classifier(Arc::new(FixedClassifier(Err(reason))));
+            let (decision, diagnostics) = plan_diagnostics(router).await;
+            assert_eq!(decision.classifier, ClassifierUsed::Heuristic);
+            assert_eq!(diagnostics.classifier_configured, ClassifierMode::Jev);
+            assert_eq!(diagnostics.fallback_reason, Some(reason));
+            assert!(!diagnostics.blended);
+            assert!(diagnostics.classifier_latency_ms.is_some());
+            assert_eq!((diagnostics.candidates, diagnostics.overflow), (1, 0));
+            assert_eq!(metrics.fallbacks.lock().unwrap().len(), 1);
+        }
+
+        // No classifier attached: unavailable, and no latency was measured.
+        let router = SmartRouter::new(config(ClassifierMode::Jev)).unwrap();
+        let (_, diagnostics) = plan_diagnostics(router).await;
+        assert_eq!(
+            diagnostics.fallback_reason,
+            Some(ClassifierFailure::Unavailable)
+        );
+        assert_eq!(diagnostics.classifier_latency_ms, None);
+    }
+
+    #[tokio::test]
+    async fn plan_surfaces_blended_classifier_output() {
+        let output = ClassifierOutput {
+            confidence: Some(0.4),
+            blended: true,
+            ..ClassifierOutput::score(0.7)
+        };
+        let router = SmartRouter::new(config(ClassifierMode::Jev))
+            .unwrap()
+            .with_jev_classifier(Arc::new(FixedClassifier(Ok(output))));
+        let (decision, diagnostics) = plan_diagnostics(router).await;
+        assert_eq!(decision.classifier, ClassifierUsed::Jev);
+        assert_eq!(decision.classifier_confidence, Some(0.4));
+        assert!(diagnostics.blended);
+        assert_eq!(diagnostics.fallback_reason, None);
+    }
+
+    #[test]
+    fn fallback_warnings_are_rate_limited_per_family_and_reason() {
+        let limiter = WarnRateLimiter::default();
+        let now = std::time::Instant::now();
+        assert!(limiter.allow_at("jev", "timeout", now));
+        assert!(!limiter.allow_at("jev", "timeout", now + std::time::Duration::from_secs(30)));
+        assert!(limiter.allow_at("jev", "backend", now));
+        assert!(limiter.allow_at("laya", "timeout", now));
+        assert!(limiter.allow_at("jev", "timeout", now + FALLBACK_WARN_INTERVAL));
     }
 
     #[test]

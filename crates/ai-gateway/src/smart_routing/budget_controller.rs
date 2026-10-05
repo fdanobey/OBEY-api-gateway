@@ -817,6 +817,9 @@ mod tests {
             token_estimate: tokens,
             confidence: None,
             resolved_model: None,
+            fallback_reason: None,
+            blended: false,
+            classifier_latency_ms: None,
         }
     }
 
