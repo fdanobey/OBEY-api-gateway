@@ -2595,10 +2595,13 @@ impl BedrockProvider {
             .and_then(|value| value.as_u64())
             .unwrap_or(0) as u32;
 
-        if content.trim().is_empty() && !compaction_summaries.is_empty() {
+        if content.trim().is_empty() && tool_calls.is_empty() && !compaction_summaries.is_empty() {
             // Compaction-only success: build a response that carries the summary
             // block(s) so the client can replay them, and mark it so the router
-            // does not treat it as an empty/dead turn.
+            // does not treat it as an empty/dead turn. Only the pure
+            // compaction-only case (no answer text AND no tool_calls) short-
+            // circuits here; a function_call reply that also carries a summary
+            // block must fall through so the tool_calls are never dropped.
             tracing::info!(
                 provider = %self.name,
                 model = %model,
@@ -2664,6 +2667,19 @@ impl BedrockProvider {
                 "Bedrock Mantle Responses: 2xx but no extractable content (empty response)"
             );
         }
+        // A function_call (or answer-text) reply may ALSO carry compaction
+        // summary block(s). Surface them exactly as the compaction-only branch
+        // does so the client can still replay compaction state, but never at
+        // the cost of the tool_calls: the summary is attached as metadata, not
+        // as the sole content, and finish_reason stays "tool_calls".
+        if !compaction_summaries.is_empty() {
+            tracing::info!(
+                provider = %self.name,
+                model = %model,
+                summary_blocks = compaction_summaries.len(),
+                "Bedrock Mantle Responses: compaction-only response, surfacing summary block(s)"
+            );
+        }
         let mut response = self.openai_response_from_text(
             &model,
             content,
@@ -2684,6 +2700,21 @@ impl BedrockProvider {
                     serde_json::Value::String(reasoning),
                 );
             }
+            if !compaction_summaries.is_empty() {
+                choice.message.extra.insert(
+                    "compaction".to_string(),
+                    serde_json::Value::Array(compaction_summaries.clone()),
+                );
+            }
+        }
+        if !compaction_summaries.is_empty() {
+            // Preserve the raw summary items at the top level too, so the
+            // Responses front door can round-trip them verbatim (parity with
+            // the compaction-only branch).
+            response.extra.insert(
+                "compaction_output".to_string(),
+                serde_json::Value::Array(compaction_summaries),
+            );
         }
         Ok(ProviderResponse {
             response,
@@ -4757,6 +4788,222 @@ mod tests {
         let terminal = chunks
             .last()
             .expect("terminal chunk present");
+        assert_eq!(
+            terminal
+                .pointer("/choices/0/finish_reason")
+                .and_then(|v| v.as_str()),
+            Some("tool_calls")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_responses_function_call_with_compaction_block_keeps_tool_calls() {
+        // A tool_use turn whose reply carries BOTH a function_call (empty
+        // message text) AND a compaction summary block. The tool_calls must
+        // survive and finish_reason must be "tool_calls"; the summary is still
+        // surfaced as compaction metadata, never dropping the tool_calls.
+        let response = responses_adapter_response(serde_json::json!({
+            "id": "resp_fc_compaction",
+            "object": "response",
+            "status": "completed",
+            "error": null,
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_fc",
+                    "name": "search",
+                    "arguments": "{\"q\":\"rust\"}"
+                },
+                { "encrypted_content": "smry_abc123", "type": "summary" }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 4}
+        }))
+        .await;
+
+        let choice = &response.choices[0];
+        assert_eq!(choice.message.content_as_text(), "", "no answer text");
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        let tool_calls = choice
+            .message
+            .extra
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .expect("tool_calls present despite compaction block");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].get("id").and_then(|v| v.as_str()), Some("call_fc"));
+        assert_eq!(tool_calls[0].get("type").and_then(|v| v.as_str()), Some("function"));
+        assert_eq!(
+            tool_calls[0].pointer("/function/name").and_then(|v| v.as_str()),
+            Some("search")
+        );
+        assert_eq!(
+            tool_calls[0]
+                .pointer("/function/arguments")
+                .and_then(|v| v.as_str()),
+            Some("{\"q\":\"rust\"}")
+        );
+        let compaction = choice
+            .message
+            .extra
+            .get("compaction")
+            .and_then(serde_json::Value::as_array)
+            .expect("compaction summary still surfaced alongside tool_calls");
+        assert_eq!(compaction.len(), 1);
+        assert_eq!(
+            compaction[0].get("encrypted_content").and_then(|v| v.as_str()),
+            Some("smry_abc123")
+        );
+        assert!(
+            response.extra.get("compaction_output").is_some(),
+            "top-level compaction_output present on tool_calls turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_responses_text_plus_compaction_plus_function_call() {
+        // Message text + a summary block + a function_call. Content is
+        // preserved, tool_calls survive, finish_reason is "tool_calls", and the
+        // compaction block is surfaced.
+        let response = responses_adapter_response(serde_json::json!({
+            "id": "resp_text_compaction_fc",
+            "object": "response",
+            "status": "completed",
+            "error": null,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Working on it."}]
+                },
+                { "encrypted_content": "smry_mix", "type": "summary" },
+                {
+                    "type": "function_call",
+                    "call_id": "call_mix",
+                    "name": "do_thing",
+                    "arguments": "{}"
+                }
+            ],
+            "usage": {"input_tokens": 8, "output_tokens": 6}
+        }))
+        .await;
+
+        let choice = &response.choices[0];
+        assert_eq!(choice.message.content_as_text(), "Working on it.");
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        let tool_calls = choice
+            .message
+            .extra
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .expect("tool_calls present");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].get("id").and_then(|v| v.as_str()), Some("call_mix"));
+        let compaction = choice
+            .message
+            .extra
+            .get("compaction")
+            .and_then(serde_json::Value::as_array)
+            .expect("compaction summary surfaced");
+        assert_eq!(compaction.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_responses_compaction_only_still_stops() {
+        // Pure compaction-only case (summary present, NO function_call, no
+        // text) must behave exactly as before: finish_reason "stop", no
+        // tool_calls, summary surfaced. Explicit no-regression guard.
+        let response = responses_adapter_response(serde_json::json!({
+            "id": "resp_compaction_only",
+            "object": "response",
+            "status": "completed",
+            "error": null,
+            "output": [
+                { "encrypted_content": "smry_only", "type": "summary" }
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 0}
+        }))
+        .await;
+
+        let choice = &response.choices[0];
+        assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+        assert!(
+            choice.message.extra.get("tool_calls").is_none(),
+            "no tool_calls on pure compaction-only turn"
+        );
+        let compaction = choice
+            .message
+            .extra
+            .get("compaction")
+            .and_then(serde_json::Value::as_array)
+            .expect("compaction summary surfaced");
+        assert_eq!(compaction.len(), 1);
+        assert_eq!(
+            compaction[0].get("encrypted_content").and_then(|v| v.as_str()),
+            Some("smry_only")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_responses_streaming_replay_compaction_plus_function_call_carries_tool_call_deltas()
+    {
+        // A compaction + function_call turn, replayed through the streaming
+        // synthesizer, must still carry the tool_call deltas and terminate with
+        // finish_reason "tool_calls".
+        let response = responses_adapter_response(serde_json::json!({
+            "id": "resp_stream_compaction",
+            "object": "response",
+            "status": "completed",
+            "error": null,
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_sc",
+                    "name": "run",
+                    "arguments": "{\"n\":2}"
+                },
+                { "encrypted_content": "smry_stream", "type": "summary" }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .await;
+
+        let chunks = crate::gateway::handlers::streaming_chunks_from_response(&response);
+
+        let header = chunks
+            .iter()
+            .find(|c| {
+                c.pointer("/choices/0/delta/tool_calls/0/id")
+                    .and_then(|v| v.as_str())
+                    == Some("call_sc")
+            })
+            .expect("tool_call header delta present despite compaction block");
+        assert_eq!(
+            header
+                .pointer("/choices/0/delta/tool_calls/0/index")
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            header
+                .pointer("/choices/0/delta/tool_calls/0/type")
+                .and_then(|v| v.as_str()),
+            Some("function")
+        );
+        assert_eq!(
+            header
+                .pointer("/choices/0/delta/tool_calls/0/function/name")
+                .and_then(|v| v.as_str()),
+            Some("run")
+        );
+
+        let args = chunks.iter().find_map(|c| {
+            c.pointer("/choices/0/delta/tool_calls/0/function/arguments")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        });
+        assert_eq!(args, Some("{\"n\":2}"));
+
+        let terminal = chunks.last().expect("terminal chunk present");
         assert_eq!(
             terminal
                 .pointer("/choices/0/finish_reason")
