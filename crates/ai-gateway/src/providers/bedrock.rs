@@ -744,6 +744,109 @@ fn chat_messages_to_responses_input(messages: &[Message]) -> Vec<serde_json::Val
     out
 }
 
+/// Parsed outcome of a Responses `output[]` array, translated into the
+/// gateway's OpenAI chat shape.
+///
+/// - `text`: concatenation of every `message` item's output text parts.
+/// - `tool_calls`: OpenAI tool_call objects
+///   (`{ "id", "type": "function", "function": { "name", "arguments" } }`),
+///   one per `function_call` item, preserving order.
+/// - `reasoning`: concatenation of any `reasoning` item text (never folded
+///   into `text`).
+/// - `incomplete_max_tokens`: `true` when the top-level `status` is
+///   `"incomplete"` with `incomplete_details.reason == "max_output_tokens"`.
+struct ResponsesOutput {
+    text: String,
+    tool_calls: Vec<serde_json::Value>,
+    reasoning: String,
+    incomplete_max_tokens: bool,
+}
+
+/// Translate a Responses API payload's `output[]` array (plus top-level status)
+/// into the gateway's OpenAI chat shape. Mirrors the input-side conventions in
+/// [`chat_messages_to_responses_input`] for the tool_call `arguments` string.
+fn responses_output_to_chat(value: &serde_json::Value) -> ResponsesOutput {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut reasoning = String::new();
+
+    let items = value.get("output").and_then(serde_json::Value::as_array);
+    for item in items.into_iter().flatten() {
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("message") => {
+                if let Some(parts) = item.get("content").and_then(serde_json::Value::as_array) {
+                    for part in parts {
+                        let part_text = match part.get("type").and_then(serde_json::Value::as_str) {
+                            Some("output_text") => part.get("text").and_then(serde_json::Value::as_str),
+                            _ => part.get("text").and_then(serde_json::Value::as_str),
+                        };
+                        if let Some(part_text) = part_text {
+                            text.push_str(part_text);
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                let name = item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                let call_id = item
+                    .get("call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let arguments = match item.get("arguments") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Null) | None => "{}".to_string(),
+                    Some(other) => other.to_string(),
+                };
+                tool_calls.push(serde_json::json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    }
+                }));
+            }
+            Some("reasoning") => {
+                for key in ["summary", "content"] {
+                    if let Some(parts) = item.get(key).and_then(serde_json::Value::as_array) {
+                        for part in parts {
+                            if let Some(part_text) =
+                                part.get("text").and_then(serde_json::Value::as_str)
+                            {
+                                reasoning.push_str(part_text);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let incomplete_max_tokens = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("incomplete")
+        && value
+            .get("incomplete_details")
+            .and_then(|d| d.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            == Some("max_output_tokens");
+
+    ResponsesOutput {
+        text,
+        tool_calls,
+        reasoning,
+        incomplete_max_tokens,
+    }
+}
+
 /// When a chat content array carries at least one image, return Responses
 /// `input_text` / `input_image` parts preserving order; otherwise `None` so the
 /// caller can use the plain text form.
@@ -2444,25 +2547,24 @@ impl BedrockProvider {
         let value = self
             .post_mantle_json(http_client, api_key, &url, custom_headers, &body)
             .await?;
-        let content = value
-            .get("output_text")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-            .or_else(|| {
-                value
-                    .get("output")
-                    .and_then(|value| value.as_array())
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|item| item.get("content").and_then(|value| value.as_array()))
-                    .flatten()
-                    .find_map(|item| {
-                        item.get("text")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string)
-                    })
-            })
-            .unwrap_or_default();
+        // Parse the Responses `output[]` array by item type into chat shape:
+        // message text, OpenAI tool_calls, reasoning_content, and the
+        // incomplete/max_output_tokens signal. Fall back to a top-level
+        // `output_text` string when the item parser surfaces no message text
+        // (back-compat with upstreams that only emit the scalar field).
+        let parsed = responses_output_to_chat(&value);
+        let ResponsesOutput {
+            mut text,
+            tool_calls,
+            reasoning,
+            incomplete_max_tokens,
+        } = parsed;
+        if text.is_empty() {
+            if let Some(fallback) = value.get("output_text").and_then(|v| v.as_str()) {
+                text.push_str(fallback);
+            }
+        }
+        let content = text;
         // Server-side compaction: when a request carries a compaction_trigger,
         // Bedrock may return a COMPACTION-ONLY response — the `output` holds a
         // summary block with `encrypted_content` (a `smry_...` token) and NO
@@ -2529,11 +2631,23 @@ impl BedrockProvider {
             });
         }
 
-        if content.trim().is_empty() {
-            // 2xx from Mantle but no extractable answer text AND no compaction
-            // block. Log the top-level response keys and a bounded snippet so the
-            // "empty response" failure reason can be traced to the actual payload
-            // shape (e.g. a status like "incomplete", a refusal, or tool-only).
+        // finish_reason: tool_calls when any function_call item was present;
+        // length when the turn was cut by max_output_tokens; else stop. A
+        // function_call-only reply (empty text) is a valid non-empty turn once
+        // tool_calls are attached below.
+        let finish_reason = if !tool_calls.is_empty() {
+            "tool_calls"
+        } else if incomplete_max_tokens {
+            "length"
+        } else {
+            "stop"
+        };
+
+        if content.trim().is_empty() && tool_calls.is_empty() {
+            // 2xx from Mantle but no extractable answer text, no tool_calls, AND
+            // no compaction block. Log the top-level response keys and a bounded
+            // snippet so the "empty response" failure reason can be traced to the
+            // actual payload shape (e.g. a status like "incomplete" or a refusal).
             let keys: Vec<&str> = value
                 .as_object()
                 .map(|m| m.keys().map(String::as_str).collect())
@@ -2550,14 +2664,29 @@ impl BedrockProvider {
                 "Bedrock Mantle Responses: 2xx but no extractable content (empty response)"
             );
         }
+        let mut response = self.openai_response_from_text(
+            &model,
+            content,
+            prompt_tokens,
+            completion_tokens,
+            finish_reason,
+        );
+        if let Some(choice) = response.choices.first_mut() {
+            if !tool_calls.is_empty() {
+                choice
+                    .message
+                    .extra
+                    .insert("tool_calls".to_string(), serde_json::Value::Array(tool_calls));
+            }
+            if !reasoning.is_empty() {
+                choice.message.extra.insert(
+                    "reasoning_content".to_string(),
+                    serde_json::Value::String(reasoning),
+                );
+            }
+        }
         Ok(ProviderResponse {
-            response: self.openai_response_from_text(
-                &model,
-                content,
-                prompt_tokens,
-                completion_tokens,
-                "stop",
-            ),
+            response,
             provider_name: self.name.clone(),
             latency_ms: start.elapsed().as_millis() as u64,
         })
@@ -4333,6 +4462,306 @@ mod tests {
             compaction[0].get("encrypted_content").and_then(|v| v.as_str()),
             Some("smry_pUPh16to4VKYDgJAPymbEAIF"),
             "the encrypted_content summary token is preserved"
+        );
+    }
+
+    /// Helper: mount a Responses mock returning `body`, dispatch a chat request
+    /// through the Responses adapter, and return the translated OpenAIResponse.
+    async fn responses_adapter_response(body: serde_json::Value) -> OpenAIResponse {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = create_api_key_mode_provider_for_base_url(
+            "bedrock-test",
+            format!("{}/v1", server.uri()),
+            "test-api-key",
+        );
+        let mut request = create_test_chat_request(false);
+        request.model = "openai.gpt-5.6-sol".to_string();
+        provider.chat_completion(request).await.unwrap().response
+    }
+
+    #[tokio::test]
+    async fn test_responses_function_call_only_maps_tool_calls() {
+        let response = responses_adapter_response(serde_json::json!({
+            "id": "resp_fc",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\"}"
+                }
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 7}
+        }))
+        .await;
+
+        let choice = &response.choices[0];
+        assert_eq!(choice.message.content_as_text(), "");
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        let tool_calls = choice
+            .message
+            .extra
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .expect("tool_calls present");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].get("id").and_then(|v| v.as_str()), Some("call_abc"));
+        assert_eq!(tool_calls[0].get("type").and_then(|v| v.as_str()), Some("function"));
+        assert_eq!(
+            tool_calls[0].pointer("/function/name").and_then(|v| v.as_str()),
+            Some("get_weather")
+        );
+        assert_eq!(
+            tool_calls[0]
+                .pointer("/function/arguments")
+                .and_then(|v| v.as_str()),
+            Some("{\"city\":\"Paris\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_responses_text_and_function_call() {
+        let response = responses_adapter_response(serde_json::json!({
+            "id": "resp_tc",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Let me check."}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{}"
+                }
+            ],
+            "usage": {"input_tokens": 2, "output_tokens": 3}
+        }))
+        .await;
+
+        let choice = &response.choices[0];
+        assert_eq!(choice.message.content_as_text(), "Let me check.");
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        let tool_calls = choice
+            .message
+            .extra
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .expect("tool_calls present");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].get("id").and_then(|v| v.as_str()), Some("call_1"));
+    }
+
+    #[tokio::test]
+    async fn test_responses_multiple_function_calls() {
+        let response = responses_adapter_response(serde_json::json!({
+            "id": "resp_multi",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {"type": "function_call", "call_id": "call_a", "name": "first", "arguments": "{\"x\":1}"},
+                {"type": "function_call", "call_id": "call_b", "name": "second", "arguments": "{\"y\":2}"}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .await;
+
+        let tool_calls = response.choices[0]
+            .message
+            .extra
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .expect("tool_calls present");
+        assert_eq!(tool_calls.len(), 2, "both calls preserved");
+        assert_eq!(tool_calls[0].get("id").and_then(|v| v.as_str()), Some("call_a"));
+        assert_eq!(tool_calls[1].get("id").and_then(|v| v.as_str()), Some("call_b"));
+        assert_eq!(
+            tool_calls[0].pointer("/function/name").and_then(|v| v.as_str()),
+            Some("first")
+        );
+        assert_eq!(
+            tool_calls[1].pointer("/function/name").and_then(|v| v.as_str()),
+            Some("second")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_responses_message_concatenates_all_output_text_parts() {
+        let response = responses_adapter_response(serde_json::json!({
+            "id": "resp_concat",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "Hello, "},
+                        {"type": "output_text", "text": "world!"}
+                    ]
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        }))
+        .await;
+
+        assert_eq!(
+            response.choices[0].message.content_as_text(),
+            "Hello, world!",
+            "all output_text parts concatenated in order"
+        );
+        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn test_responses_incomplete_max_output_tokens_maps_length() {
+        let response = responses_adapter_response(serde_json::json!({
+            "id": "resp_incomplete",
+            "object": "response",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "partial answer"}]
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        }))
+        .await;
+
+        assert_eq!(response.choices[0].message.content_as_text(), "partial answer");
+        assert_eq!(
+            response.choices[0].finish_reason.as_deref(),
+            Some("length"),
+            "incomplete/max_output_tokens maps to length"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_responses_reasoning_not_in_content() {
+        let response = responses_adapter_response(serde_json::json!({
+            "id": "resp_reason",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "thinking about it"}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_r",
+                    "name": "act",
+                    "arguments": "{}"
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .await;
+
+        let choice = &response.choices[0];
+        assert_eq!(choice.message.content_as_text(), "", "reasoning never in content");
+        assert_eq!(
+            choice
+                .message
+                .extra
+                .get("reasoning_content")
+                .and_then(|v| v.as_str()),
+            Some("thinking about it")
+        );
+        assert!(
+            choice
+                .message
+                .extra
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|c| c.len() == 1),
+            "tool_calls still present alongside reasoning"
+        );
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[tokio::test]
+    async fn test_responses_streaming_replay_carries_tool_call_deltas() {
+        let response = responses_adapter_response(serde_json::json!({
+            "id": "resp_stream",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_s",
+                    "name": "run",
+                    "arguments": "{\"n\":1}"
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .await;
+
+        let chunks = crate::gateway::handlers::streaming_chunks_from_response(&response);
+
+        // A tool_call header delta: index 0, id, type:function, function.name.
+        let header = chunks
+            .iter()
+            .find(|c| {
+                c.pointer("/choices/0/delta/tool_calls/0/id")
+                    .and_then(|v| v.as_str())
+                    == Some("call_s")
+            })
+            .expect("tool_call header delta present");
+        assert_eq!(
+            header
+                .pointer("/choices/0/delta/tool_calls/0/index")
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            header
+                .pointer("/choices/0/delta/tool_calls/0/type")
+                .and_then(|v| v.as_str()),
+            Some("function")
+        );
+        assert_eq!(
+            header
+                .pointer("/choices/0/delta/tool_calls/0/function/name")
+                .and_then(|v| v.as_str()),
+            Some("run")
+        );
+
+        // An arguments delta carrying the serialized arguments string.
+        let args = chunks.iter().find_map(|c| {
+            c.pointer("/choices/0/delta/tool_calls/0/function/arguments")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        });
+        assert_eq!(args, Some("{\"n\":1}"));
+
+        // Terminal chunk finishes with tool_calls.
+        let terminal = chunks
+            .last()
+            .expect("terminal chunk present");
+        assert_eq!(
+            terminal
+                .pointer("/choices/0/finish_reason")
+                .and_then(|v| v.as_str()),
+            Some("tool_calls")
         );
     }
 
