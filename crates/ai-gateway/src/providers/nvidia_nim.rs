@@ -19,39 +19,31 @@ pub struct NimFallbackModel {
 }
 
 // BEGIN NVIDIA NIM FALLBACK MODELS
-/// Probe provenance: catalog=https://integrate.api.nvidia.com/v1/models; probed=2026-07-19T00:00:00Z; git_rev=manual
+/// Probe provenance: catalog=https://integrate.api.nvidia.com/v1/models; probed=2026-10-05T17:47:55.3495924Z; git_rev=b496311
 pub const NVIDIA_NIM_FALLBACK_MODELS: &[NimFallbackModel] = &[
-    NimFallbackModel {
-        id: "openai/gpt-oss-120b",
-        owned_by: "openai",
-        supports_vision: false,
-        context_window: Some(128_000),
-        max_completion_tokens: None,
-        source_url: "https://build.nvidia.com/openai/gpt-oss-120b",
-    },
-    NimFallbackModel {
-        id: "meta/llama-3.1-70b-instruct",
-        owned_by: "meta",
-        supports_vision: false,
-        context_window: None,
-        max_completion_tokens: None,
-        source_url: "https://build.nvidia.com/meta/llama-3.1-70b-instruct",
-    },
-    NimFallbackModel {
-        id: "nvidia/nemotron-3-nano",
-        owned_by: "nvidia",
-        supports_vision: false,
-        context_window: None,
-        max_completion_tokens: None,
-        source_url: "https://build.nvidia.com/nvidia/nemotron-3-nano",
-    },
     NimFallbackModel {
         id: "moonshotai/kimi-k3",
         owned_by: "moonshotai",
         supports_vision: true,
-        context_window: Some(1_000_000),
+        context_window: Some(1000000),
         max_completion_tokens: None,
         source_url: "https://build.nvidia.com/moonshotai/kimi-k3",
+    },
+    NimFallbackModel {
+        id: "meta/muse-glimmer-30b",
+        owned_by: "meta",
+        supports_vision: true,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://build.nvidia.com/meta/muse-glimmer-30b",
+    },
+    NimFallbackModel {
+        id: "google/diffusiongemma-26b-a4b-it",
+        owned_by: "google",
+        supports_vision: true,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://build.nvidia.com/google/diffusiongemma-26b-a4b-it",
     },
 ];
 // END NVIDIA NIM FALLBACK MODELS
