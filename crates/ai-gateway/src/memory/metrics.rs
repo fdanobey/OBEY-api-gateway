@@ -178,9 +178,14 @@ impl StoreMethod {
 }
 
 fn saturating_add(counter: &AtomicU64, value: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(value))
-    });
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(value);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn load(counter: &AtomicU64) -> u64 {
