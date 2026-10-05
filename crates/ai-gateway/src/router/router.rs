@@ -6495,6 +6495,20 @@ impl Router {
         if !Self::content_is_empty(&choice.message.content) {
             return false;
         }
+        // Never promote reasoning into content when the turn carries tool_calls:
+        // the assistant is driving an agent loop and the reasoning belongs in the
+        // reasoning channel, not as the visible answer. Folding it into content
+        // produces a spurious text answer alongside the tool call and can stall
+        // clients that treat text-after-reasoning as a stop signal.
+        let has_tool_calls = choice
+            .message
+            .extra
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|calls| !calls.is_empty());
+        if has_tool_calls {
+            return false;
+        }
         let Some(text) = Self::reasoning_text(choice).map(str::to_string) else {
             return false;
         };
@@ -10454,6 +10468,85 @@ mod tests {
             "reasoning fallback"
         );
         assert!(Router::response_has_content(&response));
+    }
+
+    #[test]
+    fn promote_reasoning_to_content_skips_when_tool_calls_present() {
+        let mut response = OpenAIResponse {
+            id: "test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1,
+            model: "openai.gpt-5.6-sol".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String(String::new()),
+                    extra: serde_json::Map::from_iter([
+                        (
+                            "reasoning_content".to_string(),
+                            serde_json::json!("planning the call"),
+                        ),
+                        (
+                            "tool_calls".to_string(),
+                            serde_json::json!([{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "do_it", "arguments": "{}"}
+                            }]),
+                        ),
+                    ]),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+                extra: Default::default(),
+            }],
+            usage: Usage::default(),
+            extra: Default::default(),
+        };
+
+        assert!(
+            !Router::promote_reasoning_to_content(&mut response),
+            "reasoning must not be promoted on a tool_calls turn"
+        );
+        assert_eq!(
+            response.choices[0].message.content_as_text(),
+            "",
+            "content stays empty when tool_calls are present"
+        );
+    }
+
+    #[test]
+    fn promote_reasoning_to_content_still_promotes_plain_text() {
+        let mut response = OpenAIResponse {
+            id: "test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1,
+            model: "openai.gpt-5.6-sol".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String(String::new()),
+                    extra: serde_json::Map::from_iter([(
+                        "reasoning_content".to_string(),
+                        serde_json::json!("the whole answer"),
+                    )]),
+                },
+                finish_reason: Some("stop".to_string()),
+                extra: Default::default(),
+            }],
+            usage: Usage::default(),
+            extra: Default::default(),
+        };
+
+        assert!(
+            Router::promote_reasoning_to_content(&mut response),
+            "plain-text reasoning-only turn is still promoted"
+        );
+        assert_eq!(
+            response.choices[0].message.content_as_text(),
+            "the whole answer"
+        );
     }
 
     #[test]
