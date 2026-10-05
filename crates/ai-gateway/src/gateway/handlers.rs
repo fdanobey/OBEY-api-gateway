@@ -996,6 +996,26 @@ fn spawn_streaming_memory_extraction(
     });
 }
 
+/// True when a buffered response is a tool-call turn: the first choice either
+/// finishes with `tool_calls` or carries a non-empty `tool_calls` array in
+/// `message.extra`. The memory footer is a trailing content delta; emitting it
+/// after a `tool_calls` finish leaves stray content behind the terminal chunk,
+/// so footer emission is skipped for such turns.
+fn is_tool_call_turn(response: &OpenAIResponse) -> bool {
+    let Some(choice) = response.choices.first() else {
+        return false;
+    };
+    if choice.finish_reason.as_deref() == Some("tool_calls") {
+        return true;
+    }
+    choice
+        .message
+        .extra
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|calls| !calls.is_empty())
+}
+
 fn memory_feedback_chunk(request: &OpenAIRequest, suffix: &str) -> serde_json::Value {
     serde_json::json!({
         "id": format!("chatcmpl-memory-{}", uuid::Uuid::new_v4()),
@@ -2401,7 +2421,9 @@ async fn chat_completions_stream(
                                 yield Ok(Event::default().data(chunk.to_string()));
                             }
                             if let Some(suffix) = memory_suffix.as_deref() {
-                                yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+                                if !is_tool_call_turn(&response) {
+                                    yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+                                }
                             }
                             yield Ok(Event::default().data("[DONE]"));
                         }
@@ -2727,7 +2749,9 @@ async fn chat_completions_stream(
                                                         yield Ok(Event::default().data(chunk.to_string()));
                                                     }
                                                     if let Some(suffix) = memory_suffix.as_deref() {
-                                                        yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+                                                        if !is_tool_call_turn(&response) {
+                                                            yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+                                                        }
                                                     }
                                                     yield Ok(Event::default().data("[DONE]"));
                                                     break 'failover;
@@ -2811,7 +2835,9 @@ async fn chat_completions_stream(
                                                     yield Ok(Event::default().data(chunk.to_string()));
                                                 }
                                                 if let Some(suffix) = memory_suffix.as_deref() {
-                                                    yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+                                                    if !is_tool_call_turn(&response) {
+                                                        yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+                                                    }
                                                 }
                                                 yield Ok(Event::default().data("[DONE]"));
                                                 break 'failover;
@@ -2948,7 +2974,9 @@ async fn chat_completions_stream(
         yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
     }
     if let Some(suffix) = memory_suffix.as_deref() {
-        yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+        if !is_tool_call_turn(&response) {
+            yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+        }
     }
     yield Ok(Event::default().data("[DONE]"));
     };
@@ -5251,7 +5279,7 @@ mod tests {
         build_keepalive, cache_allowed_for_validation, chunk_carries_answer, chunk_carries_content,
         classify_relay_line, classify_stream_error, collect_structured_output_failure,
         eager_sse_response, early_event_chunk, emit_sse_error_event, force_eager_structured_stream,
-        json_model, memory_feedback_chunk, multipart_model, openai_json_response,
+        is_tool_call_turn, json_model, memory_feedback_chunk, multipart_model, openai_json_response,
         prepare_response_for_client, provider_pass_through_response, rechunk_structured_response,
         relay_passthrough_stream, requests_structured_output, should_cache_eager_structured,
         is_transient_stream_truncation, smart_routing_headers, sse_error_payload,
@@ -6033,6 +6061,51 @@ mod tests {
         assert_eq!(
             context.detected_project.as_deref(),
             Some("0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn memory_footer_skipped_on_tool_call_turn() {
+        // A tool_calls turn: emitting the memory footer afterward would leave
+        // stray content behind the terminal finish chunk, so it is skipped.
+        let response = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::Value::String(String::new()),
+            extra: serde_json::Map::from_iter([(
+                "tool_calls".to_string(),
+                serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "do_it", "arguments": "{}"}
+                }]),
+            )]),
+        });
+        // base_response sets finish_reason "stop"; the tool_calls array alone
+        // must classify this as a tool-call turn.
+        assert!(is_tool_call_turn(&response));
+
+        // The synthesized chunk stream for this response finishes with
+        // tool_calls and never carries a trailing memory content chunk.
+        let chunks = streaming_chunks_from_response(&response);
+        let terminal = chunks.last().expect("terminal chunk present");
+        assert_eq!(
+            terminal
+                .pointer("/choices/0/finish_reason")
+                .and_then(|v| v.as_str()),
+            Some("tool_calls")
+        );
+    }
+
+    #[test]
+    fn memory_footer_emitted_on_plain_text_turn() {
+        let response = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!("plain answer"),
+            extra: Default::default(),
+        });
+        assert!(
+            !is_tool_call_turn(&response),
+            "plain-text stop turn is not a tool-call turn, footer still emitted"
         );
     }
 
