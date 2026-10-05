@@ -68,7 +68,10 @@ jobs:
         if: steps.sync.outputs.exit_code == '1' && steps.sync.outputs.dry_run != 'true'
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Prefer a PAT (secrets.GH_PAT) so the PR triggers the CI check and
+          # auto-merge can proceed. Falls back to the built-in token, which
+          # still opens the PR but will NOT trigger CI (so auto-merge stalls).
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
         run: |
           $branch = 'chore/bedrock-fallback-sync'
           git config user.name 'github-actions[bot]'
@@ -90,9 +93,19 @@ jobs:
           $existing = gh pr list --head $branch --state open --json number --jq '.[0].number'
           if ($existing) {
             gh pr edit $existing --title 'chore(bedrock): sync built-in fallback models' --body-file $bodyPath
+            $prNumber = $existing
           } else {
             $baseBranch = '${{ github.event.repository.default_branch }}'
             gh pr create --base $baseBranch --head $branch --title 'chore(bedrock): sync built-in fallback models' --body-file $bodyPath
+            $prNumber = gh pr list --head $branch --state open --json number --jq '.[0].number'
+          }
+          # Enable auto-merge; GitHub merges once required checks pass. No-op if
+          # auto-merge is disabled on the repo or a PAT is not configured.
+          if ($prNumber) {
+            gh pr merge $prNumber --auto --squash 2>&1 | ForEach-Object { "$_" }
+            if ($LASTEXITCODE -ne 0) {
+              Write-Output "::warning::Could not enable auto-merge for PR #$prNumber. Enable 'Allow auto-merge' in repo settings and configure the GH_PAT secret; merge the PR manually for now."
+            }
           }
 
       - name: Warn on advisory AWS check unavailable

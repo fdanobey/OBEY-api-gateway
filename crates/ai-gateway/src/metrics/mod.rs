@@ -217,9 +217,14 @@ impl CompressionHistogram {
 }
 
 fn saturating_atomic_add(target: &AtomicU64, amount: u64) {
-    let _ = target.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(amount))
-    });
+    let mut current = target.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(amount);
+        match target.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn compression_level_label(level: CompressionLevel) -> &'static str {
