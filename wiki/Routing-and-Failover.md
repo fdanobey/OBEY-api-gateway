@@ -171,13 +171,26 @@ When Smart Routing selects a tier, the models in that tier are tried first. If t
 
 ### Smart Routing Decision Log
 
-Each completed request with a (non-bypassed) Smart Routing decision logs one content-free INFO line, at most once per request even when a streaming request fails over and is re-planned, so `journalctl -u obey-api-gateway -f` shows why a tier was chosen:
+Each request with a (non-bypassed) Smart Routing decision logs one content-free INFO line, at most once per request even when a streaming request fails over and is re-planned, so `journalctl -u obey-api-gateway -f` shows why a tier was chosen:
 
 ```
 INFO Smart routing decision trace_id=... group=coding tier=balanced score=0.412 classifier_configured=jev classifier_used=heuristic task_type=code_generation blended=false fallback_reason=low_confidence candidates=2 overflow=3 context_filtered=false escalated=false classifier_latency_ms=184.0
 ```
 
-`fallback_reason` appears when the configured classifier fell back to the heuristic: `low_confidence`, `timeout`, `backend` (HTTP/auth/transport), `unavailable` (classifier or model not reachable), `invalid_output`, or `no_jev_at_endpoint`. With `fallback_policy: blend`, a low-confidence System One score is mixed with the heuristic instead: `classifier_used=jev blended=true confidence=...`. Failures other than low confidence also log a WARN (`Smart routing classifier failed`) at most once per 60 s per classifier and reason. A System One HTTP failure logs a second rate-limited WARN (`System One classifier call failed`) with the error class and HTTP status. With `fallback_policy: fallback`, the confidence that missed the threshold is logged at DEBUG (`System One low confidence; using heuristic`). Pinned and bypassed requests log no decision line. Requests that fail on every provider log no line, the same as the decision metric.
+`fallback_reason` appears when the configured classifier fell back to the heuristic:
+
+- `low_confidence`
+- `timeout`
+- `backend`: System One still returned a retryable status (such as 429 or 503) after retries, or returned 401/403 or 413
+- `invalid_output`: System One returned 422, or the score was outside 0–1
+- `unavailable`: no classifier is attached, the call hit a transport error or another HTTP status, or the response could not be read
+- `no_jev_at_endpoint`
+
+With `fallback_policy: blend`, a low-confidence System One score is mixed with the heuristic instead: `classifier_used=jev blended=true confidence=...`. With `fallback_policy: fallback`, the confidence that missed the threshold is logged at DEBUG (`System One low confidence; using heuristic`).
+
+Failures other than low confidence also log a WARN (`Smart routing classifier failed`) at most once per 60 s per classifier and reason. When a System One call returns an error, a second rate-limited WARN (`System One classifier call failed`) adds the error class and HTTP status. If the classifier's own timeout expires first, only the first WARN is logged.
+
+Pinned and bypassed requests log no decision line. A buffered request logs its line after it succeeds, so a request that fails on every provider logs none, the same as the decision metric. A streaming request logs its line when the upstream stream is set up, and the line stays even if the stream fails later.
 
 ---
 
