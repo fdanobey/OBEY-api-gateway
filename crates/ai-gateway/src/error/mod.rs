@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Main gateway error type
@@ -133,7 +133,7 @@ impl GatewayError {
 }
 
 /// Single provider attempt information
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderAttempt {
     pub provider: String,
     pub model: String,

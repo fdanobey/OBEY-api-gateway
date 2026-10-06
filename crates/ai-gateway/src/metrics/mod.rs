@@ -4,6 +4,9 @@ use crate::compression::{
 };
 use crate::router::sticky_cache::CacheUsage;
 use crate::structured_output::metrics::StructuredOutputMetrics;
+
+mod provider_attempt;
+use provider_attempt::ProviderAttemptFailureMetrics;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -68,6 +71,9 @@ pub struct Metrics {
     guardrail_stego_detections: Arc<DashMap<(String, String), AtomicU64>>,
     /// Structured output validation, retry, and latency metrics.
     structured_output: Arc<StructuredOutputMetrics>,
+    /// Failed provider attempts keyed by (provider, model, status_code),
+    /// including attempts masked by a successful retry/fallback.
+    provider_attempt_failures: Arc<ProviderAttemptFailureMetrics>,
     /// Compression tokens saved counter, keyed by bounded (level, provider).
     compression_tokens_saved: Arc<DashMap<CompressionMetricKey, AtomicU64>>,
     /// Compression ratio histogram, keyed by bounded (level, provider).
@@ -610,6 +616,7 @@ impl Metrics {
             guardrail_refusal_failover: Arc::new(DashMap::new()),
             guardrail_stego_detections: Arc::new(DashMap::new()),
             structured_output: Arc::new(StructuredOutputMetrics::new()),
+            provider_attempt_failures: Arc::new(ProviderAttemptFailureMetrics::new()),
             compression_tokens_saved: Arc::new(DashMap::new()),
             compression_ratio: Arc::new(DashMap::new()),
             compression_duration_seconds: Arc::new(DashMap::new()),
@@ -1489,6 +1496,20 @@ Total unicode_stego provider detections by category and phase\n",
     pub fn write_structured_output_prometheus(&self, out: &mut String) {
         self.structured_output
             .write_structured_output_prometheus(out);
+    }
+
+    /// Record a single FAILED provider attempt, keyed by
+    /// `(provider, model, status_code)`. Called for every failed attempt even
+    /// when the request ultimately succeeds via retry/fallback, so a model's
+    /// true failure rate is observable.
+    pub fn record_provider_attempt_failure(&self, provider: &str, model: &str, status_code: u16) {
+        self.provider_attempt_failures
+            .record(provider, model, status_code);
+    }
+
+    /// Append provider attempt-failure metrics in Prometheus text format.
+    pub fn write_provider_attempt_failures_prometheus(&self, out: &mut String) {
+        self.provider_attempt_failures.write_prometheus(out);
     }
 
     /// Record content-free compression metrics for one pipeline operation.
