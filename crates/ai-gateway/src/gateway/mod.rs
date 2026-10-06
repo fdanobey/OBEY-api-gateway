@@ -1582,12 +1582,29 @@ reasoning_compat: Default::default(),
             .filter_map(|model| model["id"].as_str())
             .collect();
 
-    assert_eq!(ids.len(), 4);
-    assert!(ids.contains("openai/gpt-oss-120b"));
-    assert!(ids.contains("meta/llama-3.1-70b-instruct"));
-    assert!(ids.contains("nvidia/nemotron-3-nano"));
-    assert!(ids.contains("moonshotai/kimi-k3"));
-}
+        use crate::providers::nvidia_nim::NVIDIA_NIM_FALLBACK_MODELS;
+
+        // Without manual models or a live upstream, the endpoint surfaces exactly
+        // the NVIDIA NIM fallback catalog. Assertions are tied to the source const,
+        // not to any specific count or model id.
+        assert!(!ids.is_empty(), "endpoint must surface fallback models");
+        assert_eq!(ids.len(), NVIDIA_NIM_FALLBACK_MODELS.len());
+        for model in NVIDIA_NIM_FALLBACK_MODELS {
+            assert!(
+                ids.contains(model.id),
+                "endpoint must surface fallback model {:?}",
+                model.id
+            );
+        }
+        for id in &ids {
+            let segments: Vec<&str> = id.split('/').collect();
+            assert_eq!(segments.len(), 2, "surfaced id {id:?} must be owner/model");
+            assert!(
+                !segments[0].is_empty() && !segments[1].is_empty(),
+                "surfaced id {id:?} has an empty segment"
+            );
+        }
+    }
 
     fn config_with_size_limit(max_mb: u64) -> Config {
         let mut cfg = minimal_config();

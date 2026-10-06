@@ -6123,6 +6123,19 @@ impl Router {
                         );
                     }
 
+                    // Per-attempt failure logging: carry the failed attempts
+                    // that this request skipped past (timeouts, 5xx, breaker
+                    // skips, etc.) out to the handler so each one is logged as
+                    // its own row, even though the request ultimately succeeded.
+                    // The handler strips this key before returning to the
+                    // client (`strip_gateway_response_metadata`).
+                    if !attempts.is_empty() {
+                        response.extra.insert(
+                            "gateway_failed_attempts".to_string(),
+                            serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
+                        );
+                    }
+
                     return Ok(response);
                 }
                 Err(e) => {
@@ -6248,7 +6261,7 @@ impl Router {
         // error. These candidates already carry gateway_provider/responded_model/
         // cost metadata and their finish_reason=length is preserved verbatim, so
         // the client sees the partial content and the truncation reason.
-        if let Some(longest) = truncated_candidates
+        if let Some(mut longest) = truncated_candidates
             .into_iter()
             .max_by_key(|r| r.usage.completion_tokens)
         {
@@ -6263,6 +6276,12 @@ impl Router {
                 completion_tokens = longest.usage.completion_tokens,
                 "All providers truncated (finish_reason=length); returning longest partial response"
             );
+            if !attempts.is_empty() {
+                longest.extra.insert(
+                    "gateway_failed_attempts".to_string(),
+                    serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
+                );
+            }
             return Ok(longest);
         }
 
@@ -6294,6 +6313,12 @@ impl Router {
                 provider = %chosen_provider,
                 "All providers returned reasoning without an answer or tool call; returning the longest reasoning as content"
             );
+            if !attempts.is_empty() {
+                best.extra.insert(
+                    "gateway_failed_attempts".to_string(),
+                    serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
+                );
+            }
             return Ok(best);
         }
 

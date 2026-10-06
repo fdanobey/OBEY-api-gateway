@@ -1050,6 +1050,82 @@ mod tests {
         }
     }
 
+    /// Per-attempt failure logging: a request that succeeds after one failed
+    /// upstream attempt must write BOTH a final-outcome row (200) and a
+    /// distinct attempt-failure row (504), sharing one `trace_id`. The attempt
+    /// row is distinguished by its `path` marker and is independently
+    /// queryable by `model` + `status_code`, which is what powers
+    /// `GET /logs?model=glm-5.3:dev&status_code=504`.
+    #[test]
+    fn attempt_failure_row_is_queryable_and_distinct_from_outcome_row() {
+        let (logger, _temp) = create_test_logger();
+        let trace_id = "trace-attempt-504";
+
+        // Final-outcome row: the request ultimately succeeded (HTTP 200).
+        let mut outcome = sample_entry(trace_id, None);
+        outcome.path = "/v1/chat/completions".to_owned();
+        outcome.model = "glm-5.3:dev".to_owned();
+        outcome.provider = "electronhub".to_owned();
+        outcome.status_code = 200;
+        logger.log(outcome).unwrap();
+
+        // Attempt-failure row: the first attempt to glm-5.3:dev returned 504
+        // but was masked by the successful retry/fallback.
+        let mut attempt = sample_entry(trace_id, None);
+        attempt.path = "/v1/chat/completions#attempt".to_owned();
+        attempt.model = "glm-5.3:dev".to_owned();
+        attempt.provider = "electronhub".to_owned();
+        attempt.status_code = 504;
+        attempt.duration_ms = 0;
+        attempt.cost = 0.0;
+        attempt.response_body = Some("504 Gateway Timeout".to_owned());
+        logger.log(attempt).unwrap();
+
+        // The 504 filter surfaces exactly the attempt row.
+        let failures = logger
+            .query(LogFilter {
+                model: Some("glm-5.3:dev".to_owned()),
+                status_code: Some(504),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].path, "/v1/chat/completions#attempt");
+        assert_eq!(failures[0].trace_id, trace_id);
+        assert_eq!(failures[0].provider, "electronhub");
+        assert_eq!(
+            failures[0].response_body.as_deref(),
+            Some("504 Gateway Timeout")
+        );
+
+        // The 200 filter surfaces exactly the final-outcome row, unchanged.
+        let outcomes = logger
+            .query(LogFilter {
+                model: Some("glm-5.3:dev".to_owned()),
+                status_code: Some(200),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].path, "/v1/chat/completions");
+        assert_eq!(outcomes[0].trace_id, trace_id);
+
+        // Both rows correlate under the shared trace_id.
+        let correlated = logger
+            .query(LogFilter {
+                trace_id: Some(trace_id.to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(correlated.len(), 2);
+        assert!(correlated
+            .iter()
+            .any(|row| row.path == "/v1/chat/completions#attempt" && row.status_code == 504));
+        assert!(correlated
+            .iter()
+            .any(|row| row.path == "/v1/chat/completions" && row.status_code == 200));
+    }
+
     #[test]
     fn migrates_old_schema_and_preserves_old_rows() {
         let temp_file = NamedTempFile::new().unwrap();

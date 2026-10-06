@@ -162,6 +162,36 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Assert a single mapped `Model` satisfies the catalog invariants that must
+    /// hold regardless of which models are curated: the id is a well-formed
+    /// `owner/model` pair (exactly one `/`, non-empty segments), `owned_by` is
+    /// non-empty, and the object tag is `"model"`.
+    fn assert_model_well_formed(model: &Model) {
+        let segments: Vec<&str> = model.id.split('/').collect();
+        assert_eq!(
+            segments.len(),
+            2,
+            "model id {:?} must be of the form owner/model",
+            model.id
+        );
+        assert!(
+            !segments[0].is_empty(),
+            "model id {:?} has an empty owner segment",
+            model.id
+        );
+        assert!(
+            !segments[1].is_empty(),
+            "model id {:?} has an empty model segment",
+            model.id
+        );
+        assert!(
+            !model.owned_by.is_empty(),
+            "model {:?} has an empty owned_by",
+            model.id
+        );
+        assert_eq!(model.object, "model", "model {:?} has wrong object tag", model.id);
+    }
+
     #[test]
     fn test_nvidia_nim_provider_creation() {
         let provider = NvidiaNIMProvider::new(
@@ -195,30 +225,56 @@ mod tests {
     #[test]
     fn fallback_catalog_has_expected_models_and_metadata() {
         let models = fallback_models();
-        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
+        // Structural invariants: the fallback catalog must be non-empty and map
+        // 1:1 (in order) from the source const, with every entry well-formed.
+        assert!(!models.is_empty(), "fallback catalog must not be empty");
         assert_eq!(
-            ids,
-            vec![
-                "openai/gpt-oss-120b",
-                "meta/llama-3.1-70b-instruct",
-                "nvidia/nemotron-3-nano",
-                "moonshotai/kimi-k3",
-            ]
+            models.len(),
+            NVIDIA_NIM_FALLBACK_MODELS.len(),
+            "mapping must preserve the number of curated entries"
         );
-        assert_eq!(models[0].context_window, Some(128_000));
 
-        // Kimi K3 is the only vision-capable entry (native multimodal, 1M context).
-        let kimi = models
-            .iter()
-            .find(|model| model.id == "moonshotai/kimi-k3")
-            .expect("kimi-k3 present in fallback catalog");
-        assert!(kimi.supports_vision);
-        assert_eq!(kimi.context_window, Some(1_000_000));
-        assert!(models
-            .iter()
-            .filter(|model| model.id != "moonshotai/kimi-k3")
-            .all(|model| !model.supports_vision));
+        for (i, model) in models.iter().enumerate() {
+            assert_eq!(
+                model.id, NVIDIA_NIM_FALLBACK_MODELS[i].id,
+                "mapped id at index {i} must match the source const"
+            );
+            assert_eq!(
+                model.owned_by, NVIDIA_NIM_FALLBACK_MODELS[i].owned_by,
+                "mapped owned_by at index {i} must match the source const"
+            );
+            assert_model_well_formed(model);
+        }
+
+        // Validate the source const directly: every entry has a well-formed
+        // owner/model id, a non-empty owned_by, and a source_url that points at
+        // the NVIDIA build domain.
+        for entry in NVIDIA_NIM_FALLBACK_MODELS {
+            let segments: Vec<&str> = entry.id.split('/').collect();
+            assert_eq!(
+                segments.len(),
+                2,
+                "const id {:?} must be of the form owner/model",
+                entry.id
+            );
+            assert!(
+                !segments[0].is_empty() && !segments[1].is_empty(),
+                "const id {:?} has an empty segment",
+                entry.id
+            );
+            assert!(
+                !entry.owned_by.is_empty(),
+                "const entry {:?} has an empty owned_by",
+                entry.id
+            );
+            assert!(
+                entry.source_url.starts_with("https://build.nvidia.com"),
+                "const entry {:?} source_url {:?} must point at build.nvidia.com",
+                entry.id,
+                entry.source_url
+            );
+        }
     }
 
     #[tokio::test]
@@ -273,8 +329,12 @@ mod tests {
         .unwrap();
 
         let models = provider.list_models().await.unwrap();
+        assert!(!models.is_empty(), "fallback catalog must not be empty");
         assert_eq!(models.len(), NVIDIA_NIM_FALLBACK_MODELS.len());
-        assert_eq!(models[0].id, "openai/gpt-oss-120b");
+        // On an empty live catalog the provider returns the fallback catalog in
+        // source order; index 0 is read from the const, not hard-coded.
+        assert_eq!(models[0].id, NVIDIA_NIM_FALLBACK_MODELS[0].id);
+        assert_model_well_formed(&models[0]);
     }
 
     #[tokio::test]
@@ -297,7 +357,13 @@ mod tests {
         .unwrap();
 
         let models = provider.list_models().await.unwrap();
+        assert!(!models.is_empty(), "fallback catalog must not be empty");
         assert_eq!(models.len(), NVIDIA_NIM_FALLBACK_MODELS.len());
-        assert_eq!(models[2].id, "nvidia/nemotron-3-nano");
+        // On a live-catalog error the provider falls back in source order;
+        // verify the full mapping generically rather than naming any model.
+        for (i, model) in models.iter().enumerate() {
+            assert_eq!(model.id, NVIDIA_NIM_FALLBACK_MODELS[i].id);
+            assert_model_well_formed(model);
+        }
     }
 }

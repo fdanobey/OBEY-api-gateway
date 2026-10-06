@@ -152,10 +152,27 @@ impl GatewayExtractionAdapter {
             memory_type: String,
         }
 
-        let raw_candidates: Vec<RawCandidate> =
-            serde_json::from_str(json_str).map_err(|e| MemoryExtractionProviderError {
-                message: format!("failed to parse extraction response as JSON: {e}"),
-            })?;
+        // Lenient parse: models sometimes wrap the array in prose, in markdown
+        // fences, in a `{"memories": [...]}` wrapper, or return a single bare
+        // candidate object. Extract the first balanced JSON value from the
+        // (possibly prose-wrapped) string, normalize it to an array, then
+        // deserialize. On any failure, degrade to zero candidates — memory
+        // extraction is best-effort/out-of-band and must never surface as a
+        // provider error that could affect the user's returned completion.
+        let raw_candidates: Vec<RawCandidate> = match Self::extract_candidate_array(json_str) {
+            Some(array) => serde_json::from_value(array).unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        if raw_candidates.is_empty() {
+            // Nothing usable parsed out; skip extraction for this turn exactly
+            // as the empty-array path does. Diagnostic stays at debug so the
+            // scary WARN never fires for a model that returned prose/garbage.
+            tracing::debug!(
+                "memory extraction yielded no parseable candidates; skipping"
+            );
+            return Ok(Vec::new());
+        }
 
         Ok(raw_candidates
             .into_iter()
@@ -173,6 +190,85 @@ impl GatewayExtractionAdapter {
                 })
             })
             .collect())
+    }
+
+    /// Extract the first balanced top-level JSON value (array or object) from a
+    /// possibly prose-wrapped string and normalize it to a JSON array suitable
+    /// for `Vec<RawCandidate>`. Returns `None` when no usable value is found.
+    ///
+    /// Normalization: arrays pass through; `{"memories": [...]}` (or an object
+    /// with exactly one array-valued member) unwraps to that array; a single
+    /// candidate-shaped object (has a `content` field) is wrapped into a
+    /// one-element array.
+    fn extract_candidate_array(text: &str) -> Option<serde_json::Value> {
+        let slice = Self::first_json_value(text)?;
+        let value: serde_json::Value = serde_json::from_str(slice).ok()?;
+        Self::normalize_to_array(value)
+    }
+
+    /// Return the slice of `text` spanning the first balanced JSON value
+    /// (starting at the first `[` or `{`), respecting string literals and
+    /// escapes so brackets inside strings are not counted.
+    fn first_json_value(text: &str) -> Option<&str> {
+        let bytes = text.as_bytes();
+        let start = bytes.iter().position(|&b| b == b'[' || b == b'{')?;
+        let open = bytes[start];
+        let close = if open == b'[' { b']' } else { b'}' };
+
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (i, &b) in bytes.iter().enumerate().skip(start) {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                x if x == open => depth += 1,
+                x if x == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return text.get(start..=i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Normalize a parsed JSON value into a `Vec<RawCandidate>`-shaped array.
+    fn normalize_to_array(value: serde_json::Value) -> Option<serde_json::Value> {
+        match value {
+            serde_json::Value::Array(_) => Some(value),
+            serde_json::Value::Object(map) => {
+                // Known wrapper key first.
+                if let Some(arr @ serde_json::Value::Array(_)) = map.get("memories") {
+                    return Some(arr.clone());
+                }
+                // Fall back to the sole array-valued member, if exactly one.
+                let array_values: Vec<&serde_json::Value> =
+                    map.values().filter(|v| v.is_array()).collect();
+                if array_values.len() == 1 {
+                    return Some(array_values[0].clone());
+                }
+                // A single candidate-shaped object -> wrap into one-element array.
+                if map.contains_key("content") {
+                    return Some(serde_json::Value::Array(vec![serde_json::Value::Object(
+                        map,
+                    )]));
+                }
+                None
+            }
+            _ => None,
+        }
     }
 }
 
@@ -251,5 +347,48 @@ impl MemoryExtractionProvider for GatewayExtractionAdapter {
             .unwrap_or("");
 
         Self::parse_response(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_response_prose_wrapped_array_extracts_candidates() {
+        let input = "Here are the memories:\n[{\"content\":\"uses snake_case\",\"memory_type\":\"preference\"}]\nDone.";
+        let candidates = GatewayExtractionAdapter::parse_response(input).expect("ok");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].content, "uses snake_case");
+        assert_eq!(candidates[0].memory_type, MemoryType::Preference);
+    }
+
+    #[test]
+    fn parse_response_single_object_is_wrapped() {
+        // Reproduces "invalid type: map, expected a sequence": a bare object.
+        let input = "{\"content\":\"targets Rust 1.78\",\"memory_type\":\"fact\"}";
+        let candidates = GatewayExtractionAdapter::parse_response(input).expect("ok");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].content, "targets Rust 1.78");
+        assert_eq!(candidates[0].memory_type, MemoryType::Fact);
+    }
+
+    #[test]
+    fn parse_response_wrapper_key_is_unwrapped() {
+        let input =
+            "{\"memories\":[{\"content\":\"deploys via Terraform\",\"memory_type\":\"context\"}]}";
+        let candidates = GatewayExtractionAdapter::parse_response(input).expect("ok");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].content, "deploys via Terraform");
+        assert_eq!(candidates[0].memory_type, MemoryType::Context);
+    }
+
+    #[test]
+    fn parse_response_unparseable_prose_returns_empty() {
+        // Reproduces "expected value at line 1 column 1": pure prose, no JSON.
+        let input = "I could not find anything worth saving.";
+        let candidates = GatewayExtractionAdapter::parse_response(input)
+            .expect("unparseable output degrades to Ok(empty), not Err");
+        assert!(candidates.is_empty());
     }
 }

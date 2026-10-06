@@ -352,6 +352,105 @@ fn log_request(state: &super::AppState, request: &OpenAIRequest, context: &Reque
     }
 }
 
+/// `path` marker distinguishing per-attempt failure rows from the normal
+/// final-outcome row (`/v1/chat/completions`). Attempt rows are written to the
+/// same `requests` table and are queryable by `model`/`status_code`, so
+/// `GET /logs?model=glm-5.3:dev&status_code=504` surfaces upstream 504s even
+/// when the request ultimately succeeded via retry/fallback.
+pub(crate) const ATTEMPT_LOG_PATH: &str = "/v1/chat/completions#attempt";
+
+/// Status code used for an attempt whose own `status_code` is `None`
+/// (e.g. a connection error or circuit-breaker skip with no HTTP status).
+/// Mirrors the gateway's `AllProvidersFailed` → HTTP 502 mapping.
+const ATTEMPT_FALLBACK_STATUS: u16 = 502;
+
+/// Extract the failed `ProviderAttempt`s the router stashed on the response
+/// (`gateway_failed_attempts`) during failover. Returns an empty vec when the
+/// key is absent or malformed — this is best-effort telemetry.
+fn extract_failed_attempts(response: &OpenAIResponse) -> Vec<ProviderAttempt> {
+    response
+        .extra
+        .get("gateway_failed_attempts")
+        .and_then(|value| serde_json::from_value::<Vec<ProviderAttempt>>(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Write one content-free failure log row per failed provider attempt, and
+/// bump the model-labeled attempt-failure counter.
+///
+/// Each row carries the attempt's own `timestamp`, the attempt's target
+/// `model` and `provider`, its `status_code` (or [`ATTEMPT_FALLBACK_STATUS`]
+/// when the attempt has none), the error string in `response_body`, and the
+/// SHARED parent `trace_id` so attempt rows correlate with the final-outcome
+/// row. `duration_ms` is `0` because `ProviderAttempt` does not track
+/// per-attempt latency. No request/response bodies are logged regardless of
+/// body-logging config — only provider, model, status, and the error string.
+///
+/// Best-effort and off the request hot path: it runs after routing completes
+/// and never blocks or fails the request (log failures are only warned).
+fn log_failed_attempts(
+    state: &super::AppState,
+    trace_id: &str,
+    attempts: &[ProviderAttempt],
+) {
+    for attempt in attempts {
+        let status_code = attempt.status_code.unwrap_or(ATTEMPT_FALLBACK_STATUS);
+        state
+            .metrics
+            .record_provider_attempt_failure(&attempt.provider, &attempt.model, status_code);
+
+        let entry = LogEntry {
+            trace_id: trace_id.to_string(),
+            timestamp: attempt.timestamp,
+            method: "POST".to_string(),
+            path: ATTEMPT_LOG_PATH.to_string(),
+            model: attempt.model.clone(),
+            provider: attempt.provider.clone(),
+            status_code,
+            duration_ms: 0,
+            cost: 0.0,
+            request_body: None,
+            response_body: Some(attempt.error.clone()),
+            requested_model: None,
+            responded_model: None,
+            compression: None,
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            cache_savings_cents: None,
+            prefix_hash: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
+        };
+        if let Err(e) = state.logger.log(entry) {
+            tracing::warn!(
+                error = %e,
+                trace_id = %trace_id,
+                model = %attempt.model,
+                provider = %attempt.provider,
+                status_code,
+                "Failed to write per-attempt failure log entry"
+            );
+        }
+    }
+}
+
+/// Convenience wrapper: pull the failed attempts off the response and log them.
+/// No-op when the response carries none.
+fn log_failed_attempts_from_response(
+    state: &super::AppState,
+    trace_id: &str,
+    response: &OpenAIResponse,
+) {
+    let attempts = extract_failed_attempts(response);
+    if !attempts.is_empty() {
+        log_failed_attempts(state, trace_id, &attempts);
+    }
+}
+
 fn strip_gateway_response_metadata(response: &mut OpenAIResponse) {
     response.extra.remove("gateway_provider");
     response.extra.remove("gateway_responded_model");
@@ -364,6 +463,9 @@ fn strip_gateway_response_metadata(response: &mut OpenAIResponse) {
     response.extra.remove("gateway_prefix_hash");
     response.extra.remove("gateway_reasoning_tokens");
     response.extra.remove("gateway_reasoning_compat_actions");
+    // Per-attempt failure telemetry: internal routing metadata that must never
+    // reach the client. Consumed by `log_failed_attempts` before this strip.
+    response.extra.remove("gateway_failed_attempts");
 }
 
 fn prepare_response_for_client(response: &OpenAIResponse) -> OpenAIResponse {
@@ -1573,6 +1675,7 @@ async fn chat_completions_non_stream(
                                         .map(|memory| (&memory.context, &memory.injection)),
                                     None,
                                 );
+                                log_failed_attempts_from_response(&state, &trace_id, &response);
                                 log_request(&state, &request, &log_context);
                                 let mut http_response = openai_json_response(&response);
                                 attach_trace_id_header(&mut http_response, &trace_id);
@@ -2106,6 +2209,9 @@ async fn chat_completions_non_stream(
                     .map(|memory| (&memory.context, &memory.injection)),
                 Some(memory_extraction),
             );
+            // Log any failed provider attempts masked by this success BEFORE
+            // the response's gateway extras are stripped for the client.
+            log_failed_attempts_from_response(&state, &trace_id, &response);
             log_request(&state, &request, &log_context);
             let mut http_response = openai_json_response(&response);
             attach_validation_status_header(
@@ -2395,6 +2501,7 @@ async fn chat_completions_stream(
 
                             let duration_ms = start.elapsed().as_millis() as u64;
                             let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                            log_failed_attempts_from_response(&state, &stream_trace_id, &response);
                             log_request(&state, &request, &log_context);
 
                             // Non-blocking memory extraction now that the full
@@ -2620,6 +2727,10 @@ async fn chat_completions_stream(
                             current_model.clone(),
                             current_compression.clone(),
                         );
+                        // Surface any streaming attempts that failed before this
+                        // success so masked upstream failures (e.g. 504s) are
+                        // visible per-attempt, mirroring the buffered path.
+                        log_failed_attempts(&state, &stream_trace_id, &streaming_attempts);
                         log_request(&state, &request, &log_context);
                         break 'failover;
                     }
@@ -2637,6 +2748,11 @@ async fn chat_completions_stream(
                                             current_provider.clone(),
                                             current_model.clone(),
                                             current_compression.clone(),
+                                        );
+                                        log_failed_attempts(
+                                            &state,
+                                            &stream_trace_id,
+                                            &streaming_attempts,
                                         );
                                         log_request(&state, &request, &log_context);
                                         state
@@ -2731,6 +2847,8 @@ async fn chat_completions_stream(
                                                     }
                                                     let duration_ms = start.elapsed().as_millis() as u64;
                                                     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                                                    log_failed_attempts(&state, &stream_trace_id, &streaming_attempts);
+                                                    log_failed_attempts_from_response(&state, &stream_trace_id, &response);
                                                     log_request(&state, &request, &log_context);
                                                     if let Some(memory) = memory_context.as_ref() {
                                                         let response_content = response
@@ -2817,6 +2935,8 @@ async fn chat_completions_stream(
                                                 }
                                                 let duration_ms = start.elapsed().as_millis() as u64;
                                                 let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                                                log_failed_attempts(&state, &stream_trace_id, &streaming_attempts);
+                                                log_failed_attempts_from_response(&state, &stream_trace_id, &response);
                                                 log_request(&state, &request, &log_context);
                                                 if let Some(memory) = memory_context.as_ref() {
                                                     let response_content = response
@@ -2939,6 +3059,7 @@ async fn chat_completions_stream(
     let duration_ms = start.elapsed().as_millis() as u64;
     let log_context =
         RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
+    log_failed_attempts_from_response(&state, &trace_id, &response);
     log_request(&state, &request, &log_context);
 
     // Non-blocking memory extraction now that the full response is known.
@@ -3649,6 +3770,8 @@ async fn stream_eager_structured_output(
         Err(EagerPostCallResult::Response(_)) => unreachable!(),
     };
 
+    log_failed_attempts_from_response(&state, &trace_id, &response);
+
     if should_cache_eager_structured(&request, Some(&response), Some(validation_status)) {
         if let Ok(json) = serde_json::to_string(&response) {
             state.exact_cache.set(&request, json.clone());
@@ -3893,6 +4016,7 @@ async fn stream_buffered_with_post_call(
                     }
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                    log_failed_attempts_from_response(&state, &stream_trace_id, &response);
                     log_request(&state, &request, &log_context);
                     for chunk in chunks {
                         yield Ok(Event::default().data(chunk.to_string()));
@@ -8704,6 +8828,9 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
     state.metrics.write_compression_prometheus(&mut out);
     state.metrics.write_tool_compression_prometheus(&mut out);
     state.metrics.write_structured_output_prometheus(&mut out);
+    state
+        .metrics
+        .write_provider_attempt_failures_prometheus(&mut out);
     state
         .loop_detector
         .metrics
