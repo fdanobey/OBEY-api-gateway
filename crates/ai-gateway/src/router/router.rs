@@ -13,7 +13,7 @@ use crate::config::{
 };
 use crate::context::ContextManager;
 use crate::dashboard::CompressionEventHub;
-use crate::error::{AggregatedError, GatewayError, ProviderAttempt};
+use crate::error::{error_class_for, AggregatedError, GatewayError, ProviderAttempt};
 use crate::memory::{
     CompressionExtractionInput, CompressionMessageSnapshot, CompressionRemovalReport,
     ExtractionPolicy, MemorySystem, ResolvedNamespace,
@@ -236,6 +236,194 @@ use super::cache_cost::{compute_actual_cost, extract_cache_usage};
 use super::cache_inject::{inject_explicit_cache_breakpoints, CacheInjectorConfig};
 use super::sticky_cache::StickyCache;
 use super::{CircuitBreaker, LatencyTracker, RateLimiter};
+
+/// Error returned by the buffered dispatch when an upstream SSE stream ends
+/// without `[DONE]` and without any `finish_reason`.
+const SSE_TRUNCATED_ERROR: &str = "Upstream stream ended before completion";
+
+/// Attempt-row status for a failed try (DD8): the upstream HTTP status when
+/// one was received, 504 for router timeouts, 502 for network errors.
+fn attempt_status_for(err: &GatewayError) -> u16 {
+    match err {
+        GatewayError::TtfbTimeout(_)
+        | GatewayError::TotalTimeout(_)
+        | GatewayError::ChunkTimeout(_) => 504,
+        GatewayError::Network(_) | GatewayError::Http(_) => 502,
+        GatewayError::Provider { status_code, .. } => status_code.unwrap_or(502),
+        other => other.status_code().as_u16(),
+    }
+}
+
+/// DD10: timeout-class failures fail over immediately instead of retrying the
+/// same provider. A long generation that timed out once (router TTFB / total /
+/// chunk timeout, or an upstream gateway 504/524) almost always times out
+/// again, and the provider usually keeps generating the abandoned request.
+fn is_timeout_class(err: &GatewayError) -> bool {
+    match err {
+        GatewayError::TtfbTimeout(_)
+        | GatewayError::TotalTimeout(_)
+        | GatewayError::ChunkTimeout(_) => true,
+        GatewayError::Provider { status_code, .. } => matches!(status_code, Some(504 | 524)),
+        _ => false,
+    }
+}
+
+/// A reassembled SSE body plus whether the stream actually finished.
+#[derive(Debug)]
+struct SseReassembly {
+    response: OpenAIResponse,
+    /// `[DONE]` was seen or at least one chunk carried a `finish_reason`.
+    completed: bool,
+}
+
+/// Why an SSE body could not be reassembled.
+#[derive(Debug)]
+enum SseReassemblyError {
+    /// No parseable `data:` chunk in the body.
+    NoChunks,
+    /// A chunk carried a top-level `error` object. `frame` is the raw JSON
+    /// payload so callers can classify it (e.g. rate-limit shaped).
+    ErrorFrame { message: String, frame: String },
+    /// A chunk ended with `finish_reason: "error"`.
+    ErrorFinish(String),
+}
+
+impl std::fmt::Display for SseReassemblyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SseReassemblyError::NoChunks => f.write_str("No SSE chunks found in response body"),
+            SseReassemblyError::ErrorFrame { message, .. } => f.write_str(message),
+            SseReassemblyError::ErrorFinish(message) => f.write_str(message),
+        }
+    }
+}
+
+/// True when `body` is an SSE stream: after skipping blank lines, `:`
+/// comments and `event:`/`id:`/`retry:` fields, the first line is a `data:`
+/// field. Providers commonly open a stream with a keep-alive comment.
+fn body_looks_like_sse(body: &str) -> bool {
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with(':')
+            || line.starts_with("event:")
+            || line.starts_with("id:")
+            || line.starts_with("retry:")
+        {
+            continue;
+        }
+        return line.starts_with("data:");
+    }
+    false
+}
+
+/// Request shapes whose response cannot be rebuilt from SSE deltas, because
+/// reassembly only rebuilds `choices[0]` text, tool calls and reasoning:
+/// `n > 1`, `logprobs`/`top_logprobs`, and audio output. These stay on
+/// `stream: false` upstream.
+fn requires_non_streaming(request: &OpenAIRequest) -> bool {
+    let extra = &request.extra;
+    let is_set = |key: &str| {
+        extra
+            .get(key)
+            .is_some_and(|v| !v.is_null() && v.as_bool() != Some(false))
+    };
+    let multi_choice = extra
+        .get("n")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|n| n > 1);
+    let audio_output = is_set("audio")
+        || extra
+            .get("modalities")
+            .and_then(|v| v.as_array())
+            .is_some_and(|m| m.iter().any(|x| x.as_str() == Some("audio")));
+    multi_choice || is_set("logprobs") || is_set("top_logprobs") || audio_output
+}
+
+/// Deadlines for reading a streamed upstream body in the buffered dispatch.
+struct UpstreamBodyLimits {
+    /// No body chunk by this instant → `TtfbTimeout(ttfb_secs)`.
+    first_byte_deadline: tokio::time::Instant,
+    ttfb_secs: u64,
+    /// Max gap between chunks once the first one arrived → `ChunkTimeout`.
+    idle: Option<Duration>,
+    /// Past this instant → `TotalTimeout(total_secs)`.
+    total_deadline: tokio::time::Instant,
+    total_secs: u64,
+}
+
+/// Read an upstream response body chunk by chunk, enforcing the
+/// first-byte, inter-chunk idle and total deadlines in `limits`.
+///
+/// Any non-empty chunk (SSE comments included) counts as liveness. A
+/// transport error mid-body maps to a provider error carrying the response
+/// status, matching the `response.text()` failure path.
+async fn read_upstream_body(
+    response: reqwest::Response,
+    limits: &UpstreamBodyLimits,
+    provider_name: &str,
+) -> Result<String, GatewayError> {
+    use futures::StreamExt;
+
+    let status_code = response.status().as_u16();
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut got_first_chunk = false;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= limits.total_deadline {
+            return Err(GatewayError::TotalTimeout(limits.total_secs));
+        }
+        // Pick the nearest deadline and remember which timeout it represents.
+        let (wait_until, on_timeout) = if !got_first_chunk {
+            if limits.first_byte_deadline <= limits.total_deadline {
+                (
+                    limits.first_byte_deadline,
+                    GatewayError::TtfbTimeout(limits.ttfb_secs),
+                )
+            } else {
+                (
+                    limits.total_deadline,
+                    GatewayError::TotalTimeout(limits.total_secs),
+                )
+            }
+        } else {
+            match limits.idle {
+                Some(idle) if now + idle < limits.total_deadline => {
+                    (now + idle, GatewayError::ChunkTimeout(idle.as_secs()))
+                }
+                _ => (
+                    limits.total_deadline,
+                    GatewayError::TotalTimeout(limits.total_secs),
+                ),
+            }
+        };
+
+        match tokio::time::timeout_at(wait_until, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                if !chunk.is_empty() {
+                    got_first_chunk = true;
+                    buf.extend_from_slice(&chunk);
+                }
+            }
+            Ok(Some(Err(e))) => {
+                return Err(GatewayError::Provider {
+                    provider: provider_name.to_string(),
+                    message: format!("Failed to read response body: {}", e),
+                    status_code: Some(status_code),
+                });
+            }
+            Ok(None) => break,
+            Err(_) => return Err(on_timeout),
+        }
+    }
+
+    Ok(match String::from_utf8(buf) {
+        Ok(text) => text,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
+}
 
 /// Computes the prompt-cache cost savings of a completed response in
 /// whole cents versus its uncached baseline (Req 4.2). `actual_cost`
@@ -4234,7 +4422,10 @@ impl Router {
         let total_timeout_secs = provider_cfg.effective_total_timeout(&provider_model.model);
         let ttfb_timeout = Duration::from_secs(ttfb_timeout_secs);
         let total_timeout = Duration::from_secs(total_timeout_secs);
-        tracing::info!(provider = provider_name, %url, model = %provider_model.model, ttfb_timeout_secs, total_timeout_secs, "Calling provider");
+        // Time from request arrival to this dispatch (memory, compression,
+        // queueing, earlier failovers): separates gateway delay from upstream.
+        let pre_dispatch_ms = active.as_ref().map_or(0, ActiveRequestHandle::elapsed_ms);
+        tracing::info!(provider = provider_name, %url, model = %provider_model.model, ttfb_timeout_secs, total_timeout_secs, pre_dispatch_ms, "Calling provider");
 
         let pool_config = provider_cfg.connection_pool.clone();
         let custom_headers = provider_cfg.effective_custom_headers();
@@ -4250,24 +4441,49 @@ impl Router {
         let jitter_ratio = config.retry.jitter_ratio;
         let cache_aware_routing_cfg = config.cache_aware_routing.clone();
         let configured_base_url = provider_cfg.base_url.clone();
+        // Inter-chunk idle window for streamed upstream bodies; the streaming
+        // relay's default applies when the `streaming` section is absent.
+        let chunk_timeout_secs = config
+            .streaming
+            .as_ref()
+            .map(|s| s.chunk_timeout_seconds)
+            .unwrap_or_else(|| crate::config::StreamingConfig::default().chunk_timeout_seconds);
 
         // Drop config lock before making HTTP calls
         drop(config);
 
         let http_client = self.get_or_create_http_client(provider_name, &pool_config)?;
 
-        // Build the outgoing request body — override model to the actual provider model name
-        // Always request non-streaming from provider; gateway handles client streaming separately
+        // Build the outgoing request body — override model to the actual provider model name.
+        // The gateway buffers the full provider response here either way. By
+        // default it asks the provider for an SSE stream and reassembles it, so
+        // bytes keep flowing during long generations (an idle `stream:false`
+        // request is what upstream proxies cut off with 504s). Providers that
+        // opt out, and request shapes reassembly cannot rebuild, stay on
+        // `stream:false`.
         let mut outgoing = request.clone();
         outgoing.model = provider_model.model.clone();
-        if request.stream {
-            debug!(
-                provider = provider_name,
-                model = %provider_model.model,
-                "Client requested streaming, but gateway is forcing upstream stream=false and buffering the full provider response"
+        let mut stream_upstream = provider_cfg.effective_buffered_upstream_streaming()
+            && !requires_non_streaming(&outgoing);
+        outgoing.stream = stream_upstream;
+        // Ask for the final usage frame, unless the client already set
+        // `stream_options` itself. Tracked so the one-shot `stream:false`
+        // fallback only removes what the gateway added.
+        let inserted_stream_options =
+            stream_upstream && !outgoing.extra.contains_key("stream_options");
+        if inserted_stream_options {
+            outgoing.extra.insert(
+                "stream_options".to_string(),
+                serde_json::json!({ "include_usage": true }),
             );
         }
-        outgoing.stream = false;
+        debug!(
+            provider = provider_name,
+            model = %provider_model.model,
+            client_stream = request.stream,
+            stream_upstream,
+            "Buffered dispatch upstream transport selected"
+        );
         let mut context_retry_attempt: usize = 0;
 
         // Reasoning-compat per-attempt stage (reasoning-failover-compat
@@ -4497,7 +4713,26 @@ impl Router {
         // below): an Anthropic-style thinking/budget_tokens validation 400
         // triggers one aggressive strip + retry of the same provider.
         let mut reasoning_strip_retry_done = false;
+        // One-shot `stream:false` fallback: a 400 that rejects `stream` /
+        // `stream_options` retries the same provider once without them.
+        let mut stream_fallback_done = false;
         let mut skip_next_backoff = false;
+        // Every failed HTTP try goes into the request's attempt ledger
+        // (DD7), so retries rescued later are still visible in the log.
+        let record_try = |err: &GatewayError,
+                          class: Option<&str>,
+                          status: Option<u16>,
+                          started: std::time::Instant| {
+            Self::record_try_failure(
+                active.as_ref(),
+                provider_name,
+                &provider_model.model,
+                err,
+                class,
+                status,
+                started,
+            );
+        };
 
         for attempt in 0..=max_retries {
             let skip_backoff_this_attempt = skip_next_backoff;
@@ -4583,10 +4818,12 @@ impl Router {
                         provider = provider_name,
                         attempt,
                         ttfb_timeout_secs,
-                        "TTFB timeout — provider did not respond in time"
+                        "TTFB timeout — provider did not respond in time, failing over"
                     );
-                    last_error = Some(GatewayError::TtfbTimeout(ttfb_timeout_secs));
-                    continue;
+                    let err = GatewayError::TtfbTimeout(ttfb_timeout_secs);
+                    record_try(&err, None, None, request_start);
+                    // DD10: no same-provider retry for timeout-class errors.
+                    return Err(err);
                 }
             };
 
@@ -4607,10 +4844,51 @@ impl Router {
                         }
                     }
 
-                    // Read body with remaining total timeout budget
-                    let elapsed = request_start.elapsed();
-                    let remaining_total = total_timeout.saturating_sub(elapsed);
-                    let body_result = tokio::time::timeout(remaining_total, response.text()).await;
+                    // Streamed success body: read incrementally so the TTFB
+                    // deadline covers the first body chunk and an idle gap is
+                    // detected, while a generation that keeps sending bytes
+                    // runs up to the total timeout.
+                    // Otherwise (stream:false, or an error status whose body is
+                    // a small JSON envelope) read the body with the remaining
+                    // total timeout budget, exactly as before.
+                    let body_result = if stream_upstream && status.is_success() {
+                        let started = tokio::time::Instant::from_std(request_start);
+                        let limits = UpstreamBodyLimits {
+                            first_byte_deadline: started + ttfb_timeout,
+                            ttfb_secs: ttfb_timeout_secs,
+                            idle: Some(Duration::from_secs(chunk_timeout_secs)),
+                            total_deadline: started + total_timeout,
+                            total_secs: total_timeout_secs,
+                        };
+                        match read_upstream_body(response, &limits, provider_name).await {
+                            Ok(text) => Ok(Ok(text)),
+                            Err(e) => {
+                                warn!(
+                                    provider = provider_name,
+                                    attempt,
+                                    error = %e,
+                                    elapsed_ms = request_start.elapsed().as_millis() as u64,
+                                    "Failed to read streamed provider response body"
+                                );
+                                // Body read errors are logged as 502 (DD8);
+                                // timeouts default to 504.
+                                let status = matches!(e, GatewayError::Provider { .. })
+                                    .then_some(502);
+                                record_try(&e, None, status, request_start);
+                                // DD10: TTFB/chunk/total timeouts fail over;
+                                // a body read error keeps the retry budget.
+                                if is_timeout_class(&e) {
+                                    return Err(e);
+                                }
+                                last_error = Some(e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        let elapsed = request_start.elapsed();
+                        let remaining_total = total_timeout.saturating_sub(elapsed);
+                        tokio::time::timeout(remaining_total, response.text()).await
+                    };
                     let body_text = match body_result {
                         Ok(Ok(text)) => text,
                         Ok(Err(e)) => {
@@ -4620,11 +4898,13 @@ impl Router {
                                 error = %e,
                                 "Failed to read response body"
                             );
-                            last_error = Some(GatewayError::Provider {
+                            let err = GatewayError::Provider {
                                 provider: provider_name.to_string(),
                                 message: format!("Failed to read response body: {}", e),
                                 status_code: Some(status_code),
-                            });
+                            };
+                            record_try(&err, Some("body_read_error"), Some(502), request_start);
+                            last_error = Some(err);
                             continue;
                         }
                         Err(_) => {
@@ -4634,14 +4914,18 @@ impl Router {
                                 total_timeout_secs,
                                 "Total timeout — response body read exceeded round-trip limit"
                             );
-                            last_error = Some(GatewayError::TotalTimeout(total_timeout_secs));
-                            continue;
+                            let err = GatewayError::TotalTimeout(total_timeout_secs);
+                            record_try(&err, None, None, request_start);
+                            // DD10: no same-provider retry for timeout-class errors.
+                            return Err(err);
                         }
                     };
                     tracing::info!(
                         provider = provider_name,
                         status = status_code,
                         body_len = body_text.len(),
+                        stream_upstream,
+                        elapsed_ms = request_start.elapsed().as_millis() as u64,
                         "Provider responded"
                     );
 
@@ -4660,43 +4944,16 @@ impl Router {
                                 // handling: cooldown the provider and bail
                                 // out of the inner retry loop immediately.
                                 if Self::is_rate_limited(200, &body_text) {
-                                    let cooldown = self
-                                        .parse_rate_limit_cooldown(
+                                    let err = self
+                                        .cool_down_rate_limited_200(
                                             provider_name,
-                                            Some(&response_headers),
+                                            &response_headers,
                                             &body_text,
+                                            err_msg,
                                         )
                                         .await;
-                                    let rate_limiter = self.get_rate_limiter(provider_name).await;
-                                    rate_limiter.apply_cooldown(cooldown).await;
-                                    self.metrics
-                                        .record_provider_rate_limit_exhausted(provider_name);
-                                    let now_secs = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .map(|d| d.as_secs())
-                                        .unwrap_or(0);
-                                    let deadline = now_secs.saturating_add(cooldown.as_secs());
-                                    self.metrics.set_provider_cooldown(
-                                        provider_name,
-                                        Self::friendly_failure_reason(Some(429), &body_text),
-                                        deadline,
-                                    );
-
-                                    warn!(
-                                        provider = provider_name,
-                                        cooldown_ms = cooldown.as_millis() as u64,
-                                        error = %err_msg,
-                                        "Provider returned rate-limit-shaped HTTP 200, failing over"
-                                    );
-
-                                    return Err(GatewayError::Provider {
-                                        provider: provider_name.to_string(),
-                                        message: format!(
-                                            "Rate limited (HTTP 200 envelope): {}",
-                                            err_msg
-                                        ),
-                                        status_code: Some(429),
-                                    });
+                                    record_try(&err, Some("error_in_200"), Some(status_code), request_start);
+                                    return Err(err);
                                 }
 
                                 // Image-input rejection inside a 200 envelope: same rescue
@@ -4734,6 +4991,16 @@ impl Router {
                                             images_removed = removed,
                                             "Provider rejected image inputs (in HTTP 200 envelope) — stripped images and retrying same provider"
                                         );
+                                        record_try(
+                                            &GatewayError::Provider {
+                                                provider: provider_name.to_string(),
+                                                message: format!("Error in 200 response: {}", err_msg),
+                                                status_code: Some(status_code),
+                                            },
+                                            Some("error_in_200"),
+                                            None,
+                                            request_start,
+                                        );
                                         continue;
                                     }
                                 }
@@ -4744,11 +5011,13 @@ impl Router {
                                     error = %err_msg,
                                     "Provider returned error inside HTTP 200 — treating as retryable"
                                 );
-                                last_error = Some(GatewayError::Provider {
+                                let err = GatewayError::Provider {
                                     provider: provider_name.to_string(),
                                     message: format!("Error in 200 response: {}", err_msg),
                                     status_code: Some(status_code),
-                                });
+                                };
+                                record_try(&err, None, None, request_start);
+                                last_error = Some(err);
                                 continue;
                             }
                         }
@@ -4816,15 +5085,69 @@ impl Router {
                             return Ok(openai_response);
                         }
 
-                        // Provider may have ignored stream:false and returned SSE chunks.
-                        // Parse the SSE stream and reconstruct a single OpenAIResponse.
-                        if body_text.starts_with("data: ") {
+                        // SSE body: the requested upstream stream, or a provider
+                        // that ignored stream:false. Reconstruct a single OpenAIResponse.
+                        if body_looks_like_sse(&body_text) {
                             tracing::debug!(
                                 provider = provider_name,
-                                "Provider returned SSE despite stream:false, reassembling"
+                                stream_upstream,
+                                "Provider returned SSE, reassembling"
                             );
-                            match Self::reassemble_sse_response(&body_text) {
-                                Ok(mut response) => {
+                            match Self::reassemble_sse_stream(&body_text) {
+                                Ok(reassembled) if !reassembled.completed => {
+                                    // Neither [DONE] nor any finish_reason: the
+                                    // stream was cut short. Retryable.
+                                    warn!(
+                                        provider = provider_name,
+                                        attempt,
+                                        body_len = body_text.len(),
+                                        "Upstream SSE stream ended before completion — treating as retryable"
+                                    );
+                                    let err = GatewayError::Provider {
+                                        provider: provider_name.to_string(),
+                                        message: SSE_TRUNCATED_ERROR.to_string(),
+                                        status_code: Some(status_code),
+                                    };
+                                    record_try(&err, None, Some(502), request_start);
+                                    last_error = Some(err);
+                                    continue;
+                                }
+                                Err(SseReassemblyError::ErrorFrame { message, frame })
+                                    if Self::is_rate_limited(200, &frame) =>
+                                {
+                                    // Mid-stream rate-limit frame: same
+                                    // cooldown + fail-over as a 200 envelope.
+                                    let err = self
+                                        .cool_down_rate_limited_200(
+                                            provider_name,
+                                            &response_headers,
+                                            &frame,
+                                            &message,
+                                        )
+                                        .await;
+                                    record_try(&err, Some("error_in_200"), Some(status_code), request_start);
+                                    return Err(err);
+                                }
+                                Err(
+                                    e @ (SseReassemblyError::ErrorFrame { .. }
+                                    | SseReassemblyError::ErrorFinish(_)),
+                                ) => {
+                                    warn!(
+                                        provider = provider_name,
+                                        attempt,
+                                        error = %e,
+                                        "Provider sent an error inside the SSE stream — treating as retryable"
+                                    );
+                                    let err = GatewayError::Provider {
+                                        provider: provider_name.to_string(),
+                                        message: format!("Error in 200 response: {}", e),
+                                        status_code: Some(status_code),
+                                    };
+                                    record_try(&err, None, None, request_start);
+                                    last_error = Some(err);
+                                    continue;
+                                }
+                                Ok(SseReassembly { mut response, .. }) => {
                                     if has_tools {
                                         response.extra.insert(
                                             "gateway_tool_hint_injected".to_string(),
@@ -4843,23 +5166,29 @@ impl Router {
                                 }
                                 Err(e) => {
                                     tracing::error!(provider = provider_name, error = %e, body = %body_text.chars().take(500).collect::<String>(), "Failed to reassemble SSE response");
-                                    return Err(GatewayError::Provider {
+                                    let err = GatewayError::Provider {
                                         provider: provider_name.to_string(),
                                         message: format!("Failed to parse response: {}", e),
                                         status_code: Some(status_code),
-                                    });
+                                    };
+                                    record_try(&err, Some("other"), Some(502), request_start);
+                                    return Err(err);
                                 }
                             }
                         }
 
                         // Neither JSON nor SSE — log and fail
                         tracing::error!(provider = provider_name, body = %body_text.chars().take(500).collect::<String>(), "Failed to parse provider response");
-                        return Err(GatewayError::Provider {
+                        let err = GatewayError::Provider {
                             provider: provider_name.to_string(),
                             message: "Failed to parse response: not JSON or SSE".to_string(),
                             status_code: Some(status_code),
-                        });
+                        };
+                        record_try(&err, Some("other"), Some(502), request_start);
+                        return Err(err);
                     }
+
+                    let http_class = format!("upstream_http_{status_code}");
 
                     // Context-length failure: attempt in-process truncation + retry.
                     if self.is_context_length_error(status_code, &body_text) {
@@ -4879,6 +5208,16 @@ impl Router {
                                     messages_removed = result.messages_removed,
                                     "Context-length error detected, truncated request and retrying"
                                 );
+                                record_try(
+                                    &GatewayError::Provider {
+                                        provider: provider_name.to_string(),
+                                        message: format!("HTTP {}: context length exceeded", status_code),
+                                        status_code: Some(status_code),
+                                    },
+                                    Some(&http_class),
+                                    None,
+                                    request_start,
+                                );
                                 continue;
                             }
                             Err(e) => {
@@ -4888,10 +5227,12 @@ impl Router {
                                     error = %e,
                                     "Context-length error detected but truncation retry cannot continue"
                                 );
-                                return Err(GatewayError::InvalidRequest(format!(
+                                let err = GatewayError::InvalidRequest(format!(
                                     "Request exceeds model context limits and cannot be truncated further: {}",
                                     e
-                                )));
+                                ));
+                                record_try(&err, Some(&http_class), Some(status_code), request_start);
+                                return Err(err);
                             }
                         }
                     }
@@ -4921,6 +5262,7 @@ impl Router {
                                         provider = provider_name,
                                         "OAuth token refreshed successfully, retrying request"
                                     );
+                                    record_try(&err, None, None, request_start);
                                     last_error = Some(err);
                                     continue;
                                 }
@@ -4930,6 +5272,7 @@ impl Router {
                                         error = %e,
                                         "OAuth force-refresh failed after upstream 401, failing over"
                                     );
+                                    record_try(&err, None, None, request_start);
                                     return Err(err);
                                 }
                             }
@@ -4940,6 +5283,33 @@ impl Router {
                     // 429 (rate limit) should fail over to next provider, not retry same one
                     // 503 (service unavailable) signals provider is down — fail over immediately
                     if status_code >= 400 && status_code < 500 && status_code != 408 {
+                        // The provider rejected the upstream stream request
+                        // (`stream` / `stream_options`). Retry the same provider
+                        // once with plain stream:false, without backoff.
+                        if stream_upstream
+                            && !stream_fallback_done
+                            && status_code == 400
+                            && Self::is_stream_param_rejection(&body_text)
+                        {
+                            stream_fallback_done = true;
+                            stream_upstream = false;
+                            outgoing.stream = false;
+                            if inserted_stream_options {
+                                outgoing.extra.remove("stream_options");
+                            }
+                            skip_next_backoff = true;
+                            warn!(
+                                provider = provider_name,
+                                model = %provider_model.model,
+                                status = status_code,
+                                provider_error = %body_text.chars().take(300).collect::<String>(),
+                                "Provider rejected the upstream stream request — retrying once with stream:false. Set buffered_upstream_streaming: false for this provider if this repeats"
+                            );
+                            record_try(&err, None, None, request_start);
+                            last_error = Some(err);
+                            continue;
+                        }
+
                         // Image-input rejection: the provider refused image content even
                         // though the proactive strip pass believed it safe (stale or
                         // incorrect capabilities cache). Strip every image part and retry
@@ -5004,6 +5374,7 @@ impl Router {
                                     images_removed = removed,
                                     "Provider rejected image inputs — stripped images and retrying same provider"
                                 );
+                                record_try(&err, None, None, request_start);
                                 last_error = Some(err);
                                 continue;
                             }
@@ -5037,14 +5408,16 @@ impl Router {
                                     fields_removed = strip_report.fields_removed,
                                     "[reasoning_compat] thinking validation 400 — aggressively stripped reasoning carriers, retrying same provider"
                                 );
-                                last_error = Some(GatewayError::Provider {
+                                let strip_err = GatewayError::Provider {
                                     provider: provider_name.to_string(),
                                     message: format!(
                                 "[reasoning_compat] HTTP {}: thinking-parameter validation failed",
                                 status_code
                             ),
                                     status_code: Some(status_code),
-                                });
+                                };
+                                record_try(&strip_err, None, None, request_start);
+                                last_error = Some(strip_err);
                                 continue;
                             }
                         }
@@ -5096,15 +5469,18 @@ impl Router {
                         if reasoning_compat_cfg.enabled
                             && Self::is_thinking_validation_error(status_code, &body_text)
                         {
-                            return Err(GatewayError::Provider {
+                            let tagged = GatewayError::Provider {
                                 provider: provider_name.to_string(),
                                 message: format!(
                                     "[reasoning_compat] HTTP {}: {}",
                                     status_code, body_text
                                 ),
                                 status_code: Some(status_code),
-                            });
+                            };
+                            record_try(&tagged, None, None, request_start);
+                            return Err(tagged);
                         }
+                        record_try(&err, None, None, request_start);
                         return Err(err);
                     }
                     if status_code == 503 {
@@ -5113,6 +5489,20 @@ impl Router {
                             status = status_code,
                             "Service unavailable, failing over immediately"
                         );
+                        record_try(&err, None, None, request_start);
+                        return Err(err);
+                    }
+
+                    if is_timeout_class(&err) {
+                        // DD10: an upstream gateway timeout (504/524) on a
+                        // long generation repeats on retry and duplicates the
+                        // provider-side work, so fail over immediately.
+                        warn!(
+                            provider = provider_name,
+                            status = status_code,
+                            "Upstream gateway timeout, failing over without same-provider retry"
+                        );
+                        record_try(&err, None, None, request_start);
                         return Err(err);
                     }
 
@@ -5122,6 +5512,7 @@ impl Router {
                         attempt,
                         "Retryable error"
                     );
+                    record_try(&err, None, None, request_start);
                     last_error = Some(err);
                 }
                 Err(e) => {
@@ -5146,6 +5537,7 @@ impl Router {
                         is_connect = e.is_connect(),
                         "Network error"
                     );
+                    record_try(&err, Some("network_error"), Some(502), request_start);
                     last_error = Some(err);
                 }
             }
@@ -5158,6 +5550,210 @@ impl Router {
         }))
     }
 
+    /// Record one failed upstream try (or skip) in the request's attempt
+    /// ledger. `class`/`status` default to [`error_class_for`] and
+    /// [`attempt_status_for`]; `started` is when this try began.
+    fn record_try_failure(
+        active: Option<&ActiveRequestHandle>,
+        provider: &str,
+        model: &str,
+        err: &GatewayError,
+        class: Option<&str>,
+        status: Option<u16>,
+        started: std::time::Instant,
+    ) {
+        let Some(handle) = active else {
+            return;
+        };
+        let class = class
+            .map(str::to_string)
+            .unwrap_or_else(|| error_class_for(err));
+        handle.record_failed_attempt(
+            ProviderAttempt::new(
+                provider.to_string(),
+                model.to_string(),
+                err.to_string(),
+                Some(status.unwrap_or_else(|| attempt_status_for(err))),
+            )
+            .with_duration(started.elapsed())
+            .with_error_class(&class),
+        );
+    }
+
+    /// DD11: a streaming pass-through try failed before any content (TTFB
+    /// timeout, send error or 5xx). The caller has already recorded the
+    /// ledger attempt. Count the failure against the provider:model breaker,
+    /// then fall back to the buffered path with that entry excluded, so the
+    /// fallback never re-sends to the provider that just failed (mirrors the
+    /// 429 path). When no other entry is available, `failure` is returned.
+    async fn passthrough_fallback_excluding(
+        &self,
+        request: &OpenAIRequest,
+        exclude: &[String],
+        active: Option<ActiveRequestHandle>,
+        provider_model: &ProviderModel,
+        failure: GatewayError,
+    ) -> Result<StreamingResponse, GatewayError> {
+        let reason = match &failure {
+            GatewayError::Provider {
+                status_code,
+                message,
+                ..
+            } => Self::friendly_failure_reason(*status_code, message),
+            other => other.to_string(),
+        };
+        self.record_streaming_failure(&provider_model.provider, &provider_model.model, Some(reason))
+            .await;
+        if let Some(handle) = &active {
+            handle.set_last_error(&failure.to_string());
+        }
+        let mut excluded = exclude.to_vec();
+        let failed_key = format!("{}:{}", provider_model.provider, provider_model.model);
+        if !excluded.contains(&failed_key) {
+            excluded.push(failed_key);
+        }
+        match self
+            .route_request_with_exclusions(request, active, &excluded)
+            .await
+        {
+            Ok(response) => Ok(StreamingResponse::Buffered(response)),
+            // Nothing left to fail over to: surface this provider's failure
+            // instead of a misleading "no providers" 400.
+            Err(GatewayError::InvalidRequest(message))
+                if message == "No available providers for model" =>
+            {
+                Err(failure)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// DD12: record a `circuit_open_skip` ledger attempt for every group member
+    /// that provider selection dropped because its breaker is open. Runs once
+    /// per request (the streaming→buffered hop does not record twice).
+    /// Entries in `exclude` were removed by the caller (their failed try is
+    /// already in the ledger), not by the breaker, so they are not recorded.
+    async fn record_breaker_skips(
+        &self,
+        model_group: &ModelGroup,
+        selected: &[ProviderModel],
+        exclude: &[String],
+        active: Option<&ActiveRequestHandle>,
+    ) {
+        let Some(handle) = active else {
+            return;
+        };
+        let mut skipped = Vec::new();
+        for m in &model_group.models {
+            if selected
+                .iter()
+                .any(|s| s.provider == m.provider && s.model == m.model)
+            {
+                continue;
+            }
+            let cb_key = format!("{}:{}", m.provider, m.model);
+            if exclude.iter().any(|k| k == &cb_key) {
+                continue;
+            }
+            // Clone the Arc out of the DashMap before awaiting.
+            let Some(cb) = self
+                .circuit_breakers
+                .get(&cb_key)
+                .map(|entry| entry.value().clone())
+            else {
+                continue;
+            };
+            // Read-only check: `is_available` would move an expired breaker
+            // to half-open, which is selection's job, not the logger's.
+            if let super::circuit_breaker::CircuitState::Open {
+                opened_at,
+                retry_after,
+            } = cb.get_state().await
+            {
+                if opened_at.elapsed() < retry_after {
+                    skipped.push(m);
+                }
+            }
+        }
+        if skipped.is_empty() || !handle.claim_breaker_skip_recording() {
+            return;
+        }
+        for m in skipped {
+            handle.record_failed_attempt(
+                ProviderAttempt::new(
+                    m.provider.clone(),
+                    m.model.clone(),
+                    "Circuit breaker open".to_string(),
+                    Some(503),
+                )
+                .with_duration(Duration::ZERO)
+                .with_error_class("circuit_open_skip"),
+            );
+        }
+    }
+
+    /// Add a failover-level attempt (skip or content failover) to both the
+    /// client-visible aggregate and the request's attempt ledger.
+    fn push_attempt(
+        attempts: &mut Vec<ProviderAttempt>,
+        active: Option<&ActiveRequestHandle>,
+        attempt: ProviderAttempt,
+    ) {
+        if let Some(handle) = active {
+            handle.record_failed_attempt(attempt.clone());
+        }
+        attempts.push(attempt);
+    }
+
+    /// True when a 400 body points at the `stream` / `stream_options`
+    /// parameters (ignoring the word "upstream", which proxies use freely).
+    fn is_stream_param_rejection(body: &str) -> bool {
+        let lower = body.to_ascii_lowercase();
+        lower.contains("stream_options") || lower.replace("upstream", "").contains("stream")
+    }
+
+    /// Put a provider whose HTTP 200 response (envelope or mid-stream SSE
+    /// frame) was rate-limit shaped into cooldown, and return the 429 error
+    /// that makes the failover loop move on.
+    async fn cool_down_rate_limited_200(
+        &self,
+        provider_name: &str,
+        response_headers: &reqwest::header::HeaderMap,
+        body: &str,
+        err_msg: &str,
+    ) -> GatewayError {
+        let cooldown = self
+            .parse_rate_limit_cooldown(provider_name, Some(response_headers), body)
+            .await;
+        let rate_limiter = self.get_rate_limiter(provider_name).await;
+        rate_limiter.apply_cooldown(cooldown).await;
+        self.metrics
+            .record_provider_rate_limit_exhausted(provider_name);
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let deadline = now_secs.saturating_add(cooldown.as_secs());
+        self.metrics.set_provider_cooldown(
+            provider_name,
+            Self::friendly_failure_reason(Some(429), body),
+            deadline,
+        );
+
+        warn!(
+            provider = provider_name,
+            cooldown_ms = cooldown.as_millis() as u64,
+            error = %err_msg,
+            "Provider returned rate-limit-shaped HTTP 200, failing over"
+        );
+
+        GatewayError::Provider {
+            provider: provider_name.to_string(),
+            message: format!("Rate limited (HTTP 200 envelope): {}", err_msg),
+            status_code: Some(429),
+        }
+    }
+
     /// Reassemble an SSE (Server-Sent Events) streaming response into a single OpenAIResponse.
     /// Some providers ignore `stream: false` and return chunked SSE anyway.
     /// This parses all `data: {...}` lines, concatenates delta content, and builds
@@ -5167,15 +5763,28 @@ impl Router {
     /// same accumulation logic to assemble a cacheable response from forwarded
     /// SSE chunks.
     pub(crate) fn reassemble_sse_response(body: &str) -> Result<OpenAIResponse, String> {
+        Self::reassemble_sse_stream(body)
+            .map(|reassembled| reassembled.response)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Reassemble an SSE body and report whether the stream actually finished
+    /// (a `[DONE]` sentinel or any chunk carrying a `finish_reason`).
+    ///
+    /// The buffered dispatch uses `completed` to reject truncated upstream
+    /// streams. Shared callers (guardrail assembly, relay cache) go through
+    /// [`Self::reassemble_sse_response`], which keeps accepting partial bodies.
+    fn reassemble_sse_stream(body: &str) -> Result<SseReassembly, SseReassemblyError> {
         let mut full_content = String::new();
         let mut reasoning_content = String::new();
         let mut response_id = String::new();
         let mut model = String::new();
         let mut created: i64 = 0;
         let mut finish_reason: Option<String> = None;
-        let mut prompt_tokens: u32 = 0;
-        let mut completion_tokens: u32 = 0;
-        let mut total_tokens: u32 = 0;
+        // Last usage object reported by the provider (kept whole so
+        // prompt/completion token details survive reassembly).
+        let mut reported_usage: Option<Usage> = None;
+        let mut saw_done = false;
         let mut chunk_count: u32 = 0;
 
         // Accumulate tool_calls from streaming deltas.
@@ -5187,17 +5796,11 @@ impl Router {
         use std::collections::BTreeMap;
         let mut tool_calls_map: BTreeMap<u64, serde_json::Value> = BTreeMap::new();
 
-        // Some providers concatenate SSE chunks without newlines between them
-        // e.g. "data: {...}data: {...}" instead of "data: {...}\ndata: {...}"
-        // Split on "data: " boundaries to handle both cases.
-        let chunks_iter: Vec<&str> = body
-            .split("data: ")
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let chunks_iter = Self::sse_data_payloads(body);
 
         for json_str in &chunks_iter {
             if *json_str == "[DONE]" {
+                saw_done = true;
                 break;
             }
             // Strip trailing "data:" fragment that might appear if split left a partial
@@ -5235,7 +5838,10 @@ impl Router {
                     error_code = error_code,
                     "Mid-stream error frame received from provider"
                 );
-                return Err(format!("Mid-stream error ({}): {}", error_code, error_msg));
+                return Err(SseReassemblyError::ErrorFrame {
+                    message: format!("Mid-stream error ({}): {}", error_code, error_msg),
+                    frame: json_str.to_string(),
+                });
             }
 
             // Also check for finish_reason: "error" without a top-level error object
@@ -5251,7 +5857,10 @@ impl Router {
                             detail = delta_text,
                             "Provider stream ended with finish_reason=error"
                         );
-                        return Err(format!("Stream error: {}", delta_text));
+                        return Err(SseReassemblyError::ErrorFinish(format!(
+                            "Stream error: {}",
+                            delta_text
+                        )));
                     }
                 }
             }
@@ -5338,23 +5947,24 @@ impl Router {
                 }
             }
 
-            // Extract usage if present (some providers send it in the last chunk)
-            if let Some(usage) = chunk.get("usage") {
-                if let Some(pt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
-                    prompt_tokens = pt as u32;
-                }
-                if let Some(ct) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
-                    completion_tokens = ct as u32;
-                }
-                if let Some(tt) = usage.get("total_tokens").and_then(|v| v.as_u64()) {
-                    total_tokens = tt as u32;
+            // Keep the last usage object whole (some providers send it in the
+            // last chunk; `stream_options.include_usage` sends `usage: null` on
+            // every other chunk). Its `extra` carries prompt/completion token
+            // details such as cached_tokens and reasoning_tokens.
+            if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
+                match serde_json::from_value::<Usage>(usage.clone()) {
+                    Ok(parsed) => reported_usage = Some(parsed),
+                    Err(e) => {
+                        tracing::trace!(error = %e, "Skipping unparseable SSE usage object")
+                    }
                 }
             }
         }
 
         if chunk_count == 0 {
-            return Err("No SSE chunks found in response body".to_string());
+            return Err(SseReassemblyError::NoChunks);
         }
+        let completed = saw_done || finish_reason.is_some();
 
         // Reasoning stays in its own carrier and is NOT copied into `content`.
         // Copying it made a turn that only thought look identical to a finished
@@ -5364,11 +5974,15 @@ impl Router {
         // (no tools in play) or as a last resort after failover is exhausted.
         let final_content = full_content;
 
-        // Estimate tokens if provider didn't send usage. Reasoning counts:
-        // it is generated output even when it never reaches `content`.
-        if total_tokens == 0 {
-            completion_tokens = ((final_content.len() + reasoning_content.len()) / 4) as u32;
-            total_tokens = prompt_tokens + completion_tokens;
+        // Estimate tokens only if the provider didn't report usage. Reasoning
+        // counts: it is generated output even when it never reaches `content`.
+        let mut usage = reported_usage.unwrap_or_default();
+        if usage.total_tokens == 0 {
+            if usage.completion_tokens == 0 {
+                usage.completion_tokens =
+                    ((final_content.len() + reasoning_content.len()) / 4) as u32;
+            }
+            usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
         }
 
         // Build message extra with tool_calls if any were accumulated
@@ -5406,12 +6020,7 @@ impl Router {
                 finish_reason,
                 extra: Default::default(),
             }],
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-                extra: Default::default(),
-            },
+            usage,
             extra: Default::default(),
         };
 
@@ -5421,7 +6030,41 @@ impl Router {
         // absent finish_reason with the tool call that is actually present.
         Self::repair_tool_calls(&mut response);
 
-        Ok(response)
+        Ok(SseReassembly {
+            response,
+            completed,
+        })
+    }
+
+    /// Extract the `data:` payloads of an SSE body, in order.
+    ///
+    /// Blank lines, `:` comments and `event:`/`id:`/`retry:` fields are
+    /// skipped. Some providers concatenate frames without newlines
+    /// (`data: {...}data: {...}`); a data line that is not a single JSON value
+    /// is split on `data: ` boundaries to recover them.
+    fn sse_data_payloads(body: &str) -> Vec<&str> {
+        let mut payloads = Vec::new();
+        for line in body.lines() {
+            let Some(rest) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let rest = rest.trim();
+            if rest.is_empty() {
+                continue;
+            }
+            if rest.contains("data: ")
+                && serde_json::from_str::<serde::de::IgnoredAny>(rest).is_err()
+            {
+                payloads.extend(
+                    rest.split("data: ")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty()),
+                );
+            } else {
+                payloads.push(rest);
+            }
+        }
+        payloads
     }
 
     /// Slot a `tool_calls` delta that arrived without an `index` field.
@@ -5580,15 +6223,21 @@ impl Router {
                     warn!(provider = %provider_model.provider, spent_usd = current_cost_usd, budget_limit_usd, "Provider budget exhausted, skipping provider");
                     self.metrics
                         .record_provider_budget_exhausted(&provider_model.provider);
-                    attempts.push(ProviderAttempt::new(
-                        provider_model.provider.clone(),
-                        provider_model.model.clone(),
-                        format!(
-                            "Provider budget exhausted at ${:.2} / ${:.2}",
-                            current_cost_usd, budget_limit_usd
-                        ),
-                        Some(402),
-                    ));
+                    Self::push_attempt(
+                        &mut attempts,
+                        active.as_ref(),
+                        ProviderAttempt::new(
+                            provider_model.provider.clone(),
+                            provider_model.model.clone(),
+                            format!(
+                                "Provider budget exhausted at ${:.2} / ${:.2}",
+                                current_cost_usd, budget_limit_usd
+                            ),
+                            Some(402),
+                        )
+                        .with_duration(start.elapsed())
+                        .with_error_class("budget_skip"),
+                    );
                     continue;
                 }
             }
@@ -5599,12 +6248,18 @@ impl Router {
             let cb = self.get_circuit_breaker(&cb_key).await;
             if !cb.is_available().await {
                 debug!(provider = %provider_model.provider, model = %provider_model.model, "Circuit breaker open, skipping provider");
-                attempts.push(ProviderAttempt::new(
-                    provider_model.provider.clone(),
-                    provider_model.model.clone(),
-                    "Circuit breaker open".to_string(),
-                    Some(503),
-                ));
+                Self::push_attempt(
+                    &mut attempts,
+                    active.as_ref(),
+                    ProviderAttempt::new(
+                        provider_model.provider.clone(),
+                        provider_model.model.clone(),
+                        "Circuit breaker open".to_string(),
+                        Some(503),
+                    )
+                    .with_duration(start.elapsed())
+                    .with_error_class("circuit_open_skip"),
+                );
                 continue;
             }
 
@@ -5626,15 +6281,21 @@ impl Router {
                     cooldown_remaining_secs = remaining,
                     "Upstream rate-limit cooldown active, skipping provider"
                 );
-                attempts.push(ProviderAttempt::new(
-                    provider_model.provider.clone(),
-                    provider_model.model.clone(),
-                    format!(
-                        "Provider in upstream rate-limit cooldown ({}s remaining)",
-                        remaining
-                    ),
-                    Some(429),
-                ));
+                Self::push_attempt(
+                    &mut attempts,
+                    active.as_ref(),
+                    ProviderAttempt::new(
+                        provider_model.provider.clone(),
+                        provider_model.model.clone(),
+                        format!(
+                            "Provider in upstream rate-limit cooldown ({}s remaining)",
+                            remaining
+                        ),
+                        Some(429),
+                    )
+                    .with_duration(start.elapsed())
+                    .with_error_class("cooldown_skip"),
+                );
                 continue;
             }
 
@@ -5644,12 +6305,18 @@ impl Router {
                 warn!(provider = %provider_model.provider, "Rate limit exhausted, skipping provider");
                 self.metrics
                     .record_provider_rate_limit_exhausted(&provider_model.provider);
-                attempts.push(ProviderAttempt::new(
-                    provider_model.provider.clone(),
-                    provider_model.model.clone(),
-                    "Rate limit exhausted".to_string(),
-                    Some(429),
-                ));
+                Self::push_attempt(
+                    &mut attempts,
+                    active.as_ref(),
+                    ProviderAttempt::new(
+                        provider_model.provider.clone(),
+                        provider_model.model.clone(),
+                        "Rate limit exhausted".to_string(),
+                        Some(429),
+                    )
+                    .with_duration(start.elapsed())
+                    .with_error_class("rate_limit_skip"),
+                );
                 continue;
             }
 
@@ -5680,6 +6347,7 @@ impl Router {
                 handle.set_target(&provider_model.provider, &provider_model.model, phase);
                 handle.set_attempt(attempt_counter);
             }
+            let ledger_before = active.as_ref().map_or(0, |h| h.failed_attempt_count());
             match self
                 .attempt_with_retry(
                     &provider_model.provider,
@@ -5800,13 +6468,19 @@ impl Router {
                                 ),
                                 None,
                             );
-                            attempts.push(ProviderAttempt::new(
-                                provider_model.provider.clone(),
-                                provider_model.model.clone(),
-                                "Provider returned reasoning only (no answer text, no tool call)"
-                                    .to_string(),
-                                Some(200),
-                            ));
+                            Self::push_attempt(
+                                &mut attempts,
+                                active.as_ref(),
+                                ProviderAttempt::new(
+                                    provider_model.provider.clone(),
+                                    provider_model.model.clone(),
+                                    "Provider returned reasoning only (no answer text, no tool call)"
+                                        .to_string(),
+                                    Some(200),
+                                )
+                                .with_duration(start.elapsed())
+                                .with_error_class("reasoning_only"),
+                            );
                             // Annotate with the same gateway metadata the
                             // success path attaches so the last-resort
                             // return below needs no reprocessing.
@@ -5863,13 +6537,19 @@ impl Router {
                             ),
                             None,
                         );
-                        attempts.push(ProviderAttempt::new(
-                            provider_model.provider.clone(),
-                            provider_model.model.clone(),
-                            "Provider returned empty response with no assistant content"
-                                .to_string(),
-                            Some(200),
-                        ));
+                        Self::push_attempt(
+                            &mut attempts,
+                            active.as_ref(),
+                            ProviderAttempt::new(
+                                provider_model.provider.clone(),
+                                provider_model.model.clone(),
+                                "Provider returned empty response with no assistant content"
+                                    .to_string(),
+                                Some(200),
+                            )
+                            .with_duration(start.elapsed())
+                            .with_error_class("empty_response"),
+                        );
                         continue;
                     }
 
@@ -5921,15 +6601,21 @@ impl Router {
                             )),
                             None,
                         );
-                        attempts.push(ProviderAttempt::new(
-                            provider_model.provider.clone(),
-                            provider_model.model.clone(),
-                            format!(
-                                "Response truncated at {}/{} tokens (finish_reason=length)",
-                                completion_tokens, max_tokens
-                            ),
-                            Some(200),
-                        ));
+                        Self::push_attempt(
+                            &mut attempts,
+                            active.as_ref(),
+                            ProviderAttempt::new(
+                                provider_model.provider.clone(),
+                                provider_model.model.clone(),
+                                format!(
+                                    "Response truncated at {}/{} tokens (finish_reason=length)",
+                                    completion_tokens, max_tokens
+                                ),
+                                Some(200),
+                            )
+                            .with_duration(start.elapsed())
+                            .with_error_class("truncated_response"),
+                        );
 
                         // Preserve this partial response as a fallback candidate
                         // so task 7.2 can return the longest truncated response
@@ -6123,19 +6809,8 @@ impl Router {
                         );
                     }
 
-                    // Per-attempt failure logging: carry the failed attempts
-                    // that this request skipped past (timeouts, 5xx, breaker
-                    // skips, etc.) out to the handler so each one is logged as
-                    // its own row, even though the request ultimately succeeded.
-                    // The handler strips this key before returning to the
-                    // client (`strip_gateway_response_metadata`).
-                    if !attempts.is_empty() {
-                        response.extra.insert(
-                            "gateway_failed_attempts".to_string(),
-                            serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
-                        );
-                    }
-
+                    // Failed attempts this request skipped past are in the
+                    // request's attempt ledger; the handler logs them.
                     return Ok(response);
                 }
                 Err(e) => {
@@ -6244,13 +6919,26 @@ impl Router {
                         None,
                     );
 
-                    // Collect attempt for aggregated error
-                    attempts.push(ProviderAttempt::new(
+                    // Collect attempt for aggregated error. The HTTP dispatch
+                    // already wrote each failed try to the ledger; only record
+                    // here when it did not (slot saturation, OAuth skip,
+                    // Codex/Bedrock errors), so no try is logged twice.
+                    let attempt = ProviderAttempt::new(
                         provider_model.provider.clone(),
                         provider_model.model.clone(),
                         e.to_string(),
                         attempt_status,
-                    ));
+                    )
+                    .with_duration(start.elapsed())
+                    .with_error_class(&error_class_for(&e));
+                    let ledger_grew = active
+                        .as_ref()
+                        .is_some_and(|h| h.failed_attempt_count() > ledger_before);
+                    if ledger_grew {
+                        attempts.push(attempt);
+                    } else {
+                        Self::push_attempt(&mut attempts, active.as_ref(), attempt);
+                    }
                 }
             }
         }
@@ -6261,7 +6949,7 @@ impl Router {
         // error. These candidates already carry gateway_provider/responded_model/
         // cost metadata and their finish_reason=length is preserved verbatim, so
         // the client sees the partial content and the truncation reason.
-        if let Some(mut longest) = truncated_candidates
+        if let Some(longest) = truncated_candidates
             .into_iter()
             .max_by_key(|r| r.usage.completion_tokens)
         {
@@ -6276,12 +6964,6 @@ impl Router {
                 completion_tokens = longest.usage.completion_tokens,
                 "All providers truncated (finish_reason=length); returning longest partial response"
             );
-            if !attempts.is_empty() {
-                longest.extra.insert(
-                    "gateway_failed_attempts".to_string(),
-                    serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
-                );
-            }
             return Ok(longest);
         }
 
@@ -6313,12 +6995,6 @@ impl Router {
                 provider = %chosen_provider,
                 "All providers returned reasoning without an answer or tool call; returning the longest reasoning as content"
             );
-            if !attempts.is_empty() {
-                best.extra.insert(
-                    "gateway_failed_attempts".to_string(),
-                    serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
-                );
-            }
             return Ok(best);
         }
 
@@ -8410,6 +9086,8 @@ visible content. Do not restate your plan and do not end your turn without doing
                 .collect()
         };
         debug!(count = providers.len(), "Selected providers");
+        self.record_breaker_skips(&model_group, &providers, exclude, active.as_ref())
+            .await;
 
         if providers.is_empty() {
             return Err(GatewayError::InvalidRequest(
@@ -8992,29 +9670,55 @@ visible content. Do not restate your plan and do not end your turn without doing
         // once. Compressed SSE is vulnerable to truncated decoder frames.
         req_builder = req_builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
 
-        tracing::info!(provider = %provider_model.provider, %url, model = %provider_model.model, ttfb_timeout_secs, "Calling provider (streaming pass-through)");
+        let pre_dispatch_ms = active.as_ref().map_or(0, ActiveRequestHandle::elapsed_ms);
+        tracing::info!(provider = %provider_model.provider, %url, model = %provider_model.model, ttfb_timeout_secs, pre_dispatch_ms, "Calling provider (streaming pass-through)");
 
         // Apply the TTFB timeout to the initial response headers only. The
         // inter-chunk timeout is applied to the body by the relay loop (5.3).
         // The permit acquired during candidate selection moves with the live
         // response so it remains held until the downstream relay finishes.
+        let request_start = std::time::Instant::now();
         let send_result =
             tokio::time::timeout(ttfb_timeout, req_builder.json(&outgoing).send()).await;
         let response = match send_result {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
-                warn!(provider = %provider_model.provider, error = %e, "Streaming pass-through send failed, falling back to buffered path with full failover");
+                warn!(provider = %provider_model.provider, error = %e, "Streaming pass-through send failed, falling back to buffered path without this provider");
                 drop(concurrency_permit);
-                return Ok(StreamingResponse::Buffered(
-                    self.route_request(request, active.clone()).await?,
-                ));
+                let err = GatewayError::Provider {
+                    provider: provider_model.provider.clone(),
+                    message: format!("Request failed: {}", e),
+                    status_code: None,
+                };
+                Self::record_try_failure(
+                    active.as_ref(),
+                    &provider_model.provider,
+                    &provider_model.model,
+                    &err,
+                    Some("network_error"),
+                    Some(502),
+                    request_start,
+                );
+                return self
+                    .passthrough_fallback_excluding(request, exclude, active, &provider_model, err)
+                    .await;
             }
             Err(_) => {
-                warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — falling back to buffered path with full failover");
+                warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — falling back to buffered path without this provider");
                 drop(concurrency_permit);
-                return Ok(StreamingResponse::Buffered(
-                    self.route_request(request, active.clone()).await?,
-                ));
+                let err = GatewayError::TtfbTimeout(ttfb_timeout_secs);
+                Self::record_try_failure(
+                    active.as_ref(),
+                    &provider_model.provider,
+                    &provider_model.model,
+                    &err,
+                    None,
+                    None,
+                    request_start,
+                );
+                return self
+                    .passthrough_fallback_excluding(request, exclude, active, &provider_model, err)
+                    .await;
             }
         };
 
@@ -9025,6 +9729,23 @@ visible content. Do not restate your plan and do not end your turn without doing
             // can feed the cooldown parser.
             let response_headers = response.headers().clone();
             let body_text = response.text().await.unwrap_or_default();
+            // Every non-success pass-through try is a failed try: record it
+            // once here (upstream_http_<code>) before any fallback, so 429,
+            // context-length, image and other 4xx retries are visible too.
+            let err = GatewayError::Provider {
+                provider: provider_model.provider.clone(),
+                message: format!("HTTP {}: {}", status_code, body_text),
+                status_code: Some(status_code),
+            };
+            Self::record_try_failure(
+                active.as_ref(),
+                &provider_model.provider,
+                &provider_model.model,
+                &err,
+                None,
+                None,
+                request_start,
+            );
             if Self::is_rate_limited(status_code, &body_text) {
                 // Rate-limit response on the streaming pass-through: apply
                 // the dedicated upstream cooldown (RateLimiter + durable
@@ -9153,6 +9874,13 @@ visible content. Do not restate your plan and do not end your turn without doing
                         self.route_request(&stripped_request, active.clone()).await?,
                     ));
                 }
+            }
+            if status.is_server_error() {
+                warn!(provider = %provider_model.provider, status = status_code, "Provider returned server error (streaming), falling back to buffered path without this provider");
+                drop(concurrency_permit);
+                return self
+                    .passthrough_fallback_excluding(request, exclude, active, &provider_model, err)
+                    .await;
             }
             warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
             drop(concurrency_permit);
@@ -11227,6 +11955,7 @@ mod tests {
             timeout_seconds: 30,
             ttfb_timeout_seconds: Some(5),
             total_timeout_seconds: Some(5),
+            buffered_upstream_streaming: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
             custom_headers: Default::default(),
@@ -11828,6 +12557,798 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Buffered dispatch streams upstream (FEAT-001): SSE reassembly,
+    // incremental body reader, and the stream/stream:false transport choice.
+    // ------------------------------------------------------------------
+
+    /// An SSE body for a GLM-style turn: reasoning, then content, then a
+    /// finish_reason, then the `include_usage` frame with token details.
+    const STREAMED_TURN_SSE: &str = concat!(
+        ": keep-alive\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"thinking\"}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":80},\"completion_tokens_details\":{\"reasoning_tokens\":12}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    #[test]
+    fn reassemble_sse_response_preserves_usage_details() {
+        let response = Router::reassemble_sse_response(STREAMED_TURN_SSE).unwrap();
+        assert_eq!(response.usage.prompt_tokens, 100);
+        assert_eq!(response.usage.completion_tokens, 20);
+        assert_eq!(response.usage.total_tokens, 120);
+        assert_eq!(
+            response.usage.extra["prompt_tokens_details"]["cached_tokens"],
+            80
+        );
+        assert_eq!(
+            response.usage.extra["completion_tokens_details"]["reasoning_tokens"],
+            12
+        );
+
+        // Without a usage frame the token estimate still applies.
+        let no_usage = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"abcdefgh\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let estimated = Router::reassemble_sse_response(no_usage).unwrap();
+        assert_eq!(estimated.usage.completion_tokens, 2);
+        assert_eq!(estimated.usage.total_tokens, 2);
+        assert!(estimated.usage.extra.is_empty());
+    }
+
+    #[tokio::test]
+    async fn buffered_sse_without_done_or_finish_reason_is_truncation_error() {
+        let truncated = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+        let reassembled = Router::reassemble_sse_stream(truncated).unwrap();
+        assert!(!reassembled.completed);
+        // Shared callers (guardrail assembly, relay cache) still get the partial body.
+        assert!(Router::reassemble_sse_response(truncated).is_ok());
+        // Either terminator marks the stream complete.
+        assert!(
+            Router::reassemble_sse_stream(&format!("{truncated}data: [DONE]\n\n"))
+                .unwrap()
+                .completed
+        );
+        assert!(Router::reassemble_sse_stream(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n"
+        )
+        .unwrap()
+        .completed);
+
+        // The buffered dispatch treats the truncated stream as a failed try.
+        use wiremock::matchers::{method, path};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(truncated),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let err = router
+            .route_request(&compression_request(false), None)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains(SSE_TRUNCATED_ERROR),
+            "expected truncation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn buffered_sse_with_leading_comment_lines_is_reassembled() {
+        let body = concat!(
+            ": OPENROUTER PROCESSING\n\n",
+            "event: message\nid: 1\nretry: 1000\n",
+            "data:{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            ": keep-alive\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" there\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert!(body_looks_like_sse(body));
+        assert!(body_looks_like_sse("data: [DONE]\n\n"));
+        assert!(!body_looks_like_sse("{\"choices\":[]}"));
+        assert!(!body_looks_like_sse(": only a comment\n\n"));
+
+        let reassembled = Router::reassemble_sse_stream(body).unwrap();
+        assert!(reassembled.completed);
+        assert_eq!(
+            reassembled.response.choices[0].message.content,
+            serde_json::json!("Hi there")
+        );
+
+        // Frames concatenated without newlines are still split apart.
+        let concatenated = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"},\"finish_reason\":\"stop\"}]}";
+        let joined = Router::reassemble_sse_response(concatenated).unwrap();
+        assert_eq!(joined.choices[0].message.content, serde_json::json!("ab"));
+
+        // A single frame whose content contains "data: " is not split.
+        let embedded = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"meta data: x\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let kept = Router::reassemble_sse_response(embedded).unwrap();
+        assert_eq!(
+            kept.choices[0].message.content,
+            serde_json::json!("meta data: x")
+        );
+    }
+
+    /// A synthetic upstream response whose body yields each chunk after its delay.
+    fn timed_body_response(chunks: Vec<(Duration, &'static str)>) -> reqwest::Response {
+        let stream = async_stream::stream! {
+            for (delay, chunk) in chunks {
+                tokio::time::sleep(delay).await;
+                yield Ok::<_, std::io::Error>(chunk.as_bytes());
+            }
+        };
+        reqwest::Response::from(axum::http::Response::new(reqwest::Body::wrap_stream(
+            stream,
+        )))
+    }
+
+    fn reader_limits(ttfb: Duration, idle: Option<Duration>, total: Duration) -> UpstreamBodyLimits {
+        let now = tokio::time::Instant::now();
+        UpstreamBodyLimits {
+            first_byte_deadline: now + ttfb,
+            ttfb_secs: ttfb.as_secs(),
+            idle,
+            total_deadline: now + total,
+            total_secs: total.as_secs(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_sse_reader_ttfb_covers_first_body_chunk() {
+        // Headers arrive at once; the first body byte comes after the deadline.
+        let response = timed_body_response(vec![(Duration::from_secs(2), "data: x\n\n")]);
+        let limits = reader_limits(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(10)),
+            Duration::from_secs(30),
+        );
+        let err = read_upstream_body(response, &limits, "p").await.unwrap_err();
+        assert!(matches!(err, GatewayError::TtfbTimeout(1)), "got {err:?}");
+    }
+
+    /// Key regression guard: a generation that keeps sending bytes must not be
+    /// cut off by the TTFB timeout, however long it runs (up to the total cap).
+    #[tokio::test(start_paused = true)]
+    async fn buffered_sse_reader_allows_generation_longer_than_ttfb_when_bytes_flow() {
+        let chunks: Vec<(Duration, &'static str)> =
+            (0..15).map(|_| (Duration::from_millis(200), "x")).collect();
+        let response = timed_body_response(chunks);
+        let limits = reader_limits(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(30),
+        );
+        let started = tokio::time::Instant::now();
+        let body = read_upstream_body(response, &limits, "p").await.unwrap();
+        assert_eq!(body, "x".repeat(15));
+        assert!(started.elapsed() >= Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_sse_reader_idle_gap_is_chunk_timeout() {
+        let response = timed_body_response(vec![
+            (Duration::ZERO, "data: a\n\n"),
+            (Duration::from_secs(3), "data: b\n\n"),
+        ]);
+        let limits = reader_limits(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(30),
+        );
+        let err = read_upstream_body(response, &limits, "p").await.unwrap_err();
+        assert!(matches!(err, GatewayError::ChunkTimeout(1)), "got {err:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_sse_reader_total_timeout() {
+        let chunks: Vec<(Duration, &'static str)> =
+            (0..25).map(|_| (Duration::from_millis(200), "x")).collect();
+        let response = timed_body_response(chunks);
+        let limits = reader_limits(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(2),
+        );
+        let err = read_upstream_body(response, &limits, "p").await.unwrap_err();
+        assert!(matches!(err, GatewayError::TotalTimeout(2)), "got {err:?}");
+    }
+
+    /// Parsed JSON bodies of every chat-completions request the mock received.
+    async fn received_chat_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn buffered_dispatch_requests_upstream_stream_and_reassembles_sse() {
+        use wiremock::matchers::{body_partial_json, method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "stream": true,
+                "stream_options": {"include_usage": true}
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        // Client asked for a non-streaming response.
+        let response = router
+            .route_request(&compression_request(false), None)
+            .await
+            .unwrap();
+        let choice = &response.choices[0];
+        assert_eq!(choice.message.content, serde_json::json!("Hello"));
+        assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            choice.message.extra.get("reasoning_content"),
+            Some(&serde_json::json!("thinking"))
+        );
+        assert_eq!(response.usage.prompt_tokens, 100);
+        assert_eq!(
+            response.usage.extra["prompt_tokens_details"]["cached_tokens"],
+            80
+        );
+        assert_eq!(
+            response.usage.extra["completion_tokens_details"]["reasoning_tokens"],
+            12
+        );
+        assert_eq!(
+            response.extra.get("gateway_cache_read_tokens"),
+            Some(&serde_json::json!(80))
+        );
+        assert_eq!(
+            response.extra.get("gateway_reasoning_tokens"),
+            Some(&serde_json::json!(12))
+        );
+    }
+
+    fn ledger_handle() -> ActiveRequestHandle {
+        crate::active_requests::ActiveRequestRegistry::new().register(
+            crate::active_requests::ActiveRequestInfo {
+                trace_id: "ledger-trace".to_string(),
+                requested_model: "test-group".to_string(),
+                model_group: None,
+                provider: None,
+                model: None,
+                attempt: 0,
+                phase: ActivePhase::Pending,
+                last_error: None,
+                virtual_key_id: None,
+                started_at_ms: 0,
+                kind: crate::active_requests::RequestKind::Chat,
+                smart_routing_logged: false,
+                failed_attempts: Vec::new(),
+                outcome_logged: false,
+                breaker_skips_recorded: false,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn ttfb_timeout_attempt_records_duration_and_error_class() {
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(STREAMED_TURN_SSE)
+                    .set_delay(Duration::from_secs(3)),
+            )
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        let mut provider = test_provider("provider", server.uri());
+        provider.ttfb_timeout_seconds = Some(1);
+        config.providers = vec![provider];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let handle = ledger_handle();
+
+        let result = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await;
+        let Err(GatewayError::AllProvidersFailed(agg)) = result else {
+            panic!("expected AllProvidersFailed");
+        };
+        // The client-visible aggregate still has its one attempt.
+        assert_eq!(agg.attempts.len(), 1);
+
+        // The dispatch recorded the try; the failover Err arm did not add a
+        // duplicate because the ledger grew during the call.
+        let ledger = handle.take_failed_attempts();
+        assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+        assert_eq!(ledger[0].error_class.as_deref(), Some("ttfb_timeout"));
+        assert_eq!(ledger[0].status_code, Some(504));
+        assert_eq!(ledger[0].provider, "provider");
+        assert!(ledger[0].duration_ms.unwrap() >= 1000, "{:?}", ledger[0].duration_ms);
+    }
+
+    #[tokio::test]
+    async fn same_provider_retry_failure_is_recorded_in_ledger() {
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
+            )
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 1;
+        config.retry.backoff_sequence_seconds = vec![0];
+        config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let handle = ledger_handle();
+
+        let response = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .expect("retry rescues the request");
+        assert!(response.extra.get("gateway_failed_attempts").is_none());
+
+        let ledger = handle.take_failed_attempts();
+        assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+        assert_eq!(ledger[0].status_code, Some(500));
+        assert_eq!(ledger[0].error_class.as_deref(), Some("upstream_http_500"));
+        assert!(ledger[0].duration_ms.is_some());
+    }
+
+    /// Two-provider group ("a" then "b") with one same-provider retry
+    /// allowed and no backoff, as in the live GLM incident. "a" gets a 1 s
+    /// TTFB so a delayed mock trips it.
+    fn failover_pair_router(a: &MockServer, b: &MockServer) -> Router {
+        Router::new(Arc::new(RwLock::new(failover_pair_config(a, b))), test_metrics())
+    }
+
+    fn failover_pair_config(a: &MockServer, b: &MockServer) -> Config {
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 1;
+        config.retry.backoff_sequence_seconds = vec![0];
+        let mut provider_a = test_provider("a", a.uri());
+        provider_a.ttfb_timeout_seconds = Some(1);
+        config.providers = vec![provider_a, test_provider("b", b.uri())];
+        config.model_groups = vec![test_group(vec![test_model("a", 1), test_model("b", 2)])];
+        config
+    }
+
+    async fn mount_streamed_turn(server: &MockServer) {
+        use wiremock::matchers::{method, path};
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
+            )
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    /// DD10 guard: a TTFB timeout fails over to the next provider without a
+    /// second request to the provider that timed out.
+    #[tokio::test]
+    async fn timeout_class_errors_fail_over_without_same_provider_retry() {
+        use wiremock::matchers::{method, path};
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE)
+                    .set_delay(Duration::from_secs(3)),
+            )
+            .expect(1)
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        mount_streamed_turn(&b).await;
+        let router = failover_pair_router(&a, &b);
+        let handle = ledger_handle();
+
+        router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .expect("provider b answers after a times out");
+
+        let ledger = handle.take_failed_attempts();
+        assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+        assert_eq!(ledger[0].provider, "a");
+        assert_eq!(ledger[0].error_class.as_deref(), Some("ttfb_timeout"));
+        a.verify().await;
+        b.verify().await;
+    }
+
+    #[tokio::test]
+    async fn upstream_504_fails_over_without_same_provider_retry() {
+        use wiremock::matchers::{method, path};
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(504).set_body_string("error code: 504"))
+            .expect(1)
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        mount_streamed_turn(&b).await;
+        let router = failover_pair_router(&a, &b);
+        let handle = ledger_handle();
+
+        router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .expect("provider b answers after a returns 504");
+
+        let ledger = handle.take_failed_attempts();
+        assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+        assert_eq!(ledger[0].status_code, Some(504));
+        assert_eq!(ledger[0].error_class.as_deref(), Some("upstream_http_504"));
+        a.verify().await;
+        b.verify().await;
+    }
+
+    /// 500 is not timeout-class: it keeps `max_retries_per_provider`.
+    #[tokio::test]
+    async fn upstream_500_still_retries_same_provider() {
+        use wiremock::matchers::{method, path};
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .expect(2)
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        mount_streamed_turn(&b).await;
+        let router = failover_pair_router(&a, &b);
+        let handle = ledger_handle();
+
+        router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .expect("provider b answers after a's retries");
+
+        let ledger = handle.take_failed_attempts();
+        assert_eq!(ledger.len(), 2, "ledger: {ledger:?}");
+        assert!(ledger.iter().all(|attempt| attempt.status_code == Some(500)));
+        a.verify().await;
+        b.verify().await;
+    }
+
+    #[test]
+    fn is_timeout_class_covers_router_timeouts_and_gateway_statuses() {
+        let provider = |status| GatewayError::Provider {
+            provider: "p".to_string(),
+            message: "HTTP".to_string(),
+            status_code: status,
+        };
+        assert!(is_timeout_class(&GatewayError::TtfbTimeout(1)));
+        assert!(is_timeout_class(&GatewayError::TotalTimeout(1)));
+        assert!(is_timeout_class(&GatewayError::ChunkTimeout(1)));
+        assert!(is_timeout_class(&provider(Some(504))));
+        assert!(is_timeout_class(&provider(Some(524))));
+        for status in [Some(500), Some(502), Some(503), Some(200), None] {
+            assert!(!is_timeout_class(&provider(status)), "{status:?}");
+        }
+    }
+
+    /// DD11: a pass-through TTFB timeout is recorded (ledger + breaker) and
+    /// the buffered fallback skips the provider that just timed out.
+    #[tokio::test]
+    async fn streaming_ttfb_timeout_fallback_excludes_failed_provider() {
+        use wiremock::matchers::{method, path};
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(sse_done_mock().set_delay(Duration::from_secs(3)))
+            .expect(1)
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        mount_streamed_turn(&b).await;
+        let mut config = failover_pair_config(&a, &b);
+        // One failure opens the breaker, so the assertion below observes it.
+        config.circuit_breaker.failure_threshold = 1;
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let handle = ledger_handle();
+
+        let response = router
+            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .await
+            .expect("buffered fallback is served by b");
+        assert!(
+            matches!(response, StreamingResponse::Buffered(_)),
+            "TTFB fallback must use the buffered path"
+        );
+
+        let ledger = handle.take_failed_attempts();
+        // Exactly one row for a: the excluded entry must not also show up as
+        // a circuit_open_skip although its breaker is now open.
+        let a_rows: Vec<_> = ledger.iter().filter(|attempt| attempt.provider == "a").collect();
+        assert_eq!(a_rows.len(), 1, "ledger: {ledger:?}");
+        assert_eq!(a_rows[0].error_class.as_deref(), Some("ttfb_timeout"));
+        let cb = router.get_circuit_breaker("a:upstream-model").await;
+        assert!(
+            matches!(
+                cb.get_state().await,
+                super::super::circuit_breaker::CircuitState::Open { .. }
+            ),
+            "a's breaker must record the failure"
+        );
+        a.verify().await;
+        b.verify().await;
+    }
+
+    /// Every non-success pass-through try (here a 429) is a ledger attempt,
+    /// not only the TTFB/send/5xx arms that exclude the provider.
+    #[tokio::test]
+    async fn streaming_passthrough_rate_limit_is_recorded_in_ledger() {
+        use wiremock::matchers::{method, path};
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": {"message": "Rate limit exceeded"}
+            })))
+            .expect(1)
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        mount_streamed_turn(&b).await;
+        let router = failover_pair_router(&a, &b);
+        let handle = ledger_handle();
+
+        router
+            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .await
+            .expect("buffered fallback is served by b");
+
+        let ledger = handle.take_failed_attempts();
+        assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+        assert_eq!(ledger[0].provider, "a");
+        assert_eq!(ledger[0].status_code, Some(429));
+        assert_eq!(ledger[0].error_class.as_deref(), Some("upstream_http_429"));
+        assert!(ledger[0].duration_ms.is_some());
+        a.verify().await;
+        b.verify().await;
+    }
+
+    #[tokio::test]
+    async fn breaker_prefilter_skip_is_recorded_once_per_request() {
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
+            )
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.providers = vec![
+            test_provider("broken", server.uri()),
+            test_provider("healthy", server.uri()),
+        ];
+        config.model_groups = vec![test_group(vec![
+            test_model("broken", 1),
+            test_model("healthy", 2),
+        ])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let broken = test_model("broken", 1);
+        let cb = router
+            .get_circuit_breaker(&format!("{}:{}", broken.provider, broken.model))
+            .await;
+        for _ in 0..20 {
+            cb.record_failure().await;
+        }
+        assert!(!cb.is_available().await, "breaker must be open");
+        let handle = ledger_handle();
+
+        for _ in 0..2 {
+            router
+                .route_request(&compression_request(false), Some(handle.clone()))
+                .await
+                .expect("healthy provider serves the request");
+        }
+        let ledger = handle.take_failed_attempts();
+        assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+        assert_eq!(ledger[0].provider, "broken");
+        assert_eq!(ledger[0].status_code, Some(503));
+        assert_eq!(ledger[0].error_class.as_deref(), Some("circuit_open_skip"));
+    }
+
+    #[tokio::test]
+    async fn buffered_dispatch_accepts_json_body_when_provider_ignores_stream_true() {
+        use wiremock::matchers::{body_partial_json, method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"stream": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let response = router
+            .route_request(&compression_request(false), None)
+            .await
+            .unwrap();
+        assert_eq!(response.choices[0].message.content, serde_json::json!("ok"));
+        assert_eq!(response.usage.total_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn buffered_upstream_streaming_disabled_sends_stream_false() {
+        use wiremock::matchers::{body_partial_json, method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"stream": false})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        let mut provider = test_provider("provider", server.uri());
+        provider.buffered_upstream_streaming = Some(false);
+        config.providers = vec![provider];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        // Even a streaming client request is fetched with stream:false.
+        let response = router
+            .route_request(&compression_request(true), None)
+            .await
+            .unwrap();
+        assert_eq!(response.choices[0].message.content, serde_json::json!("ok"));
+        let bodies = received_chat_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].get("stream_options").is_none());
+    }
+
+    #[tokio::test]
+    async fn buffered_dispatch_keeps_stream_false_for_multi_choice_or_logprobs() {
+        use wiremock::matchers::{body_partial_json, method, path};
+
+        let mut audio = compression_request(false);
+        audio
+            .extra
+            .insert("modalities".to_string(), serde_json::json!(["text", "audio"]));
+        assert!(requires_non_streaming(&audio));
+        assert!(!requires_non_streaming(&compression_request(false)));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"stream": false})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let mut multi_choice = compression_request(false);
+        multi_choice
+            .extra
+            .insert("n".to_string(), serde_json::json!(2));
+        let mut logprobs = compression_request(false);
+        logprobs
+            .extra
+            .insert("logprobs".to_string(), serde_json::json!(true));
+        for request in [multi_choice, logprobs] {
+            router.route_request(&request, None).await.unwrap();
+        }
+        for body in received_chat_bodies(&server).await {
+            assert!(body.get("stream_options").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_dispatch_falls_back_to_stream_false_when_stream_options_rejected() {
+        use wiremock::matchers::{body_partial_json, method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"stream": true})))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {"message": "Unrecognized request argument: stream_options"}
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"stream": false})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 1;
+        config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+        let started = std::time::Instant::now();
+        let response = router
+            .route_request(&compression_request(false), None)
+            .await
+            .unwrap();
+        assert_eq!(response.choices[0].message.content, serde_json::json!("ok"));
+        // The retry skips backoff.
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let bodies = received_chat_bodies(&server).await;
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1].get("stream_options").is_none());
+    }
+
+    // ------------------------------------------------------------------
     // Provider-configured user_agent and custom headers must reach the
     // upstream request on the buffered dispatch path (chat completions).
     // ------------------------------------------------------------------
@@ -12106,6 +13627,9 @@ mod tests {
             started_at_ms: 0,
             kind: crate::active_requests::RequestKind::Chat,
             smart_routing_logged: false,
+            failed_attempts: Vec::new(),
+            outcome_logged: false,
+            breaker_skips_recorded: false,
         })));
         let result = router
             .route_request(&compression_request(false), Some(handle.clone()))
@@ -12724,6 +14248,9 @@ mod tests {
                 started_at_ms: 0,
                 kind: crate::active_requests::RequestKind::Stream,
                 smart_routing_logged: false,
+                failed_attempts: Vec::new(),
+                outcome_logged: false,
+                breaker_skips_recorded: false,
             },
         );
 
@@ -12988,6 +14515,7 @@ mod tests {
             timeout_seconds: 30,
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
             custom_headers: Default::default(),
@@ -14794,6 +16322,7 @@ mod property_tests {
             timeout_seconds: 30,
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
             max_connections: 10,
             // Tight bucket so check_available() trivially returns false
             // after a single consume.
@@ -14974,6 +16503,7 @@ mod property_tests {
             timeout_seconds: 30,
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
             custom_headers: Default::default(),

@@ -11,9 +11,11 @@ The gateway operates in two streaming modes depending on provider capabilities:
 | Mode | When Used | Behavior |
 |------|-----------|----------|
 | **True Pass-Through** | OpenAI-compatible providers | Upstream SSE chunks relayed in real time |
-| **Buffer-and-Replay** | Bedrock, XML tool rewrite, Codex OAuth, token sanitization, Smart Routing when Streaming Reliability (early event and keep-alive) is disabled | Response buffered, transformed, then re-chunked as SSE |
+| **Buffer-and-Replay** | Codex Search enabled (all streaming requests), Bedrock, XML tool rewrite, Codex OAuth, token sanitization, Smart Routing when Streaming Reliability (early event and keep-alive) is disabled | Response buffered, transformed, then re-chunked as SSE |
 
-Pass-through delivers the lowest latency; buffer-and-replay is used when the response needs transformation before delivery. With Streaming Reliability enabled, Smart Routing requests stream via pass-through over the Smart Routing provider order (tier candidates, then overflow); cascade escalation applies only to buffered responses.
+Pass-through delivers the lowest latency; buffer-and-replay is used when the response needs transformation before delivery. While Codex Search is enabled, every streaming request is buffered so the gateway can run search tool calls, and the client receives the content only once the full completion has been assembled.
+
+Buffered responses (buffer-and-replay and non-streaming client requests) are still fetched from the provider as a stream (`stream: true` with `stream_options.include_usage`) and reassembled by the gateway. Bytes flow from the first token, so a long generation is not cut off by an upstream proxy's non-streaming timeout. `ttfb_timeout_seconds` covers the response headers plus the first body chunk, and a gap between chunks longer than `streaming.chunk_timeout_seconds` fails the try. A provider that rejects upstream streaming can opt out with `buffered_upstream_streaming: false` (see [Providers](Providers#timeout-configuration)). With Streaming Reliability enabled, Smart Routing requests stream via pass-through over the Smart Routing provider order (tier candidates, then overflow); cascade escalation applies only to buffered responses.
 
 ---
 

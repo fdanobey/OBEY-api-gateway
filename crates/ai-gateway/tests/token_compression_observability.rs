@@ -130,6 +130,7 @@ fn log_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> Log
             prefix_hash: None,
             reasoning_tokens: None,
             reasoning_compat_actions: None,
+            error_class: None,
         }
     }
 

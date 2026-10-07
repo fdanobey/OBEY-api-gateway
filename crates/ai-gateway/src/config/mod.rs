@@ -423,6 +423,16 @@ pub struct Provider {
     /// Default: 300 s (standard models), 600 s (thinking models).
     #[serde(default)]
     pub total_timeout_seconds: Option<u64>,
+    /// Fetch buffered (non-streaming) responses from the provider as an SSE
+    /// stream (`stream: true` + `stream_options.include_usage`) and reassemble
+    /// them inside the gateway. Bytes flowing keep the request alive, so a long
+    /// generation is not cut off by the TTFB timeout or an upstream proxy idle
+    /// limit. `ttfb_timeout_seconds` then covers headers plus the first body
+    /// chunk, and `streaming.chunk_timeout_seconds` bounds gaps between chunks.
+    /// Default: `true` for every provider type except `bedrock` (which has its
+    /// own dispatch). Set `false` to restore plain `stream: false` requests.
+    #[serde(default)]
+    pub buffered_upstream_streaming: Option<bool>,
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
     #[serde(default)]
@@ -514,6 +524,14 @@ impl Provider {
         } else {
             default_ttfb_timeout()
         }
+    }
+
+    /// Whether buffered dispatch should request an SSE stream from the
+    /// provider. Explicit `buffered_upstream_streaming` wins; otherwise on for
+    /// every provider type except `bedrock`.
+    pub fn effective_buffered_upstream_streaming(&self) -> bool {
+        self.buffered_upstream_streaming
+            .unwrap_or(self.provider_type != "bedrock")
     }
 
     /// Resolve the effective total (round-trip) timeout for a given model.
@@ -1688,6 +1706,7 @@ mod runtime_resolution_tests {
             timeout_seconds: 30,
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
@@ -1730,6 +1749,7 @@ mod runtime_resolution_tests {
             timeout_seconds: 30,
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
@@ -1776,6 +1796,7 @@ mod runtime_resolution_tests {
             timeout_seconds: 30,
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: headers,
@@ -1822,6 +1843,7 @@ fn test_provider_effective_custom_headers_user_agent() {
         timeout_seconds: 30,
         ttfb_timeout_seconds: None,
         total_timeout_seconds: None,
+        buffered_upstream_streaming: None,
         max_connections: 100,
         rate_limit_per_minute: 0,
         custom_headers: HashMap::new(),
@@ -1871,6 +1893,32 @@ fn test_provider_effective_custom_headers_user_agent() {
     env::remove_var("TEST_UA_TOKEN");
 }
 
+#[test]
+fn buffered_upstream_streaming_defaults_by_provider_type() {
+    let parse = |yaml: &str| -> Provider { serde_yaml::from_str(yaml).unwrap() };
+
+    // YAML without the field parses and leaves it unset.
+    for provider_type in ["openai", "nvidia_nim", "ollama"] {
+        let provider = parse(&format!("name: p\ntype: {provider_type}\n"));
+        assert_eq!(provider.buffered_upstream_streaming, None);
+        assert!(
+            provider.effective_buffered_upstream_streaming(),
+            "{provider_type} should stream upstream by default"
+        );
+    }
+
+    let bedrock = parse("name: b\ntype: bedrock\n");
+    assert!(!bedrock.effective_buffered_upstream_streaming());
+
+    // An explicit value always wins.
+    let opted_out = parse("name: p\ntype: openai\nbuffered_upstream_streaming: false\n");
+    assert_eq!(opted_out.buffered_upstream_streaming, Some(false));
+    assert!(!opted_out.effective_buffered_upstream_streaming());
+
+    let opted_in = parse("name: b\ntype: bedrock\nbuffered_upstream_streaming: true\n");
+    assert!(opted_in.effective_buffered_upstream_streaming());
+}
+
     #[test]
     fn test_provider_resolve_api_key_prefers_runtime_secret() {
         let provider = Provider {
@@ -1888,6 +1936,7 @@ fn test_provider_effective_custom_headers_user_agent() {
             timeout_seconds: 30,
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
@@ -1931,6 +1980,7 @@ fn test_provider_effective_custom_headers_user_agent() {
             timeout_seconds: 30,
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
