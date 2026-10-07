@@ -2149,6 +2149,7 @@ mod tests {
                     timeout_seconds: timeout,
                     ttfb_timeout_seconds: None,
                     total_timeout_seconds: None,
+                    buffered_upstream_streaming: None,
                     max_connections: max_conn,
                     rate_limit_per_minute: rate_limit,
                     custom_headers: HashMap::new(),
@@ -2718,6 +2719,7 @@ retry:
                 timeout_seconds: 30,
                 ttfb_timeout_seconds: None,
                 total_timeout_seconds: None,
+                buffered_upstream_streaming: None,
                 max_connections: 10,
                 rate_limit_per_minute: 0,
                 custom_headers: Default::default(),
@@ -3434,6 +3436,62 @@ retry:
         // Cleanup
         std::env::remove_var(user_env);
         std::env::remove_var(pass_env);
+    }
+
+    /// Admin-panel parity: `buffered_upstream_streaming` saved through
+    /// PUT /admin/config persists to YAML and comes back from GET.
+    #[tokio::test]
+    async fn admin_config_round_trips_buffered_upstream_streaming() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "obey-admin-buffered-stream-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.yaml");
+        let mut initial = test_config_with_auth(false);
+        // PUT validates the full config; the shared fixture's port 0 does not pass.
+        initial.server.port = 8080;
+        let server = crate::gateway::GatewayServer::new(initial, Some(config_path.clone()))
+            .await
+            .unwrap();
+
+        let get = || {
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/admin/config")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let response = tower::ServiceExt::oneshot(server.build_router(), get())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut config = smart_routing_response_json(response).await;
+        // Unset by default: the effective value comes from the provider type.
+        assert!(config["providers"][0]["buffered_upstream_streaming"].is_null());
+
+        config["providers"][0]["buffered_upstream_streaming"] = json!(false);
+        let response = tower::ServiceExt::oneshot(
+            server.build_router(),
+            smart_routing_json_request("PUT", "/admin/config", config),
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        let body = smart_routing_response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "PUT /admin/config failed: {body}");
+
+        let saved: Config =
+            serde_yaml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(saved.providers[0].buffered_upstream_streaming, Some(false));
+
+        let response = tower::ServiceExt::oneshot(server.build_router(), get())
+            .await
+            .unwrap();
+        let config = smart_routing_response_json(response).await;
+        assert_eq!(config["providers"][0]["buffered_upstream_streaming"], json!(false));
+
+        let _ = std::fs::remove_dir_all(&config_dir);
     }
 
     fn smart_routing_json_request(

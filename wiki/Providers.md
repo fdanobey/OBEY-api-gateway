@@ -245,8 +245,13 @@ Timeouts split into two phases:
 | `ttfb_timeout_seconds` | 30s | 120s | Time-to-first-byte |
 | `total_timeout_seconds` | 300s | 600s | Total round-trip ceiling |
 | `timeout_seconds` | 30s | — | Legacy (used as `total_timeout` when split fields omitted) |
+| `buffered_upstream_streaming` | `true` (`false` for `bedrock`) | same | Fetch buffered (non-pass-through) responses from the provider as a stream and reassemble them. Requests with `n > 1`, `logprobs` or audio output always use `stream: false`. Set `false` to restore `stream: false` for this provider. Admin panel: "Stream upstream for buffered requests" |
 
 **Thinking models** (o1, o3, DeepSeek-R1, QwQ, Claude 3.5 Sonnet v2+, Claude Opus/4+) are auto-detected and get higher defaults.
+
+With upstream streaming, `ttfb_timeout_seconds` is measured to the first body byte (headers plus the first chunk), so a generation that keeps sending bytes runs up to `total_timeout_seconds`. With `stream: false`, it is measured to the response headers.
+
+A timeout-class failure (TTFB, total or inter-chunk timeout, or an upstream HTTP 504/524) fails over to the next provider without a same-provider retry. Other retryable errors (500, 502, network) still use `retry.max_retries_per_provider`.
 
 When a timeout fires, the error response tells the caller which timeout was hit and which config field to adjust.
 

@@ -31,6 +31,11 @@ pub enum GatewayError {
     #[error("Request timeout after {0}s total round-trip time")]
     TotalTimeout(u64),
 
+    /// The provider started a response body and then went silent for longer
+    /// than the inter-chunk idle window (`streaming.chunk_timeout_seconds`).
+    #[error("Provider stopped sending data for {0}s")]
+    ChunkTimeout(u64),
+
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
@@ -120,6 +125,7 @@ impl GatewayError {
             GatewayError::RateLimitExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             GatewayError::TtfbTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             GatewayError::TotalTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            GatewayError::ChunkTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             GatewayError::CircuitBreakerOpen(_) => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::GuardrailPolicyViolation { .. } => StatusCode::FORBIDDEN,
             GatewayError::GuardrailInvalidAction => StatusCode::BAD_REQUEST,
@@ -140,6 +146,13 @@ pub struct ProviderAttempt {
     pub error: String,
     pub status_code: Option<u16>,
     pub timestamp: DateTime<Utc>,
+    /// Wall-clock time spent on this try. Internal only: written to the request
+    /// log, never serialized into the client-visible error body.
+    #[serde(default, skip_serializing)]
+    pub duration_ms: Option<u64>,
+    /// Content-free failure class (see [`error_class_for`]). Internal only.
+    #[serde(default, skip_serializing)]
+    pub error_class: Option<String>,
 }
 
 impl ProviderAttempt {
@@ -150,7 +163,66 @@ impl ProviderAttempt {
             error,
             status_code,
             timestamp: Utc::now(),
+            duration_ms: None,
+            error_class: None,
         }
+    }
+
+    /// Attach the elapsed time of this try.
+    pub fn with_duration(mut self, elapsed: std::time::Duration) -> Self {
+        self.duration_ms = Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+        self
+    }
+
+    /// Attach a content-free failure class.
+    pub fn with_error_class(mut self, class: &str) -> Self {
+        self.error_class = Some(class.to_string());
+        self
+    }
+}
+
+/// Stable, content-free snake_case class for a failed try (≤ 32 chars).
+///
+/// Values: `upstream_http_<code>`, `ttfb_timeout`, `total_timeout`,
+/// `chunk_timeout`, `network_error`, `body_read_error`, `stream_truncated`,
+/// `error_in_200`, `rate_limit_skip`, `cooldown_skip`, `circuit_open_skip`,
+/// `budget_skip`, `slot_saturated`, `empty_response`, `reasoning_only`,
+/// `truncated_response`, `client_disconnect`, `gateway_deadline`, `other`.
+/// Only the timeout/network/HTTP families can be derived from an error value;
+/// the rest are assigned at the call site that knows the reason.
+pub fn error_class_for(err: &GatewayError) -> String {
+    match err {
+        GatewayError::TtfbTimeout(_) => "ttfb_timeout".to_string(),
+        GatewayError::TotalTimeout(_) => "total_timeout".to_string(),
+        GatewayError::ChunkTimeout(_) => "chunk_timeout".to_string(),
+        GatewayError::Network(_) | GatewayError::Http(_) => "network_error".to_string(),
+        GatewayError::RateLimitExceeded(_) => "rate_limit_skip".to_string(),
+        GatewayError::CircuitBreakerOpen(_) => "circuit_open_skip".to_string(),
+        GatewayError::SmartRoutingBudgetExceeded { .. } => "budget_skip".to_string(),
+        // The outcome of an exhausted failover is the last attempt's failure.
+        GatewayError::AllProvidersFailed(agg) => agg
+            .attempts
+            .last()
+            .and_then(|attempt| attempt.error_class.clone())
+            .unwrap_or_else(|| "other".to_string()),
+        GatewayError::Provider {
+            message,
+            status_code,
+            ..
+        } => {
+            if message.starts_with("Failed to read response body") {
+                "body_read_error".to_string()
+            } else if message.starts_with("Error in 200 response") {
+                "error_in_200".to_string()
+            } else if message.starts_with("Upstream stream ended before completion") {
+                "stream_truncated".to_string()
+            } else if let Some(code) = status_code {
+                format!("upstream_http_{code}")
+            } else {
+                "other".to_string()
+            }
+        }
+        _ => "other".to_string(),
     }
 }
 
@@ -313,5 +385,61 @@ mod tests {
         );
         let json_without = serde_json::to_value(&attempt_without_code).unwrap();
         assert!(json_without["status_code"].is_null());
+    }
+
+    #[test]
+    fn aggregated_error_json_has_no_internal_attempt_fields() {
+        let attempt = ProviderAttempt::new(
+            "provider".to_string(),
+            "model".to_string(),
+            "Request timeout after 120s waiting for first byte from provider".to_string(),
+            Some(504),
+        )
+        .with_duration(std::time::Duration::from_millis(120_004))
+        .with_error_class("ttfb_timeout");
+        assert_eq!(attempt.duration_ms, Some(120_004));
+
+        let json = serde_json::to_value(AggregatedError::new(vec![attempt])).unwrap();
+        let keys: Vec<&String> = json["attempts"][0].as_object().unwrap().keys().collect();
+        let mut keys: Vec<&str> = keys.into_iter().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["error", "model", "provider", "status_code", "timestamp"]
+        );
+    }
+
+    #[test]
+    fn error_class_for_maps_router_errors() {
+        let provider = |message: &str, status_code: Option<u16>| GatewayError::Provider {
+            provider: "p".to_string(),
+            message: message.to_string(),
+            status_code,
+        };
+        assert_eq!(error_class_for(&GatewayError::TtfbTimeout(120)), "ttfb_timeout");
+        assert_eq!(error_class_for(&GatewayError::TotalTimeout(300)), "total_timeout");
+        assert_eq!(error_class_for(&GatewayError::ChunkTimeout(60)), "chunk_timeout");
+        assert_eq!(
+            error_class_for(&GatewayError::Network("reset".to_string())),
+            "network_error"
+        );
+        assert_eq!(error_class_for(&provider("boom", Some(504))), "upstream_http_504");
+        assert_eq!(
+            error_class_for(&provider("Failed to read response body: eof", Some(200))),
+            "body_read_error"
+        );
+        assert_eq!(
+            error_class_for(&provider("Error in 200 response: x", Some(200))),
+            "error_in_200"
+        );
+        assert_eq!(
+            error_class_for(&provider("Upstream stream ended before completion", Some(200))),
+            "stream_truncated"
+        );
+        assert_eq!(error_class_for(&provider("odd", None)), "other");
+        assert_eq!(
+            error_class_for(&GatewayError::InvalidRequest("x".to_string())),
+            "other"
+        );
     }
 }

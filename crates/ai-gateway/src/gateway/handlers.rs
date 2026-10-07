@@ -115,6 +115,8 @@ struct RequestLogContext {
     /// JSON report of reasoning-compat strip/normalize actions taken for
     /// this request: counts and model/family identifiers only (Req 4.6).
     reasoning_compat_actions: Option<String>,
+    /// Content-free failure class for error outcomes (`error_class_for`).
+    error_class: Option<String>,
 }
 
 impl RequestLogContext {
@@ -226,6 +228,7 @@ impl RequestLogContext {
                 .get("gateway_reasoning_compat_actions")
                 .and_then(|v| v.as_str())
                 .map(String::from),
+            error_class: None,
         }
     }
 
@@ -260,6 +263,7 @@ impl RequestLogContext {
             // `record_streaming_success`.
             reasoning_tokens: None,
             reasoning_compat_actions: None,
+            error_class: None,
         }
     }
 
@@ -309,7 +313,28 @@ impl RequestLogContext {
             prefix_hash: None,
             reasoning_tokens: None,
             reasoning_compat_actions: None,
+            error_class: Some(crate::error::error_class_for(error)),
         }
+    }
+}
+
+/// Write the terminal outcome row for a chat request: first drain the
+/// request's attempt ledger into `#attempt` rows, then write the outcome row,
+/// then mark the handle so the abandon logger in [`RequestCompleteGuard`]
+/// does not write a second outcome.
+fn log_outcome(
+    state: &super::AppState,
+    request: &OpenAIRequest,
+    context: &RequestLogContext,
+    handle: Option<&crate::active_requests::ActiveRequestHandle>,
+) {
+    if let Some(handle) = handle {
+        let attempts = handle.take_failed_attempts();
+        log_failed_attempts(&state.logger, &state.metrics, &context.trace_id, &attempts);
+    }
+    log_request(state, request, context);
+    if let Some(handle) = handle {
+        handle.mark_outcome_logged();
     }
 }
 
@@ -346,6 +371,7 @@ fn log_request(state: &super::AppState, request: &OpenAIRequest, context: &Reque
         // gateway_reasoning_* response extras.
         reasoning_tokens: context.reasoning_tokens,
         reasoning_compat_actions: context.reasoning_compat_actions.clone(),
+        error_class: context.error_class.clone(),
     };
     if let Err(e) = state.logger.log(entry) {
         tracing::warn!(error = %e, trace_id = %context.trace_id, "Failed to write request log entry");
@@ -364,40 +390,28 @@ pub(crate) const ATTEMPT_LOG_PATH: &str = "/v1/chat/completions#attempt";
 /// Mirrors the gateway's `AllProvidersFailed` → HTTP 502 mapping.
 const ATTEMPT_FALLBACK_STATUS: u16 = 502;
 
-/// Extract the failed `ProviderAttempt`s the router stashed on the response
-/// (`gateway_failed_attempts`) during failover. Returns an empty vec when the
-/// key is absent or malformed — this is best-effort telemetry.
-fn extract_failed_attempts(response: &OpenAIResponse) -> Vec<ProviderAttempt> {
-    response
-        .extra
-        .get("gateway_failed_attempts")
-        .and_then(|value| serde_json::from_value::<Vec<ProviderAttempt>>(value.clone()).ok())
-        .unwrap_or_default()
-}
-
 /// Write one content-free failure log row per failed provider attempt, and
 /// bump the model-labeled attempt-failure counter.
 ///
-/// Each row carries the attempt's own `timestamp`, the attempt's target
-/// `model` and `provider`, its `status_code` (or [`ATTEMPT_FALLBACK_STATUS`]
-/// when the attempt has none), the error string in `response_body`, and the
-/// SHARED parent `trace_id` so attempt rows correlate with the final-outcome
-/// row. `duration_ms` is `0` because `ProviderAttempt` does not track
-/// per-attempt latency. No request/response bodies are logged regardless of
-/// body-logging config — only provider, model, status, and the error string.
+/// `attempts` comes from the request's attempt ledger
+/// (`ActiveRequestHandle::take_failed_attempts`). Each row carries the
+/// attempt's own `timestamp`, target `model`/`provider`, its `status_code` (or
+/// [`ATTEMPT_FALLBACK_STATUS`] when it has none), `duration_ms` and
+/// `error_class` (always stored), the error string in `response_body` (subject
+/// to body logging), and the SHARED parent `trace_id` so attempt rows
+/// correlate with the final-outcome row. No request body is ever logged.
 ///
-/// Best-effort and off the request hot path: it runs after routing completes
-/// and never blocks or fails the request (log failures are only warned).
+/// Best-effort and off the request hot path: it never blocks or fails the
+/// request (log failures are only warned).
 fn log_failed_attempts(
-    state: &super::AppState,
+    logger: &crate::logger::RequestLogger,
+    metrics: &Metrics,
     trace_id: &str,
     attempts: &[ProviderAttempt],
 ) {
     for attempt in attempts {
         let status_code = attempt.status_code.unwrap_or(ATTEMPT_FALLBACK_STATUS);
-        state
-            .metrics
-            .record_provider_attempt_failure(&attempt.provider, &attempt.model, status_code);
+        metrics.record_provider_attempt_failure(&attempt.provider, &attempt.model, status_code);
 
         let entry = LogEntry {
             trace_id: trace_id.to_string(),
@@ -407,7 +421,7 @@ fn log_failed_attempts(
             model: attempt.model.clone(),
             provider: attempt.provider.clone(),
             status_code,
-            duration_ms: 0,
+            duration_ms: attempt.duration_ms.unwrap_or(0),
             cost: 0.0,
             request_body: None,
             response_body: Some(attempt.error.clone()),
@@ -424,8 +438,14 @@ fn log_failed_attempts(
             prefix_hash: None,
             reasoning_tokens: None,
             reasoning_compat_actions: None,
+            error_class: Some(
+                attempt
+                    .error_class
+                    .clone()
+                    .unwrap_or_else(|| "other".to_string()),
+            ),
         };
-        if let Err(e) = state.logger.log(entry) {
+        if let Err(e) = logger.log(entry) {
             tracing::warn!(
                 error = %e,
                 trace_id = %trace_id,
@@ -435,19 +455,6 @@ fn log_failed_attempts(
                 "Failed to write per-attempt failure log entry"
             );
         }
-    }
-}
-
-/// Convenience wrapper: pull the failed attempts off the response and log them.
-/// No-op when the response carries none.
-fn log_failed_attempts_from_response(
-    state: &super::AppState,
-    trace_id: &str,
-    response: &OpenAIResponse,
-) {
-    let attempts = extract_failed_attempts(response);
-    if !attempts.is_empty() {
-        log_failed_attempts(state, trace_id, &attempts);
     }
 }
 
@@ -463,9 +470,6 @@ fn strip_gateway_response_metadata(response: &mut OpenAIResponse) {
     response.extra.remove("gateway_prefix_hash");
     response.extra.remove("gateway_reasoning_tokens");
     response.extra.remove("gateway_reasoning_compat_actions");
-    // Per-attempt failure telemetry: internal routing metadata that must never
-    // reach the client. Consumed by `log_failed_attempts` before this strip.
-    response.extra.remove("gateway_failed_attempts");
 }
 
 fn prepare_response_for_client(response: &OpenAIResponse) -> OpenAIResponse {
@@ -890,7 +894,8 @@ async fn preprocess_memory_request(
         .map(|capabilities| capabilities.context_window)
         .unwrap_or(default_context_window);
     let post_truncation_tokens = TokenCounter::new().count_request(request);
-    let result: MemoryRequestResult = match system
+    let memory_start = Instant::now();
+    let processed = system
         .process_request(
             request,
             &query,
@@ -899,8 +904,17 @@ async fn preprocess_memory_request(
             effective,
             virtual_key_id,
         )
-        .await
-    {
+        .await;
+    // Memory retrieval runs before provider dispatch; surface slow runs so
+    // gateway-side delay is distinguishable from upstream latency.
+    let memory_elapsed = memory_start.elapsed();
+    if memory_elapsed > Duration::from_secs(1) {
+        tracing::info!(
+            elapsed_ms = memory_elapsed.as_millis() as u64,
+            "Memory request preprocessing took longer than 1s"
+        );
+    }
+    let result: MemoryRequestResult = match processed {
         Ok(result) => result,
         Err(error) => {
             tracing::warn!(error = %error, "Memory request preprocessing failed; routing unchanged");
@@ -1149,7 +1163,7 @@ fn guardrail_error_response(
     let duration_ms = request_guard.complete();
     let log_context =
         RequestLogContext::from_error(request, trace_id.to_string(), duration_ms, &error);
-    log_request(state, request, &log_context);
+    log_outcome(state, request, &log_context, request_guard.active_handle());
     let mut response = error.into_response();
     attach_trace_id_header(&mut response, trace_id);
     response
@@ -1216,6 +1230,10 @@ impl IntoResponse for GatewayError {
                 StatusCode::GATEWAY_TIMEOUT,
                 serde_json::json!({ "error": { "message": format!("Request exceeded {}s total round-trip timeout. The response may be too large or the model too slow — consider increasing total_timeout_seconds.", secs), "type": "total_timeout_error" } }),
             ),
+            GatewayError::ChunkTimeout(secs) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                serde_json::json!({ "error": { "message": format!("Provider stopped sending data for {}s (inter-chunk timeout).", secs), "type": "chunk_timeout_error" } }),
+            ),
             GatewayError::Provider {
                 provider: _,
                 message: _,
@@ -1274,6 +1292,123 @@ struct RequestCompleteGuard {
     /// Optional in-flight registry handle so the request is removed when the
     /// guard is dropped (including mid-stream cancellations).
     active: Option<(Arc<crate::active_requests::ActiveRequestRegistry>, String)>,
+    /// Writes the outcome row for a chat request that was dropped before it
+    /// logged one (client disconnect or global deadline).
+    abandon: Option<AbandonLogger>,
+}
+
+/// Everything [`RequestCompleteGuard`]'s `Drop` needs to log an abandoned
+/// chat request without access to `AppState`.
+struct AbandonLogger {
+    logger: Arc<crate::logger::RequestLogger>,
+    handle: crate::active_requests::ActiveRequestHandle,
+    requested_model: String,
+    kind: crate::active_requests::RequestKind,
+    /// Global request deadline in seconds (0 = disabled).
+    deadline_secs: u64,
+}
+
+impl AbandonLogger {
+    fn new(state: &super::AppState, handle: &crate::active_requests::ActiveRequestHandle) -> Self {
+        let (requested_model, kind) = handle
+            .0
+            .lock()
+            .map(|info| (info.requested_model.clone(), info.kind))
+            .unwrap_or_else(|_| (String::new(), crate::active_requests::RequestKind::Chat));
+        Self {
+            logger: state.logger.clone(),
+            handle: handle.clone(),
+            requested_model,
+            kind,
+            deadline_secs: state.runtime_limits.request_timeout_seconds(),
+        }
+    }
+
+    /// Write the content-free 499/504 outcome row, then drain the ledger.
+    fn log_abandoned(&self, metrics: &Metrics, elapsed: Duration) {
+        if self.handle.outcome_logged() {
+            return;
+        }
+        self.handle.mark_outcome_logged();
+        let snapshot = self.handle.0.lock().ok().map(|info| info.clone());
+        let (trace_id, provider, model, attempt, phase) = match snapshot.as_ref() {
+            Some(info) => (
+                info.trace_id.clone(),
+                info.provider.clone().unwrap_or_default(),
+                info.model.clone(),
+                info.attempt,
+                info.phase,
+            ),
+            None => (
+                String::new(),
+                String::new(),
+                None,
+                0,
+                crate::active_requests::ActivePhase::Pending,
+            ),
+        };
+        let (status_code, error_class) = abandon_outcome(elapsed, self.deadline_secs);
+        let kind = match self.kind {
+            crate::active_requests::RequestKind::Chat => "chat",
+            crate::active_requests::RequestKind::Stream => "stream",
+        };
+        let message = format!(
+            "{kind} request abandoned after {}s while on {}/{}, attempt {attempt}, phase {}",
+            elapsed.as_secs(),
+            if provider.is_empty() { "-" } else { provider.as_str() },
+            model.as_deref().unwrap_or("-"),
+            phase.label(),
+        );
+        let attempts = self.handle.take_failed_attempts();
+        log_failed_attempts(&self.logger, metrics, &trace_id, &attempts);
+        let entry = LogEntry {
+            trace_id: trace_id.clone(),
+            timestamp: chrono::Utc::now(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            model: model.clone().unwrap_or_else(|| self.requested_model.clone()),
+            provider,
+            status_code,
+            duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            cost: 0.0,
+            request_body: None,
+            response_body: Some(message),
+            requested_model: Some(self.requested_model.clone()),
+            responded_model: None,
+            compression: None,
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            cache_savings_cents: None,
+            prefix_hash: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
+            error_class: Some(error_class.to_string()),
+        };
+        tracing::info!(
+            trace_id = %trace_id,
+            status_code,
+            error_class,
+            duration_ms = entry.duration_ms,
+            "Request abandoned before completion"
+        );
+        if let Err(e) = self.logger.log(entry) {
+            tracing::warn!(error = %e, trace_id = %trace_id, "Failed to write abandoned-request log entry");
+        }
+    }
+}
+
+/// Status and class for an abandoned request: 504 `gateway_deadline` when it
+/// ran into the global deadline (within 1 s), otherwise 499 `client_disconnect`.
+fn abandon_outcome(elapsed: Duration, deadline_secs: u64) -> (u16, &'static str) {
+    if deadline_secs > 0 && elapsed.as_secs() + 1 >= deadline_secs {
+        (504, "gateway_deadline")
+    } else {
+        (499, "client_disconnect")
+    }
 }
 
 impl RequestCompleteGuard {
@@ -1287,7 +1422,19 @@ impl RequestCompleteGuard {
             start,
             completed: false,
             active,
+            abandon: None,
         }
+    }
+
+    /// Enable the abandoned-request outcome row for a chat request.
+    fn with_abandon_logger(mut self, abandon: AbandonLogger) -> Self {
+        self.abandon = Some(abandon);
+        self
+    }
+
+    /// The in-flight handle carried by the abandon logger, if any.
+    fn active_handle(&self) -> Option<&crate::active_requests::ActiveRequestHandle> {
+        self.abandon.as_ref().map(|abandon| &abandon.handle)
     }
 
     /// Mark the request as completed normally (prevents the Drop impl from
@@ -1313,6 +1460,9 @@ impl Drop for RequestCompleteGuard {
                 "RequestCompleteGuard dropped without explicit complete — completing request metrics via Drop (this is expected for cancelled streams)"
             );
             self.metrics.complete_request(duration_ms);
+            if let Some(abandon) = &self.abandon {
+                abandon.log_abandoned(&self.metrics, self.start.elapsed());
+            }
         }
         // Remove the entry from the in-flight registry if one was registered.
         if let Some((registry, trace_id)) = &self.active {
@@ -1346,6 +1496,9 @@ fn build_active_request_info(
         started_at_ms,
         kind,
         smart_routing_logged: false,
+        failed_attempts: Vec::new(),
+        outcome_logged: false,
+        breaker_skips_recorded: false,
     }
 }
 
@@ -1423,7 +1576,8 @@ async fn chat_completions_non_stream(
         state.metrics.clone(),
         start,
         Some((state.active_requests.clone(), trace_id.clone())),
-    );
+    )
+    .with_abandon_logger(AbandonLogger::new(&state, &active_handle));
     tracing::debug!(model = %request.model, "Routing non-stream request");
 
     // Snapshot request-scoped engines once and release both hot-reload locks
@@ -1675,8 +1829,7 @@ async fn chat_completions_non_stream(
                                         .map(|memory| (&memory.context, &memory.injection)),
                                     None,
                                 );
-                                log_failed_attempts_from_response(&state, &trace_id, &response);
-                                log_request(&state, &request, &log_context);
+                                log_outcome(&state, &request, &log_context, request_guard.active_handle());
                                 let mut http_response = openai_json_response(&response);
                                 attach_trace_id_header(&mut http_response, &trace_id);
                                 return http_response;
@@ -2211,8 +2364,7 @@ async fn chat_completions_non_stream(
             );
             // Log any failed provider attempts masked by this success BEFORE
             // the response's gateway extras are stripped for the client.
-            log_failed_attempts_from_response(&state, &trace_id, &response);
-            log_request(&state, &request, &log_context);
+            log_outcome(&state, &request, &log_context, request_guard.active_handle());
             let mut http_response = openai_json_response(&response);
             attach_validation_status_header(
                 &mut http_response,
@@ -2226,7 +2378,7 @@ async fn chat_completions_non_stream(
             let duration_ms = request_guard.complete();
             let log_context =
                 RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
-            log_request(&state, &request, &log_context);
+            log_outcome(&state, &request, &log_context, request_guard.active_handle());
             let mut response = e.into_response();
             attach_trace_id_header(&mut response, &trace_id);
             response
@@ -2252,7 +2404,8 @@ async fn chat_completions_stream(
         state.metrics.clone(),
         start,
         Some((state.active_requests.clone(), trace_id.clone())),
-    );
+    )
+    .with_abandon_logger(AbandonLogger::new(&state, &active_handle));
     tracing::debug!(
         trace_id = %trace_id,
         model = %request.model,
@@ -2501,8 +2654,7 @@ async fn chat_completions_stream(
 
                             let duration_ms = start.elapsed().as_millis() as u64;
                             let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                            log_failed_attempts_from_response(&state, &stream_trace_id, &response);
-                            log_request(&state, &request, &log_context);
+                            log_outcome(&state, &request, &log_context, _guard.active_handle());
 
                             // Non-blocking memory extraction now that the full
                             // response content is known (parity with the
@@ -2613,6 +2765,7 @@ async fn chat_completions_stream(
                             let mut current_compression = compression;
 
                             'failover: loop {
+                                let relay_start = Instant::now();
                                 // Defensive bound (see note above): unreachable in normal
                                 // operation because the exclusion list already bounds the
                                 // loop. If ever tripped, emit whatever was accumulated.
@@ -2627,6 +2780,9 @@ async fn chat_completions_stream(
                                     let aggregated = GatewayError::AllProvidersFailed(
                                         AggregatedError::new(std::mem::take(&mut streaming_attempts)),
                                     );
+                                    let duration_ms = start.elapsed().as_millis() as u64;
+                                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
+                                    log_outcome(&state, &request, &log_context, _guard.active_handle());
                                     let (error_type, message) = classify_stream_error(&aggregated);
                                     for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                                         yield Ok(event);
@@ -2727,11 +2883,9 @@ async fn chat_completions_stream(
                             current_model.clone(),
                             current_compression.clone(),
                         );
-                        // Surface any streaming attempts that failed before this
-                        // success so masked upstream failures (e.g. 504s) are
-                        // visible per-attempt, mirroring the buffered path.
-                        log_failed_attempts(&state, &stream_trace_id, &streaming_attempts);
-                        log_request(&state, &request, &log_context);
+                        // Streaming attempts that failed before this success are
+                        // in the ledger; log_outcome writes them as #attempt rows.
+                        log_outcome(&state, &request, &log_context, _guard.active_handle());
                         break 'failover;
                     }
                                     // Post-content failure (Req 4.2): the relay already
@@ -2749,12 +2903,13 @@ async fn chat_completions_stream(
                                             current_model.clone(),
                                             current_compression.clone(),
                                         );
-                                        log_failed_attempts(
-                                            &state,
-                                            &stream_trace_id,
-                                            &streaming_attempts,
-                                        );
-                                        log_request(&state, &request, &log_context);
+                                        active_handle_stream.record_failed_attempt(relay_failure_attempt(
+                                            &current_provider,
+                                            &current_model,
+                                            &reason,
+                                            relay_start.elapsed(),
+                                        ));
+                                        log_outcome(&state, &request, &log_context, _guard.active_handle());
                                         state
                                             .router
                                             .record_streaming_failure(
@@ -2811,12 +2966,14 @@ async fn chat_completions_stream(
                                             );
                                             // Record the attempt for the aggregated error in
                                             // case everything ultimately fails (Req 4.3).
-                                            streaming_attempts.push(ProviderAttempt::new(
-                                                current_provider.clone(),
-                                                current_model.clone(),
-                                                reason.clone(),
-                                                None,
-                                            ));
+                                            let attempt = relay_failure_attempt(
+                                                &current_provider,
+                                                &current_model,
+                                                &reason,
+                                                relay_start.elapsed(),
+                                            );
+                                            streaming_attempts.push(attempt.clone());
+                                            active_handle_stream.record_failed_attempt(attempt);
                                             drop(_current_concurrency_permit.take());
 
                                             // Re-request WITHOUT excluding the current
@@ -2847,9 +3004,7 @@ async fn chat_completions_stream(
                                                     }
                                                     let duration_ms = start.elapsed().as_millis() as u64;
                                                     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                                                    log_failed_attempts(&state, &stream_trace_id, &streaming_attempts);
-                                                    log_failed_attempts_from_response(&state, &stream_trace_id, &response);
-                                                    log_request(&state, &request, &log_context);
+                                                    log_outcome(&state, &request, &log_context, _guard.active_handle());
                                                     if let Some(memory) = memory_context.as_ref() {
                                                         let response_content = response
                                                             .choices
@@ -2881,7 +3036,7 @@ async fn chat_completions_stream(
                                                     );
                                                     let duration_ms = start.elapsed().as_millis() as u64;
                                                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-                                                    log_request(&state, &request, &log_context);
+                                                    log_outcome(&state, &request, &log_context, _guard.active_handle());
                                                     let (error_type, message) = classify_stream_error(&aggregated);
                                                     for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                                                         yield Ok(event);
@@ -2900,12 +3055,14 @@ async fn chat_completions_stream(
                                         tried_providers.push(current_key);
                                         // Req 4.3: record this pre-content failure for the
                                         // aggregated error in case every provider fails.
-                                        streaming_attempts.push(ProviderAttempt::new(
-                                            current_provider.clone(),
-        current_model.clone(),
-        reason.clone(),
-        None,
-        ));
+                                        let attempt = relay_failure_attempt(
+                                            &current_provider,
+                                            &current_model,
+                                            &reason,
+                                            relay_start.elapsed(),
+                                        );
+                                        streaming_attempts.push(attempt.clone());
+                                        active_handle_stream.record_failed_attempt(attempt);
         drop(_current_concurrency_permit.take());
 
         match state
@@ -2935,9 +3092,7 @@ async fn chat_completions_stream(
                                                 }
                                                 let duration_ms = start.elapsed().as_millis() as u64;
                                                 let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                                                log_failed_attempts(&state, &stream_trace_id, &streaming_attempts);
-                                                log_failed_attempts_from_response(&state, &stream_trace_id, &response);
-                                                log_request(&state, &request, &log_context);
+                                                log_outcome(&state, &request, &log_context, _guard.active_handle());
                                                 if let Some(memory) = memory_context.as_ref() {
                                                     let response_content = response
                                                         .choices
@@ -2975,7 +3130,7 @@ async fn chat_completions_stream(
                                                 );
                                                 let duration_ms = start.elapsed().as_millis() as u64;
                                                 let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-                                                log_request(&state, &request, &log_context);
+                                                log_outcome(&state, &request, &log_context, _guard.active_handle());
                                                 let (error_type, message) = classify_stream_error(&aggregated);
                                                 for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                                                     yield Ok(event);
@@ -2994,7 +3149,7 @@ async fn chat_completions_stream(
                             // before the stream terminates (Req 5.1, 5.2, 5.4).
                             let duration_ms = start.elapsed().as_millis() as u64;
                             let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
-                            log_request(&state, &request, &log_context);
+                            log_outcome(&state, &request, &log_context, _guard.active_handle());
 
                             // Map the error variant to an SSE error frame. emit_sse_error_event
                             // already appends [DONE], so we must NOT yield a separate one.
@@ -3038,7 +3193,7 @@ async fn chat_completions_stream(
             let duration_ms = request_guard.complete();
             let log_context =
                 RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
-            log_request(&state, &request, &log_context);
+            log_outcome(&state, &request, &log_context, request_guard.active_handle());
             let mut response = e.into_response();
             attach_trace_id_header(&mut response, &trace_id);
             return response;
@@ -3059,8 +3214,7 @@ async fn chat_completions_stream(
     let duration_ms = start.elapsed().as_millis() as u64;
     let log_context =
         RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
-    log_failed_attempts_from_response(&state, &trace_id, &response);
-    log_request(&state, &request, &log_context);
+    log_outcome(&state, &request, &log_context, request_guard.active_handle());
 
     // Non-blocking memory extraction now that the full response is known.
     if let Some(memory) = memory_context.as_ref() {
@@ -3609,7 +3763,7 @@ async fn stream_eager_structured_output(
                             duration_ms,
                             &error,
                         );
-                        log_request(&state, &request, &log_context);
+                        log_outcome(&state, &request, &log_context, request_guard.active_handle());
                         return eager_sse_response(
                             structured_stream_overflow_events(&trace_id),
                             &streaming_config,
@@ -3629,7 +3783,7 @@ async fn stream_eager_structured_output(
                             duration_ms,
                             &gateway_error,
                         );
-                        log_request(&state, &request, &log_context);
+                        log_outcome(&state, &request, &log_context, request_guard.active_handle());
                         return eager_sse_response(
                             emit_sse_error_event(
                                 "stream_error",
@@ -3656,7 +3810,7 @@ async fn stream_eager_structured_output(
                         duration_ms,
                         &gateway_error,
                     );
-                    log_request(&state, &request, &log_context);
+                    log_outcome(&state, &request, &log_context, request_guard.active_handle());
                     return eager_sse_response(
                         emit_sse_error_event("stream_error", &gateway_error.to_string(), &trace_id),
                         &streaming_config,
@@ -3676,7 +3830,7 @@ async fn stream_eager_structured_output(
                     duration_ms,
                     &gateway_error,
                 );
-                log_request(&state, &request, &log_context);
+                log_outcome(&state, &request, &log_context, request_guard.active_handle());
                 return eager_sse_response(
                     emit_sse_error_event("stream_error", message, &trace_id),
                     &streaming_config,
@@ -3714,7 +3868,7 @@ async fn stream_eager_structured_output(
             let duration_ms = request_guard.complete();
             let log_context =
                 RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
-            log_request(&state, &request, &log_context);
+            log_outcome(&state, &request, &log_context, request_guard.active_handle());
             let (error_type, message) = classify_stream_error(&error);
             return eager_sse_response(
                 emit_sse_error_event(error_type, &message, &trace_id),
@@ -3742,7 +3896,7 @@ async fn stream_eager_structured_output(
             let duration_ms = request_guard.complete();
             let log_context =
                 RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
-            log_request(&state, &request, &log_context);
+            log_outcome(&state, &request, &log_context, request_guard.active_handle());
             return eager_sse_response(events, &streaming_config, &trace_id, None, None);
         }
     };
@@ -3764,13 +3918,12 @@ async fn stream_eager_structured_output(
             let duration_ms = request_guard.complete();
             let log_context =
                 RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
-            log_request(&state, &request, &log_context);
+            log_outcome(&state, &request, &log_context, request_guard.active_handle());
             return eager_sse_response(events, &streaming_config, &trace_id, None, None);
         }
         Err(EagerPostCallResult::Response(_)) => unreachable!(),
     };
 
-    log_failed_attempts_from_response(&state, &trace_id, &response);
 
     if should_cache_eager_structured(&request, Some(&response), Some(validation_status)) {
         if let Ok(json) = serde_json::to_string(&response) {
@@ -3796,7 +3949,7 @@ async fn stream_eager_structured_output(
     let duration_ms = request_guard.complete();
     let log_context =
         RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
-    log_request(&state, &request, &log_context);
+    log_outcome(&state, &request, &log_context, request_guard.active_handle());
     eager_sse_response(
         events,
         &streaming_config,
@@ -3913,7 +4066,7 @@ async fn stream_buffered_with_post_call(
                         let duration_ms = start.elapsed().as_millis() as u64;
                         let err = GatewayError::GuardrailUnavailable(msg.clone());
                         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                        log_request(&state, &request, &log_context);
+                        log_outcome(&state, &request, &log_context, _guard.active_handle());
                         for event in emit_sse_error_event("guardrail_buffer_overflow", &msg, &stream_trace_id) {
                             yield Ok(event);
                         }
@@ -3939,7 +4092,7 @@ async fn stream_buffered_with_post_call(
                     // Routing failed before any streaming — graceful SSE error frame.
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
-                    log_request(&state, &request, &log_context);
+                    log_outcome(&state, &request, &log_context, _guard.active_handle());
                     let (error_type, message) = classify_stream_error(&e);
                     for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                         yield Ok(event);
@@ -3956,7 +4109,7 @@ async fn stream_buffered_with_post_call(
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let err = GatewayError::GuardrailUnavailable(msg.clone());
                 let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                log_request(&state, &request, &log_context);
+                log_outcome(&state, &request, &log_context, _guard.active_handle());
                 for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                     yield Ok(event);
                 }
@@ -4016,8 +4169,7 @@ async fn stream_buffered_with_post_call(
                     }
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                    log_failed_attempts_from_response(&state, &stream_trace_id, &response);
-                    log_request(&state, &request, &log_context);
+                    log_outcome(&state, &request, &log_context, _guard.active_handle());
                     for chunk in chunks {
                         yield Ok(Event::default().data(chunk.to_string()));
                     }
@@ -4040,7 +4192,7 @@ async fn stream_buffered_with_post_call(
                             };
                             let duration_ms = start.elapsed().as_millis() as u64;
                             let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                            log_request(&state, &request, &log_context);
+                            log_outcome(&state, &request, &log_context, _guard.active_handle());
                             for chunk in chunks {
                                 yield Ok(Event::default().data(chunk.to_string()));
                             }
@@ -4113,7 +4265,7 @@ async fn stream_buffered_with_post_call(
                                         let duration_ms = start.elapsed().as_millis() as u64;
                                         let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
                                         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                                        log_request(&state, &request, &log_context);
+                                        log_outcome(&state, &request, &log_context, _guard.active_handle());
                                         yield Ok(Event::default().data(payload.to_string()));
                                         yield Ok(Event::default().data("[DONE]"));
                                         _guard.complete();
@@ -4124,7 +4276,7 @@ async fn stream_buffered_with_post_call(
                                         let duration_ms = start.elapsed().as_millis() as u64;
                                         let err = GatewayError::GuardrailUnavailable(msg.clone());
                                         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                                        log_request(&state, &request, &log_context);
+                                        log_outcome(&state, &request, &log_context, _guard.active_handle());
                                         for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                                             yield Ok(event);
                                         }
@@ -4176,7 +4328,7 @@ async fn stream_buffered_with_post_call(
                     }
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &last_response);
-                    log_request(&state, &request, &log_context);
+                    log_outcome(&state, &request, &log_context, _guard.active_handle());
                     for chunk in chunks {
                         yield Ok(Event::default().data(chunk.to_string()));
                     }
@@ -4188,7 +4340,7 @@ async fn stream_buffered_with_post_call(
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                    log_request(&state, &request, &log_context);
+                    log_outcome(&state, &request, &log_context, _guard.active_handle());
                     yield Ok(Event::default().data(payload.to_string()));
                     yield Ok(Event::default().data("[DONE]"));
                 }
@@ -4198,7 +4350,7 @@ async fn stream_buffered_with_post_call(
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let err = GatewayError::GuardrailUnavailable(msg.clone());
                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                    log_request(&state, &request, &log_context);
+                    log_outcome(&state, &request, &log_context, _guard.active_handle());
                     for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                         yield Ok(event);
                     }
@@ -4302,6 +4454,8 @@ fn classify_stream_error(e: &GatewayError) -> (&'static str, String) {
     const TTFB_SIGNATURE: &str = "waiting for first byte";
     /// Total-timeout signature from `GatewayError::TotalTimeout` Display text.
     const TOTAL_SIGNATURE: &str = "total round-trip";
+    /// Inter-chunk signature from `GatewayError::ChunkTimeout` Display text.
+    const CHUNK_SIGNATURE: &str = "stopped sending data";
 
     match e {
         GatewayError::TtfbTimeout(secs) => (
@@ -4311,6 +4465,10 @@ fn classify_stream_error(e: &GatewayError) -> (&'static str, String) {
         GatewayError::TotalTimeout(secs) => (
             "total_timeout_error",
             format!("Response exceeded {}s total timeout", secs),
+        ),
+        GatewayError::ChunkTimeout(secs) => (
+            "chunk_timeout_error",
+            format!("Provider stopped sending data for {}s", secs),
         ),
         GatewayError::AllProvidersFailed(agg) => {
             let any_attempt_contains = |needle: &str| {
@@ -4328,6 +4486,11 @@ fn classify_stream_error(e: &GatewayError) -> (&'static str, String) {
                 (
                     "total_timeout_error",
                     "Response exceeded the total timeout".to_string(),
+                )
+            } else if any_attempt_contains(CHUNK_SIGNATURE) {
+                (
+                    "chunk_timeout_error",
+                    "Provider stopped sending data before the response completed".to_string(),
                 )
             } else {
                 ("stream_error", e.to_string())
@@ -4585,6 +4748,33 @@ fn reqwest_error_chain(error: &reqwest::Error) -> String {
 /// - `error reading a body from connection`
 /// - `IncompleteMessage` / `incomplete` bodies
 /// - `connection reset` / `connection closed` before content
+/// Content-free `error_class` for a pass-through relay failure reason.
+fn relay_failure_class(reason: &str) -> &'static str {
+    if reason.starts_with("Provider stopped sending data") {
+        "chunk_timeout"
+    } else if reason.contains("total timeout") {
+        "total_timeout"
+    } else if reason.contains("ended without sending any content") {
+        "empty_response"
+    } else if is_transient_stream_truncation(reason) {
+        "stream_truncated"
+    } else {
+        "other"
+    }
+}
+
+/// Ledger entry for a failed pass-through relay attempt.
+fn relay_failure_attempt(
+    provider: &str,
+    model: &str,
+    reason: &str,
+    elapsed: Duration,
+) -> ProviderAttempt {
+    ProviderAttempt::new(provider.to_string(), model.to_string(), reason.to_string(), None)
+        .with_duration(elapsed)
+        .with_error_class(relay_failure_class(reason))
+}
+
 fn is_transient_stream_truncation(reason: &str) -> bool {
     let r = reason.to_ascii_lowercase();
     const TRANSIENT_MARKERS: [&str; 8] = [
@@ -6641,6 +6831,38 @@ mod tests {
     }
 
     // -- Stream error classification (task 4.2) ------------------------------
+
+    #[test]
+    fn abandon_outcome_classifies_disconnect_vs_deadline() {
+        let secs = Duration::from_secs;
+        assert_eq!(super::abandon_outcome(secs(5), 300), (499, "client_disconnect"));
+        assert_eq!(super::abandon_outcome(secs(298), 300), (499, "client_disconnect"));
+        assert_eq!(super::abandon_outcome(secs(299), 300), (504, "gateway_deadline"));
+        assert_eq!(super::abandon_outcome(secs(300), 300), (504, "gateway_deadline"));
+        // A disabled deadline (0) never classifies as gateway_deadline.
+        assert_eq!(super::abandon_outcome(secs(10_000), 0), (499, "client_disconnect"));
+    }
+
+    #[test]
+    fn relay_failure_class_maps_relay_reasons() {
+        assert_eq!(
+            super::relay_failure_class("Provider stopped sending data for 60s"),
+            "chunk_timeout"
+        );
+        assert_eq!(
+            super::relay_failure_class("Response exceeded 600s total timeout"),
+            "total_timeout"
+        );
+        assert_eq!(
+            super::relay_failure_class("Provider stream ended without sending any content"),
+            "empty_response"
+        );
+        assert_eq!(
+            super::relay_failure_class("Stream error: connection reset by peer"),
+            "stream_truncated"
+        );
+        assert_eq!(super::relay_failure_class("something else"), "other");
+    }
 
     fn attempt_with_error(error: String) -> ProviderAttempt {
         ProviderAttempt::new("openai".to_string(), "gpt-4".to_string(), error, Some(504))

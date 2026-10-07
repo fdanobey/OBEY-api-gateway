@@ -146,6 +146,7 @@ fn base_config(provider_uri: &str) -> Config {
             timeout_seconds: 30,
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
             custom_headers: Default::default(),
@@ -310,7 +311,15 @@ async fn provider_requests(server: &MockServer) -> Vec<Value> {
         .collect()
 }
 
-fn assert_corrective_retry(initial: &Value, retry: &Value, expected_stream: bool) {
+/// A request sent by the buffered dispatch: it fetches the provider response
+/// as a stream (`stream:true` + gateway-added `stream_options.include_usage`)
+/// and reassembles it before the client sees anything.
+fn assert_buffered_upstream_request(request: &Value) {
+    assert_eq!(request["stream"], true);
+    assert_eq!(request["stream_options"]["include_usage"], true);
+}
+
+fn assert_corrective_retry(initial: &Value, retry: &Value) {
     assert_eq!(initial["messages"].as_array().unwrap().len(), 1);
     let messages = retry["messages"].as_array().expect("retry messages array");
     assert_eq!(messages.len(), 3, "retry appends exactly two messages");
@@ -324,7 +333,7 @@ fn assert_corrective_retry(initial: &Value, retry: &Value, expected_stream: bool
     assert!(correction.contains("previous output was not valid JSON"));
     assert!(correction.contains("Output ONLY valid JSON"));
     assert_eq!(retry["temperature"].as_f64(), Some(RETRY_TEMPERATURE));
-    assert_eq!(retry["stream"], expected_stream);
+    assert_buffered_upstream_request(retry);
 }
 
 fn validation_header(response: &Response<Body>) -> Option<&str> {
@@ -410,7 +419,7 @@ async fn task_13_1_non_stream_corrective_retry_and_post_call_guardrail() {
         2,
         "one initial call plus one corrective retry"
     );
-    assert_corrective_retry(&requests[0], &requests[1], false);
+    assert_corrective_retry(&requests[0], &requests[1]);
 }
 
 #[tokio::test]
@@ -463,8 +472,11 @@ async fn task_13_2_streaming_invalid_sse_retries_non_stream_and_finishes_sse() {
 
     let requests = provider_requests(&provider).await;
     assert_eq!(requests.len(), 2);
+    // The first call is the streaming pass-through (no gateway stream_options);
+    // the corrective retry goes through the buffered dispatch.
     assert_eq!(requests[0]["stream"], true);
-    assert_corrective_retry(&requests[0], &requests[1], false);
+    assert!(requests[0].get("stream_options").is_none());
+    assert_corrective_retry(&requests[0], &requests[1]);
 }
 
 #[tokio::test]
@@ -683,6 +695,6 @@ async fn task_13_4_provider_model_passthrough_overrides_group_and_global() {
     for request in requests {
         assert_eq!(request["messages"].as_array().unwrap().len(), 1);
         assert_eq!(request["temperature"], 0.0);
-        assert_eq!(request["stream"], false);
+        assert_buffered_upstream_request(&request);
     }
 }

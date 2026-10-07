@@ -137,6 +137,7 @@ mod tests {
                 timeout_seconds: 30,
                 ttfb_timeout_seconds: None,
                 total_timeout_seconds: None,
+                buffered_upstream_streaming: None,
                 max_connections: 10,
                 rate_limit_per_minute: 0,
         custom_headers: Default::default(),

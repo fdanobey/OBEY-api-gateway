@@ -208,6 +208,10 @@ pub struct LogEntry {
     /// reasoning payloads, signatures, or redacted data (Req 4.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_compat_actions: Option<String>,
+    /// Content-free failure class (`crate::error::error_class_for` values).
+    /// Always stored, independent of body logging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
 }
 
 impl LogEntry {
@@ -426,7 +430,8 @@ impl RequestLogger {
             cache_savings_cents INTEGER,
             prefix_hash TEXT,
             reasoning_tokens INTEGER,
-            reasoning_compat_actions TEXT
+            reasoning_compat_actions TEXT,
+            error_class TEXT
             )",
         [],
     )?;
@@ -443,6 +448,7 @@ impl RequestLogger {
         Self::ensure_column(conn, "prefix_hash", "TEXT")?;
         Self::ensure_column(conn, "reasoning_tokens", "INTEGER")?;
         Self::ensure_column(conn, "reasoning_compat_actions", "TEXT")?;
+        Self::ensure_column(conn, "error_class", "TEXT")?;
 
         // Create indexes for common query patterns
         conn.execute(
@@ -823,10 +829,10 @@ fn insert_entry(
             requested_model, responded_model, compression_metadata, compression_level,
             memories_injected, memories_stored, injection_tokens, detected_project,
             cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
-            reasoning_tokens, reasoning_compat_actions
+            reasoning_tokens, reasoning_compat_actions, error_class
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
         )",
         params![
             entry.trace_id,
@@ -854,6 +860,7 @@ fn insert_entry(
             entry.prefix_hash,
             entry.reasoning_tokens.map(i64::from),
             entry.reasoning_compat_actions,
+            entry.error_class,
         ],
     )?;
 
@@ -862,7 +869,7 @@ fn insert_entry(
 
 /// Query log entries with optional filtering. Runs on the writer thread.
 fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
-    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions FROM requests WHERE 1=1");
+    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class FROM requests WHERE 1=1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     if let Some(ref trace_id) = filter.trace_id {
@@ -944,6 +951,7 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
                 .get::<_, Option<i64>>(22)?
                 .and_then(|tokens| u32::try_from(tokens).ok()),
             reasoning_compat_actions: row.get(23)?,
+            error_class: row.get(24)?,
         })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1030,6 +1038,7 @@ mod tests {
         prefix_hash: None,
     reasoning_tokens: None,
     reasoning_compat_actions: None,
+    error_class: None,
     }
 }
 
@@ -1446,6 +1455,85 @@ fn reasoning_fields_round_trip() {
 }
 
 #[test]
+fn error_class_column_migrates_and_round_trips() {
+    // A legacy table with every column except error_class.
+    let temp_file = NamedTempFile::new().unwrap();
+    let conn = Connection::open(temp_file.path()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE requests (
+            id INTEGER PRIMARY KEY,
+            trace_id TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            method TEXT NOT NULL,
+            path TEXT NOT NULL,
+            model TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            status_code INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            cost REAL NOT NULL,
+            request_body TEXT,
+            response_body TEXT,
+            requested_model TEXT,
+            responded_model TEXT,
+            compression_metadata TEXT,
+            compression_level TEXT,
+            memories_injected INTEGER NOT NULL DEFAULT 0,
+            memories_stored INTEGER NOT NULL DEFAULT 0,
+            injection_tokens INTEGER NOT NULL DEFAULT 0,
+            detected_project TEXT,
+            cache_read_tokens INTEGER,
+            cache_creation_tokens INTEGER,
+            cache_savings_cents INTEGER,
+            prefix_hash TEXT,
+            reasoning_tokens INTEGER,
+            reasoning_compat_actions TEXT
+        );
+        INSERT INTO requests (
+            trace_id, timestamp, method, path, model, provider, status_code,
+            duration_ms, cost
+        ) VALUES (
+            'legacy-row', 1700000000, 'POST', '/v1/chat/completions', 'gpt-4',
+            'openai', 200, 10, 0.0
+        );",
+    )
+    .unwrap();
+    drop(conn);
+
+    // Body logging off: error_class must still be stored.
+    let logger = RequestLogger::new(LoggingConfig {
+        database_path: temp_file.path().to_string_lossy().into_owned(),
+        request_body_logging: false,
+        response_body_logging: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let legacy = logger
+        .query(LogFilter {
+            trace_id: Some("legacy-row".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(legacy.len(), 1);
+    assert!(legacy[0].error_class.is_none());
+
+    let mut entry = sample_entry("timed-out", None);
+    entry.path = "/v1/chat/completions#attempt".to_owned();
+    entry.status_code = 504;
+    entry.response_body = Some("Request timeout after 120s".to_owned());
+    entry.error_class = Some("ttfb_timeout".to_owned());
+    logger.log(entry).unwrap();
+    let rows = logger
+        .query(LogFilter {
+            trace_id: Some("timed-out".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].error_class.as_deref(), Some("ttfb_timeout"));
+    assert!(rows[0].response_body.is_none(), "body logging is off");
+}
+
+#[test]
 fn encode_prefix_hash_is_sixteen_lowercase_hex_digits() {
     assert_eq!(encode_prefix_hash(0), "0000000000000000");
     assert_eq!(encode_prefix_hash(u64::MAX), "ffffffffffffffff");
@@ -1665,6 +1753,7 @@ fn compute_cache_savings_cents_prices_cached_turns() {
             prefix_hash: None,
         reasoning_tokens: None,
         reasoning_compat_actions: None,
+        error_class: None,
         };
 
         logger.log(entry.clone()).unwrap();
@@ -1790,6 +1879,7 @@ fn compute_cache_savings_cents_prices_cached_turns() {
             prefix_hash: None,
         reasoning_tokens: None,
         reasoning_compat_actions: None,
+        error_class: None,
         };
 
         logger.log(old_entry).unwrap();
@@ -1820,6 +1910,7 @@ fn compute_cache_savings_cents_prices_cached_turns() {
             prefix_hash: None,
         reasoning_tokens: None,
         reasoning_compat_actions: None,
+        error_class: None,
         };
 
         logger.log(recent_entry).unwrap();
@@ -1900,6 +1991,7 @@ mod property_tests {
                         prefix_hash: None,
                     reasoning_tokens: None,
                     reasoning_compat_actions: None,
+                    error_class: None,
                     }
                 },
             )
@@ -1993,6 +2085,7 @@ mod property_tests {
                 prefix_hash: None,
             reasoning_tokens: None,
             reasoning_compat_actions: None,
+            error_class: None,
             };
 
             logger.log(entry.clone()).unwrap();
@@ -2066,6 +2159,7 @@ mod property_tests {
                 prefix_hash: None,
             reasoning_tokens: None,
             reasoning_compat_actions: None,
+            error_class: None,
             };
 
             logger.log(entry).unwrap();
@@ -2136,6 +2230,7 @@ mod property_tests {
                 prefix_hash: None,
             reasoning_tokens: None,
             reasoning_compat_actions: None,
+            error_class: None,
             };
 
             logger.log(entry).unwrap();
@@ -2204,6 +2299,7 @@ mod property_tests {
                 prefix_hash: None,
             reasoning_tokens: None,
             reasoning_compat_actions: None,
+            error_class: None,
             };
 
             logger.log(entry).unwrap();
@@ -2283,6 +2379,7 @@ mod property_tests {
                 prefix_hash: None,
             reasoning_tokens: None,
             reasoning_compat_actions: None,
+            error_class: None,
             };
 
             logger.log(entry).unwrap();

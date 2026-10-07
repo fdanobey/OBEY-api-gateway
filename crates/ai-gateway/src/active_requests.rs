@@ -7,6 +7,7 @@
 //! smart-routing cascade). Only active requests are retained; entries are removed when
 //! the request completes.
 
+use crate::error::ProviderAttempt;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -78,6 +79,15 @@ pub struct ActiveRequestInfo {
     /// The per-request Smart Routing decision line was already logged.
     #[serde(skip)]
     pub smart_routing_logged: bool,
+    /// Ledger of failed upstream tries and skips, drained into `#attempt` log rows.
+    #[serde(skip)]
+    pub failed_attempts: Vec<ProviderAttempt>,
+    /// A terminal outcome row was written for this request.
+    #[serde(skip)]
+    pub outcome_logged: bool,
+    /// Breaker pre-filter skips were already recorded for this request.
+    #[serde(skip)]
+    pub breaker_skips_recorded: bool,
 }
 
 impl ActiveRequestInfo {
@@ -141,6 +151,52 @@ impl ActiveRequestHandle {
             return None;
         }
         Some(info.trace_id.clone())
+    }
+
+    /// Milliseconds since the request started (0 if the lock is poisoned).
+    pub fn elapsed_ms(&self) -> i64 {
+        self.0.lock().map(|info| info.elapsed_ms()).unwrap_or(0)
+    }
+
+    /// Append a failed upstream try (or skip) to the request's attempt ledger.
+    pub fn record_failed_attempt(&self, attempt: ProviderAttempt) {
+        if let Ok(mut info) = self.0.lock() {
+            info.failed_attempts.push(attempt);
+        }
+    }
+
+    /// Number of attempts currently held in the ledger.
+    pub fn failed_attempt_count(&self) -> usize {
+        self.0.lock().map(|info| info.failed_attempts.len()).unwrap_or(0)
+    }
+
+    /// Drain the ledger, leaving it empty so a second drain writes nothing.
+    pub fn take_failed_attempts(&self) -> Vec<ProviderAttempt> {
+        self.0
+            .lock()
+            .map(|mut info| std::mem::take(&mut info.failed_attempts))
+            .unwrap_or_default()
+    }
+
+    /// Mark that a terminal outcome row was written for this request.
+    pub fn mark_outcome_logged(&self) {
+        if let Ok(mut info) = self.0.lock() {
+            info.outcome_logged = true;
+        }
+    }
+
+    /// Whether a terminal outcome row was already written.
+    pub fn outcome_logged(&self) -> bool {
+        self.0.lock().map(|info| info.outcome_logged).unwrap_or(false)
+    }
+
+    /// Returns `true` only the first time it is called for this request, so
+    /// breaker pre-filter skips are recorded once even across re-routes.
+    pub fn claim_breaker_skip_recording(&self) -> bool {
+        match self.0.lock() {
+            Ok(mut info) => !std::mem::replace(&mut info.breaker_skips_recorded, true),
+            Err(_) => false,
+        }
     }
 }
 
@@ -237,7 +293,50 @@ mod tests {
                 .as_millis() as i64,
             kind: RequestKind::Chat,
             smart_routing_logged: false,
+            failed_attempts: Vec::new(),
+            outcome_logged: false,
+            breaker_skips_recorded: false,
         }
+    }
+
+    #[test]
+    fn failed_attempt_ledger_records_and_drains() {
+        let reg = ActiveRequestRegistry::new();
+        let handle = reg.register(sample_info("trace-ledger"));
+        assert_eq!(handle.failed_attempt_count(), 0);
+
+        handle.record_failed_attempt(
+            ProviderAttempt::new("p1".into(), "m1".into(), "timeout".into(), Some(504))
+                .with_duration(Duration::from_millis(1500))
+                .with_error_class("ttfb_timeout"),
+        );
+        handle.clone().record_failed_attempt(ProviderAttempt::new(
+            "p2".into(),
+            "m2".into(),
+            "boom".into(),
+            Some(500),
+        ));
+        assert_eq!(handle.failed_attempt_count(), 2);
+
+        let drained = handle.take_failed_attempts();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].error_class.as_deref(), Some("ttfb_timeout"));
+        assert_eq!(drained[0].duration_ms, Some(1500));
+        assert_eq!(drained[1].provider, "p2");
+        assert_eq!(handle.failed_attempt_count(), 0);
+        assert!(handle.take_failed_attempts().is_empty());
+
+        assert!(!handle.outcome_logged());
+        handle.mark_outcome_logged();
+        assert!(handle.outcome_logged());
+
+        assert!(handle.claim_breaker_skip_recording());
+        assert!(!handle.claim_breaker_skip_recording());
+
+        // The ledger never reaches the dashboard JSON.
+        let json = serde_json::to_value(&reg.snapshot()[0]).unwrap();
+        assert!(json.get("failed_attempts").is_none());
+        assert!(json.get("outcome_logged").is_none());
     }
 
     #[test]

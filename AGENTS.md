@@ -46,6 +46,12 @@ Every `GatewayServer::new` opens SQLite databases. Tests use `common::isolate_da
 - **Tests use `tower::ServiceExt::oneshot()`**: Integration tests don't bind ports; they call router directly
 - **Property tests with proptest**: Many tests use `proptest!` macro for randomized input validation
 - **Admin panel parity (standing user requirement)**: every YAML-configurable feature must also expose matching controls in the embedded admin panel (`crates/ai-gateway/src/admin/static/index.html`). Config-only features without UI are considered incomplete; specs must include admin-UI tasks.
+- **Upstream timeouts and failover** (see [ADR 0001](docs/adr/0001-buffered-dispatch-streams-upstream.md); do not regress):
+  - Buffered dispatch (`dispatch_attempts_under_permit`) streams upstream (`stream: true` + `stream_options.include_usage`) and reassembles the SSE. Never force `stream: false` by default: provider edges cut long non-streaming requests (Electron Hub returned 504 at ~100 s). Only `buffered_upstream_streaming: false`, `n > 1`, `logprobs` and audio use `stream: false`. While Codex Search is enabled, every streaming client request takes this buffered path.
+  - TTFB = headers plus the first body byte; idle gaps use `streaming.chunk_timeout_seconds` (`ChunkTimeout`); `total_timeout` caps the whole try.
+  - Timeout-class errors (TTFB/total/chunk timeout, upstream 504/524) fail over without a same-provider retry (`is_timeout_class`). 500/502/network errors keep `max_retries_per_provider`. Pass-through TTFB/send/5xx fallbacks exclude the failed `provider:model`, as the 429 path does.
+  - Every failed try and every abandoned request is logged through the `ActiveRequestHandle` attempt ledger: `#attempt` rows with `duration_ms`/`error_class`, and 499 `client_disconnect` / 504 `gateway_deadline` outcome rows written by `RequestCompleteGuard`. Do not reintroduce response-extras channels for attempts.
+  - Guard tests: `buffered_sse_reader_allows_generation_longer_than_ttfb_when_bytes_flow`, `buffered_dispatch_requests_upstream_stream_and_reassembles_sse`, `timeout_class_errors_fail_over_without_same_provider_retry` (router.rs) and `abandoned_stream_writes_client_disconnect_outcome_row` (tests/request_outcome_logging.rs).
 
 ## Agent skills
 
