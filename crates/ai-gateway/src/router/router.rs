@@ -63,6 +63,8 @@ impl ProviderClient for SearchResubmitter<'_> {
         &self,
         request: OpenAIRequest,
     ) -> Result<ProviderResponse, GatewayError> {
+        // Each search round is a separate upstream request to the same
+        // provider, so it is charged (debited) one rate-limit token (ADR 0002).
         let response = self
             .router
             .attempt_with_retry(
@@ -71,6 +73,7 @@ impl ProviderClient for SearchResubmitter<'_> {
                 self.provider_model,
                 self.active.clone(),
                 self.base_attempt,
+                FirstSendToken::Debit,
             )
             .await?;
         Ok(ProviderResponse {
@@ -104,6 +107,83 @@ impl ProviderClient for SearchResubmitter<'_> {
 
     fn provider_name(&self) -> &str {
         self.provider_name
+    }
+}
+
+/// Who pays the provider rate-limit token for the FIRST upstream send of a
+/// dispatch (`attempt_with_retry`). Every later send inside the same dispatch
+/// (same-provider retry, `stream:false` retry, image/reasoning repair retry,
+/// Codex context retry, Codex Search round) is debited where it is sent.
+/// Invariant (ADR 0002): exactly one token per real upstream HTTP request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstSendToken {
+    /// The failover admission gate already took the token.
+    Prepaid,
+    /// A continuation of an admitted request (Codex Search round, reasoning
+    /// nudge): debit the token without blocking or refusing.
+    Debit,
+}
+
+/// Charges one rate-limit token per `chat_completion` call on a client that
+/// performs its own HTTP (Codex, Bedrock SDK), so their repair retries and
+/// Codex Search rounds are counted like the HTTP dispatch loop's sends.
+struct MeteredClient<'a, C: ProviderClient + ?Sized> {
+    inner: &'a C,
+    limiter: Arc<RateLimiter>,
+    /// Set while the next send is already paid for by the caller.
+    prepaid: std::sync::atomic::AtomicBool,
+}
+
+impl<'a, C: ProviderClient + ?Sized> MeteredClient<'a, C> {
+    fn new(inner: &'a C, limiter: Arc<RateLimiter>, first_send: FirstSendToken) -> Self {
+        Self {
+            inner,
+            limiter,
+            prepaid: std::sync::atomic::AtomicBool::new(first_send == FirstSendToken::Prepaid),
+        }
+    }
+
+    async fn charge(&self) {
+        if !self
+            .prepaid
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.limiter.debit().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<C: ProviderClient + ?Sized> ProviderClient for MeteredClient<'_, C> {
+    async fn chat_completion(
+        &self,
+        request: OpenAIRequest,
+    ) -> Result<ProviderResponse, GatewayError> {
+        self.charge().await;
+        self.inner.chat_completion(request).await
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        request: OpenAIRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::providers::SSEEvent, GatewayError>> + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        self.charge().await;
+        self.inner.chat_completion_stream(request).await
+    }
+
+    async fn list_models(&self) -> Result<Vec<crate::providers::Model>, GatewayError> {
+        self.inner.list_models().await
+    }
+
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
     }
 }
 
@@ -3979,6 +4059,9 @@ impl Router {
     /// Skips retry on 4xx errors except 429 (rate limit) and 408 (timeout)
     ///
     /// Requirements: 10.1-10.5
+    ///
+    /// `first_send` says who pays the rate-limit token for the first upstream
+    /// send; every further send is charged inside (ADR 0002).
     pub async fn attempt_with_retry(
         &self,
         provider_name: &str,
@@ -3986,6 +4069,7 @@ impl Router {
         provider_model: &ProviderModel,
         active: Option<ActiveRequestHandle>,
         base_attempt: usize,
+        first_send: FirstSendToken,
     ) -> Result<OpenAIResponse, GatewayError> {
         self.attempt_with_retry_with_permit(
             provider_name,
@@ -3994,6 +4078,7 @@ impl Router {
             active,
             base_attempt,
             None,
+            first_send,
         )
         .await
     }
@@ -4006,6 +4091,7 @@ impl Router {
         active: Option<ActiveRequestHandle>,
         base_attempt: usize,
         concurrency_permit: Option<ProviderConcurrencyPermit>,
+        first_send: FirstSendToken,
     ) -> Result<OpenAIResponse, GatewayError> {
         let provider_cfg = {
             let config = self.config.read().await;
@@ -4035,6 +4121,7 @@ impl Router {
             active,
             base_attempt,
             provider_cfg,
+            first_send,
         )
         .await
     }
@@ -4222,7 +4309,14 @@ impl Router {
         active: Option<ActiveRequestHandle>,
         base_attempt: usize,
         provider_cfg: Provider,
+        first_send: FirstSendToken,
     ) -> Result<OpenAIResponse, GatewayError> {
+        // Fetched before the config guard below: `get_rate_limiter` may read
+        // the config itself. Sends after the first one are debited here; the
+        // provider permit is held, so nothing in this function waits for a
+        // token (ADR 0002).
+        let rate_limiter = self.get_rate_limiter(provider_name).await;
+        let mut send_prepaid = first_send == FirstSendToken::Prepaid;
         let config = self.config.read().await;
         let max_retries = config.retry.max_retries_per_provider;
         let backoff_sequence = config.retry.backoff_sequence_seconds.clone();
@@ -4299,6 +4393,9 @@ impl Router {
                 search_enabled,
             );
 
+            // Every Codex call (first send, repair retries, search rounds)
+            // is one upstream request and is charged one token.
+            let codex_client = MeteredClient::new(&codex_client, rate_limiter.clone(), first_send);
             let result = self
                 .dispatch_buffered_with_context_retry(&codex_client, codex_request.clone())
                 .await?;
@@ -4361,6 +4458,8 @@ impl Router {
                 provider_cfg.effective_custom_headers(),
             )
             .await?;
+            let bedrock_client =
+                MeteredClient::new(&bedrock_client, rate_limiter.clone(), first_send);
             return Ok(self
                 .dispatch_buffered_with_context_retry(&bedrock_client, bedrock_request)
                 .await?
@@ -4806,6 +4905,14 @@ impl Router {
             // once. Compressed SSE is vulnerable to truncated decoder frames.
             req_builder = req_builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
 
+            // ADR 0002: one token per real upstream request. The first send
+            // may be prepaid by the admission gate; every other send (retry,
+            // stream:false / repair retry, continuation) is debited here.
+            if send_prepaid {
+                send_prepaid = false;
+            } else {
+                rate_limiter.debit().await;
+            }
             let request_start = std::time::Instant::now();
             let result =
                 tokio::time::timeout(ttfb_timeout, req_builder.json(&outgoing).send()).await;
@@ -6206,9 +6313,21 @@ impl Router {
         // 4.7). Cloned before the guard is dropped, mirroring the other
         // snapshots.
         let reasoning_compat_cfg = config.reasoning_compat.clone();
+        // Bounded rate-limit wait per provider (ADR 0002), snapshotted so the
+        // wait below never runs under the config guard.
+        let rate_limit_max_waits: std::collections::HashMap<String, Duration> = config
+            .providers
+            .iter()
+            .map(|provider| {
+                (
+                    provider.name.clone(),
+                    provider.effective_rate_limit_max_wait(),
+                )
+            })
+            .collect();
         drop(config);
 
-        for provider_model in providers {
+        for (candidate_index, provider_model) in providers.into_iter().enumerate() {
             let start = std::time::Instant::now();
             let request_id = format!("route-{}", uuid::Uuid::new_v4());
 
@@ -6299,25 +6418,54 @@ impl Router {
                 continue;
             }
 
-            // Consume rate limit token before attempting request
+            // Admission gate (ADR 0002): take the token for this candidate's
+            // first upstream send. The primary candidate may wait briefly for
+            // its next token (at most one refill, capped by
+            // `rate_limit_max_wait_ms`) instead of failing over to a slower
+            // chain. Nothing is held here: the config guard is dropped above,
+            // and the provider permit is acquired later in `attempt_with_retry`.
             let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
-            if !rate_limiter.consume().await {
-                warn!(provider = %provider_model.provider, "Rate limit exhausted, skipping provider");
-                self.metrics
-                    .record_provider_rate_limit_exhausted(&provider_model.provider);
-                Self::push_attempt(
-                    &mut attempts,
-                    active.as_ref(),
-                    ProviderAttempt::new(
-                        provider_model.provider.clone(),
-                        provider_model.model.clone(),
-                        "Rate limit exhausted".to_string(),
-                        Some(429),
-                    )
-                    .with_duration(start.elapsed())
-                    .with_error_class("rate_limit_skip"),
-                );
-                continue;
+            let max_wait = if candidate_index == 0 {
+                rate_limit_max_waits
+                    .get(&provider_model.provider)
+                    .copied()
+                    .unwrap_or(Duration::ZERO)
+            } else {
+                Duration::ZERO
+            };
+            match rate_limiter.acquire_within(max_wait).await {
+                Ok(waited) if !waited.is_zero() => {
+                    info!(
+                        provider = %provider_model.provider,
+                        model = %provider_model.model,
+                        waited_ms = waited.as_millis() as u64,
+                        "Waited for the local rate-limit token instead of failing over"
+                    );
+                }
+                Ok(_) => {}
+                Err(shortfall) => {
+                    warn!(
+                        provider = %provider_model.provider,
+                        model = %provider_model.model,
+                        reason = %shortfall,
+                        "Local rate limiter refused the request, skipping provider"
+                    );
+                    self.metrics
+                        .record_provider_rate_limit_exhausted(&provider_model.provider);
+                    Self::push_attempt(
+                        &mut attempts,
+                        active.as_ref(),
+                        ProviderAttempt::new(
+                            provider_model.provider.clone(),
+                            provider_model.model.clone(),
+                            shortfall.to_string(),
+                            Some(429),
+                        )
+                        .with_duration(start.elapsed())
+                        .with_error_class("rate_limit_skip"),
+                    );
+                    continue;
+                }
             }
 
             let (mut prepared_request, compression) = self
@@ -6355,6 +6503,7 @@ impl Router {
                     &provider_model,
                     active.clone(),
                     attempt_counter,
+                    FirstSendToken::Prepaid,
                 )
                 .await
             {
@@ -7314,6 +7463,8 @@ visible content. Do not restate your plan and do not end your turn without doing
                 provider_model,
                 active,
                 attempt_counter,
+                // The nudge is a second upstream request: debit its token.
+                FirstSendToken::Debit,
             )
             .await
         {
@@ -11956,6 +12107,7 @@ mod tests {
             ttfb_timeout_seconds: Some(5),
             total_timeout_seconds: Some(5),
             buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
             custom_headers: Default::default(),
@@ -13059,6 +13211,384 @@ mod tests {
         assert!(ledger.iter().all(|attempt| attempt.status_code == Some(500)));
         a.verify().await;
         b.verify().await;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // ADR 0002: provider rate-limit accounting
+    // ────────────────────────────────────────────────────────────────────
+
+    /// "primary" (rate limited) then "backup" (unlimited); one same-provider
+    /// retry with no backoff.
+    fn rate_limited_config(
+        primary: &MockServer,
+        backup: &MockServer,
+        rpm: u32,
+        max_wait_ms: Option<u64>,
+    ) -> Config {
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 1;
+        config.retry.backoff_sequence_seconds = vec![0];
+        let mut provider = test_provider("primary", primary.uri());
+        provider.rate_limit_per_minute = rpm;
+        provider.rate_limit_max_wait_ms = max_wait_ms;
+        config.providers = vec![provider, test_provider("backup", backup.uri())];
+        config.model_groups = vec![test_group(vec![
+            test_model("primary", 1),
+            test_model("backup", 2),
+        ])];
+        config
+    }
+
+    /// Router with Codex Search enabled (as live): an OAuth manager holding a
+    /// valid test token, `max_iterations: 1`, search endpoint on `primary`.
+    async fn codex_search_router(
+        config: Config,
+        primary: &MockServer,
+    ) -> (Router, std::path::PathBuf) {
+        let mut config = config;
+        config.codex_search = Some(crate::codex::search::config::CodexSearchConfig {
+            enabled: Some(true),
+            base_url: Some(format!("{}/search", primary.uri())),
+            max_iterations: Some(1),
+            ..Default::default()
+        });
+        let token_path =
+            std::env::temp_dir().join(format!("oauth-rate-limit-test-{}", uuid::Uuid::new_v4()));
+        let manager = Arc::new(crate::oauth::OAuthManager::new(
+            crate::oauth::OAuthTokenStore::new(token_path.clone()),
+            reqwest::Client::new(),
+        ));
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        manager
+            .store_tokens(crate::oauth::store::StoredTokens {
+                access_token: "test-access-token".to_string(),
+                refresh_token: "test-refresh-token".to_string(),
+                expires_at,
+                scopes: "openid".to_string(),
+            })
+            .await
+            .unwrap();
+        let mut router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        router.set_oauth_manager(manager);
+        assert!(router.codex_search_ready().await.is_some());
+        (router, token_path)
+    }
+
+    async fn chat_requests(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/v1/chat/completions")
+            .count()
+    }
+
+    async fn tokens_left(router: &Router, provider: &str) -> f64 {
+        router.get_rate_limiter(provider).await.get_tokens().await
+    }
+
+    fn search_call_response() -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-search",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "upstream-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_search_1",
+                        "type": "function",
+                        // Empty query: rejected locally, so no search HTTP call.
+                        "function": {"name": "codex_search", "arguments": "{\"q\":\"\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+    }
+
+    fn has_rate_limit_skip(ledger: &[ProviderAttempt]) -> bool {
+        ledger
+            .iter()
+            .any(|a| a.error_class.as_deref() == Some("rate_limit_skip"))
+    }
+
+    /// ADR 0002 guard: tokens consumed == upstream HTTP requests received,
+    /// for client `stream:false` and `stream:true` with Codex Search enabled,
+    /// including a same-provider retry and a Codex Search round.
+    #[tokio::test]
+    async fn single_request_consumes_exactly_one_provider_rate_token() {
+        use wiremock::matchers::{method, path};
+
+        // (label, client stream, primary responses in order, expected requests)
+        enum Script {
+            Plain,
+            RetryThenOk,
+            SearchRound,
+        }
+        for (label, stream, script, expected) in [
+            ("non-stream", false, Script::Plain, 1usize),
+            ("stream", true, Script::Plain, 1),
+            ("non-stream retry", false, Script::RetryThenOk, 2),
+            ("stream retry", true, Script::RetryThenOk, 2),
+            ("non-stream search round", false, Script::SearchRound, 2),
+            ("stream search round", true, Script::SearchRound, 2),
+        ] {
+            let primary = MockServer::start().await;
+            let backup = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/search"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&primary)
+                .await;
+            match script {
+                Script::Plain => {}
+                Script::RetryThenOk => {
+                    Mock::given(method("POST"))
+                        .and(path("/v1/chat/completions"))
+                        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+                        .up_to_n_times(1)
+                        .mount(&primary)
+                        .await;
+                }
+                Script::SearchRound => {
+                    Mock::given(method("POST"))
+                        .and(path("/v1/chat/completions"))
+                        .respond_with(
+                            ResponseTemplate::new(200).set_body_json(search_call_response()),
+                        )
+                        .up_to_n_times(1)
+                        .mount(&primary)
+                        .await;
+                }
+            }
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+                .mount(&primary)
+                .await;
+
+            // 6/min refills 0.1 token/s: negligible over a sub-second case.
+            let (router, token_path) =
+                codex_search_router(rate_limited_config(&primary, &backup, 6, Some(0)), &primary)
+                    .await;
+            let before = tokens_left(&router, "primary").await;
+            let handle = ledger_handle();
+            let request = compression_request(stream);
+            let response = if stream {
+                match router
+                    .route_request_streaming(&request, Some(handle.clone()))
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: {e}"))
+                {
+                    StreamingResponse::Buffered(response) => response,
+                    _ => panic!("{label}: Codex Search must force the buffered path"),
+                }
+            } else {
+                router
+                    .route_request(&request, Some(handle.clone()))
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: {e}"))
+            };
+            assert_eq!(
+                response.extra.get("gateway_provider"),
+                Some(&serde_json::json!("primary")),
+                "{label}"
+            );
+            let sent = chat_requests(&primary).await;
+            let consumed = before - tokens_left(&router, "primary").await;
+            assert_eq!(sent, expected, "{label}: upstream requests");
+            assert_eq!(
+                consumed.round() as usize,
+                sent,
+                "{label}: tokens consumed ({consumed:.3}) must equal upstream requests ({sent})"
+            );
+            assert_eq!(chat_requests(&backup).await, 0, "{label}: no failover");
+            assert!(
+                !has_rate_limit_skip(&handle.take_failed_attempts()),
+                "{label}"
+            );
+            let _ = std::fs::remove_file(&token_path);
+        }
+    }
+
+    /// ADR 0002 guard: sequential requests at the configured limit are all
+    /// admitted by the primary (no local skip, no failover).
+    #[tokio::test]
+    async fn sequential_requests_under_limit_never_rate_limit_skip() {
+        use wiremock::matchers::{method, path};
+
+        let primary = MockServer::start().await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&primary)
+            .await;
+        // Electron Hub's deliberate 8/min; no waiting, so any over-charge
+        // shows up as a skip.
+        let (router, token_path) =
+            codex_search_router(rate_limited_config(&primary, &backup, 8, Some(0)), &primary).await;
+
+        for i in 0..8 {
+            let handle = ledger_handle();
+            let request = compression_request(i % 2 == 1);
+            let response = if request.stream {
+                match router
+                    .route_request_streaming(&request, Some(handle.clone()))
+                    .await
+                    .unwrap()
+                {
+                    StreamingResponse::Buffered(response) => response,
+                    _ => panic!("Codex Search must force the buffered path"),
+                }
+            } else {
+                router
+                    .route_request(&request, Some(handle.clone()))
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(
+                response.extra.get("gateway_provider"),
+                Some(&serde_json::json!("primary")),
+                "request {i}"
+            );
+            let ledger = handle.take_failed_attempts();
+            assert!(!has_rate_limit_skip(&ledger), "request {i}: {ledger:?}");
+        }
+        assert_eq!(chat_requests(&primary).await, 8);
+        assert_eq!(chat_requests(&backup).await, 0);
+        let _ = std::fs::remove_file(&token_path);
+    }
+
+    /// ADR 0002 guard: an empty primary bucket whose next token is within
+    /// `rate_limit_max_wait_ms` waits for it instead of failing over.
+    #[tokio::test]
+    async fn rate_limit_skip_waits_briefly_for_primary_token() {
+        use wiremock::matchers::{method, path};
+
+        let primary = MockServer::start().await;
+        let backup = MockServer::start().await;
+        for server in [&primary, &backup] {
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+                .mount(server)
+                .await;
+        }
+        // 120/min: one token every 0.5 s; wait budget 2 s.
+        let router = Router::new(
+            Arc::new(RwLock::new(rate_limited_config(
+                &primary,
+                &backup,
+                120,
+                Some(2_000),
+            ))),
+            test_metrics(),
+        );
+        let limiter = router.get_rate_limiter("primary").await;
+        while limiter.consume().await {}
+
+        let handle = ledger_handle();
+        let started = std::time::Instant::now();
+        let response = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .unwrap();
+        let waited = started.elapsed();
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("primary"))
+        );
+        assert!(waited >= Duration::from_millis(400), "waited {waited:?}");
+        assert!(waited < Duration::from_millis(1_900), "waited {waited:?}");
+        let ledger = handle.take_failed_attempts();
+        assert!(!has_rate_limit_skip(&ledger), "{ledger:?}");
+        assert_eq!(chat_requests(&primary).await, 1);
+        assert_eq!(chat_requests(&backup).await, 0);
+
+        // A token further away than the wait budget still fails over at once.
+        let router = Router::new(
+            Arc::new(RwLock::new(rate_limited_config(
+                &primary,
+                &backup,
+                120,
+                Some(100),
+            ))),
+            test_metrics(),
+        );
+        let limiter = router.get_rate_limiter("primary").await;
+        while limiter.consume().await {}
+        let handle = ledger_handle();
+        let response = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("backup"))
+        );
+        assert!(has_rate_limit_skip(&handle.take_failed_attempts()));
+        assert_eq!(chat_requests(&primary).await, 1, "no new primary request");
+    }
+
+    /// ADR 0002: the `rate_limit_skip` attempt states the local bucket state
+    /// and that nothing was sent, so it can't be read as an upstream 429.
+    #[tokio::test]
+    async fn rate_limit_skip_message_states_local_bucket_state() {
+        use wiremock::matchers::{method, path};
+
+        let primary = MockServer::start().await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&backup)
+            .await;
+        let router = Router::new(
+            Arc::new(RwLock::new(rate_limited_config(
+                &primary,
+                &backup,
+                2,
+                Some(0),
+            ))),
+            test_metrics(),
+        );
+        let limiter = router.get_rate_limiter("primary").await;
+        while limiter.consume().await {}
+
+        let handle = ledger_handle();
+        router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .unwrap();
+        let ledger = handle.take_failed_attempts();
+        let skip = ledger
+            .iter()
+            .find(|a| a.error_class.as_deref() == Some("rate_limit_skip"))
+            .expect("rate_limit_skip attempt recorded");
+        assert_eq!(skip.status_code, Some(429));
+        assert!(
+            skip.error.starts_with("local rate limit 2/min exhausted"),
+            "{}",
+            skip.error
+        );
+        assert!(skip.error.contains("next token in"), "{}", skip.error);
+        assert!(
+            skip.error.contains("request not sent to provider"),
+            "{}",
+            skip.error
+        );
+        assert_eq!(chat_requests(&primary).await, 0);
     }
 
     #[test]
@@ -14516,6 +15046,7 @@ mod tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
             custom_headers: Default::default(),
@@ -16323,6 +16854,7 @@ mod property_tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
             max_connections: 10,
             // Tight bucket so check_available() trivially returns false
             // after a single consume.
@@ -16504,6 +17036,7 @@ mod property_tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
             custom_headers: Default::default(),

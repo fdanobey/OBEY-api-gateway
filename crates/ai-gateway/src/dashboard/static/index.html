@@ -362,7 +362,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     <h2 class="section-title">Recent Errors</h2>
     <div class="table-wrap">
       <table aria-label="Recent errors">
-        <thead><tr><th>Timestamp</th><th>Provider</th><th>Model</th><th>Status</th><th>Error</th></tr></thead>
+        <thead><tr><th>Timestamp</th><th>Kind</th><th>Provider</th><th>Model</th><th>Status</th><th>Error</th><th>Trace</th></tr></thead>
         <tbody id="errors-tbody"></tbody>
       </table>
     </div>
@@ -808,12 +808,50 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 
     var html='';
     errors.forEach(function(e){
-      var errorText=e.error||e.response_body||'';
-      html+='<tr><td>'+fmtTime(e.timestamp)+'</td><td>'+esc(e.provider||'')+'</td>'
+      // Attempt rows are content-free (no body), so fall back to a label for
+      // the stable error_class. "Attempt" rows belong to requests that may
+      // still have succeeded via retry or failover.
+      var isAttempt=/#attempt$/.test(String(e.path||''));
+      var kind=isAttempt?'Attempt (failover/retry)':'Final';
+      var label=errorClassLabel(e.error_class);
+      var detail=e.error||e.response_body||'';
+      var errorText=detail?(label&&detail.indexOf(label)<0?label+': '+detail:detail):(label||'');
+      var trace=String(e.trace_id||'');
+      html+='<tr><td>'+fmtTime(e.timestamp)+'</td><td>'+esc(kind)+'</td><td>'+esc(e.provider||'')+'</td>'
         +'<td>'+esc(e.model||'')+'</td><td>'+esc(String(e.status_code||''))+'</td>'
-        +'<td class="failure-reason" title="'+esc(errorText)+'">'+esc(errorText)+'</td></tr>';
+        +'<td class="failure-reason" title="'+esc(errorText)+'">'+esc(errorText)+'</td>'
+        +'<td title="'+esc(trace)+'"><code>'+esc(trace.slice(0,8))+'</code></td></tr>';
     });
     tbody.innerHTML=html;
+  }
+
+  // Human-readable text for the content-free error_class vocabulary
+  // (crate::error::error_class_for).
+  function errorClassLabel(cls){
+    if(!cls)return '';
+    var m=/^upstream_http_(\d+)$/.exec(cls);
+    if(m)return 'Provider returned HTTP '+m[1];
+    var labels={
+      rate_limit_skip:'Local rate limiter: not sent to provider',
+      cooldown_skip:'Upstream rate-limit cooldown: not sent to provider',
+      circuit_open_skip:'Circuit breaker open: not sent to provider',
+      budget_skip:'Provider budget exhausted: not sent to provider',
+      slot_saturated:'Provider connection limit reached',
+      ttfb_timeout:'No first byte before TTFB timeout',
+      total_timeout:'Total timeout exceeded',
+      chunk_timeout:'Stream stalled (chunk timeout)',
+      network_error:'Network error reaching provider',
+      body_read_error:'Failed to read provider response body',
+      stream_truncated:'Provider stream ended early',
+      error_in_200:'Provider returned an error inside HTTP 200',
+      empty_response:'Provider returned an empty response',
+      reasoning_only:'Provider returned reasoning only',
+      truncated_response:'Provider response truncated',
+      client_disconnect:'Client disconnected before completion',
+      gateway_deadline:'Gateway request deadline reached',
+      other:'Request failed (see attempt rows with the same trace)'
+    };
+    return labels[cls]||cls;
   }
 
   function normalizeCompressionEvent(data){

@@ -437,6 +437,12 @@ pub struct Provider {
     pub max_connections: u32,
     #[serde(default)]
     pub rate_limit_per_minute: u32,
+    /// Longest time (ms) the primary candidate waits for its next local
+    /// rate-limit token before the request fails over. The wait never exceeds
+    /// the time to refill one token. `0` disables waiting. Range 0-60000;
+    /// default 10000 (covers one token at 8/min). See ADR 0002.
+    #[serde(default)]
+    pub rate_limit_max_wait_ms: Option<u64>,
     #[serde(default)]
     pub custom_headers: HashMap<String, String>,
     /// Optional User-Agent string sent with every request to this provider.
@@ -532,6 +538,14 @@ impl Provider {
     pub fn effective_buffered_upstream_streaming(&self) -> bool {
         self.buffered_upstream_streaming
             .unwrap_or(self.provider_type != "bedrock")
+    }
+
+    /// Bounded wait for the primary candidate's next rate-limit token.
+    pub fn effective_rate_limit_max_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.rate_limit_max_wait_ms
+                .unwrap_or(DEFAULT_RATE_LIMIT_MAX_WAIT_MS),
+        )
     }
 
     /// Resolve the effective total (round-trip) timeout for a given model.
@@ -668,6 +682,12 @@ impl Provider {
         headers
     }
 }
+
+/// Default `rate_limit_max_wait_ms`: one token at 8/min refills in 7.5 s.
+pub const DEFAULT_RATE_LIMIT_MAX_WAIT_MS: u64 = 10_000;
+
+/// Upper bound accepted for `rate_limit_max_wait_ms`.
+pub const MAX_RATE_LIMIT_MAX_WAIT_MS: u64 = 60_000;
 
 fn default_max_connections() -> u32 {
     100
@@ -1707,6 +1727,7 @@ mod runtime_resolution_tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
@@ -1750,6 +1771,7 @@ mod runtime_resolution_tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
@@ -1797,6 +1819,7 @@ mod runtime_resolution_tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: headers,
@@ -1844,6 +1867,7 @@ fn test_provider_effective_custom_headers_user_agent() {
         ttfb_timeout_seconds: None,
         total_timeout_seconds: None,
         buffered_upstream_streaming: None,
+        rate_limit_max_wait_ms: None,
         max_connections: 100,
         rate_limit_per_minute: 0,
         custom_headers: HashMap::new(),
@@ -1937,6 +1961,7 @@ fn buffered_upstream_streaming_defaults_by_provider_type() {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
@@ -1981,6 +2006,7 @@ fn buffered_upstream_streaming_defaults_by_provider_type() {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
             custom_headers: HashMap::new(),
