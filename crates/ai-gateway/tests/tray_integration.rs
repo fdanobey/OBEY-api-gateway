@@ -39,6 +39,7 @@ fn test_config() -> Config {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
             custom_headers: Default::default(),

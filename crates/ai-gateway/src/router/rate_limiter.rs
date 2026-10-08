@@ -29,6 +29,39 @@ struct RateLimiterState {
     cooldown_until: Option<Instant>,
 }
 
+/// Why the local limiter refused a request. The request was not sent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateLimitShortfall {
+    /// Configured `rate_limit_per_minute`.
+    pub requests_per_minute: u32,
+    /// Bucket balance at the time of the check (negative after debits).
+    pub tokens_available: f64,
+    /// Time until one token is available (or the cooldown ends).
+    pub retry_in: Duration,
+    /// True when an upstream-driven cooldown, not the bucket, refused.
+    pub cooldown: bool,
+}
+
+impl std::fmt::Display for RateLimitShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.cooldown {
+            write!(
+                f,
+                "local cooldown after an upstream rate limit ({:.0}s remaining); request not sent to provider",
+                self.retry_in.as_secs_f64().ceil()
+            )
+        } else {
+            write!(
+                f,
+                "local rate limit {}/min exhausted ({:.2} tokens available); next token in {:.1}s; request not sent to provider",
+                self.requests_per_minute,
+                self.tokens_available,
+                self.retry_in.as_secs_f64()
+            )
+        }
+    }
+}
+
 /// Token bucket rate limiter for per-provider rate limiting
 #[derive(Debug)]
 pub struct RateLimiter {
@@ -134,29 +167,89 @@ impl RateLimiter {
     /// Returns true if a token was consumed (or the bucket is unlimited)
     /// AND the limiter is not in an upstream-driven cooldown.
     pub async fn consume(&self) -> bool {
+        self.try_acquire().await.is_ok()
+    }
+
+    /// Take one token for a new upstream request, or report why not.
+    ///
+    /// Same gate as [`Self::consume`]; the error carries the bucket state so a
+    /// local skip can never be mistaken for an upstream 429 (ADR 0002).
+    pub async fn try_acquire(&self) -> Result<(), RateLimitShortfall> {
         let mut state = self.state.lock().await;
 
         // Honor upstream-driven cooldown regardless of bucket capacity.
         if let Some(deadline) = state.cooldown_until {
-            if Instant::now() < deadline {
-                return false;
+            let now = Instant::now();
+            if now < deadline {
+                return Err(RateLimitShortfall {
+                    requests_per_minute: self.requests_per_minute,
+                    tokens_available: state.tokens,
+                    retry_in: deadline - now,
+                    cooldown: true,
+                });
             }
             state.cooldown_until = None;
         }
 
         // Unlimited rate limit
         if self.requests_per_minute == 0 {
-            return true;
+            return Ok(());
         }
 
         self.refill_tokens_internal(&mut state);
 
         if state.tokens >= 1.0 {
             state.tokens -= 1.0;
-            true
+            Ok(())
         } else {
-            false
+            let tokens_per_second = self.requests_per_minute as f64 / 60.0;
+            Err(RateLimitShortfall {
+                requests_per_minute: self.requests_per_minute,
+                tokens_available: state.tokens,
+                retry_in: Duration::from_secs_f64((1.0 - state.tokens) / tokens_per_second),
+                cooldown: false,
+            })
         }
+    }
+
+    /// Take one token, waiting up to `max_wait` for the bucket to refill.
+    ///
+    /// Returns how long it waited. Never waits through an upstream cooldown,
+    /// and gives up at once when the next token is further away than the
+    /// remaining wait budget. The bucket mutex is released while sleeping, so
+    /// callers must not hold any other lock or permit across this call.
+    pub async fn acquire_within(&self, max_wait: Duration) -> Result<Duration, RateLimitShortfall> {
+        let started = Instant::now();
+        let mut slept = false;
+        loop {
+            let shortfall = match self.try_acquire().await {
+                // Zero when granted without sleeping, so callers can tell a
+                // real wait from an immediate grant.
+                Ok(()) if !slept => return Ok(Duration::ZERO),
+                Ok(()) => return Ok(started.elapsed()),
+                Err(shortfall) => shortfall,
+            };
+            if shortfall.cooldown || started.elapsed() + shortfall.retry_in > max_wait {
+                return Err(shortfall);
+            }
+            // Another request may take the refilled token first; the loop then
+            // re-checks against the same overall budget.
+            tokio::time::sleep(shortfall.retry_in + Duration::from_millis(1)).await;
+            slept = true;
+        }
+    }
+
+    /// Charge one token for a continuation request (retry, Codex Search
+    /// round, nudge) of a request that was already admitted. Never blocks and
+    /// never refuses: the balance may go negative, which delays the next
+    /// admission instead of failing work already in flight (ADR 0002).
+    pub async fn debit(&self) {
+        if self.requests_per_minute == 0 {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        self.refill_tokens_internal(&mut state);
+        state.tokens -= 1.0;
     }
 
     /// Refill tokens based on elapsed time since last refill
@@ -359,6 +452,77 @@ mod tests {
         sleep(Duration::from_millis(600)).await;
         assert!(limiter.check_available().await); // Now have >= 1 token
         assert!(limiter.consume().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_within_waits_for_one_token_inside_budget() {
+        let limiter = RateLimiter::new(8); // one token per 7.5 s
+        assert_eq!(
+            limiter.acquire_within(Duration::from_secs(10)).await,
+            Ok(Duration::ZERO),
+            "an immediate grant reports no wait"
+        );
+        for _ in 0..7 {
+            assert!(limiter.consume().await);
+        }
+        let waited = limiter
+            .acquire_within(Duration::from_secs(10))
+            .await
+            .expect("token refills within the 10 s budget");
+        assert!(waited >= Duration::from_millis(7_500), "{waited:?}");
+        assert!(waited < Duration::from_millis(7_600), "{waited:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_within_refuses_when_token_is_beyond_budget() {
+        let limiter = RateLimiter::new(2); // one token per 30 s
+        assert!(limiter.consume().await);
+        assert!(limiter.consume().await);
+        let shortfall = limiter
+            .acquire_within(Duration::from_secs(10))
+            .await
+            .expect_err("30 s refill exceeds the 10 s budget");
+        assert!(!shortfall.cooldown);
+        assert_eq!(shortfall.requests_per_minute, 2);
+        let message = shortfall.to_string();
+        assert!(
+            message.starts_with("local rate limit 2/min exhausted"),
+            "{message}"
+        );
+        assert!(message.contains("next token in 30.0s"), "{message}");
+        assert!(
+            message.ends_with("request not sent to provider"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_within_never_waits_through_cooldown() {
+        let limiter = RateLimiter::new(60);
+        limiter.apply_cooldown(Duration::from_millis(50)).await;
+        let shortfall = limiter
+            .acquire_within(Duration::from_secs(10))
+            .await
+            .expect_err("cooldown is not waited out");
+        assert!(shortfall.cooldown);
+        assert!(shortfall.to_string().starts_with("local cooldown"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debit_charges_even_when_empty_and_delays_next_admission() {
+        let limiter = RateLimiter::new(60); // one token per second
+        for _ in 0..60 {
+            assert!(limiter.consume().await);
+        }
+        limiter.debit().await;
+        assert!((limiter.get_tokens().await + 1.0).abs() < 1e-6);
+        // Two tokens of refill are now needed before the next admission.
+        let shortfall = limiter.try_acquire().await.unwrap_err();
+        assert!((shortfall.retry_in.as_secs_f64() - 2.0).abs() < 0.01);
+
+        let unlimited = RateLimiter::new(0);
+        unlimited.debit().await;
+        assert!(unlimited.consume().await);
     }
 
     // Feature: ai-gateway, Property 40: Rate Limit Enforcement

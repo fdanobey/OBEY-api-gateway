@@ -300,6 +300,10 @@ pub struct LogFilter {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub status_code: Option<u16>,
+    /// Only rows with `status_code >= min_status_code` (applied before
+    /// `limit`, so the newest N errors are found however many successes
+    /// followed them).
+    pub min_status_code: Option<u16>,
     pub compression_level: Option<String>,
     pub limit: Option<usize>,
 }
@@ -900,6 +904,11 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
     if let Some(status_code) = filter.status_code {
         query.push_str(" AND status_code = ?");
         params.push(Box::new(status_code));
+    }
+
+    if let Some(min_status_code) = filter.min_status_code {
+        query.push_str(" AND status_code >= ?");
+        params.push(Box::new(min_status_code));
     }
 
     if let Some(ref compression_level) = filter.compression_level {

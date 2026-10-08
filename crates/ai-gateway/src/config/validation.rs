@@ -310,6 +310,16 @@ impl Config {
                 }
             }
 
+            if let Some(wait) = provider.rate_limit_max_wait_ms {
+                if wait > MAX_RATE_LIMIT_MAX_WAIT_MS {
+                    errors.push(ValidationError::InvalidValue {
+                        field: format!("providers.{}.rate_limit_max_wait_ms", provider.name),
+                        value: wait.to_string(),
+                        expected: format!("0-{} milliseconds", MAX_RATE_LIMIT_MAX_WAIT_MS),
+                    });
+                }
+            }
+
             if provider.connection_pool.max_idle_per_host == 0 {
                 errors.push(ValidationError::InvalidValue {
                     field: format!(
@@ -1109,6 +1119,7 @@ mod property_tests {
                 ttfb_timeout_seconds: None,
                 total_timeout_seconds: None,
                 buffered_upstream_streaming: None,
+                rate_limit_max_wait_ms: None,
                 max_connections: 100,
                 rate_limit_per_minute: 0,
         custom_headers: Default::default(),
@@ -1985,6 +1996,7 @@ model_groups:
                 ttfb_timeout_seconds: None,
                 total_timeout_seconds: None,
                 buffered_upstream_streaming: None,
+                rate_limit_max_wait_ms: None,
                 max_connections: 100,
                 rate_limit_per_minute: 0,
         custom_headers: Default::default(),

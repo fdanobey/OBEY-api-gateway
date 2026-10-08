@@ -515,6 +515,7 @@ async fn logs_handler(
         model: params.model,
         provider: params.provider,
         status_code: params.status_code,
+        min_status_code: None,
         compression_level: params.compression_level,
         limit: params.limit,
     };
@@ -583,16 +584,16 @@ async fn build_dashboard_snapshot(state: &AppState) -> crate::metrics::MetricsSn
     snapshot
 }
 
+/// Newest `limit` error rows: final outcomes AND `#attempt` rows (failed
+/// tries, local skips, failovers) of requests that later succeeded. Filtered
+/// in SQL so later successes can never push an error out of the window.
 fn recent_errors(state: &AppState, limit: usize) -> Vec<crate::logger::LogEntry> {
     match state.logger.query(LogFilter {
-        limit: Some(limit * 4),
+        min_status_code: Some(400),
+        limit: Some(limit),
         ..Default::default()
     }) {
-        Ok(entries) => entries
-            .into_iter()
-            .filter(|entry| entry.status_code >= 400)
-            .take(limit)
-            .collect(),
+        Ok(entries) => entries,
         Err(error) => {
             tracing::error!(%error, "Failed to load dashboard error entries");
             Vec::new()
@@ -993,6 +994,7 @@ mod tests {
                 ttfb_timeout_seconds: None,
                 total_timeout_seconds: None,
                 buffered_upstream_streaming: None,
+                rate_limit_max_wait_ms: None,
                 max_connections: 10,
                 rate_limit_per_minute: 0,
         custom_headers: Default::default(),
@@ -1438,5 +1440,116 @@ reasoning_compat: Default::default(),
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.as_array().is_some_and(|arr| !arr.is_empty()));
         assert_eq!(json[0]["status_code"], 502);
+    }
+
+    fn content_free_row(
+        trace_id: &str,
+        path: &str,
+        status_code: u16,
+        error_class: Option<&str>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> LogEntry {
+        LogEntry {
+            trace_id: trace_id.to_owned(),
+            timestamp,
+            method: "POST".to_owned(),
+            path: path.to_owned(),
+            model: "glm-5.3:dev".to_owned(),
+            provider: "Electron Hub".to_owned(),
+            status_code,
+            duration_ms: 0,
+            cost: 0.0,
+            request_body: None,
+            response_body: None,
+            requested_model: None,
+            responded_model: None,
+            compression: None,
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            cache_savings_cents: None,
+            prefix_hash: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
+            error_class: error_class.map(str::to_owned),
+        }
+    }
+
+    /// ADR 0002 guard: failed attempts of a request that later succeeded
+    /// (local skips, timeouts, upstream errors) stay on the Errors tab no
+    /// matter how many successful requests were logged after them.
+    #[tokio::test]
+    async fn errors_tab_includes_failed_attempts_on_successful_request() {
+        let mut config = test_config();
+        let database = tempfile::NamedTempFile::new().unwrap();
+        config.logging.database_path = database.path().to_string_lossy().into_owned();
+        let server = GatewayServer::new(config, None).await.unwrap();
+        let logger = &server.state.logger;
+        let earlier = chrono::Utc::now() - chrono::Duration::seconds(30);
+        for (class, status) in [
+            ("rate_limit_skip", 429),
+            ("ttfb_timeout", 504),
+            ("upstream_http_404", 404),
+        ] {
+            logger
+                .log(content_free_row(
+                    "trace-recovered",
+                    "/v1/chat/completions#attempt",
+                    status,
+                    Some(class),
+                    earlier,
+                ))
+                .unwrap();
+        }
+        logger
+            .log(content_free_row(
+                "trace-recovered",
+                "/v1/chat/completions",
+                200,
+                None,
+                earlier,
+            ))
+            .unwrap();
+        // More newer successes than the old `limit * 4` scan window held.
+        let now = chrono::Utc::now();
+        for i in 0..101 {
+            logger
+                .log(content_free_row(
+                    &format!("trace-ok-{i}"),
+                    "/v1/chat/completions",
+                    200,
+                    None,
+                    now,
+                ))
+                .unwrap();
+        }
+
+        let response = server
+            .build_router()
+            .oneshot(
+                Request::get("/dashboard/errors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let entries: Vec<LogEntry> = serde_json::from_slice(&body).unwrap();
+        for class in ["rate_limit_skip", "ttfb_timeout", "upstream_http_404"] {
+            let row = entries
+                .iter()
+                .find(|e| e.error_class.as_deref() == Some(class))
+                .unwrap_or_else(|| panic!("{class} attempt missing from Errors tab: {entries:?}"));
+            assert_eq!(row.trace_id, "trace-recovered");
+            assert_eq!(row.path, "/v1/chat/completions#attempt");
+            assert!(row.request_body.is_none() && row.response_body.is_none());
+        }
+        assert!(entries.iter().all(|e| e.status_code >= 400));
     }
 }
