@@ -410,6 +410,9 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 <div class="card"><div class="card-label">Jev Endpoint</div><div class="card-value" id="sr-jev-endpoint">—</div></div>
 <div class="card"><div class="card-label">Jev Model</div><div class="card-value" id="sr-jev-model">—</div></div>
 <div class="card"><div class="card-label">Jev Confidence Gate</div><div class="card-value" id="sr-jev-confidence">—</div></div>
+<div class="card"><div class="card-label">Laya Endpoint</div><div class="card-value" id="sr-laya-endpoint">—</div></div>
+<div class="card"><div class="card-label">Laya Model</div><div class="card-value" id="sr-laya-model">—</div></div>
+<div class="card"><div class="card-label">Laya Confidence Gate</div><div class="card-value" id="sr-laya-confidence">—</div></div>
 </div>
 <div class="chart-row">
 <div class="chart-box"><h3>Budget limits</h3><pre id="sr-budget" class="failure-reason">—</pre></div>
@@ -1581,11 +1584,15 @@ function renderSmartRouting(config){
     smartRoutingConfig = config;
     $('sr-status').textContent = config.enabled ? 'Enabled' : 'Disabled';
     $('sr-classifier').textContent = config.classifier || 'heuristic';
-    var jev = config.jev || {};
-    $('sr-jev-endpoint').textContent = jev.base_url || 'Not configured';
-    $('sr-jev-model').textContent = jev.model || 'auto';
-    $('sr-jev-confidence').textContent = jev.min_confidence !== undefined ? Number(jev.min_confidence).toFixed(2) : '0.60';
-    $('sr-cascade').textContent = config.cascade&&config.cascade.enabled ? 'Enabled' : 'Disabled';
+var jev = config.jev || {};
+$('sr-jev-endpoint').textContent = jev.base_url || 'Not configured';
+$('sr-jev-model').textContent = jev.model || 'auto';
+$('sr-jev-confidence').textContent = jev.min_confidence !== undefined ? Number(jev.min_confidence).toFixed(2) : '0.60';
+var laya = config.laya || {};
+$('sr-laya-endpoint').textContent = laya.base_url || 'Not configured';
+$('sr-laya-model').textContent = laya.model || 'auto';
+$('sr-laya-confidence').textContent = laya.min_confidence !== undefined ? Number(laya.min_confidence).toFixed(2) : '0.55';
+$('sr-cascade').textContent = config.cascade&&config.cascade.enabled ? 'Enabled' : 'Disabled';
 }
 function loadSmartRouting(){
 adminJson('/config').then(renderSmartRouting).catch(function(){ $('sr-status').textContent='Admin auth required'; });
