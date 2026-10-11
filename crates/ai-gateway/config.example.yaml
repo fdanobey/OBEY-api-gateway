@@ -233,38 +233,63 @@ tray:
 #   chunk_timeout_seconds: 60         # max gap between provider SSE chunks
 #   retry_on_truncation: true         # fail over when a response is truncated (finish_reason=length)
 
-# Smart model routing (optional). Jev is a calibrated System One classifier
-# optimized for fast typed decisions. TypeSafe is the default endpoint, but
-# any compatible provider such as OpenRouter may be used.
+# Smart model routing (optional). Jev and Laya are calibrated System One
+# classifiers optimized for fast typed decisions. Jev defaults to TypeSafe;
+# Laya defaults to the hosted Convai endpoint. Any compatible provider such
+# as OpenRouter may be used.
 # smart_routing:
-#   enabled: true
-#   classifier: jev
-#   cost_quality_threshold: 0.5
-#   tier_boundaries:
-#     fast_max: 0.33
-#     balanced_max: 0.66
-#   jev:
-#     api_key_env: JEV_API_KEY
-#     base_url: "https://api.typesafe.ai"
-#     # Third-party example (provider must expose /v1/models + /v1/systemone):
-#     # base_url: "https://openrouter.ai/api"
-#     model: auto # discovers and selects the latest Jev-capable model
-#     timeout_ms: 1000
-#     min_confidence: 0.60
-#     min_task_confidence: 0.50
-#     fallback_policy: fallback # fallback | blend
-#     char_budget: 1024
-#     discovery_ttl_secs: 600
-#     retry:
-#       max_attempts: 2
-#       backoff_ms: 200
-#     dimension_weights:
-#       reasoning_depth: 0.1666666667
-#       tool_coupling: 0.1666666667
-#       context_synthesis: 0.1666666667
-#       output_precision: 0.1666666667
-#       domain_load: 0.1666666667
-#       ambiguity: 0.1666666667
-#   cascade:
-#     enabled: true
-#     max_escalations: 2
+# enabled: true
+# classifier: jev # heuristic | llm | ml | composite | jev | laya
+# cost_quality_threshold: 0.5
+# tier_boundaries:
+# fast_max: 0.33
+# balanced_max: 0.66
+# jev:
+# api_key_env: JEV_API_KEY
+# base_url: "https://api.typesafe.ai"
+# # Third-party example (provider must expose /v1/models + /v1/systemone):
+# # base_url: "https://openrouter.ai/api"
+# model: auto # discovers and selects the latest Jev-capable model
+# timeout_ms: 1000
+# min_confidence: 0.60
+# min_task_confidence: 0.50
+# fallback_policy: fallback # fallback | blend
+# char_budget: 1024
+# discovery_ttl_secs: 600
+# retry:
+# max_attempts: 2
+# backoff_ms: 200
+# dimension_weights:
+# reasoning_depth: 0.1666666667
+# tool_coupling: 0.1666666667
+# context_synthesis: 0.1666666667
+# output_precision: 0.1666666667
+# domain_load: 0.1666666667
+# ambiguity: 0.1666666667
+# laya:
+# api_key_env: LAYA_API_KEY
+# base_url: "https://api.laya-ai.com"
+# # Self-hosted example (laya-serve; HTTP allowed on localhost/private):
+# # base_url: "http://laya-serve.internal:8080"
+# model: auto # pins typed-decisions when the endpoint exposes no listing
+# # Pin a checkpoint explicitly:
+# # model: typed-decisions # english | multilingual | typed-decisions
+# timeout_ms: 800
+# min_confidence: 0.55 # applied to answer_confidence (falls back to confidence)
+# min_task_confidence: 0.50
+# fallback_policy: fallback # fallback | blend
+# char_budget: 1024 # halved down to 256 after a 413 payload-limit response
+# discovery_ttl_secs: 600
+# retry: # retries 429/529/503 honoring Retry-After
+# max_attempts: 2
+# backoff_ms: 200
+# dimension_weights:
+# reasoning_depth: 0.1666666667
+# tool_coupling: 0.1666666667
+# context_synthesis: 0.1666666667
+# output_precision: 0.1666666667
+# domain_load: 0.1666666667
+# ambiguity: 0.1666666667
+# cascade:
+# enabled: true
+# max_escalations: 2
