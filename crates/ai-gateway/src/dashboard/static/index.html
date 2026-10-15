@@ -470,7 +470,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
         <thead>
           <tr>
             <th>Timestamp</th><th>Trace ID</th><th>Provider</th><th>Model</th>
-            <th>Status</th><th>Duration</th><th>Cost</th><th>Compression</th>
+            <th>Status</th><th>Duration</th><th>Cost</th><th>Compression</th><th>Reduction</th>
           </tr>
         </thead>
         <tbody id="logs-tbody"></tbody>
@@ -839,6 +839,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
       cooldown_skip:'Upstream rate-limit cooldown: not sent to provider',
       circuit_open_skip:'Circuit breaker open: not sent to provider',
       budget_skip:'Provider budget exhausted: not sent to provider',
+      context_window_exceeded:'Request context exceeds model window: not sent or reduced',
       slot_saturated:'Provider connection limit reached',
       ttfb_timeout:'No first byte before TTFB timeout',
       total_timeout:'Total timeout exceeded',
@@ -934,7 +935,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     renderCompression();
   }
 
-  function appendCompressionDetail(row, compression){
+ function appendCompressionDetail(row, compression){
     var cell=document.createElement('td');
     cell.className='compression-detail';
     if(!compression){cell.textContent='—';row.appendChild(cell);return;}
@@ -956,13 +957,47 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
       ['Duration',fmtMs(compression.duration_ms)]
     ].forEach(function(item){
       var term=document.createElement('dt');term.textContent=item[0];
+      var description=document.createElement('dd');term.textContent=item[0];description.textContent=item[1];
+      list.appendChild(term);list.appendChild(description);
+    });
+    details.appendChild(list);
+    cell.appendChild(details);
+    row.appendChild(cell);
+ }
+
+ // Context-reduction detail (context-overflow spec, task 5.1): renders the
+ // content-free reduction metadata (strategy, token drop, groups/clears,
+ // summarization fallback) for requests the proactive gate reduced.
+ function appendReductionDetail(row, reduction){
+    var cell=document.createElement('td');
+    cell.className='compression-detail';
+    if(!reduction){cell.textContent='—';row.appendChild(cell);return;}
+
+    var details=document.createElement('details');
+    var summary=document.createElement('summary');
+    var strategy=String(reduction.strategy||'unknown');
+    summary.textContent=strategy+' · '+fmtTokens(reduction.original_tokens)+' → '+fmtTokens(reduction.final_tokens);
+    summary.setAttribute('aria-label','Show context reduction details for '+strategy);
+    details.appendChild(summary);
+
+    var list=document.createElement('dl');
+    list.className='compression-detail-grid';
+    [
+      ['Strategy',strategy],
+      ['Tokens',fmtTokens(reduction.original_tokens)+' → '+fmtTokens(reduction.final_tokens)],
+      ['Groups removed',String(reduction.groups_removed==null?0:reduction.groups_removed)],
+      ['Tool results cleared',String(reduction.tool_results_cleared==null?0:reduction.tool_results_cleared)],
+      ['Summarized',reduction.summarized?'yes':'no'],
+      ['Fallback',reduction.fallback_from_summarization?'yes':'no']
+    ].forEach(function(item){
+      var term=document.createElement('dt');term.textContent=item[0];
       var description=document.createElement('dd');description.textContent=item[1];
       list.appendChild(term);list.appendChild(description);
     });
     details.appendChild(list);
     cell.appendChild(details);
     row.appendChild(cell);
-  }
+ }
 
   function renderLogs(logs){
     var tbody=$('logs-tbody');
@@ -980,11 +1015,12 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
       appendTextCell(row,fmtMs(log.duration_ms));
       appendTextCell(row,fmtCost(log.cost));
       appendCompressionDetail(row,log.compression);
+      appendReductionDetail(row,log.context_reduction);
       tbody.appendChild(row);
-    });
-  }
+ });
+ }
 
-  // --- WebSocket (Req 16.14, 40.1-40.7) ---
+ // --- WebSocket (Req 16.14, 40.1-40.7) ---
   var ws = null;
   var wsRetryCount = 0;
   var wsMaxRetry = 10;

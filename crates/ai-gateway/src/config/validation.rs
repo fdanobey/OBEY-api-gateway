@@ -682,6 +682,73 @@ expected: "a valid reasoning compatibility configuration".to_string(),
             });
         }
 
+        // Validate context overflow policy (US-2)
+        let valid_overflow_policies = [
+            "reject",
+            "route_larger_context",
+            "reduce",
+            "route_then_reduce",
+        ];
+        if !valid_overflow_policies.contains(&self.context.overflow_policy.as_str()) {
+            errors.push(ValidationError::InvalidValue {
+                field: "context.overflow_policy".to_string(),
+                value: self.context.overflow_policy.clone(),
+                expected: "one of: reject, route_larger_context, reduce, route_then_reduce"
+                    .to_string(),
+            });
+        }
+
+        // Validate context reduction strategy (US-3)
+        let valid_reduction_strategies = [
+            "remove_oldest",
+            "sliding_window",
+            "clear_tools_then_remove",
+            "summarize_then_trim",
+        ];
+        if !valid_reduction_strategies.contains(&self.context.reduction_strategy.as_str()) {
+            errors.push(ValidationError::InvalidValue {
+                field: "context.reduction_strategy".to_string(),
+                value: self.context.reduction_strategy.clone(),
+                expected: "one of: remove_oldest, sliding_window, clear_tools_then_remove, summarize_then_trim"
+                    .to_string(),
+            });
+        }
+
+        if self.context.reduction_strategy == "summarize_then_trim"
+            && self.context.summarize_model.is_none()
+        {
+            errors.push(ValidationError::InvalidValue {
+                field: "context.summarize_model".to_string(),
+                value: "None".to_string(),
+                expected: "a model name when context.reduction_strategy is summarize_then_trim"
+                    .to_string(),
+            });
+        }
+
+        if self.context.summarize_trigger_percent == 0
+            || self.context.summarize_trigger_percent > 100
+        {
+            errors.push(ValidationError::InvalidValue {
+                field: "context.summarize_trigger_percent".to_string(),
+                value: self.context.summarize_trigger_percent.to_string(),
+                expected: "a percentage between 1 and 100".to_string(),
+            });
+        }
+
+        // Cross-field check only when the trigger itself is in range, so a
+        // bad trigger is reported on the trigger field alone (N-2) instead
+        // of cascading a spurious error onto the target field.
+        if self.context.summarize_trigger_percent >= 1
+            && self.context.summarize_trigger_percent <= 100
+            && self.context.summarize_target_percent >= self.context.summarize_trigger_percent
+        {
+            errors.push(ValidationError::InvalidValue {
+                field: "context.summarize_target_percent".to_string(),
+                value: self.context.summarize_target_percent.to_string(),
+                expected: "strictly less than context.summarize_trigger_percent".to_string(),
+            });
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1320,14 +1387,141 @@ fn explicit_cache_breakpoints_out_of_range_are_rejected() {
         )));
     }
 
-    #[test]
-    fn provider_model_zero_and_plausible_context_windows_are_valid() {
+#[test]
+fn provider_model_zero_and_plausible_context_windows_are_valid() {
+    let mut config = minimal_valid_config();
+    config.model_groups[0].models[0].context_window = 0;
+    assert!(config.validate().is_ok());
+    config.model_groups[0].models[0].context_window = 1_000_000;
+    assert!(config.validate().is_ok());
+}
+
+// Context Overflow Management, Task 1.3: validation of the new
+// ContextConfig overflow fields. **Validates: Requirements US-2, US-3**
+
+fn context_overflow_error_fields(config: &Config) -> Vec<String> {
+    config
+        .validate()
+        .expect_err("config should be invalid")
+        .iter()
+        .filter_map(|error| match error {
+            ValidationError::InvalidValue { field, .. } if field.starts_with("context.") => {
+                Some(field.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn context_overflow_defaults_are_valid() {
+    let config = minimal_valid_config();
+    assert!(!config.context.proactive_enforcement);
+    assert_eq!(config.context.overflow_policy, "reduce");
+    assert_eq!(config.context.reduction_strategy, "remove_oldest");
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn context_overflow_policy_values_are_validated() {
+    for policy in [
+        "reject",
+        "route_larger_context",
+        "reduce",
+        "route_then_reduce",
+    ] {
         let mut config = minimal_valid_config();
-        config.model_groups[0].models[0].context_window = 0;
-        assert!(config.validate().is_ok());
-        config.model_groups[0].models[0].context_window = 1_000_000;
-        assert!(config.validate().is_ok());
+        config.context.overflow_policy = policy.to_string();
+        assert!(
+            config.validate().is_ok(),
+            "policy {policy} should be valid"
+        );
     }
+
+    let mut config = minimal_valid_config();
+    config.context.overflow_policy = "explode".to_string();
+    assert_eq!(
+        context_overflow_error_fields(&config),
+        vec!["context.overflow_policy".to_string()]
+    );
+}
+
+#[test]
+fn context_reduction_strategy_values_are_validated() {
+    for strategy in [
+        "remove_oldest",
+        "sliding_window",
+        "clear_tools_then_remove",
+    ] {
+        let mut config = minimal_valid_config();
+        config.context.reduction_strategy = strategy.to_string();
+        assert!(
+            config.validate().is_ok(),
+            "strategy {strategy} should be valid"
+        );
+    }
+
+    let mut config = minimal_valid_config();
+    config.context.reduction_strategy = "compress".to_string();
+    assert_eq!(
+        context_overflow_error_fields(&config),
+        vec!["context.reduction_strategy".to_string()]
+    );
+}
+
+#[test]
+fn context_summarize_then_trim_requires_summarize_model() {
+    let mut config = minimal_valid_config();
+    config.context.reduction_strategy = "summarize_then_trim".to_string();
+    assert_eq!(
+        context_overflow_error_fields(&config),
+        vec!["context.summarize_model".to_string()]
+    );
+
+    config.context.summarize_model = Some("gpt-4o-mini".to_string());
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn context_summarize_target_must_be_strictly_below_trigger() {
+    let mut config = minimal_valid_config();
+    config.context.summarize_target_percent = 80;
+    assert_eq!(
+        context_overflow_error_fields(&config),
+        vec!["context.summarize_target_percent".to_string()]
+    );
+
+    let mut config = minimal_valid_config();
+    config.context.summarize_target_percent = 90;
+    config.context.summarize_trigger_percent = 90;
+    assert_eq!(
+        context_overflow_error_fields(&config),
+        vec!["context.summarize_target_percent".to_string()]
+    );
+}
+
+#[test]
+fn context_summarize_trigger_percent_must_be_in_range_1_to_100() {
+    let mut config = minimal_valid_config();
+    config.context.summarize_trigger_percent = 101;
+    assert_eq!(
+        context_overflow_error_fields(&config),
+        vec!["context.summarize_trigger_percent".to_string()]
+    );
+
+    let mut config = minimal_valid_config();
+    config.context.summarize_trigger_percent = 0;
+    assert_eq!(
+        context_overflow_error_fields(&config),
+        vec!["context.summarize_trigger_percent".to_string()],
+        "trigger=0 must be reported on the trigger field, not on target"
+    );
+
+    let mut config = minimal_valid_config();
+    config.context.summarize_trigger_percent = 100;
+    config.context.summarize_target_percent = 99;
+    assert!(config.validate().is_ok());
+}
 
     #[test]
     fn test_load_config_resolves_plaintext_provider_key_to_runtime_only() {

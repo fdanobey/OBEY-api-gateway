@@ -11,6 +11,11 @@ use crate::config::{
     CacheAwareRouting, Config, ContextConfig, ModelGroup, PromptCacheSupport, Provider,
     ProviderModel,
 };
+use crate::context::overflow::{
+    BudgetCheck, ContextBudgetGate, ContextOverflowPolicy, ContextReductionStrategy,
+    ReductionOptions, ReductionOutcome,
+};
+use crate::context::summarizer::GatewaySummarizer;
 use crate::context::ContextManager;
 use crate::dashboard::CompressionEventHub;
 use crate::error::{error_class_for, AggregatedError, GatewayError, ProviderAttempt};
@@ -319,6 +324,11 @@ use super::{CircuitBreaker, LatencyTracker, RateLimiter};
 
 /// Error returned by the buffered dispatch when an upstream SSE stream ends
 /// without `[DONE]` and without any `finish_reason`.
+/// Content-free class shared by every overflow source (US-5): reactive
+/// context-length detections and proactive gate skips aggregate in the
+/// Errors tab under this one value.
+const CONTEXT_WINDOW_EXCEEDED_CLASS: &str = "context_window_exceeded";
+
 const SSE_TRUNCATED_ERROR: &str = "Upstream stream ended before completion";
 
 /// Attempt-row status for a failed try (DD8): the upstream HTTP status when
@@ -580,6 +590,11 @@ pub struct Router {
     http_clients: Arc<DashMap<String, reqwest::Client>>,
     /// Context manager for automatic context window handling
     context_manager: Arc<ContextManager>,
+    /// Proactive context-overflow summarizer adapter (US-3
+    /// `summarize_then_trim`): direct provider calls, never routed through
+    /// this router, so summarization cannot recurse (context-overflow spec,
+    /// task 3 pattern).
+    context_summarizer: GatewaySummarizer,
     /// Request-scoped runtime snapshot for compression and pre-compressed contexts.
     compression_runtime: Arc<std::sync::RwLock<CompressionRuntime>>,
     /// Shared dashboard event stream for every provider-specific compression attempt.
@@ -1009,13 +1024,14 @@ impl Router {
             metrics.enable_smart_routing();
         }
         Self {
-            config,
+            config: config.clone(),
             circuit_breakers: Arc::new(DashMap::new()),
             latency_tracker: Arc::new(LatencyTracker::new()),
             rate_limiters: Arc::new(DashMap::new()),
             provider_concurrency_limiters: Arc::new(DashMap::new()),
             http_clients: Arc::new(DashMap::new()),
             context_manager: Arc::new(ContextManager::with_config(context_config)),
+            context_summarizer: GatewaySummarizer::new(config.clone()),
             compression_runtime: Arc::new(std::sync::RwLock::new(CompressionRuntime {
                 pipeline: Arc::new(CompressionPipeline::from_config(compression_config)),
                 precompressed_manager: None,
@@ -1055,13 +1071,14 @@ impl Router {
             metrics.enable_smart_routing();
         }
         Self {
-            config,
+            config: config.clone(),
             circuit_breakers: Arc::new(DashMap::new()),
             latency_tracker: Arc::new(LatencyTracker::new()),
             rate_limiters: Arc::new(DashMap::new()),
             provider_concurrency_limiters: Arc::new(DashMap::new()),
             http_clients: Arc::new(DashMap::new()),
             context_manager: Arc::new(ContextManager::with_config(context_config)),
+            context_summarizer: GatewaySummarizer::new(config.clone()),
             compression_runtime: Arc::new(std::sync::RwLock::new(CompressionRuntime {
                 pipeline: Arc::new(CompressionPipeline::from_config(compression_config)),
                 precompressed_manager: None,
@@ -1839,7 +1856,7 @@ impl Router {
         self.promote_sticky_provider(request, &mut providers).await;
 
         if !overflow.is_empty() {
-            let mut overflow_group = model_group;
+            let mut overflow_group = model_group.clone();
             overflow_group.models = overflow;
             let extra = self.select_provider_order(&overflow_group).await;
             let mut seen: HashSet<String> = providers
@@ -1851,6 +1868,53 @@ impl Router {
                     .into_iter()
                     .filter(|pm| seen.insert(format!("{}:{}", pm.provider, pm.model))),
             );
+        }
+
+        // Proactive context routing (US-2/US-7, task 4.3): when a
+        // reduction-tolerant policy is active, models the smart-routing
+        // capacity filter dropped are re-attached as reduce-candidates at
+        // the tail — fitting candidates stay first, the gate decides at
+        // dispatch. `reject` / `route_larger_context` / disabled keep the
+        // hard exclusion. Only meaningful when Smart Routing actually
+        // filtered; plain ordering never drops over-budget models.
+        let context_cfg = {
+            let config = self.config.read().await;
+            config.context.clone()
+        };
+        if context_cfg.enabled
+            && context_cfg.proactive_enforcement
+            && decision.is_some()
+            && !bypassed
+            && matches!(
+                ContextOverflowPolicy::from_config(&context_cfg.overflow_policy),
+                ContextOverflowPolicy::Reduce | ContextOverflowPolicy::RouteThenReduce
+            )
+        {
+            let requirement =
+                crate::smart_routing::context_filter::ContextRequirement::from_gate_estimate(
+                    request,
+                );
+            let mut seen: HashSet<String> = providers
+                .iter()
+                .map(|pm| format!("{}:{}", pm.provider, pm.model))
+                .collect();
+            let reduce_group =
+                crate::smart_routing::context_filter::reduce_candidates_by_context_capacity(
+                    &model_group.models,
+                    requirement,
+                );
+            let appended: Vec<ProviderModel> = reduce_group
+                .models
+                .into_iter()
+                .filter(|pm| seen.insert(format!("{}:{}", pm.provider, pm.model)))
+                .collect();
+            if !appended.is_empty() {
+                debug!(
+                    count = appended.len(),
+                    "Smart routing dropped over-budget models; re-attached as reduce-candidates"
+                );
+                providers.extend(appended);
+            }
         }
 
         Ok(RoutedProviders {
@@ -4079,6 +4143,34 @@ impl Router {
             base_attempt,
             None,
             first_send,
+            false,
+        )
+        .await
+    }
+
+    /// Dispatch variant that skips the routing phase of the proactive context
+    /// gate and reduces the request copy unconditionally (`route_then_reduce`
+    /// exhaustion: the first candidate is retried with reduction once no
+    /// fitting candidate remains). A reduction that still cannot fit returns
+    /// the same 413 [`GatewayError::ContextCapacityExceeded`] as the gate.
+    async fn attempt_with_retry_forced_reduce(
+        &self,
+        provider_name: &str,
+        request: &OpenAIRequest,
+        provider_model: &ProviderModel,
+        active: Option<ActiveRequestHandle>,
+        base_attempt: usize,
+        first_send: FirstSendToken,
+    ) -> Result<OpenAIResponse, GatewayError> {
+        self.attempt_with_retry_with_permit(
+            provider_name,
+            request,
+            provider_model,
+            active,
+            base_attempt,
+            None,
+            first_send,
+            true,
         )
         .await
     }
@@ -4092,6 +4184,7 @@ impl Router {
         base_attempt: usize,
         concurrency_permit: Option<ProviderConcurrencyPermit>,
         first_send: FirstSendToken,
+        force_context_reduce: bool,
     ) -> Result<OpenAIResponse, GatewayError> {
         let provider_cfg = {
             let config = self.config.read().await;
@@ -4122,6 +4215,7 @@ impl Router {
             base_attempt,
             provider_cfg,
             first_send,
+            force_context_reduce,
         )
         .await
     }
@@ -4301,7 +4395,181 @@ impl Router {
         Ok(final_response)
     }
 
-    async fn dispatch_attempts_under_permit(
+    /// True when the configured overflow policy is `route_then_reduce` (the
+    /// only policy with an exhaustion retry).
+    fn is_route_then_reduce(overflow_policy: &str) -> bool {
+        ContextOverflowPolicy::from_config(overflow_policy) == ContextOverflowPolicy::RouteThenReduce
+    }
+
+    /// Proactive context-budget gate (US-1/US-2, task 4.1): compare the final
+    /// outgoing body against the target model's effective input budget
+    /// (`context_window − max_tokens − safety margin`, mirroring the reactive
+    /// [`ContextManager`] math via [`ContextBudgetGate::input_budget`]) and
+    /// apply the configured overflow policy.
+    ///
+    /// Returns `Ok(None)` when the request fits (or the gate is disabled, or
+    /// the target's capacity is unknown — today's behavior), `Ok(Some((body`
+    /// `, outcome))` with the reduced copy to send and the reduction
+    /// outcome for logging, or `Err`:
+    /// - [`GatewayError::ContextCapacityExceeded`] (HTTP 413, class
+    ///   `context_window_exceeded`) for the `reject` policy, and for
+    ///   `route_larger_context` / `route_then_reduce` / `reduce` candidates
+    ///   that cannot be reduced to fit — the caller excludes the candidate
+    ///   and continues the failover loop.
+    ///
+    /// The context window comes from the same capability source the reactive
+    /// path uses ([`ContextManager::get_capabilities`]), falling back to the
+    /// model's declared `context_window`; unknown (0) capacity skips the gate
+    /// rather than guessing a limit.
+    ///
+    /// `force_context_reduce` bypasses the routing phase (the
+    /// `route_then_reduce` exhaustion retry already established no fitting
+    /// candidate remains) and reduces immediately.
+    async fn enforce_context_budget(
+        &self,
+        outgoing: &OpenAIRequest,
+        provider_model: &ProviderModel,
+        context_config: &ContextConfig,
+        force_context_reduce: bool,
+    ) -> Result<Option<(OpenAIRequest, ReductionOutcome)>, GatewayError> {
+        // Gate is pass-through unless proactive enforcement is enabled.
+        if !context_config.enabled || !context_config.proactive_enforcement {
+            return Ok(None);
+        }
+        let context_window = self
+            .context_manager
+            .get_capabilities(&provider_model.model)
+            .map(|caps| caps.context_window)
+            .filter(|window| *window > 0)
+            .or_else(|| (provider_model.context_window > 0).then_some(provider_model.context_window));
+        let Some(context_window) = context_window else {
+            // Unknown capacity: enforcing a guessed limit would 413 valid
+            // requests. The reactive backstop still covers real overflows.
+            debug!(
+                provider = %provider_model.provider,
+                model = %provider_model.model,
+                "Context window unknown; proactive budget gate skipped"
+            );
+            return Ok(None);
+        };
+        let max_tokens = outgoing.max_tokens.unwrap_or(0);
+let check = ContextBudgetGate::check(outgoing, context_window, max_tokens);
+let policy = ContextOverflowPolicy::from_config(&context_config.overflow_policy);
+let strategy = ContextReductionStrategy::from_config(&context_config.reduction_strategy);
+let summarize = strategy == ContextReductionStrategy::SummarizeThenTrim
+&& (policy == ContextOverflowPolicy::Reduce || force_context_reduce)
+&& u64::from(check.estimate) * 100
+> u64::from(check.budget) * u64::from(context_config.summarize_trigger_percent);
+if check.fits && !summarize {
+return Ok(None);
+}
+        debug!(
+            provider = %provider_model.provider,
+            model = %provider_model.model,
+            estimate = check.estimate,
+            budget = check.budget,
+            policy = ?policy,
+            "Proactive context budget exceeded"
+        );
+        // Routing policies exclude this candidate (the failover loop
+        // continues); forced reduction never routes.
+        if !force_context_reduce {
+            match policy {
+                ContextOverflowPolicy::Reject => {
+                    return Err(GatewayError::ContextCapacityExceeded {
+                        // Total context requirement (prompt + reserved output +
+                        // safety margin), consistent with the skip path and
+                        // the smart-routing capacity filter.
+                        estimated_requirement: u64::from(check.estimate)
+                            + u64::from(check.reserved_output_tokens)
+                            + u64::from(check.safety_margin_tokens),
+                        largest_supported_context: Some(context_window),
+                    })
+                }
+                ContextOverflowPolicy::RouteLargerContext
+                | ContextOverflowPolicy::RouteThenReduce => {
+                    return Err(Self::context_capacity_skip(provider_model, check));
+                }
+                ContextOverflowPolicy::Reduce => {}
+            }
+        }
+        // Reduce a copy (never the caller's original), per configured
+        // strategy. `summarize_then_trim` runs the async summarizer with its
+        // clear-tools fallback; every other strategy is sync.
+let options = ReductionOptions::from_config(strategy, check.budget, context_config);
+        let mut reduced = outgoing.clone();
+        let outcome = if strategy == ContextReductionStrategy::SummarizeThenTrim {
+            self.context_summarizer
+                .reduce_with_summarizer(&mut reduced, &options, context_config)
+                .await
+        } else {
+            ContextBudgetGate::reduce(&mut reduced, &options)
+        };
+        if !outcome.fits {
+            // US-1: a request that still exceeds the budget is never
+            // dispatched to this provider; skip to the next candidate
+            // (the failover loop keeps the policy/413 semantics).
+            return Err(Self::context_capacity_skip(provider_model, check));
+        }
+    info!(
+        provider = %provider_model.provider,
+        model = %provider_model.model,
+        strategy = ?outcome.strategy_applied,
+        original_tokens = outcome.original_tokens,
+        final_tokens = outcome.final_tokens,
+        budget = outcome.budget,
+        groups_removed = outcome.groups_removed,
+        tool_results_cleared = outcome.tool_results_cleared,
+        summarized = outcome.summarized,
+        fallback_from_summarization = outcome.fallback_from_summarization,
+        "Context reduction fits the budget; dispatching reduced copy"
+    );
+    Ok(Some((reduced, outcome)))
+    }
+
+    /// True when the configured overflow policy is `reject`: the first
+    /// gate overflow surfaces its 413 immediately instead of failing over.
+    fn context_policy_is_reject(overflow_policy: &str) -> bool {
+        ContextOverflowPolicy::from_config(overflow_policy) == ContextOverflowPolicy::Reject
+    }
+/// The skip signal for the failover loop: a 413-shaped capacity error the
+/// loop recognizes as "exclude this candidate and continue" (task 4.2).
+/// Recorded attempts use class `context_window_exceeded` via
+/// [`error_class_for`].
+///
+/// `estimated_requirement` describes the **total context requirement**
+/// (prompt estimate + reserved output + safety margin), matching how the
+/// smart-routing capacity filter and the HTTP 413 body report it — not the
+/// bare prompt count.
+fn context_capacity_skip(
+    provider_model: &ProviderModel,
+    check: BudgetCheck,
+) -> GatewayError {
+    GatewayError::ContextCapacityExceeded {
+        estimated_requirement: u64::from(check.estimate)
+            + u64::from(check.reserved_output_tokens)
+            + u64::from(check.safety_margin_tokens),
+        // The failing candidate's effective budget bound plus the same
+        // reservations, in window terms.
+        largest_supported_context: Some(
+            provider_model
+                .context_window
+                .max(check.budget + check.reserved_output_tokens + check.safety_margin_tokens),
+        ),
+    }
+}
+
+    fn attach_context_reduction(response: &mut OpenAIResponse, outcome: Option<&ReductionOutcome>) {
+if let Some(outcome) = outcome {
+response.extra.insert(
+"gateway_context_reduction".to_string(),
+serde_json::to_value(crate::logger::ContextReductionLog::from(outcome))
+.expect("ContextReductionLog serialization must succeed"),
+);
+}
+}
+
+async fn dispatch_attempts_under_permit(
         &self,
         provider_name: &str,
         request: &OpenAIRequest,
@@ -4310,6 +4578,7 @@ impl Router {
         base_attempt: usize,
         provider_cfg: Provider,
         first_send: FirstSendToken,
+        force_context_reduce: bool,
     ) -> Result<OpenAIResponse, GatewayError> {
         // Fetched before the config guard below: `get_rate_limiter` may read
         // the config itself. Sends after the first one are debited here; the
@@ -4318,8 +4587,9 @@ impl Router {
         let rate_limiter = self.get_rate_limiter(provider_name).await;
         let mut send_prepaid = first_send == FirstSendToken::Prepaid;
         let config = self.config.read().await;
-        let max_retries = config.retry.max_retries_per_provider;
-        let backoff_sequence = config.retry.backoff_sequence_seconds.clone();
+let max_retries = config.retry.max_retries_per_provider;
+let backoff_sequence = config.retry.backoff_sequence_seconds.clone();
+let context_config = config.context.clone();
 
         // ─── Codex dispatch (Req 10.1, 10.2) ────────────────────────────────
         let is_codex = provider_cfg.auth_method.as_deref() == Some("oauth")
@@ -4395,7 +4665,18 @@ impl Router {
 
             // Every Codex call (first send, repair retries, search rounds)
             // is one upstream request and is charged one token.
-            let codex_client = MeteredClient::new(&codex_client, rate_limiter.clone(), first_send);
+            let context_reduction = match self
+.enforce_context_budget(&codex_request, provider_model, &context_config, force_context_reduce)
+.await?
+{
+Some((reduced, outcome)) => {
+codex_request = reduced;
+Some(outcome)
+}
+None => None,
+};
+
+let codex_client = MeteredClient::new(&codex_client, rate_limiter.clone(), first_send);
             let result = self
                 .dispatch_buffered_with_context_retry(&codex_client, codex_request.clone())
                 .await?;
@@ -4431,10 +4712,13 @@ impl Router {
                     "The gateway ran your web search, but this turn produced no answer text and no tool call. \
                      Continue the task with your own tools, or say what information you still need.",
                 );
-                return Ok(final_response);
-            }
+Self::attach_context_reduction(&mut final_response, context_reduction.as_ref());
+return Ok(final_response);
+}
 
-            return Ok(result.response);
+let mut response = result.response;
+Self::attach_context_reduction(&mut response, context_reduction.as_ref());
+return Ok(response);
         }
         // ─── End Codex dispatch ──────────────────────────────────────────────
 
@@ -4445,8 +4729,19 @@ impl Router {
         if is_bedrock_api_key {
             let mut bedrock_request = request.clone();
             bedrock_request.model = provider_model.model.clone();
-            bedrock_request.stream = false;
-            let bedrock_client = BedrockProvider::new_with_config(
+bedrock_request.stream = false;
+drop(config);
+let context_reduction = match self
+.enforce_context_budget(&bedrock_request, provider_model, &context_config, force_context_reduce)
+.await?
+{
+Some((reduced, outcome)) => {
+bedrock_request = reduced;
+Some(outcome)
+}
+None => None,
+};
+let bedrock_client = BedrockProvider::new_with_config(
                 provider_name.to_string(),
                 provider_cfg
                     .region
@@ -4460,10 +4755,12 @@ impl Router {
             .await?;
             let bedrock_client =
                 MeteredClient::new(&bedrock_client, rate_limiter.clone(), first_send);
-            return Ok(self
-                .dispatch_buffered_with_context_retry(&bedrock_client, bedrock_request)
-                .await?
-                .response);
+let mut response = self
+.dispatch_buffered_with_context_retry(&bedrock_client, bedrock_request)
+.await?
+.response;
+Self::attach_context_reduction(&mut response, context_reduction.as_ref());
+return Ok(response);
         }
 
         // OAuth bearer override (Req 6.2): when the provider declares
@@ -4540,7 +4837,10 @@ impl Router {
         let jitter_ratio = config.retry.jitter_ratio;
         let cache_aware_routing_cfg = config.cache_aware_routing.clone();
         let configured_base_url = provider_cfg.base_url.clone();
-        // Inter-chunk idle window for streamed upstream bodies; the streaming
+        // Proactive context-overflow enforcement snapshot (context-overflow
+        // spec, task 4): per-request read of the `context` knobs — hot-reload
+        // applies without a ContextManager rebuild (pattern: check_and_truncate_context).
+// Inter-chunk idle window for streamed upstream bodies; the streaming
         // relay's default applies when the `streaming` section is absent.
         let chunk_timeout_secs = config
             .streaming
@@ -4801,6 +5101,32 @@ impl Router {
             is_openrouter,
             &cache_aware_routing_cfg,
         );
+
+        // ─── Proactive context-overflow gate (US-1, task 4.1) ───────────────
+// The final buffered HTTP body is checked here; Codex and Bedrock
+// check their dispatch copies in their dedicated arms. Streaming checks
+// its final pass-through body and delegates overflow to buffered routing.
+// Reductions only mutate a dispatch copy, preserving later failover input.
+        let mut context_reduction: Option<ReductionOutcome> = None;
+        if let Some((reduced, outcome)) = self
+            .enforce_context_budget(
+                &outgoing,
+                provider_model,
+                &context_config,
+                force_context_reduce,
+            )
+            .await?
+        {
+            info!(
+                provider = provider_name,
+                model = %provider_model.model,
+                original_messages = outgoing.messages.len(),
+                reduced_messages = reduced.messages.len(),
+                "Proactive context reduction applied to outgoing request"
+            );
+            outgoing = reduced;
+            context_reduction = Some(outcome);
+        }
 
         let mut last_error = None;
         // One-shot reactive image strip: when the provider rejects the request
@@ -5181,15 +5507,26 @@ impl Router {
                             // stage's actions (counts/families only) where the report exists;
                             // the failover success path and the handler pass it through and
                             // strip it before the client sees the response.
-                            if let Some(actions) =
-                                reasoning_report.and_then(AttemptReport::actions_json)
-                            {
-                                openai_response.extra.insert(
-                                    "gateway_reasoning_compat_actions".to_string(),
-                                    serde_json::Value::String(actions),
-                                );
-                            }
-                            return Ok(openai_response);
+        if let Some(actions) =
+            reasoning_report.and_then(AttemptReport::actions_json)
+        {
+            openai_response.extra.insert(
+                "gateway_reasoning_compat_actions".to_string(),
+                serde_json::Value::String(actions),
+            );
+        }
+        // Context-reduction log telemetry (task 5.1): attach the
+        // gate's reduction outcome where it exists; the handler
+        // persists it on the request log entry and strips the key
+        // before the client sees the response.
+        if let Some(outcome) = &context_reduction {
+            openai_response.extra.insert(
+                "gateway_context_reduction".to_string(),
+                serde_json::to_value(crate::logger::ContextReductionLog::from(outcome))
+                    .expect("ContextReductionLog serialization must succeed"),
+            );
+        }
+        return Ok(openai_response);
                         }
 
                         // SSE body: the requested upstream stream, or a provider
@@ -5261,15 +5598,22 @@ impl Router {
                                             serde_json::json!(inject_tool_hint),
                                         );
                                     }
-                                    if let Some(actions) =
-                                        reasoning_report.and_then(AttemptReport::actions_json)
-                                    {
-                                        response.extra.insert(
-                                            "gateway_reasoning_compat_actions".to_string(),
-                                            serde_json::Value::String(actions),
-                                        );
-                                    }
-                                    return Ok(response);
+        if let Some(actions) =
+            reasoning_report.and_then(AttemptReport::actions_json)
+        {
+            response.extra.insert(
+                "gateway_reasoning_compat_actions".to_string(),
+                serde_json::Value::String(actions),
+            );
+        }
+        if let Some(outcome) = &context_reduction {
+            response.extra.insert(
+                "gateway_context_reduction".to_string(),
+                serde_json::to_value(crate::logger::ContextReductionLog::from(outcome))
+                    .expect("ContextReductionLog serialization must succeed"),
+            );
+        }
+        return Ok(response);
                                 }
                                 Err(e) => {
                                     tracing::error!(provider = provider_name, error = %e, body = %body_text.chars().take(500).collect::<String>(), "Failed to reassemble SSE response");
@@ -5295,10 +5639,11 @@ impl Router {
                         return Err(err);
                     }
 
-                    let http_class = format!("upstream_http_{status_code}");
-
-                    // Context-length failure: attempt in-process truncation + retry.
-                    if self.is_context_length_error(status_code, &body_text) {
+// Context-length failure: attempt in-process truncation + retry. Both the
+// retry-succeeded and cannot-continue branches classify the try as
+// `context_window_exceeded` (US-5 normalized overflow class); generic
+// 400/413 bodies keep `upstream_http_<code>` below.
+if self.is_context_length_error(status_code, &body_text) {
                         match self.context_manager.handle_context_error(
                             &mut outgoing,
                             context_retry_attempt,
@@ -5321,26 +5666,35 @@ impl Router {
                                         message: format!("HTTP {}: context length exceeded", status_code),
                                         status_code: Some(status_code),
                                     },
-                                    Some(&http_class),
+                                    Some(CONTEXT_WINDOW_EXCEEDED_CLASS),
                                     None,
                                     request_start,
                                 );
                                 continue;
                             }
-                            Err(e) => {
-                                warn!(
-                                    provider = provider_name,
-                                    model = %provider_model.model,
-                                    error = %e,
-                                    "Context-length error detected but truncation retry cannot continue"
-                                );
-                                let err = GatewayError::InvalidRequest(format!(
-                                    "Request exceeds model context limits and cannot be truncated further: {}",
-                                    e
-                                ));
-                                record_try(&err, Some(&http_class), Some(status_code), request_start);
-                                return Err(err);
-                            }
+                Err(e) => {
+                    warn!(
+                        provider = %provider_name,
+                        model = %provider_model.model,
+                        error = %e,
+                        "Context-length error detected but truncation retry cannot continue"
+                    );
+                    let err = GatewayError::InvalidRequest(format!(
+                        "Request exceeds model context limits and cannot be truncated further: {}",
+                        e
+                    ));
+                    // Classified by the overflow's nature, not the raw
+                    // upstream status: every overflow source aggregates
+                    // under the normalized class (US-5), while generic
+                    // 400/413s keep `upstream_http_<code>`.
+                    record_try(
+                        &err,
+                        Some(CONTEXT_WINDOW_EXCEEDED_CLASS),
+                        Some(status_code),
+                        request_start,
+                    );
+                    return Err(err);
+                }
                         }
                     }
 
@@ -6291,6 +6645,22 @@ impl Router {
         // ...") is retried on the same provider with a nudge before
         // failover gives up on it.
         let mut reasoning_nudge_done = false;
+        // Proactive context-gate skip bookkeeping (task 4.2): every candidate
+        // the pre-dispatch context gate skipped, and the first one seen (the
+// `route_then_reduce` exhaustion retry target).
+let mut context_skip_estimates: Vec<u64> = Vec::new();
+let mut first_context_skip: Option<ProviderModel> = None;
+// Largest window actually seen among gate-skipped candidates (the truthful
+// `largest_supported_context` for the 413; `first_context_skip` alone could
+// name a small window when larger ones were also skipped).
+let mut largest_skipped_context: u32 = 0;
+        // Snapshot of the context-overflow knobs for the per-candidate gate
+        // decisions below (hot-reloadable per request, no ContextManager
+        // rebuild).
+        let context_config = {
+            let config = self.config.read().await;
+            config.context.clone()
+        };
         let config = self.config.read().await;
         let provider_budgets: std::collections::HashMap<String, f64> = config
             .providers
@@ -6327,7 +6697,19 @@ impl Router {
             .collect();
         drop(config);
 
-        for (candidate_index, provider_model) in providers.into_iter().enumerate() {
+        let mut candidates = providers.into_iter().enumerate();
+let mut forced_reduce_attempted = false;
+loop {
+let (candidate_index, provider_model, force_context_reduce) = match candidates.next() {
+Some((index, model)) => (index, model, false),
+None if !forced_reduce_attempted
+&& Self::is_route_then_reduce(&context_config.overflow_policy)
+&& first_context_skip.is_some() => {
+forced_reduce_attempted = true;
+(usize::MAX, first_context_skip.clone().expect("context skip checked above"), true)
+}
+None => break,
+};
             let start = std::time::Instant::now();
             let request_id = format!("route-{}", uuid::Uuid::new_v4());
 
@@ -6443,12 +6825,17 @@ impl Router {
                     );
                 }
                 Ok(_) => {}
-                Err(shortfall) => {
-                    warn!(
-                        provider = %provider_model.provider,
-                        model = %provider_model.model,
-                        reason = %shortfall,
-                        "Local rate limiter refused the request, skipping provider"
+Err(shortfall) if force_context_reduce => {
+warn!(provider = %provider_model.provider, reason = %shortfall,
+"Route-then-reduce retry refused by the local rate limiter; failing with the context error");
+break;
+}
+Err(shortfall) => {
+warn!(
+provider = %provider_model.provider,
+model = %provider_model.model,
+reason = %shortfall,
+"Local rate limiter refused the request, skipping provider"
                     );
                     self.metrics
                         .record_provider_rate_limit_exhausted(&provider_model.provider);
@@ -6496,17 +6883,28 @@ impl Router {
                 handle.set_attempt(attempt_counter);
             }
             let ledger_before = active.as_ref().map_or(0, |h| h.failed_attempt_count());
-            match self
-                .attempt_with_retry(
-                    &provider_model.provider,
-                    &prepared_request,
-                    &provider_model,
-                    active.clone(),
-                    attempt_counter,
-                    FirstSendToken::Prepaid,
-                )
-                .await
-            {
+let dispatch_result = if force_context_reduce {
+self.attempt_with_retry_forced_reduce(
+&provider_model.provider,
+&prepared_request,
+&provider_model,
+active.clone(),
+attempt_counter,
+FirstSendToken::Prepaid,
+)
+.await
+} else {
+self.attempt_with_retry(
+&provider_model.provider,
+&prepared_request,
+&provider_model,
+active.clone(),
+attempt_counter,
+FirstSendToken::Prepaid,
+)
+.await
+};
+match dispatch_result {
                 Ok(mut response) => {
                     // ---- Repair the turn before judging it ----------------
                     // Order matters here. Each of these steps can turn what
@@ -6963,6 +7361,72 @@ impl Router {
                     return Ok(response);
                 }
                 Err(e) => {
+                    // Proactive context-gate skip (task 4.2): the candidate's
+                    // budget cannot fit the request. No token was consumed
+                    // for it (refunded below, ADR 0002: one token per real
+                    // upstream request), no breaker failure (the provider is
+                    // not unhealthy — the request is too large), and no
+                    // provider-failure metric (nothing was sent). Continue to
+                    // the next candidate.
+                    if let GatewayError::ContextCapacityExceeded {
+                        estimated_requirement,
+                        largest_supported_context,
+                    } = &e
+                    {
+                        if Self::context_policy_is_reject(&context_config.overflow_policy) {
+                            // Reject: surface the 413 immediately (no
+                            // failover), after refunding the unused
+                            // admission token and recording the skip row.
+                            let rate_limiter =
+                                self.get_rate_limiter(&provider_model.provider).await;
+                            rate_limiter.refund().await;
+                            Self::push_attempt(
+                                &mut attempts,
+                                active.as_ref(),
+                                ProviderAttempt::new(
+                                    provider_model.provider.clone(),
+                                    provider_model.model.clone(),
+                                    format!(
+                                        "Request context (~{estimated_requirement} tokens) exceeds this model's input budget; rejected by policy"
+                                    ),
+                                    Some(413),
+                                )
+                                .with_duration(start.elapsed())
+                                .with_error_class(CONTEXT_WINDOW_EXCEEDED_CLASS),
+                            );
+                            return Err(e);
+                        }
+                        let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
+                        rate_limiter.refund().await;
+                        info!(
+                            provider = %provider_model.provider,
+                            model = %provider_model.model,
+                            estimated_requirement,
+                            largest_supported_context,
+                            "Candidate cannot fit the request context; skipping to next provider"
+                        );
+                        Self::push_attempt(
+                            &mut attempts,
+                            active.as_ref(),
+                            ProviderAttempt::new(
+                                provider_model.provider.clone(),
+                                provider_model.model.clone(),
+                                format!(
+                                    "Request context (~{estimated_requirement} tokens) exceeds this model's input budget; not sent"
+                                ),
+                                Some(413),
+                            )
+                            .with_duration(start.elapsed())
+                            .with_error_class(CONTEXT_WINDOW_EXCEEDED_CLASS),
+                        );
+                        context_skip_estimates.push(u64::from(*estimated_requirement));
+                        if first_context_skip.is_none() {
+                            first_context_skip = Some(provider_model.clone());
+                        }
+                        largest_skipped_context = largest_skipped_context
+                            .max(largest_supported_context.unwrap_or(0));
+                        continue;
+                    }
                     // Record failure — except rate-limit-class errors (HTTP 429
                     // and rate-limit-shaped error-in-200 envelopes). Those are
                     // governed exclusively by the dedicated upstream cooldown
@@ -7092,6 +7556,33 @@ impl Router {
             }
         }
 
+
+        // Every candidate the gate skipped and nothing real was attempted:
+        // surface the normalized 413 (US-5) instead of a misleading
+        // "all providers failed" aggregate.
+        let only_context_skips = !context_skip_estimates.is_empty()
+            && attempts
+                .iter()
+                .all(|attempt| attempt.error_class.as_deref() == Some(CONTEXT_WINDOW_EXCEEDED_CLASS));
+if only_context_skips {
+    return Err(GatewayError::ContextCapacityExceeded {
+        estimated_requirement: *context_skip_estimates
+            .iter()
+            .min()
+            .expect("non-empty checked above"),
+        // The largest window actually offered by any skipped candidate —
+        // truthful even when the first skip was a small window and larger
+        // ones were skipped after it.
+        largest_supported_context: if largest_skipped_context > 0 {
+            Some(largest_skipped_context)
+        } else {
+            first_context_skip.as_ref().and_then(|pm| {
+                (pm.context_window > 0).then_some(pm.context_window)
+            })
+        },
+    });
+}
+
         // All providers failed.
         // Req 6.2: when every provider truncated with finish_reason=length we
         // return the longest partial (highest completion_tokens) rather than an
@@ -7115,7 +7606,6 @@ impl Router {
             );
             return Ok(longest);
         }
-
         // Every provider stopped after its reasoning block. Failing over was
         // worth trying — usually another provider completes the turn — but once
         // the chain is exhausted, surfacing the model's thinking beats returning
@@ -9676,25 +10166,6 @@ visible content. Do not restate your plan and do not end your turn without doing
             ));
         }
 
-        // Consume an internal rate-limit token for this streaming dispatch,
-        // mirroring the buffered path (`route_with_failover_for_group`):
-        // streaming traffic must not bypass `rate_limit_per_minute`, or a
-        // streaming-heavy workload would never be throttled locally and the
-        // provider would answer with real 429s. On exhaustion, drop to the
-        // buffered path — its own consume() gate then skips this provider
-        // with proper attempt logging and fails over to the next candidate.
-        // (The token is consumed here, after the transformation checks, so
-        // requests that end up buffered anyway are not double-charged.)
-        let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
-        if !rate_limiter.consume().await {
-            warn!(provider = %provider_model.provider, "Rate limit exhausted before streaming dispatch, using buffered path");
-            self.metrics
-                .record_provider_rate_limit_exhausted(&provider_model.provider);
-            drop(concurrency_permit);
-            return Ok(StreamingResponse::Buffered(
-                self.route_request(request, active.clone()).await?,
-            ));
-        }
 
         // Base URL normalization — strip trailing '/', ensure '/v1'. Bedrock
         // never reaches this pass-through path (it takes the buffered gate
@@ -9800,7 +10271,37 @@ visible content. Do not restate your plan and do not end your turn without doing
             &cache_aware_routing_cfg,
         );
 
-        let http_client = self.get_or_create_http_client(&provider_model.provider, &pool_config)?;
+        let context_config = self.config.read().await.context.clone();
+if context_config.enabled && context_config.proactive_enforcement {
+let context_window = self.context_manager
+.get_capabilities(&provider_model.model)
+.map(|caps| caps.context_window)
+.filter(|window| *window > 0)
+.or_else(|| (provider_model.context_window > 0).then_some(provider_model.context_window));
+if let Some(window) = context_window {
+let check = ContextBudgetGate::check(&outgoing, window, outgoing.max_tokens.unwrap_or(0));
+let summarize = context_config.reduction_strategy == "summarize_then_trim"
+&& context_config.overflow_policy == "reduce"
+&& u64::from(check.estimate) * 100
+> u64::from(check.budget) * u64::from(context_config.summarize_trigger_percent);
+if !check.fits || summarize {
+drop(concurrency_permit);
+return Ok(StreamingResponse::Buffered(
+self.route_request_with_exclusions(request, active, exclude).await?,
+));
+}
+}
+}
+let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
+if !rate_limiter.consume().await {
+warn!(provider = %provider_model.provider, "Rate limit exhausted before streaming dispatch, using buffered path");
+self.metrics.record_provider_rate_limit_exhausted(&provider_model.provider);
+drop(concurrency_permit);
+return Ok(StreamingResponse::Buffered(
+self.route_request_with_exclusions(request, active, exclude).await?,
+));
+}
+let http_client = self.get_or_create_http_client(&provider_model.provider, &pool_config)?;
 
         let mut req_builder = http_client
             .post(&url)
@@ -9885,18 +10386,28 @@ visible content. Do not restate your plan and do not end your turn without doing
             // context-length, image and other 4xx retries are visible too.
             let err = GatewayError::Provider {
                 provider: provider_model.provider.clone(),
-                message: format!("HTTP {}: {}", status_code, body_text),
-                status_code: Some(status_code),
-            };
-            Self::record_try_failure(
-                active.as_ref(),
-                &provider_model.provider,
-                &provider_model.model,
-                &err,
-                None,
-                None,
-                request_start,
-            );
+            message: format!("HTTP {}: {}", status_code, body_text),
+            status_code: Some(status_code),
+        };
+        // Every non-success pass-through try is a failed try: record it
+        // once here before any fallback, so 429, context-length, image and
+        // other 4xx retries are visible too. Context-length bodies take
+        // the normalized overflow class (US-5); everything else keeps
+        // `upstream_http_<code>`.
+        let try_class = if self.is_context_length_error(status_code, &body_text) {
+            Some(CONTEXT_WINDOW_EXCEEDED_CLASS)
+        } else {
+            None
+        };
+        Self::record_try_failure(
+            active.as_ref(),
+            &provider_model.provider,
+            &provider_model.model,
+            &err,
+            try_class,
+            None,
+            request_start,
+        );
             if Self::is_rate_limited(status_code, &body_text) {
                 // Rate-limit response on the streaming pass-through: apply
                 // the dedicated upstream cooldown (RateLimiter + durable
@@ -13316,7 +13827,254 @@ mod tests {
         })
     }
 
-    fn has_rate_limit_skip(ledger: &[ProviderAttempt]) -> bool {
+    fn overflow_review_config(server: &MockServer, policy: &str) -> Config {
+let mut config = create_test_config();
+config.retry.max_retries_per_provider = 0;
+let mut provider = test_provider("primary", server.uri());
+provider.rate_limit_per_minute = 1;
+provider.rate_limit_max_wait_ms = Some(0);
+config.providers = vec![provider];
+let mut model = test_model("primary", 1);
+model.context_window = 8192;
+model.cost_per_million_input_tokens = 1_000_000.0;
+model.cost_per_million_output_tokens = 1_000_000.0;
+config.model_groups = vec![test_group(vec![model])];
+config.context.proactive_enforcement = true;
+config.context.overflow_policy = policy.to_string();
+config
+}
+
+fn overflow_review_request() -> OpenAIRequest {
+let mut request = compression_request(false);
+request.messages = (0..700).map(|index| Message {
+role: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
+content: serde_json::json!(format!("turn {index} with some padding text to fill the context window and exceed its budget.")),
+extra: Default::default(),
+}).collect();
+request
+}
+
+#[tokio::test]
+async fn forced_reduce_success_runs_search_interception_and_records_metrics_cost() {
+use wiremock::matchers::{method, path};
+let upstream = MockServer::start().await;
+Mock::given(method("POST"))
+.and(path("/v1/chat/completions"))
+.respond_with(ResponseTemplate::new(200).set_body_json(search_call_response()))
+.expect(1)
+.mount(&upstream).await;
+let router = Router::new(Arc::new(RwLock::new(overflow_review_config(&upstream, "route_then_reduce"))), test_metrics());
+let request = overflow_review_request();
+let response = router.route_request(&request, None).await.unwrap();
+let choice = &response.choices[0];
+assert!(!choice.message.content_as_text().is_empty());
+assert!(!choice.message.extra.get("tool_calls").and_then(|calls| calls.as_array())
+.is_some_and(|calls| calls.iter().any(|call| call["function"]["name"] == "codex_search")));
+assert!(response.extra["gateway_cost"].as_f64().unwrap() > 0.0);
+assert!(response.extra.contains_key("gateway_compression"));
+assert!(response.extra.contains_key("gateway_context_reduction"));
+let snapshot = router.metrics.snapshot();
+let health = snapshot.provider_health.iter().find(|health| health.provider == "primary").unwrap();
+assert_eq!(health.successful_requests, 1);
+assert_eq!(health.failed_requests, 0);
+assert!(router.metrics.current_provider_cost_usd("primary") > 0.0);
+assert!(tokens_left(&router, "primary").await < 0.1);
+upstream.verify().await;
+}
+
+#[tokio::test]
+async fn forced_reduce_gate_reject_refunds_token_and_records_attempt() {
+use wiremock::matchers::{method, path};
+let upstream = MockServer::start().await;
+Mock::given(method("POST"))
+.and(path("/v1/chat/completions"))
+.respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+.mount(&upstream).await;
+let router = Router::new(Arc::new(RwLock::new(overflow_review_config(&upstream, "route_then_reduce"))), test_metrics());
+let mut request = compression_request(false);
+request.messages[0].role = "system".to_string();
+request.messages[0].content = serde_json::json!("unremovable instructions ".repeat(10_000));
+let handle = ledger_handle();
+let error = router.route_request(&request, Some(handle.clone())).await.unwrap_err();
+assert!(matches!(error, GatewayError::ContextCapacityExceeded { .. }));
+assert_eq!(chat_requests(&upstream).await, 0);
+assert_eq!(tokens_left(&router, "primary").await, 1.0);
+let ledger = handle.take_failed_attempts();
+assert_eq!(ledger.len(), 2, "initial skip and forced-reduce rejection: {ledger:?}");
+assert!(ledger.iter().all(|attempt| attempt.error_class.as_deref() == Some(CONTEXT_WINDOW_EXCEEDED_CLASS)
+&& attempt.status_code == Some(413)));
+router.route_request(&compression_request(false), None).await.unwrap();
+assert_eq!(chat_requests(&upstream).await, 1);
+}
+
+#[tokio::test]
+async fn streaming_passthrough_context_reject_returns_413_without_send() {
+use wiremock::matchers::{method, path};
+let upstream = MockServer::start().await;
+Mock::given(method("POST"))
+.and(path("/v1/chat/completions"))
+.respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+.expect(0)
+.mount(&upstream).await;
+let mut config = overflow_review_config(&upstream, "reject");
+config.streaming = Some(crate::config::StreamingConfig {
+passthrough_enabled: true,
+..Default::default()
+});
+let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+let mut request = overflow_review_request();
+request.stream = true;
+let error = match router.route_request_streaming(&request, None).await {
+Err(error) => error,
+Ok(_) => panic!("oversized pass-through must be rejected"),
+};
+assert!(matches!(error, GatewayError::ContextCapacityExceeded { .. }));
+assert_eq!(axum::response::IntoResponse::into_response(error).status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+assert_eq!(tokens_left(&router, "primary").await, 1.0);
+upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_context_gate_rejects_without_send_and_refunds_admission() {
+let upstream = MockServer::start().await;
+let mut config = overflow_review_config(&upstream, "reject");
+config.providers[0].auth_method = Some("oauth".to_string());
+config.providers[0].codex_base_url_override = Some(upstream.uri());
+let instructions = Arc::new(crate::codex::InstructionsStore::new(&config).await.unwrap());
+let (mut router, token_path) = codex_search_router(config, &upstream).await;
+router.set_instructions_store(instructions);
+let handle = ledger_handle();
+assert!(matches!(router.route_request(&overflow_review_request(), Some(handle.clone())).await,
+Err(GatewayError::ContextCapacityExceeded { .. })));
+assert_eq!(tokens_left(&router, "primary").await, 1.0);
+assert!(upstream.received_requests().await.unwrap().is_empty());
+let ledger = handle.take_failed_attempts();
+assert_eq!(ledger.len(), 1);
+assert_eq!(ledger[0].error_class.as_deref(), Some(CONTEXT_WINDOW_EXCEEDED_CLASS));
+let _ = std::fs::remove_file(token_path);
+}
+
+#[tokio::test]
+async fn router_summary_trigger_applies_before_full_budget_is_exceeded() {
+use wiremock::matchers::{method, path};
+let upstream = MockServer::start().await;
+Mock::given(method("POST"))
+.and(path("/v1/chat/completions"))
+.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+"choices": [{"message": {"role": "assistant", "content": "Goals: continue work."}}]
+})))
+.expect(1)
+.mount(&upstream).await;
+let mut config = overflow_review_config(&upstream, "reduce");
+config.context.reduction_strategy = "summarize_then_trim".to_string();
+config.context.summarize_model = Some("upstream-model".to_string());
+config.context.summarize_trigger_percent = 80;
+config.context.summarize_target_percent = 65;
+let model = config.model_groups[0].models[0].clone();
+let context_config = config.context.clone();
+let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+let mut request = overflow_review_request();
+while ContextBudgetGate::check(&request, model.context_window, 0).estimate > 6400 {
+request.messages.remove(0);
+}
+let check = ContextBudgetGate::check(&request, model.context_window, 0);
+assert!(check.fits);
+assert!(u64::from(check.estimate) * 100 > u64::from(check.budget) * 80);
+let original_len = request.messages.len();
+let (_, outcome) = router.enforce_context_budget(&request, &model, &context_config, false)
+.await.unwrap().expect("above trigger must summarize despite fitting the hard budget");
+assert!(outcome.summarized);
+assert!(outcome.fits);
+assert_eq!(request.messages.len(), original_len);
+let mut below_trigger = context_config.clone();
+below_trigger.summarize_trigger_percent = 100;
+assert!(router.enforce_context_budget(&request, &model, &below_trigger, false).await.unwrap().is_none());
+upstream.verify().await;
+}
+
+#[tokio::test]
+async fn bedrock_api_key_context_gate_rejects_before_client_construction() {
+    let upstream = MockServer::start().await;
+    let mut config = overflow_review_config(&upstream, "reject");
+    config.providers[0].provider_type = "bedrock".to_string();
+    config.providers[0].resolved_api_key = Some("test-key".to_string());
+    let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+    assert!(matches!(router.route_request(&overflow_review_request(), None).await,
+        Err(GatewayError::ContextCapacityExceeded { .. })));
+    assert_eq!(tokens_left(&router, "primary").await, 1.0);
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+/// N-6 regression: when every candidate is gate-skipped, the 413's
+/// `largest_supported_context` must report the LARGEST skipped window (the
+/// truthful "best the chain could offer"), not the first skipped
+/// candidate's window, and the requirement includes the reserved output
+/// and safety margin rather than the bare prompt estimate.
+#[tokio::test]
+async fn route_larger_context_all_skips_report_largest_window_and_total_requirement() {
+    use wiremock::matchers::{method, path};
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    // First candidate has the SMALL window so a first-skip-based value
+    // would be wrong; the larger second window must win.
+    let mut config = create_test_config();
+    config.retry.max_retries_per_provider = 0;
+    config.providers = vec![test_provider("small", upstream.uri())];
+    let mut small = test_model("small", 1);
+    small.context_window = 8_192;
+    let mut large = test_model("small", 2);
+    large.context_window = 32_768;
+    config.model_groups = vec![test_group(vec![small, large])];
+    config.context.proactive_enforcement = true;
+    config.context.overflow_policy = "route_larger_context".to_string();
+    let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+
+    // ~3,000 padded turns ≈ 60k tokens: over the small budget (7,168) AND
+    // the large budget (32,768 − 1,638 = 31,130), so every candidate is
+    // gate-skipped and nothing dispatches.
+    let mut request = compression_request(false);
+    request.messages = (0..3_000)
+        .map(|index| Message {
+            role: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
+            content: serde_json::json!(format!(
+                "turn {index} with some padding text to fill the context window and exceed its budget."
+            )),
+            extra: Default::default(),
+        })
+        .collect();
+    let bare_estimate =
+        crate::compression::token_counter::TokenCounter::new().count_request(&request) as u64;
+
+    let error = router.route_request(&request, None).await.unwrap_err();
+    let GatewayError::ContextCapacityExceeded {
+        estimated_requirement,
+        largest_supported_context,
+    } = error
+    else {
+        panic!("all-skips must surface the normalized 413, got {error:?}");
+    };
+    assert_eq!(largest_supported_context, Some(32_768));
+    // The requirement is the full gate figure (prompt estimate + per-skip
+    // output reservation and safety margin), strictly above the bare
+    // prompt count and above the largest window's input budget.
+    assert!(
+        estimated_requirement > bare_estimate,
+        "requirement must include reserved output + margin, got {estimated_requirement} vs bare {bare_estimate}"
+    );
+    assert!(
+        estimated_requirement > 31_130,
+        "requirement should reflect the total context need, got {estimated_requirement}"
+    );
+    assert_eq!(chat_requests(&upstream).await, 0);
+    upstream.verify().await;
+}
+
+fn has_rate_limit_skip(ledger: &[ProviderAttempt]) -> bool {
         ledger
             .iter()
             .any(|a| a.error_class.as_deref() == Some("rate_limit_skip"))

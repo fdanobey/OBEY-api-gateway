@@ -1157,6 +1157,41 @@ pub struct ContextConfig {
     /// and no limit can be parsed from the provider error. Defaults to 32768.
     #[serde(default = "default_context_window")]
     pub default_context_window: u32,
+    /// Check the context budget before every upstream request. Defaults to
+    /// false (today's reactive behavior).
+    #[serde(default)]
+    pub proactive_enforcement: bool,
+    /// What happens when a request cannot fit the selected model:
+    /// "reject", "route_larger_context", "reduce", or "route_then_reduce".
+    #[serde(default = "default_overflow_policy")]
+    pub overflow_policy: String,
+    /// How context is reduced when the policy calls for reduction:
+    /// "remove_oldest", "sliding_window", "clear_tools_then_remove",
+    /// or "summarize_then_trim".
+    #[serde(default = "default_reduction_strategy")]
+    pub reduction_strategy: String,
+    /// Number of recent tool results kept when clearing old tool outputs.
+    #[serde(default = "default_tool_result_keep_recent")]
+    pub tool_result_keep_recent: usize,
+    /// Tool names whose results are never cleared.
+    #[serde(default)]
+    pub tool_result_exclude_tools: Vec<String>,
+    /// Placeholder text substituted for cleared tool results.
+    #[serde(default = "default_tool_result_placeholder")]
+    pub tool_result_placeholder: String,
+    /// Summary trigger as a percentage of the context budget.
+    #[serde(default = "default_summarize_trigger_percent")]
+    pub summarize_trigger_percent: u32,
+    /// Summary target as a percentage of the context budget.
+    #[serde(default = "default_summarize_target_percent")]
+    pub summarize_target_percent: u32,
+    /// Summarizer model required when reduction_strategy is
+    /// "summarize_then_trim".
+    #[serde(default)]
+    pub summarize_model: Option<String>,
+    /// Timeout for the summarizer call in seconds.
+    #[serde(default = "default_summarize_timeout_seconds")]
+    pub summarize_timeout_seconds: u64,
 }
 
 impl Default for ContextConfig {
@@ -1168,6 +1203,16 @@ impl Default for ContextConfig {
             capabilities_cache_ttl_seconds: 3600,
             max_truncation_retries: 3,
             default_context_window: 32768,
+            proactive_enforcement: false,
+            overflow_policy: default_overflow_policy(),
+            reduction_strategy: default_reduction_strategy(),
+            tool_result_keep_recent: default_tool_result_keep_recent(),
+            tool_result_exclude_tools: Vec::new(),
+            tool_result_placeholder: default_tool_result_placeholder(),
+            summarize_trigger_percent: default_summarize_trigger_percent(),
+            summarize_target_percent: default_summarize_target_percent(),
+            summarize_model: None,
+            summarize_timeout_seconds: default_summarize_timeout_seconds(),
         }
     }
 }
@@ -1190,6 +1235,34 @@ fn default_max_truncation_retries() -> usize {
 
 fn default_context_window() -> u32 {
     32768
+}
+
+fn default_overflow_policy() -> String {
+    "reduce".to_string()
+}
+
+fn default_reduction_strategy() -> String {
+    "remove_oldest".to_string()
+}
+
+fn default_tool_result_keep_recent() -> usize {
+    3
+}
+
+fn default_tool_result_placeholder() -> String {
+    "[Earlier tool output omitted to meet the context budget.]".to_string()
+}
+
+fn default_summarize_trigger_percent() -> u32 {
+    80
+}
+
+fn default_summarize_target_percent() -> u32 {
+    65
+}
+
+fn default_summarize_timeout_seconds() -> u64 {
+    10
 }
 
 /// Streaming reliability configuration.
@@ -1381,6 +1454,82 @@ retry_on_stream_truncation: false
         assert_eq!(cfg.chunk_timeout_seconds, 60);
         assert!(cfg.retry_on_truncation);
         assert!(cfg.retry_on_stream_truncation);
+    }
+
+    // Context Overflow Management, Task 1.3: ContextConfig deserialization
+    // **Validates: Requirements US-4, US-6**
+
+    #[test]
+    fn test_context_config_deserialize_empty_section_applies_defaults() {
+        // An absent or empty `context:` section fills every field from defaults.
+        let cfg: ContextConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg, ContextConfig::default());
+        assert!(!cfg.proactive_enforcement);
+        assert_eq!(cfg.overflow_policy, "reduce");
+        assert_eq!(cfg.reduction_strategy, "remove_oldest");
+        assert_eq!(cfg.tool_result_keep_recent, 3);
+        assert!(cfg.tool_result_exclude_tools.is_empty());
+        assert_eq!(
+            cfg.tool_result_placeholder,
+            "[Earlier tool output omitted to meet the context budget.]"
+        );
+        assert_eq!(cfg.summarize_trigger_percent, 80);
+        assert_eq!(cfg.summarize_target_percent, 65);
+        assert_eq!(cfg.summarize_model, None);
+        assert_eq!(cfg.summarize_timeout_seconds, 10);
+    }
+
+    #[test]
+    fn test_context_config_deserialize_partial_fields_default_the_rest() {
+        let yaml = r#"
+            proactive_enforcement: true
+            overflow_policy: route_then_reduce
+            summarize_model: gpt-4o-mini
+        "#;
+        let cfg: ContextConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.proactive_enforcement);
+        assert_eq!(cfg.overflow_policy, "route_then_reduce");
+        assert_eq!(cfg.summarize_model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(cfg.reduction_strategy, "remove_oldest");
+        assert_eq!(cfg.tool_result_keep_recent, 3);
+        assert!(cfg.tool_result_exclude_tools.is_empty());
+        assert_eq!(
+            cfg.tool_result_placeholder,
+            "[Earlier tool output omitted to meet the context budget.]"
+        );
+        assert_eq!(cfg.summarize_trigger_percent, 80);
+        assert_eq!(cfg.summarize_target_percent, 65);
+        assert_eq!(cfg.summarize_timeout_seconds, 10);
+    }
+
+    #[test]
+    fn test_context_config_deserialize_all_overflow_fields_present() {
+        let yaml = r#"
+            enabled: true
+            truncation_strategy: sliding_window
+            proactive_enforcement: true
+            overflow_policy: reject
+            reduction_strategy: summarize_then_trim
+            tool_result_keep_recent: 5
+            tool_result_exclude_tools: [fetch, search]
+            tool_result_placeholder: "[omitted]"
+            summarize_trigger_percent: 90
+            summarize_target_percent: 50
+            summarize_model: claude-3-5-haiku
+            summarize_timeout_seconds: 30
+        "#;
+        let cfg: ContextConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.proactive_enforcement);
+        assert_eq!(cfg.overflow_policy, "reject");
+        assert_eq!(cfg.reduction_strategy, "summarize_then_trim");
+        assert_eq!(cfg.tool_result_keep_recent, 5);
+        assert_eq!(cfg.tool_result_exclude_tools, vec!["fetch", "search"]);
+        assert_eq!(cfg.tool_result_placeholder, "[omitted]");
+        assert_eq!(cfg.summarize_trigger_percent, 90);
+        assert_eq!(cfg.summarize_target_percent, 50);
+        assert_eq!(cfg.summarize_model.as_deref(), Some("claude-3-5-haiku"));
+        assert_eq!(cfg.summarize_timeout_seconds, 30);
+        assert_eq!(cfg.truncation_strategy, "sliding_window");
     }
 
     #[test]
