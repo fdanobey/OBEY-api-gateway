@@ -13,6 +13,7 @@ use crate::{
         CompressionLevel,
     },
     config::{LoggingConfig, ProviderModel},
+    context::overflow::{ContextReductionStrategy, ReductionOutcome},
     models::openai::Usage as OpenAIUsage,
     router::cache_cost::{compute_actual_cost, extract_cache_usage},
     router::sticky_cache::CacheUsage,
@@ -154,6 +155,54 @@ fn compression_log_metadata_from_json(json: &str) -> Option<CompressionLogMetada
     }
 }
 
+/// Content-free context-reduction metadata persisted with a request log
+/// (context-overflow spec, task 5.1). Mirrors the reduction outcome the
+/// proactive gate produced for the attempt that served the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextReductionLog {
+    pub strategy: String,
+    pub original_tokens: u32,
+    pub final_tokens: u32,
+    pub groups_removed: usize,
+    pub tool_results_cleared: usize,
+    pub summarized: bool,
+    pub fallback_from_summarization: bool,
+}
+
+impl From<&ReductionOutcome> for ContextReductionLog {
+    fn from(outcome: &ReductionOutcome) -> Self {
+        Self {
+            strategy: context_reduction_strategy_label(outcome.strategy_applied).to_owned(),
+            original_tokens: outcome.original_tokens,
+            final_tokens: outcome.final_tokens,
+            groups_removed: outcome.groups_removed,
+            tool_results_cleared: outcome.tool_results_cleared,
+            summarized: outcome.summarized,
+            fallback_from_summarization: outcome.fallback_from_summarization,
+        }
+    }
+}
+
+fn context_reduction_strategy_label(strategy: ContextReductionStrategy) -> &'static str {
+    match strategy {
+        ContextReductionStrategy::RemoveOldest => "remove_oldest",
+        ContextReductionStrategy::SlidingWindow => "sliding_window",
+        ContextReductionStrategy::ClearToolsThenRemove => "clear_tools_then_remove",
+        ContextReductionStrategy::SummarizeThenTrim => "summarize_then_trim",
+    }
+}
+
+fn context_reduction_log_from_json(json: &str) -> Option<ContextReductionLog> {
+    match serde_json::from_str::<ContextReductionLog>(json) {
+        Ok(metadata) => Some(metadata),
+        Err(error) => {
+            tracing::warn!(%error, "Ignoring malformed context reduction log metadata");
+            None
+        }
+    }
+}
+
 /// Log entry for a single request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -212,6 +261,11 @@ pub struct LogEntry {
     /// Always stored, independent of body logging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_class: Option<String>,
+    /// Content-free metadata describing a proactive context reduction
+    /// applied to the attempt that served this request (context-overflow
+    /// spec, task 5.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_reduction: Option<ContextReductionLog>,
 }
 
 impl LogEntry {
@@ -253,6 +307,17 @@ impl LogEntry {
     ) -> Self {
         self.reasoning_tokens = reasoning_tokens;
         self.reasoning_compat_actions = actions;
+        self
+    }
+
+    /// Builder-style setter for the context-reduction telemetry column.
+    ///
+    /// Router-side wiring seam (context-overflow spec, task 5.1): the
+    /// response-extras reader calls `entry.with_context_reduction(outcome)`
+    /// before `logger.log(entry)`; callers without a reduction pass `None`
+    /// and the column stays NULL.
+    pub fn with_context_reduction(mut self, outcome: Option<&ReductionOutcome>) -> Self {
+        self.context_reduction = outcome.map(ContextReductionLog::from);
         self
     }
 }
@@ -435,8 +500,9 @@ impl RequestLogger {
             prefix_hash TEXT,
             reasoning_tokens INTEGER,
             reasoning_compat_actions TEXT,
-            error_class TEXT
-            )",
+            error_class TEXT,
+            context_reduction TEXT
+        )",
         [],
     )?;
 
@@ -453,6 +519,7 @@ impl RequestLogger {
         Self::ensure_column(conn, "reasoning_tokens", "INTEGER")?;
         Self::ensure_column(conn, "reasoning_compat_actions", "TEXT")?;
         Self::ensure_column(conn, "error_class", "TEXT")?;
+        Self::ensure_column(conn, "context_reduction", "TEXT")?;
 
         // Create indexes for common query patterns
         conn.execute(
@@ -825,6 +892,11 @@ fn insert_entry(
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
+    let context_reduction = entry
+        .context_reduction
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
 
     conn.execute(
         "INSERT INTO requests (
@@ -833,10 +905,10 @@ fn insert_entry(
             requested_model, responded_model, compression_metadata, compression_level,
             memories_injected, memories_stored, injection_tokens, detected_project,
             cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
-            reasoning_tokens, reasoning_compat_actions, error_class
+            reasoning_tokens, reasoning_compat_actions, error_class, context_reduction
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
         )",
         params![
             entry.trace_id,
@@ -865,6 +937,7 @@ fn insert_entry(
             entry.reasoning_tokens.map(i64::from),
             entry.reasoning_compat_actions,
             entry.error_class,
+            context_reduction,
         ],
     )?;
 
@@ -873,7 +946,7 @@ fn insert_entry(
 
 /// Query log entries with optional filtering. Runs on the writer thread.
 fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
-    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class FROM requests WHERE 1=1");
+    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class, context_reduction FROM requests WHERE 1=1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     if let Some(ref trace_id) = filter.trace_id {
@@ -932,6 +1005,10 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
             let compression = compression_json
                 .as_deref()
                 .and_then(compression_log_metadata_from_json);
+            let context_reduction_json: Option<String> = row.get(25)?;
+            let context_reduction = context_reduction_json
+                .as_deref()
+                .and_then(context_reduction_log_from_json);
 
             Ok(LogEntry {
                 trace_id: row.get(0)?,
@@ -961,6 +1038,7 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
                 .and_then(|tokens| u32::try_from(tokens).ok()),
             reasoning_compat_actions: row.get(23)?,
             error_class: row.get(24)?,
+            context_reduction,
         })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1045,13 +1123,14 @@ mod tests {
         cache_creation_tokens: None,
         cache_savings_cents: None,
         prefix_hash: None,
-    reasoning_tokens: None,
-    reasoning_compat_actions: None,
-    error_class: None,
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
+        error_class: None,
+        context_reduction: None,
     }
 }
 
-    fn sample_compression(level: CompressionLevel) -> CompressionLogMetadata {
+fn sample_compression(level: CompressionLevel) -> CompressionLogMetadata {
         CompressionLogMetadata {
             compression_level: compression_level_label(level).to_owned(),
             original_tokens: 1_000,
@@ -1202,6 +1281,7 @@ mod tests {
             .unwrap();
     assert!(columns.contains(&"compression_metadata".to_owned()));
     assert!(columns.contains(&"compression_level".to_owned()));
+    assert!(columns.contains(&"context_reduction".to_owned()));
 }
 
 #[test]
@@ -1543,6 +1623,58 @@ fn error_class_column_migrates_and_round_trips() {
 }
 
 #[test]
+fn context_reduction_round_trips_and_serializes_into_api_payload() {
+    let (logger, _temp) = create_test_logger();
+    let outcome = ReductionOutcome {
+        strategy_applied: ContextReductionStrategy::ClearToolsThenRemove,
+        original_tokens: 12_000,
+        final_tokens: 7_000,
+        budget: 7_168,
+        groups_removed: 3,
+        tool_results_cleared: 4,
+        summarized: true,
+        fallback_from_summarization: true,
+        fits: true,
+    };
+    let entry = sample_entry("reduced-turn", None).with_context_reduction(Some(&outcome));
+    logger.log(entry).unwrap();
+
+    let rows = logger
+        .query(LogFilter {
+            trace_id: Some("reduced-turn".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let reduction = rows[0].context_reduction.as_ref().expect("row carries reduction");
+    assert_eq!(reduction.strategy, "clear_tools_then_remove");
+    assert_eq!(reduction.original_tokens, 12_000);
+    assert_eq!(reduction.final_tokens, 7_000);
+    assert_eq!(reduction.groups_removed, 3);
+    assert_eq!(reduction.tool_results_cleared, 4);
+    assert!(reduction.summarized);
+    assert!(reduction.fallback_from_summarization);
+
+    // The /dashboard/logs payload serializes the structured object.
+    let payload = serde_json::to_value(&rows[0]).unwrap();
+    assert_eq!(payload["context_reduction"]["strategy"], "clear_tools_then_remove");
+    assert_eq!(payload["context_reduction"]["original_tokens"], 12_000);
+    assert_eq!(payload["context_reduction"]["final_tokens"], 7_000);
+
+    logger.log(sample_entry("unreduced", None)).unwrap();
+    let rows = logger
+        .query(LogFilter {
+            trace_id: Some("unreduced".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].context_reduction.is_none());
+    let payload = serde_json::to_value(&rows[0]).unwrap();
+    assert!(payload.get("context_reduction").is_none());
+}
+
+#[test]
 fn encode_prefix_hash_is_sixteen_lowercase_hex_digits() {
     assert_eq!(encode_prefix_hash(0), "0000000000000000");
     assert_eq!(encode_prefix_hash(u64::MAX), "ffffffffffffffff");
@@ -1763,6 +1895,7 @@ fn compute_cache_savings_cents_prices_cached_turns() {
         reasoning_tokens: None,
         reasoning_compat_actions: None,
         error_class: None,
+        context_reduction: None,
         };
 
         logger.log(entry.clone()).unwrap();
@@ -1889,6 +2022,7 @@ fn compute_cache_savings_cents_prices_cached_turns() {
         reasoning_tokens: None,
         reasoning_compat_actions: None,
         error_class: None,
+        context_reduction: None,
         };
 
         logger.log(old_entry).unwrap();
@@ -1920,6 +2054,7 @@ fn compute_cache_savings_cents_prices_cached_turns() {
         reasoning_tokens: None,
         reasoning_compat_actions: None,
         error_class: None,
+        context_reduction: None,
         };
 
         logger.log(recent_entry).unwrap();
@@ -2001,6 +2136,7 @@ mod property_tests {
                     reasoning_tokens: None,
                     reasoning_compat_actions: None,
                     error_class: None,
+                    context_reduction: None,
                     }
                 },
             )
@@ -2095,6 +2231,7 @@ mod property_tests {
             reasoning_tokens: None,
             reasoning_compat_actions: None,
             error_class: None,
+            context_reduction: None,
             };
 
             logger.log(entry.clone()).unwrap();
@@ -2169,6 +2306,7 @@ mod property_tests {
             reasoning_tokens: None,
             reasoning_compat_actions: None,
             error_class: None,
+            context_reduction: None,
             };
 
             logger.log(entry).unwrap();
@@ -2240,6 +2378,7 @@ mod property_tests {
             reasoning_tokens: None,
             reasoning_compat_actions: None,
             error_class: None,
+            context_reduction: None,
             };
 
             logger.log(entry).unwrap();
@@ -2309,6 +2448,7 @@ mod property_tests {
             reasoning_tokens: None,
             reasoning_compat_actions: None,
             error_class: None,
+            context_reduction: None,
             };
 
             logger.log(entry).unwrap();
@@ -2389,6 +2529,7 @@ mod property_tests {
             reasoning_tokens: None,
             reasoning_compat_actions: None,
             error_class: None,
+            context_reduction: None,
             };
 
             logger.log(entry).unwrap();

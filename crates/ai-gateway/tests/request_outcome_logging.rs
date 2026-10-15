@@ -277,3 +277,184 @@ async fn all_providers_failed_logs_attempt_rows() {
         .iter()
         .all(|row| row.status_code == 500 && row.error_class.as_deref() == Some("upstream_http_500")));
 }
+
+// ─── Context-overflow observability (context-overflow spec, task 5.2) ──────
+
+/// ~20 tokens per message: 700 messages ≈ 14k tokens — over the small
+/// budget (8192-1024=7168), under the large budget (32768-1638=31130).
+fn overflowing_messages() -> Vec<serde_json::Value> {
+    (0..700)
+        .map(|i| {
+            serde_json::json!({
+                "role": if i % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("OVERFLOW-MARKER turn {i} with padding text to fill the window.")
+            })
+        })
+        .collect()
+}
+
+/// Two-provider config with proactive enforcement: `small` (window 8192,
+/// priority 1) and `large` (window 32768, priority 2), reduction strategy
+/// `remove_oldest`, and the given overflow policy.
+fn overflow_outcome_config(policy: &str, small: &str, large: &str) -> Config {
+    let mut config: Config = serde_json::from_value(serde_json::json!({
+        "server": { "host": "127.0.0.1", "port": 0 },
+        "providers": [
+            { "name": "small", "type": "openai", "base_url": small },
+            { "name": "large", "type": "openai", "base_url": large }
+        ],
+        "model_groups": [{
+            "name": "outcome-group",
+            "models": [
+                { "provider": "small", "model": "gpt-4", "priority": 1, "context_window": 8192 },
+                { "provider": "large", "model": "gpt-4", "priority": 2, "context_window": 32768 }
+            ]
+        }],
+        "context": {
+            "enabled": true,
+            "proactive_enforcement": true,
+            "overflow_policy": policy,
+            "reduction_strategy": "remove_oldest"
+        }
+    }))
+    .expect("overflow outcome config should deserialize");
+    config.retry.max_retries_per_provider = 0;
+    config.retry.backoff_sequence_seconds = vec![0];
+    config.retry.jitter_enabled = false;
+    config
+}
+
+#[tokio::test]
+async fn reduce_policy_outcome_row_carries_context_reduction() {
+    let small = MockServer::start().await;
+    let large = MockServer::start().await;
+    // The over-budget small provider serves the REDUCED copy successfully;
+    // the outcome row must carry the reduction metadata of that dispatch.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_body()))
+        .mount(&small)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_body()))
+        .mount(&large)
+        .await;
+    let mut config = overflow_outcome_config("reduce", &small.uri(), &large.uri());
+    common::isolate_databases(&mut config);
+    let server = GatewayServer::new(config, None).await.unwrap();
+
+    let response = server
+        .build_router()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "outcome-group",
+                        "messages": overflowing_messages()
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = poll_logs(&server, Duration::from_secs(5), |rows| {
+        rows.iter().any(|row| row.path == OUTCOME_PATH && row.context_reduction.is_some())
+    })
+    .await;
+
+    let outcomes: Vec<&LogEntry> = rows
+        .iter()
+        .filter(|row| row.path == OUTCOME_PATH && row.status_code == 200)
+        .collect();
+    assert_eq!(outcomes.len(), 1, "{rows:?}");
+    let outcome = outcomes[0];
+    assert_eq!(outcome.provider, "small", "reduced small attempt served it");
+    let reduction = outcome
+        .context_reduction
+        .as_ref()
+        .expect("outcome row carries the reduction metadata");
+    assert_eq!(reduction.strategy, "remove_oldest");
+    assert!(!reduction.summarized);
+    assert!(!reduction.fallback_from_summarization);
+    // ~14k-token request reduced into the 7168-token small budget.
+    assert!(reduction.original_tokens > 7_168, "{reduction:?}");
+    assert!(reduction.final_tokens <= 7_168, "{reduction:?}");
+    assert!(reduction.final_tokens < reduction.original_tokens);
+    assert!(reduction.groups_removed > 0);
+    assert_eq!(reduction.tool_results_cleared, 0);
+
+    // Nothing failed: no #attempt rows for this request.
+    let attempt_rows: Vec<&LogEntry> = rows
+        .iter()
+        .filter(|row| row.path == ATTEMPT_PATH && row.trace_id == outcome.trace_id)
+        .collect();
+    assert!(attempt_rows.is_empty(), "{rows:?}");
+}
+
+#[tokio::test]
+async fn route_larger_context_skip_attempt_row_carries_context_window_exceeded() {
+    let small = MockServer::start().await;
+    let large = MockServer::start().await;
+    for upstream in [&small, &large] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_body()))
+            .mount(upstream)
+            .await;
+    }
+    let mut config = overflow_outcome_config(
+        "route_larger_context",
+        &small.uri(),
+        &large.uri(),
+    );
+    common::isolate_databases(&mut config);
+    let server = GatewayServer::new(config, None).await.unwrap();
+
+    let response = server
+        .build_router()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "outcome-group",
+                        "messages": overflowing_messages()
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = poll_logs(&server, Duration::from_secs(5), |rows| {
+        rows.iter().any(|row| row.path == ATTEMPT_PATH
+            && row.error_class.as_deref() == Some("context_window_exceeded"))
+            && rows.iter().any(|row| row.path == OUTCOME_PATH && row.status_code == 200)
+    })
+    .await;
+
+    // Gate-excluded candidate: #attempt row with the normalized overflow
+    // class and a 413 status, sharing the outcome's trace_id.
+    let outcomes: Vec<&LogEntry> = rows
+        .iter()
+        .filter(|row| row.path == OUTCOME_PATH && row.status_code == 200)
+        .collect();
+    assert_eq!(outcomes.len(), 1, "{rows:?}");
+    let skip_rows: Vec<&LogEntry> = rows
+        .iter()
+        .filter(|row| row.path == ATTEMPT_PATH && row.error_class.as_deref() == Some("context_window_exceeded"))
+        .collect();
+    assert_eq!(skip_rows.len(), 1, "{rows:?}");
+    assert_eq!(skip_rows[0].provider, "small");
+    assert_eq!(skip_rows[0].status_code, 413);
+    assert_eq!(skip_rows[0].trace_id, outcomes[0].trace_id);
+    // A gate skip is a routing decision, not a reduction: no metadata.
+    assert!(skip_rows[0].context_reduction.is_none());
+}

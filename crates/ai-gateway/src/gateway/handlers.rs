@@ -117,6 +117,9 @@ struct RequestLogContext {
     reasoning_compat_actions: Option<String>,
     /// Content-free failure class for error outcomes (`error_class_for`).
     error_class: Option<String>,
+    /// Content-free metadata of the proactive context reduction applied to
+    /// the attempt that served this request (context-overflow spec 5.1).
+    context_reduction: Option<crate::logger::ContextReductionLog>,
 }
 
 impl RequestLogContext {
@@ -223,14 +226,31 @@ impl RequestLogContext {
                 .get("gateway_reasoning_tokens")
                 .and_then(|v| v.as_u64())
                 .and_then(|v| u32::try_from(v).ok()),
-            reasoning_compat_actions: response
+        reasoning_compat_actions: response
+            .extra
+            .get("gateway_reasoning_compat_actions")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+            // Context-reduction log telemetry (task 5.1): the per-attempt
+            // dispatch attaches the gate's reduction outcome on the success
+            // path; the handler strips the key before the client sees it.
+            // Malformed metadata degrades to None with a content-free warn
+            // (never logs the request, message bodies, or the metadata
+            // itself — it may carry reduction counts only, but the warn
+            // stays minimal regardless).
+            context_reduction: response
                 .extra
-                .get("gateway_reasoning_compat_actions")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            error_class: None,
-        }
+                .get("gateway_context_reduction")
+                .and_then(|value| match serde_json::from_value::<crate::logger::ContextReductionLog>(value.clone()) {
+                    Ok(metadata) => Some(metadata),
+                    Err(error) => {
+                        tracing::warn!(%error, "Ignoring malformed context-reduction log metadata");
+                        None
+                    }
+                }),
+        error_class: None,
     }
+}
 
     fn from_streaming_success(
         request: &OpenAIRequest,
@@ -258,14 +278,15 @@ impl RequestLogContext {
             cache_creation_tokens: None,
             cache_savings_cents: None,
             prefix_hash: None,
-            // Pass-through streams have no response extras to read; the
-            // reasoning usage itself is attributed to metrics inside
-            // `record_streaming_success`.
-            reasoning_tokens: None,
-            reasoning_compat_actions: None,
-            error_class: None,
-        }
+        // Pass-through streams have no response extras to read; the
+        // reasoning usage itself is attributed to metrics inside
+        // `record_streaming_success`.
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
+        context_reduction: None,
+        error_class: None,
     }
+}
 
     fn from_error(
         request: &OpenAIRequest,
@@ -309,13 +330,17 @@ impl RequestLogContext {
             detected_project: None,
             cache_read_tokens: None,
             cache_creation_tokens: None,
-            cache_savings_cents: None,
-            prefix_hash: None,
-            reasoning_tokens: None,
-            reasoning_compat_actions: None,
-            error_class: Some(crate::error::error_class_for(error)),
-        }
+        cache_savings_cents: None,
+        prefix_hash: None,
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
+        // Error paths carry no reduction: the request never completed, and
+        // gate-skipped attempts surface as context_window_exceeded
+        // `#attempt` rows instead.
+        context_reduction: None,
+        error_class: Some(crate::error::error_class_for(error)),
     }
+}
 }
 
 /// Write the terminal outcome row for a chat request: first drain the
@@ -372,6 +397,7 @@ fn log_request(state: &super::AppState, request: &OpenAIRequest, context: &Reque
         reasoning_tokens: context.reasoning_tokens,
         reasoning_compat_actions: context.reasoning_compat_actions.clone(),
         error_class: context.error_class.clone(),
+        context_reduction: context.context_reduction.clone(),
     };
     if let Err(e) = state.logger.log(entry) {
         tracing::warn!(error = %e, trace_id = %context.trace_id, "Failed to write request log entry");
@@ -436,15 +462,16 @@ fn log_failed_attempts(
             cache_creation_tokens: None,
             cache_savings_cents: None,
             prefix_hash: None,
-            reasoning_tokens: None,
-            reasoning_compat_actions: None,
-            error_class: Some(
-                attempt
-                    .error_class
-                    .clone()
-                    .unwrap_or_else(|| "other".to_string()),
-            ),
-        };
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
+        context_reduction: None,
+        error_class: Some(
+            attempt
+                .error_class
+                .clone()
+                .unwrap_or_else(|| "other".to_string()),
+        ),
+    };
         if let Err(e) = logger.log(entry) {
             tracing::warn!(
                 error = %e,
@@ -470,6 +497,7 @@ fn strip_gateway_response_metadata(response: &mut OpenAIResponse) {
     response.extra.remove("gateway_prefix_hash");
     response.extra.remove("gateway_reasoning_tokens");
     response.extra.remove("gateway_reasoning_compat_actions");
+    response.extra.remove("gateway_context_reduction");
 }
 
 fn prepare_response_for_client(response: &OpenAIResponse) -> OpenAIResponse {
@@ -1384,10 +1412,11 @@ impl AbandonLogger {
             cache_creation_tokens: None,
             cache_savings_cents: None,
             prefix_hash: None,
-            reasoning_tokens: None,
-            reasoning_compat_actions: None,
-            error_class: Some(error_class.to_string()),
-        };
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
+        context_reduction: None,
+        error_class: Some(error_class.to_string()),
+    };
         tracing::info!(
             trace_id = %trace_id,
             status_code,

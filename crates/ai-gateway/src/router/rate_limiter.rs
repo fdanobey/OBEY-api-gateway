@@ -252,6 +252,22 @@ impl RateLimiter {
         state.tokens -= 1.0;
     }
 
+    /// Return one admission token taken for a candidate that was never
+    /// dispatched (ADR 0002: exactly one token per real upstream request — a
+    /// gate-skipped candidate consumes nothing).
+    ///
+    /// The inverse of [`Self::debit`]: adds one token back, capped at capacity.
+    /// No-op for unlimited buckets (`requests_per_minute == 0` never
+    /// consumed one).
+    pub async fn refund(&self) {
+        if self.requests_per_minute == 0 {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        self.refill_tokens_internal(&mut state);
+        state.tokens = (state.tokens + 1.0).min(self.capacity as f64);
+    }
+
     /// Refill tokens based on elapsed time since last refill
     /// Internal method that operates on already-locked state
     fn refill_tokens_internal(&self, state: &mut RateLimiterState) {
