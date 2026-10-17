@@ -644,9 +644,9 @@ fn mime_from_path(path: &str) -> &'static str {
     }
 }
 
-// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Tool Compression Dashboard Handlers Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// ─── Tool Compression Dashboard Handlers ─────────────────────────────────
 
-/// GET /dashboard/tool-compression/config Ã¢â‚¬â€ serve current tool compression config as JSON.
+/// GET /dashboard/tool-compression/config — serve current tool compression config as JSON.
 async fn tool_compression_config_handler(State(state): State<AppState>) -> Response {
     let config = state.config.read().await;
     let tc_config = &config.tool_compression;
@@ -657,7 +657,7 @@ async fn tool_compression_config_handler(State(state): State<AppState>) -> Respo
         .into_response()
 }
 
-/// GET /dashboard/tool-compression/overrides Ã¢â‚¬â€ serve per-model-group overrides.
+/// GET /dashboard/tool-compression/overrides — serve per-model-group overrides.
 async fn tool_compression_overrides_handler(State(state): State<AppState>) -> Response {
     let config = state.config.read().await;
     let overrides = &config.tool_compression.model_group_overrides;
@@ -668,7 +668,7 @@ async fn tool_compression_overrides_handler(State(state): State<AppState>) -> Re
         .into_response()
 }
 
-/// GET /dashboard/tool-compression/stats Ã¢â‚¬â€ serve real-time compression statistics.
+/// GET /dashboard/tool-compression/stats — serve real-time compression statistics.
 async fn tool_compression_stats_handler(State(state): State<AppState>) -> Response {
     let tc_state = &state.tool_compression_state;
 
@@ -703,7 +703,7 @@ async fn tool_compression_stats_handler(State(state): State<AppState>) -> Respon
     (StatusCode::OK, Json(stats)).into_response()
 }
 
-/// POST /dashboard/tool-compression/test Ã¢â‚¬â€ apply compression to sample input.
+/// POST /dashboard/tool-compression/test — apply compression to sample input.
 ///
 /// Accepts `{"tools": [...]}`, runs the configured compression pipeline stages,
 /// and returns a side-by-side comparison of original vs compressed output with
@@ -837,7 +837,7 @@ async fn tool_compression_test_handler(
         .into_response()
 }
 
-/// GET /dashboard/tool-compression/activity Ã¢â‚¬â€ pruning and disclosure activity.
+/// GET /dashboard/tool-compression/activity — pruning and disclosure activity.
 async fn tool_compression_activity_handler(State(state): State<AppState>) -> Response {
     let tc_state = &state.tool_compression_state;
     let config = state.config.read().await;
@@ -1359,6 +1359,7 @@ reasoning_compat: Default::default(),
             reasoning_tokens: None,
             reasoning_compat_actions: None,
             error_class: None,
+            context_reduction: None,
         })
         .unwrap();
     }
@@ -1420,6 +1421,7 @@ reasoning_compat: Default::default(),
             reasoning_tokens: None,
             reasoning_compat_actions: None,
             error_class: None,
+            context_reduction: None,
         })
         .unwrap();
 
@@ -1475,6 +1477,7 @@ reasoning_compat: Default::default(),
             reasoning_tokens: None,
             reasoning_compat_actions: None,
             error_class: error_class.map(str::to_owned),
+            context_reduction: None,
         }
     }
 

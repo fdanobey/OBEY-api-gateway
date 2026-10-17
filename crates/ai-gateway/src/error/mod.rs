@@ -187,7 +187,8 @@ impl ProviderAttempt {
 /// `chunk_timeout`, `network_error`, `body_read_error`, `stream_truncated`,
 /// `error_in_200`, `rate_limit_skip`, `cooldown_skip`, `circuit_open_skip`,
 /// `budget_skip`, `slot_saturated`, `empty_response`, `reasoning_only`,
-/// `truncated_response`, `client_disconnect`, `gateway_deadline`, `other`.
+/// `truncated_response`, `context_window_exceeded`, `client_disconnect`,
+/// `gateway_deadline`, `other`.
 /// Only the timeout/network/HTTP families can be derived from an error value;
 /// the rest are assigned at the call site that knows the reason.
 pub fn error_class_for(err: &GatewayError) -> String {
@@ -199,6 +200,10 @@ pub fn error_class_for(err: &GatewayError) -> String {
         GatewayError::RateLimitExceeded(_) => "rate_limit_skip".to_string(),
         GatewayError::CircuitBreakerOpen(_) => "circuit_open_skip".to_string(),
         GatewayError::SmartRoutingBudgetExceeded { .. } => "budget_skip".to_string(),
+        // Cloudflare-style normalized overflow class (US-5): proactive
+        // pre-dispatch rejects, smart-routing capacity planning, and reactive
+        // context-length detections all aggregate under this one class.
+        GatewayError::ContextCapacityExceeded { .. } => "context_window_exceeded".to_string(),
         // The outcome of an exhausted failover is the last attempt's failure.
         GatewayError::AllProvidersFailed(agg) => agg
             .attempts

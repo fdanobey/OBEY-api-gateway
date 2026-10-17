@@ -128,11 +128,12 @@ fn log_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> Log
             cache_creation_tokens: None,
             cache_savings_cents: None,
             prefix_hash: None,
-            reasoning_tokens: None,
-            reasoning_compat_actions: None,
-            error_class: None,
-        }
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
+        error_class: None,
+        context_reduction: None,
     }
+}
 
 #[tokio::test]
 async fn compression_event_hub_replays_and_streams_pipeline_stats_with_dashboard_hooks() {

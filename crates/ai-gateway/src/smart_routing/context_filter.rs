@@ -20,6 +20,28 @@ impl ContextRequirement {
             .and_then(|total| total.checked_add(self.safety_margin_tokens))
             .unwrap_or(u64::MAX)
     }
+
+    /// Requirement consistent with the proactive `ContextBudgetGate`: the
+    /// same full-request estimate (`TokenCounter::count_request`, which
+    /// already includes tools/extras/reply priming — never add them twice)
+    /// plus the output reservation and the same safety margin
+    /// (`max(context_window/20, 1024)`-style floor when the window is
+    /// unknown). Used by `reduce_candidates_by_context_capacity` callers so
+    /// a candidate the gate would fit is never ordered as a reduce-candidate
+    /// (and vice versa) — both decisions derive from one budget formula.
+    pub fn from_gate_estimate(request: &crate::models::openai::OpenAIRequest) -> Self {
+        let estimate =
+            crate::compression::token_counter::TokenCounter::new().count_request(request) as u64;
+        // The gate's per-model budget subtracts a window-proportional safety
+        // margin; without a specific window here, use the gate's minimum
+        // margin floor (1_024) so the requirement is never optimistic.
+        Self {
+            input_tokens: estimate,
+            reserved_output_tokens: u64::from(request.max_tokens.unwrap_or(0)),
+            provider_overhead_tokens: 0,
+            safety_margin_tokens: 1_024,
+        }
+    }
 }
 
 /// Successful capacity filtering performed before tier selection.
@@ -52,6 +74,52 @@ pub enum ContextFilterResult {
     },
     /// Candidates were supplied, but every candidate was excluded as unsafe.
     NoSafeCandidate(NoSafeCandidate),
+}
+
+/// Candidates that a reduction policy (`reduce` / `route_then_reduce`) could
+/// still make dispatchable, ordered after the fitting ones.
+///
+/// The proactive context gate (router task 4) is the final arbiter: these are
+/// routing hints, never a dispatch guarantee. A model with an unknown
+/// (`0`) context window is never a reduce-candidate — its capacity is
+/// unknown, not insufficient.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReduceCandidates {
+    /// Over-budget models that a reduction strategy could fit, in group order.
+    pub models: Vec<ProviderModel>,
+    /// The largest declared context window among all inspected candidates.
+    pub largest_known_context: Option<u32>,
+}
+
+/// Split group candidates into fitting and reduce-eligible buckets for a
+/// reduction-tolerant overflow policy (US-2 `reduce` / `route_then_reduce`).
+///
+/// Returns the over-budget candidates (`known window >= 1` and below the
+/// requirement) as [`ReduceCandidates`] so the router can append them after
+/// the fitting candidates instead of silently dropping them (US-7). The hard
+/// exclusion policy of [`filter_by_context_capacity`] is unchanged and used
+/// for `reject` / `route_larger_context` / disabled deployments.
+pub fn reduce_candidates_by_context_capacity(
+    candidates: &[ProviderModel],
+    requirement: ContextRequirement,
+) -> ReduceCandidates {
+    let estimated_requirement = requirement.estimated_tokens();
+    let largest_known_context = candidates
+        .iter()
+        .filter_map(|candidate| (candidate.context_window > 0).then_some(candidate.context_window))
+        .max();
+    let models = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.context_window > 0
+                && u64::from(candidate.context_window) < estimated_requirement
+        })
+        .cloned()
+        .collect();
+    ReduceCandidates {
+        models,
+        largest_known_context,
+    }
 }
 
 /// Filter models by token capacity before any tier selection occurs.
@@ -211,6 +279,69 @@ mod tests {
                 largest_known_context: None,
                 estimated_requirement: 100,
             }
+        );
+    }
+
+    #[test]
+    fn from_gate_estimate_reports_requirement_consistent_with_the_gate() {
+        use crate::models::openai::OpenAIRequest;
+
+        // A request whose counted estimate sits just under a window's
+        // gate budget: from_gate_estimate must derive its requirement from
+        // the same full-request estimate + output reservation + the gate's
+        // minimum safety margin, so a window the gate fits is never a
+        // reduce-candidate and vice versa.
+        let request: OpenAIRequest = serde_json::from_value(serde_json::json!({
+            "model": "some-model",
+            "messages": [
+                {"role": "user", "content": "margin band probe message with a little padding text"}
+            ],
+            "max_tokens": 512
+        }))
+        .unwrap();
+        let estimate =
+            crate::compression::token_counter::TokenCounter::new().count_request(&request) as u64;
+        let requirement = ContextRequirement::from_gate_estimate(&request);
+        assert_eq!(requirement.input_tokens, estimate);
+        assert_eq!(requirement.reserved_output_tokens, 512);
+        assert_eq!(requirement.safety_margin_tokens, 1_024);
+        // estimate + 512 + 1024, no double counting of tools/extras (none
+        // present here; count_request already includes reply priming).
+        assert_eq!(requirement.estimated_tokens(), estimate + 512 + 1_024);
+    }
+
+    #[test]
+    fn reduce_candidates_margin_band_matches_gate_ordering() {
+        // N-3: candidates in the margin band between "prompt fits the gate
+        // budget" and "raw window >= prompt" must be ordered after fitting
+        // candidates exactly when the gate would also skip them — both use
+        // estimate + reserved output + safety margin. Here the requirement
+        // (2_600) exceeds the small window's TOTAL (2_560) but the prompt
+        // alone would fit a naive prompt-only check against the window.
+        let candidates = [
+            model("band", 2_560, SmartRoutingTier::Fast),
+            model("ample", 4_096, SmartRoutingTier::Balanced),
+        ];
+        let required = requirement(2_600, 0, 0, 0);
+
+        let group = reduce_candidates_by_context_capacity(&candidates, required);
+        assert_eq!(
+            group
+                .models
+                .iter()
+                .map(|candidate| candidate.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["band"],
+            "window below the total requirement is a reduce-candidate"
+        );
+
+        // Fitting candidates are never reduce-candidates, even when the
+        // raw window barely clears the requirement.
+        let candidates = [model("just-fits", 2_600, SmartRoutingTier::Fast)];
+        let group = reduce_candidates_by_context_capacity(&candidates, required);
+        assert!(
+            group.models.is_empty(),
+            "window equal to the requirement fits (>=), not a reduce-candidate"
         );
     }
 

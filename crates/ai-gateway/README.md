@@ -154,11 +154,14 @@ prometheus:
 
 # Context management - automatic context window handling
 context:
-  enabled: true
-  truncation_strategy: "remove_oldest"  # "remove_oldest" or "sliding_window"
-  sliding_window_size: 10  # Number of messages to keep (for sliding_window strategy)
-  capabilities_cache_ttl_seconds: 3600  # Cache TTL for model capabilities
-  max_truncation_retries: 3  # Max retries when context exceeds limits
+enabled: true
+truncation_strategy: "remove_oldest" # "remove_oldest" or "sliding_window"
+sliding_window_size: 10 # Number of messages to keep (for sliding_window strategy)
+capabilities_cache_ttl_seconds: 3600 # Cache TTL for model capabilities
+max_truncation_retries: 3 # Max retries when context exceeds limits
+proactive_enforcement: false # Check context budget before dispatch (see Context Management)
+overflow_policy: "reduce" # "reject" | "route_larger_context" | "reduce" | "route_then_reduce"
+reduction_strategy: "remove_oldest" # "remove_oldest" | "sliding_window" | "clear_tools_then_remove" | "summarize_then_trim"
 ```
 
 ## Environment Variables
@@ -310,3 +313,66 @@ The gateway detects context length errors from various provider error messages:
 - `context window`
 - `too many tokens`
 - `input is too long`
+
+### Proactive Overflow Enforcement
+
+Reactive truncation (above) only runs after a provider returns a context-length error. Setting `context.proactive_enforcement: true` (with `context.enabled: true`) additionally checks every outgoing request against the target model's effective input budget **before** dispatch, so oversized requests never waste an upstream call, trip circuit breakers, or get silently excluded by smart routing. The gate defaults to `false` — with it off, the gateway keeps today's reactive behavior and existing deployments are unaffected.
+
+Two settings (also the two dropdowns in the admin panel's Context tab) control what happens when a request cannot fit the selected model:
+
+- **`context.overflow_policy`** — what to do when the request exceeds the model's budget:
+  - `reject` — return an explicit 413 context-window-exceeded error without dispatching
+  - `route_larger_context` — fail over to a larger-context model that fits, preserving the request unchanged; returns 413 if no candidate fits
+  - `reduce` — keep the selected model and reduce the request per the reduction strategy
+  - `route_then_reduce` — try larger-context candidates first; only reduce on the first candidate if none fits
+- **`context.reduction_strategy`** — how context is reduced when the policy calls for reduction:
+  - `remove_oldest` — removes the oldest complete conversation/tool groups (never orphaning tool results), preserving system messages and the most recent exchange
+  - `sliding_window` — keeps only the most recent N messages (`sliding_window_size`), then enforces the token budget with `remove_oldest` as a final pass
+  - `clear_tools_then_remove` — replaces older tool-result contents with a placeholder (preserving `tool_call_id` linkage and message structure), then falls back to `remove_oldest` if still over budget
+  - `summarize_then_trim` — generates a structured summary of older history (goals, decisions, facts, unresolved tasks) via `summarize_model`, inserts it as a `[Conversation summary]` system message, then trims to budget; falls back to `clear_tools_then_remove` on timeout or error
+
+Each provider attempt reduces its own copy of the request — the original client request is never damaged by small-window truncation, so later large-window attempts still see the full context.
+
+#### Configuration Fields
+
+| Field | Default | Purpose |
+|---|---|---|
+| `proactive_enforcement` | `false` | Check the context budget before every upstream request; all behavior above is off by default |
+| `overflow_policy` | `"reduce"` | Overflow behavior: `reject`, `route_larger_context`, `reduce`, or `route_then_reduce` |
+| `reduction_strategy` | `"remove_oldest"` | Reduction method: `remove_oldest`, `sliding_window`, `clear_tools_then_remove`, or `summarize_then_trim` |
+| `tool_result_keep_recent` | `3` | Number of recent tool results kept when clearing old tool outputs |
+| `tool_result_exclude_tools` | `[]` | Tool names whose results are never cleared |
+| `tool_result_placeholder` | `"[Earlier tool output omitted to meet the context budget.]"` | Placeholder text substituted for cleared tool results |
+| `summarize_trigger_percent` | `80` | Invoke summarization only when the estimate strictly exceeds this percentage of the input budget (including before hard overflow under `reduce`); at or below the trigger, use the synchronous clear-tools/trim stages without a summarizer call |
+| `summarize_target_percent` | `65` | Summary target as a percentage of the budget (must be below the trigger; trigger must be ≤ 100) |
+| `summarize_model` | none | Summarizer model — **required** when `reduction_strategy` is `summarize_then_trim` (validation rejects the config otherwise) |
+| `summarize_timeout_seconds` | `10` | Timeout for the summarizer call |
+
+```yaml
+context:
+  enabled: true
+  proactive_enforcement: true
+  overflow_policy: "reduce"
+  reduction_strategy: "clear_tools_then_remove"
+  tool_result_keep_recent: 3
+  tool_result_exclude_tools: ["read_file"]
+  tool_result_placeholder: "[Earlier tool output omitted to meet the context budget.]"
+  summarize_trigger_percent: 80
+  summarize_target_percent: 65
+  summarize_model: "gpt-4o-mini"   # required only for summarize_then_trim
+  summarize_timeout_seconds: 10
+```
+
+**Recommended first enable** for agent-style workloads:
+
+```yaml
+context:
+  enabled: true
+  proactive_enforcement: true
+  overflow_policy: "reduce"
+  reduction_strategy: "clear_tools_then_remove"
+```
+
+This is the least destructive default that protects tool-result freshness: old tool outputs are replaced with a short placeholder while the last 3 tool results stay intact, and oldest messages are removed only if the request is still over budget. `summarize_then_trim` additionally requires `summarize_model` to be set.
+
+Reduction outcomes (strategy applied, original/final token estimates, groups removed, tool results cleared, summarization fallback) are recorded on the attempt ledger and request log with error class `context_window_exceeded`, visible on the dashboard without enabling request-body logging. All of these settings are also available in the admin panel's Context Management tab and round-trip through `GET/PUT /admin/config`.

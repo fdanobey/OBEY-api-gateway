@@ -49,6 +49,7 @@ border-radius:var(--radius);font-size:.875rem;background:var(--surface);color:va
 .form-group input.field-invalid,.form-group select.field-invalid{border-color:var(--danger);box-shadow:0 0 0 3px rgba(220,53,69,.15)}
 
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+.form-row[hidden]{display:none}
 @media(max-width:600px){.form-row{grid-template-columns:1fr}}
 
 fieldset{border:1px solid var(--border);border-radius:var(--radius);padding:1rem;margin-bottom:1.5rem;background:var(--surface)}
@@ -1566,12 +1567,12 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
         </select>
         <div class="hint" id="context-strategy-hint"></div>
       </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label for="context-window-size">Sliding Window Size (messages)</label>
-          <input type="number" id="context-window-size" value="10" min="1" max="100">
-          <div class="hint" id="context-window-size-hint"></div>
-        </div>
+<div class="form-row">
+<div class="form-group" id="context-window-size-group">
+<label for="context-window-size">Sliding Window Size (messages)</label>
+<input type="number" id="context-window-size" value="10" min="1" max="100">
+<div class="hint" id="context-window-size-hint"></div>
+</div>
         <div class="form-group">
           <label for="context-cache-ttl">Model Capabilities Cache TTL (seconds)</label>
           <input type="number" id="context-cache-ttl" value="3600" min="60" max="86400">
@@ -1590,12 +1591,83 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 <div class="hint">Fallback limit when the provider error and model capabilities do not supply a context window. This does not override a model's advertised limit.</div>
 </div>
 </div>
-    </fieldset>
-    <div class="actions">
-      <button class="btn btn-primary" data-action="save">Save</button>
-      <button class="btn btn-secondary" data-action="reset">Reset</button>
-    </div>
-  </section>
+</fieldset>
+
+<fieldset><legend>Context Overflow Management</legend>
+<div class="form-check">
+<input type="checkbox" id="context-proactive">
+<label for="context-proactive">Proactive enforcement</label>
+<div class="hint" style="margin-top:-.25rem">Check the context budget before every upstream request. Default off keeps today's reactive behavior.</div>
+</div>
+<div class="form-group">
+<label for="context-overflow-policy">Context Overflow Policy</label>
+<select id="context-overflow-policy">
+<option value="reject">Reject</option>
+<option value="route_larger_context">Prefer larger-context model</option>
+<option value="reduce">Reduce context to fit (default)</option>
+<option value="route_then_reduce">Prefer larger model, then reduce</option>
+</select>
+<div class="hint">What happens when a request cannot fit the selected model. Only governs overflow handling when proactive enforcement is on.</div>
+</div>
+<div class="form-group">
+<label for="context-reduction-strategy">Context Reduction Strategy</label>
+<select id="context-reduction-strategy">
+<option value="remove_oldest">Remove Oldest Messages</option>
+<option value="sliding_window">Sliding Window</option>
+<option value="clear_tools_then_remove">Clear Old Tool Results, then Remove Oldest</option>
+<option value="summarize_then_trim">Summarize Older History, then Trim</option>
+</select>
+<div class="hint">How context is reduced when the overflow policy calls for reduction.</div>
+</div>
+<div class="form-row" id="context-tool-block" hidden>
+<div class="form-group">
+<label for="context-tool-keep-recent">Keep Recent Tool Results</label>
+<input type="number" id="context-tool-keep-recent" value="3" min="0" max="100">
+<div class="hint">Number of most-recent tool results kept when clearing old tool outputs.</div>
+</div>
+<div class="form-group">
+<label for="context-tool-exclude">Never Clear Tools</label>
+<input type="text" id="context-tool-exclude" placeholder="web_search, read_file">
+<div class="hint">Comma-separated tool names whose results are never cleared.</div>
+</div>
+</div>
+<div class="form-group" id="context-placeholder-block" hidden>
+<label for="context-tool-placeholder">Placeholder Text</label>
+<input type="text" id="context-tool-placeholder" value="[Earlier tool output omitted to meet the context budget.]">
+<div class="hint">Substituted for cleared tool results.</div>
+</div>
+<div id="context-summarize-block" hidden>
+<div class="form-row">
+<div class="form-group">
+<label for="context-summarize-model">Summarizer Model</label>
+<select id="context-summarize-model"><option value="">-- select model --</option></select>
+<div class="hint">Model used to summarize older history. Required for this strategy.</div>
+</div>
+</div>
+<div class="form-row">
+<div class="form-group">
+<label for="context-summarize-trigger">Summary Trigger (% of budget)</label>
+<input type="number" id="context-summarize-trigger" value="80" min="1" max="100">
+<div class="hint">Summarize when the request exceeds this percentage of the context budget.</div>
+</div>
+<div class="form-group">
+<label for="context-summarize-target">Summary Target (% of budget)</label>
+<input type="number" id="context-summarize-target" value="65" min="1" max="100">
+<div class="hint">Reduce to this percentage of the context budget after summarizing.</div>
+</div>
+<div class="form-group">
+<label for="context-summarize-timeout">Summarizer Timeout (seconds)</label>
+<input type="number" id="context-summarize-timeout" value="10" min="1" max="120">
+<div class="hint">On timeout the gateway falls back to clearing old tool results.</div>
+</div>
+</div>
+</div>
+</fieldset>
+<div class="actions">
+<button class="btn btn-primary" data-action="save">Save</button>
+<button class="btn btn-secondary" data-action="reset">Reset</button>
+</div>
+</section>
 
   <!-- Streaming Reliability -->
   <section class="page" id="page-streaming" role="tabpanel" aria-labelledby="tab-streaming">
@@ -2359,12 +2431,36 @@ function refreshModelGroupModels() {
     clearError(input); return true;
   }
 
-  /** Validate a non-negative integer (>= 0). */
-  function validateNonNegativeInt(input, label) {
+ /** Validate a non-negative integer (>= 0). */
+ function validateNonNegativeInt(input, label) {
     var v = parseInt(input.value, 10);
     if (isNaN(v) || v < 0) { showError(input, (label || 'Value') + ' must be 0 or greater'); return false; }
     clearError(input); return true;
-  }
+ }
+
+ /** Collect a non-negative integer from an input, preserving valid
+  * configured zeros (target 0 / timeout 0 are backend-legal values that
+  * `parseInt(...) || default` would clobber). Empty or non-finite input
+  * falls back to the provided default; the value is never silently
+  * rewritten while the user is editing. */
+ function collectNonNegativeInt(id, fallback) {
+    var raw = (document.getElementById(id).value || '').trim();
+    if (raw === '') { return fallback; }
+    var v = parseInt(raw, 10);
+    return (Number.isFinite(v) && v >= 0) ? v : fallback;
+ }
+
+ /** Populate a numeric input from config, preserving valid zeros and
+  * falling back to the default only when the configured value is absent
+  * (null/undefined) or non-finite. Mirrors collectNonNegativeInt so a
+  * saved 0 round-trips as 0 instead of being replaced by the default. */
+ function populateNonNegativeInt(id, configured, fallback) {
+    var v = (configured == null) ? fallback : configured;
+    if (!Number.isFinite(Number(v)) || Number(v) < 0) { v = fallback; }
+    document.getElementById(id).value = v;
+    return v;
+ }
+
 
   /** Validate a non-negative number (>= 0, allows decimals). */
   function validateNonNegativeNum(input, label) {
@@ -2750,13 +2846,63 @@ function refreshModelGroupModels() {
     return ok;
   }
 
-  function validateContextPage() {
-    var ok = true;
-    if (!validatePositiveInt(document.getElementById('context-window-size'), 'Sliding window size')) ok = false;
-    if (!validatePositiveInt(document.getElementById('context-cache-ttl'), 'Cache TTL')) ok = false;
-    if (!validateNonNegativeInt(document.getElementById('context-max-retries'), 'Max retries')) ok = false;
-    return ok;
-  }
+function validateContextPage() {
+var ok = true;
+if (!validatePositiveInt(document.getElementById('context-window-size'), 'Sliding window size')) ok = false;
+if (!validatePositiveInt(document.getElementById('context-cache-ttl'), 'Cache TTL')) ok = false;
+if (!validateNonNegativeInt(document.getElementById('context-max-retries'), 'Max retries')) ok = false;
+var red = document.getElementById('context-reduction-strategy').value;
+if (red === 'clear_tools_then_remove' || red === 'summarize_then_trim') {
+if (!validateNonNegativeInt(document.getElementById('context-tool-keep-recent'), 'Keep recent tool results')) ok = false;
+}
+if (red === 'summarize_then_trim') {
+if (!validateRequired(document.getElementById('context-summarize-model'), 'Summarizer model')) ok = false;
+var ctTrig = document.getElementById('context-summarize-trigger');
+var ctTarg = document.getElementById('context-summarize-target');
+var ctTime = document.getElementById('context-summarize-timeout');
+var trigOk = validatePositiveInt(ctTrig, 'Summary trigger');
+if (trigOk && parseInt(ctTrig.value, 10) > 100) { showError(ctTrig, 'Must be between 1 and 100'); trigOk = false; }
+var targOk = validatePositiveInt(ctTarg, 'Summary target');
+if (targOk && parseInt(ctTarg.value, 10) > 100) { showError(ctTarg, 'Must be between 1 and 100'); targOk = false; }
+if (trigOk && targOk && parseInt(ctTarg.value, 10) >= parseInt(ctTrig.value, 10)) { showError(ctTarg, 'Must be less than summary trigger'); targOk = false; }
+if (!trigOk || !targOk) ok = false;
+if (!validatePositiveInt(ctTime, 'Summarizer timeout')) ok = false;
+}
+return ok;
+}
+
+// --- Context Overflow Management (conditional controls) ---
+function updateContextOverflowVisibility() {
+var reduction = document.getElementById('context-reduction-strategy').value;
+var showTools = reduction === 'clear_tools_then_remove' || reduction === 'summarize_then_trim';
+document.getElementById('context-tool-block').hidden = !showTools;
+document.getElementById('context-placeholder-block').hidden = !showTools;
+document.getElementById('context-summarize-block').hidden = reduction !== 'summarize_then_trim';
+var truncation = document.getElementById('context-strategy').value;
+document.getElementById('context-window-size-group').hidden = truncation !== 'sliding_window' && reduction !== 'sliding_window';
+}
+
+function populateContextSummarizeModels(current) {
+var sel = document.getElementById('context-summarize-model');
+var seen = {}, models = [];
+((config && config.model_groups) || []).forEach(function(g) {
+if (g && g.name && !seen[g.name]) { seen[g.name] = true; models.push(g.name); }
+(g.models || []).forEach(function(m) {
+if (m && m.model && !seen[m.model]) { seen[m.model] = true; models.push(m.model); }
+});
+});
+if (current && !seen[current]) models.push(current);
+models.sort();
+var opts = '<option value="">-- select model --</option>';
+models.forEach(function(m) {
+var esc = m.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+opts += '<option value="' + esc + '"' + (m === current ? ' selected' : '') + '>' + esc + '</option>';
+});
+sel.innerHTML = opts;
+}
+
+document.getElementById('context-strategy').addEventListener('change', updateContextOverflowVisibility);
+document.getElementById('context-reduction-strategy').addEventListener('change', updateContextOverflowVisibility);
 
   function validateStreamingPage() {
     var ok = true;
@@ -3941,7 +4087,7 @@ if(cfg.cors){document.getElementById('cors-enabled').checked=!!cfg.cors.enabled;
     if(cfg.circuit_breaker){document.getElementById('cb-threshold').value=cfg.circuit_breaker.failure_threshold||1; document.getElementById('cb-initial-backoff').value=(cfg.circuit_breaker.backoff_sequence_seconds&&cfg.circuit_breaker.backoff_sequence_seconds[0])||5; document.getElementById('cb-max-backoff').value=(cfg.circuit_breaker.backoff_sequence_seconds&&cfg.circuit_breaker.backoff_sequence_seconds[cfg.circuit_breaker.backoff_sequence_seconds.length-1])||300; if(cfg.circuit_breaker.backoff_sequence_seconds&&cfg.circuit_breaker.backoff_sequence_seconds.length>1&&cfg.circuit_breaker.backoff_sequence_seconds[0]){document.getElementById('cb-multiplier').value=(cfg.circuit_breaker.backoff_sequence_seconds[1]/cfg.circuit_breaker.backoff_sequence_seconds[0]).toFixed(2).replace(/\.00$/,'');}else{document.getElementById('cb-multiplier').value=2;}}
     if(cfg.logging){document.getElementById('log-request-body').checked=!!cfg.logging.request_body_logging; document.getElementById('log-response-body').checked=!!cfg.logging.response_body_logging; document.getElementById('log-max-body').value=cfg.logging.max_body_size_bytes||10240; document.getElementById('log-db-path').value=cfg.logging.database_path||'logs.db'; document.getElementById('log-excluded-fields').value=(cfg.logging.excluded_fields||[]).join(', '); document.getElementById('log-retention').value=cfg.logging.retention_days||30; document.getElementById('log-cleanup').value=cfg.logging.cleanup_schedule_hours||24;}
     if(cfg.semantic_cache){document.getElementById('cache-enabled').checked=!!cfg.semantic_cache.enabled; document.getElementById('cache-qdrant-url').value=cfg.semantic_cache.qdrant_url||''; document.getElementById('cache-collection').value=cfg.semantic_cache.collection_name||'ai_gateway_cache'; document.getElementById('cache-threshold').value=cfg.semantic_cache.similarity_threshold||0.95; document.getElementById('cache-ttl').value=cfg.semantic_cache.ttl_seconds||3600; document.getElementById('cache-max-entries').value=cfg.semantic_cache.max_cache_size||10000;}
-    if(cfg.context){document.getElementById('context-enabled').checked=!!cfg.context.enabled; document.getElementById('context-strategy').value=cfg.context.truncation_strategy||'remove_oldest'; document.getElementById('context-window-size').value=cfg.context.sliding_window_size||10; document.getElementById('context-cache-ttl').value=cfg.context.capabilities_cache_ttl_seconds||3600; document.getElementById('context-max-retries').value=cfg.context.max_truncation_retries||3; document.getElementById('context-default-window').value=cfg.context.default_context_window!=null?cfg.context.default_context_window:32768;}
+    if(cfg.context){document.getElementById('context-enabled').checked=!!cfg.context.enabled; document.getElementById('context-strategy').value=cfg.context.truncation_strategy||'remove_oldest'; document.getElementById('context-window-size').value=populateNonNegativeInt('context-window-size',cfg.context.sliding_window_size,10); document.getElementById('context-cache-ttl').value=populateNonNegativeInt('context-cache-ttl',cfg.context.capabilities_cache_ttl_seconds,3600); document.getElementById('context-max-retries').value=populateNonNegativeInt('context-max-retries',cfg.context.max_truncation_retries,3); document.getElementById('context-default-window').value=populateNonNegativeInt('context-default-window',cfg.context.default_context_window,32768); document.getElementById('context-proactive').checked=!!cfg.context.proactive_enforcement; document.getElementById('context-overflow-policy').value=cfg.context.overflow_policy||'reduce'; document.getElementById('context-reduction-strategy').value=cfg.context.reduction_strategy||'remove_oldest'; document.getElementById('context-tool-keep-recent').value=populateNonNegativeInt('context-tool-keep-recent',cfg.context.tool_result_keep_recent,3); document.getElementById('context-tool-exclude').value=(cfg.context.tool_result_exclude_tools||[]).join(', '); document.getElementById('context-tool-placeholder').value=cfg.context.tool_result_placeholder!=null?cfg.context.tool_result_placeholder:'[Earlier tool output omitted to meet the context budget.]'; document.getElementById('context-summarize-trigger').value=populateNonNegativeInt('context-summarize-trigger',cfg.context.summarize_trigger_percent,80); document.getElementById('context-summarize-target').value=populateNonNegativeInt('context-summarize-target',cfg.context.summarize_target_percent,65); document.getElementById('context-summarize-timeout').value=populateNonNegativeInt('context-summarize-timeout',cfg.context.summarize_timeout_seconds,10); populateContextSummarizeModels(cfg.context.summarize_model||''); updateContextOverflowVisibility();}
     populateCompression(cfg.compression || COMPRESSION_DEFAULTS);
     var sc=cfg.streaming||{};document.getElementById('stream-early-event').checked=sc.emit_early_event!==false;document.getElementById('stream-keepalive').value=sc.keepalive_interval_seconds!=null?sc.keepalive_interval_seconds:5;document.getElementById('stream-passthrough').checked=sc.passthrough_enabled!==false;document.getElementById('stream-chunk-timeout').value=sc.chunk_timeout_seconds||60;document.getElementById('stream-retry-truncation').checked=sc.retry_on_truncation!==false;document.getElementById('stream-retry-stream-truncation').checked=sc.retry_on_stream_truncation!==false;document.getElementById('stream-relay-reasoning').checked=sc.relay_reasoning_progress!==false;
     populateLoopDetection(cfg.loop_detection||LOOP_DEFAULTS);
@@ -4121,7 +4267,7 @@ cfg.reasoning_compat=collectReasoningCompat();
     cfg.circuit_breaker=cfg.circuit_breaker||{}; cfg.circuit_breaker.failure_threshold=parseInt(document.getElementById('cb-threshold').value,10); cfg.circuit_breaker.success_threshold=cfg.circuit_breaker.success_threshold||1; cfg.circuit_breaker.backoff_sequence_seconds=[parseInt(document.getElementById('cb-initial-backoff').value,10),Math.round(parseInt(document.getElementById('cb-initial-backoff').value,10)*parseFloat(document.getElementById('cb-multiplier').value||'2')),Math.round(parseInt(document.getElementById('cb-max-backoff').value,10)/2),parseInt(document.getElementById('cb-max-backoff').value,10)].filter(function(v,i,arr){return Number.isFinite(v)&&v>0&&(i===0||v!==arr[i-1]);});
     cfg.logging={request_body_logging:document.getElementById('log-request-body').checked,response_body_logging:document.getElementById('log-response-body').checked,max_body_size_bytes:parseInt(document.getElementById('log-max-body').value,10),database_path:document.getElementById('log-db-path').value.trim(),excluded_fields:document.getElementById('log-excluded-fields').value.split(',').map(function(s){return s.trim();}).filter(Boolean),retention_days:parseInt(document.getElementById('log-retention').value,10),cleanup_schedule_hours:parseInt(document.getElementById('log-cleanup').value,10)};
     cfg.semantic_cache={enabled:document.getElementById('cache-enabled').checked,qdrant_url:document.getElementById('cache-qdrant-url').value.trim(),collection_name:document.getElementById('cache-collection').value.trim(),embedding_provider:document.getElementById('cache-embed-provider').value,embedding_model:document.getElementById('cache-embed-model').value.trim(),similarity_threshold:parseFloat(document.getElementById('cache-threshold').value),ttl_seconds:parseInt(document.getElementById('cache-ttl').value,10),max_cache_size:parseInt(document.getElementById('cache-max-entries').value,10)};
-    cfg.context={enabled:document.getElementById('context-enabled').checked,truncation_strategy:document.getElementById('context-strategy').value,sliding_window_size:parseInt(document.getElementById('context-window-size').value,10),capabilities_cache_ttl_seconds:parseInt(document.getElementById('context-cache-ttl').value,10),max_truncation_retries:parseInt(document.getElementById('context-max-retries').value,10),default_context_window:parseInt(document.getElementById('context-default-window').value,10)};
+    cfg.context={enabled:document.getElementById('context-enabled').checked,truncation_strategy:document.getElementById('context-strategy').value,sliding_window_size:collectNonNegativeInt('context-window-size',10),capabilities_cache_ttl_seconds:collectNonNegativeInt('context-cache-ttl',3600),max_truncation_retries:collectNonNegativeInt('context-max-retries',3),default_context_window:collectNonNegativeInt('context-default-window',32768),proactive_enforcement:document.getElementById('context-proactive').checked,overflow_policy:document.getElementById('context-overflow-policy').value,reduction_strategy:document.getElementById('context-reduction-strategy').value,tool_result_keep_recent:collectNonNegativeInt('context-tool-keep-recent',3),tool_result_exclude_tools:document.getElementById('context-tool-exclude').value.split(',').map(function(s){return s.trim();}).filter(Boolean),tool_result_placeholder:document.getElementById('context-tool-placeholder').value,summarize_trigger_percent:collectNonNegativeInt('context-summarize-trigger',80),summarize_target_percent:collectNonNegativeInt('context-summarize-target',65),summarize_model:document.getElementById('context-summarize-model').value||null,summarize_timeout_seconds:collectNonNegativeInt('context-summarize-timeout',10)};
     cfg.compression=collectCompression();
     cfg.tool_compression=collectToolCompression();
     cfg.memory=collectMemory();
