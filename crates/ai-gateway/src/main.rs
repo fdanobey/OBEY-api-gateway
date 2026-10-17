@@ -35,6 +35,7 @@ mod models;
 mod oauth;
 mod providers;
 mod reasoning_compat;
+mod reasoning_relay;
 mod request_body_limit;
 mod router;
 mod runtime_limits;

@@ -1510,6 +1510,953 @@ async fn test_streaming_failover_records_circuit_breaker_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// 13b. Buffered reasoning progress relay (buffered-reasoning-progress-relay
+// task 9, spec scenarios a-d).
+//
+// These tests force the buffered path (`passthrough_enabled: false`) and give
+// the mock provider a real SSE body whose reasoning deltas precede content
+// deltas. The router tap (`read_upstream_body`) relays reasoning-only frames
+// while the body streams; the handler's select loop forwards them to the
+// client before the final re-chunk (which suppresses reasoning when frames
+// were relayed). Frame ordering is asserted via string indices only — the
+// relay happens during the buffered read while content only ever appears in
+// the final replay, so ordering is deterministic without inter-event delays.
+//
+// Scenario (e) — re-running `abandoned_stream_writes_client_disconnect_outcome_row`
+// and the rate-token guards — lives in the guard binaries:
+// `tests/request_outcome_logging.rs` and `src/router/router.rs`
+// (`single_request_consumes_exactly_one_provider_rate_token`); they run
+// unchanged in the full-binary sweep at the end of this task.
+// ---------------------------------------------------------------------------
+
+/// Build a single SSE data line carrying a `reasoning`-only delta with the
+/// mock provider's envelope, mirroring how `sse_content_chunk` builds content
+/// deltas. `data: [DONE]` and content/tool/usage frames are never relayed.
+fn sse_reasoning_chunk(reasoning: &str) -> String {
+    let value = serde_json::json!({
+        "id": MOCK_PROVIDER_ID,
+        "object": "chat.completion.chunk",
+        "created": 1700000000_i64,
+        "model": "gpt-4",
+        "choices": [{
+            "index": 0,
+            "delta": { "reasoning": reasoning },
+            "finish_reason": null
+        }]
+    });
+    format!("data: {}\n\n", value)
+}
+
+/// Index of the first chunk carrying a non-null `delta.reasoning` (relayed or
+/// replayed) inside the parsed chunk list, or None.
+fn first_reasoning_index_in(chunks: &[serde_json::Value]) -> Option<usize> {
+    chunks.iter().position(|c| {
+        c.pointer("/choices/0/delta/reasoning")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    })
+}
+
+/// Index of the first chunk carrying a non-null `delta.content`, or None.
+fn first_content_index_in(chunks: &[serde_json::Value]) -> Option<usize> {
+    chunks.iter().position(|c| {
+        c.pointer("/choices/0/delta/content")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    })
+}
+
+/// Build a buffered-relay streaming config: early event on, buffered path
+/// forced (`passthrough_enabled: false`), relay optionally enabled.
+fn relay_test_config(mock_uri: &str, relay_reasoning_progress: bool) -> Config {
+    let mut cfg = test_config();
+    cfg.providers[0].base_url = Some(mock_uri.to_string());
+    cfg.streaming = Some(StreamingConfig {
+        emit_early_event: true,
+        passthrough_enabled: false,
+        relay_reasoning_progress,
+        ..StreamingConfig::default()
+    });
+    cfg
+}
+
+/// Variant of [`relay_test_config`] with the early event DISABLED (site 2:
+/// the buffered fallback path where `route_request` runs first and the FIRST
+/// relayed reasoning frame carries the `role` marker, Req 2.5).
+fn relay_no_early_test_config(mock_uri: &str, relay_reasoning_progress: bool) -> Config {
+    let mut cfg = test_config();
+    cfg.providers[0].base_url = Some(mock_uri.to_string());
+    cfg.streaming = Some(StreamingConfig {
+        emit_early_event: false,
+        passthrough_enabled: false,
+        relay_reasoning_progress,
+        ..StreamingConfig::default()
+    });
+    cfg
+}
+
+/// Post a streaming request and return (status, raw body bytes).
+async fn send_streaming(app: axum::Router) -> (StatusCode, Vec<u8>) {
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(streaming_request_body())
+        .unwrap();
+    send(app, req).await
+}
+
+/// The reasoning-then-content SSE body shared by scenarios (a)/(b): two
+/// reasoning deltas, two content deltas, then `[DONE]`.
+fn reasoning_then_content_sse_body() -> String {
+    format!(
+        "{}{}{}{}{}",
+        sse_reasoning_chunk("thinking about the question"),
+        sse_reasoning_chunk("weighing approaches"),
+        sse_content_chunk("Hello from ", None),
+        sse_content_chunk("mock provider!", Some("stop")),
+        "data: [DONE]\n\n",
+    )
+}
+
+/// A minimal PACED SSE upstream: binds an ephemeral TCP port, accepts one
+/// connection, and writes the given SSE frames with a small delay between
+/// them, then closes.
+///
+/// wiremock's `ResponseTemplate` writes the whole body in one flush, so it
+/// cannot reproduce the spec's "reasoning deltas (spread with delays), then
+/// content" shape: with an instant body the buffered read finishes before
+/// the handler's select loop is ever polled, and `select!` may complete the
+/// routing arm first, dropping queued relay frames (a race — not a
+/// wall-clock assertion; ordering is still asserted purely via indices).
+/// This is a mock *upstream* only, in the same role as wiremock; the
+/// gateway under test is still driven exclusively via tower oneshot.
+async fn start_paced_sse_mock(frames: Vec<String>, delay_ms: u64) -> String {
+    start_paced_sse_mock_raw(
+        frames.into_iter().map(String::into_bytes).collect(),
+        delay_ms,
+    )
+    .await
+}
+
+/// Raw-bytes variant of [`start_paced_sse_mock`]: each element of `writes` is
+/// emitted verbatim with no UTF-8 boundary rounding, so tests can split a
+/// multi-byte character across two writes and assert the relay tap (which
+/// scans raw bytes and decodes only completed lines) never bakes U+FFFD into
+/// relayed text.
+async fn start_paced_sse_mock_raw(writes: Vec<Vec<u8>>, delay_ms: u64) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // Bounded accept: without it a gateway that never dials the mock would
+        // hang the test silently until the harness timeout.
+        let (mut socket, _) = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            listener.accept(),
+        )
+        .await
+        {
+            Ok(accepted) => accepted.expect("paced SSE mock: accept() failed"),
+            Err(_) => panic!("paced SSE mock: the gateway never connected within 10s"),
+        };
+        // Consume the request head (best-effort; the response is written
+        // regardless — the gateway's client does not need it read first).
+        let mut scratch = [0u8; 8192];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            socket.read(&mut scratch),
+        )
+        .await;
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+        socket.write_all(head.as_bytes()).await.unwrap();
+        for chunk in writes {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            socket.write_all(&chunk).await.unwrap();
+        }
+        socket.shutdown().await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// (a) Req 1.1/1.2/1.3/1.5 + 4.4: reasoning frames arrive before any content
+/// frame; relayed frames share the early event's response id and carry no
+/// `role`; the final replay is complete (full content), reasoning-free, and
+/// `[DONE]` is the last line. The upstream emits reasoning deltas with small
+/// delays, then content, then [DONE] (spec scenario a); ordering is asserted
+/// via string/vec indices only — no wall-clock assertions.
+#[tokio::test]
+async fn relay_reasoning_frames_arrive_before_final_content() {
+    let uri = start_paced_sse_mock(
+        vec![
+            sse_reasoning_chunk("thinking about the question"),
+            sse_reasoning_chunk("weighing approaches"),
+            sse_content_chunk("Hello from ", None),
+            sse_content_chunk("mock provider!", Some("stop")),
+            "data: [DONE]\n\n".to_string(),
+        ],
+        15,
+    )
+    .await;
+    let app = build_app(relay_test_config(&uri, true)).await;
+
+    let (status, raw) = send_streaming(app).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let data_lines = raw_sse_data_lines(&raw);
+    assert!(
+        data_lines.last().map(String::as_str) == Some("[DONE]"),
+        "[DONE] must be the last data line (got {:?})",
+        data_lines.last()
+    );
+
+    let chunks = parse_sse_chunks(&raw);
+
+    // Relayed reasoning frames arrive BEFORE any content frame (Req 1.1).
+    let first_reasoning = first_reasoning_index_in(&chunks)
+        .expect("at least one reasoning frame must be relayed mid-stream");
+    let first_content = first_content_index_in(&chunks)
+        .expect("final content must be present in the replay");
+    assert!(
+        first_reasoning < first_content,
+        "relayed reasoning (index {first_reasoning}) must precede the first content frame (index {first_content})"
+    );
+
+    // All chunks (early event, relayed frames, replay) share one response id
+    // (Req 1.5) — and it is the fresh early-event id, not the provider's.
+    let early_id = chunks[0]["id"].as_str().unwrap();
+    assert_ne!(early_id, MOCK_PROVIDER_ID);
+    for (index, chunk) in chunks.iter().enumerate() {
+        assert_eq!(
+            chunk["id"].as_str(),
+            Some(early_id),
+            "chunk at index {index} must share the early event id"
+        );
+    }
+
+    // Relayed frames carry no `role`; exactly ONE role marker overall (the
+    // early event) — the replay's role chunk is suppressed by the early event.
+    let role_count = chunks
+        .iter()
+        .filter(|c| c.pointer("/choices/0/delta/role").is_some())
+        .count();
+    assert_eq!(role_count, 1, "single role marker overall (the early event)");
+    for (index, chunk) in chunks.iter().enumerate().skip(1) {
+        assert!(
+            chunk.pointer("/choices/0/delta/role").is_none(),
+            "relayed/replayed chunk at index {index} must not carry a role"
+        );
+    }
+
+    // No reasoning frame after the first content frame: everything at or
+    // after `first_content` is the final replay, and the replay suppresses
+    // reasoning when frames were relayed (Req 4.4 no double-emit).
+    for (index, chunk) in chunks.iter().enumerate() {
+        if index >= first_content {
+            assert!(
+                first_reasoning_index_in(std::slice::from_ref(chunk)).is_none(),
+                "no reasoning frame allowed after the first content frame (index {index})"
+            );
+        }
+    }
+
+    // The final content is complete: both content deltas reassembled by the
+    // buffered pipeline into the replay chunk.
+    let replay_content = chunks
+        .iter()
+        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .collect::<String>();
+    assert_eq!(
+        replay_content, "Hello from mock provider!",
+        "final content must be the complete reassembled response"
+    );
+}
+
+/// (b) Req 2.1: `relay_reasoning_progress: false` restores the legacy stream —
+/// no mid-stream reasoning frames; the final response still carries the full
+/// reassembled reasoning (the whole reasoning stays in the replay chunk).
+#[tokio::test]
+async fn relay_disabled_keeps_reasoning_only_in_final_response() {
+    let mock = start_sse_streaming_mock(reasoning_then_content_sse_body()).await;
+    let app = build_app(relay_test_config(&mock.uri(), false)).await;
+
+    let (status, raw) = send_streaming(app).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let data_lines = raw_sse_data_lines(&raw);
+    assert!(data_lines.last().map(String::as_str) == Some("[DONE]"));
+
+    let chunks = parse_sse_chunks(&raw);
+
+    // No reasoning frame BEFORE the first content frame: with the relay off,
+    // reasoning only ever appears inside the final replay (legacy behavior).
+    let first_content = first_content_index_in(&chunks)
+        .expect("final content must be present in the replay");
+    for (index, chunk) in chunks.iter().enumerate() {
+        if index < first_content {
+            assert!(
+                first_reasoning_index_in(std::slice::from_ref(chunk)).is_none(),
+                "no mid-stream reasoning frame allowed with the relay disabled (index {index})"
+            );
+        }
+    }
+
+    // The final replay still carries the full reassembled reasoning
+    // (both deltas concatenated), exactly once. The reassembled response
+    // stores reasoning under the `reasoning_content` carrier and the replay
+    // preserves the field name, so accept either spelling.
+    let reasoning_frames: Vec<&str> = chunks
+        .iter()
+        .filter_map(|c| {
+            ["reasoning", "reasoning_content"]
+                .iter()
+                .find_map(|field| c.pointer(&format!("/choices/0/delta/{field}")))
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    assert_eq!(
+        reasoning_frames,
+        vec!["thinking about the questionweighing approaches"],
+        "final response carries the full reasoning (legacy behavior)"
+    );
+
+    // Content is complete and [DONE] terminated.
+    let replay_content: String = chunks
+        .iter()
+        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(replay_content, "Hello from mock provider!");
+}
+
+/// Shared config for the two-provider relay scenarios: `primary`
+/// (priority 100, tried first) and `backup` (priority 200), single `gpt-4`
+/// model group, buffered path forced via `passthrough_enabled: false` and
+/// the reasoning relay enabled. Distinct reasoning/content strings per
+/// provider identify whose bytes reached the client.
+fn relay_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
+    let mut cfg = test_config();
+    let template = cfg.providers[0].clone();
+    let primary = Provider {
+        name: "primary".to_string(),
+        base_url: Some(primary_uri.to_string()),
+        memory: None,
+        ..template.clone()
+    };
+    let backup = Provider {
+        name: "backup".to_string(),
+        base_url: Some(backup_uri.to_string()),
+        memory: None,
+        ..template
+    };
+    cfg.providers = vec![primary, backup];
+    cfg.model_groups = vec![ModelGroup {
+        name: "gpt-4-group".to_string(),
+        version_fallback_enabled: false,
+        compression: None,
+        memory: None,
+        structured_output: None,
+        models: vec![
+            ProviderModel {
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
+                provider: "primary".to_string(),
+                model: "gpt-4".to_string(),
+                cost_per_million_input_tokens: 30.0,
+                cost_per_million_output_tokens: 60.0,
+                priority: 100,
+                structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
+            },
+            ProviderModel {
+                cache_support: None,
+                cache_min_tokens: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
+                provider: "backup".to_string(),
+                model: "gpt-4".to_string(),
+                cost_per_million_input_tokens: 30.0,
+                cost_per_million_output_tokens: 60.0,
+                priority: 200,
+                structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
+            },
+        ],
+    }];
+    cfg.streaming = Some(StreamingConfig {
+        emit_early_event: true,
+        passthrough_enabled: false,
+        relay_reasoning_progress: true,
+        ..StreamingConfig::default()
+    });
+    cfg
+}
+
+/// (c) Req 4.1/4.3: the primary emits reasoning then truncates pre-content
+/// (no `[DONE]`, no finish_reason) — the buffered dispatch treats that as a
+/// retryable failure and fails over. The client still saw the primary's
+/// reasoning relayed live, then receives exactly ONE final response with the
+/// backup's content and a terminating `[DONE]`.
+#[tokio::test]
+async fn relay_failover_after_truncated_primary_relays_reasoning_from_first() {
+    // Primary: reasoning deltas (paced), then the stream is cut short (no
+    // [DONE], no finish_reason) — the SSE_TRUNCATED_ERROR failover trigger.
+    // Pacing makes the reasoning relay deterministic: frames are drained by
+    // the select loop while the read is still open.
+    let primary_uri = start_paced_sse_mock(
+        vec![
+            sse_reasoning_chunk("primary pondering"),
+            sse_reasoning_chunk("primary about to answer"),
+            // truncation: connection closes without [DONE]/finish_reason
+        ],
+        15,
+    )
+    .await;
+
+    // Backup: full reasoning + content + [DONE].
+    let backup_body = format!(
+        "{}{}{}",
+        sse_reasoning_chunk("backup recovering"),
+        sse_content_chunk("BACKUP_ANSWER", Some("stop")),
+        "data: [DONE]\n\n",
+    );
+    let backup = start_sse_streaming_mock(backup_body).await;
+
+let app = build_app(relay_failover_config(&primary_uri, &backup.uri())).await;
+
+let (status, raw) = send_streaming(app).await;
+assert_eq!(status, StatusCode::OK);
+
+    let data_lines = raw_sse_data_lines(&raw);
+    assert!(
+        data_lines.last().map(String::as_str) == Some("[DONE]"),
+        "[DONE] must be last (got {:?})",
+        data_lines.last()
+    );
+    // One final response: exactly one [DONE], one finish_reason-bearing chunk.
+    let done_count = data_lines.iter().filter(|l| l.as_str() == "[DONE]").count();
+    assert_eq!(done_count, 1, "exactly one [DONE] sentinel");
+    let finish_count = data_lines
+        .iter()
+        .filter(|l| l.contains("\"finish_reason\":\"stop\""))
+        .count();
+    assert_eq!(finish_count, 1, "exactly one final finish_reason chunk");
+
+    let chunks = parse_sse_chunks(&raw);
+
+    // Reasoning from the FIRST provider was relayed before any content: the
+    // primary's reasoning frames must appear mid-stream.
+    let reasoning_texts: Vec<&str> = chunks
+        .iter()
+        .filter_map(|c| {
+            c.pointer("/choices/0/delta/reasoning")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    assert!(
+        reasoning_texts.iter().any(|r| *r == "primary pondering"),
+        "primary's reasoning must have been relayed before failover (got {reasoning_texts:?})"
+    );
+
+    // Content came from the SECOND provider.
+    let content: String = chunks
+        .iter()
+        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        content, "BACKUP_ANSWER",
+        "client must receive the backup provider's content after failover"
+    );
+
+    // Ordering guard: relayed reasoning before the final content.
+    let first_reasoning = first_reasoning_index_in(&chunks)
+        .expect("relayed reasoning frames present");
+    let first_content = first_content_index_in(&chunks)
+        .expect("final content present");
+    assert!(first_reasoning < first_content);
+}
+
+/// Find the (single) error outcome row in the isolated request log: the row
+/// with path `/v1/chat/completions` (not an `#attempt` row) that carries a
+/// non-null error_class. Returns (error_class, reasoning_relayed_frames).
+/// `/dashboard/logs` does not expose `reasoning_relayed_frames`, so this
+/// reads the SQLite column directly, mirroring the handlers.rs unit tests.
+fn find_error_outcome_row(cfg: &Config) -> Option<(Option<String>, Option<i64>)> {
+    let conn = rusqlite::Connection::open(&cfg.logging.database_path).ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT error_class, reasoning_relayed_frames FROM requests
+             WHERE path = '/v1/chat/completions' AND error_class IS NOT NULL",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([], |row| {
+            let error_class: Option<String> = row.get(0)?;
+            let relayed: Option<i64> = row.get(1)?;
+            Ok((error_class, relayed))
+        })
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .collect::<Vec<_>>();
+    rows.into_iter().next()
+}
+
+/// Poll the isolated request log (bounded) until an error outcome row with a
+/// non-null error_class appears; the writer thread persists asynchronously.
+async fn wait_for_error_outcome_row(cfg: &Config) -> Option<(Option<String>, Option<i64>)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Some(row) = find_error_outcome_row(cfg) {
+            return Some(row);
+        }
+        if std::time::Instant::now() >= deadline {
+            return find_error_outcome_row(cfg);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// (d) Req 4.2/5.1: a mid-stream failure AFTER reasoning frames were relayed
+/// (both providers emit a mid-stream `data: {"error":...}` frame) yields the
+/// graceful SSE error event + `[DONE]`; the request log row carries the
+/// `error_class` AND `reasoning_relayed_frames > 0`.
+#[tokio::test]
+async fn relay_midstream_failure_emits_error_and_logs_relayed_frames() {
+    // Both providers: reasoning first (paced so the relay deterministically
+    // drains), then an in-band error frame — the buffered dispatch
+    // retries/fails over and eventually errors out, AFTER the client
+    // already saw relayed reasoning.
+    let mk_body = || {
+        vec![
+            sse_reasoning_chunk("doomed deliberation"),
+            sse_error_frame(),
+        ]
+    };
+    let primary_uri = start_paced_sse_mock(mk_body(), 15).await;
+    let backup = start_sse_streaming_mock(mk_body().join("")).await;
+
+    let mut cfg = relay_failover_config(&primary_uri, &backup.uri());
+    // build_app isolates its own copy; isolate here first so this test can
+    // query the very same SQLite file for the outcome row afterwards.
+    common::isolate_databases(&mut cfg);
+    let server = ai_gateway::gateway::GatewayServer::new(cfg.clone(), None)
+        .await
+        .unwrap();
+    let app = server.build_router();
+
+    let (status, raw) = send_streaming(app).await;
+    assert_eq!(status, StatusCode::OK, "early event forces a 200 SSE stream");
+
+    let data_lines = raw_sse_data_lines(&raw);
+    assert!(
+        data_lines.last().map(String::as_str) == Some("[DONE]"),
+        "graceful failure must still terminate with [DONE] (got {:?})",
+        data_lines.last()
+    );
+
+    let chunks = parse_sse_chunks(&raw);
+    // Reasoning WAS relayed before the failure surfaced.
+    assert!(
+        first_reasoning_index_in(&chunks).is_some(),
+        "reasoning frames must be relayed before the mid-stream failure"
+    );
+
+    // The frame before [DONE] is the graceful aggregated error event.
+    let error_line = &data_lines[data_lines.len() - 2];
+    let error_json: serde_json::Value = serde_json::from_str(error_line)
+        .expect("error frame before [DONE] must be valid JSON");
+    assert!(error_json["error"].is_object());
+    assert!(
+        error_json["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "error frame must carry a message"
+    );
+
+    // The isolated log row carries error_class AND relayed-frame count > 0.
+    let (error_class, relayed_frames) = wait_for_error_outcome_row(&cfg)
+        .await
+        .expect("an error outcome row must be logged");
+    assert!(
+        error_class.as_deref().is_some_and(|c| !c.is_empty()),
+        "log row must carry an error_class (got {error_class:?})"
+    );
+    assert!(
+        relayed_frames.unwrap_or(0) > 0,
+        "log row must carry reasoning_relayed_frames > 0 (got {relayed_frames:?})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13c. Buffered reasoning progress relay — remediation wave B coverage.
+//
+// Wave-A fixes under test: select loops drain queued frames; the site-2
+// (early-event off) path returns a proper HTTP error status when routing
+// fails before any relayed frame; site 3 (`stream_buffered_with_post_call`)
+// spawns routing + relays on the Buffered arm too; the relay tap scans raw
+// bytes so a multi-byte character split across upstream writes survives.
+// ---------------------------------------------------------------------------
+
+use ai_gateway::guardrail::{
+    FailurePolicy, GuardrailConfig, GuardrailProviderConfig, GuardrailProviderType,
+    InstructionInsertionMode, PipelineConfig, PolicyAction, ProviderSettings, RegexPatternConfig,
+    RegexRuleMode, StageConfig, StagePhase,
+};
+
+/// A benign post-call guardrail: a regex provider whose pattern never matches
+/// the mock's response and whose action is `allow`, so `run_post_call`
+/// proceeds untouched. The stage's mere existence forces the buffered
+/// `stream_buffered_with_post_call` path (relay site 3).
+fn benign_post_call_guardrails() -> GuardrailConfig {
+    GuardrailConfig {
+        providers: vec![GuardrailProviderConfig {
+            name: "regex_benign".to_string(),
+            provider_type: GuardrailProviderType::Regex,
+            failure_policy: FailurePolicy::FailOpen,
+            timeout_seconds: 5,
+            settings: ProviderSettings {
+                patterns: vec![RegexPatternConfig {
+                    name: "never_matches".to_string(),
+                    regex: r"NEVERMATCHES\d+".to_string(),
+                    entity: "BENIGN".to_string(),
+                    mode: RegexRuleMode::Deny,
+                }],
+                ..Default::default()
+            },
+        }],
+        pipelines: vec![PipelineConfig {
+            name: "post_benign".to_string(),
+            stages: vec![StageConfig {
+                name: "benign_scan".to_string(),
+                provider: "regex_benign".to_string(),
+                phase: StagePhase::PostCall,
+                action: PolicyAction::Allow,
+            }],
+            redaction_notice_instruction: None,
+            instruction_insertion_mode: InstructionInsertionMode::default(),
+            failover_on_refusal: false,
+            refusal_phrase_list: None,
+            tool_result: ai_gateway::guardrail::config::ToolResultPhaseConfig::default(),
+        }],
+        global_default_pipeline: Some("post_benign".to_string()),
+        bindings: Default::default(),
+        ..Default::default()
+    }
+}
+
+/// Site 2 (early event off), success shape: the FIRST relayed reasoning frame
+/// carries the single `role: "assistant"` marker (Req 2.5); relayed frames and
+/// final replay share one fresh response id; reasoning precedes content; the
+/// final replay suppresses relayed reasoning (no double-emit); `[DONE]` last.
+#[tokio::test]
+async fn relay_first_frame_carries_role_when_early_event_disabled() {
+    let uri = start_paced_sse_mock(
+        vec![
+            sse_reasoning_chunk("thinking about the question"),
+            sse_reasoning_chunk("weighing approaches"),
+            sse_content_chunk("Hello from ", None),
+            sse_content_chunk("mock provider!", Some("stop")),
+            "data: [DONE]\n\n".to_string(),
+        ],
+        15,
+    )
+    .await;
+    let app = build_app(relay_no_early_test_config(&uri, true)).await;
+
+    let (status, raw) = send_streaming(app).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let data_lines = raw_sse_data_lines(&raw);
+    assert!(
+        data_lines.last().map(String::as_str) == Some("[DONE]"),
+        "[DONE] must be the last data line (got {:?})",
+        data_lines.last()
+    );
+
+    let chunks = parse_sse_chunks(&raw);
+    assert!(
+        !chunks.is_empty(),
+        "relayed reasoning frames must be present"
+    );
+
+    // Exactly one role marker across the whole stream — and it sits on the
+    // FIRST relayed reasoning frame (Req 2.5).
+    let role_count = chunks
+        .iter()
+        .filter(|c| c.pointer("/choices/0/delta/role").is_some())
+        .count();
+    assert_eq!(
+        role_count, 1,
+        "single role marker overall (the first relayed frame)"
+    );
+    assert_eq!(
+        chunks[0].pointer("/choices/0/delta/role").and_then(|v| v.as_str()),
+        Some("assistant"),
+        "the first chunk must be the role-bearing relayed reasoning frame"
+    );
+    assert!(
+        first_reasoning_index_in(std::slice::from_ref(&chunks[0])).is_some(),
+        "the role marker must ride a reasoning frame, not a content frame"
+    );
+
+    // Shared id across relayed frames AND final chunks — the fresh relay id,
+    // not the provider's own envelope id.
+    let shared_id = chunks[0]["id"].as_str().unwrap();
+    assert_ne!(
+        shared_id, MOCK_PROVIDER_ID,
+        "relay frames use a fresh id, not the provider's"
+    );
+    for (index, chunk) in chunks.iter().enumerate() {
+        assert_eq!(
+            chunk["id"].as_str(),
+            Some(shared_id),
+            "chunk at index {index} must share the relay stream id"
+        );
+    }
+
+    // Reasoning relayed before content.
+    let first_reasoning = first_reasoning_index_in(&chunks)
+        .expect("at least one reasoning frame must be relayed");
+    let first_content = first_content_index_in(&chunks)
+        .expect("final content must be present in the replay");
+    assert!(
+        first_reasoning < first_content,
+        "relayed reasoning (index {first_reasoning}) must precede the first content frame (index {first_content})"
+    );
+
+    // Both reasoning deltas were relayed live.
+    let reasoning_texts: Vec<&str> = chunks
+        .iter()
+        .filter_map(|c| {
+            c.pointer("/choices/0/delta/reasoning")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    assert!(
+        reasoning_texts.contains(&"thinking about the question")
+            && reasoning_texts.contains(&"weighing approaches"),
+        "both reasoning deltas must be relayed (got {reasoning_texts:?})"
+    );
+
+    // The final replay suppresses relayed reasoning (Req 4.4 no double-emit).
+    for (index, chunk) in chunks.iter().enumerate() {
+        if index >= first_content {
+            assert!(
+                first_reasoning_index_in(std::slice::from_ref(chunk)).is_none(),
+                "no reasoning frame allowed in the final replay (index {index})"
+            );
+        }
+    }
+
+    // Final content complete.
+    let replay_content: String = chunks
+        .iter()
+        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        replay_content, "Hello from mock provider!",
+        "final content must be the complete reassembled response"
+    );
+}
+
+/// Site 2, pre-stream error shape: with the early event off and the relay on,
+/// routing that fails BEFORE any frame was relayed must return the proper
+/// HTTP error status (same mapping as the relay-disabled path: the aggregated
+/// AllProvidersFailed error → 502 JSON), never a 200 SSE stream.
+#[tokio::test]
+async fn relay_routing_error_before_frames_returns_http_error_status() {
+    // Upstream answers 500 immediately — no reasoning emitted first.
+    let server = MockServer::start().await;
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_json(serde_json::json!({"error": "upstream exploded"})),
+        )
+        .mount(&server)
+        .await;
+
+    let mut cfg = relay_no_early_test_config(&server.uri(), true);
+    // No in-provider retries/backoff sleeps: surface the aggregated error
+    // immediately.
+    let mut retry = RetryConfig::default();
+    retry.max_retries_per_provider = 0;
+    retry.backoff_sequence_seconds = vec![];
+    cfg.retry = retry;
+
+    let app = build_app(cfg).await;
+    let (status, raw) = send_streaming(app).await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "pre-stream routing failure must map to the relay-disabled error status (502 AllProvidersFailed)"
+    );
+    let text = std::str::from_utf8(&raw).unwrap();
+    assert!(
+        !text.contains("data: "),
+        "the error must be a plain JSON response, not a 200 SSE stream (got: {text:?})"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert!(
+        json["error"].is_object(),
+        "error response must carry an error object"
+    );
+    assert_eq!(
+        json["error"]["type"], "all_providers_failed",
+        "same aggregated-error mapping as the relay-disabled path"
+    );
+}
+
+/// Site 3 (`stream_buffered_with_post_call`, Buffered arm): a bound post-call
+/// guardrail stage plus `passthrough_enabled: false` makes
+/// `route_request_streaming` return Buffered; reasoning frames must still be
+/// relayed live BEFORE the final assembled content, the final response must
+/// be intact, and the stream ends with exactly one `[DONE]`.
+#[tokio::test]
+async fn relay_site3_buffered_arm_relays_reasoning() {
+    let uri = start_paced_sse_mock(
+        vec![
+            sse_reasoning_chunk("site three deliberation"),
+            sse_content_chunk("Hello from ", None),
+            sse_content_chunk("mock provider!", Some("stop")),
+            "data: [DONE]\n\n".to_string(),
+        ],
+        15,
+    )
+    .await;
+    let mut cfg = relay_test_config(&uri, true);
+    cfg.guardrails = Some(benign_post_call_guardrails());
+    let app = build_app(cfg).await;
+
+    let (status, raw) = send_streaming(app).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let data_lines = raw_sse_data_lines(&raw);
+    let done_count = data_lines
+        .iter()
+        .filter(|l| l.as_str() == "[DONE]")
+        .count();
+    assert_eq!(done_count, 1, "exactly one [DONE] sentinel");
+    assert!(
+        data_lines.last().map(String::as_str) == Some("[DONE]"),
+        "[DONE] must be last (got {:?})",
+        data_lines.last()
+    );
+
+    let chunks = parse_sse_chunks(&raw);
+
+    // Reasoning relayed live BEFORE the final assembled content.
+    let first_reasoning = first_reasoning_index_in(&chunks)
+        .expect("site 3 must relay reasoning live while buffering for post-call");
+    let first_content = first_content_index_in(&chunks)
+        .expect("final assembled content must be present");
+    assert!(
+        first_reasoning < first_content,
+        "relayed reasoning (index {first_reasoning}) must precede the assembled content (index {first_content})"
+    );
+    assert_eq!(
+        chunks[first_reasoning]
+            .pointer("/choices/0/delta/reasoning")
+            .and_then(serde_json::Value::as_str),
+        Some("site three deliberation"),
+        "the live-relayed reasoning text must be intact"
+    );
+
+    // Final assembled response intact after the benign post-call pass.
+    let replay_content: String = chunks
+        .iter()
+        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        replay_content, "Hello from mock provider!",
+        "final assembled content must be complete"
+    );
+}
+
+/// The relay tap must scan RAW BYTES: a reasoning delta containing multi-byte
+/// UTF-8 ("思考") whose SSE line is split MID-CHARACTER across upstream TCP
+/// writes must be relayed with the character intact (no U+FFFD) and the final
+/// assembled content must be complete.
+#[tokio::test]
+async fn relay_multibyte_reasoning_split_across_chunks_survives() {
+    let frame = sse_reasoning_chunk("思考");
+    let bytes = frame.as_bytes();
+    let char_start = frame.find("思考").expect("multibyte text present");
+    // 思 = E6 80 9D, 考 = E8 80 83 (3 bytes each). Split inside both chars:
+    // the bytes at split1/split2 must be UTF-8 continuation bytes (10xxxxxx).
+    let split1 = char_start + 1;
+    let split2 = char_start + 4;
+    assert_eq!(
+        bytes[split1] & 0xC0,
+        0x80,
+        "split1 must land mid-character"
+    );
+    assert_eq!(
+        bytes[split2] & 0xC0,
+        0x80,
+        "split2 must land mid-character"
+    );
+
+    let uri = start_paced_sse_mock_raw(
+        vec![
+            bytes[..split1].to_vec(),
+            bytes[split1..split2].to_vec(),
+            bytes[split2..].to_vec(),
+            sse_content_chunk("final ", None).into_bytes(),
+            sse_content_chunk("answer", Some("stop")).into_bytes(),
+            b"data: [DONE]\n\n".to_vec(),
+        ],
+        15,
+    )
+    .await;
+    let app = build_app(relay_test_config(&uri, true)).await;
+
+    let (status, raw) = send_streaming(app).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let text = std::str::from_utf8(&raw).expect("client stream must be valid UTF-8");
+    assert!(
+        !text.contains('\u{FFFD}'),
+        "no U+FFFD replacement character may leak into the client stream"
+    );
+
+    let chunks = parse_sse_chunks(&raw);
+    let reasoning_texts: Vec<&str> = chunks
+        .iter()
+        .filter_map(|c| {
+            c.pointer("/choices/0/delta/reasoning")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    assert!(
+        reasoning_texts.contains(&"思考"),
+        "the relayed reasoning frame must carry the intact multi-byte character (got {reasoning_texts:?})"
+    );
+
+    let replay_content: String = chunks
+        .iter()
+        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        replay_content, "final answer",
+        "final assembled content must be complete"
+    );
+
+    let data_lines = raw_sse_data_lines(&raw);
+    assert!(data_lines.last().map(String::as_str) == Some("[DONE]"));
+}
+
+// ---------------------------------------------------------------------------
 // 14. Truncation detection and retry (streaming-reliability task 7.3)
 //
 // These tests exercise the non-streaming buffered path

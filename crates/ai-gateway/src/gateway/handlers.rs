@@ -39,6 +39,9 @@ use crate::memory::{
 use crate::metrics::Metrics;
 use crate::models::openai::{Choice, OpenAIRequest, OpenAIResponse, Usage};
 use crate::providers::Model;
+use crate::reasoning_relay::{
+classify_reasoning_frame, sse_data_payload, RelayFrame, RelayHandle,
+};
 use crate::router::router::{ProviderPassThroughEndpoint, ProviderPassThroughResponse};
 use crate::router::trace_id::generate_trace_id;
 use crate::router::StreamingResponse;
@@ -115,12 +118,24 @@ struct RequestLogContext {
     /// JSON report of reasoning-compat strip/normalize actions taken for
     /// this request: counts and model/family identifiers only (Req 4.6).
     reasoning_compat_actions: Option<String>,
+    /// Reasoning frames relayed live to the client while the buffered
+    /// pipeline assembled this response (response extra
+    /// `gateway_reasoning_relayed_frames`; `None` when nothing was
+    /// relayed — spec buffered-reasoning-progress-relay, Req 5.1).
+    reasoning_relayed_frames: Option<u64>,
     /// Content-free failure class for error outcomes (`error_class_for`).
     error_class: Option<String>,
 }
 
 impl RequestLogContext {
-    fn with_memory(
+    fn with_reasoning_relay(mut self, relay: Option<&RelayHandle>) -> Self {
+        if let Some(relay) = relay {
+            self.reasoning_relayed_frames = Some(relay.forwarded());
+}
+        self
+}
+
+fn with_memory(
         mut self,
         memory: Option<(&ContextType, &InjectionResult)>,
         extraction: Option<ExtractionCounts>,
@@ -223,12 +238,20 @@ impl RequestLogContext {
                 .get("gateway_reasoning_tokens")
                 .and_then(|v| v.as_u64())
                 .and_then(|v| u32::try_from(v).ok()),
-            reasoning_compat_actions: response
-                .extra
-                .get("gateway_reasoning_compat_actions")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            error_class: None,
+        reasoning_compat_actions: response
+            .extra
+            .get("gateway_reasoning_compat_actions")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        // Reasoning-relay telemetry (spec Req 5.1): the handler attaches
+        // the relayed-frame count to the response extras only when at
+        // least one frame was relayed; the strip-before-client logic
+        // mirrors `gateway_reasoning_tokens`.
+        reasoning_relayed_frames: response
+            .extra
+            .get("gateway_reasoning_relayed_frames")
+            .and_then(|v| v.as_u64()),
+        error_class: None,
         }
     }
 
@@ -258,12 +281,13 @@ impl RequestLogContext {
             cache_creation_tokens: None,
             cache_savings_cents: None,
             prefix_hash: None,
-            // Pass-through streams have no response extras to read; the
-            // reasoning usage itself is attributed to metrics inside
-            // `record_streaming_success`.
-            reasoning_tokens: None,
-            reasoning_compat_actions: None,
-            error_class: None,
+    // Pass-through streams have no response extras to read; the
+    // reasoning usage itself is attributed to metrics inside
+    // `record_streaming_success`.
+    reasoning_tokens: None,
+    reasoning_compat_actions: None,
+    reasoning_relayed_frames: None,
+    error_class: None,
         }
     }
 
@@ -310,10 +334,11 @@ impl RequestLogContext {
             cache_read_tokens: None,
             cache_creation_tokens: None,
             cache_savings_cents: None,
-            prefix_hash: None,
-            reasoning_tokens: None,
-            reasoning_compat_actions: None,
-            error_class: Some(crate::error::error_class_for(error)),
+        prefix_hash: None,
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
+        reasoning_relayed_frames: None,
+        error_class: Some(crate::error::error_class_for(error)),
         }
     }
 }
@@ -332,7 +357,9 @@ fn log_outcome(
         let attempts = handle.take_failed_attempts();
         log_failed_attempts(&state.logger, &state.metrics, &context.trace_id, &attempts);
     }
-    log_request(state, request, context);
+    let relay = handle.and_then(|handle| handle.reasoning_relay());
+    let context = context.clone().with_reasoning_relay(relay.as_ref());
+    log_request(state, request, &context);
     if let Some(handle) = handle {
         handle.mark_outcome_logged();
     }
@@ -340,6 +367,16 @@ fn log_outcome(
 
 /// Log a completed request to the SQLite database for the dashboard log viewer.
 fn log_request(state: &super::AppState, request: &OpenAIRequest, context: &RequestLogContext) {
+    if let Err(error) = write_request_log(&state.logger, request, context) {
+        tracing::warn!(%error, trace_id = %context.trace_id, "Failed to write request log entry");
+}
+}
+
+fn write_request_log(
+    logger: &crate::logger::RequestLogger,
+    request: &OpenAIRequest,
+    context: &RequestLogContext,
+) -> crate::logger::Result<()> {
     let entry = LogEntry {
         trace_id: context.trace_id.clone(),
         timestamp: chrono::Utc::now(),
@@ -373,9 +410,7 @@ fn log_request(state: &super::AppState, request: &OpenAIRequest, context: &Reque
         reasoning_compat_actions: context.reasoning_compat_actions.clone(),
         error_class: context.error_class.clone(),
     };
-    if let Err(e) = state.logger.log(entry) {
-        tracing::warn!(error = %e, trace_id = %context.trace_id, "Failed to write request log entry");
-    }
+    logger.log_with_reasoning_relay(entry, context.reasoning_relayed_frames)
 }
 
 /// `path` marker distinguishing per-attempt failure rows from the normal
@@ -470,6 +505,7 @@ fn strip_gateway_response_metadata(response: &mut OpenAIResponse) {
     response.extra.remove("gateway_prefix_hash");
     response.extra.remove("gateway_reasoning_tokens");
     response.extra.remove("gateway_reasoning_compat_actions");
+    response.extra.remove("gateway_reasoning_relayed_frames");
 }
 
 fn prepare_response_for_client(response: &OpenAIResponse) -> OpenAIResponse {
@@ -1395,7 +1431,8 @@ impl AbandonLogger {
             duration_ms = entry.duration_ms,
             "Request abandoned before completion"
         );
-        if let Err(e) = self.logger.log(entry) {
+        let frames = self.handle.reasoning_relay().map(|relay| relay.forwarded());
+        if let Err(e) = self.logger.log_with_reasoning_relay(entry, frames) {
             tracing::warn!(error = %e, trace_id = %trace_id, "Failed to write abandoned-request log entry");
         }
     }
@@ -1499,6 +1536,7 @@ fn build_active_request_info(
         failed_attempts: Vec::new(),
         outcome_logged: false,
         breaker_skips_recorded: false,
+        reasoning_relay: None,
     }
 }
 
@@ -2469,7 +2507,7 @@ async fn chat_completions_stream(
             let stream = async_stream::stream! {
                 tracing::debug!(trace_id = %stream_trace_id, "Streaming cached response from exact cache");
                 for chunk in streaming_chunks_from_response(&cached_resp) {
-                    yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
+            yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
                 }
                 yield Ok(Event::default().data("[DONE]"));
             };
@@ -2638,530 +2676,673 @@ async fn chat_completions_stream(
                     // Early synthetic event (Req 1.1, 1.2, 1.3).
                     yield Ok::<_, Infallible>(Event::default().data(early_chunk.to_string()));
 
-                    // Task 5.5: dispatch through the streaming router so capable
-                    // providers stream in real time (PassThrough) while providers that
-                    // need response transformation fall back to buffer-and-replay
-                    // (Buffered) — both behind the early event already flushed above.
-                    match state.router.route_request_streaming(&request, Some(active_handle_stream.clone())).await {
-                        Ok(StreamingResponse::Buffered(response)) => {
-                            // Buffer-and-replay: cache the assembled response so a later
-                            // identical request replays without hitting the provider.
-                            if crate::router::router::Router::should_cache_response(&response) {
-                                if let Ok(json) = serde_json::to_string(&response) {
-                                    state.exact_cache.set(&request, json);
-                                }
-                            }
-
-                            let duration_ms = start.elapsed().as_millis() as u64;
-                            let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                            log_outcome(&state, &request, &log_context, _guard.active_handle());
-
-                            // Non-blocking memory extraction now that the full
-                            // response content is known (parity with the
-                            // non-stream path, spawned so it never delays SSE).
-                            if let Some(memory) = memory_context.as_ref() {
-                                let response_content = response
-                                    .choices
-                                    .first()
-                                    .map(|choice| choice.message.content_as_text())
-                                    .unwrap_or_default();
-                                spawn_streaming_memory_extraction(
-                                    &state,
-                                    memory,
-                                    response_content,
-                                    uuid::Uuid::parse_str(&stream_trace_id).ok(),
-                                );
-                            }
-
-                            // Req 1.5: continue emitting content chunks after the early
-                            // event, reusing its id/created and skipping the duplicate
-                            // role delta (task 2.2).
-                            for chunk in streaming_chunks_after_early_event(&response, &response_id, created) {
-                                yield Ok(Event::default().data(chunk.to_string()));
-                            }
-                            if let Some(suffix) = memory_suffix.as_deref() {
-                                if !is_tool_call_turn(&response) {
-                                    yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
-                                }
-                            }
-                            yield Ok(Event::default().data("[DONE]"));
-                        }
-                        Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit, .. }) => {
-                            // True streaming pass-through (Req 3.1, 3.2). The early event
-                            // above already reset the client idle timer; now relay the
-                            // upstream chunks verbatim.
-                            //
-                            // EARLY-EVENT ID TRADEOFF: the relayed chunks carry the
-                            // provider's own `id`, which differs from the synthetic
-                            // early event's fresh uuid. We do NOT rewrite per-chunk ids
-                            // (costly and unnecessary): OpenAI-compatible clients merge
-                            // deltas by `choices[].index`, not by envelope `id`, and the
-                            // role-only early event is idempotent. So we forward upstream
-                            // chunks as-is.
-                            //
-                            // Task 6.1 — PRE-CONTENT FAILOVER LOOP (Req 4.1, 4.4, 4.5):
-                            // relay the current provider; if it fails BEFORE any content
-                            // reached the client, record a circuit-breaker failure, add
-                            // the provider to the exclusion list, and retry the next
-                            // eligible provider — WITHOUT emitting a second early/role
-                            // event (the early event was emitted once, above). The loop
-                            // is bounded because every retry excludes the failed
-                            // provider, so `route_request_streaming_excluding` eventually
-                            // returns `Buffered`/`Err` (no eligible pass-through left).
-                            //
-                    // Task 6.3 — RETRY/FAILOVER LIMITS + AGGREGATED ERROR (Req 4.3):
-                    // - Provider ordering: `route_request_streaming_excluding`
-                    //   picks from the SAME `select_provider_order()` list as the
-                    //   non-streaming path, skipping `tried_providers` (keyed per
-                    //   `provider:model`, matching the circuit-breaker key, so a
-                    //   provider offering several models stays eligible via its
-                    //   other models). That list is the natural bound — each
-                    //   provider:model entry is tried for pass-through at most once.
-                            // - `max_retries_per_provider` mapping: the non-streaming
-                            //   path applies it INSIDE `attempt_with_retry` (inline
-                            //   same-provider retries). A live SSE relay cannot be safely
-                            //   retried inline once response headers/bytes have arrived,
-                            //   so each provider gets exactly ONE pass-through attempt and
-                            //   failover advances to the NEXT provider. The buffered
-                            //   fallback (`route_request`) still honors
-                            //   `max_retries_per_provider` via `attempt_with_retry`.
-                            // - Defensive hard cap: even though the exclusion list bounds
-                            //   the loop, cap total pass-through attempts at
-                            //   (provider count + 1) so a logic error can never spin
-                            //   forever.
-                            // - Aggregated error: each pre-content failure is recorded as
-                            //   a `ProviderAttempt`; if every provider fails they are
-                            //   merged into a single `AllProvidersFailed` error.
-                let (max_retries_per_provider, max_failover_attempts) = {
-                    let cfg = state.config.read().await;
-                    // Exclusion is per provider:model, so the natural loop bound is
-                    // the number of distinct model entries across all groups.
-                    let model_entries: usize = cfg.model_groups.iter().map(|g| g.models.len()).sum();
-                    (cfg.retry.max_retries_per_provider, cfg.providers.len() + model_entries + 1)
-                };
-                            tracing::debug!(
-                                trace_id = %stream_trace_id,
-                                max_retries_per_provider,
-                                max_failover_attempts,
-                                "Streaming failover policy: one pass-through attempt per provider; max_retries_per_provider applies to the buffered fallback only"
-                            );
-
-                            let mut tried_providers: Vec<String> = Vec::new();
-                            // Req 4.3: accumulate each failed pass-through attempt so a
-                            // total failure surfaces every provider, not just the last.
-                            let mut streaming_attempts: Vec<ProviderAttempt> = Vec::new();
-                            let mut failover_attempts: usize = 0;
-                            // Pre-content stream-truncation retry (transient `unexpected
-                            // EOF` etc.): track which `provider:model` keys have already
-                            // been given their ONE same-provider retry so a repeatedly
-                            // truncating provider is excluded and failover advances.
-                            let retry_on_stream_truncation =
-                                streaming_config.retry_on_stream_truncation;
-                            let mut stream_truncation_retried: Vec<String> = Vec::new();
-                                let mut _current_concurrency_permit = Some(concurrency_permit);
-                                let mut current_stream = byte_stream;
-                            let mut current_provider = provider;
-                            let mut current_model = model;
-                            let mut current_compression = compression;
-
-                            'failover: loop {
-                                let relay_start = Instant::now();
-                                // Defensive bound (see note above): unreachable in normal
-                                // operation because the exclusion list already bounds the
-                                // loop. If ever tripped, emit whatever was accumulated.
-                                failover_attempts += 1;
-                                if failover_attempts > max_failover_attempts {
-                                    tracing::error!(
-                                        trace_id = %stream_trace_id,
-                                        failover_attempts,
-                                        max_failover_attempts,
-                                        "Streaming failover exceeded safety cap; aborting with aggregated error"
-                                    );
-                                    let aggregated = GatewayError::AllProvidersFailed(
-                                        AggregatedError::new(std::mem::take(&mut streaming_attempts)),
-                                    );
-                                    let duration_ms = start.elapsed().as_millis() as u64;
-                                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-                                    log_outcome(&state, &request, &log_context, _guard.active_handle());
-                                    let (error_type, message) = classify_stream_error(&aggregated);
-                                    for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
-                                        yield Ok(event);
-                                    }
-                                    break 'failover;
-                                }
-                                // Resolve the chosen provider's effective total timeout
-                                // for the relay budget (Req 3.11). Short-lived guard,
-                                // dropped before relaying — never held across `.await`s.
-                                let total_timeout = {
-                                    let cfg = state.config.read().await;
-                                    let secs = cfg
-                                        .providers
-                                        .iter()
-                                        .find(|p| p.name == current_provider)
-                                        .map(|p| p.effective_total_timeout(&current_model))
-                                        .unwrap_or(600);
-                                    Duration::from_secs(secs)
-                                };
-
-                // Shared handle the relay writes its terminal outcome to.
-                let outcome = Arc::new(tokio::sync::Mutex::new(RelayOutcome::Completed {
-                    usage: Usage::default(),
-                }));
-                                // Enable adaptive XML-tool detection only when the
-                                // request carries `tools` (XML tool use is irrelevant
-                                // otherwise). A learned combo would already have been
-                                // routed to the buffered path, so here it is always an
-                                // as-yet-unlearned combo.
-                                let xml_detect = if request.extra.contains_key("tools") {
-                                    Some(XmlToolDetect {
-                                        router: state.router.clone(),
-                                        provider: current_provider.clone(),
-                                        model: current_model.clone(),
-                                    })
-                                } else {
-                                    None
-                                };
-                                let relay_memory_extraction = memory_context.as_ref().map(|memory| {
-                                    RelayMemoryExtraction {
-                                        system: memory.system.clone(),
-                                        extraction_messages: memory.extraction_messages.clone(),
-                                        namespace: memory.namespace.clone(),
-                                        memory_events: state.memory_events.clone(),
-                                        request_id: uuid::Uuid::parse_str(&stream_trace_id).ok(),
-                                    }
-                                });
-                                let relay = relay_passthrough_stream(
-                                    current_stream,
-                                    streaming_config_relay.clone(),
-                                    stream_trace_id.clone(),
-                                    total_timeout,
-                                    state.exact_cache.clone(),
-                                    state.metrics.clone(),
-                                    request.clone(),
-                                    outcome.clone(),
-                                    xml_detect,
-                                    memory_suffix.clone(),
-                                    relay_memory_extraction,
-                                );
-                                // The relay emits its own terminal `[DONE]` (or a graceful
-                                // error event that appends one, or — on pre-content
-                                // failure — nothing), so we must NOT emit another here.
-                                // `relay_passthrough_stream` returns an `!Unpin` async
-                                // stream, so pin it on the stack before polling.
-                                futures::pin_mut!(relay);
-                                while let Some(ev) = relay.next().await {
-                                    yield ev;
-                                }
-                                drop(relay);
-
-                let final_outcome = { outcome.lock().await.clone() };
-                match final_outcome {
-                    // Clean finish — relay already emitted `[DONE]`.
-                    RelayOutcome::Completed { usage } => {
-                        let duration = start.elapsed();
-                        // Success accounting for pass-through streams (mirror of the
-                        // buffered path): close/record circuit-breaker success, feed
-                        // the latency tracker, accrue cost from the relay's
-                        // reassembled usage, and clear any upstream-driven cooldown
-                        // so a recovered provider is reselected immediately.
-            state
-                .router
-                .record_streaming_success(
-                    &request,
-                    &current_provider,
-                    &current_model,
-                    duration,
-                    &usage,
-                )
-                .await;
-                        let duration_ms = duration.as_millis() as u64;
-                        let log_context = RequestLogContext::from_streaming_success(
-                            &request,
-                            stream_trace_id.clone(),
-                            duration_ms,
-                            current_provider.clone(),
-                            current_model.clone(),
-                            current_compression.clone(),
-                        );
-                        // Streaming attempts that failed before this success are
-                        // in the ledger; log_outcome writes them as #attempt rows.
-                        log_outcome(&state, &request, &log_context, _guard.active_handle());
-                        break 'failover;
+            // Task 5.5: dispatch through the streaming router so capable
+            // providers stream in real time (PassThrough) while providers that
+            // need response transformation fall back to buffer-and-replay
+            // (Buffered) — both behind the early event already flushed above.
+            //
+            // Task 5 — buffered reasoning progress relay (Component 4, site 1):
+            // when enabled, `route_request_streaming` runs on a spawned task so
+            // this generator can interleave reasoning-only deltas (tapped by
+            // `read_upstream_body` out of the buffered upstream SSE) as extra
+            // `data:` events while the buffered pipeline assembles the final
+            // response. The task owns its request clone; no config lock is held
+            // across the await. When the relay is disabled the original direct
+            // await is preserved byte-for-byte (Task 6 owns the disabled /
+            // no-early-event fallback sites).
+        enum RelayStep {
+            Frame(RelayFrame),
+            Routing(Result<StreamingResponse, GatewayError>),
+        }
+        let (routing_result, relayed_frames, dropped_frames) = if streaming_config_relay.relay_reasoning_progress {
+                let (relay_handle, mut relay_rx) = RelayHandle::new();
+                active_handle_stream.attach_reasoning_relay(relay_handle.clone());
+                        let router = Arc::clone(&state.router);
+                        let routed_request = request.clone();
+                        let active_for_routing = active_handle_stream.clone();
+        let mut routing_task = AbortRoutingOnDrop(Some(tokio::spawn(async move {
+        router
+        .route_request_streaming(&routed_request, Some(active_for_routing))
+        .await
+        })));
+        // Once the sender side is dropped, `recv()` resolves to `None`
+        // immediately; the `if relay_open` guard disables that branch so
+        // the loop then waits on the routing task only.
+        let mut relay_open = true;
+            let routing_result = loop {
+            let step = tokio::select! {
+                frame = relay_rx.recv(), if relay_open => match frame {
+                    Some(frame) => RelayStep::Frame(frame),
+                    None => {
+                        relay_open = false;
+                        continue;
                     }
-                                    // Post-content failure (Req 4.2): the relay already
-                                    // emitted the graceful error event + `[DONE]`. We
-                                    // cannot transparently fail over mid-content, so
-                                    // account the failed attempt against the circuit
-                                    // breaker + metrics (Req 4.5) and stop — no retry.
-                                    RelayOutcome::FailedAfterContent(reason) => {
-                                        let duration_ms = start.elapsed().as_millis() as u64;
-                                        let log_context = RequestLogContext::from_streaming_success(
-                                            &request,
-                                            stream_trace_id.clone(),
-                                            duration_ms,
-                                            current_provider.clone(),
-                                            current_model.clone(),
-                                            current_compression.clone(),
+                },
+        res = &mut routing_task.0.as_mut().expect("routing handle lives until Routing arm") => RelayStep::Routing(
+        res.unwrap_or_else(|join_err| {
+        // JoinError (panic/cancel): map to the generic
+        // network class; the graceful SSE error path
+        // below emits the terminal event (design,
+        // Error Scenarios 3) — never a second final
+        // response afterwards.
+        tracing::error!(
+        trace_id = %stream_trace_id,
+        error = %join_err,
+        "Routing task failed while relaying reasoning progress"
+        );
+        Err(GatewayError::Network("routing task failed".to_string()))
+        }),
+        ),
+        };
+        match step {
+        RelayStep::Frame(RelayFrame::Reasoning { text }) => {
+        // Extra `data:` event between keep-alives: same
+        // id/created as the early event, reasoning-only
+        // delta, no `role`, never retracted (Req 1.5).
+        record_reasoning_forwarded(&relay_handle, &stream_trace_id);
+        yield Ok::<_, Infallible>(Event::default().data(
+        reasoning_relay_chunk(&response_id, created, &requested_model, &text)
+        .to_string(),
+        ));
+        }
+        RelayStep::Routing(res) => {
+        // Routing resolved: cancel the abort-on-drop guard
+        // (the task is finished) and drain any frames still
+        // queued in the relay channel so a routing-side burst
+        // is never silently dropped by the select loop.
+        routing_task.0 = None;
+        while let Ok(frame) = relay_rx.try_recv() {
+        let RelayFrame::Reasoning { text } = frame;
+        record_reasoning_forwarded(&relay_handle, &stream_trace_id);
+        yield Ok::<_, Infallible>(Event::default().data(
+        reasoning_relay_chunk(&response_id, created, &requested_model, &text)
+        .to_string(),
+        ));
+        }
+        break res;
+        }
+        }
+        };
+        // Task 8 (Req 4.4/5.1): no double-emit — when frames were relayed
+        // live, the final replay suppresses the reasoning delta, and the
+        // relayed-frame count rides the response extras into the request
+        // log row (stripped before the client sees the replay). Frames
+        // dropped by a full/disconnected channel veto suppression: the
+        // replay then re-emits the full reasoning (a duplicated prefix is
+        // the documented fail-open tradeoff) so no relay tail is lost.
+        let relayed_frames = relay_handle.forwarded();
+        let dropped_frames = relay_handle.dropped();
+        (routing_result, relayed_frames, dropped_frames)
+        } else {
+        (
+        state.router
+        .route_request_streaming(&request, Some(active_handle_stream.clone()))
+        .await,
+        0,
+        0,
+        )
+        };
+        match routing_result {
+                Ok(StreamingResponse::Buffered(mut response)) => {
+                    // Buffer-and-replay: cache the assembled response so a later
+                    // identical request replays without hitting the provider.
+                    if crate::router::router::Router::should_cache_response(&response) {
+                        if let Ok(json) = serde_json::to_string(&response) {
+                            state.exact_cache.set(&request, json);
+                        }
+                    }
+
+                    // Task 8 (Req 5.1): relay telemetry rides the response extras
+                    // into `RequestLogContext::from_response` and the log row; the
+                    // re-chunk path strips it before emitting to the client.
+                    if relayed_frames > 0 {
+                        response.extra.insert(
+                            "gateway_reasoning_relayed_frames".to_string(),
+                            serde_json::json!(relayed_frames),
+                        );
+                    }
+
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                    log_outcome(&state, &request, &log_context, _guard.active_handle());
+
+                                    // Non-blocking memory extraction now that the full
+                                    // response content is known (parity with the
+                                    // non-stream path, spawned so it never delays SSE).
+                                    if let Some(memory) = memory_context.as_ref() {
+                                        let response_content = response
+                                            .choices
+                                            .first()
+                                            .map(|choice| choice.message.content_as_text())
+                                            .unwrap_or_default();
+                                        spawn_streaming_memory_extraction(
+                                            &state,
+                                            memory,
+                                            response_content,
+                                            uuid::Uuid::parse_str(&stream_trace_id).ok(),
                                         );
-                                        active_handle_stream.record_failed_attempt(relay_failure_attempt(
-                                            &current_provider,
-                                            &current_model,
-                                            &reason,
-                                            relay_start.elapsed(),
-                                        ));
-                                        log_outcome(&state, &request, &log_context, _guard.active_handle());
-                                        state
-                                            .router
-                                            .record_streaming_failure(
-                                                &current_provider,
-                                                &current_model,
-                                                Some(reason.clone()),
-                                            )
-                                            .await;
-                                        tracing::warn!(
-                                            trace_id = %stream_trace_id,
-                                            provider = %current_provider,
-                                            reason = %reason,
-                                            "Streaming provider failed after content was sent; closing stream (no failover)"
-                                        );
-                                        break 'failover;
                                     }
-                                    // Pre-content failure — transparently fail over.
-                                    RelayOutcome::FailedBeforeContent(reason) => {
-                                        // Req 4.5: account the failed attempt against the
-                                        // circuit breaker before retrying.
-                                        state
-                                            .router
-                                            .record_streaming_failure(
-                                                &current_provider,
-                                                &current_model,
-                                                Some(reason.clone()),
-                                            )
-                                            .await;
 
-                                        let current_key =
-                                            format!("{}:{}", current_provider, current_model);
+                    // Req 1.5: continue emitting content chunks after the early
+                    // event, reusing its id/created and skipping the duplicate
+                    // role delta (task 2.2). Task 8 (Req 4.4): when reasoning
+                    // was already relayed live, the replay suppresses the
+                    // reasoning delta (no double-emit).
+        let chunks = if relayed_frames > 0 && dropped_frames == 0 {
+        streaming_chunks_after_early_event_suppress_reasoning(
+        &response,
+        &response_id,
+        created,
+        )
+        } else {
+        streaming_chunks_after_early_event(&response, &response_id, created)
+        };
+                    for chunk in chunks {
+                        yield Ok(Event::default().data(chunk.to_string()));
+                    }
+                    if let Some(suffix) = memory_suffix.as_deref() {
+                        if !is_tool_call_turn(&response) {
+                            yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+                        }
+                    }
+                    yield Ok(Event::default().data("[DONE]"));
+                }
+                Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit, .. }) => {
+                                    // True streaming pass-through (Req 3.1, 3.2). The early event
+                                    // above already reset the client idle timer; now relay the
+                                    // upstream chunks verbatim.
+                                    //
+                                    // EARLY-EVENT ID TRADEOFF: the relayed chunks carry the
+                                    // provider's own `id`, which differs from the synthetic
+                                    // early event's fresh uuid. We do NOT rewrite per-chunk ids
+                                    // (costly and unnecessary): OpenAI-compatible clients merge
+                                    // deltas by `choices[].index`, not by envelope `id`, and the
+                                    // role-only early event is idempotent. So we forward upstream
+                                    // chunks as-is.
+                                    //
+                                    // Task 6.1 — PRE-CONTENT FAILOVER LOOP (Req 4.1, 4.4, 4.5):
+                                    // relay the current provider; if it fails BEFORE any content
+                                    // reached the client, record a circuit-breaker failure, add
+                                    // the provider to the exclusion list, and retry the next
+                                    // eligible provider — WITHOUT emitting a second early/role
+                                    // event (the early event was emitted once, above). The loop
+                                    // is bounded because every retry excludes the failed
+                                    // provider, so `route_request_streaming_excluding` eventually
+                                    // returns `Buffered`/`Err` (no eligible pass-through left).
+                                    //
+                            // Task 6.3 — RETRY/FAILOVER LIMITS + AGGREGATED ERROR (Req 4.3):
+                            // - Provider ordering: `route_request_streaming_excluding`
+                            //   picks from the SAME `select_provider_order()` list as the
+                            //   non-streaming path, skipping `tried_providers` (keyed per
+                            //   `provider:model`, matching the circuit-breaker key, so a
+                            //   provider offering several models stays eligible via its
+                            //   other models). That list is the natural bound — each
+                            //   provider:model entry is tried for pass-through at most once.
+                                    // - `max_retries_per_provider` mapping: the non-streaming
+                                    //   path applies it INSIDE `attempt_with_retry` (inline
+                                    //   same-provider retries). A live SSE relay cannot be safely
+                                    //   retried inline once response headers/bytes have arrived,
+                                    //   so each provider gets exactly ONE pass-through attempt and
+                                    //   failover advances to the NEXT provider. The buffered
+                                    //   fallback (`route_request`) still honors
+                                    //   `max_retries_per_provider` via `attempt_with_retry`.
+                                    // - Defensive hard cap: even though the exclusion list bounds
+                                    //   the loop, cap total pass-through attempts at
+                                    //   (provider count + 1) so a logic error can never spin
+                                    //   forever.
+                                    // - Aggregated error: each pre-content failure is recorded as
+                                    //   a `ProviderAttempt`; if every provider fails they are
+                                    //   merged into a single `AllProvidersFailed` error.
+                        let (max_retries_per_provider, max_failover_attempts) = {
+                            let cfg = state.config.read().await;
+                            // Exclusion is per provider:model, so the natural loop bound is
+                            // the number of distinct model entries across all groups.
+                            let model_entries: usize = cfg.model_groups.iter().map(|g| g.models.len()).sum();
+                            (cfg.retry.max_retries_per_provider, cfg.providers.len() + model_entries + 1)
+                        };
+                                    tracing::debug!(
+                                        trace_id = %stream_trace_id,
+                                        max_retries_per_provider,
+                                        max_failover_attempts,
+                                        "Streaming failover policy: one pass-through attempt per provider; max_retries_per_provider applies to the buffered fallback only"
+                                    );
 
-                                        // Transient stream-truncation retry: the upstream
-                                        // dropped the connection mid-body before any
-                                        // content reached the client (e.g. `unexpected EOF
-                                        // during chunk size line`). These transport
-                                        // failures are non-deterministic, so give the SAME
-                                        // provider ONE more attempt before excluding it and
-                                        // advancing. Gated by `retry_on_stream_truncation`
-                                        // and bounded to one retry per provider:model via
-                                        // `stream_truncation_retried`. The defensive
-                                        // `max_failover_attempts` cap still bounds the loop.
-                                        if retry_on_stream_truncation
-                                            && is_transient_stream_truncation(&reason)
-                                            && !stream_truncation_retried.contains(&current_key)
-                                        {
-                                            stream_truncation_retried.push(current_key.clone());
-                                            tracing::warn!(
+                                    let mut tried_providers: Vec<String> = Vec::new();
+                                    // Req 4.3: accumulate each failed pass-through attempt so a
+                                    // total failure surfaces every provider, not just the last.
+                                    let mut streaming_attempts: Vec<ProviderAttempt> = Vec::new();
+                                    let mut failover_attempts: usize = 0;
+                                    // Pre-content stream-truncation retry (transient `unexpected
+                                    // EOF` etc.): track which `provider:model` keys have already
+                                    // been given their ONE same-provider retry so a repeatedly
+                                    // truncating provider is excluded and failover advances.
+                                    let retry_on_stream_truncation =
+                                        streaming_config.retry_on_stream_truncation;
+                                    let mut stream_truncation_retried: Vec<String> = Vec::new();
+                                        let mut _current_concurrency_permit = Some(concurrency_permit);
+                                        let mut current_stream = byte_stream;
+                                    let mut current_provider = provider;
+                                    let mut current_model = model;
+                                    let mut current_compression = compression;
+
+                                    'failover: loop {
+                                        let relay_start = Instant::now();
+                                        // Defensive bound (see note above): unreachable in normal
+                                        // operation because the exclusion list already bounds the
+                                        // loop. If ever tripped, emit whatever was accumulated.
+                                        failover_attempts += 1;
+                                        if failover_attempts > max_failover_attempts {
+                                            tracing::error!(
                                                 trace_id = %stream_trace_id,
-                                                provider = %current_provider,
-                                                model = %current_model,
-                                                reason = %reason,
-                                                "Streaming provider truncated before any content; retrying same provider once (transient transport failure)"
+                                                failover_attempts,
+                                                max_failover_attempts,
+                                                "Streaming failover exceeded safety cap; aborting with aggregated error"
                                             );
-                                            // Record the attempt for the aggregated error in
-                                            // case everything ultimately fails (Req 4.3).
-                                            let attempt = relay_failure_attempt(
-                                                &current_provider,
-                                                &current_model,
-                                                &reason,
-                                                relay_start.elapsed(),
+                                            let aggregated = GatewayError::AllProvidersFailed(
+                                                AggregatedError::new(std::mem::take(&mut streaming_attempts)),
                                             );
-                                            streaming_attempts.push(attempt.clone());
-                                            active_handle_stream.record_failed_attempt(attempt);
-                                            drop(_current_concurrency_permit.take());
-
-                                            // Re-request WITHOUT excluding the current
-                                            // provider so the router can hand back the same
-                                            // provider:model for a fresh connection.
-                                            match state
-                                                .router
-                                                .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
-                                                .await
-                                            {
-                                                Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit, .. }) => {
-                                                    _current_concurrency_permit = Some(concurrency_permit);
-                                                    current_stream = byte_stream;
-                                                    current_provider = provider;
-                                                    current_model = model;
-                                                    current_compression = compression;
-                                                    continue 'failover;
-                                                }
-                                                // No eligible pass-through provider (e.g. the
-                                                // provider is now circuit-broken from the
-                                                // failure we just recorded) — replay the
-                                                // buffered fallback after the early event.
-                                                Ok(StreamingResponse::Buffered(response)) => {
-                                                    if crate::router::router::Router::should_cache_response(&response) {
-                                                        if let Ok(json) = serde_json::to_string(&response) {
-                                                            state.exact_cache.set(&request, json);
-                                                        }
-                                                    }
-                                                    let duration_ms = start.elapsed().as_millis() as u64;
-                                                    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                                                    log_outcome(&state, &request, &log_context, _guard.active_handle());
-                                                    if let Some(memory) = memory_context.as_ref() {
-                                                        let response_content = response
-                                                            .choices
-                                                            .first()
-                                                            .map(|choice| choice.message.content_as_text())
-                                                            .unwrap_or_default();
-                                                        spawn_streaming_memory_extraction(
-                                                            &state,
-                                                            memory,
-                                                            response_content,
-                                                            uuid::Uuid::parse_str(&stream_trace_id).ok(),
-                                                        );
-                                                    }
-                                                    for chunk in streaming_chunks_after_early_event(&response, &response_id, created) {
-                                                        yield Ok(Event::default().data(chunk.to_string()));
-                                                    }
-                                                    if let Some(suffix) = memory_suffix.as_deref() {
-                                                        if !is_tool_call_turn(&response) {
-                                                            yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
-                                                        }
-                                                    }
-                                                    yield Ok(Event::default().data("[DONE]"));
-                                                    break 'failover;
-                                                }
-                                                Err(e) => {
-                                                    let aggregated = merge_streaming_attempts(
-                                                        std::mem::take(&mut streaming_attempts),
-                                                        e,
-                                                    );
-                                                    let duration_ms = start.elapsed().as_millis() as u64;
-                                                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-                                                    log_outcome(&state, &request, &log_context, _guard.active_handle());
-                                                    let (error_type, message) = classify_stream_error(&aggregated);
-                                                    for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
-                                                        yield Ok(event);
-                                                    }
-                                                    break 'failover;
-                                                }
+                                            let duration_ms = start.elapsed().as_millis() as u64;
+                                            let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
+                                            log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                            let (error_type, message) = classify_stream_error(&aggregated);
+                                            for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
+                                                yield Ok(event);
                                             }
+                                            break 'failover;
                                         }
+                                        // Resolve the chosen provider's effective total timeout
+                                        // for the relay budget (Req 3.11). Short-lived guard,
+                                        // dropped before relaying — never held across `.await`s.
+                                        let total_timeout = {
+                                            let cfg = state.config.read().await;
+                                            let secs = cfg
+                                                .providers
+                                                .iter()
+                                                .find(|p| p.name == current_provider)
+                                                .map(|p| p.effective_total_timeout(&current_model))
+                                                .unwrap_or(600);
+                                            Duration::from_secs(secs)
+                                        };
 
-                                        tracing::warn!(
-                                            trace_id = %stream_trace_id,
-                                            provider = %current_provider,
-                                            reason = %reason,
-                                            "Streaming provider failed before any content; attempting pre-content failover"
+                        // Shared handle the relay writes its terminal outcome to.
+                        let outcome = Arc::new(tokio::sync::Mutex::new(RelayOutcome::Completed {
+                            usage: Usage::default(),
+                        }));
+                                        // Enable adaptive XML-tool detection only when the
+                                        // request carries `tools` (XML tool use is irrelevant
+                                        // otherwise). A learned combo would already have been
+                                        // routed to the buffered path, so here it is always an
+                                        // as-yet-unlearned combo.
+                                        let xml_detect = if request.extra.contains_key("tools") {
+                                            Some(XmlToolDetect {
+                                                router: state.router.clone(),
+                                                provider: current_provider.clone(),
+                                                model: current_model.clone(),
+                                            })
+                                        } else {
+                                            None
+                                        };
+                                        let relay_memory_extraction = memory_context.as_ref().map(|memory| {
+                                            RelayMemoryExtraction {
+                                                system: memory.system.clone(),
+                                                extraction_messages: memory.extraction_messages.clone(),
+                                                namespace: memory.namespace.clone(),
+                                                memory_events: state.memory_events.clone(),
+                                                request_id: uuid::Uuid::parse_str(&stream_trace_id).ok(),
+                                            }
+                                        });
+                                        let relay = relay_passthrough_stream(
+                                            current_stream,
+                                            streaming_config_relay.clone(),
+                                            stream_trace_id.clone(),
+                                            total_timeout,
+                                            state.exact_cache.clone(),
+                                            state.metrics.clone(),
+                                            request.clone(),
+                                            outcome.clone(),
+                                            xml_detect,
+                                            memory_suffix.clone(),
+                                            relay_memory_extraction,
                                         );
-                                        tried_providers.push(current_key);
-                                        // Req 4.3: record this pre-content failure for the
-                                        // aggregated error in case every provider fails.
-                                        let attempt = relay_failure_attempt(
-                                            &current_provider,
-                                            &current_model,
-                                            &reason,
-                                            relay_start.elapsed(),
-                                        );
-                                        streaming_attempts.push(attempt.clone());
-                                        active_handle_stream.record_failed_attempt(attempt);
-        drop(_current_concurrency_permit.take());
+                                        // The relay emits its own terminal `[DONE]` (or a graceful
+                                        // error event that appends one, or — on pre-content
+                                        // failure — nothing), so we must NOT emit another here.
+                                        // `relay_passthrough_stream` returns an `!Unpin` async
+                                        // stream, so pin it on the stack before polling.
+                                        futures::pin_mut!(relay);
+                                        while let Some(ev) = relay.next().await {
+                                            yield ev;
+                                        }
+                                        drop(relay);
 
+                        let final_outcome = { outcome.lock().await.clone() };
+                        match final_outcome {
+                            // Clean finish — relay already emitted `[DONE]`.
+                            RelayOutcome::Completed { usage } => {
+                                let duration = start.elapsed();
+                                // Success accounting for pass-through streams (mirror of the
+                                // buffered path): close/record circuit-breaker success, feed
+                                // the latency tracker, accrue cost from the relay's
+                                // reassembled usage, and clear any upstream-driven cooldown
+                                // so a recovered provider is reselected immediately.
+                    state
+                        .router
+                        .record_streaming_success(
+                            &request,
+                            &current_provider,
+                            &current_model,
+                            duration,
+                            &usage,
+                        )
+                        .await;
+                                let duration_ms = duration.as_millis() as u64;
+                                let log_context = RequestLogContext::from_streaming_success(
+                                    &request,
+                                    stream_trace_id.clone(),
+                                    duration_ms,
+                                    current_provider.clone(),
+                                    current_model.clone(),
+                                    current_compression.clone(),
+                                );
+                                // Streaming attempts that failed before this success are
+                                // in the ledger; log_outcome writes them as #attempt rows.
+                                log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                break 'failover;
+                            }
+                                            // Post-content failure (Req 4.2): the relay already
+                                            // emitted the graceful error event + `[DONE]`. We
+                                            // cannot transparently fail over mid-content, so
+                                            // account the failed attempt against the circuit
+                                            // breaker + metrics (Req 4.5) and stop — no retry.
+                                            RelayOutcome::FailedAfterContent(reason) => {
+                                                let duration_ms = start.elapsed().as_millis() as u64;
+                                                let log_context = RequestLogContext::from_streaming_success(
+                                                    &request,
+                                                    stream_trace_id.clone(),
+                                                    duration_ms,
+                                                    current_provider.clone(),
+                                                    current_model.clone(),
+                                                    current_compression.clone(),
+                                                );
+                                                active_handle_stream.record_failed_attempt(relay_failure_attempt(
+                                                    &current_provider,
+                                                    &current_model,
+                                                    &reason,
+                                                    relay_start.elapsed(),
+                                                ));
+                                                log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                                state
+                                                    .router
+                                                    .record_streaming_failure(
+                                                        &current_provider,
+                                                        &current_model,
+                                                        Some(reason.clone()),
+                                                    )
+                                                    .await;
+                                                tracing::warn!(
+                                                    trace_id = %stream_trace_id,
+                                                    provider = %current_provider,
+                                                    reason = %reason,
+                                                    "Streaming provider failed after content was sent; closing stream (no failover)"
+                                                );
+                                                break 'failover;
+                                            }
+                                            // Pre-content failure — transparently fail over.
+                                            RelayOutcome::FailedBeforeContent(reason) => {
+                                                // Req 4.5: account the failed attempt against the
+                                                // circuit breaker before retrying.
+                                                state
+                                                    .router
+                                                    .record_streaming_failure(
+                                                        &current_provider,
+                                                        &current_model,
+                                                        Some(reason.clone()),
+                                                    )
+                                                    .await;
+
+                                                let current_key =
+                                                    format!("{}:{}", current_provider, current_model);
+
+                                                // Transient stream-truncation retry: the upstream
+                                                // dropped the connection mid-body before any
+                                                // content reached the client (e.g. `unexpected EOF
+                                                // during chunk size line`). These transport
+                                                // failures are non-deterministic, so give the SAME
+                                                // provider ONE more attempt before excluding it and
+                                                // advancing. Gated by `retry_on_stream_truncation`
+                                                // and bounded to one retry per provider:model via
+                                                // `stream_truncation_retried`. The defensive
+                                                // `max_failover_attempts` cap still bounds the loop.
+                                                if retry_on_stream_truncation
+                                                    && is_transient_stream_truncation(&reason)
+                                                    && !stream_truncation_retried.contains(&current_key)
+                                                {
+                                                    stream_truncation_retried.push(current_key.clone());
+                                                    tracing::warn!(
+                                                        trace_id = %stream_trace_id,
+                                                        provider = %current_provider,
+                                                        model = %current_model,
+                                                        reason = %reason,
+                                                        "Streaming provider truncated before any content; retrying same provider once (transient transport failure)"
+                                                    );
+                                                    // Record the attempt for the aggregated error in
+                                                    // case everything ultimately fails (Req 4.3).
+                                                    let attempt = relay_failure_attempt(
+                                                        &current_provider,
+                                                        &current_model,
+                                                        &reason,
+                                                        relay_start.elapsed(),
+                                                    );
+                                                    streaming_attempts.push(attempt.clone());
+                                                    active_handle_stream.record_failed_attempt(attempt);
+                                                    drop(_current_concurrency_permit.take());
+
+        // Re-request WITHOUT excluding the current
+        // provider so the router can hand back the same
+        // provider:model for a fresh connection. Detach
+        // the reasoning relay first: the select loop is
+        // done, so a buffered attempt inside this call
+        // must not tap frames into the un-drained receiver.
+        active_handle_stream.detach_reasoning_relay();
         match state
-                                            .router
-                                            .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
-                                            .await
-                                        {
-                                            // Another eligible provider — relay it,
-                                            // reusing the SAME early-event id (Req 4.4:
-                                            // do NOT emit a second role event).
+        .router
+        .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
+        .await
+        {
         Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit, .. }) => {
         _current_concurrency_permit = Some(concurrency_permit);
         current_stream = byte_stream;
-                                                current_provider = provider;
-                                                current_model = model;
-                                                current_compression = compression;
-                                                continue 'failover;
-                                            }
-                                            // No eligible pass-through provider remains —
-                                            // replay the buffered fallback after the early
-                                            // event, then terminate.
-                                            Ok(StreamingResponse::Buffered(response)) => {
-                                                if crate::router::router::Router::should_cache_response(&response) {
-                                                    if let Ok(json) = serde_json::to_string(&response) {
-                                                        state.exact_cache.set(&request, json);
-                                                    }
-                                                }
-                                                let duration_ms = start.elapsed().as_millis() as u64;
-                                                let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                                                log_outcome(&state, &request, &log_context, _guard.active_handle());
-                                                if let Some(memory) = memory_context.as_ref() {
-                                                    let response_content = response
-                                                        .choices
-                                                        .first()
-                                                        .map(|choice| choice.message.content_as_text())
-                                                        .unwrap_or_default();
-                                                    spawn_streaming_memory_extraction(
-                                                        &state,
-                                                        memory,
-                                                        response_content,
-                                                        uuid::Uuid::parse_str(&stream_trace_id).ok(),
-                                                    );
-                                                }
-                                                for chunk in streaming_chunks_after_early_event(&response, &response_id, created) {
-                                                    yield Ok(Event::default().data(chunk.to_string()));
-                                                }
-                                                if let Some(suffix) = memory_suffix.as_deref() {
-                                                    if !is_tool_call_turn(&response) {
-                                                        yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
-                                                    }
-                                                }
-                                                yield Ok(Event::default().data("[DONE]"));
-                                                break 'failover;
-                                            }
-                                            // All providers exhausted/failed — merge the
-                                            // accumulated pass-through attempts with the
-                                            // error from the excluding call (Req 4.3) so
-                                            // the client sees every failed provider, then
-                                            // emit a single graceful aggregated error
-                                            // event (client is in SSE mode).
-                                            Err(e) => {
-                                                let aggregated = merge_streaming_attempts(
-                                                    std::mem::take(&mut streaming_attempts),
-                                                    e,
+        current_provider = provider;
+        current_model = model;
+        current_compression = compression;
+        continue 'failover;
+        }
+        // No eligible pass-through provider (e.g. the
+        // provider is now circuit-broken from the
+        // failure we recorded) — replay the
+        // buffered fallback after the early event.
+        // Suppression rule (Task 8, Req 4.4): suppress
+        // reasoning only when frames were relayed AND
+        // none were dropped (full replay otherwise).
+        Ok(StreamingResponse::Buffered(response)) => {
+                                                            if crate::router::router::Router::should_cache_response(&response) {
+                                                                if let Ok(json) = serde_json::to_string(&response) {
+                                                                    state.exact_cache.set(&request, json);
+                                                                }
+                                                            }
+                                                            let duration_ms = start.elapsed().as_millis() as u64;
+                                                            let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                                                            log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                                            if let Some(memory) = memory_context.as_ref() {
+                                                                let response_content = response
+                                                                    .choices
+                                                                    .first()
+                                                                    .map(|choice| choice.message.content_as_text())
+                                                                    .unwrap_or_default();
+                                                                spawn_streaming_memory_extraction(
+                                                                    &state,
+                                                                    memory,
+                                                                    response_content,
+                                                                    uuid::Uuid::parse_str(&stream_trace_id).ok(),
+                                                                );
+                                                            }
+        for chunk in if relayed_frames > 0 && dropped_frames == 0 {
+        streaming_chunks_after_early_event_suppress_reasoning(&response, &response_id, created)
+        } else {
+        streaming_chunks_after_early_event(&response, &response_id, created)
+        } {
+        yield Ok(Event::default().data(chunk.to_string()));
+        }
+        if let Some(suffix) = memory_suffix.as_deref() {
+        if !is_tool_call_turn(&response) {
+        yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+        }
+        }
+        yield Ok(Event::default().data("[DONE]"));
+        break 'failover;
+        }
+        Err(e) => {
+        let aggregated = merge_streaming_attempts(
+        std::mem::take(&mut streaming_attempts),
+        e,
+        );
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
+        log_outcome(&state, &request, &log_context, _guard.active_handle());
+        let (error_type, message) = classify_stream_error(&aggregated);
+        for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
+        yield Ok(event);
+        }
+        break 'failover;
+        }
+        }
+        }
+
+        tracing::warn!(
+        trace_id = %stream_trace_id,
+        provider = %current_provider,
+        reason = %reason,
+        "Streaming provider failed before any content; attempting pre-content failover"
+        );
+                                                tried_providers.push(current_key);
+                                                // Req 4.3: record this pre-content failure for the
+                                                // aggregated error in case every provider fails.
+                                                let attempt = relay_failure_attempt(
+                                                    &current_provider,
+                                                    &current_model,
+                                                    &reason,
+                                                    relay_start.elapsed(),
                                                 );
-                                                let duration_ms = start.elapsed().as_millis() as u64;
-                                                let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-                                                log_outcome(&state, &request, &log_context, _guard.active_handle());
-                                                let (error_type, message) = classify_stream_error(&aggregated);
-                                                for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
-                                                    yield Ok(event);
+                                                streaming_attempts.push(attempt.clone());
+                                                active_handle_stream.record_failed_attempt(attempt);
+        drop(_current_concurrency_permit.take());
+
+        // Detach the reasoning relay before the excluding re-route: the
+        // select loop above is done, so frames tapped by a buffered attempt
+        // inside this call must not sit in the un-drained receiver.
+        active_handle_stream.detach_reasoning_relay();
+        match state
+        .router
+        .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
+        .await
+        {
+        // Another eligible provider — relay it,
+                                                    // reusing the SAME early-event id (Req 4.4:
+                                                    // do NOT emit a second role event).
+                Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit, .. }) => {
+                _current_concurrency_permit = Some(concurrency_permit);
+                current_stream = byte_stream;
+                                                        current_provider = provider;
+                                                        current_model = model;
+                                                        current_compression = compression;
+                                                        continue 'failover;
+                                                    }
+        // No eligible pass-through provider remains —
+        // replay the buffered fallback after the early
+        // event, then terminate. Same suppression rule as
+        // the truncation-retry fallback above.
+        Ok(StreamingResponse::Buffered(response)) => {
+                                                        if crate::router::router::Router::should_cache_response(&response) {
+                                                            if let Ok(json) = serde_json::to_string(&response) {
+                                                                state.exact_cache.set(&request, json);
+                                                            }
+                                                        }
+                                                        let duration_ms = start.elapsed().as_millis() as u64;
+                                                        let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+                                                        log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                                        if let Some(memory) = memory_context.as_ref() {
+                                                            let response_content = response
+                                                                .choices
+                                                                .first()
+                                                                .map(|choice| choice.message.content_as_text())
+                                                                .unwrap_or_default();
+                                                            spawn_streaming_memory_extraction(
+                                                                &state,
+                                                                memory,
+                                                                response_content,
+                                                                uuid::Uuid::parse_str(&stream_trace_id).ok(),
+                                                            );
+                                                        }
+        for chunk in if relayed_frames > 0 && dropped_frames == 0 {
+        streaming_chunks_after_early_event_suppress_reasoning(&response, &response_id, created)
+        } else {
+        streaming_chunks_after_early_event(&response, &response_id, created)
+        } {
+        yield Ok(Event::default().data(chunk.to_string()));
+        }
+        if let Some(suffix) = memory_suffix.as_deref() {
+        if !is_tool_call_turn(&response) {
+        yield Ok(Event::default().data(memory_feedback_chunk(&request, suffix).to_string()));
+        }
+        }
+        yield Ok(Event::default().data("[DONE]"));
+        break 'failover;
+        }
+        // All providers exhausted/failed — merge the
+                                                    // accumulated pass-through attempts with the
+                                                    // error from the excluding call (Req 4.3) so
+                                                    // the client sees every failed provider, then
+                                                    // emit a single graceful aggregated error
+                                                    // event (client is in SSE mode).
+                                                    Err(e) => {
+                                                        let aggregated = merge_streaming_attempts(
+                                                            std::mem::take(&mut streaming_attempts),
+                                                            e,
+                                                        );
+                                                        let duration_ms = start.elapsed().as_millis() as u64;
+                                                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
+                                                        log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                                        let (error_type, message) = classify_stream_error(&aggregated);
+                                                        for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
+                                                            yield Ok(event);
+                                                        }
+                                                        break 'failover;
+                                                    }
                                                 }
-                                                break 'failover;
                                             }
                                         }
                                     }
                                 }
-                            }
-                        }
-                        Err(e) => {
-                            // The early event already put the client in SSE parsing mode,
-                            // so an HTTP error status is no longer possible. Emit a
-                            // graceful SSE error event so the client always gets a reason
-                            // before the stream terminates (Req 5.1, 5.2, 5.4).
-                            let duration_ms = start.elapsed().as_millis() as u64;
-                            let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
-                            log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                Err(e) => {
+                                    // The early event already put the client in SSE parsing mode,
+                                    // so an HTTP error status is no longer possible. Emit a
+                                    // graceful SSE error event so the client always gets a reason
+                                    // before the stream terminates (Req 5.1, 5.2, 5.4).
+                                    let duration_ms = start.elapsed().as_millis() as u64;
+                                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
+                                    log_outcome(&state, &request, &log_context, _guard.active_handle());
 
-                            // Map the error variant to an SSE error frame. emit_sse_error_event
-                            // already appends [DONE], so we must NOT yield a separate one.
-                            let (error_type, message) = classify_stream_error(&e);
-                            for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
-                                yield Ok(event);
+                                    // Map the error variant to an SSE error frame. emit_sse_error_event
+                                    // already appends [DONE], so we must NOT yield a separate one.
+                                    let (error_type, message) = classify_stream_error(&e);
+                                    for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
+                                        yield Ok(event);
+                                    }
+                                }
                             }
-                        }
-                    }
 
-                    _guard.complete();
-                };
+                            _guard.complete();
+                        };
 
         let mut sse = Sse::new(stream)
             .keep_alive(build_keepalive(&streaming_config))
@@ -3180,24 +3361,306 @@ async fn chat_completions_stream(
     // buffered preserves the "pre-stream errors return proper HTTP status"
     // behavior (Req 1.6) with the smallest change.
     //
+    // Task 6 — buffered reasoning progress relay (Component 4, site 2): when
+    // enabled, `route_request` runs on a spawned task inside the SSE generator
+    // with the same select-loop shape as the early-event branch (Task 5), so
+    // reasoning-only deltas are interleaved while the buffered pipeline
+    // assembles the final response. Because no early role event was sent on
+    // this path, the FIRST relayed frame carries `delta.role: "assistant"`
+    // exactly once (Req 2.5); a `first` flag tracks that. Errors surface
+    // before any frame was relayed still return a proper HTTP status (the
+    // generator yields nothing until routing resolves or a frame arrives —
+    // the response status is committed on first poll of the SSE body); once
+    // relay frames have been emitted, errors map to the graceful SSE error
+    // event like the early-event path.
+    //
+    // When the relay is disabled, route_request() runs directly in the
+    // handler (byte-identical to the pre-relay flow) and pre-stream errors
+    // return proper HTTP status codes.
+    let relay_enabled_fallback = streaming_config.relay_reasoning_progress;
+
     // Route the request first (provider always returns non-streaming JSON).
     // Errors here happen BEFORE any SSE chunks are sent, so we return a
     // normal JSON error response with the proper HTTP status code.
-    let response = match state
-        .router
-        .route_request(&request, Some(active_handle.clone()))
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            let duration_ms = request_guard.complete();
-            let log_context =
-                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
-            log_outcome(&state, &request, &log_context, request_guard.active_handle());
-            let mut response = e.into_response();
-            attach_trace_id_header(&mut response, &trace_id);
-            return response;
+    let response = if !relay_enabled_fallback {
+        match state
+            .router
+            .route_request(&request, Some(active_handle.clone()))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                let duration_ms = request_guard.complete();
+                let log_context =
+                    RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
+                log_outcome(
+                    &state,
+                    &request,
+                    &log_context,
+                    request_guard.active_handle(),
+                );
+                let mut response = e.into_response();
+                attach_trace_id_header(&mut response, &trace_id);
+                return response;
+            }
         }
+    } else {
+        // Pre-generate the shared envelope (same convention as the final
+        // re-chunk's provider id/created override in the early-event path):
+        // every relayed frame and the final replay line up on one id/created.
+        let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+        let created = chrono::Utc::now().timestamp();
+        let requested_model = request.model.clone();
+        let stream_trace_id = trace_id.clone();
+        let active_handle_stream = active_handle.clone();
+        let streaming_config_relay = streaming_config.clone();
+
+        enum RelayStep {
+            Frame(RelayFrame),
+            Routing(Result<OpenAIResponse, GatewayError>),
+        }
+        let (relay_handle, mut relay_rx) = RelayHandle::new();
+        active_handle_stream.attach_reasoning_relay(relay_handle.clone());
+        let router = Arc::clone(&state.router);
+        let routed_request = request.clone();
+        let active_for_routing = active_handle_stream.clone();
+        let mut routing_task = AbortRoutingOnDrop(Some(tokio::spawn(async move {
+            router
+                .route_request(&routed_request, Some(active_for_routing))
+                .await
+        })));
+
+        // Pre-stream error status regression fix: drive the FIRST step here in
+        // the handler, before the SSE response is committed. If routing errors
+        // before any relay frame was emitted, return the original HTTP error
+        // status exactly like the relay-disabled branch (Req 1.6).
+        let mut relay_open = true;
+        let first_step = loop {
+            tokio::select! {
+            frame = relay_rx.recv(), if relay_open => match frame {
+            Some(frame) => break RelayStep::Frame(frame),
+            None => {
+            relay_open = false;
+            continue;
+            }
+            },
+            res = &mut routing_task.0.as_mut().expect("routing handle lives until Routing arm") => break RelayStep::Routing(
+            res.unwrap_or_else(|join_err| {
+            // JoinError (panic/cancel): map to the generic
+            // network class below.
+            tracing::error!(
+            trace_id = %stream_trace_id,
+            error = %join_err,
+            "Routing task failed while relaying reasoning progress (early event disabled)"
+            );
+            Err(GatewayError::Network("routing task failed".to_string()))
+            })
+            ),
+            }
+        };
+        let first_step = match first_step {
+            RelayStep::Routing(Err(e)) => {
+                let duration_ms = request_guard.complete();
+                let log_context =
+                    RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
+                log_outcome(
+                    &state,
+                    &request,
+                    &log_context,
+                    request_guard.active_handle(),
+                );
+                let mut response = e.into_response();
+                attach_trace_id_header(&mut response, &trace_id);
+                return response;
+            }
+            step => step,
+        };
+
+        let mut relayed_any = false;
+        let stream = async_stream::stream! {
+        // Drop guard: ensures active_requests is decremented even if the
+        // client disconnects and the stream is cancelled mid-flight.
+        let mut _guard = request_guard;
+
+        // Continuation of the select loop after the handler-driven first
+        // step above: identical frame/routing handling, with the first step
+        // replayed through the same match arms.
+        let mut first = Some(first_step);
+        let routing_result = loop {
+        let step = match first.take() {
+        Some(step) => step,
+        None => tokio::select! {
+        frame = relay_rx.recv(), if relay_open => match frame {
+        Some(frame) => RelayStep::Frame(frame),
+        None => {
+        relay_open = false;
+        continue;
+        }
+        },
+        res = &mut routing_task.0.as_mut().expect("routing handle lives until Routing arm") => RelayStep::Routing(
+        res.unwrap_or_else(|join_err| {
+        // JoinError (panic/cancel): map to the generic
+        // network class; the graceful SSE error path
+        // below emits the terminal event (design,
+        // Error Scenarios 3).
+        tracing::error!(
+        trace_id = %stream_trace_id,
+        error = %join_err,
+        "Routing task failed while relaying reasoning progress (early event disabled)"
+        );
+        Err(GatewayError::Network("routing task failed".to_string()))
+        })
+        ),
+        },
+        };
+        match step {
+        RelayStep::Frame(RelayFrame::Reasoning { text }) => {
+        // Req 2.5: no early role event was sent, so the
+        // first relayed frame carries the role marker
+        // exactly once; later frames omit it.
+        let chunk = if !relayed_any {
+        relayed_any = true;
+        reasoning_relay_chunk_with_role(
+        &response_id,
+        created,
+        &requested_model,
+        &text,
+        )
+        } else {
+        reasoning_relay_chunk(&response_id, created, &requested_model, &text)
+        };
+        record_reasoning_forwarded(&relay_handle, &stream_trace_id);
+        yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
+        }
+        RelayStep::Routing(res) => {
+        // Routing resolved: cancel the abort-on-drop guard
+        // and drain any frames still queued in the relay
+        // channel (same fix as the early-event branch).
+        drop(routing_task.0.take());
+        while let Ok(frame) = relay_rx.try_recv() {
+        let RelayFrame::Reasoning { text } = frame;
+        let chunk = if !relayed_any {
+        relayed_any = true;
+        reasoning_relay_chunk_with_role(
+        &response_id,
+        created,
+        &requested_model,
+        &text,
+        )
+        } else {
+        reasoning_relay_chunk(&response_id, created, &requested_model, &text)
+        };
+        record_reasoning_forwarded(&relay_handle, &stream_trace_id);
+        yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
+        }
+        break res;
+        }
+        }
+        };
+        // Task 8 (Req 4.4/5.1): the handle's counter is authoritative (frames
+        // relayed by every attempt/round), `relayed_any` only tracks the
+        // first-frame role marker above. Dropped frames veto suppression (see
+        // the early-event branch).
+        let relayed_frames = relay_handle.forwarded();
+        let relay_dropped = relay_handle.dropped();
+        match routing_result {
+            Ok(mut response) => {
+                // Buffer-and-replay: cache the assembled response so a
+                // later identical request replays without hitting the
+                // provider.
+                if crate::router::router::Router::should_cache_response(&response) {
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        state.exact_cache.set(&request, json);
+                    }
+                }
+
+                // Task 8 (Req 5.1): relay telemetry rides the response extras
+                // into the request log row; stripped before the client emit.
+                if relayed_frames > 0 {
+                    response.extra.insert(
+                        "gateway_reasoning_relayed_frames".to_string(),
+                        serde_json::json!(relayed_frames),
+                    );
+                }
+
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let log_context = RequestLogContext::from_response(
+                    &request,
+                    stream_trace_id.clone(),
+                    duration_ms,
+                    &response,
+                );
+                log_outcome(&state, &request, &log_context, _guard.active_handle());
+
+                // Non-blocking memory extraction now that the full
+                // response content is known.
+                if let Some(memory) = memory_context.as_ref() {
+                    let response_content = response
+                        .choices
+                        .first()
+                        .map(|choice| choice.message.content_as_text())
+                        .unwrap_or_default();
+                    spawn_streaming_memory_extraction(
+                        &state,
+                        memory,
+                        response_content,
+                        uuid::Uuid::parse_str(&stream_trace_id).ok(),
+                    );
+                }
+
+                // Final replay reuses the shared id/created. Role
+                // suppression: the first relayed frame already sent the
+                // role marker, so skip it here too when frames were
+                // relayed (mirrors the early-event suppression); with no
+                // relayed frames the role chunk is emitted as today.
+                // Task 8 (Req 4.4): reasoning suppression is wholesale —
+                // already-relayed text is never double-emitted.
+        for chunk in if relayed_frames > 0 && relay_dropped == 0 {
+        streaming_chunks_after_early_event_suppress_reasoning(&response, &response_id, created)
+        } else {
+        streaming_chunks_from_response(&response)
+        } {
+                    yield Ok(Event::default().data(chunk.to_string()));
+                }
+                        if let Some(suffix) = memory_suffix.as_deref() {
+                            if !is_tool_call_turn(&response) {
+                                yield Ok(Event::default().data(
+                                    memory_feedback_chunk(&request, suffix).to_string(),
+                                ));
+                            }
+                        }
+                        yield Ok(Event::default().data("[DONE]"));
+                    }
+                    Err(e) => {
+                        // Routing failed. If no relay frame was emitted the
+                        // generator has yielded nothing yet — but the SSE
+                        // response was already committed when the handler
+                        // returned, so a JSON HTTP error status is no longer
+                        // possible; emit the graceful SSE error event (same
+                        // mapping as the early-event path).
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        let log_context = RequestLogContext::from_error(
+                            &request,
+                            stream_trace_id.clone(),
+                            duration_ms,
+                            &e,
+                        );
+                        log_outcome(&state, &request, &log_context, _guard.active_handle());
+                        let (error_type, message) = classify_stream_error(&e);
+                        for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
+                            yield Ok(event);
+                        }
+                    }
+                }
+
+                _guard.complete();
+            };
+
+        let mut sse = Sse::new(stream)
+            .keep_alive(build_keepalive(&streaming_config_relay))
+            .into_response();
+        attach_trace_id_header(&mut sse, &trace_id);
+        return sse;
     };
 
     // Buffer-and-replay: store the assembled response in the exact cache so
@@ -3214,7 +3677,12 @@ async fn chat_completions_stream(
     let duration_ms = start.elapsed().as_millis() as u64;
     let log_context =
         RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
-    log_outcome(&state, &request, &log_context, request_guard.active_handle());
+    log_outcome(
+        &state,
+        &request,
+        &log_context,
+        request_guard.active_handle(),
+    );
 
     // Non-blocking memory extraction now that the full response is known.
     if let Some(memory) = memory_context.as_ref() {
@@ -3763,7 +4231,12 @@ async fn stream_eager_structured_output(
                             duration_ms,
                             &error,
                         );
-                        log_outcome(&state, &request, &log_context, request_guard.active_handle());
+                        log_outcome(
+                            &state,
+                            &request,
+                            &log_context,
+                            request_guard.active_handle(),
+                        );
                         return eager_sse_response(
                             structured_stream_overflow_events(&trace_id),
                             &streaming_config,
@@ -3783,7 +4256,12 @@ async fn stream_eager_structured_output(
                             duration_ms,
                             &gateway_error,
                         );
-                        log_outcome(&state, &request, &log_context, request_guard.active_handle());
+                        log_outcome(
+                            &state,
+                            &request,
+                            &log_context,
+                            request_guard.active_handle(),
+                        );
                         return eager_sse_response(
                             emit_sse_error_event(
                                 "stream_error",
@@ -3810,7 +4288,12 @@ async fn stream_eager_structured_output(
                         duration_ms,
                         &gateway_error,
                     );
-                    log_outcome(&state, &request, &log_context, request_guard.active_handle());
+                    log_outcome(
+                        &state,
+                        &request,
+                        &log_context,
+                        request_guard.active_handle(),
+                    );
                     return eager_sse_response(
                         emit_sse_error_event("stream_error", &gateway_error.to_string(), &trace_id),
                         &streaming_config,
@@ -3830,7 +4313,12 @@ async fn stream_eager_structured_output(
                     duration_ms,
                     &gateway_error,
                 );
-                log_outcome(&state, &request, &log_context, request_guard.active_handle());
+                log_outcome(
+                    &state,
+                    &request,
+                    &log_context,
+                    request_guard.active_handle(),
+                );
                 return eager_sse_response(
                     emit_sse_error_event("stream_error", message, &trace_id),
                     &streaming_config,
@@ -3868,7 +4356,12 @@ async fn stream_eager_structured_output(
             let duration_ms = request_guard.complete();
             let log_context =
                 RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
-            log_outcome(&state, &request, &log_context, request_guard.active_handle());
+            log_outcome(
+                &state,
+                &request,
+                &log_context,
+                request_guard.active_handle(),
+            );
             let (error_type, message) = classify_stream_error(&error);
             return eager_sse_response(
                 emit_sse_error_event(error_type, &message, &trace_id),
@@ -3896,7 +4389,12 @@ async fn stream_eager_structured_output(
             let duration_ms = request_guard.complete();
             let log_context =
                 RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
-            log_outcome(&state, &request, &log_context, request_guard.active_handle());
+            log_outcome(
+                &state,
+                &request,
+                &log_context,
+                request_guard.active_handle(),
+            );
             return eager_sse_response(events, &streaming_config, &trace_id, None, None);
         }
     };
@@ -3918,12 +4416,16 @@ async fn stream_eager_structured_output(
             let duration_ms = request_guard.complete();
             let log_context =
                 RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
-            log_outcome(&state, &request, &log_context, request_guard.active_handle());
+            log_outcome(
+                &state,
+                &request,
+                &log_context,
+                request_guard.active_handle(),
+            );
             return eager_sse_response(events, &streaming_config, &trace_id, None, None);
         }
         Err(EagerPostCallResult::Response(_)) => unreachable!(),
     };
-
 
     if should_cache_eager_structured(&request, Some(&response), Some(validation_status)) {
         if let Ok(json) = serde_json::to_string(&response) {
@@ -3949,7 +4451,12 @@ async fn stream_eager_structured_output(
     let duration_ms = request_guard.complete();
     let log_context =
         RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
-    log_outcome(&state, &request, &log_context, request_guard.active_handle());
+    log_outcome(
+        &state,
+        &request,
+        &log_context,
+        request_guard.active_handle(),
+    );
     eager_sse_response(
         events,
         &streaming_config,
@@ -3992,6 +4499,12 @@ async fn stream_buffered_with_post_call(
     active: Option<crate::active_requests::ActiveRequestHandle>,
 ) -> Response {
     let emit_early = streaming_config.emit_early_event;
+    // Task 7 — buffered reasoning progress relay (Component 4, site 3):
+    // when enabled, the PassThrough buffering loop below scans each newly
+    // completed upstream SSE line and yields reasoning-only deltas live
+    // while the rest of the body stays buffered for post-call. Disabled →
+    // byte-identical behavior.
+    let relay_enabled = streaming_config.relay_reasoning_progress;
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
     let requested_model = request.model.clone();
@@ -4007,48 +4520,224 @@ async fn stream_buffered_with_post_call(
     let active_stream = active.clone();
 
     let stream = async_stream::stream! {
-            let mut _guard = request_guard;
+                let mut _guard = request_guard;
 
-            // Early synthetic role event (Req 1.1-1.3) so the client's idle timer
-            // resets while we buffer; re-chunking below reuses its id/created.
-            if emit_early {
-                let early = early_event_chunk(&response_id, created, &requested_model);
-                yield Ok::<_, Infallible>(Event::default().data(early.to_string()));
-            }
+                // Early synthetic role event (Req 1.1-1.3) so the client's idle timer
+                // resets while we buffer; re-chunking below reuses its id/created.
+                if emit_early {
+                    let early = early_event_chunk(&response_id, created, &requested_model);
+                    yield Ok::<_, Infallible>(Event::default().data(early.to_string()));
+                }
 
-            // Force the buffered path: assemble the full upstream response (never
-            // relay pass-through chunks to the caller) so the post-call pipeline
-            // sees the complete content.
-            let mut assembled: Option<OpenAIResponse> = None;
-            let mut streaming_compression: Option<CompressionStats> = None;
-            let mut disconnected = false;
+                // Force the buffered path: assemble the full upstream response (never
+                // relay pass-through chunks to the caller) so the post-call pipeline
+                // sees the complete content.
+                let mut assembled: Option<OpenAIResponse> = None;
+                let mut streaming_compression: Option<CompressionStats> = None;
+                let mut disconnected = false;
+        // Task 8 seam: set once any reasoning frame was relayed live in
+        // the PassThrough buffering loop below; final-emit reasoning
+        // suppression and the relayed-frame telemetry consume these at
+        // re-chunk/log time (`relayed_frames` counts every direct yield,
+        // matching `RelayHandle::sent()` semantics on the channel sites).
+    let mut relayed_any = false;
+    let mut relayed_frames: u64 = 0;
+    // Set when the channel-based routing head dropped frames (full or
+    // disconnected): suppression is then vetoed (same rule as sites 1/2)
+    // so the full replay re-emits the reasoning tail.
+    let mut relay_dropped: u64 = 0;
 
-            match state.router.route_request_streaming(&request, active_stream.clone()).await {
+    // Routing head (Task 7, Component 4 site 3): when the relay is enabled,
+    // run `route_request_streaming` on a spawned task (same shape as sites
+    // 1/2) so relay frames tapped out of a Buffered attempt — e.g. the
+    // Codex-Search-forced buffering path — actually reach this generator;
+    // the old direct-yield scan stays for the PassThrough arm below. When
+    // the relay is disabled, routing runs inline, byte-identical to before.
+    enum RelayStep3 {
+    Frame(RelayFrame),
+    Routing(Result<StreamingResponse, GatewayError>),
+    }
+    let (relay_handle, mut relay_rx) = RelayHandle::new();
+    let routed: Result<StreamingResponse, GatewayError> = if relay_enabled {
+    if let Some(active) = active_stream.as_ref() {
+    active.attach_reasoning_relay(relay_handle.clone());
+    }
+    let router = Arc::clone(&state.router);
+    let routed_request = request.clone();
+    let active_for_routing = active_stream.clone();
+    let mut routing_task = AbortRoutingOnDrop(Some(tokio::spawn(async move {
+    router
+    .route_request_streaming(&routed_request, active_for_routing)
+    .await
+    })));
+    let mut relay_open = true;
+    let result = loop {
+    let step = tokio::select! {
+    frame = relay_rx.recv(), if relay_open => match frame {
+    Some(frame) => RelayStep3::Frame(frame),
+    None => {
+    relay_open = false;
+    continue;
+    }
+    },
+    res = &mut routing_task.0.as_mut().expect("routing handle lives until Routing arm") => RelayStep3::Routing(
+    res.unwrap_or_else(|join_err| {
+    // JoinError (panic/cancel): map to the generic
+    // network class; the routing-error arms below
+    // handle the terminal event.
+    tracing::error!(
+    trace_id = %stream_trace_id,
+    error = %join_err,
+    "Routing task failed while relaying reasoning progress (post-call buffered)"
+    );
+    Err(GatewayError::Network("routing task failed".to_string()))
+    })
+    ),
+    };
+    match step {
+    RelayStep3::Frame(RelayFrame::Reasoning { text }) => {
+    // Req 2.5: when no early role event was sent, the
+    // first relayed frame carries `delta.role` exactly
+    // once; with emit_early the role already went out.
+    let first_frame = !relayed_any;
+    relayed_any = true;
+    record_reasoning_forwarded(&relay_handle, &stream_trace_id);
+    let chunk = if emit_early || !first_frame {
+    reasoning_relay_chunk(
+    &response_id,
+    created,
+    &requested_model,
+    &text,
+    )
+    } else {
+    reasoning_relay_chunk_with_role(
+    &response_id,
+    created,
+    &requested_model,
+    &text,
+    )
+    };
+    yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
+    }
+    RelayStep3::Routing(res) => {
+    // Routing resolved: cancel the abort-on-drop guard
+    // and drain any frames still queued in the relay
+    // channel (same fix as sites 1/2).
+    routing_task.0 = None;
+    while let Ok(frame) = relay_rx.try_recv() {
+    let RelayFrame::Reasoning { text } = frame;
+    let first_frame = !relayed_any;
+    relayed_any = true;
+    record_reasoning_forwarded(&relay_handle, &stream_trace_id);
+    let chunk = if emit_early || !first_frame {
+    reasoning_relay_chunk(
+    &response_id,
+    created,
+    &requested_model,
+    &text,
+    )
+    } else {
+    reasoning_relay_chunk_with_role(
+    &response_id,
+    created,
+    &requested_model,
+    &text,
+    )
+    };
+    yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
+    }
+    break res;
+    }
+    }
+    };
+    relayed_frames = relay_handle.forwarded();
+    relay_dropped = relay_handle.dropped();
+    result
+    } else {
+    state.router.route_request_streaming(&request, active_stream.clone()).await
+    };
+    match routed {
                 Ok(StreamingResponse::Buffered(response)) => {
                     assembled = Some(response);
                 }
     Ok(StreamingResponse::PassThrough { byte_stream, compression, concurrency_permit, .. }) => {
     let _concurrency_permit = concurrency_permit;
     streaming_compression = Some(compression.clone());
-                    // Buffer the live SSE body under the 10 MB cap while emitting
-                    // keep-alive comments during idle gaps (Req 10.1, 10.2).
-                    let mut buf = guardrail_stream::SseBuffer::with_default_cap();
-                    let mut bytes = byte_stream.bytes_stream();
-                    let mut too_large = false;
-                    loop {
-                        match tokio::time::timeout(keepalive_interval, bytes.next()).await {
-                            // Idle gap while buffering: keep the client alive (Req 10.2).
-                            Err(_elapsed) => {
-                                yield Ok(Event::default().comment("keepalive"));
-                            }
-                            // Upstream stream ended.
-                            Ok(None) => break,
-                            Ok(Some(Ok(b))) => {
-                                if buf.push_bytes(&b).is_err() {
-                                    too_large = true;
-                                    break;
-                                }
-                            }
+            // Buffer the live SSE body under the 10 MB cap while emitting
+            // keep-alive comments during idle gaps (Req 10.1, 10.2).
+            // Task 7 (Component 4, site 3): concurrently classify each newly
+            // completed upstream line and relay reasoning-only deltas to the
+            // client live (Req 1.1/1.2/1.5); content, tool calls, usage and
+            // finish reasons stay buffered for the post-call pipeline.
+    let mut buf = guardrail_stream::SseBuffer::with_default_cap();
+// Partial-line carry for the incremental relay scan: RAW BYTES —
+// only the trailing incomplete line is retained between chunks, and
+// each complete line is decoded on its own so split multibyte
+// characters never bake U+FFFD into relayed text.
+    let mut relay_carry: Vec<u8> = Vec::new();
+            let mut bytes = byte_stream.bytes_stream();
+            let mut too_large = false;
+            loop {
+                match tokio::time::timeout(keepalive_interval, bytes.next()).await {
+                    // Idle gap while buffering: keep the client alive (Req 10.2).
+                    Err(_elapsed) => {
+                        yield Ok(Event::default().comment("keepalive"));
+                    }
+                    // Upstream stream ended.
+                    Ok(None) => break,
+                    Ok(Some(Ok(b))) => {
+                        if buf.push_bytes(&b).is_err() {
+                            too_large = true;
+                            break;
+                        }
+    if relay_enabled {
+    relay_carry.extend_from_slice(&b);
+    let mut consumed = 0usize;
+    while let Some(newline) = relay_carry[consumed..]
+    .iter()
+    .position(|byte| *byte == b'\n')
+    {
+    let end = consumed + newline;
+    let mut line = &relay_carry[consumed..end];
+    if line.last() == Some(&b'\r') {
+    line = &line[..line.len() - 1];
+}
+    let line = String::from_utf8_lossy(line);
+    if let Some(text) =
+    sse_data_payload(&line).and_then(classify_reasoning_frame)
+    {
+// Req 2.5: when no early role event was
+// sent, the first relayed frame carries
+// `delta.role` exactly once; with
+// emit_early the role already went out.
+    let first_frame = !relayed_any;
+    relayed_any = true;
+// Direct yields bypass the channel: count them here
+// (mirrors `RelayHandle::sent()` on the channel sites).
+    relayed_frames += 1;
+    relay_handle.record_forwarded();
+    let chunk = if emit_early || !first_frame {
+        reasoning_relay_chunk(
+            &response_id,
+            created,
+            &requested_model,
+            &text,
+        )
+    } else {
+        reasoning_relay_chunk_with_role(
+            &response_id,
+            created,
+            &requested_model,
+            &text,
+        )
+    };
+    yield Ok(Event::default().data(chunk.to_string()));
+}
+    consumed = end + 1;
+}
+    relay_carry.drain(..consumed);
+}
+                    }
                             // Transport error mid-stream → premature disconnect (Req 10.5).
                             Ok(Some(Err(_e))) => {
                                 disconnected = true;
@@ -4153,28 +4842,45 @@ async fn stream_buffered_with_post_call(
                 .run_post_call(&mut response, &selector, &mut guardrail_ctx, &stream_trace_id, &tool_ctx)
                 .await
             {
-                // Proceed without refusal, or replaced (halting action skips
-                // re-injection, Req 9.4) → re-chunk normally.
-                (PostCallOutcome::Proceed, RefusalDecision::NotRefusal)
-                | (PostCallOutcome::Replaced, _) => {
-                    let chunks = if emit_early {
-                        guardrail_stream::rechunk_after_early_event(&response, &response_id, created)
-                    } else {
-                        guardrail_stream::rechunk_full(&response)
-                    };
-                    if crate::router::router::Router::should_cache_response(&response) {
-                        if let Ok(json) = serde_json::to_string(&response) {
-                            state.exact_cache.set(&request, json);
-                        }
-                    }
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                    log_outcome(&state, &request, &log_context, _guard.active_handle());
-                    for chunk in chunks {
-                        yield Ok(Event::default().data(chunk.to_string()));
-                    }
-                    yield Ok(Event::default().data("[DONE]"));
-                }
+    // Proceed without refusal, or replaced (halting action skips
+    // re-injection, Req 9.4) → re-chunk normally.
+    (PostCallOutcome::Proceed, RefusalDecision::NotRefusal)
+    | (PostCallOutcome::Replaced, _) => {
+// Task 8 (Req 4.4): when reasoning was relayed live, the final
+// replay suppresses the reasoning delta (no double-emit); the
+// suppress variant keeps the shared id/created and role
+// suppression of the early-event shape. Dropped frames veto
+// suppression (full replay beats silent loss; duplicated prefix
+// is the documented fail-open tradeoff).
+    let chunks = if relayed_any && relay_dropped == 0 {
+        streaming_chunks_after_early_event_suppress_reasoning(&response, &response_id, created)
+    } else if emit_early {
+        guardrail_stream::rechunk_after_early_event(&response, &response_id, created)
+    } else {
+        guardrail_stream::rechunk_full(&response)
+    };
+    if crate::router::router::Router::should_cache_response(&response) {
+        if let Ok(json) = serde_json::to_string(&response) {
+            state.exact_cache.set(&request, json);
+        }
+    }
+    // Task 8 (Req 5.1): relay telemetry rides the response extras
+    // into `RequestLogContext::from_response` and the log row; the
+    // re-chunk path strips it before emitting to the client.
+    if relayed_frames > 0 {
+        response.extra.insert(
+            "gateway_reasoning_relayed_frames".to_string(),
+            serde_json::json!(relayed_frames),
+        );
+    }
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+    log_outcome(&state, &request, &log_context, _guard.active_handle());
+    for chunk in chunks {
+        yield Ok(Event::default().data(chunk.to_string()));
+    }
+    yield Ok(Event::default().data("[DONE]"));
+    }
                 // Refusal detected with failover enabled (Req 12.5, 12.9, 12.14):
                 // run the bounded re-dispatch loop, buffering each re-dispatched
                 // target before detection (same pattern as the non-streaming 17.2).
@@ -4182,24 +4888,35 @@ async fn stream_buffered_with_post_call(
                     // Compute the fallback ordering once (Req 12.5, 12.7).
                     let model_group = match state.router.find_model_group(&request.model).await {
                         Ok(mg) => mg,
-                        Err(_) => {
-                            // Cannot resolve model group — re-inject on current response and return.
-                            engine.reinject_response(&mut response, &guardrail_ctx);
-                            let chunks = if emit_early {
-                                guardrail_stream::rechunk_after_early_event(&response, &response_id, created)
-                            } else {
-                                guardrail_stream::rechunk_full(&response)
-                            };
-                            let duration_ms = start.elapsed().as_millis() as u64;
-                            let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                            log_outcome(&state, &request, &log_context, _guard.active_handle());
-                            for chunk in chunks {
-                                yield Ok(Event::default().data(chunk.to_string()));
-                            }
-                            yield Ok(Event::default().data("[DONE]"));
-                            _guard.complete();
-                            return;
-                        }
+        Err(_) => {
+            // Cannot resolve model group — re-inject on current response and return.
+            engine.reinject_response(&mut response, &guardrail_ctx);
+            // Task 8 (Req 4.4): suppress already-relayed reasoning in
+// the final replay (no double-emit). Dropped frames veto
+// suppression (see the Proceed arm above).
+    let chunks = if relayed_any && relay_dropped == 0 {
+                streaming_chunks_after_early_event_suppress_reasoning(&response, &response_id, created)
+            } else if emit_early {
+                guardrail_stream::rechunk_after_early_event(&response, &response_id, created)
+            } else {
+                guardrail_stream::rechunk_full(&response)
+            };
+            if relayed_frames > 0 {
+                response.extra.insert(
+                    "gateway_reasoning_relayed_frames".to_string(),
+                    serde_json::json!(relayed_frames),
+                );
+            }
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
+            log_outcome(&state, &request, &log_context, _guard.active_handle());
+            for chunk in chunks {
+                yield Ok(Event::default().data(chunk.to_string()));
+            }
+            yield Ok(Event::default().data("[DONE]"));
+            _guard.complete();
+            return;
+        }
                     };
                     let fallback_order = state.router.select_provider_order(&model_group).await;
 
@@ -4315,18 +5032,29 @@ async fn stream_buffered_with_post_call(
                         engine.reinject_response(&mut last_response, &guardrail_ctx);
                     }
 
-                    // Re-chunk the final response into SSE events (Req 10.4).
-                    let chunks = if emit_early {
-                        guardrail_stream::rechunk_after_early_event(&last_response, &response_id, created)
-                    } else {
-                        guardrail_stream::rechunk_full(&last_response)
-                    };
-                    if crate::router::router::Router::should_cache_response(&last_response) {
-                        if let Ok(json) = serde_json::to_string(&last_response) {
-                            state.exact_cache.set(&request, json);
-                        }
-                    }
-                    let duration_ms = start.elapsed().as_millis() as u64;
+        // Re-chunk the final response into SSE events (Req 10.4).
+        // Task 8 (Req 4.4): suppress already-relayed reasoning in the
+// final replay (no double-emit). Dropped frames veto
+// suppression (see the Proceed arm above).
+    let chunks = if relayed_any && relay_dropped == 0 {
+    streaming_chunks_after_early_event_suppress_reasoning(&last_response, &response_id, created)
+        } else if emit_early {
+            guardrail_stream::rechunk_after_early_event(&last_response, &response_id, created)
+        } else {
+            guardrail_stream::rechunk_full(&last_response)
+        };
+        if crate::router::router::Router::should_cache_response(&last_response) {
+            if let Ok(json) = serde_json::to_string(&last_response) {
+                state.exact_cache.set(&request, json);
+            }
+        }
+        if relayed_frames > 0 {
+            last_response.extra.insert(
+                "gateway_reasoning_relayed_frames".to_string(),
+                serde_json::json!(relayed_frames),
+            );
+        }
+        let duration_ms = start.elapsed().as_millis() as u64;
                     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &last_response);
                     log_outcome(&state, &request, &log_context, _guard.active_handle());
                     for chunk in chunks {
@@ -4367,6 +5095,16 @@ async fn stream_buffered_with_post_call(
     sse
 }
 
+struct AbortRoutingOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> Drop for AbortRoutingOnDrop<T> {
+fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+}
+}
+}
+
 /// Build the SSE keep-alive policy from streaming config (Req 2.1-2.5).
 ///
 /// When `keepalive_interval_seconds == 0`, keep-alive falls back to axum's
@@ -4402,6 +5140,59 @@ fn early_event_chunk(id: &str, created: i64, model: &str) -> serde_json::Value {
             "finish_reason": null
         }]
     })
+}
+
+/// Build a relayed reasoning-progress SSE chunk (buffered reasoning progress
+/// relay, spec Req 1.2/1.5): same envelope convention as [`early_event_chunk`]
+/// — shared `id`/`created`, `chat.completion.chunk` object — carrying a
+/// reasoning-only delta with NO `role` field. These are extra `data:` events
+/// between keep-alives; they are never retracted and never duplicate the final
+/// replayed response's reasoning (suppression is handled at re-chunk time).
+/// Increment the relay's forwarded-frame counter; the counter is read back
+/// via `RelayHandle::forwarded()` at telemetry points (kept separate from
+/// the per-frame trace log, which fires once per request).
+fn record_reasoning_forwarded(relay: &RelayHandle, trace_id: &str) {
+    let frames = relay.record_forwarded();
+    if frames == 1 {
+        tracing::debug!(
+            trace_id,
+            reasoning_relayed_frames = frames,
+            "Buffered reasoning progress was relayed live to the client"
+        );
+}
+}
+
+fn reasoning_relay_chunk(id: &str, created: i64, model: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": { "reasoning": text },
+            "finish_reason": null
+        }]
+    })
+}
+
+/// Variant of [`reasoning_relay_chunk`] for the early-event-disabled fallback
+/// (buffered reasoning progress relay, Component 4 site 2, Req 2.5): no early
+/// role event was sent on this path, so the FIRST relayed frame carries
+/// `delta.role: "assistant"` alongside the reasoning delta — clients expect a
+/// role-bearing first chunk. Subsequent frames use [`reasoning_relay_chunk`]
+/// (no role), so the role marker appears exactly once.
+fn reasoning_relay_chunk_with_role(
+    id: &str,
+    created: i64,
+    model: &str,
+    text: &str,
+) -> serde_json::Value {
+    let mut chunk = reasoning_relay_chunk(id, created, model, text);
+    if let Some(delta) = chunk["choices"][0]["delta"].as_object_mut() {
+        delta.insert("role".to_string(), serde_json::json!("assistant"));
+    }
+    chunk
 }
 
 /// Build a graceful SSE error termination: an `error` data event followed by
@@ -5305,7 +6096,7 @@ fn relay_passthrough_stream(
 
 pub(crate) fn streaming_chunks_from_response(response: &OpenAIResponse) -> Vec<serde_json::Value> {
     let response = prepare_response_for_client(response);
-    build_streaming_chunks(&response, None)
+    build_streaming_chunks(&response, None, false)
 }
 
 /// Variant used after an early synthetic `role: assistant` event has already
@@ -5318,7 +6109,28 @@ pub(crate) fn streaming_chunks_after_early_event(
     created: i64,
 ) -> Vec<serde_json::Value> {
     let response = prepare_response_for_client(response);
-    build_streaming_chunks(&response, Some((id, created)))
+    build_streaming_chunks(&response, Some((id, created)), false)
+}
+
+/// Suppress-reasoning variant of [`streaming_chunks_after_early_event`]
+/// (design Component 5, Req 4.4): used for the final replay when reasoning
+/// frames were already relayed live to the client during buffered dispatch.
+/// Identical envelope/role/id handling, but the reasoning delta is omitted so
+/// already-relayed text is never double-emitted; content, tool calls, usage,
+/// and the finish reason are unchanged. The assembled response object itself
+/// still carries the full reasoning text (relay is a copy, not a move).
+///
+/// Suppression applies wholesale by design (documented fail-open): on
+/// multi-attempt failover the relayed text may belong to an abandoned attempt,
+/// and dropping a duplicate is strictly safer than re-emitting reasoning the
+/// client has already seen.
+pub(crate) fn streaming_chunks_after_early_event_suppress_reasoning(
+    response: &OpenAIResponse,
+    id: &str,
+    created: i64,
+) -> Vec<serde_json::Value> {
+    let response = prepare_response_for_client(response);
+    build_streaming_chunks(&response, Some((id, created)), true)
 }
 
 /// Core chunk synthesizer. When `early_event` is `Some`, the leading
@@ -5326,10 +6138,12 @@ pub(crate) fn streaming_chunks_after_early_event(
 /// supplied `id`/`created` override the provider response's own envelope values
 /// so all chunks line up with the early event. When `None` (cache replay and
 /// the `emit_early_event: false` path), the role chunk is emitted and the
-/// provider's `id`/`created` are used unchanged.
+/// provider's `id`/`created` are used unchanged. When `suppress_reasoning` is
+/// set, the reasoning delta is dropped from the replay (Task 8, Req 4.4).
 fn build_streaming_chunks(
     response: &OpenAIResponse,
     early_event: Option<(&str, i64)>,
+    suppress_reasoning: bool,
 ) -> Vec<serde_json::Value> {
     let skip_role = early_event.is_some();
 
@@ -5364,7 +6178,11 @@ fn build_streaming_chunks(
         .cloned();
 
     let has_tool_calls = tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
-    let reasoning_delta = reasoning_delta(choice);
+    let reasoning_delta = if suppress_reasoning {
+        None
+    } else {
+        reasoning_delta(choice)
+    };
     let mut chunks = Vec::new();
 
     if has_tool_calls {
@@ -5593,11 +6411,12 @@ mod tests {
         build_keepalive, cache_allowed_for_validation, chunk_carries_answer, chunk_carries_content,
         classify_relay_line, classify_stream_error, collect_structured_output_failure,
         eager_sse_response, early_event_chunk, emit_sse_error_event, force_eager_structured_stream,
-        is_tool_call_turn, json_model, memory_feedback_chunk, multipart_model, openai_json_response,
-        prepare_response_for_client, provider_pass_through_response, rechunk_structured_response,
-        relay_passthrough_stream, requests_structured_output, should_cache_eager_structured,
-        is_transient_stream_truncation, smart_routing_headers, sse_error_payload,
-        streaming_chunks_after_early_event,
+        is_tool_call_turn, is_transient_stream_truncation, json_model, memory_feedback_chunk,
+        multipart_model, openai_json_response, prepare_response_for_client,
+        provider_pass_through_response, reasoning_relay_chunk, reasoning_relay_chunk_with_role,
+        rechunk_structured_response, relay_passthrough_stream, requests_structured_output,
+        should_cache_eager_structured, smart_routing_headers, sse_error_payload,
+        streaming_chunks_after_early_event, streaming_chunks_after_early_event_suppress_reasoning,
         streaming_chunks_from_response, structured_stream_overflow_events,
         upstream_stream_metadata, RelayLineAction, RelayOutcome, RequestCompleteGuard,
         RequestLogContext, ValidationResponseStatus,
@@ -6699,6 +7518,127 @@ mod tests {
         assert!(chunks.iter().all(|c| c["id"] == "chatcmpl-early"));
     }
 
+    /// Task 8 (Req 4.4): the suppress-reasoning variant used after live relay
+    /// emits NO reasoning delta fields, while content, tool calls, the finish
+    /// reason, and the shared early-event id/created are unchanged. A response
+    /// with reasoning + content + tool calls replays as content/tool_calls only.
+    #[test]
+    fn streaming_chunks_suppress_reasoning_variant_drops_reasoning_only() {
+        // Reasoning + content + tool_calls response.
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "reasoning_content".to_string(),
+            serde_json::json!("already relayed live"),
+        );
+        extra.insert(
+            "tool_calls".to_string(),
+            serde_json::json!([{
+                "index": 0,
+                "id": "call_abc",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }]),
+        );
+        let response = base_response(Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("codex search findings"),
+            extra,
+        });
+
+        let chunks = streaming_chunks_after_early_event_suppress_reasoning(
+            &response,
+            "chatcmpl-early",
+            1700,
+        );
+
+        // No reasoning fields anywhere in the suppressed replay.
+        assert!(
+            chunks.iter().all(|c| {
+                let delta = &c["choices"][0]["delta"];
+                delta.get("reasoning").is_none() && delta.get("reasoning_content").is_none()
+            }),
+            "suppressed replay must not re-emit relayed reasoning"
+        );
+        // Content and tool calls still arrive, in provider order.
+        let content = chunks
+            .iter()
+            .position(|c| {
+                c["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .is_some_and(|text: &str| !text.is_empty())
+            })
+            .expect("content must survive suppression");
+        let tool = chunks
+            .iter()
+            .position(|c| c["choices"][0]["delta"].get("tool_calls").is_some())
+            .expect("tool_calls must survive suppression");
+        assert!(
+            content < tool,
+            "content({content}) must precede tool_calls({tool})"
+        );
+        assert_eq!(
+            chunks[content]["choices"][0]["delta"]["content"],
+            "codex search findings"
+        );
+        assert_eq!(
+            chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+        // Envelope unchanged: shared early-event id on every chunk, no role.
+        assert!(chunks.iter().all(|c| c["id"] == "chatcmpl-early"));
+        assert!(chunks
+            .iter()
+            .all(|c| c["choices"][0]["delta"].get("role").is_none()));
+    }
+
+    /// Task 8 (Req 5.1): the relayed-frame telemetry rides the response extras
+    /// into `RequestLogContext` exactly like the other gateway_reasoning_* extras
+    /// and is stripped from the client payload by `prepare_response_for_client`.
+    /// The extra is only present when frames were relayed (> 0) — matching
+    /// `gateway_reasoning_tokens`, which the router only attaches when non-zero.
+    #[test]
+    fn reasoning_relayed_frames_extra_is_logged_and_stripped() {
+        let request = OpenAIRequest {
+            model: "requested-model".to_owned(),
+            messages: Vec::new(),
+            stream: true,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+
+        // Relayed frames present → count lands in the log context.
+        let mut response = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!("ok"),
+            extra: Default::default(),
+        });
+        response.extra.insert(
+            "gateway_reasoning_relayed_frames".to_owned(),
+            serde_json::json!(7u64),
+        );
+        let context = RequestLogContext::from_response(&request, "trace".to_owned(), 10, &response);
+        assert_eq!(context.reasoning_relayed_frames, Some(7));
+
+        // Stripped before the client sees the payload.
+        let client_response = prepare_response_for_client(&response);
+        assert!(!client_response
+            .extra
+            .contains_key("gateway_reasoning_relayed_frames"));
+        assert!(!serde_json::to_string(&client_response)
+            .unwrap()
+            .contains("gateway_reasoning_relayed_frames"));
+
+        // Nothing relayed → no extra → log context stays None.
+        let plain = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!("ok"),
+            extra: Default::default(),
+        });
+        let context = RequestLogContext::from_response(&request, "trace".to_owned(), 10, &plain);
+        assert_eq!(context.reasoning_relayed_frames, None);
+    }
+
     // -- Early synthetic SSE event (task 2.3) --------------------------------
 
     /// Req 1.1, 1.3: the early event carries a `role: assistant` delta and a
@@ -6717,6 +7657,174 @@ mod tests {
         assert!(chunk["choices"][0]["finish_reason"].is_null());
         // The early event only signals the role; it must not carry content.
         assert!(chunk["choices"][0]["delta"].get("content").is_none());
+    }
+
+    /// Buffered reasoning progress relay (Task 5): a relayed reasoning frame
+    /// reuses the early event's `id`/`created`, keeps the chunk envelope, and
+    /// carries a reasoning-only delta with NO `role` field (the early event
+    /// already set it once) and no content.
+    #[test]
+    fn reasoning_relay_logs_success_and_failure_without_content() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let logger = crate::logger::RequestLogger::new(crate::config::LoggingConfig {
+            database_path: temp.path().to_string_lossy().into_owned(),
+            request_body_logging: false,
+            response_body_logging: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let request = serde_json::from_str(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        let response = base_response(Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!("private answer"),
+            extra: Default::default(),
+        });
+        let (relay, mut receiver) = crate::reasoning_relay::RelayHandle::new();
+        for _ in 0..3 {
+            relay.try_relay(crate::reasoning_relay::RelayFrame::Reasoning {
+                text: "private reasoning".to_owned(),
+            });
+        }
+        assert!(receiver.try_recv().is_ok());
+        super::record_reasoning_forwarded(&relay, "success");
+        let success =
+            RequestLogContext::from_response(&request, "success".to_owned(), 10, &response)
+                .with_reasoning_relay(Some(&relay));
+        assert_eq!(success.reasoning_relayed_frames, Some(1));
+        super::write_request_log(&logger, &request, &success).unwrap();
+        let failure = RequestLogContext::from_error(
+            &request,
+            "failure".to_owned(),
+            20,
+            &GatewayError::Network("upstream failed".to_owned()),
+        )
+        .with_reasoning_relay(Some(&relay));
+        let expected_class = failure.error_class.clone();
+        let expected_status = failure.status_code;
+        super::write_request_log(&logger, &request, &failure).unwrap();
+        logger.flush();
+        let conn = rusqlite::Connection::open(temp.path()).unwrap();
+        for trace_id in ["success", "failure"] {
+            let row: (Option<i64>, u16, Option<String>, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT reasoning_relayed_frames, status_code, error_class, request_body, response_body FROM requests WHERE trace_id = ?1",
+                    [trace_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .unwrap();
+            assert_eq!(row.0, Some(1));
+            assert_eq!(
+                row.1,
+                if trace_id == "success" {
+                    200
+                } else {
+                    expected_status
+                }
+            );
+            assert_eq!(
+                row.2,
+                if trace_id == "success" {
+                    None
+                } else {
+                    expected_class.clone()
+                }
+            );
+            assert!(row.3.is_none());
+            assert!(row.4.is_none());
+        }
+    }
+
+    #[test]
+    fn reasoning_relay_traces_first_forwarded_frame_only() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Capture(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let (relay, mut receiver) = crate::reasoning_relay::RelayHandle::new();
+            relay.try_relay(crate::reasoning_relay::RelayFrame::Reasoning {
+                text: "private reasoning".to_owned(),
+            });
+            assert!(output.lock().unwrap().is_empty());
+            assert!(receiver.try_recv().is_ok());
+            super::record_reasoning_forwarded(&relay, "first-frame-trace");
+            assert!(!output.lock().unwrap().is_empty());
+            super::record_reasoning_forwarded(&relay.clone(), "first-frame-trace");
+        });
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("Buffered reasoning progress was relayed live to the client")
+                .count(),
+            1
+        );
+        assert!(text.contains("first-frame-trace"));
+        assert!(!text.contains("private reasoning"));
+    }
+
+    #[test]
+    fn reasoning_relay_chunk_shares_envelope_and_omits_role() {
+        let chunk = reasoning_relay_chunk("chatcmpl-early-id", 1700, "gpt-4o", "thinking hard");
+
+        assert_eq!(chunk["id"], "chatcmpl-early-id");
+        assert_eq!(chunk["object"], "chat.completion.chunk");
+        assert_eq!(chunk["created"], 1700);
+        assert_eq!(chunk["model"], "gpt-4o");
+        assert_eq!(chunk["choices"][0]["index"], 0);
+        assert_eq!(chunk["choices"][0]["delta"]["reasoning"], "thinking hard");
+        // No role and no content: role was established by the early event; content
+        // is held back for the final buffered replay.
+        assert!(chunk["choices"][0]["delta"].get("role").is_none());
+        assert!(chunk["choices"][0]["delta"].get("content").is_none());
+        assert!(chunk["choices"][0]["finish_reason"].is_null());
+    }
+
+    /// Buffered reasoning progress relay, fallback site (Task 6, Req 2.5): on the
+    /// early-event-disabled path the FIRST relayed frame must carry
+    /// `delta.role: "assistant"` (no early role event was sent) plus the
+    /// reasoning text; the plain variant used for subsequent frames omits the
+    /// role so the marker appears exactly once.
+    #[test]
+    fn reasoning_relay_chunk_with_role_marks_first_frame_only() {
+        let first = reasoning_relay_chunk_with_role(
+            "chatcmpl-fallback-id",
+            1700,
+            "gpt-4o",
+            "first thought",
+        );
+        let later = reasoning_relay_chunk("chatcmpl-fallback-id", 1700, "gpt-4o", "second thought");
+
+        // First frame: role marker + reasoning, shared envelope, no content.
+        assert_eq!(first["id"], "chatcmpl-fallback-id");
+        assert_eq!(first["object"], "chat.completion.chunk");
+        assert_eq!(first["created"], 1700);
+        assert_eq!(first["model"], "gpt-4o");
+        assert_eq!(first["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(first["choices"][0]["delta"]["reasoning"], "first thought");
+        assert!(first["choices"][0]["delta"].get("content").is_none());
+        assert!(first["choices"][0]["finish_reason"].is_null());
+
+        // Subsequent frames: identical envelope but no second role marker.
+        assert_eq!(later["id"], "chatcmpl-fallback-id");
+        assert_eq!(later["choices"][0]["delta"]["reasoning"], "second thought");
+        assert!(later["choices"][0]["delta"].get("role").is_none());
     }
 
     /// Req 1.5 + same-id: chunks emitted after the early event reuse the
@@ -6835,12 +7943,27 @@ mod tests {
     #[test]
     fn abandon_outcome_classifies_disconnect_vs_deadline() {
         let secs = Duration::from_secs;
-        assert_eq!(super::abandon_outcome(secs(5), 300), (499, "client_disconnect"));
-        assert_eq!(super::abandon_outcome(secs(298), 300), (499, "client_disconnect"));
-        assert_eq!(super::abandon_outcome(secs(299), 300), (504, "gateway_deadline"));
-        assert_eq!(super::abandon_outcome(secs(300), 300), (504, "gateway_deadline"));
+        assert_eq!(
+            super::abandon_outcome(secs(5), 300),
+            (499, "client_disconnect")
+        );
+        assert_eq!(
+            super::abandon_outcome(secs(298), 300),
+            (499, "client_disconnect")
+        );
+        assert_eq!(
+            super::abandon_outcome(secs(299), 300),
+            (504, "gateway_deadline")
+        );
+        assert_eq!(
+            super::abandon_outcome(secs(300), 300),
+            (504, "gateway_deadline")
+        );
         // A disabled deadline (0) never classifies as gateway_deadline.
-        assert_eq!(super::abandon_outcome(secs(10_000), 0), (499, "client_disconnect"));
+        assert_eq!(
+            super::abandon_outcome(secs(10_000), 0),
+            (499, "client_disconnect")
+        );
     }
 
     #[test]
@@ -7321,7 +8444,9 @@ mod tests {
             "Provider stream ended without sending any content"
         ));
         // Case-insensitive.
-        assert!(is_transient_stream_truncation("Stream error: Unexpected EOF"));
+        assert!(is_transient_stream_truncation(
+            "Stream error: Unexpected EOF"
+        ));
 
         // Deterministic pre-content failures must NOT be treated as transient.
         assert!(!is_transient_stream_truncation(
@@ -7330,7 +8455,9 @@ mod tests {
         assert!(!is_transient_stream_truncation(
             "Provider signaled a mid-stream error (finish_reason=error)"
         ));
-        assert!(!is_transient_stream_truncation("Stream error: 429 rate limit"));
+        assert!(!is_transient_stream_truncation(
+            "Stream error: 429 rate limit"
+        ));
     }
 
     /// `chunk_carries_answer` is deliberately stricter than
