@@ -414,6 +414,7 @@ When a client requests `stream: true`, the gateway improves perceived reliabilit
 - **Graceful error frames** — TTFB / total / inter-chunk timeouts and mid-stream failures are surfaced as `{"error":{...}}` SSE events followed by `[DONE]`, never a silent disconnect.
 - **Mid-stream failover** — if a provider fails *before* any content reaches the client, the gateway transparently retries the next provider (no duplicate role event); after content has been sent it emits an error and closes.
 - **Truncation retry** — a `finish_reason: "length"` response that stops well short of the requested `max_tokens` is treated as a truncation and retried on the next provider; if every provider truncates, the longest partial is returned.
+- **Reasoning progress relay** — while a buffered dispatch waits for the upstream response, thinking-only deltas are forwarded to the client as SSE chunks so streaming clients with aggressive first-token timeouts (e.g. Kilo Code's 300s hardcoded limit) don't abort. Content, tool calls, and usage are held back until the final response, which omits already-relayed reasoning (no double-emit). See [ADR 0003](docs/adr/0003-buffered-reasoning-progress-relay.md); disable `relay_reasoning_progress` if a client rejects mid-stream reasoning frames.
 
 All fields are optional with safe defaults, so existing configs keep working unchanged:
 
@@ -424,6 +425,7 @@ streaming:
   passthrough_enabled: true         # true SSE relay for capable providers
   chunk_timeout_seconds: 60         # max gap between SSE chunks (min 5)
   retry_on_truncation: true         # failover on suspicious finish_reason=length
+  relay_reasoning_progress: true    # forward reasoning-only deltas during buffered dispatch (default true)
 ```
 
 ### Timeout Configuration

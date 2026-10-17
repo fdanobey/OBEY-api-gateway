@@ -387,7 +387,7 @@ const MAX_WRITE_BATCH: usize = 64;
 /// Command processed by the dedicated writer thread. The command channel
 /// is FIFO, so a `Query` always observes every `Write` enqueued before it.
 enum LoggerCommand {
-    Write(LogEntry),
+    Write(LogEntry, Option<u64>),
     Query {
         filter: Box<LogFilter>,
         responder: mpsc::Sender<Result<Vec<LogEntry>>>,
@@ -467,7 +467,11 @@ impl RequestLogger {
     /// call only fails when the bounded queue is full or the writer is
     /// gone, so callers can warn without stalling the response path.
     pub fn log(&self, entry: LogEntry) -> Result<()> {
-        self.send_command(LoggerCommand::Write(entry))
+        self.log_with_reasoning_relay(entry, None)
+    }
+
+    pub fn log_with_reasoning_relay(&self, entry: LogEntry, frames: Option<u64>) -> Result<()> {
+        self.send_command(LoggerCommand::Write(entry, frames))
     }
 
     /// Create database schema with indexes
@@ -501,6 +505,7 @@ impl RequestLogger {
             reasoning_tokens INTEGER,
             reasoning_compat_actions TEXT,
             error_class TEXT,
+            reasoning_relayed_frames INTEGER,
             context_reduction TEXT
         )",
         [],
@@ -519,6 +524,7 @@ impl RequestLogger {
         Self::ensure_column(conn, "reasoning_tokens", "INTEGER")?;
         Self::ensure_column(conn, "reasoning_compat_actions", "TEXT")?;
         Self::ensure_column(conn, "error_class", "TEXT")?;
+        Self::ensure_column(conn, "reasoning_relayed_frames", "INTEGER")?;
         Self::ensure_column(conn, "context_reduction", "TEXT")?;
 
         // Create indexes for common query patterns
@@ -767,13 +773,13 @@ fn writer_loop(mut conn: Connection, config: LoggingConfig, receiver: Receiver<L
 
     while let Ok(command) = receiver.recv() {
         match command {
-            LoggerCommand::Write(entry) => {
+            LoggerCommand::Write(entry, frames) => {
                 let mut batch = Vec::with_capacity(MAX_WRITE_BATCH);
-                batch.push(entry);
+                batch.push((entry, frames));
                 loop {
                     match receiver.try_recv() {
-                        Ok(LoggerCommand::Write(entry)) => {
-                            batch.push(entry);
+                        Ok(LoggerCommand::Write(entry, frames)) => {
+                            batch.push((entry, frames));
                             if batch.len() >= MAX_WRITE_BATCH {
                                 break;
                             }
@@ -805,8 +811,8 @@ fn handle_command(
     command: LoggerCommand,
 ) {
     match command {
-        LoggerCommand::Write(entry) => {
-            write_batch(conn, sanitizer, config, std::slice::from_ref(&entry))
+        LoggerCommand::Write(entry, frames) => {
+            write_batch(conn, sanitizer, config, &[(entry, frames)])
         }
         LoggerCommand::Query { filter, responder } => {
             let _ = responder.send(run_query(conn, &filter));
@@ -829,7 +835,7 @@ fn write_batch(
     conn: &mut Connection,
     sanitizer: &BodySanitizer,
     config: &LoggingConfig,
-    entries: &[LogEntry],
+    entries: &[(LogEntry, Option<u64>)],
 ) {
     if entries.is_empty() {
         return;
@@ -837,8 +843,8 @@ fn write_batch(
 
     let batch = (|| -> Result<()> {
         let tx = conn.transaction()?;
-        for entry in entries {
-            insert_entry(&tx, sanitizer, config, entry)?;
+        for (entry, frames) in entries {
+            insert_entry(&tx, sanitizer, config, entry, *frames)?;
         }
         tx.commit()?;
         Ok(())
@@ -846,8 +852,8 @@ fn write_batch(
 
     if let Err(error) = batch {
         tracing::error!(%error, count = entries.len(), "Failed to commit request log batch");
-        for entry in entries {
-            if let Err(error) = insert_entry(conn, sanitizer, config, entry) {
+        for (entry, frames) in entries {
+            if let Err(error) = insert_entry(conn, sanitizer, config, entry, *frames) {
                 tracing::error!(%error, trace_id = %entry.trace_id, "Failed to write request log entry");
             }
         }
@@ -860,6 +866,7 @@ fn insert_entry(
     sanitizer: &BodySanitizer,
     config: &LoggingConfig,
     entry: &LogEntry,
+    reasoning_relayed_frames: Option<u64>,
 ) -> Result<()> {
     // Process request body if logging is enabled
     let request_body = if config.request_body_logging {
@@ -905,10 +912,11 @@ fn insert_entry(
             requested_model, responded_model, compression_metadata, compression_level,
             memories_injected, memories_stored, injection_tokens, detected_project,
             cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
-            reasoning_tokens, reasoning_compat_actions, error_class, context_reduction
+            reasoning_tokens, reasoning_compat_actions, error_class, reasoning_relayed_frames,
+            context_reduction
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
         )",
         params![
             entry.trace_id,
@@ -937,6 +945,7 @@ fn insert_entry(
             entry.reasoning_tokens.map(i64::from),
             entry.reasoning_compat_actions,
             entry.error_class,
+            reasoning_relayed_frames.map(|frames| i64::try_from(frames).unwrap_or(i64::MAX)),
             context_reduction,
         ],
     )?;
