@@ -243,6 +243,7 @@ tray:
 #   passthrough_enabled: true         # true token-by-token streaming for compatible providers
 #   chunk_timeout_seconds: 60         # max gap between provider SSE chunks
 #   retry_on_truncation: true         # fail over when a response is truncated (finish_reason=length)
+#   relay_reasoning_progress: true    # relay reasoning deltas during buffering (false = legacy, nothing relayed)
 
 # Smart model routing (optional). Jev and Laya are calibrated System One
 # classifiers optimized for fast typed decisions. Jev defaults to TypeSafe;

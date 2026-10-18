@@ -19,6 +19,7 @@ pub mod models;
 pub mod oauth;
 pub mod providers;
 pub mod reasoning_compat;
+pub mod reasoning_relay;
 pub mod request_body_limit;
 pub mod responses;
 pub mod router;

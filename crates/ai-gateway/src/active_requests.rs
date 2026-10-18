@@ -8,6 +8,7 @@
 //! the request completes.
 
 use crate::error::ProviderAttempt;
+use crate::reasoning_relay::RelayHandle;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -88,6 +89,10 @@ pub struct ActiveRequestInfo {
     /// Breaker pre-filter skips were already recorded for this request.
     #[serde(skip)]
     pub breaker_skips_recorded: bool,
+    /// Tap for forwarding buffered reasoning deltas to a waiting client
+    /// (never serialized to the dashboard).
+    #[serde(skip)]
+    pub reasoning_relay: Option<RelayHandle>,
 }
 
 impl ActiveRequestInfo {
@@ -198,6 +203,28 @@ impl ActiveRequestHandle {
             Err(_) => false,
         }
     }
+
+    /// Attach a reasoning relay handle for this request.
+    pub fn attach_reasoning_relay(&self, relay: RelayHandle) {
+        if let Ok(mut info) = self.0.lock() {
+            info.reasoning_relay = Some(relay);
+        }
+    }
+
+    /// Detach the relay before routing without a receiver.
+pub fn detach_reasoning_relay(&self) {
+if let Ok(mut info) = self.0.lock() {
+info.reasoning_relay = None;
+}
+}
+
+/// Clone the attached reasoning relay handle, if any.
+    pub fn reasoning_relay(&self) -> Option<RelayHandle> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|info| info.reasoning_relay.clone())
+    }
 }
 
 /// Registry of all currently in-flight requests, keyed by trace id.
@@ -296,6 +323,7 @@ mod tests {
             failed_attempts: Vec::new(),
             outcome_logged: false,
             breaker_skips_recorded: false,
+            reasoning_relay: None,
         }
     }
 
@@ -394,5 +422,51 @@ mod tests {
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].trace_id, "new");
+    }
+
+    #[test]
+    fn reasoning_relay_round_trips_through_handle() {
+        let handle = ActiveRequestRegistry::new().register(sample_info("trace-relay"));
+        assert!(handle.reasoning_relay().is_none());
+
+        let (relay, mut rx) = RelayHandle::new();
+        handle.attach_reasoning_relay(relay);
+        let retrieved = handle.reasoning_relay().expect("relay attached");
+        retrieved.try_relay(crate::reasoning_relay::RelayFrame::Reasoning {
+            text: "thinking".to_string(),
+        });
+        assert_eq!(retrieved.sent(), 1);
+        match rx.try_recv() {
+            Ok(crate::reasoning_relay::RelayFrame::Reasoning { text }) => {
+                assert_eq!(text, "thinking");
+            }
+            other => panic!("expected relay frame, got {:?}", other),
+        }
+    }
+
+#[test]
+fn reasoning_relay_default_is_none() {
+let handle = ActiveRequestRegistry::new().register(sample_info("trace-no-relay"));
+assert!(handle.reasoning_relay().is_none());
+}
+
+#[test]
+fn detach_reasoning_relay_clears_attached_handle() {
+let handle = ActiveRequestRegistry::new().register(sample_info("trace-detach"));
+let (relay, _rx) = RelayHandle::new();
+handle.attach_reasoning_relay(relay);
+assert!(handle.reasoning_relay().is_some());
+handle.detach_reasoning_relay();
+assert!(handle.reasoning_relay().is_none());
+}
+
+    #[test]
+    fn reasoning_relay_never_reaches_dashboard_json() {
+        let reg = ActiveRequestRegistry::new();
+        let handle = reg.register(sample_info("trace-relay-json"));
+        let (relay, _rx) = RelayHandle::new();
+        handle.attach_reasoning_relay(relay);
+        let json = serde_json::to_string(&reg.snapshot()[0]).unwrap();
+        assert!(!json.contains("reasoning_relay"));
     }
 }

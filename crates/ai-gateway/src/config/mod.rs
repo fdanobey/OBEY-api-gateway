@@ -1310,6 +1310,12 @@ pub struct StreamingConfig {
     /// before excluding the provider and failing over to the next one.
     #[serde(default = "default_true")]
     pub retry_on_stream_truncation: bool,
+
+    /// Relay reasoning-only deltas to the client while a buffered dispatch
+    /// waits for the full upstream response. Disable to restore the legacy
+    /// behavior where nothing is relayed during buffering.
+    #[serde(default = "default_true")]
+    pub relay_reasoning_progress: bool,
 }
 
 impl Default for StreamingConfig {
@@ -1321,6 +1327,7 @@ impl Default for StreamingConfig {
             chunk_timeout_seconds: default_chunk_timeout(),
             retry_on_truncation: true,
             retry_on_stream_truncation: true,
+            relay_reasoning_progress: true,
         }
     }
 }
@@ -1423,6 +1430,7 @@ passthrough_enabled: false
 chunk_timeout_seconds: 30
 retry_on_truncation: false
 retry_on_stream_truncation: false
+relay_reasoning_progress: false
 "#;
         let cfg: StreamingConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
@@ -1434,6 +1442,7 @@ retry_on_stream_truncation: false
                 chunk_timeout_seconds: 30,
                 retry_on_truncation: false,
                 retry_on_stream_truncation: false,
+                relay_reasoning_progress: false,
             }
         );
     }
@@ -1462,6 +1471,52 @@ retry_on_stream_truncation: false
         assert_eq!(cfg.chunk_timeout_seconds, 60);
         assert!(cfg.retry_on_truncation);
         assert!(cfg.retry_on_stream_truncation);
+    }
+
+    // Buffered reasoning progress relay, Task 3: relay_reasoning_progress
+    // defaults to on so existing configs gain the relay without edits.
+
+    #[test]
+    fn test_streaming_config_relay_reasoning_progress_default_is_true() {
+        assert!(StreamingConfig::default().relay_reasoning_progress);
+    }
+
+    #[test]
+    fn test_streaming_config_absent_section_defaults_relay_reasoning_progress_true() {
+        // A config document with no top-level `streaming` key deserializes to
+        // `None`; callers fall back to `StreamingConfig::default()` at use
+        // time, which must have the relay enabled.
+        let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers:
+  - name: "openai"
+    type: "openai"
+    base_url: "https://api.openai.com/v1"
+    timeout_seconds: 30
+model_groups:
+  - name: "default"
+    version_fallback_enabled: false
+    models:
+      - provider: "openai"
+        model: "gpt-4"
+        priority: 100
+"#;
+        let cfg: crate::config::Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.streaming.is_none());
+        assert!(cfg.streaming.unwrap_or_default().relay_reasoning_progress);
+    }
+
+    #[test]
+    fn test_streaming_config_relay_reasoning_progress_false_round_trips() {
+        let cfg: StreamingConfig =
+            serde_yaml::from_str("relay_reasoning_progress: false").unwrap();
+        assert!(!cfg.relay_reasoning_progress);
+        let serialized = serde_yaml::to_string(&cfg).unwrap();
+        assert!(serialized.contains("relay_reasoning_progress: false"));
     }
 
     // Context Overflow Management, Task 1.3: ContextConfig deserialization
