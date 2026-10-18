@@ -71,8 +71,12 @@ font-size:.875rem;font-weight:500;cursor:pointer;transition:background .15s}
   .item-list{margin-bottom:1rem}
   .item-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;margin-bottom:.5rem;
   box-shadow:var(--shadow)}
-  .item-card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:.5rem}
-  .item-card-header strong{font-size:.9rem}
+.item-card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:.5rem}
+.item-card-header strong{font-size:.9rem}
+.prov-budget-live{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:.6rem;font-size:.8rem;color:var(--text-muted)}
+.prov-budget-live[hidden]{display:none}
+.prov-budget-reset-btn[hidden]{display:none}
+.prov-budget-live-text.prov-budget-exhausted{color:var(--danger);font-weight:600}
   .secret-status{margin-top:.35rem;font-size:.75rem;padding:.4rem .55rem;border-radius:var(--radius);border:1px solid var(--border)}
   .secret-status.status-encrypted{background:rgba(25,135,84,.08);border-color:rgba(25,135,84,.25);color:var(--success)}
   .secret-status.status-plaintext{background:rgba(220,53,69,.08);border-color:rgba(220,53,69,.25);color:var(--danger)}
@@ -535,12 +539,19 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
           </div>
           <div class="form-group">
             <label>Budget Reset Policy</label>
-            <select class="prov-budget-reset">
-              <option value="manual">Manual</option>
-            </select>
-          </div>
-        </div>
-        <div class="form-group" style="margin-top:.5rem">
+<select class="prov-budget-reset">
+<option value="manual">Manual</option>
+<option value="daily">Daily</option>
+<option value="weekly">Weekly</option>
+<option value="monthly">Monthly</option>
+</select>
+</div>
+</div>
+<div class="prov-budget-live" hidden>
+<span class="prov-budget-live-text" aria-live="polite">—</span>
+<button type="button" class="btn btn-secondary btn-sm prov-budget-reset-btn" hidden>Reset budget</button>
+</div>
+<div class="form-group" style="margin-top:.5rem">
             <label>Manual Models (one per line, always included in model lists)</label>
             <textarea class="prov-manual-models" rows="2" placeholder="model-name-1&#10;model-name-2" style="font-size:.8rem;font-family:monospace"></textarea>
             <div class="hint">Optional override. Bedrock ships separate maintained fallbacks for Mantle Chat (API key) and Runtime/Converse (AWS SDK); NVIDIA NIM also has a maintained fallback.</div>
@@ -2327,8 +2338,9 @@ if (pageId === 'loop-detection') { populateLoopDetection((config && config.loop_
 if (pageId === 'smart-routing') { populateSmartRouting((config && config.smart_routing) || {}); }
 if (pageId === 'virtual-keys') { vkOnOpen(); }
     if (pageId === 'guardrails') { loadGuardrailVirtualKeys(); }
-    if (pageId === 'circuit-breaker') { loadCircuitBreakerStates(); }
-  }
+ if (pageId === 'circuit-breaker') { loadCircuitBreakerStates(); }
+ if (pageId === 'providers') { refreshProvBudgetsBulk(); }
+}
 
   /**
    * Refresh each model row's provider model list, preserving the current selection.
@@ -3307,9 +3319,11 @@ function addProviderCard(data) {
           .finally(function() { testBtn.disabled = false; });
       }
     });
-    renderProviderKeyStatus(card);
-    wireOAuthButtons(card);
-    provList.appendChild(clone);
+renderProviderKeyStatus(card);
+wireOAuthButtons(card);
+var provBudgetResetBtn = card.querySelector('.prov-budget-reset-btn');
+ if (provBudgetResetBtn) provBudgetResetBtn.addEventListener('click', function() { provResetBudget(card); });
+ provList.appendChild(clone);
   }
 
   document.getElementById('add-provider').addEventListener('click', function() { addProviderCard(null); setStatus('Provider added'); });
@@ -4442,12 +4456,91 @@ document.getElementById('cb-reset-btn').addEventListener('click', function() {
       var m = Math.ceil((secs % 3600) / 60);
       return '(resets in ' + h + 'h' + (m > 0 ? ' ' + m + 'm' : '') + ')';
     }
-    var d = Math.floor(secs / 86400);
-    var h = Math.ceil((secs % 86400) / 3600);
-    return '(resets in ' + d + 'd' + (h > 0 ? ' ' + h + 'h' : '') + ')';
-  }
+ var d = Math.floor(secs / 86400);
+ var h = Math.ceil((secs % 86400) / 3600);
+ return '(resets in ' + d + 'd' + (h > 0 ? ' ' + h + 'h' : '') + ')';
+}
 
-  function formatUsageWindow(window) {
+// ===== Provider budget: live status + manual reset (persistent budgets) =====
+
+function provBudgetFmtUsd(n) { var num = Number(n); if (!isFinite(num)) num = 0; return '$' + num.toFixed(2); }
+
+/** Render a provider card's live budget line from a GET budget status payload. */
+function renderProvBudgetStatus(card, data) {
+var wrap = card.querySelector('.prov-budget-live');
+if (!wrap) return;
+var text = wrap.querySelector('.prov-budget-live-text');
+var resetBtn = wrap.querySelector('.prov-budget-reset-btn');
+if (!data) { wrap.hidden = true; if (resetBtn) resetBtn.hidden = true; return; }
+var label = provBudgetFmtUsd(data.spent_usd) + ' / ' + (data.limit_usd != null ? provBudgetFmtUsd(data.limit_usd) : 'no limit');
+if (data.window) label += ' \u00b7 ' + data.window;
+if (data.next_reset) label += ' ' + formatResetTime(data.next_reset);
+if (data.exhausted) label += ' \u00b7 exhausted';
+text.textContent = 'Spent / Budget: ' + label;
+text.className = 'prov-budget-live-text' + (data.exhausted ? ' prov-budget-exhausted' : '');
+wrap.hidden = false;
+if (resetBtn) resetBtn.hidden = false;
+}
+
+/** Hydrate all provider cards' live budget lines from one bulk snapshot. */
+function refreshProvBudgetsBulk() {
+  var cards = document.querySelectorAll('#providers-list .item-card');
+  if (!cards.length) return;
+  // Dashboard is mounted at a configurable path; #dashboard-link's href is
+  // rewritten server-side to that path, so derive the bulk endpoint from it.
+  var dashLink = document.getElementById('dashboard-link');
+  var dashBase = dashLink ? dashLink.getAttribute('href') : '/dashboard';
+  if (!dashBase) dashBase = '/dashboard';
+  dashBase = dashBase.replace(/\/+$/, '');
+  fetch(dashBase + '/metrics')
+  .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+  .then(function(snap) {
+    var byProv = (snap && snap.budget_status_by_provider) || {};
+    cards.forEach(function(card) {
+      var name = card.querySelector('.prov-name') ? card.querySelector('.prov-name').value.trim() : '';
+      var st = name ? byProv[name] : null;
+      if (st) {
+        // Bulk snapshot uses next_reset_epoch; renderer expects next_reset.
+        renderProvBudgetStatus(card, { limit_usd: st.limit_usd, spent_usd: st.spent_usd, remaining_usd: st.remaining_usd, window: st.window, next_reset: st.next_reset_epoch, exhausted: st.exhausted });
+      } else {
+        renderProvBudgetStatus(card, null);
+      }
+    });
+  })
+  .catch(function() {
+    // Bulk endpoint unavailable (e.g. dashboard disabled) — hide quietly,
+    // matching the per-card fetch failure behavior.
+    cards.forEach(function(card) { renderProvBudgetStatus(card, null); });
+  });
+}
+
+/** Reset a provider's budget window after explicit confirmation. */
+function provResetBudget(card) {
+var name = card.querySelector('.prov-name').value.trim();
+if (!name) { showToast('Enter a provider name before resetting a budget', true); return; }
+vkConfirm({
+title: 'Reset provider budget',
+message: 'Reset the budget window for "' + name + '"? Current-window spend returns to $0.00. Usage history is preserved.',
+confirmLabel: 'Reset budget', danger: true,
+onConfirm: function () {
+setStatus('Resetting budget for ' + name + '\u2026');
+fetch(apiUrl('providers/' + encodeURIComponent(name) + '/budget/reset'), { method: 'POST' })
+.then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json().catch(function () { return {}; }); })
+.then(function (data) {
+var prev = data && data.previous_spend_usd;
+setStatus('Budget reset for ' + name);
+showToast('Budget reset for ' + name + (prev != null ? ' \u2014 previous spend ' + provBudgetFmtUsd(prev) : ''));
+      refreshProvBudgetsBulk();
+      })
+      .catch(function (err) {
+        setStatus('Failed to reset budget: ' + err.message);
+showToast('Failed to reset budget: ' + err.message, true);
+});
+}
+});
+}
+
+function formatUsageWindow(window) {
     if (!window || window.limit == null || window.remaining == null) return '—';
     if (window.is_percentage) {
       var used = window.limit - window.remaining;
@@ -4693,14 +4786,23 @@ document.getElementById('cb-reset-btn').addEventListener('click', function() {
     edit.addEventListener('click', function (e) { e.stopPropagation(); vkOpenEditForm(key); });
     cell.appendChild(edit);
 
-    var revoke = document.createElement('button');
-    revoke.type = 'button';
-    revoke.className = 'btn btn-secondary btn-sm';
-    revoke.textContent = 'Revoke';
-    revoke.setAttribute('aria-label', 'Revoke ' + label);
-    if (status === 'revoked') { revoke.disabled = true; revoke.title = 'Key is already revoked'; }
-    revoke.addEventListener('click', function (e) { e.stopPropagation(); vkRevoke(key); });
-    cell.appendChild(revoke);
+var revoke = document.createElement('button');
+revoke.type = 'button';
+revoke.className = 'btn btn-secondary btn-sm';
+revoke.textContent = 'Revoke';
+revoke.setAttribute('aria-label', 'Revoke ' + label);
+if (status === 'revoked') { revoke.disabled = true; revoke.title = 'Key is already revoked'; }
+revoke.addEventListener('click', function (e) { e.stopPropagation(); vkRevoke(key); });
+cell.appendChild(revoke);
+
+var resetSpend = document.createElement('button');
+resetSpend.type = 'button';
+resetSpend.className = 'btn btn-secondary btn-sm';
+resetSpend.textContent = 'Reset spend';
+resetSpend.setAttribute('aria-label', 'Reset spend for ' + label);
+if (status === 'revoked') { resetSpend.disabled = true; resetSpend.title = 'Key is already revoked'; }
+resetSpend.addEventListener('click', function (e) { e.stopPropagation(); vkResetSpend(key); });
+cell.appendChild(resetSpend);
 
     var del = document.createElement('button');
     del.type = 'button';
@@ -4799,25 +4901,51 @@ document.getElementById('cb-reset-btn').addEventListener('click', function() {
     document.getElementById('vk-confirm-cancel').focus();
   }
 
-  /** Revoke a key after explicit confirmation (Req 12.6, 12.12). */
-  function vkRevoke(key) {
-    var label = vkKeyLabel(key);
-    vkConfirm({
-      title: 'Revoke virtual key',
-      message: 'Revoke key "' + label + '"? Callers using this key will be rejected immediately.',
-      confirmLabel: 'Revoke', danger: true,
-      onConfirm: function () {
-        setStatus('Revoking virtual key\u2026');
-        fetch(apiUrl('keys/' + encodeURIComponent(key.id) + '/revoke'), { method: 'POST' })
-          .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json().catch(function () { return {}; }); })
-          .then(function () { setStatus('Virtual key revoked'); showToast('Virtual key revoked'); vkReload(); })
-          .catch(function (err) {
-            setStatus('Failed to revoke key: ' + err.message);
-            showToast('Failed to revoke key: ' + err.message, true);
-          });
-      }
-    });
-  }
+/** Revoke a key after explicit confirmation (Req 12.6, 12.12). */
+function vkRevoke(key) {
+var label = vkKeyLabel(key);
+vkConfirm({
+title: 'Revoke virtual key',
+message: 'Revoke key "' + label + '"? Callers using this key will be rejected immediately.',
+confirmLabel: 'Revoke', danger: true,
+onConfirm: function () {
+setStatus('Revoking virtual key\u2026');
+fetch(apiUrl('keys/' + encodeURIComponent(key.id) + '/revoke'), { method: 'POST' })
+.then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json().catch(function () { return {}; }); })
+.then(function () { setStatus('Virtual key revoked'); showToast('Virtual key revoked'); vkReload(); })
+.catch(function (err) {
+setStatus('Failed to revoke key: ' + err.message);
+showToast('Failed to revoke key: ' + err.message, true);
+});
+}
+});
+}
+
+/** Reset a key's window spend/tokens after explicit confirmation (persistent budgets). */
+function vkResetSpend(key) {
+var label = vkKeyLabel(key);
+vkConfirm({
+title: 'Reset key spend',
+message: 'Reset the current-window spend and tokens for "' + label + '" to zero? Usage history is preserved.',
+confirmLabel: 'Reset spend', danger: true,
+onConfirm: function () {
+setStatus('Resetting spend for ' + label + '\u2026');
+fetch(apiUrl('keys/' + encodeURIComponent(key.id) + '/reset'), { method: 'POST' })
+.then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json().catch(function () { return {}; }); })
+.then(function (data) {
+var prev = data && data.previous;
+var detail = prev ? ' \u2014 previous ' + vkFmtUsd(prev.spend_usd != null ? prev.spend_usd : 0) : '';
+setStatus('Spend reset for ' + label);
+showToast('Spend reset for ' + label + detail);
+vkReload();
+})
+.catch(function (err) {
+setStatus('Failed to reset spend: ' + err.message);
+showToast('Failed to reset spend: ' + err.message, true);
+});
+}
+});
+}
 
   /** Delete a key after explicit confirmation (Req 12.6, 12.12). */
   function vkDelete(key) {

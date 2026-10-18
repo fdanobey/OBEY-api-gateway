@@ -86,6 +86,23 @@ pub enum BudgetWindow {
     Monthly,
 }
 
+/// Maps a provider budget reset policy onto virtual-key budget-window
+/// semantics. `Manual` maps to `None`: spend only clears via an explicit
+/// admin reset, so no periodic window applies.
+///
+/// Lives here (not in `config`) because `virtual_keys` already depends on
+/// `config`; the reverse dependency would create a module cycle.
+impl From<crate::config::BudgetResetPolicy> for Option<BudgetWindow> {
+    fn from(policy: crate::config::BudgetResetPolicy) -> Self {
+        match policy {
+            crate::config::BudgetResetPolicy::Daily => Some(BudgetWindow::Daily),
+            crate::config::BudgetResetPolicy::Weekly => Some(BudgetWindow::Weekly),
+            crate::config::BudgetResetPolicy::Monthly => Some(BudgetWindow::Monthly),
+            crate::config::BudgetResetPolicy::Manual => None,
+        }
+    }
+}
+
 /// Lifecycle status of a virtual key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

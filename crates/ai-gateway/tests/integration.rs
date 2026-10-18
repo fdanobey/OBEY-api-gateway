@@ -529,7 +529,7 @@ async fn test_admin_config_validate_accepts_reliability_fields() {
         .idle_timeout_seconds = 120;
     validatable.providers[0].budget = Some(ProviderBudgetConfig {
         limit_usd: 25.0,
-        reset_policy: BudgetResetPolicy::Manual,
+        reset_policy: Some(BudgetResetPolicy::Manual),
     });
 
     let req = Request::post("/admin/config/validate")

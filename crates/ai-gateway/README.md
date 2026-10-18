@@ -258,10 +258,40 @@ The Compression tab also reports optional ONNX model/runtime readiness and can i
 The dashboard supports:
 - Real-time metrics over WebSocket
 - Provider and per-model circuit-breaker visibility
+- Per-provider budget columns (spent, remaining, window badge with reset countdown, exhausted state) driven by `budget_status_by_provider` in the metrics snapshot
+- Request-rate chart seeded from `GET /dashboard/rate-history` on load and WebSocket reconnect, then advanced live by rolling 60s metrics snapshots
 - Recent error retrieval from logged failed requests
 - Log viewer filtering by timestamp, provider, model, status code, and trace id
 
 For custom paths, the embedded UIs automatically use the configured admin/dashboard route prefixes for links and API calls.
+
+## Provider Budgets
+
+Each provider accepts a persistent USD budget. When cumulative spend meets or exceeds `limit_usd`, the gateway skips that provider (error class `budget_skip`) until the window resets:
+
+```yaml
+providers:
+  - name: openai
+    # ...
+    budget:
+      limit_usd: 50.0
+      reset_policy: manual # daily | weekly | monthly | manual (default)
+```
+
+- `reset_policy` controls when spend resets to zero: `daily` at UTC midnight, `weekly` at Monday 00:00 UTC, `monthly` on the 1st at 00:00 UTC — the same boundary math as virtual-key budget windows. `manual` (the default) never resets automatically.
+- Window rollover is lazy: it happens on the next dispatch after expiry, with no background timers.
+- Spend persists across restarts in `budgets.db` beside `logs.db` and is restored at startup.
+
+Administrative endpoints:
+
+```bash
+curl http://localhost:8080/admin/providers/openai/budget          # limit, spent, remaining, window, next_reset, exhausted
+curl -X POST http://localhost:8080/admin/providers/openai/budget/reset  # zero spend + clear budget_skip, returns previous spend
+curl -X POST http://localhost:8080/admin/keys/{id}/reset          # virtual-key spend/token counters; usage history preserved
+curl http://localhost:8080/dashboard/rate-history                 # trailing-60s per-second request buckets (chart seeding)
+```
+
+These controls are also exposed in the embedded admin panel and the dashboard provider table.
 
 ## Building for Release
 

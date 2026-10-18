@@ -2,16 +2,87 @@ use crate::compression::{
     stats::{sanitize_operational_metadata, CompressionStats, MAX_PROVIDER_LEN},
     CompressionLevel,
 };
+use crate::config::Config;
 use crate::router::sticky_cache::CacheUsage;
 use crate::structured_output::metrics::StructuredOutputMetrics;
 
 mod provider_attempt;
 use provider_attempt::ProviderAttemptFailureMetrics;
+pub mod provider_budget_store;
 use dashmap::DashMap;
+pub use provider_budget_store::{ProviderBudgetStore, ProviderBudgetStoreError};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Number of one-second buckets in the rolling request-rate window.
+const REQUEST_RATE_WINDOW_SECONDS: usize = 60;
+
+/// Fixed-size ring of per-second request counts providing the trailing-60s
+/// request rate. The slot for second `s` lives at `s % WINDOW`; buckets older
+/// than the window are zeroed on access, and the window sum is maintained
+/// incrementally, so recording and snapshotting are bounded by the window
+/// size (O(1) amortized) with no background reset task and no unbounded
+/// memory.
+#[derive(Debug)]
+struct RequestRateRing {
+    /// Newest second already reflected in the slot layout.
+    base_second: u64,
+    /// Per-second request counts.
+    slots: [u64; REQUEST_RATE_WINDOW_SECONDS],
+    /// Sum of all slots (the trailing-window total).
+    total: u64,
+}
+
+impl RequestRateRing {
+    fn new() -> Self {
+        Self {
+            base_second: 0,
+            slots: [0; REQUEST_RATE_WINDOW_SECONDS],
+            total: 0,
+        }
+    }
+
+    /// Zero buckets that have aged out of the trailing window as of `now`.
+    fn advance(&mut self, now: u64) {
+        if now <= self.base_second {
+            return;
+        }
+        let elapsed = now - self.base_second;
+        if elapsed >= REQUEST_RATE_WINDOW_SECONDS as u64 {
+            self.slots = [0; REQUEST_RATE_WINDOW_SECONDS];
+            self.total = 0;
+            self.base_second = now;
+            return;
+        }
+        let base_pos = (self.base_second % REQUEST_RATE_WINDOW_SECONDS as u64) as usize;
+        for i in 1..=elapsed as usize {
+            let pos = (base_pos + i) % REQUEST_RATE_WINDOW_SECONDS;
+            self.total -= self.slots[pos];
+            self.slots[pos] = 0;
+        }
+        self.base_second = now;
+    }
+
+    /// Record one request during second `now`. Clock steps backwards are
+    /// clamped to the newest observed second so a stale slot is never
+    /// incremented.
+    fn record_at(&mut self, now: u64) {
+        let now = now.max(self.base_second);
+        self.advance(now);
+        let pos = (now % REQUEST_RATE_WINDOW_SECONDS as u64) as usize;
+        self.slots[pos] = self.slots[pos].saturating_add(1);
+        self.total = self.total.saturating_add(1);
+    }
+
+    /// Trailing-window sum as of `now`, aging out expired buckets.
+    fn rolling_total_at(&mut self, now: u64) -> u64 {
+        self.advance(now);
+        self.total
+    }
+}
 
 /// Thread-safe metrics tracking for the gateway
 #[derive(Debug)]
@@ -24,8 +95,9 @@ pub struct Metrics {
     completed_requests: AtomicU64,
     /// Timestamp of last request (for rate calculation)
     last_request_time: AtomicU64,
-    /// Request count in last minute window
-    requests_last_minute: AtomicU64,
+    /// Trailing-60s rolling request count driving `requests_last_minute` and
+    /// `request_rate_per_min`
+    requests_last_minute: Mutex<RequestRateRing>,
     /// Currently active/in-flight requests
     active_requests: AtomicU64,
     /// Cumulative cost in dollars
@@ -40,6 +112,10 @@ pub struct Metrics {
     retry_delay_ms_by_provider: Arc<DashMap<String, AtomicU64>>,
     /// Configured provider budget limits in cents
     budget_limit_by_provider_cents: Arc<DashMap<String, AtomicU64>>,
+    /// Configured provider budget reset policies (config-authoritative;
+    /// Task 7 status derivation reads this, not the store's default-manual
+    /// window column).
+    budget_policy_by_provider: Arc<DashMap<String, crate::config::BudgetResetPolicy>>,
     /// Per-provider budget exhaustion counts
     budget_exhaustions_by_provider: Arc<DashMap<String, AtomicU64>>,
     /// Per-provider unknown-cost response counts
@@ -99,7 +175,34 @@ pub struct Metrics {
     /// Lazily allocated Smart Routing metrics. Disabled gateways retain no
     /// Smart Routing metric maps or counters.
     smart_routing: Mutex<Option<Arc<SmartRoutingMetricState>>>,
+    /// Durable owner of per-provider budget-window spend (`budgets.db`).
+    /// The cost/budget atomics in this struct act as a write-through cache
+    /// of the store: on restore the store value wins (durable truth).
+    /// `None` only in unit tests constructing [`Metrics::new`] directly;
+    /// the gateway always sets it (persistent-budgets Task 3).
+    provider_budget_store: Mutex<Option<Arc<ProviderBudgetStore>>>,
+    /// 1-second TTL cache of the budget-store rows (`get_all()` result)
+    /// backing `budget_status_by_provider`, so dashboard snapshot polling
+    /// does not hit SQLite on every snapshot. Guarded by a short-lived
+    /// Mutex; see `cached_budget_store_rows`.
+    budget_store_rows_cache: Mutex<
+        Option<(
+            std::time::Instant,
+            HashMap<String, crate::metrics::provider_budget_store::ProviderBudgetRow>,
+        )>,
+    >,
+    /// In-memory next-boundary cache for the lazy budget-window rollover
+    /// (hot-path remediation, finding B1): provider -> (policy at seed
+    /// time, durable `window_start`, next boundary epoch). Seeded from the
+    /// store + policy once per provider per window; every later rollover
+    /// check is a pure `now >= next_boundary_epoch` comparison with no
+    /// SQL. A policy change (config hot-reload) re-seeds via the cached
+    /// policy mismatch check.
+    budget_window_boundaries: Mutex<HashMap<String, (crate::config::BudgetResetPolicy, i64, i64)>>,
 }
+
+/// TTL of the cached budget-store rows served to budget status snapshots.
+const BUDGET_STORE_ROWS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Bounded label set for compression metrics: (level, provider).
 type CompressionMetricKey = (String, String);
@@ -493,6 +596,12 @@ pub struct MetricsSnapshot {
     /// Live snapshot of currently in-flight requests (dashboard "In-Flight Requests").
     #[serde(default)]
     pub active_requests_list: Vec<crate::active_requests::ActiveRequestInfo>,
+    /// Server-derived per-provider budget status (persistent budgets,
+    /// Task 7): limits, current-window spend, remaining, window policy,
+    /// next reset boundary, exhausted flag. Serialized to the dashboard
+    /// via WS snapshots and `GET /dashboard/metrics`.
+    #[serde(default)]
+    pub budget_status_by_provider: HashMap<String, ProviderBudgetStatus>,
 }
 
 impl MetricsSnapshot {
@@ -518,6 +627,229 @@ impl MetricsSnapshot {
                     _ => "closed",
                 });
             ph.circuit_breaker_state = worst_state.to_string();
+        }
+    }
+}
+
+/// Server-derived per-provider budget status for the dashboard
+/// (persistent budgets, Task 7). All fields are computed server-side
+/// from the store rows, the seeded limit atomics and the exhaustion
+/// counters — the JS renders only, never derives.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderBudgetStatus {
+    /// Configured budget limit in USD; `None` = no limit configured
+    /// (spend-only row, no fake limit or remaining).
+    pub limit_usd: Option<f64>,
+    /// Spend accrued in the current budget window (durable store value
+    /// restored into the cost atomics at startup).
+    pub spent_usd: f64,
+    /// `limit - spent`; `None` when no limit is configured.
+    pub remaining_usd: Option<f64>,
+    /// Reset policy for the window. Serializes as the snake_case label
+    /// ("daily" / "weekly" / "monthly" / "manual") via the enum's serde
+    /// derive — the JSON contract is unchanged from the previous string
+    /// field.
+    pub window: crate::config::BudgetResetPolicy,
+    /// UTC epoch seconds the current window opened at.
+    pub window_start_epoch: i64,
+    /// Next UTC reset boundary (epoch seconds); `None` for manual policy.
+    pub next_reset_epoch: Option<i64>,
+    /// Whether the provider is currently budget-exhausted (spent >= limit).
+    pub exhausted: bool,
+}
+
+/// Next UTC reset boundary for a windowed policy, anchored on the row's
+/// durable `window_start` (persistent budgets, Task 7). Uses the same
+/// boundary math as the virtual-key budgets — daily/weekly/monthly via
+/// the `From<BudgetResetPolicy>` mapping onto `BudgetWindow` — not a
+/// fork. `None` for manual policy (never resets). Public so the Task-10
+/// guard tests can assert boundary equivalence with the VK logic.
+pub fn next_reset_epoch(
+    policy: crate::config::BudgetResetPolicy,
+    window_start_epoch: i64,
+) -> Option<i64> {
+    use chrono::Datelike as _;
+    let window: Option<crate::virtual_keys::models::BudgetWindow> = policy.into();
+    let window = window?;
+    let start = chrono::DateTime::from_timestamp(window_start_epoch, 0)?;
+    let next = match window {
+        crate::virtual_keys::models::BudgetWindow::Daily => {
+            let d = start.date_naive() + chrono::Duration::days(1);
+            d.and_hms_opt(0, 0, 0)?.and_utc()
+        }
+        crate::virtual_keys::models::BudgetWindow::Weekly => {
+            // Monday 00:00 UTC starting the week after window_start's week —
+            // the same boundary `window_expired` rolls at.
+            let offset = start.date_naive().weekday().num_days_from_monday() as i64;
+            let days_to_next_monday = 7 - offset;
+            let d = start.date_naive() + chrono::Duration::days(days_to_next_monday);
+            d.and_hms_opt(0, 0, 0)?.and_utc()
+        }
+        crate::virtual_keys::models::BudgetWindow::Monthly => {
+            // First of the following month, 00:00 UTC.
+            let d = start.date_naive().with_day(1)?;
+            let (year, month) = (d.year(), d.month());
+            let (next_year, next_month) = if month == 12 {
+                (year + 1, 1)
+            } else {
+                (year, month + 1)
+            };
+            chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)?
+                .and_hms_opt(0, 0, 0)?
+                .and_utc()
+        }
+    };
+    Some(next.timestamp())
+}
+
+impl Metrics {
+    /// Derive the server-authoritative per-provider budget status map
+    /// (persistent budgets, Task 7) from three sources:
+    ///
+    /// - durable store rows (window policy, window start),
+    /// - the seeded `budget_limit_by_provider` atomics (config limit),
+    /// - the `cost_by_provider` atomics (current-window spend, restored
+    /// from the store at startup), and `budget_exhaustions` for the
+    /// exhausted flag.
+    ///
+    /// Providers are unioned across store rows and configured limits so a
+    /// configured-but-never-spent provider still shows its limit, and a
+    /// spend-only row still shows its spend. Store read failures degrade
+    /// to atomics-only derivation (observability, never a request blocker).
+    ///
+    /// The store rows are served from a tiny 1-second TTL cache: the
+    /// dashboard polls `snapshot()` frequently and every snapshot otherwise
+    /// hits SQLite with a full `get_all()` table scan. The cache holds the
+    /// lock only to clone the cached map (or refresh it once per second),
+    /// keeping snapshot blocking bounded.
+    fn budget_status_by_provider(&self) -> HashMap<String, ProviderBudgetStatus> {
+        let store_rows: HashMap<String, crate::metrics::provider_budget_store::ProviderBudgetRow> =
+            self.cached_budget_store_rows();
+        // Degraded store: fall back to manual windows for store-known providers.
+        let mut provider_names: std::collections::BTreeSet<String> =
+            store_rows.keys().cloned().collect();
+        for entry in self.budget_limit_by_provider_cents.iter() {
+            provider_names.insert(entry.key().clone());
+        }
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        provider_names
+            .into_iter()
+            .map(|provider| {
+                let row = store_rows.get(&provider);
+                let limit_usd = self
+                    .budget_limit_by_provider_cents
+                    .get(&provider)
+                    .map(|entry| entry.value().load(Ordering::Relaxed) as f64 / 100.0)
+                    // Config limit wins over any stale stored copy.
+                    .or_else(|| row.and_then(|row| row.limit_usd));
+                let spent_usd = self
+                    .cost_by_provider_cents
+                    .get(&provider)
+                    .map(|entry| entry.value().load(Ordering::Relaxed) as f64 / 100.0)
+                    .unwrap_or_else(|| row.map(|row| row.current_spend_usd).unwrap_or(0.0));
+                // Config-seeded policy is authoritative (the store row's window
+                // column only ever holds the insert-time default `manual`).
+                let policy = self
+                    .budget_policy_by_provider
+                    .get(&provider)
+                    .map(|entry| *entry.value())
+                    .or_else(|| row.map(|row| row.window))
+                    .unwrap_or(crate::config::BudgetResetPolicy::Manual);
+                let window_start_epoch = row
+                    .map(|row| row.window_start)
+                    .filter(|epoch| *epoch > 0)
+                    .unwrap_or(0);
+                let exhausted = limit_usd.map(|limit| spent_usd >= limit).unwrap_or(false);
+                let status = ProviderBudgetStatus {
+                    limit_usd,
+                    spent_usd,
+                    remaining_usd: limit_usd.map(|limit| (limit - spent_usd).max(0.0)),
+                    window: policy,
+                    window_start_epoch,
+                    // A missing/zero/legacy anchor cannot yield a meaningful next
+                    // boundary (the epoch-0 fallback would promise a reset at some
+                    // 1970-derived instant) — emit `None` instead.
+                    next_reset_epoch: (window_start_epoch > 0)
+                        .then(|| next_reset_epoch(policy, window_start_epoch.max(now_epoch)))
+                        .flatten(),
+                    exhausted,
+                };
+                (provider, status)
+            })
+            .collect()
+    }
+
+    /// All store rows keyed by provider, served from a 1-second TTL cache
+    /// shared by every `budget_status_by_provider` derivation. On a cold or
+    /// expired cache the SQLite `get_all()` runs inside the same short lock;
+    /// concurrent snapshots inside the TTL window clone the cached map
+    /// without touching the database.
+    fn cached_budget_store_rows(
+        &self,
+    ) -> HashMap<String, crate::metrics::provider_budget_store::ProviderBudgetRow> {
+        let mut cache = self
+            .budget_store_rows_cache
+            .lock()
+            .expect("budget store rows cache poisoned");
+        let fresh = cache
+            .as_ref()
+            .map(|(at, _)| at.elapsed() < BUDGET_STORE_ROWS_TTL)
+            .unwrap_or(false);
+        if !fresh {
+            let rows: HashMap<String, crate::metrics::provider_budget_store::ProviderBudgetRow> =
+                match self.provider_budget_store() {
+                    Some(store) => store
+                        .get_all()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|row| (row.provider.clone(), row))
+                        .collect(),
+                    None => HashMap::new(),
+                };
+            *cache = Some((std::time::Instant::now(), rows));
+        }
+        cache
+            .as_ref()
+            .map(|(_, rows)| rows.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Current window start (UTC epoch seconds) for a policy: the current
+/// daily/weekly/monthly period boundary (today 00:00 UTC, this week's
+/// Monday 00:00 UTC, first-of-month 00:00 UTC — the same boundary math
+/// the rollover check and `next_reset_epoch` use), or "now" for manual.
+/// This is the insert-time row anchor for a provider's first durable
+/// spend accrual.
+fn current_window_start_for_policy(policy: crate::config::BudgetResetPolicy) -> i64 {
+    use chrono::Datelike as _;
+    let now = chrono::Utc::now();
+    let fallback = now.timestamp();
+    match policy {
+        crate::config::BudgetResetPolicy::Manual => fallback,
+        crate::config::BudgetResetPolicy::Daily => now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|d| d.and_utc().timestamp())
+            .unwrap_or(fallback),
+        crate::config::BudgetResetPolicy::Weekly => {
+            let offset = now.date_naive().weekday().num_days_from_monday() as i64;
+            now.date_naive()
+                .checked_sub_signed(chrono::Duration::days(offset))
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|d| d.and_utc().timestamp())
+                .unwrap_or(fallback)
+        }
+        crate::config::BudgetResetPolicy::Monthly => {
+            let first = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+                .unwrap_or_else(|| now.date_naive());
+            first
+                .and_hms_opt(0, 0, 0)
+                .map(|d| d.and_utc().timestamp())
+                .unwrap_or(fallback)
         }
     }
 }
@@ -597,7 +929,7 @@ impl Metrics {
             total_response_time_ms: AtomicU64::new(0),
             completed_requests: AtomicU64::new(0),
             last_request_time: AtomicU64::new(0),
-            requests_last_minute: AtomicU64::new(0),
+            requests_last_minute: Mutex::new(RequestRateRing::new()),
             active_requests: AtomicU64::new(0),
             cumulative_cost_cents: AtomicU64::new(0),
             provider_health: Arc::new(DashMap::new()),
@@ -605,6 +937,7 @@ impl Metrics {
             retry_count_by_provider: Arc::new(DashMap::new()),
             retry_delay_ms_by_provider: Arc::new(DashMap::new()),
             budget_limit_by_provider_cents: Arc::new(DashMap::new()),
+            budget_policy_by_provider: Arc::new(DashMap::new()),
             budget_exhaustions_by_provider: Arc::new(DashMap::new()),
             unknown_cost_by_provider: Arc::new(DashMap::new()),
             rate_limit_exhaustions_by_provider: Arc::new(DashMap::new()),
@@ -629,7 +962,256 @@ impl Metrics {
             tool_compression_feedback_error_rate: Arc::new(DashMap::new()),
             tool_compression_feedback_adjustments: Arc::new(DashMap::new()),
             smart_routing: Mutex::new(None),
+            provider_budget_store: Mutex::new(None),
+            budget_store_rows_cache: Mutex::new(None),
+            budget_window_boundaries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Attach the durable provider-budget store. Called once during
+    /// `GatewayServer` construction (startup/config-reload wiring only,
+    /// never on the request path). After this call the in-memory
+    /// cost/budget atomics are a write-through cache of the store.
+    pub fn set_provider_budget_store(&self, store: Arc<ProviderBudgetStore>) {
+        self.provider_budget_store_with_lock(|slot| *slot = Some(store));
+    }
+
+    /// The attached durable provider-budget store, if any. Spend accrual
+    /// (Task 4) persists through this handle; the Task 3 rebuild test uses
+    /// it to write durable spend.
+    pub fn provider_budget_store(&self) -> Option<Arc<ProviderBudgetStore>> {
+        self.provider_budget_store_with_lock(|slot| slot.clone())
+    }
+
+    /// Whether the budget window for `provider` under `policy` has
+    /// expired, answered from the in-memory next-boundary cache (hot-path
+    /// remediation, finding B1).
+    ///
+    /// Fast path: a cached entry seeded for the same policy is a pure
+    /// `now >= next_boundary_epoch` comparison — no SQL on the tokio
+    /// worker for the common not-expired case. The one sync store read at
+    /// cache-seed time (once per provider per window) is acceptable; the
+    /// store's `Arc<Mutex<Connection>>` serializes it and WAL keeps it
+    /// cheap.
+    ///
+    /// Cache misses and policy changes (config hot-reload) re-seed from
+    /// the store. Boundary math reuses [`next_reset_epoch`] — the same
+    /// UTC daily/weekly/monthly logic as the virtual-key budgets
+    /// (`window_expired`), not a fork. Returns `None` when no store is
+    /// attached, the provider has no row yet (nothing accrued to roll;
+    /// not cached so the first spend re-seeds), or the anchor is invalid.
+    pub fn budget_window_expired_cached(
+        &self,
+        provider: &str,
+        policy: crate::config::BudgetResetPolicy,
+    ) -> Option<bool> {
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        {
+            let cache = self
+                .budget_window_boundaries
+                .lock()
+                .expect("budget window boundary cache poisoned");
+            if let Some((cached_policy, _anchor, next_boundary)) = cache.get(provider) {
+                if *cached_policy == policy {
+                    return Some(now_epoch >= *next_boundary);
+                }
+            }
+        }
+        // Seed: one sync store read per provider per window. The read
+        // runs outside the cache lock so the lock is never held across
+        // SQLite I/O; a concurrent double-seed is benign (same data).
+        let store = self.provider_budget_store()?;
+        let anchor = match store.get_window_start(provider) {
+            Ok(anchor) => anchor?,
+            Err(error) => {
+                tracing::warn!(
+                    provider = provider,
+                    error = %error,
+                    "Failed to read provider budget window start; skipping lazy rollover"
+                );
+                return None;
+            }
+        };
+        let next_boundary = next_reset_epoch(policy, anchor)?;
+        self.budget_window_boundaries
+            .lock()
+            .expect("budget window boundary cache poisoned")
+            .insert(provider.to_string(), (policy, anchor, next_boundary));
+        Some(now_epoch >= next_boundary)
+    }
+
+    /// Persist a cost accrual to the durable provider-budget store,
+    /// **off the response path** (persistent budgets, Task 4, Req 1.3).
+    ///
+    /// Mirrors the `UsageTracker` spawn pattern: the caller invokes this
+    /// where `add_cost` runs, the write is spawned onto a blocking-safe
+    /// task, and a store failure is logged as a warning and never fails
+    /// the request (Req 1.4) — the metrics atomics incremented by
+    /// `add_cost` remain the hot-path truth; the store is the durability
+    /// tail. Spend is persisted for every provider, including providers
+    /// without a configured limit (the store upserts the row; the limit is
+    /// metadata seeded from config).
+    ///
+    /// Lost-update guard: the write carries the durable `window_start` it
+    /// intends to accrue into. When the provider already has a row, that
+    /// row's anchor is read first; when it does not (first accrual), the
+    /// anchor is the current window start derived from the config policy
+    /// (boundary-anchored for daily/weekly/monthly, "now" for manual), so
+    /// the row is born with a correct window anchor. A write whose anchor
+    /// no longer matches the row (a `reset_window` raced it) is dropped by
+    /// the store's conditional upsert instead of polluting the new window.
+    pub fn persist_provider_spend(&self, provider: &str, usd: f64) {
+        let Some(store) = self.provider_budget_store() else {
+            return;
+        };
+        let provider = provider.to_string();
+        // Resolve the window anchor BEFORE spawning: the row read is cheap
+        // and the anchor must reflect the instant this accrual happened.
+        let window_start_epoch = match store.get_window_start(provider.as_str()) {
+            Ok(Some(epoch)) if epoch > 0 => epoch,
+            Ok(_) => self.current_budget_window_start(provider.as_str()),
+            Err(error) => {
+                tracing::warn!(
+                    provider = %provider,
+                    error = %error,
+                    "Failed to read provider budget window start; skipping durable spend accrual"
+                );
+                return;
+            }
+        };
+        let write = move || {
+            if let Err(error) = store.add_spend(&provider, usd, window_start_epoch) {
+                tracing::warn!(
+                    provider = %provider,
+                    error = %error,
+                    "Failed to persist provider budget spend; in-memory metrics remain authoritative"
+                );
+            }
+        };
+        // Inside the async gateway, keep the sync SQLite write off the
+        // response path entirely (spawn-and-forget, never awaited). The
+        // inline fallback only runs in non-tokio contexts (unit tests),
+        // where there is no response path to block.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(write);
+            }
+            Err(_) => write(),
+        }
+    }
+
+    /// The current budget-window start (UTC epoch seconds) for `provider`
+    /// derived from its config-seeded reset policy: the current period
+    /// boundary for daily/weekly/monthly (the same UTC boundary math as
+    /// the virtual-key budgets) and "now" for manual/unknown providers.
+    /// Used as the insert-time row anchor when the first spend accrual
+    /// creates the durable row.
+    fn current_budget_window_start(&self, provider: &str) -> i64 {
+        let policy = self
+            .budget_policy_by_provider
+            .get(provider)
+            .map(|entry| *entry.value())
+            .unwrap_or(crate::config::BudgetResetPolicy::Manual);
+        current_window_start_for_policy(policy)
+    }
+
+    /// Zero `provider`'s in-memory spend atomics. The lazy window-rollover
+    /// path (persistent budgets, Task 4) calls this together with
+    /// [`ProviderBudgetStore::reset_window`] so both the hot-path truth and
+    /// the durable store agree the new window starts from zero.
+    pub fn reset_provider_spend(&self, provider: &str) {
+        if let Some(entry) = self.cost_by_provider_cents.get(provider) {
+            entry.value().store(0, Ordering::Relaxed);
+        }
+        // The rollover just advanced the durable anchor: drop the cached
+        // next-boundary entry so the next check re-seeds from the fresh
+        // store row (finding B1 cache discipline).
+        self.budget_window_boundaries
+            .lock()
+            .expect("budget window boundary cache poisoned")
+            .remove(provider);
+    }
+
+    /// Seed `budget_limit_by_provider` from `config` for every provider
+    /// with a budget configured, and CLEAR the limit/policy entries of
+    /// providers absent from the new config — both the startup path and
+    /// the config-reload path call this, so a provider whose budget was
+    /// removed (or renamed) on reload must not keep a stale limit or
+    /// policy. Clearing is equally safe at startup (the maps start
+    /// empty). Providers without a configured limit are skipped here (no
+    /// limit gauge) but their spend is still persisted through the store;
+    /// spend accrual is Task 4.
+    ///
+    /// Also clears the boundary-cache entries of providers whose policy
+    /// changed (or vanished) so the rollover fast path re-seeds from the
+    /// store under the new policy (finding B1 cache discipline).
+    pub fn seed_provider_budget_limits(&self, config: &Config) {
+        let configured: std::collections::HashSet<&str> = config
+            .providers
+            .iter()
+            .filter(|provider| provider.budget.is_some())
+            .map(|provider| provider.name.as_str())
+            .collect();
+        self.budget_limit_by_provider_cents
+            .retain(|name, _| configured.contains(name.as_str()));
+        self.budget_policy_by_provider
+            .retain(|name, _| configured.contains(name.as_str()));
+        {
+            let mut boundaries = self
+                .budget_window_boundaries
+                .lock()
+                .expect("budget window boundary cache poisoned");
+            boundaries.retain(|name, (policy, _, _)| {
+                config.providers.iter().any(|provider| {
+                    provider.name == *name
+                        && provider
+                            .budget
+                            .as_ref()
+                            .and_then(|budget| budget.reset_policy)
+                            .is_some_and(|configured| configured == *policy)
+                })
+            });
+        }
+        for provider in &config.providers {
+            if let Some(budget) = &provider.budget {
+                self.set_provider_budget_limit(&provider.name, budget.limit_usd);
+                self.budget_policy_by_provider.insert(
+                    provider.name.clone(),
+                    budget.reset_policy.unwrap_or_default(),
+                );
+            }
+        }
+    }
+
+    /// Restore one provider's persisted budget-window spend into the
+    /// in-memory cost atomics. Called only during startup restore with
+    /// rows from [`ProviderBudgetStore::get_all`]; the store value is the
+    /// durable truth and wins over the (freshly zeroed) atomics. Restores
+    /// ONLY the per-provider window spend — never the process-lifetime
+    /// `cumulative_cost` counter, which measures spend accrued during THIS
+    /// process, not across restarts (dashboard "total cost since start").
+    pub fn restore_provider_budget_spend(&self, provider: &str, spend_usd: f64) {
+        let spend_cents = (spend_usd * 100.0).round() as u64;
+        self.cost_by_provider_cents
+            .entry(provider.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(spend_cents, Ordering::Relaxed);
+    }
+
+    /// Shared lock helper for the budget-store slot. Panics on a poisoned
+    /// lock, matching the codebase's other `Mutex` usages.
+    fn provider_budget_store_with_lock<T>(
+        &self,
+        f: impl FnOnce(&mut Option<Arc<ProviderBudgetStore>>) -> T,
+    ) -> T {
+        let mut slot = self
+            .provider_budget_store
+            .lock()
+            .expect("provider budget store slot poisoned");
+        f(&mut slot)
     }
 
     /// Allocate Smart Routing metric state once. Until this method is called,
@@ -861,7 +1443,11 @@ impl Metrics {
             .unwrap()
             .as_secs();
         self.last_request_time.store(now, Ordering::Relaxed);
-        self.requests_last_minute.fetch_add(1, Ordering::Relaxed);
+        let mut ring = self
+            .requests_last_minute
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ring.record_at(now);
 
         if prev_active > 0 && prev_active % 100 == 0 {
             tracing::warn!(
@@ -1231,6 +1817,13 @@ impl Metrics {
             .entry(provider.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Clear `provider`'s budget-exhaustion marker. Called by the admin
+    /// provider-budget reset endpoint so dashboards/Prometheus reflect the
+    /// fresh window instead of lingering skip counts from the reset one.
+    pub fn clear_provider_budget_exhausted(&self, provider: &str) {
+        self.budget_exhaustions_by_provider.remove(provider);
     }
 
     pub fn record_provider_unknown_cost(&self, provider: &str) {
@@ -1901,44 +2494,44 @@ Total unicode_stego provider detections by category and phase\n",
             "filtered",
             &state.context_filtered,
         );
-    write_smart_routing_counter2(
-        out,
-        "obey_api_smart_routing_jev_consults_total",
-        "Total System One classifier consultations by family",
-        ["group", "family"],
-        &state.jev_consults,
-    );
-    write_smart_routing_counter2(
-        out,
-        "obey_api_smart_routing_jev_fallbacks_total",
-        "Total System One classifier fallbacks by bounded reason and family",
-        ["reason", "family"],
-        &state.jev_fallbacks,
-    );
-    write_smart_routing_histogram1(
-        out,
-        "obey_api_smart_routing_jev_confidence",
-        "System One composite confidence by family",
-        "family",
-        &state.jev_confidence,
-        &SMART_ROUTING_SCORE_BUCKETS,
-    );
-    write_smart_routing_histogram1(
-        out,
-        "obey_api_smart_routing_jev_latency_ms",
-        "System One classifier latency in milliseconds by family",
-        "family",
-        &state.jev_latency,
-        &SMART_ROUTING_LATENCY_BUCKETS_MS,
-    );
-    write_smart_routing_counter2(
-        out,
-        "obey_api_smart_routing_jev_discovery_refreshes_total",
-        "System One model discovery refreshes by bounded status and family",
-        ["status", "family"],
-        &state.jev_discovery_refreshes,
-    );
-}
+        write_smart_routing_counter2(
+            out,
+            "obey_api_smart_routing_jev_consults_total",
+            "Total System One classifier consultations by family",
+            ["group", "family"],
+            &state.jev_consults,
+        );
+        write_smart_routing_counter2(
+            out,
+            "obey_api_smart_routing_jev_fallbacks_total",
+            "Total System One classifier fallbacks by bounded reason and family",
+            ["reason", "family"],
+            &state.jev_fallbacks,
+        );
+        write_smart_routing_histogram1(
+            out,
+            "obey_api_smart_routing_jev_confidence",
+            "System One composite confidence by family",
+            "family",
+            &state.jev_confidence,
+            &SMART_ROUTING_SCORE_BUCKETS,
+        );
+        write_smart_routing_histogram1(
+            out,
+            "obey_api_smart_routing_jev_latency_ms",
+            "System One classifier latency in milliseconds by family",
+            "family",
+            &state.jev_latency,
+            &SMART_ROUTING_LATENCY_BUCKETS_MS,
+        );
+        write_smart_routing_counter2(
+            out,
+            "obey_api_smart_routing_jev_discovery_refreshes_total",
+            "System One model discovery refreshes by bounded status and family",
+            ["status", "family"],
+            &state.jev_discovery_refreshes,
+        );
+    }
 
     pub fn write_compression_prometheus(&self, out: &mut String) {
         self.write_smart_routing_prometheus(out);
@@ -2206,7 +2799,7 @@ Total unicode_stego provider detections by category and phase\n",
         MetricsSnapshot {
             request_count: self.request_count.load(Ordering::Relaxed),
             avg_response_time_ms,
-            request_rate_per_min: self.requests_last_minute.load(Ordering::Relaxed) as f64,
+            request_rate_per_min: self.requests_last_minute_per_min(),
             provider_health,
             active_requests: self.active_requests.load(Ordering::Relaxed),
             cumulative_cost: self.cumulative_cost_cents.load(Ordering::Relaxed) as f64 / 100.0,
@@ -2220,12 +2813,29 @@ Total unicode_stego provider detections by category and phase\n",
             cache_hit_rate,
             circuit_breaker_states: Vec::new(),
             active_requests_list: Vec::new(),
+            budget_status_by_provider: self.budget_status_by_provider(),
         }
     }
 
-    /// Reset per-minute request counter (should be called every minute)
-    pub fn reset_minute_counter(&self) {
-        self.requests_last_minute.store(0, Ordering::Relaxed);
+    /// Trailing-60s rolling request count as of now. This replaces the old
+    /// hard-reset per-minute counter: the value decays as per-second buckets
+    /// age out of the window instead of saw-toothing to zero.
+    pub fn requests_last_minute(&self) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut ring = self
+            .requests_last_minute
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ring.rolling_total_at(now)
+    }
+
+    /// `requests_last_minute` expressed as the per-minute rate exposed in
+    /// [`MetricsSnapshot::request_rate_per_min`].
+    fn requests_last_minute_per_min(&self) -> f64 {
+        self.requests_last_minute() as f64
     }
 
     /// Log a final metrics snapshot during graceful shutdown (Req 18.3).
@@ -2506,31 +3116,31 @@ mod tests {
     }
 
     #[test]
-fn smart_routing_jev_metrics_render_with_bounded_labels() {
-    let metrics = Metrics::new();
-    metrics.enable_smart_routing();
-    metrics.record_jev_consult("private-group", "jev");
-    metrics.record_jev_consult("private-group", "laya");
-    metrics.record_jev_fallback("no_jev_at_endpoint", "jev");
-    metrics.record_jev_confidence(0.87, "laya");
-    metrics.record_jev_latency(123.0, "jev");
-    metrics.record_jev_discovery_refresh("success", "laya");
+    fn smart_routing_jev_metrics_render_with_bounded_labels() {
+        let metrics = Metrics::new();
+        metrics.enable_smart_routing();
+        metrics.record_jev_consult("private-group", "jev");
+        metrics.record_jev_consult("private-group", "laya");
+        metrics.record_jev_fallback("no_jev_at_endpoint", "jev");
+        metrics.record_jev_confidence(0.87, "laya");
+        metrics.record_jev_latency(123.0, "jev");
+        metrics.record_jev_discovery_refresh("success", "laya");
 
-    let mut out = String::new();
-    metrics.write_smart_routing_prometheus(&mut out);
+        let mut out = String::new();
+        metrics.write_smart_routing_prometheus(&mut out);
 
-    assert!(out.contains("obey_api_smart_routing_jev_consults_total"));
-    assert!(out.contains(
+        assert!(out.contains("obey_api_smart_routing_jev_consults_total"));
+        assert!(out.contains(
         "obey_api_smart_routing_jev_fallbacks_total{reason=\"no_jev_at_endpoint\",family=\"jev\"} 1"
     ));
-    assert!(out.contains("obey_api_smart_routing_jev_confidence_bucket"));
-    assert!(out.contains("obey_api_smart_routing_jev_latency_ms_bucket"));
-    assert!(out.contains(
+        assert!(out.contains("obey_api_smart_routing_jev_confidence_bucket"));
+        assert!(out.contains("obey_api_smart_routing_jev_latency_ms_bucket"));
+        assert!(out.contains(
         "obey_api_smart_routing_jev_discovery_refreshes_total{status=\"success\",family=\"laya\"} 1"
     ));
-    // Family label is bounded: no unknown family series.
-    assert!(!out.contains("family=\"other\""));
-}
+        // Family label is bounded: no unknown family series.
+        assert!(!out.contains("family=\"other\""));
+    }
 
     #[test]
     fn smart_routing_classifier_label_includes_laya() {
@@ -3324,5 +3934,268 @@ fn smart_routing_jev_metrics_render_with_bounded_labels() {
         // No refusal counters should appear.
         assert!(!out.contains("refusal_detected"));
         assert!(!out.contains("refusal_failover"));
+    }
+
+    // --- Rolling request-rate ring ---
+
+    #[test]
+    fn request_rate_ring_burst_then_monotonic_decay_to_zero() {
+        let mut ring = RequestRateRing::new();
+
+        // One request per second for seconds 100..=109 (a 10-second burst).
+        for second in 100..110 {
+            ring.record_at(second);
+        }
+        assert_eq!(ring.rolling_total_at(109), 10);
+
+        // Idle: the whole burst stays inside the trailing window for 59 more
+        // seconds and never increases.
+        let mut previous = 10;
+        for now in 110..=159 {
+            let current = ring.rolling_total_at(now);
+            assert!(
+                current <= previous,
+                "rate must be non-increasing while idle"
+            );
+            assert_eq!(current, 10, "full burst still inside window at t={}", now);
+            previous = current;
+        }
+
+        // Seconds 100..=109 age out one per second: 9, 8, ..., 1, 0.
+        let mut expected = 9;
+        for now in 160..=168 {
+            assert_eq!(ring.rolling_total_at(now), expected, "decay at t={}", now);
+            expected -= 1;
+        }
+        assert_eq!(ring.rolling_total_at(169), 0);
+        assert_eq!(ring.rolling_total_at(170), 0);
+    }
+
+    #[test]
+    fn request_rate_ring_ages_out_beyond_sixty_seconds() {
+        let mut ring = RequestRateRing::new();
+
+        for second in 500..503 {
+            ring.record_at(second);
+        }
+        assert_eq!(ring.rolling_total_at(502), 3);
+        // Seconds 500-502 are older than the trailing 60s of second 563.
+        assert_eq!(ring.rolling_total_at(563), 0);
+
+        // A single long jump clears every bucket at once.
+        ring.record_at(700);
+        assert_eq!(ring.rolling_total_at(700), 1);
+        assert_eq!(ring.rolling_total_at(700 + 60), 0);
+    }
+
+    #[test]
+    fn request_rate_ring_counts_trailing_window_with_sustained_traffic() {
+        let mut ring = RequestRateRing::new();
+
+        // One request per second for 90 seconds.
+        for second in 0..90 {
+            ring.record_at(second);
+        }
+        // At t=89 the trailing window covers seconds 30..=89.
+        assert_eq!(ring.rolling_total_at(89), 60);
+        // Second 30 ages out at t=90 while no new request arrives.
+        assert_eq!(ring.rolling_total_at(90), 59);
+        // Window at t=119 covers seconds 60..=119: only 60..=89 had traffic.
+        assert_eq!(ring.rolling_total_at(119), 30);
+        // All traffic is older than the window at t=149 (89 + 60).
+        assert_eq!(ring.rolling_total_at(149), 0);
+    }
+
+    #[test]
+    fn request_rate_ring_wraps_slots_and_reuses_cleared_buckets() {
+        let mut ring = RequestRateRing::new();
+
+        // Two full window rotations with traffic re-use cleared slots.
+        for second in 0..150 {
+            ring.record_at(second);
+        }
+        assert_eq!(ring.rolling_total_at(149), 60);
+        assert_eq!(ring.rolling_total_at(209), 0);
+
+        // Old window total must not leak into the fresh window.
+        ring.record_at(210);
+        assert_eq!(ring.rolling_total_at(210), 1);
+    }
+
+    #[test]
+    fn request_rate_ring_handles_clock_steps_backwards() {
+        let mut ring = RequestRateRing::new();
+
+        ring.record_at(1_000);
+        ring.record_at(1_000);
+        // A backwards clock reading must not double-count a stale slot.
+        ring.record_at(998);
+        assert_eq!(ring.rolling_total_at(1_000), 3);
+    }
+
+    #[test]
+    fn request_rate_snapshot_matches_rolling_counter() {
+        let metrics = Metrics::new();
+
+        // `start_request` uses wall-clock seconds, so drive the same clock the
+        // same way for both consumers: record requests and compare the snapshot
+        // rate against the rolling counter read at the same instant.
+        let before = metrics.requests_last_minute();
+        for _ in 0..5 {
+            metrics.start_request();
+        }
+        let after = metrics.requests_last_minute();
+
+        // Both reads happen within the same wall-clock second (no sleeps), so
+        // the counter and snapshot must be identical.
+        assert!(after >= before + 5);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.request_rate_per_min, after as f64);
+    }
+
+    /// Task-10 guard: the rolling request rate decays monotonically after a
+    /// burst and never hard-drops to zero while burst requests are still inside
+    /// the trailing window (the old reset-task sawtooth dropped the whole
+    /// counter to zero once per minute regardless of in-window traffic).
+    #[test]
+    fn rolling_rate_decays_without_sawtooth() {
+        let mut ring = RequestRateRing::new();
+
+        // Burst of 30 requests in one second.
+        for _ in 0..30 {
+            ring.record_at(1_000);
+        }
+        assert_eq!(ring.rolling_total_at(1_000), 30);
+
+        // While the burst stays inside the window the rate never drops to
+        // zero and never increases: no sawtooth.
+        for now in 1_001..=1_059 {
+            let current = ring.rolling_total_at(now);
+            assert_eq!(current, 30, "in-window burst must persist at t={now}");
+        }
+
+        // The burst ages out only by crossing the 60s boundary — a smooth
+        // single step to zero exactly when the last in-window second passes,
+        // never earlier.
+        assert_eq!(ring.rolling_total_at(1_060), 0);
+
+        // A second burst mid-decay must add, not reset: continuing traffic
+        // keeps a floor under the rate (no zero-drop while traffic flows).
+        let mut ring = RequestRateRing::new();
+        for _ in 0..10 {
+            ring.record_at(2_000);
+        }
+        for second in (2_001..=2_050).step_by(10) {
+            ring.record_at(second);
+        }
+        let mut previous = ring.rolling_total_at(2_050);
+        assert!(previous >= 10);
+        for now in 2_051..=2_059 {
+            let current = ring.rolling_total_at(now);
+            assert!(
+                current >= 10,
+                "in-window requests must keep the rate above zero at t={now}"
+            );
+            assert!(current <= previous, "decay must be monotonic at t={now}");
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn budget_boundary_cache_entries_expire_at_next_boundary() {
+        // Pure cache-map logic (finding B1): a seeded entry reports
+        // not-expired while `now` is before the boundary and expired at
+        // or after it — the exact comparison the hot-path check performs
+        // without touching SQLite.
+        let mut cache: HashMap<String, (crate::config::BudgetResetPolicy, i64, i64)> =
+            HashMap::new();
+        let policy = crate::config::BudgetResetPolicy::Daily;
+        let anchor = 1_700_000_000_i64;
+        let next_boundary = next_reset_epoch(policy, anchor).expect("daily boundary computable");
+        cache.insert("provider".to_string(), (policy, anchor, next_boundary));
+
+        let entry = cache.get("provider").copied().unwrap();
+        assert_eq!(entry.0, policy);
+        assert_eq!(entry.1, anchor);
+        // One second before the boundary: not expired.
+        assert!(!((next_boundary - 1) >= next_boundary));
+        // At and after the boundary: expired.
+        assert!(next_boundary >= next_boundary);
+        assert!((next_boundary + 1) >= next_boundary);
+        // Boundary is a 00:00 UTC instant.
+        let boundary_utc = chrono::DateTime::from_timestamp(next_boundary, 0).expect("valid epoch");
+        assert_eq!(
+            (
+                boundary_utc.timestamp_subsec_nanos(),
+                boundary_utc.format("%H:%M:%S").to_string()
+            ),
+            (0, "00:00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn budget_boundary_cache_reports_not_expired_and_reseeds_after_reset() {
+        // Full metrics wiring (finding B1): with a real store row the
+        // cached check reports `false` while the window is current;
+        // `reset_provider_spend` drops the cache entry so the next check
+        // re-seeds from the store.
+        use crate::config::BudgetResetPolicy;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(
+            ProviderBudgetStore::new(&dir.path().join("budgets.db")).expect("store opens"),
+        );
+        let metrics = Metrics::new();
+        metrics.set_provider_budget_store(store.clone());
+
+        let provider = "cached-provider";
+        // No row yet: nothing to roll.
+        assert_eq!(
+            metrics.budget_window_expired_cached(provider, BudgetResetPolicy::Daily),
+            None
+        );
+
+        // Row anchored today: daily window is current → not expired.
+        let today_start = current_window_start_for_policy(BudgetResetPolicy::Daily);
+        store
+            .add_spend(provider, 1.0, today_start)
+            .expect("row created");
+        assert_eq!(
+            metrics.budget_window_expired_cached(provider, BudgetResetPolicy::Daily),
+            Some(false),
+            "current daily window must report not-expired via the cache"
+        );
+
+        // Manual policy never reports expired (never rolls).
+        assert_eq!(
+            metrics.budget_window_expired_cached(provider, BudgetResetPolicy::Manual),
+            None,
+            "manual policy maps to no boundary"
+        );
+
+        // In-memory zeroing drops the cache entry (re-seed discipline).
+        metrics.reset_provider_spend(provider);
+        assert!(
+            !metrics
+                .budget_window_boundaries
+                .lock()
+                .expect("cache lock")
+                .contains_key(provider),
+            "reset_provider_spend must drop the cached boundary entry"
+        );
+
+        // Re-seed after the drop: the row still anchors today, so the
+        // cache re-populates and serves not-expired again.
+        assert_eq!(
+            metrics.budget_window_expired_cached(provider, BudgetResetPolicy::Daily),
+            Some(false)
+        );
+        assert!(
+            metrics
+                .budget_window_boundaries
+                .lock()
+                .expect("cache lock")
+                .contains_key(provider),
+            "re-check must re-seed the cache entry"
+        );
     }
 }

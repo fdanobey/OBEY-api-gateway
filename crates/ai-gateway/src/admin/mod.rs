@@ -95,6 +95,11 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .nest("/smart-routing", smart_routing_api)
         .nest_service("/keys", virtual_keys_api)
         .route("/providers/models", get(proxy_provider_models))
+        .route("/providers/{name}/budget", get(get_provider_budget))
+        .route(
+            "/providers/{name}/budget/reset",
+            post(reset_provider_budget),
+        )
         .route("/test-connection", post(test_connection))
         .route("/oauth/openai/login", post(oauth_login))
         .route("/oauth/openai/complete", post(oauth_complete))
@@ -1506,6 +1511,147 @@ async fn import_config(body: String) -> Response {
 // ---------------------------------------------------------------------------
 // Test Connection endpoint (Req 11.3, 11.6, 12.2)
 // ---------------------------------------------------------------------------
+
+/// GET /admin/providers/{name}/budget — provider budget state.
+///
+/// Serves the server-authoritative per-provider budget status derived by
+/// `Metrics::snapshot().budget_status_by_provider` (persistent budgets,
+/// Task 7): `{limit_usd, spent_usd, remaining_usd, window, next_reset,
+/// exhausted}`. `next_reset` is null for `manual`/unset policy. A KNOWN
+/// provider (present in config) that is not yet in the snapshot (no
+/// configured limit, no durable spend row) gets a 200 zero-spend/no-limit
+/// status derived from config — it must not be conflated with a 404. Only
+/// a provider absent from config yields 404 via the `GatewayError`
+/// mapping.
+async fn get_provider_budget(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, crate::error::GatewayError> {
+    let budget_config = {
+        let config = state.config.read().await;
+        config
+            .providers
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.budget.clone())
+    };
+    // Truly unknown provider (not in config — and by construction not in
+    // the store-seeded snapshot union either).
+    let Some(budget_config) = budget_config else {
+        return Err(unknown_provider(&name));
+    };
+
+    let snap = state.metrics.snapshot();
+    // Known provider without a snapshot entry: fall back to a zero-spend
+    // status shaped by the config budget (limit/policy) instead of a 404.
+    let status = snap.budget_status_by_provider.get(&name);
+    let limit_usd = status
+        .and_then(|s| s.limit_usd)
+        .or_else(|| budget_config.as_ref().map(|b| b.limit_usd));
+    let spent_usd = status.map(|s| s.spent_usd).unwrap_or(0.0);
+    let window = status
+        .map(|s| s.window)
+        .or_else(|| budget_config.as_ref().and_then(|b| b.reset_policy))
+        .unwrap_or_default();
+    let next_reset = status.and_then(|s| s.next_reset_epoch);
+    let exhausted = status.map(|s| s.exhausted).unwrap_or(false);
+
+    Ok(Json(json!({
+        "provider": name,
+        "limit_usd": limit_usd,
+        "spent_usd": spent_usd,
+        "remaining_usd": limit_usd.map(|limit| (limit - spent_usd).max(0.0)),
+        "window": window,
+        "next_reset": next_reset,
+        "exhausted": exhausted,
+    })))
+}
+
+/// POST /admin/providers/{name}/budget/reset — zero the provider's window.
+///
+/// Zeroes the current-window spend in the durable store
+/// (`ProviderBudgetStore::reset_window`, transactional, on the blocking
+/// pool like `reset_key_window`) AND the in-memory metrics atomics, clears
+/// the budget-exhaustion marker, and preserves all logs/usage history.
+/// Fail-closed: when the provider HAS a durable row but the store reset
+/// errors (SQLite failure), nothing is zeroed — the durable spend is the
+/// truth and must not silently resurrect after a restart — and the
+/// handler surfaces a 500 `GatewayError::Database`. A provider with no
+/// row yet succeeds trivially (previous spend 0). Returns the previous
+/// spend. 404 on unknown provider.
+async fn reset_provider_budget(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, crate::error::GatewayError> {
+    {
+        let config = state.config.read().await;
+        if !config.providers.iter().any(|p| p.name == name) {
+            return Err(unknown_provider(&name));
+        }
+    }
+
+    // Durable reset first (CAS on the durable window_start: zeroes the
+    // row only when it is still anchored where we read it), on the
+    // blocking pool — same discipline as the virtual-key reset. A store
+    // error for a provider that HAS a row is fail-closed: durable spend
+    // survives and the request errors instead of reporting success.
+    let store_reset: Result<Option<f64>, String> = match state.metrics.provider_budget_store() {
+        Some(store) => {
+            let store_name = name.clone();
+            tokio::task::spawn_blocking(move || {
+                // Read the durable anchor the CAS reset expects. An error
+                // here is treated like a reset error (the row's existence
+                // is unknowable — do not claim success).
+                let expected = store.get_window_start(&store_name)?;
+                match expected {
+                    Some(expected) => store.reset_window(&store_name, expected),
+                    // No row yet: nothing durable to zero.
+                    None => Ok(None),
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|inner| inner.map_err(|e| e.to_string()))
+        }
+        // No durable store attached (e.g. degraded startup path): nothing
+        // durable to zero; reset the in-memory view only.
+        None => Ok(None),
+    };
+    let previous_spend_usd = match store_reset {
+        Ok(previous) => previous.unwrap_or(0.0),
+        Err(error) => {
+            tracing::error!(
+                provider = %name,
+                error = %error,
+                "Failed to reset provider budget window in store; refusing to zero in-memory spend"
+            );
+            return Err(crate::error::GatewayError::Database(format!(
+                "Failed to reset budget window for provider '{name}': {error}"
+            )));
+        }
+    };
+    // Metrics atomics + exhaustion marker (budget_skip visibility) only
+    // after the durable reset succeeded.
+    state.metrics.reset_provider_spend(&name);
+    state.metrics.clear_provider_budget_exhausted(&name);
+
+    tracing::info!(provider = %name, "Admin endpoint reset provider budget window");
+    Ok(Json(json!({
+        "provider": name,
+        "previous_spend_usd": previous_spend_usd,
+        "reset": true,
+    })))
+}
+
+/// 404 error for an unknown provider name (matches the `test_connection`
+/// admin pattern of surfacing `GatewayError::Provider` with a 404 status).
+fn unknown_provider(name: &str) -> crate::error::GatewayError {
+    crate::error::GatewayError::Provider {
+        provider: name.to_string(),
+        message: format!("Provider '{name}' not found"),
+        status_code: Some(404),
+    }
+}
 
 /// POST /admin/test-connection
 ///
@@ -3491,7 +3637,10 @@ retry:
             .await
             .unwrap();
         let config = smart_routing_response_json(response).await;
-        assert_eq!(config["providers"][0]["buffered_upstream_streaming"], json!(false));
+        assert_eq!(
+            config["providers"][0]["buffered_upstream_streaming"],
+            json!(false)
+        );
 
         let _ = std::fs::remove_dir_all(&config_dir);
     }

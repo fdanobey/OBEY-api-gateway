@@ -385,12 +385,17 @@ const LOG_QUEUE_CAPACITY: usize = 4096;
 const MAX_WRITE_BATCH: usize = 64;
 
 /// Command processed by the dedicated writer thread. The command channel
-/// is FIFO, so a `Query` always observes every `Write` enqueued before it.
+/// is FIFO, so a `Query` or `CountBySecond` always observes every `Write`
+/// enqueued before it.
 enum LoggerCommand {
     Write(LogEntry),
     Query {
         filter: Box<LogFilter>,
         responder: mpsc::Sender<Result<Vec<LogEntry>>>,
+    },
+    CountBySecond {
+        start_epoch: i64,
+        responder: mpsc::Sender<Result<Vec<(i64, u64)>>>,
     },
     Cleanup {
         responder: mpsc::Sender<Result<usize>>,
@@ -503,15 +508,15 @@ impl RequestLogger {
             error_class TEXT,
             context_reduction TEXT
         )",
-        [],
-    )?;
+            [],
+        )?;
 
-    Self::ensure_column(conn, "compression_metadata", "TEXT")?;
-    Self::ensure_column(conn, "compression_level", "TEXT")?;
-    Self::ensure_column(conn, "memories_injected", "INTEGER NOT NULL DEFAULT 0")?;
-    Self::ensure_column(conn, "memories_stored", "INTEGER NOT NULL DEFAULT 0")?;
-    Self::ensure_column(conn, "injection_tokens", "INTEGER NOT NULL DEFAULT 0")?;
-    Self::ensure_column(conn, "detected_project", "TEXT")?;
+        Self::ensure_column(conn, "compression_metadata", "TEXT")?;
+        Self::ensure_column(conn, "compression_level", "TEXT")?;
+        Self::ensure_column(conn, "memories_injected", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::ensure_column(conn, "memories_stored", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::ensure_column(conn, "injection_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::ensure_column(conn, "detected_project", "TEXT")?;
         Self::ensure_column(conn, "cache_read_tokens", "INTEGER")?;
         Self::ensure_column(conn, "cache_creation_tokens", "INTEGER")?;
         Self::ensure_column(conn, "cache_savings_cents", "INTEGER")?;
@@ -599,6 +604,23 @@ impl RequestLogger {
         })?;
         response.recv().map_err(|_| {
             LoggerError::Enqueue("request log writer stopped during query".to_owned())
+        })?
+    }
+
+    /// Per-second request counts for entries with `timestamp >= start_epoch`.
+    ///
+    /// Aggregates in SQL on the writer thread (same FIFO round-trip as
+    /// [`RequestLogger::query`]), so callers count rows without ever
+    /// materializing request/response bodies. The dashboard rate-history
+    /// endpoint uses this instead of a full-body `LogFilter` query.
+    pub fn count_by_second(&self, start_epoch: i64) -> Result<Vec<(i64, u64)>> {
+        let (responder, response) = mpsc::channel();
+        self.send_command(LoggerCommand::CountBySecond {
+            start_epoch,
+            responder,
+        })?;
+        response.recv().map_err(|_| {
+            LoggerError::Enqueue("request log writer stopped during count_by_second".to_owned())
         })?
     }
 
@@ -810,6 +832,12 @@ fn handle_command(
         }
         LoggerCommand::Query { filter, responder } => {
             let _ = responder.send(run_query(conn, &filter));
+        }
+        LoggerCommand::CountBySecond {
+            start_epoch,
+            responder,
+        } => {
+            let _ = responder.send(run_count_by_second(conn, start_epoch));
         }
         LoggerCommand::Cleanup { responder } => {
             let _ = responder.send(run_cleanup(conn, config));
@@ -1024,26 +1052,43 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
                 response_body: row.get(10)?,
                 requested_model: row.get(11)?,
                 responded_model: row.get(12)?,
-            compression,
-            memories_injected: row.get(14)?,
-            memories_stored: row.get(15)?,
-            injection_tokens: row.get(16)?,
-            detected_project: row.get(17)?,
-            cache_read_tokens: row.get(18)?,
-            cache_creation_tokens: row.get(19)?,
-            cache_savings_cents: row.get(20)?,
-            prefix_hash: row.get(21)?,
-            reasoning_tokens: row
-                .get::<_, Option<i64>>(22)?
-                .and_then(|tokens| u32::try_from(tokens).ok()),
-            reasoning_compat_actions: row.get(23)?,
-            error_class: row.get(24)?,
-            context_reduction,
-        })
+                compression,
+                memories_injected: row.get(14)?,
+                memories_stored: row.get(15)?,
+                injection_tokens: row.get(16)?,
+                detected_project: row.get(17)?,
+                cache_read_tokens: row.get(18)?,
+                cache_creation_tokens: row.get(19)?,
+                cache_savings_cents: row.get(20)?,
+                prefix_hash: row.get(21)?,
+                reasoning_tokens: row
+                    .get::<_, Option<i64>>(22)?
+                    .and_then(|tokens| u32::try_from(tokens).ok()),
+                reasoning_compat_actions: row.get(23)?,
+                error_class: row.get(24)?,
+                context_reduction,
+            })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(entries)
+}
+
+/// Per-second `COUNT(*)` aggregation for entries newer than `start_epoch`.
+/// Runs on the writer thread and never touches body columns.
+fn run_count_by_second(conn: &Connection, start_epoch: i64) -> Result<Vec<(i64, u64)>> {
+    let mut stmt =
+        conn.prepare("SELECT timestamp, COUNT(*) FROM requests WHERE timestamp >= ?1 GROUP BY timestamp ORDER BY timestamp")?;
+    let rows = stmt
+        .query_map(params![start_epoch], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Sparse non-zero buckets; widening to u64 is lossless for real counts.
+    Ok(rows
+        .into_iter()
+        .map(|(second, count)| (second, u64::try_from(count).unwrap_or(u64::MAX)))
+        .collect())
 }
 
 /// Clean up old log entries based on retention policy. Runs on the writer
@@ -1114,23 +1159,23 @@ mod tests {
             response_body: None,
             requested_model: None,
             responded_model: None,
-        compression,
-        memories_injected: 0,
-        memories_stored: 0,
-        injection_tokens: 0,
-        detected_project: None,
-        cache_read_tokens: None,
-        cache_creation_tokens: None,
-        cache_savings_cents: None,
-        prefix_hash: None,
-        reasoning_tokens: None,
-        reasoning_compat_actions: None,
-        error_class: None,
-        context_reduction: None,
+            compression,
+            memories_injected: 0,
+            memories_stored: 0,
+            injection_tokens: 0,
+            detected_project: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            cache_savings_cents: None,
+            prefix_hash: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
+            error_class: None,
+            context_reduction: None,
+        }
     }
-}
 
-fn sample_compression(level: CompressionLevel) -> CompressionLogMetadata {
+    fn sample_compression(level: CompressionLevel) -> CompressionLogMetadata {
         CompressionLogMetadata {
             compression_level: compression_level_label(level).to_owned(),
             original_tokens: 1_000,
@@ -1279,34 +1324,34 @@ fn sample_compression(level: CompressionLevel) -> CompressionLogMetadata {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-    assert!(columns.contains(&"compression_metadata".to_owned()));
-    assert!(columns.contains(&"compression_level".to_owned()));
-    assert!(columns.contains(&"context_reduction".to_owned()));
-}
+        assert!(columns.contains(&"compression_metadata".to_owned()));
+        assert!(columns.contains(&"compression_level".to_owned()));
+        assert!(columns.contains(&"context_reduction".to_owned()));
+    }
 
-#[test]
-fn fresh_schema_has_cache_columns() {
-    let (_logger, temp) = create_test_logger();
-    let conn = Connection::open(temp.path()).unwrap();
-    let columns = conn
-        .prepare("PRAGMA table_info(requests)")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap();
-    assert!(columns.contains(&"cache_read_tokens".to_owned()));
-    assert!(columns.contains(&"cache_creation_tokens".to_owned()));
-    assert!(columns.contains(&"cache_savings_cents".to_owned()));
-    assert!(columns.contains(&"prefix_hash".to_owned()));
-}
+    #[test]
+    fn fresh_schema_has_cache_columns() {
+        let (_logger, temp) = create_test_logger();
+        let conn = Connection::open(temp.path()).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(requests)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.contains(&"cache_read_tokens".to_owned()));
+        assert!(columns.contains(&"cache_creation_tokens".to_owned()));
+        assert!(columns.contains(&"cache_savings_cents".to_owned()));
+        assert!(columns.contains(&"prefix_hash".to_owned()));
+    }
 
-#[test]
-fn migrates_pre_cache_schema_and_preserves_rows() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let conn = Connection::open(temp_file.path()).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE requests (
+    #[test]
+    fn migrates_pre_cache_schema_and_preserves_rows() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_file.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE requests (
             id INTEGER PRIMARY KEY,
             trace_id TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
@@ -1336,109 +1381,110 @@ fn migrates_pre_cache_schema_and_preserves_rows() {
             'pre-cache', 1700000000, 'POST', '/v1/chat/completions', 'gpt-4',
             'openai', 200, 10, 0.0, NULL, NULL, NULL, NULL, 3
         );",
-    )
-    .unwrap();
-    drop(conn);
-
-    let config = LoggingConfig {
-        database_path: temp_file.path().to_string_lossy().into_owned(),
-        ..Default::default()
-    };
-    let logger = RequestLogger::new(config).unwrap();
-    let rows = logger
-        .query(LogFilter {
-            trace_id: Some("pre-cache".to_owned()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].memories_injected, 3);
-    assert!(rows[0].cache_read_tokens.is_none());
-    assert!(rows[0].cache_creation_tokens.is_none());
-    assert!(rows[0].cache_savings_cents.is_none());
-    assert!(rows[0].prefix_hash.is_none());
-    drop(logger);
-
-    let conn = Connection::open(temp_file.path()).unwrap();
-    let columns = conn
-        .prepare("PRAGMA table_info(requests)")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap();
-    assert!(columns.contains(&"cache_read_tokens".to_owned()));
-    assert!(columns.contains(&"cache_creation_tokens".to_owned()));
-    assert!(columns.contains(&"cache_savings_cents".to_owned()));
-    assert!(columns.contains(&"prefix_hash".to_owned()));
-    let preserved: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM requests WHERE trace_id = 'pre-cache'",
-            [],
-            |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(preserved, 1);
-}
+        drop(conn);
 
-#[test]
-fn cache_fields_round_trip() {
-    let (logger, _temp) = create_test_logger();
-    let usage = CacheUsage {
-        cache_read_input_tokens: 8_000,
-        cache_creation_input_tokens: 1_500,
-        uncached_input_tokens: 500,
-    };
-    let entry = sample_entry("cache-hit", None).with_cache(Some(&usage), Some(42), Some(0xDEAD_BEEF));
-    logger.log(entry).unwrap();
-
-    let results = logger
-        .query(LogFilter {
-            trace_id: Some("cache-hit".to_owned()),
+        let config = LoggingConfig {
+            database_path: temp_file.path().to_string_lossy().into_owned(),
             ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].cache_read_tokens, Some(8_000));
-    assert_eq!(results[0].cache_creation_tokens, Some(1_500));
-    assert_eq!(results[0].cache_savings_cents, Some(42));
-    assert_eq!(results[0].prefix_hash.as_deref(), Some("00000000deadbeef"));
+        };
+        let logger = RequestLogger::new(config).unwrap();
+        let rows = logger
+            .query(LogFilter {
+                trace_id: Some("pre-cache".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].memories_injected, 3);
+        assert!(rows[0].cache_read_tokens.is_none());
+        assert!(rows[0].cache_creation_tokens.is_none());
+        assert!(rows[0].cache_savings_cents.is_none());
+        assert!(rows[0].prefix_hash.is_none());
+        drop(logger);
 
-    logger.log(sample_entry("cache-miss", None)).unwrap();
-    let results = logger
-        .query(LogFilter {
-            trace_id: Some("cache-miss".to_owned()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(results.len(), 1);
-    assert!(results[0].cache_read_tokens.is_none());
-    assert!(results[0].cache_creation_tokens.is_none());
-    assert!(results[0].cache_savings_cents.is_none());
-    assert!(results[0].prefix_hash.is_none());
-}
+        let conn = Connection::open(temp_file.path()).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(requests)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.contains(&"cache_read_tokens".to_owned()));
+        assert!(columns.contains(&"cache_creation_tokens".to_owned()));
+        assert!(columns.contains(&"cache_savings_cents".to_owned()));
+        assert!(columns.contains(&"prefix_hash".to_owned()));
+        let preserved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM requests WHERE trace_id = 'pre-cache'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+    }
 
-#[test]
-fn fresh_schema_has_reasoning_columns() {
-    let (_logger, temp) = create_test_logger();
-    let conn = Connection::open(temp.path()).unwrap();
-    let columns = conn
-        .prepare("PRAGMA table_info(requests)")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap();
-    assert!(columns.contains(&"reasoning_tokens".to_owned()));
-    assert!(columns.contains(&"reasoning_compat_actions".to_owned()));
-}
+    #[test]
+    fn cache_fields_round_trip() {
+        let (logger, _temp) = create_test_logger();
+        let usage = CacheUsage {
+            cache_read_input_tokens: 8_000,
+            cache_creation_input_tokens: 1_500,
+            uncached_input_tokens: 500,
+        };
+        let entry =
+            sample_entry("cache-hit", None).with_cache(Some(&usage), Some(42), Some(0xDEAD_BEEF));
+        logger.log(entry).unwrap();
 
-#[test]
-fn migrates_pre_reasoning_schema_and_preserves_rows() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let conn = Connection::open(temp_file.path()).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE requests (
+        let results = logger
+            .query(LogFilter {
+                trace_id: Some("cache-hit".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].cache_read_tokens, Some(8_000));
+        assert_eq!(results[0].cache_creation_tokens, Some(1_500));
+        assert_eq!(results[0].cache_savings_cents, Some(42));
+        assert_eq!(results[0].prefix_hash.as_deref(), Some("00000000deadbeef"));
+
+        logger.log(sample_entry("cache-miss", None)).unwrap();
+        let results = logger
+            .query(LogFilter {
+                trace_id: Some("cache-miss".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].cache_read_tokens.is_none());
+        assert!(results[0].cache_creation_tokens.is_none());
+        assert!(results[0].cache_savings_cents.is_none());
+        assert!(results[0].prefix_hash.is_none());
+    }
+
+    #[test]
+    fn fresh_schema_has_reasoning_columns() {
+        let (_logger, temp) = create_test_logger();
+        let conn = Connection::open(temp.path()).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(requests)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.contains(&"reasoning_tokens".to_owned()));
+        assert!(columns.contains(&"reasoning_compat_actions".to_owned()));
+    }
+
+    #[test]
+    fn migrates_pre_reasoning_schema_and_preserves_rows() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_file.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE requests (
             id INTEGER PRIMARY KEY,
             trace_id TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
@@ -1472,84 +1518,87 @@ fn migrates_pre_reasoning_schema_and_preserves_rows() {
             'pre-reasoning', 1700000000, 'POST', '/v1/chat/completions', 'gpt-4',
             'openai', 200, 10, 0.0, NULL, NULL, NULL, NULL, 512
         );",
-    )
-    .unwrap();
-    drop(conn);
-
-    let config = LoggingConfig {
-        database_path: temp_file.path().to_string_lossy().into_owned(),
-        ..Default::default()
-    };
-    let logger = RequestLogger::new(config).unwrap();
-    let rows = logger
-        .query(LogFilter {
-            trace_id: Some("pre-reasoning".to_owned()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].cache_read_tokens, Some(512));
-    assert!(rows[0].reasoning_tokens.is_none());
-    assert!(rows[0].reasoning_compat_actions.is_none());
-    drop(logger);
-
-    let conn = Connection::open(temp_file.path()).unwrap();
-    let columns = conn
-        .prepare("PRAGMA table_info(requests)")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap();
-    assert!(columns.contains(&"reasoning_tokens".to_owned()));
-    assert!(columns.contains(&"reasoning_compat_actions".to_owned()));
-    let preserved: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM requests WHERE trace_id = 'pre-reasoning'",
-            [],
-            |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(preserved, 1);
-}
+        drop(conn);
 
-#[test]
-fn reasoning_fields_round_trip() {
-    let (logger, _temp) = create_test_logger();
-    let actions = r#"{"stripped":{"thinking_blocks":2,"redacted_thinking_blocks":1},"families":["anthropic_manual","openai_reasoning"]}"#;
-    let entry = sample_entry("reasoning-turn", None)
-        .with_reasoning_usage(Some(1_024), Some(actions.to_owned()));
-    logger.log(entry).unwrap();
-
-    let results = logger
-        .query(LogFilter {
-            trace_id: Some("reasoning-turn".to_owned()),
+        let config = LoggingConfig {
+            database_path: temp_file.path().to_string_lossy().into_owned(),
             ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].reasoning_tokens, Some(1_024));
-    assert_eq!(results[0].reasoning_compat_actions.as_deref(), Some(actions));
+        };
+        let logger = RequestLogger::new(config).unwrap();
+        let rows = logger
+            .query(LogFilter {
+                trace_id: Some("pre-reasoning".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cache_read_tokens, Some(512));
+        assert!(rows[0].reasoning_tokens.is_none());
+        assert!(rows[0].reasoning_compat_actions.is_none());
+        drop(logger);
 
-    logger.log(sample_entry("no-reasoning", None)).unwrap();
-    let results = logger
-        .query(LogFilter {
-            trace_id: Some("no-reasoning".to_owned()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(results.len(), 1);
-    assert!(results[0].reasoning_tokens.is_none());
-    assert!(results[0].reasoning_compat_actions.is_none());
-}
+        let conn = Connection::open(temp_file.path()).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(requests)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.contains(&"reasoning_tokens".to_owned()));
+        assert!(columns.contains(&"reasoning_compat_actions".to_owned()));
+        let preserved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM requests WHERE trace_id = 'pre-reasoning'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+    }
 
-#[test]
-fn error_class_column_migrates_and_round_trips() {
-    // A legacy table with every column except error_class.
-    let temp_file = NamedTempFile::new().unwrap();
-    let conn = Connection::open(temp_file.path()).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE requests (
+    #[test]
+    fn reasoning_fields_round_trip() {
+        let (logger, _temp) = create_test_logger();
+        let actions = r#"{"stripped":{"thinking_blocks":2,"redacted_thinking_blocks":1},"families":["anthropic_manual","openai_reasoning"]}"#;
+        let entry = sample_entry("reasoning-turn", None)
+            .with_reasoning_usage(Some(1_024), Some(actions.to_owned()));
+        logger.log(entry).unwrap();
+
+        let results = logger
+            .query(LogFilter {
+                trace_id: Some("reasoning-turn".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].reasoning_tokens, Some(1_024));
+        assert_eq!(
+            results[0].reasoning_compat_actions.as_deref(),
+            Some(actions)
+        );
+
+        logger.log(sample_entry("no-reasoning", None)).unwrap();
+        let results = logger
+            .query(LogFilter {
+                trace_id: Some("no-reasoning".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].reasoning_tokens.is_none());
+        assert!(results[0].reasoning_compat_actions.is_none());
+    }
+
+    #[test]
+    fn error_class_column_migrates_and_round_trips() {
+        // A legacy table with every column except error_class.
+        let temp_file = NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_file.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE requests (
             id INTEGER PRIMARY KEY,
             trace_id TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
@@ -1584,142 +1633,151 @@ fn error_class_column_migrates_and_round_trips() {
             'legacy-row', 1700000000, 'POST', '/v1/chat/completions', 'gpt-4',
             'openai', 200, 10, 0.0
         );",
-    )
-    .unwrap();
-    drop(conn);
+        )
+        .unwrap();
+        drop(conn);
 
-    // Body logging off: error_class must still be stored.
-    let logger = RequestLogger::new(LoggingConfig {
-        database_path: temp_file.path().to_string_lossy().into_owned(),
-        request_body_logging: false,
-        response_body_logging: false,
-        ..Default::default()
-    })
-    .unwrap();
-    let legacy = logger
-        .query(LogFilter {
-            trace_id: Some("legacy-row".to_owned()),
+        // Body logging off: error_class must still be stored.
+        let logger = RequestLogger::new(LoggingConfig {
+            database_path: temp_file.path().to_string_lossy().into_owned(),
+            request_body_logging: false,
+            response_body_logging: false,
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(legacy.len(), 1);
-    assert!(legacy[0].error_class.is_none());
+        let legacy = logger
+            .query(LogFilter {
+                trace_id: Some("legacy-row".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert!(legacy[0].error_class.is_none());
 
-    let mut entry = sample_entry("timed-out", None);
-    entry.path = "/v1/chat/completions#attempt".to_owned();
-    entry.status_code = 504;
-    entry.response_body = Some("Request timeout after 120s".to_owned());
-    entry.error_class = Some("ttfb_timeout".to_owned());
-    logger.log(entry).unwrap();
-    let rows = logger
-        .query(LogFilter {
-            trace_id: Some("timed-out".to_owned()),
-            ..Default::default()
-        })
+        let mut entry = sample_entry("timed-out", None);
+        entry.path = "/v1/chat/completions#attempt".to_owned();
+        entry.status_code = 504;
+        entry.response_body = Some("Request timeout after 120s".to_owned());
+        entry.error_class = Some("ttfb_timeout".to_owned());
+        logger.log(entry).unwrap();
+        let rows = logger
+            .query(LogFilter {
+                trace_id: Some("timed-out".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].error_class.as_deref(), Some("ttfb_timeout"));
+        assert!(rows[0].response_body.is_none(), "body logging is off");
+    }
+
+    #[test]
+    fn context_reduction_round_trips_and_serializes_into_api_payload() {
+        let (logger, _temp) = create_test_logger();
+        let outcome = ReductionOutcome {
+            strategy_applied: ContextReductionStrategy::ClearToolsThenRemove,
+            original_tokens: 12_000,
+            final_tokens: 7_000,
+            budget: 7_168,
+            groups_removed: 3,
+            tool_results_cleared: 4,
+            summarized: true,
+            fallback_from_summarization: true,
+            fits: true,
+        };
+        let entry = sample_entry("reduced-turn", None).with_context_reduction(Some(&outcome));
+        logger.log(entry).unwrap();
+
+        let rows = logger
+            .query(LogFilter {
+                trace_id: Some("reduced-turn".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let reduction = rows[0]
+            .context_reduction
+            .as_ref()
+            .expect("row carries reduction");
+        assert_eq!(reduction.strategy, "clear_tools_then_remove");
+        assert_eq!(reduction.original_tokens, 12_000);
+        assert_eq!(reduction.final_tokens, 7_000);
+        assert_eq!(reduction.groups_removed, 3);
+        assert_eq!(reduction.tool_results_cleared, 4);
+        assert!(reduction.summarized);
+        assert!(reduction.fallback_from_summarization);
+
+        // The /dashboard/logs payload serializes the structured object.
+        let payload = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(
+            payload["context_reduction"]["strategy"],
+            "clear_tools_then_remove"
+        );
+        assert_eq!(payload["context_reduction"]["original_tokens"], 12_000);
+        assert_eq!(payload["context_reduction"]["final_tokens"], 7_000);
+
+        logger.log(sample_entry("unreduced", None)).unwrap();
+        let rows = logger
+            .query(LogFilter {
+                trace_id: Some("unreduced".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].context_reduction.is_none());
+        let payload = serde_json::to_value(&rows[0]).unwrap();
+        assert!(payload.get("context_reduction").is_none());
+    }
+
+    #[test]
+    fn encode_prefix_hash_is_sixteen_lowercase_hex_digits() {
+        assert_eq!(encode_prefix_hash(0), "0000000000000000");
+        assert_eq!(encode_prefix_hash(u64::MAX), "ffffffffffffffff");
+        assert_eq!(
+            encode_prefix_hash(0x0123_4567_89AB_CDEF),
+            "0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn compute_cache_savings_cents_prices_cached_turns() {
+        let model: ProviderModel = serde_json::from_value(serde_json::json!({
+            "provider": "anthropic",
+            "model": "claude",
+            "cost_per_million_input_tokens": 3.0,
+            "cost_per_million_output_tokens": 15.0,
+            "cost_per_million_cache_read_input_tokens": 0.3,
+            "cost_per_million_cache_creation_input_tokens": 3.75
+        }))
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].error_class.as_deref(), Some("ttfb_timeout"));
-    assert!(rows[0].response_body.is_none(), "body logging is off");
-}
 
-#[test]
-fn context_reduction_round_trips_and_serializes_into_api_payload() {
-    let (logger, _temp) = create_test_logger();
-    let outcome = ReductionOutcome {
-        strategy_applied: ContextReductionStrategy::ClearToolsThenRemove,
-        original_tokens: 12_000,
-        final_tokens: 7_000,
-        budget: 7_168,
-        groups_removed: 3,
-        tool_results_cleared: 4,
-        summarized: true,
-        fallback_from_summarization: true,
-        fits: true,
-    };
-    let entry = sample_entry("reduced-turn", None).with_context_reduction(Some(&outcome));
-    logger.log(entry).unwrap();
-
-    let rows = logger
-        .query(LogFilter {
-            trace_id: Some("reduced-turn".to_owned()),
-            ..Default::default()
-        })
+        // No cached tokens -> NULL column.
+        let uncached: OpenAIUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1_000,
+            "completion_tokens": 200
+        }))
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    let reduction = rows[0].context_reduction.as_ref().expect("row carries reduction");
-    assert_eq!(reduction.strategy, "clear_tools_then_remove");
-    assert_eq!(reduction.original_tokens, 12_000);
-    assert_eq!(reduction.final_tokens, 7_000);
-    assert_eq!(reduction.groups_removed, 3);
-    assert_eq!(reduction.tool_results_cleared, 4);
-    assert!(reduction.summarized);
-    assert!(reduction.fallback_from_summarization);
+        assert_eq!(compute_cache_savings_cents(&model, &uncached), None);
 
-    // The /dashboard/logs payload serializes the structured object.
-    let payload = serde_json::to_value(&rows[0]).unwrap();
-    assert_eq!(payload["context_reduction"]["strategy"], "clear_tools_then_remove");
-    assert_eq!(payload["context_reduction"]["original_tokens"], 12_000);
-    assert_eq!(payload["context_reduction"]["final_tokens"], 7_000);
-
-    logger.log(sample_entry("unreduced", None)).unwrap();
-    let rows = logger
-        .query(LogFilter {
-            trace_id: Some("unreduced".to_owned()),
-            ..Default::default()
-        })
+        // 800k read + 200k creation of 1M prompt tokens, 200k completion
+        // tokens. Expected value is derived from the same per-million formula
+        // the cost model uses, so this asserts the seam rather than
+        // re-implementing pricing constants twice.
+        let cached: OpenAIUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 200_000,
+            "cache_read_input_tokens": 800_000,
+            "cache_creation_input_tokens": 200_000
+        }))
         .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].context_reduction.is_none());
-    let payload = serde_json::to_value(&rows[0]).unwrap();
-    assert!(payload.get("context_reduction").is_none());
-}
-
-#[test]
-fn encode_prefix_hash_is_sixteen_lowercase_hex_digits() {
-    assert_eq!(encode_prefix_hash(0), "0000000000000000");
-    assert_eq!(encode_prefix_hash(u64::MAX), "ffffffffffffffff");
-    assert_eq!(encode_prefix_hash(0x0123_4567_89AB_CDEF), "0123456789abcdef");
-}
-
-#[test]
-fn compute_cache_savings_cents_prices_cached_turns() {
-    let model: ProviderModel = serde_json::from_value(serde_json::json!({
-        "provider": "anthropic",
-        "model": "claude",
-        "cost_per_million_input_tokens": 3.0,
-        "cost_per_million_output_tokens": 15.0,
-        "cost_per_million_cache_read_input_tokens": 0.3,
-        "cost_per_million_cache_creation_input_tokens": 3.75
-    }))
-    .unwrap();
-
-    // No cached tokens -> NULL column.
-    let uncached: OpenAIUsage = serde_json::from_value(serde_json::json!({
-        "prompt_tokens": 1_000,
-        "completion_tokens": 200
-    }))
-    .unwrap();
-    assert_eq!(compute_cache_savings_cents(&model, &uncached), None);
-
-    // 800k read + 200k creation of 1M prompt tokens, 200k completion
-    // tokens. Expected value is derived from the same per-million formula
-    // the cost model uses, so this asserts the seam rather than
-    // re-implementing pricing constants twice.
-    let cached: OpenAIUsage = serde_json::from_value(serde_json::json!({
-        "prompt_tokens": 1_000_000,
-        "completion_tokens": 200_000,
-        "cache_read_input_tokens": 800_000,
-        "cache_creation_input_tokens": 200_000
-    }))
-    .unwrap();
-    let base: f64 = (1_000_000.0 * 3.0 + 200_000.0 * 15.0) / 1_000_000.0;
-    // uncached = prompt - read - creation = 0 here, so the actual cost skips
-    // the base-rate term and prices read/creation/completion only.
-    let actual: f64 = (800_000.0 * 0.3 + 200_000.0 * 3.75 + 200_000.0 * 15.0) / 1_000_000.0;
-    let expected = ((base - actual) * 100.0).round() as i64;
-    assert_eq!(compute_cache_savings_cents(&model, &cached), Some(expected));
-    assert!(expected > 0);
-}
+        let base: f64 = (1_000_000.0 * 3.0 + 200_000.0 * 15.0) / 1_000_000.0;
+        // uncached = prompt - read - creation = 0 here, so the actual cost skips
+        // the base-rate term and prices read/creation/completion only.
+        let actual: f64 = (800_000.0 * 0.3 + 200_000.0 * 3.75 + 200_000.0 * 15.0) / 1_000_000.0;
+        let expected = ((base - actual) * 100.0).round() as i64;
+        assert_eq!(compute_cache_savings_cents(&model, &cached), Some(expected));
+        assert!(expected > 0);
+    }
 
     #[test]
     fn compression_metadata_round_trips() {
@@ -1892,10 +1950,10 @@ fn compute_cache_savings_cents_prices_cached_turns() {
             cache_creation_tokens: None,
             cache_savings_cents: None,
             prefix_hash: None,
-        reasoning_tokens: None,
-        reasoning_compat_actions: None,
-        error_class: None,
-        context_reduction: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
+            error_class: None,
+            context_reduction: None,
         };
 
         logger.log(entry.clone()).unwrap();
@@ -2019,10 +2077,10 @@ fn compute_cache_savings_cents_prices_cached_turns() {
             cache_creation_tokens: None,
             cache_savings_cents: None,
             prefix_hash: None,
-        reasoning_tokens: None,
-        reasoning_compat_actions: None,
-        error_class: None,
-        context_reduction: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
+            error_class: None,
+            context_reduction: None,
         };
 
         logger.log(old_entry).unwrap();
@@ -2051,10 +2109,10 @@ fn compute_cache_savings_cents_prices_cached_turns() {
             cache_creation_tokens: None,
             cache_savings_cents: None,
             prefix_hash: None,
-        reasoning_tokens: None,
-        reasoning_compat_actions: None,
-        error_class: None,
-        context_reduction: None,
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
+            error_class: None,
+            context_reduction: None,
         };
 
         logger.log(recent_entry).unwrap();
@@ -2133,10 +2191,10 @@ mod property_tests {
                         cache_creation_tokens: None,
                         cache_savings_cents: None,
                         prefix_hash: None,
-                    reasoning_tokens: None,
-                    reasoning_compat_actions: None,
-                    error_class: None,
-                    context_reduction: None,
+                        reasoning_tokens: None,
+                        reasoning_compat_actions: None,
+                        error_class: None,
+                        context_reduction: None,
                     }
                 },
             )

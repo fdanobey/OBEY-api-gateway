@@ -1396,7 +1396,7 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
             connection_pool: ProviderConnectionPoolConfig::default(),
             budget: (i % 2 == 0).then(|| ProviderBudgetConfig {
                 limit_usd: 10.0,
-                reset_policy: BudgetResetPolicy::Manual,
+                reset_policy: Some(BudgetResetPolicy::Manual),
             }),
             manual_models: vec![],
             global_inference_profile: false,
@@ -1615,13 +1615,13 @@ async fn config_lookup_cardinality_measurement() {
                     "expected half the providers budgeted"
                 );
             }
-        eprintln!(
-            "config_lookup[{}][budget_map] ({} providers, {} budgeted): {}",
-            scenario.label,
-            scenario.providers,
-            scenario.providers.div_ceil(2),
-            samples.report()
-        );
+            eprintln!(
+                "config_lookup[{}][budget_map] ({} providers, {} budgeted): {}",
+                scenario.label,
+                scenario.providers,
+                scenario.providers.div_ceil(2),
+                samples.report()
+            );
         }
     }
 }

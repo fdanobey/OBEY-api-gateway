@@ -36,6 +36,7 @@ mod oauth;
 mod providers;
 mod reasoning_compat;
 mod request_body_limit;
+mod responses;
 mod router;
 mod runtime_limits;
 mod secrets;
@@ -45,7 +46,6 @@ mod smart_routing;
 mod structured_output;
 #[allow(dead_code, unused_imports)]
 mod tool_compression;
-mod responses;
 #[cfg(feature = "tray")]
 mod tray;
 mod virtual_keys;

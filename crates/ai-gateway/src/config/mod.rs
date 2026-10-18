@@ -124,23 +124,23 @@ pub struct Config {
     /// Additional model identifiers that accept Codex reasoning parameters.
     #[serde(default)]
     pub reasoning_models_allowlist: Vec<String>,
-/// Codex Search feature configuration. Absent section defaults to
-/// enabled-when-codex-provider-exists with default timeout/iterations.
-/// See [`crate::codex::search::config::CodexSearchConfig`].
-#[serde(default)]
-pub codex_search: Option<crate::codex::search::config::CodexSearchConfig>,
-/// Prompt-cache-aware routing (sticky provider selection, cache-control
-/// breakpoint injection, cached-token-aware cost sorting). Absent section
-/// applies [`CacheAwareRouting::default`] (disabled). See the
-/// `prompt-cache-routing` spec.
-#[serde(default)]
-pub cache_aware_routing: CacheAwareRouting,
-/// Reasoning-state failover compatibility (detect → strip/preserve →
-/// normalize → cost attribution). Absent section applies
-/// [`ReasoningCompatConfig::default`] (enabled). See
-/// [`crate::reasoning_compat`].
-#[serde(default)]
-pub reasoning_compat: ReasoningCompatConfig,
+    /// Codex Search feature configuration. Absent section defaults to
+    /// enabled-when-codex-provider-exists with default timeout/iterations.
+    /// See [`crate::codex::search::config::CodexSearchConfig`].
+    #[serde(default)]
+    pub codex_search: Option<crate::codex::search::config::CodexSearchConfig>,
+    /// Prompt-cache-aware routing (sticky provider selection, cache-control
+    /// breakpoint injection, cached-token-aware cost sorting). Absent section
+    /// applies [`CacheAwareRouting::default`] (disabled). See the
+    /// `prompt-cache-routing` spec.
+    #[serde(default)]
+    pub cache_aware_routing: CacheAwareRouting,
+    /// Reasoning-state failover compatibility (detect → strip/preserve →
+    /// normalize → cost attribution). Absent section applies
+    /// [`ReasoningCompatConfig::default`] (enabled). See
+    /// [`crate::reasoning_compat`].
+    #[serde(default)]
+    pub reasoning_compat: ReasoningCompatConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -693,9 +693,15 @@ fn default_max_connections() -> u32 {
     100
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Reset policy for persistent provider budgets. Mirrors the virtual-key
+/// `BudgetWindow` semantics: `manual` (the default) preserves today's
+/// behavior — spend only clears via an explicit admin reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetResetPolicy {
+    Daily,
+    Weekly,
+    Monthly,
     Manual,
 }
 
@@ -733,8 +739,10 @@ fn default_pool_idle_timeout_seconds() -> u64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderBudgetConfig {
     pub limit_usd: f64,
+    /// Budget reset policy. `None` behaves as [`BudgetResetPolicy::Manual`]
+    /// (zero-config compatibility with configs that only set `limit_usd`).
     #[serde(default)]
-    pub reset_policy: BudgetResetPolicy,
+    pub reset_policy: Option<BudgetResetPolicy>,
 }
 
 /// Model group configuration
@@ -1576,37 +1584,37 @@ structured_output:
         );
     }
 
-#[test]
-fn structured_output_yaml_fields_default_to_none_when_absent() {
-    let model: ProviderModel =
-        serde_yaml::from_str("provider: openai\nmodel: gpt-4o\n").unwrap();
-    assert_eq!(model.structured_output_passthrough, None);
-    assert_eq!(model.tier, None);
-    assert_eq!(model.context_window, 0);
-    assert!(model.specializations.is_empty());
+    #[test]
+    fn structured_output_yaml_fields_default_to_none_when_absent() {
+        let model: ProviderModel =
+            serde_yaml::from_str("provider: openai\nmodel: gpt-4o\n").unwrap();
+        assert_eq!(model.structured_output_passthrough, None);
+        assert_eq!(model.tier, None);
+        assert_eq!(model.context_window, 0);
+        assert!(model.specializations.is_empty());
 
-    let group: ModelGroup = serde_yaml::from_str(
-        "name: default\nmodels:\n  - provider: openai\n    model: gpt-4o\n",
-    )
-    .unwrap();
-    assert_eq!(group.structured_output, None);
-}
+        let group: ModelGroup = serde_yaml::from_str(
+            "name: default\nmodels:\n  - provider: openai\n    model: gpt-4o\n",
+        )
+        .unwrap();
+        assert_eq!(group.structured_output, None);
+    }
 
-#[test]
-fn provider_model_cache_fields_default_to_none_when_absent() {
-    // Existing (pre-cache) model YAML must load unchanged.
-    let legacy: ProviderModel =
-        serde_yaml::from_str("provider: openai\nmodel: gpt-4o\n").unwrap();
-    assert_eq!(legacy.cost_per_million_cache_read_input_tokens, None);
-    assert_eq!(legacy.cost_per_million_cache_creation_input_tokens, None);
-    assert_eq!(legacy.cache_min_tokens, None);
-    assert_eq!(legacy.cache_support, None);
-}
+    #[test]
+    fn provider_model_cache_fields_default_to_none_when_absent() {
+        // Existing (pre-cache) model YAML must load unchanged.
+        let legacy: ProviderModel =
+            serde_yaml::from_str("provider: openai\nmodel: gpt-4o\n").unwrap();
+        assert_eq!(legacy.cost_per_million_cache_read_input_tokens, None);
+        assert_eq!(legacy.cost_per_million_cache_creation_input_tokens, None);
+        assert_eq!(legacy.cache_min_tokens, None);
+        assert_eq!(legacy.cache_support, None);
+    }
 
-#[test]
-fn provider_model_cache_fields_deserialize_when_present() {
-    let model: ProviderModel = serde_yaml::from_str(
-        r#"
+    #[test]
+    fn provider_model_cache_fields_deserialize_when_present() {
+        let model: ProviderModel = serde_yaml::from_str(
+            r#"
 provider: anthropic
 model: claude-3-7-sonnet
 cost_per_million_cache_read_input_tokens: 0.30
@@ -1616,68 +1624,66 @@ cache_support:
   type: explicit
   max_breakpoints: 4
 "#,
-    )
-    .unwrap();
-    assert_eq!(model.cost_per_million_cache_read_input_tokens, Some(0.30));
-    assert_eq!(
-        model.cost_per_million_cache_creation_input_tokens,
-        Some(3.75)
-    );
-    assert_eq!(model.cache_min_tokens, Some(2048));
-    assert_eq!(
-        model.cache_support,
-        Some(PromptCacheSupport::Explicit {
-            max_breakpoints: 4
-        })
-    );
+        )
+        .unwrap();
+        assert_eq!(model.cost_per_million_cache_read_input_tokens, Some(0.30));
+        assert_eq!(
+            model.cost_per_million_cache_creation_input_tokens,
+            Some(3.75)
+        );
+        assert_eq!(model.cache_min_tokens, Some(2048));
+        assert_eq!(
+            model.cache_support,
+            Some(PromptCacheSupport::Explicit { max_breakpoints: 4 })
+        );
 
-    let automatic: ProviderModel = serde_yaml::from_str(
-        "provider: openai\nmodel: gpt-4o\ncache_support:\n  type: automatic\n",
-    )
-    .unwrap();
-    assert_eq!(automatic.cache_support, Some(PromptCacheSupport::Automatic));
-}
+        let automatic: ProviderModel = serde_yaml::from_str(
+            "provider: openai\nmodel: gpt-4o\ncache_support:\n  type: automatic\n",
+        )
+        .unwrap();
+        assert_eq!(automatic.cache_support, Some(PromptCacheSupport::Automatic));
+    }
 
-#[test]
-fn cache_aware_routing_section_defaults_and_deserializes() {
-    // Absent section applies defaults (disabled).
-    let config: Config = serde_yaml::from_str(
-        "server:\n  host: 127.0.0.1\n  port: 8080\nproviders: []\nmodel_groups: []\n",
-    )
-    .unwrap();
-    assert_eq!(config.cache_aware_routing, CacheAwareRouting::default());
-    assert!(!config.cache_aware_routing.enabled);
+    #[test]
+    fn cache_aware_routing_section_defaults_and_deserializes() {
+        // Absent section applies defaults (disabled).
+        let config: Config = serde_yaml::from_str(
+            "server:\n  host: 127.0.0.1\n  port: 8080\nproviders: []\nmodel_groups: []\n",
+        )
+        .unwrap();
+        assert_eq!(config.cache_aware_routing, CacheAwareRouting::default());
+        assert!(!config.cache_aware_routing.enabled);
 
-    // Empty section fills every field from defaults.
-    let empty: CacheAwareRouting = serde_yaml::from_str("{}").unwrap();
-    assert_eq!(empty, CacheAwareRouting::default());
-    assert_eq!(empty.stickiness_ttl_seconds, 300);
-    assert_eq!(empty.default_cache_min_tokens, 1024);
-    assert_eq!(empty.cost_sort_hit_rate, 0.0);
+        // Empty section fills every field from defaults.
+        let empty: CacheAwareRouting = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(empty, CacheAwareRouting::default());
+        assert_eq!(empty.stickiness_ttl_seconds, 300);
+        assert_eq!(empty.default_cache_min_tokens, 1024);
+        assert_eq!(empty.cost_sort_hit_rate, 0.0);
 
-    // Partial section defaults the rest.
-    let yaml = "enabled: true\nstickiness_ttl_seconds: 60";
-    let partial: CacheAwareRouting = serde_yaml::from_str(yaml).unwrap();
-    assert!(partial.enabled);
-    assert_eq!(partial.stickiness_ttl_seconds, 60);
-    assert_eq!(partial.default_cache_min_tokens, 1024);
-    assert_eq!(partial.cost_sort_hit_rate, 0.0);
+        // Partial section defaults the rest.
+        let yaml = "enabled: true\nstickiness_ttl_seconds: 60";
+        let partial: CacheAwareRouting = serde_yaml::from_str(yaml).unwrap();
+        assert!(partial.enabled);
+        assert_eq!(partial.stickiness_ttl_seconds, 60);
+        assert_eq!(partial.default_cache_min_tokens, 1024);
+        assert_eq!(partial.cost_sort_hit_rate, 0.0);
 
-    // Full section round-trips.
-    let full: CacheAwareRouting = serde_yaml::from_str(
+        // Full section round-trips.
+        let full: CacheAwareRouting = serde_yaml::from_str(
         "enabled: true\nstickiness_ttl_seconds: 600\ndefault_cache_min_tokens: 512\ncost_sort_hit_rate: 0.8",
     )
     .unwrap();
-    assert_eq!(
-        full,
-        CacheAwareRouting {
-            enabled: true,
-            stickiness_ttl_seconds: 600,
-            default_cache_min_tokens: 512,
-            cost_sort_hit_rate: 0.8,
-        }
-    );
-}
+        assert_eq!(
+            full,
+            CacheAwareRouting {
+                enabled: true,
+                stickiness_ttl_seconds: 600,
+                default_cache_min_tokens: 512,
+                cost_sort_hit_rate: 0.8,
+            }
+        );
+    }
 
     #[test]
     fn provider_model_smart_routing_fields_deserialize_and_default() {
@@ -1989,108 +1995,111 @@ mod runtime_resolution_tests {
             max_rate_limit_cooldown_seconds: None,
         };
 
-    let resolved = provider.resolve_custom_headers();
-    assert_eq!(resolved.get("X-API-Key"), Some(&"token123".to_string()));
-    assert_eq!(resolved.get("X-Static"), Some(&"static-value".to_string()));
+        let resolved = provider.resolve_custom_headers();
+        assert_eq!(resolved.get("X-API-Key"), Some(&"token123".to_string()));
+        assert_eq!(resolved.get("X-Static"), Some(&"static-value".to_string()));
 
-    env::remove_var("CUSTOM_TOKEN");
-}
-
-#[test]
-fn test_provider_effective_custom_headers_user_agent() {
-    env::set_var("TEST_UA_TOKEN", "ua-token");
-
-    let mut provider = Provider {
-        name: "test".to_string(),
-        provider_type: "openai".to_string(),
-        base_url: None,
-        api_key_env: None,
-        api_key_encrypted: None,
-        api_secret_env: None,
-        api_secret_encrypted: None,
-        auth_method: None,
-        resolved_api_key: None,
-        resolved_api_secret: None,
-        region: None,
-        timeout_seconds: 30,
-        ttfb_timeout_seconds: None,
-        total_timeout_seconds: None,
-        buffered_upstream_streaming: None,
-        rate_limit_max_wait_ms: None,
-        max_connections: 100,
-        rate_limit_per_minute: 0,
-        custom_headers: HashMap::new(),
-        user_agent: Some("my-app/1.0 (${TEST_UA_TOKEN})".to_string()),
-        connection_pool: ProviderConnectionPoolConfig::default(),
-        budget: None,
-        manual_models: vec![],
-        global_inference_profile: false,
-        cross_region_inference: false,
-        custom_vpc_endpoint: false,
-        prompt_caching: false,
-        compression: None,
-        memory: None,
-        reasoning: true,
-        codex_base_url_override: None,
-        codex_model_override: None,
-        instructions_override: None,
-        max_rate_limit_cooldown_seconds: None,
-    };
-
-    // Env substitution applies to the user agent.
-    assert_eq!(
-        provider.resolve_user_agent(),
-        Some("my-app/1.0 (ua-token)".to_string())
-    );
-    // UA is injected into the effective header set.
-    let effective = provider.effective_custom_headers();
-    assert_eq!(
-        effective.get("User-Agent"),
-        Some(&"my-app/1.0 (ua-token)".to_string())
-    );
-
-    // An explicit User-Agent custom header takes precedence.
-    provider
-        .custom_headers
-        .insert("user-agent".to_string(), "explicit/2.0".to_string());
-    let effective = provider.effective_custom_headers();
-    assert_eq!(effective.get("user-agent"), Some(&"explicit/2.0".to_string()));
-    assert_eq!(effective.get("User-Agent"), None);
-
-    // An empty user_agent resolves to None and injects nothing.
-    provider.user_agent = Some(String::new());
-    assert_eq!(provider.resolve_user_agent(), None);
-    provider.custom_headers.clear();
-    assert!(provider.effective_custom_headers().is_empty());
-
-    env::remove_var("TEST_UA_TOKEN");
-}
-
-#[test]
-fn buffered_upstream_streaming_defaults_by_provider_type() {
-    let parse = |yaml: &str| -> Provider { serde_yaml::from_str(yaml).unwrap() };
-
-    // YAML without the field parses and leaves it unset.
-    for provider_type in ["openai", "nvidia_nim", "ollama"] {
-        let provider = parse(&format!("name: p\ntype: {provider_type}\n"));
-        assert_eq!(provider.buffered_upstream_streaming, None);
-        assert!(
-            provider.effective_buffered_upstream_streaming(),
-            "{provider_type} should stream upstream by default"
-        );
+        env::remove_var("CUSTOM_TOKEN");
     }
 
-    let bedrock = parse("name: b\ntype: bedrock\n");
-    assert!(!bedrock.effective_buffered_upstream_streaming());
+    #[test]
+    fn test_provider_effective_custom_headers_user_agent() {
+        env::set_var("TEST_UA_TOKEN", "ua-token");
 
-    // An explicit value always wins.
-    let opted_out = parse("name: p\ntype: openai\nbuffered_upstream_streaming: false\n");
-    assert_eq!(opted_out.buffered_upstream_streaming, Some(false));
-    assert!(!opted_out.effective_buffered_upstream_streaming());
+        let mut provider = Provider {
+            name: "test".to_string(),
+            provider_type: "openai".to_string(),
+            base_url: None,
+            api_key_env: None,
+            api_key_encrypted: None,
+            api_secret_env: None,
+            api_secret_encrypted: None,
+            auth_method: None,
+            resolved_api_key: None,
+            resolved_api_secret: None,
+            region: None,
+            timeout_seconds: 30,
+            ttfb_timeout_seconds: None,
+            total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
+            max_connections: 100,
+            rate_limit_per_minute: 0,
+            custom_headers: HashMap::new(),
+            user_agent: Some("my-app/1.0 (${TEST_UA_TOKEN})".to_string()),
+            connection_pool: ProviderConnectionPoolConfig::default(),
+            budget: None,
+            manual_models: vec![],
+            global_inference_profile: false,
+            cross_region_inference: false,
+            custom_vpc_endpoint: false,
+            prompt_caching: false,
+            compression: None,
+            memory: None,
+            reasoning: true,
+            codex_base_url_override: None,
+            codex_model_override: None,
+            instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
+        };
 
-    let opted_in = parse("name: b\ntype: bedrock\nbuffered_upstream_streaming: true\n");
-    assert!(opted_in.effective_buffered_upstream_streaming());
-}
+        // Env substitution applies to the user agent.
+        assert_eq!(
+            provider.resolve_user_agent(),
+            Some("my-app/1.0 (ua-token)".to_string())
+        );
+        // UA is injected into the effective header set.
+        let effective = provider.effective_custom_headers();
+        assert_eq!(
+            effective.get("User-Agent"),
+            Some(&"my-app/1.0 (ua-token)".to_string())
+        );
+
+        // An explicit User-Agent custom header takes precedence.
+        provider
+            .custom_headers
+            .insert("user-agent".to_string(), "explicit/2.0".to_string());
+        let effective = provider.effective_custom_headers();
+        assert_eq!(
+            effective.get("user-agent"),
+            Some(&"explicit/2.0".to_string())
+        );
+        assert_eq!(effective.get("User-Agent"), None);
+
+        // An empty user_agent resolves to None and injects nothing.
+        provider.user_agent = Some(String::new());
+        assert_eq!(provider.resolve_user_agent(), None);
+        provider.custom_headers.clear();
+        assert!(provider.effective_custom_headers().is_empty());
+
+        env::remove_var("TEST_UA_TOKEN");
+    }
+
+    #[test]
+    fn buffered_upstream_streaming_defaults_by_provider_type() {
+        let parse = |yaml: &str| -> Provider { serde_yaml::from_str(yaml).unwrap() };
+
+        // YAML without the field parses and leaves it unset.
+        for provider_type in ["openai", "nvidia_nim", "ollama"] {
+            let provider = parse(&format!("name: p\ntype: {provider_type}\n"));
+            assert_eq!(provider.buffered_upstream_streaming, None);
+            assert!(
+                provider.effective_buffered_upstream_streaming(),
+                "{provider_type} should stream upstream by default"
+            );
+        }
+
+        let bedrock = parse("name: b\ntype: bedrock\n");
+        assert!(!bedrock.effective_buffered_upstream_streaming());
+
+        // An explicit value always wins.
+        let opted_out = parse("name: p\ntype: openai\nbuffered_upstream_streaming: false\n");
+        assert_eq!(opted_out.buffered_upstream_streaming, Some(false));
+        assert!(!opted_out.effective_buffered_upstream_streaming());
+
+        let opted_in = parse("name: b\ntype: bedrock\nbuffered_upstream_streaming: true\n");
+        assert!(opted_in.effective_buffered_upstream_streaming());
+    }
 
     #[test]
     fn test_provider_resolve_api_key_prefers_runtime_secret() {

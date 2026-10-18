@@ -429,16 +429,44 @@ impl KeyStore {
 
     /// Reset the budget-window counters to zero and set the window start to now.
     pub fn reset_window_counters(&self, id: &str) -> Result<(), KeyStoreError> {
-        let conn = self.conn.lock().expect("keys.db mutex poisoned");
-        conn.execute(
+        self.reset_window_counters_with_previous(id).map(|_| ())
+    }
+
+    /// Transactional variant of [`Self::reset_window_counters`] that returns
+    /// the previous `{spend_usd, tokens_used}` so admin reset endpoints can
+    /// echo what was cleared. The read and the zeroing UPDATE run inside one
+    /// transaction (transactional in this store, Req admin-reset). Usage
+    /// rows, `request_count`, and `last_used_at` are never touched.
+    pub fn reset_window_counters_with_previous(
+        &self,
+        id: &str,
+    ) -> Result<(f64, u64), KeyStoreError> {
+        let mut conn = self.conn.lock().expect("keys.db mutex poisoned");
+        let tx = conn.transaction()?;
+        let previous = tx.query_row(
+            "SELECT current_spend_usd, current_tokens_used FROM virtual_keys WHERE id = ?1",
+            params![id],
+            |row| {
+                let spend: f64 = row.get(0)?;
+                let tokens: i64 = row.get(1)?;
+                Ok((spend, tokens as u64))
+            },
+        );
+        let previous = match previous {
+            Ok(values) => Some(values),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+        tx.execute(
             "UPDATE virtual_keys SET
-                current_spend_usd = 0.0,
-                current_tokens_used = 0,
-                window_start_timestamp = ?1
-             WHERE id = ?2",
+            current_spend_usd = 0.0,
+            current_tokens_used = 0,
+            window_start_timestamp = ?1
+            WHERE id = ?2",
             params![Utc::now().timestamp(), id],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(previous.unwrap_or((0.0, 0)))
     }
 
     /// Insert a single usage row into `virtual_key_usage`.

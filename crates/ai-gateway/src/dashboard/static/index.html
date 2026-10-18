@@ -62,6 +62,12 @@ tbody tr:hover{background:rgba(59,130,246,.06)}
 .badge-closed{background:rgba(34,197,94,.15);color:var(--success)}
 .badge-open{background:rgba(239,68,68,.15);color:var(--danger)}
 .badge-halfopen{background:rgba(245,158,11,.15);color:var(--warning)}
+.badge-window-daily{background:rgba(59,130,246,.15);color:var(--primary)}
+.badge-window-weekly{background:rgba(168,85,247,.15);color:#a855f7}
+.badge-window-monthly{background:rgba(20,184,166,.15);color:#14b8a6}
+.badge-window-manual{background:rgba(148,163,184,.15);color:var(--text-muted)}
+.badge-exhausted{background:rgba(239,68,68,.15);color:var(--danger)}
+.badge-ok{background:rgba(34,197,94,.15);color:var(--success)}
 
 /* In-flight request phase badges */
 .inflight-pending{background:rgba(148,163,184,.18);color:var(--text-muted)}
@@ -194,8 +200,12 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
             <th data-sort="cache_write">Cache Write <span class="sort-arrow"></span></th>
             <th data-sort="cache_hit">Cache Hit Rate <span class="sort-arrow"></span></th>
             <th data-sort="cache_savings">Cache Savings <span class="sort-arrow"></span></th>
-            <th data-sort="last_success">Last Success <span class="sort-arrow"></span></th>
-            <th data-sort="last_failure_reason">Last Failure Reason <span class="sort-arrow"></span></th>
+<th data-sort="last_success">Last Success <span class="sort-arrow"></span></th>
+<th data-sort="budget_spent">Budget Spent <span class="sort-arrow"></span></th>
+<th data-sort="budget_remaining">Budget Remaining <span class="sort-arrow"></span></th>
+ <th data-sort="budget_next_reset">Resets In <span class="sort-arrow"></span></th>
+<th data-sort="budget_exhausted">Budget State <span class="sort-arrow"></span></th>
+<th data-sort="last_failure_reason">Last Failure Reason <span class="sort-arrow"></span></th>
           </tr>
         </thead>
         <tbody id="provider-tbody"></tbody>
@@ -512,7 +522,10 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 
   // --- Helpers ---
   function $(id){ return document.getElementById(id); }
-  function esc(s){ var d=document.createElement('div');d.textContent=s;return d.innerHTML; }
+  // Escapes text for both element and double-quoted attribute contexts
+// (title="...", class="..."): textContent-based escaping covers <, >, &
+// and the replaces close the quote escape gaps.
+function esc(s){ var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
   function fmtTime(ts){
     if(!ts) return '—';
     var d=new Date(typeof ts==='number'?ts*1000:ts);
@@ -593,14 +606,53 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
       options:chartOpts});
   }
 
-  function pushChartPoint(chart, dataArr, label, value){
-    dataArr.push(value);
-    if(dataArr.length>MAX_POINTS) dataArr.shift();
-    if(!chart) return;
-    chart.data.labels = dataArr.map(function(_,i){return i;});
-    chart.data.datasets[0].data = dataArr.slice();
-    chart.update('none');
-  }
+ function pushChartPoint(chart, dataArr, label, value){
+ dataArr.push(value);
+ if(dataArr.length>MAX_POINTS) dataArr.shift();
+ if(!chart) return;
+ chart.data.labels = dataArr.map(function(_,i){return i;});
+ chart.data.datasets[0].data = dataArr.slice();
+ chart.update('none');
+ }
+
+// --- Rate-history seeding (Req: chart populated on load/reconnect) ---
+// The endpoint returns sparse per-second counts for the trailing 60s. The
+// chart series is the same rolling metric WS snapshots append
+// (`request_rate_per_min` = trailing-60s request sum), so the seed must be
+// zero-filled to epoch-aligned seconds and converted to the rolling sum —
+// otherwise the first WS tick jumps the chart ~60x.
+function seedRequestRateChart(){
+ fetch(dashboardBasePath+'/rate-history')
+ .then(function(r){if(!r.ok) throw new Error('HTTP '+r.status);return r.json();})
+ .then(function(data){
+ var points = (data&&data.points)||[];
+ if(!points.length) return;
+ var nowSec = Math.floor(Date.now()/1000);
+ // Epoch-aligned slots for the last 60 seconds ending now (same window
+ // semantics as MAX_POINTS/pushChartPoint).
+ var slots = new Array(MAX_POINTS).fill(0);
+ var first = nowSec-(MAX_POINTS-1);
+ points.forEach(function(p){
+ var second = Number(p.epoch_second);
+ var idx = second-first;
+ if(idx>=0 && idx<MAX_POINTS) slots[idx] += Number(p.count)||0;
+ });
+ // Rolling series: slot i = sum of the trailing MAX_POINTS slots ending
+ // at i, so the first WS point continues the series smoothly.
+ reqRateData = [];
+ var rolling = 0;
+ for(var i=0;i<slots.length;i++){
+ rolling += slots[i];
+ reqRateData.push(rolling);
+ }
+ if(reqRateChart){
+ reqRateChart.data.labels = reqRateData.map(function(_,i){return i;});
+ reqRateChart.data.datasets[0].data = reqRateData.slice();
+ reqRateChart.update('none');
+ }
+ })
+ .catch(function(){/* silent: chart keeps appending from WS snapshots */});
+}
 
   // --- State ---
   var providerData = [];
@@ -678,10 +730,68 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     tbody.innerHTML = html;
   }
 
-  function renderProviders(providers){
-    providerData = providers||[];
-    sortAndRenderProviders();
-  }
+function renderProviders(providers, budgetStatus){
+providerData = providers||[];
+var budgets = budgetStatus||{};
+ providerData.forEach(function(p){ p.budgetStatus = budgets[p.provider]||null; });
+sortAndRenderProviders();
+}
+
+// --- Provider budget cells (persistent budgets, Task 7) ---
+// All values are server-derived from budget_status_by_provider; the JS
+// only renders. Providers without a configured limit show spend only.
+function budgetWindowBadgeHtml(b){
+var labels={daily:'daily',weekly:'weekly',monthly:'monthly',manual:'manual'};
+var label=labels[b.window]||b.window||'manual';
+return '<span class="badge badge-window-'+esc(label)+'">'+esc(label)+'</span>';
+}
+
+function fmtDurationSecs(sec){
+if(sec<0) sec=0;
+var h=Math.floor(sec/3600);
+var m=Math.floor((sec%3600)/60);
+var s=Math.floor(sec%60);
+if(h>0) return h+'h '+m+'m';
+if(m>0) return m+'m '+s+'s';
+return s+'s';
+}
+
+function budgetResetsHtml(b, nowSec){
+if(!b) return '—';
+if(b.next_reset_epoch==null) return ''; // manual: no reset scheduled
+var remaining=b.next_reset_epoch-nowSec;
+if(remaining<=0) return 'soon';
+return '<span title="Resets at '+esc(new Date(b.next_reset_epoch*1000).toLocaleString())+'">in '+esc(fmtDurationSecs(remaining))+'</span>';
+}
+
+function budgetSpentHtml(b){
+if(!b) return '—';
+var badge=budgetWindowBadgeHtml(b);
+var spent=fmtCost(b.spent_usd);
+if(b.limit_usd!=null){
+return badge+' <span title="Window spend / limit">'+spent+' / '+fmtCost(b.limit_usd)+'</span>';
+}
+// No configured limit: spend only, no fake limit/remaining.
+return badge+' <span title="Window spend (no limit configured)">'+spent+'</span>';
+}
+
+function budgetRemainingHtml(b){
+if(!b) return '—';
+if(b.limit_usd==null) return '—';
+return fmtCost(b.remaining_usd!=null?b.remaining_usd:0);
+}
+
+function budgetStateHtml(b){
+if(!b) return '—';
+if(b.exhausted){
+// Icon + text, never color alone (accessibility).
+return '<span class="badge badge-exhausted" title="Spend meets or exceeds the configured budget limit">&#9888; Exhausted</span>';
+}
+if(b.limit_usd!=null){
+return '<span class="badge badge-ok" title="Spend is under the configured budget limit">&#10003; OK</span>';
+}
+return '<span class="badge badge-window-manual" title="No budget limit configured">No limit</span>';
+}
 
   function sortAndRenderProviders(){
     var data = providerData.slice();
@@ -698,8 +808,12 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
         case 'cache_write':va=a.cache_creation_tokens||0;vb=b.cache_creation_tokens||0;break;
         case 'cache_hit':va=a.cache_prompt_hit_rate||0;vb=b.cache_prompt_hit_rate||0;break;
         case 'cache_savings':va=a.cache_savings_cents||0;vb=b.cache_savings_cents||0;break;
-        case 'last_success':va=a.last_success_timestamp||0;vb=b.last_success_timestamp||0;break;
-        case 'last_failure_reason':va=a.last_failure_reason||'';vb=b.last_failure_reason||'';break;
+case 'last_success':va=a.last_success_timestamp||0;vb=b.last_success_timestamp||0;break;
+ case 'budget_spent':va=(a.budgetStatus&&a.budgetStatus.spent_usd)||0;vb=(b.budgetStatus&&b.budgetStatus.spent_usd)||0;break;
+ case 'budget_remaining':va=(a.budgetStatus&&a.budgetStatus.remaining_usd!=null)?a.budgetStatus.remaining_usd:-1;vb=(b.budgetStatus&&b.budgetStatus.remaining_usd!=null)?b.budgetStatus.remaining_usd:-1;break;
+ case 'budget_exhausted':va=a.budgetStatus&&a.budgetStatus.exhausted?1:0;vb=b.budgetStatus&&b.budgetStatus.exhausted?1:0;break;
+ case 'budget_next_reset':va=(a.budgetStatus&&a.budgetStatus.next_reset_epoch!=null)?a.budgetStatus.next_reset_epoch:-1;vb=(b.budgetStatus&&b.budgetStatus.next_reset_epoch!=null)?b.budgetStatus.next_reset_epoch:-1;break;
+case 'last_failure_reason':va=a.last_failure_reason||'';vb=b.last_failure_reason||'';break;
         default:va=a.provider;vb=b.provider;
       }
       if(typeof va==='string') return sortAsc?va.localeCompare(vb):vb.localeCompare(va);
@@ -710,9 +824,9 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
     if(!data.length){tbody.innerHTML='';$('provider-empty').style.display='block';return;}
     $('provider-empty').style.display='none';
 
-    var html='';
-    var nowSec = Math.floor(Date.now()/1000);
-    data.forEach(function(p){
+var html='';
+var nowSec = Math.floor(Date.now()/1000);
+data.forEach(function(p){
       var statusCls = p.status==='healthy'?'badge-healthy':p.status==='degraded'?'badge-degraded':'badge-unhealthy';
       var cbState = p.circuit_breaker_state||'closed';
       var cbCls = cbState==='closed'?'badge-closed':cbState==='open'?'badge-open':'badge-halfopen';
@@ -742,18 +856,22 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
         reasonHtml = '<span class="failure-reason failure-reason-none">—</span>';
       }
 
-      html+='<tr><td>'+esc(displayName)+'</td>'
-        +'<td><span class="badge '+statusCls+'">'+esc(p.status)+'</span></td>'
-        +'<td><span class="badge '+cbCls+'">'+esc(cbState)+'</span></td>'
-        +'<td>'+p.total_requests+'</td>'
-        +'<td>'+fmtPct(p.success_rate)+'</td>'
-        +'<td>'+fmtMs(p.avg_response_time_ms)+'</td>'
-        +'<td>'+fmtTokens(p.cache_read_tokens)+'</td>'
-        +'<td>'+fmtTokens(p.cache_creation_tokens)+'</td>'
-        +'<td>'+(p.cache_prompt_hit_rate!=null?fmtPct(p.cache_prompt_hit_rate):'—')+'</td>'
-        +'<td title="'+(p.cache_savings_cents||0)+' cents vs uncached baseline">'+fmtCost((p.cache_savings_cents||0)/100)+'</td>'
-        +'<td>'+fmtTime(p.last_success_timestamp)+'</td>'
-        +'<td>'+reasonHtml+'</td></tr>';
+html+='<tr><td>'+esc(displayName)+'</td>'
++'<td><span class="badge '+statusCls+'">'+esc(p.status)+'</span></td>'
++'<td><span class="badge '+cbCls+'">'+esc(cbState)+'</span></td>'
++'<td>'+p.total_requests+'</td>'
++'<td>'+fmtPct(p.success_rate)+'</td>'
++'<td>'+fmtMs(p.avg_response_time_ms)+'</td>'
++'<td>'+fmtTokens(p.cache_read_tokens)+'</td>'
++'<td>'+fmtTokens(p.cache_creation_tokens)+'</td>'
++'<td>'+(p.cache_prompt_hit_rate!=null?fmtPct(p.cache_prompt_hit_rate):'—')+'</td>'
++'<td title="'+(p.cache_savings_cents||0)+' cents vs uncached baseline">'+fmtCost((p.cache_savings_cents||0)/100)+'</td>'
++'<td>'+fmtTime(p.last_success_timestamp)+'</td>'
+ +'<td>'+budgetSpentHtml(p.budgetStatus)+'</td>'
+ +'<td>'+budgetRemainingHtml(p.budgetStatus)+'</td>'
+ +'<td>'+budgetResetsHtml(p.budgetStatus, nowSec)+'</td>'
+ +'<td>'+budgetStateHtml(p.budgetStatus)+'</td>'
++'<td>'+reasonHtml+'</td></tr>';
     });
     tbody.innerHTML=html;
   }
@@ -1033,12 +1151,13 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 
     try{ ws = new WebSocket(url); } catch(e){ scheduleReconnect(); return; }
 
-ws.onopen = function(){
-wsRetryCount=0;
-memEvents = [];
-memTimelineNamespaces = {};
-renderMemoryMetrics();
-$('conn-dot').classList.add('connected');
+ ws.onopen = function(){
+ wsRetryCount=0;
+ memEvents = [];
+ memTimelineNamespaces = {};
+ renderMemoryMetrics();
+ seedRequestRateChart();
+ $('conn-dot').classList.add('connected');
       $('conn-dot').title='WebSocket connected';
       $('conn-label').textContent='Connected';
     };
@@ -1046,12 +1165,12 @@ $('conn-dot').classList.add('connected');
     ws.onmessage = function(evt){
       try{
         var msg = JSON.parse(evt.data);
-        if(msg.type==='metrics'&&msg.data){
-          renderMetrics(msg.data);
-          renderProviders(msg.data.provider_health);
-          renderCircuitBreakers(msg.data.circuit_breaker_states);
-          renderCosts(msg.data.cost_by_provider, msg.data.cumulative_cost);
-        }
+if(msg.type==='metrics'&&msg.data){
+renderMetrics(msg.data);
+renderProviders(msg.data.provider_health, msg.data.budget_status_by_provider);
+renderCircuitBreakers(msg.data.circuit_breaker_states);
+renderCosts(msg.data.cost_by_provider, msg.data.cumulative_cost);
+}
         if(msg.type==='errors'&&msg.data){ renderErrors(msg.data); }
         if(msg.type==='compression'&&msg.data){ handleCompressionEvent(msg.data); handleToolCompressionEvent(msg.data); }
         if((msg.type==='memory_event'||msg.type==='memory')&&msg.data){ handleMemoryEvent(msg.data); }
@@ -1111,12 +1230,12 @@ $('conn-dot').classList.add('connected');
   function pollMetrics(){
     fetch(dashboardBasePath+'/metrics')
       .then(function(r){return r.json();})
-      .then(function(data){
-        renderMetrics(data);
-        renderProviders(data.provider_health);
-        renderCircuitBreakers(data.circuit_breaker_states);
-        renderCosts(data.cost_by_provider, data.cumulative_cost);
-      })
+.then(function(data){
+renderMetrics(data);
+renderProviders(data.provider_health, data.budget_status_by_provider);
+renderCircuitBreakers(data.circuit_breaker_states);
+renderCosts(data.cost_by_provider, data.cumulative_cost);
+})
       .catch(function(){/* silent */});
   }
 
@@ -1638,10 +1757,11 @@ adminJson('/ab-test/results').then(function(body){ $('sr-ab').textContent=JSON.s
 }
 
 // --- Init ---
-  initCharts();
-  initTcSavingsChart();
+initCharts();
+initTcSavingsChart();
 initMemoryCharts();
 renderCompression();
+seedRequestRateChart();
 loadMemorySnapshot().then(wsConnect);
   loadErrors();
   loadToolCompressionActivity();
