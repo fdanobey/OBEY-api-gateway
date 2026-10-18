@@ -279,6 +279,7 @@ pub fn dashboard_routes(state: AppState) -> Router<AppState> {
         .route("/memory/snapshot", get(memory_snapshot_handler))
         .route("/errors", get(errors_handler))
         .route("/logs", get(logs_handler))
+        .route("/rate-history", get(rate_history_handler))
         .route(
             "/tool-compression/config",
             get(tool_compression_config_handler),
@@ -540,6 +541,70 @@ async fn logs_handler(
 
 async fn errors_handler(State(state): State<AppState>) -> Response {
     Json(recent_errors(&state, 25)).into_response()
+}
+
+/// Number of trailing seconds covered by the rate-history endpoint; must
+/// match the dashboard's `MAX_POINTS` chart window.
+const RATE_HISTORY_WINDOW_SECONDS: i64 = 60;
+
+/// Per-second request count for one epoch second.
+#[derive(Debug, Serialize)]
+pub struct RateHistoryPoint {
+    pub epoch_second: i64,
+    pub count: u64,
+}
+
+/// Response body of `GET /dashboard/rate-history`.
+#[derive(Debug, Serialize)]
+pub struct RateHistoryResponse {
+    pub points: Vec<RateHistoryPoint>,
+    pub window_seconds: i64,
+}
+
+/// Seed data for the dashboard request-rate chart: requests in the trailing
+/// [`RATE_HISTORY_WINDOW_SECONDS`] window, bucketed per second from the logs
+/// database via a SQL `COUNT(*) GROUP BY` on the writer thread (no bodies
+/// materialized). Degrades to empty points when the logs database is
+/// unavailable, empty, or logging is disabled — never an error response.
+async fn rate_history_handler(State(state): State<AppState>) -> Response {
+    let cutoff = Utc::now() - chrono::Duration::seconds(RATE_HISTORY_WINDOW_SECONDS);
+    let logger = state.logger.clone();
+    let buckets =
+        match tokio::task::spawn_blocking(move || logger.count_by_second(cutoff.timestamp())).await
+        {
+            Ok(inner) => inner,
+            Err(join_error) => Err(crate::logger::LoggerError::Enqueue(join_error.to_string())),
+        };
+    rate_history_response(buckets)
+}
+
+/// Maps a (possibly failed) per-second bucket query to the rate-history
+/// response body. A failed query degrades to empty points: logs are
+/// observability-only and must never break the dashboard.
+fn rate_history_response<E: std::fmt::Display>(
+    buckets: std::result::Result<Vec<(i64, u64)>, E>,
+) -> Response {
+    let points = match buckets {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(epoch_second, count)| RateHistoryPoint {
+                epoch_second,
+                count,
+            })
+            .collect(),
+        Err(e) => {
+            // Logs are observability-only; a missing/unavailable database must
+            // not break the dashboard, so degrade to empty points.
+            tracing::warn!("Rate-history log query unavailable: {}", e);
+            Vec::new()
+        }
+    };
+
+    Json(RateHistoryResponse {
+        points,
+        window_seconds: RATE_HISTORY_WINDOW_SECONDS,
+    })
+    .into_response()
 }
 
 fn parse_datetime(s: &str) -> Option<DateTime<chrono::Utc>> {
@@ -997,9 +1062,9 @@ mod tests {
                 rate_limit_max_wait_ms: None,
                 max_connections: 10,
                 rate_limit_per_minute: 0,
-        custom_headers: Default::default(),
-        user_agent: None,
-        connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
+                custom_headers: Default::default(),
+                user_agent: None,
+                connection_pool: crate::config::ProviderConnectionPoolConfig::default(),
                 budget: None,
                 manual_models: vec![],
                 global_inference_profile: false,
@@ -1033,11 +1098,11 @@ mod tests {
                     structured_output_passthrough: None,
                     tier: None,
                     context_window: 0,
-specializations: vec![],
-cost_per_million_reasoning_tokens: None,
-reasoning_family: None,
-reasoning_parameter: None,
-}],
+                    specializations: vec![],
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
+                }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
             retry: RetryConfig::default(),
@@ -1060,9 +1125,9 @@ reasoning_parameter: None,
             memory: None,
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
-codex_search: None,
-reasoning_compat: Default::default(),
-}
+            codex_search: None,
+            reasoning_compat: Default::default(),
+        }
     }
 
     fn compression_stats(request_id: impl Into<String>) -> CompressionStats {
@@ -1274,6 +1339,27 @@ reasoning_compat: Default::default(),
         assert!(parse_datetime("").is_none());
     }
 
+    /// Finding D3: a failed per-second count query (logger writer gone,
+    /// database unavailable) must degrade to 200 with empty points, never a
+    /// 5xx — logs are observability-only.
+    #[tokio::test]
+    async fn rate_history_degrades_to_empty_points_on_query_error() {
+        let response = rate_history_response::<crate::logger::LoggerError>(Err(
+            crate::logger::LoggerError::Enqueue("request log writer stopped".to_owned()),
+        ));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["window_seconds"], 60);
+        assert_eq!(
+            json["points"].as_array().map(Vec::len),
+            Some(0),
+            "query failure must yield empty points: {json}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_dashboard_metrics_enriches_circuit_breaker_state() {
         let server = GatewayServer::new(test_config(), None).await.unwrap();
@@ -1348,21 +1434,21 @@ reasoning_compat: Default::default(),
                         timed_out: false,
                         error: false,
                     }),
-            memories_injected: 0,
-            memories_stored: 0,
-            injection_tokens: 0,
-            detected_project: None,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-            cache_savings_cents: None,
-            prefix_hash: None,
-            reasoning_tokens: None,
-            reasoning_compat_actions: None,
-            error_class: None,
-            context_reduction: None,
-        })
-        .unwrap();
-    }
+                    memories_injected: 0,
+                    memories_stored: 0,
+                    injection_tokens: 0,
+                    detected_project: None,
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                    cache_savings_cents: None,
+                    prefix_hash: None,
+                    reasoning_tokens: None,
+                    reasoning_compat_actions: None,
+                    error_class: None,
+                    context_reduction: None,
+                })
+                .unwrap();
+        }
 
         let response = server
             .build_router()
@@ -1414,16 +1500,16 @@ reasoning_compat: Default::default(),
                 memories_stored: 0,
                 injection_tokens: 0,
                 detected_project: None,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-            cache_savings_cents: None,
-            prefix_hash: None,
-            reasoning_tokens: None,
-            reasoning_compat_actions: None,
-            error_class: None,
-            context_reduction: None,
-        })
-        .unwrap();
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                cache_savings_cents: None,
+                prefix_hash: None,
+                reasoning_tokens: None,
+                reasoning_compat_actions: None,
+                error_class: None,
+                context_reduction: None,
+            })
+            .unwrap();
 
         let app = server.build_router();
         let response = app

@@ -30,12 +30,23 @@ providers:
   - name: "openai"
     type: "openai"
     base_url: "https://api.openai.com/v1"
-    api_key_env: "OPENAI_API_KEY"       # Env var name, not the key itself
+    api_key_env: "OPENAI_API_KEY" # Env var name, not the key itself
     timeout_seconds: 30
     max_connections: 100
-    rate_limit_per_minute: 60           # 0 = unlimited
+    rate_limit_per_minute: 60 # 0 = unlimited
+    # Persistent budget: when cumulative spend for this provider crosses
+    # limit_usd, requests skip it until the budget resets.
+    # reset_policy controls when spend resets to 0:
+    #   daily   - resets at the next UTC midnight
+    #   weekly  - resets at the next UTC Monday midnight
+    #   monthly - resets at the next UTC 1st of month
+    #   manual  - never resets automatically; clear it via the admin panel
+    #             (POST /admin/providers/openai/budget/reset). Default.
+    budget:
+      limit_usd: 50.0
+      reset_policy: manual # daily | weekly | monthly | manual
     # custom_headers:
-    #   X-Custom: "${MY_ENV_VAR}"
+    # X-Custom: "${MY_ENV_VAR}"
 
   - name: "ollama-local"
     type: "ollama"

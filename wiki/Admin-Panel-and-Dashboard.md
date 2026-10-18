@@ -107,6 +107,9 @@ Shows per-provider:
 - Average latency
 - Error rate
 - Request count
+- Budget columns (persistent budgets): spent USD, remaining USD, window badge (daily/weekly/monthly/manual) with a reset countdown, and an exhausted marker. All values are server-derived from `budget_status_by_provider` in the metrics snapshot — the JS renders only.
+
+The request-rate chart is seeded from `GET /dashboard/rate-history` (trailing-60s per-second buckets from the logs database) on page load and on WebSocket reconnect, then continues from live rolling-rate metrics snapshots.
 
 ### Log Viewer
 
@@ -154,13 +157,23 @@ curl -X POST http://localhost:8080/admin/config/import \
 ### Virtual Keys
 
 ```bash
-curl http://localhost:8080/admin/keys              # List
-curl -X POST http://localhost:8080/admin/keys      # Create
-curl http://localhost:8080/admin/keys/{id}         # Get
+curl http://localhost:8080/admin/keys # List
+curl -X POST http://localhost:8080/admin/keys # Create
+curl http://localhost:8080/admin/keys/{id} # Get
 curl -X PATCH http://localhost:8080/admin/keys/{id} # Update
-curl -X POST http://localhost:8080/admin/keys/{id}/revoke  # Revoke
-curl -X DELETE http://localhost:8080/admin/keys/{id}        # Delete
+curl -X POST http://localhost:8080/admin/keys/{id}/revoke # Revoke
+curl -X POST http://localhost:8080/admin/keys/{id}/reset # Reset spend/token counters (history preserved)
+curl -X DELETE http://localhost:8080/admin/keys/{id} # Delete
 ```
+
+### Provider Budgets
+
+```bash
+curl http://localhost:8080/admin/providers/{name}/budget # Limit, spent, remaining, window, next_reset, exhausted
+curl -X POST http://localhost:8080/admin/providers/{name}/budget/reset # Zero current-window spend, clear budget_skip
+```
+
+Providers declare budgets in config (`budget.limit_usd` + `budget.reset_policy: daily|weekly|monthly|manual`); spend persists across restarts in `budgets.db` and rolls over lazily at the same UTC boundaries as virtual-key budget windows.
 
 ### OAuth
 
@@ -173,9 +186,10 @@ curl -X POST http://localhost:8080/admin/oauth/openai/logout   # Logout
 ### Dashboard Data
 
 ```bash
-curl http://localhost:8080/dashboard/metrics   # Current metrics snapshot
-curl http://localhost:8080/dashboard/errors    # Recent errors
-curl "http://localhost:8080/dashboard/logs?limit=100&provider=openai"  # Filtered logs
+curl http://localhost:8080/dashboard/metrics # Current metrics snapshot
+curl http://localhost:8080/dashboard/errors # Recent errors
+curl "http://localhost:8080/dashboard/logs?limit=100&provider=openai" # Filtered logs
+curl http://localhost:8080/dashboard/rate-history # Trailing-60s per-second request buckets (seeds the request-rate chart)
 ```
 
 ### Memory

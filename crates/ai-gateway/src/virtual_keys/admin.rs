@@ -16,8 +16,9 @@
 //! | GET    | `/{id}`         | [`get_key`]          | 200     |
 //! | PATCH  | `/{id}`         | [`update_key`]       | 200     |
 //! | DELETE | `/{id}`         | [`delete_key`]       | 204     |
-//! | POST   | `/{id}/revoke`  | [`revoke_key`]       | 200     |
-//! | GET    | `/{id}/usage`   | [`query_usage`]      | 200     |
+//! | POST | `/{id}/revoke` | [`revoke_key`] | 200 |
+//! | GET | `/{id}/usage` | [`query_usage`] | 200 |
+//! | POST | `/{id}/reset` | [`reset_key_window`] | 200 |
 //!
 //! The router is state-complete (`Router` with no outstanding state): it owns an
 //! `Arc<VirtualKeyManager>` via [`Router::with_state`]. Task 13.1 nests it under
@@ -69,6 +70,7 @@ pub fn routes(manager: Arc<VirtualKeyManager>) -> Router {
         .route("/{id}", get(get_key).patch(update_key).delete(delete_key))
         .route("/{id}/revoke", post(revoke_key))
         .route("/{id}/usage", get(query_usage))
+        .route("/{id}/reset", post(reset_key_window))
         .with_state(manager)
 }
 
@@ -178,6 +180,50 @@ async fn query_usage(
 ) -> Result<Response, KeyError> {
     let aggregate = manager.query_usage(&id, params).await?;
     Ok((StatusCode::OK, Json(aggregate)).into_response())
+}
+
+/// `POST /{id}/reset` — reset the key's budget-window counters.
+///
+/// Zeroes `current_spend_usd` and `current_tokens_used` and advances
+/// `window_start` to now, transactionally in the key store. `request_count`,
+/// `last_used_at`, and all `virtual_key_usage` rows are preserved (history is
+/// never deleted). Returns HTTP 200 with the previous spend/token values;
+/// an unknown key id yields 404 via [`KeyError`].
+async fn reset_key_window(
+    State(manager): ManagerState,
+    Path(id): Path<String>,
+) -> Result<Response, KeyError> {
+    // Store access runs on the blocking pool (same discipline as the other
+    // store-touching operations): load the key (404 when unknown), reset the
+    // counters in one transaction, and report the previous values.
+    let store = std::sync::Arc::clone(&manager.store);
+    let key_id = id.clone();
+    let (key_hash, previous) = tokio::task::spawn_blocking(move || {
+        let stored = store
+            .get_key_by_id(&key_id)?
+            .ok_or_else(|| KeyError::NotFound(key_id.clone()))?;
+        let (previous_spend_usd, previous_tokens_used) =
+            store.reset_window_counters_with_previous(&key_id)?;
+        Ok::<_, KeyError>((stored.key_hash, (previous_spend_usd, previous_tokens_used)))
+    })
+    .await
+    .map_err(|e| KeyError::TaskFailed(e.to_string()))??;
+    // Drop the cached auth entry so the zeroed counters are enforced on the
+    // next request instead of served from the pre-reset snapshot.
+    manager.invalidate_cache(&key_hash);
+    let (previous_spend_usd, previous_tokens_used) = previous;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": id,
+            "reset": true,
+            "previous": {
+                "spend_usd": previous_spend_usd,
+                "tokens_used": previous_tokens_used,
+            },
+        })),
+    )
+        .into_response())
 }
 
 #[cfg(test)]
