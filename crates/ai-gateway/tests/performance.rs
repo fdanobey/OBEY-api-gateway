@@ -242,6 +242,7 @@ fn test_metrics() -> Arc<ai_gateway::metrics::Metrics> {
 
 fn build_router_from_fixture(fixture: &ProviderSelectionFixture) -> Router {
     let mut config = Config {
+        security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
@@ -651,6 +652,7 @@ async fn provider_order_matches_reference_policy_generated_scenarios() {
 /// Build a minimal valid Config for performance tests.
 fn test_config() -> Config {
     Config {
+        security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
@@ -1450,6 +1452,7 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
         .collect();
 
     let mut config = Config {
+        security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),

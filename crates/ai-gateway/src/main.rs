@@ -42,6 +42,8 @@ mod router;
 mod runtime_limits;
 mod secrets;
 #[allow(dead_code, unused_imports)]
+mod security;
+#[allow(dead_code, unused_imports)]
 mod smart_routing;
 #[allow(dead_code, unused_imports)]
 mod structured_output;

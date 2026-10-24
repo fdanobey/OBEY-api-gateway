@@ -10,6 +10,7 @@ use crate::memory::{MemoryConfig, ModelGroupMemoryOverride, ProviderMemoryOverri
 use crate::reasoning_compat::config::{ReasoningFamily, ReasoningParamShape};
 use crate::reasoning_compat::ReasoningCompatConfig;
 use crate::secrets;
+use crate::security::outbound_fetch::OutboundFetchConfig;
 use crate::smart_routing::config::SmartRoutingConfig;
 use crate::smart_routing::tier::{SmartRoutingTier, TaskType};
 use crate::structured_output::config::{StructuredOutputConfig, StructuredOutputOverride};
@@ -141,6 +142,11 @@ pub struct Config {
     /// [`crate::reasoning_compat`].
     #[serde(default)]
     pub reasoning_compat: ReasoningCompatConfig,
+    /// Security hardening (outbound-fetch SSRF guard, later components).
+    /// Absent section applies [`SecurityConfig::default`] (strictest caller
+    /// tier). See [`crate::security`].
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,6 +157,23 @@ pub struct TrayConfig {
     pub auto_open_browser: bool,
     #[serde(default = "default_splash_duration")]
     pub splash_duration_ms: u64,
+}
+
+/// `security:` configuration section root. Absent section applies defaults
+/// (strictest outbound-fetch rules); legacy YAML loads unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Outbound-fetch (SSRF) guard settings. See [`OutboundFetchConfig`].
+    pub outbound_fetch: OutboundFetchConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            outbound_fetch: OutboundFetchConfig::default(),
+        }
+    }
 }
 
 impl Default for TrayConfig {
@@ -253,7 +276,7 @@ pub struct TlsConfig {
 }
 
 /// Admin panel configuration
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AdminConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -261,6 +284,15 @@ pub struct AdminConfig {
     pub path: String,
     #[serde(default)]
     pub auth: AdminAuthConfig,
+    /// Migration marker (Req 1.10). None means the configuration predates the
+    /// security-hardening spec; resolution then depends on the `auth` section's
+    /// YAML presence (see `auth_section_present`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_mode: Option<AdminSecurityMode>,
+    /// True when the loaded YAML contained an explicit `admin.auth` section.
+    /// Populated by the custom deserializer below; never serialized.
+    #[serde(skip)]
+    pub auth_section_present: bool,
 }
 
 impl Default for AdminConfig {
@@ -269,12 +301,92 @@ impl Default for AdminConfig {
             enabled: true,
             path: "/admin".to_string(),
             auth: AdminAuthConfig::default(),
+            security_mode: None,
+            auth_section_present: false,
         }
+    }
+}
+
+/// Custom deserializer recording whether the `auth` section was explicitly present.
+impl<'de> Deserialize<'de> for AdminConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawAdminConfig {
+            #[serde(default = "default_true")]
+            enabled: bool,
+            #[serde(default = "default_admin_path")]
+            path: String,
+            #[serde(default)]
+            auth: AuthSection,
+            #[serde(default)]
+            security_mode: Option<AdminSecurityMode>,
+        }
+
+        let raw = RawAdminConfig::deserialize(deserializer)?;
+        Ok(AdminConfig {
+            enabled: raw.enabled,
+            path: raw.path,
+            auth: raw.auth.config,
+            security_mode: raw.security_mode,
+            auth_section_present: raw.auth.present,
+        })
+    }
+}
+
+/// Wrapper distinguishing "no `auth` key in YAML" from "key present but
+/// null/empty". Field deserialization only runs when the key exists in the
+/// map, so any parse here (including null → default config) marks the
+/// section present; `Default` (missing key) marks it absent.
+#[derive(Default)]
+struct AuthSection {
+    present: bool,
+    config: AdminAuthConfig,
+}
+
+impl<'de> Deserialize<'de> for AuthSection {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let config = Option::<AdminAuthConfig>::deserialize(deserializer)?.unwrap_or_default();
+        Ok(AuthSection {
+            present: true,
+            config,
+        })
     }
 }
 
 fn default_admin_path() -> String {
     "/admin".to_string()
+}
+
+/// Resolved admin security posture (spec: black-october-security-hardening, Req 1).
+///
+/// The mode is derived at config load by `admin::auth_policy::resolve_admin_security_mode`
+/// and drives middleware enforcement plus startup/UI warnings. `security_mode` in YAML
+/// is an explicit migration marker written by the admin config save path (Req 1.10);
+/// its absence means the configuration predates this spec (legacy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdminSecurityMode {
+    /// Basic auth required for all admin/dashboard access.
+    Authenticated,
+    /// Admin open without credentials; binding is loopback only.
+    LoopbackOpen,
+    /// Legacy config (no `admin.auth` section): behavior preserved, loudly warned.
+    OpenWarnedLegacy,
+    /// Explicit operator opt-in to unauthenticated non-loopback access (Req 1.4).
+    OpenOptIn,
+}
+
+impl AdminSecurityMode {
+    /// Kebab-case wire label mirroring the serde representation used by
+    /// the config schema and the `/admin/security-status` payload.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            AdminSecurityMode::Authenticated => "authenticated",
+            AdminSecurityMode::LoopbackOpen => "loopback-open",
+            AdminSecurityMode::OpenWarnedLegacy => "open-warned-legacy",
+            AdminSecurityMode::OpenOptIn => "open-opt-in",
+        }
+    }
 }
 
 /// Admin authentication configuration
@@ -284,6 +396,10 @@ pub struct AdminAuthConfig {
     pub enabled: bool,
     pub username_env: Option<String>,
     pub password_env: Option<String>,
+    /// Explicit operator acknowledgment exposing admin without credentials on a
+    /// non-loopback bind (Req 1.4). Default false; startup/UI warnings accompany it.
+    #[serde(default)]
+    pub allow_unauthenticated_non_loopback: bool,
 }
 
 impl Default for AdminAuthConfig {
@@ -292,6 +408,7 @@ impl Default for AdminAuthConfig {
             enabled: false,
             username_env: None,
             password_env: None,
+            allow_unauthenticated_non_loopback: false,
         }
     }
 }
@@ -360,21 +477,30 @@ pub struct CorsConfig {
     pub allowed_methods: Vec<String>,
     #[serde(default = "default_allowed_headers")]
     pub allowed_headers: Vec<String>,
+    /// Allow credentialed cross-origin requests
+    /// (`Access-Control-Allow-Credentials: true`).
+    /// Rejected at validation when combined with wildcard origins
+    /// (black-october-security-hardening, Req 4.2).
+    #[serde(default)]
+    pub allow_credentials: bool,
 }
 
 impl Default for CorsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            allowed_origins: vec!["*".to_string()],
+            allowed_origins: default_allowed_origins(),
             allowed_methods: vec!["GET".to_string(), "POST".to_string(), "OPTIONS".to_string()],
             allowed_headers: vec!["Content-Type".to_string(), "Authorization".to_string()],
+            allow_credentials: false,
         }
     }
 }
 
 fn default_allowed_origins() -> Vec<String> {
-    vec!["*".to_string()]
+    // SECURITY (black-october-security-hardening, Req 4.1): empty default —
+    // no CORS headers are emitted when no origins are configured.
+    Vec::new()
 }
 
 fn default_allowed_methods() -> Vec<String> {
@@ -1512,8 +1638,7 @@ model_groups:
 
     #[test]
     fn test_streaming_config_relay_reasoning_progress_false_round_trips() {
-        let cfg: StreamingConfig =
-            serde_yaml::from_str("relay_reasoning_progress: false").unwrap();
+        let cfg: StreamingConfig = serde_yaml::from_str("relay_reasoning_progress: false").unwrap();
         assert!(!cfg.relay_reasoning_progress);
         let serialized = serde_yaml::to_string(&cfg).unwrap();
         assert!(serialized.contains("relay_reasoning_progress: false"));
@@ -2253,6 +2378,7 @@ mod runtime_resolution_tests {
             enabled: true,
             username_env: Some("ADMIN_USER".to_string()),
             password_env: Some("ADMIN_PASS".to_string()),
+            allow_unauthenticated_non_loopback: false,
         };
 
         assert_eq!(auth.resolve_username(), Some("admin".to_string()));
@@ -2260,5 +2386,83 @@ mod runtime_resolution_tests {
 
         env::remove_var("ADMIN_USER");
         env::remove_var("ADMIN_PASS");
+    }
+}
+
+#[cfg(test)]
+mod admin_security_config_tests {
+    use super::*;
+
+    // black-october-security-hardening, Task 1: AdminSecurityMode + auth-section
+    // presence detection.
+    // **Validates: Requirements 1.1, 1.2, 1.4**
+
+    #[test]
+    fn test_admin_auth_section_present_when_key_exists() {
+        let admin: AdminConfig = serde_yaml::from_str("auth:\n  enabled: true\n").unwrap();
+        assert!(admin.auth_section_present);
+        assert!(admin.auth.enabled);
+
+        // Present but null still counts as an explicit section.
+        let admin: AdminConfig = serde_yaml::from_str("auth:\n").unwrap();
+        assert!(admin.auth_section_present);
+        assert_eq!(admin.auth, AdminAuthConfig::default());
+    }
+
+    #[test]
+    fn test_admin_auth_section_absent_when_key_missing() {
+        let admin: AdminConfig = serde_yaml::from_str("enabled: true\n").unwrap();
+        assert!(!admin.auth_section_present);
+        assert_eq!(admin.auth, AdminAuthConfig::default());
+
+        // Whole section absent.
+        let admin: AdminConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(!admin.auth_section_present);
+
+        // Programmatic construction is never marked present.
+        let admin = AdminConfig::default();
+        assert!(!admin.auth_section_present);
+    }
+
+    #[test]
+    fn test_admin_security_mode_parses_all_kebab_case_variants() {
+        for (yaml_value, expected) in [
+            ("authenticated", AdminSecurityMode::Authenticated),
+            ("loopback-open", AdminSecurityMode::LoopbackOpen),
+            ("open-warned-legacy", AdminSecurityMode::OpenWarnedLegacy),
+            ("open-opt-in", AdminSecurityMode::OpenOptIn),
+        ] {
+            let admin: AdminConfig =
+                serde_yaml::from_str(&format!("security_mode: {yaml_value}\n")).unwrap();
+            assert_eq!(admin.security_mode, Some(expected));
+
+            // Round-trip through serialization preserves the kebab-case tag.
+            let serialized = serde_yaml::to_string(&admin).unwrap();
+            assert!(serialized.contains(yaml_value));
+        }
+    }
+
+    #[test]
+    fn test_admin_config_defaults_are_legacy() {
+        let admin = AdminConfig::default();
+        assert_eq!(admin.security_mode, None);
+        assert!(!admin.auth_section_present);
+
+        let parsed: AdminConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(parsed.security_mode, None);
+        assert!(!parsed.auth_section_present);
+    }
+
+    #[test]
+    fn test_admin_allow_unauthenticated_non_loopback_defaults_and_parses() {
+        // Absent section/field → false.
+        let admin: AdminConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(!admin.auth.allow_unauthenticated_non_loopback);
+
+        // Explicit true parses.
+        let admin: AdminConfig =
+            serde_yaml::from_str("auth:\n  allow_unauthenticated_non_loopback: true\n").unwrap();
+        assert!(admin.auth.allow_unauthenticated_non_loopback);
+        assert!(admin.auth_section_present);
     }
 }

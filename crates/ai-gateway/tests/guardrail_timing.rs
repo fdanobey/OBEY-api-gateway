@@ -100,7 +100,14 @@ fn build_regex_engine() -> ai_gateway::guardrail::GuardrailEngine {
         ..Default::default()
     };
 
-    build_engine(&config, &Client::new(), None, None).expect("engine builds")
+    build_engine(
+        &config,
+        &Client::new(),
+        None,
+        None,
+        &ai_gateway::config::SecurityConfig::default().outbound_fetch,
+    )
+    .expect("engine builds")
 }
 
 /// Build a chat request whose user message content is at least `target_bytes`

@@ -348,12 +348,10 @@ async fn admin_config_get_put_round_trips_and_hot_applies_context_policy() {
     }
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("config.yaml");
-    std::fs::write(&config_path, serde_yaml::to_string(&overflow_config(
-        "route_larger_context",
-        &small,
-        &large,
-    ))
-    .unwrap())
+    std::fs::write(
+        &config_path,
+        serde_yaml::to_string(&overflow_config("route_larger_context", &small, &large)).unwrap(),
+    )
     .unwrap();
     let server = GatewayServer::new(
         overflow_config("route_larger_context", &small, &large),
@@ -401,7 +399,11 @@ async fn admin_config_get_put_round_trips_and_hot_applies_context_policy() {
     let put_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap();
-    assert_eq!(status, StatusCode::OK, "PUT /admin/config applies: {put_body:?}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "PUT /admin/config applies: {put_body:?}"
+    );
 
     // The live state now rejects: an overflowing request 413s immediately
     // (previously route_larger_context would have skipped to `large`).
@@ -431,9 +433,12 @@ async fn route_larger_context_exhaustion_returns_413_with_largest_window() {
             .mount(upstream)
             .await;
     }
-    let server = GatewayServer::new(overflow_config("route_larger_context", &small, &large), None)
-        .await
-        .unwrap();
+    let server = GatewayServer::new(
+        overflow_config("route_larger_context", &small, &large),
+        None,
+    )
+    .await
+    .unwrap();
 
     // ~58k tokens: over the small budget (7168) AND the large budget
     // (32768-1638=31130), so every candidate is gate-skipped.

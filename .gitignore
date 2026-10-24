@@ -2,9 +2,6 @@
 /target
 /release
 
-# Cargo lock (library crate — regenerated on build)
-Cargo.lock
-
 # Runtime databases
 *.db
 *.db-shm

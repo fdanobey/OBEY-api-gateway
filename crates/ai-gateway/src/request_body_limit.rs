@@ -109,11 +109,12 @@ mod tests {
     fn minimal_config() -> Config {
         // Mirrors the minimal_config in gateway::mod::tests but kept local to
         // avoid depending on private test helpers.
-    Config {
-        cache_aware_routing: Default::default(),
-        server: ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: 3000,
+        Config {
+            security: Default::default(),
+            cache_aware_routing: Default::default(),
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 3000,
                 request_timeout_seconds: 30,
                 max_request_size_mb: 10,
             },
@@ -141,9 +142,9 @@ mod tests {
                 rate_limit_max_wait_ms: None,
                 max_connections: 10,
                 rate_limit_per_minute: 0,
-        custom_headers: Default::default(),
-        user_agent: None,
-        connection_pool: ProviderConnectionPoolConfig::default(),
+                custom_headers: Default::default(),
+                user_agent: None,
+                connection_pool: ProviderConnectionPoolConfig::default(),
                 memory: None,
                 budget: None,
                 manual_models: vec![],
@@ -164,24 +165,24 @@ mod tests {
                 memory: None,
                 compression: None,
                 structured_output: None,
-            models: vec![ProviderModel {
-                provider: "test".to_string(),
-                model: "gpt-4".to_string(),
-                cost_per_million_input_tokens: 0.0,
-                cost_per_million_output_tokens: 0.0,
-                cache_support: None,
-                cache_min_tokens: None,
-                cost_per_million_cache_read_input_tokens: None,
-                cost_per_million_cache_creation_input_tokens: None,
-                priority: 100,
+                models: vec![ProviderModel {
+                    provider: "test".to_string(),
+                    model: "gpt-4".to_string(),
+                    cost_per_million_input_tokens: 0.0,
+                    cost_per_million_output_tokens: 0.0,
+                    cache_support: None,
+                    cache_min_tokens: None,
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    priority: 100,
                     structured_output_passthrough: None,
                     tier: None,
                     context_window: 0,
-specializations: vec![],
-cost_per_million_reasoning_tokens: None,
-reasoning_family: None,
-reasoning_parameter: None,
-}],
+                    specializations: vec![],
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
+                }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
             retry: RetryConfig::default(),
@@ -203,9 +204,9 @@ reasoning_parameter: None,
             smart_routing: Default::default(),
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
-codex_search: None,
-reasoning_compat: Default::default(),
-}
+            codex_search: None,
+            reasoning_compat: Default::default(),
+        }
     }
 
     fn config_with_size_limit(max_mb: u64) -> Config {

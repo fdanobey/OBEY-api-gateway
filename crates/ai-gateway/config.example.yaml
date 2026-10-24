@@ -160,11 +160,21 @@ dashboard:
   path: "/dashboard"
   metrics_update_interval_seconds: 1
 
+# CORS — SECURITY MIGRATION (black-october-security-hardening, Req 4):
+# The default `allowed_origins` is now EMPTY: when no origins are listed, the
+# gateway emits no CORS headers (same-origin only). The previous default was
+# ["*"], which let any website call a localhost/LAN gateway from a browser
+# (the OpenCode localhost-attack class). To keep serving cross-origin browser
+# clients, list trusted origins explicitly, e.g. ["http://localhost:3000"].
+# Wildcard "*" is still allowed ONLY without Authorization in allowed_headers
+# and with allow_credentials false; wildcard + Authorization/credentials is
+# rejected at config validation with an actionable error.
 cors:
   enabled: false
-  allowed_origins: ["*"]
+  # allowed_origins: []  # default: empty = no CORS headers
   allowed_methods: ["GET", "POST", "OPTIONS"]
   allowed_headers: ["Content-Type", "Authorization"]
+  allow_credentials: false
 
 # Token compression is opt-in. Provider/model-group `compression` blocks override
 # these defaults field-by-field; `level: none` explicitly disables auto-trigger.

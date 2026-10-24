@@ -118,6 +118,7 @@ pub struct OnnxAssetManager {
     install_lock: Arc<Mutex<()>>,
     files: Arc<Vec<ManagedFile>>,
     runtime: RuntimeArchive,
+    outbound: crate::security::outbound_fetch::OutboundFetchConfig,
 }
 
 impl std::fmt::Debug for OnnxAssetManager {
@@ -132,17 +133,21 @@ impl std::fmt::Debug for OnnxAssetManager {
 
 impl OnnxAssetManager {
     pub fn new() -> Result<Self, OnnxAssetError> {
+        Self::with_outbound_config(Default::default())
+    }
+
+    /// Constructor carrying the live outbound-fetch (SSRF) guard settings:
+    /// every download URL is validated before a request is sent and the
+    /// HTTP client re-validates each redirect hop (Req 2.1).
+    pub fn with_outbound_config(
+        outbound: crate::security::outbound_fetch::OutboundFetchConfig,
+    ) -> Result<Self, OnnxAssetError> {
         let client = reqwest::Client::builder()
             .timeout(DOWNLOAD_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.url().scheme() != "https" {
-                    attempt.stop()
-                } else if attempt.previous().len() > 10 {
-                    attempt.error("too many asset redirects")
-                } else {
-                    attempt.follow()
-                }
-            }))
+            .redirect(crate::security::outbound_fetch::guarded_redirect_policy(
+                outbound.clone(),
+                Arc::new(crate::security::outbound_fetch::std_resolve_host),
+            ))
             .build()
             .map_err(|error| OnnxAssetError::Download {
                 asset: "HTTP client".to_owned(),
@@ -153,6 +158,7 @@ impl OnnxAssetManager {
             install_lock: Arc::new(Mutex::new(())),
             files: Arc::new(production_files()),
             runtime: production_runtime()?,
+            outbound,
         })
     }
 
@@ -184,6 +190,16 @@ impl OnnxAssetManager {
         Ok(model_parent(model_path)
             .join(RUNTIME_DIRECTORY)
             .join(runtime_library_file_name()))
+    }
+
+    /// Outbound-fetch validation status for a prospective download URL.
+    /// Exposed for tests and admin diagnostics; performs no network I/O
+    /// for literal-IP hosts.
+    pub fn outbound_guard_status(
+        &self,
+        url: &str,
+    ) -> Result<(), crate::security::outbound_fetch::OutboundFetchError> {
+        self.guard_outbound_url(url)
     }
 
     pub async fn status(&self, model_path: &Path) -> Result<OnnxAssetStatus, OnnxAssetError> {
@@ -258,8 +274,26 @@ impl OnnxAssetManager {
             match inspect_file(&destination, Some(asset.exact_size)).await? {
                 FileState::Valid => skipped.push(asset.name.to_owned()),
                 FileState::Missing | FileState::Invalid => {
-                    self.download_file(asset, &destination).await?;
-                    installed.push(asset.name.to_owned());
+                    // Outbound-fetch guard (Req 2.1): assets are optional, so
+                    // a rejected download target degrades gracefully — warn
+                    // (host + reason only, never the URL) and leave the asset
+                    // un-downloaded for `status` to report as missing.
+                    match self.guard_outbound_url(&asset.url) {
+                        Ok(()) => {
+                            self.download_file(asset, &destination).await?;
+                            installed.push(asset.name.to_owned());
+                        }
+                        Err(error) => {
+                            let (host, reason) = error.host_and_reason();
+                            tracing::warn!(
+                                target: "security::outbound_fetch",
+                                asset = asset.name,
+                                host = %host,
+                                reason = %reason,
+                                "ONNX asset download skipped: outbound-fetch guard rejected host"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -270,8 +304,23 @@ impl OnnxAssetManager {
         match inspect_file(&runtime_path, None).await? {
             FileState::Valid => skipped.push("runtime".to_owned()),
             FileState::Missing | FileState::Invalid => {
-                self.install_runtime(&parent).await?;
-                installed.push("runtime".to_owned());
+                let runtime_guard = self.guard_outbound_url(&self.runtime.url);
+                match runtime_guard {
+                    Ok(()) => {
+                        self.install_runtime(&parent).await?;
+                        installed.push("runtime".to_owned());
+                    }
+                    Err(error) => {
+                        let (host, reason) = error.host_and_reason();
+                        tracing::warn!(
+                            target: "security::outbound_fetch",
+                            asset = self.runtime.name,
+                            host = %host,
+                            reason = %reason,
+                            "ONNX runtime download skipped: outbound-fetch guard rejected host"
+                        );
+                    }
+                }
             }
         }
 
@@ -283,11 +332,46 @@ impl OnnxAssetManager {
         })
     }
 
+    /// Validate a download URL against the configured outbound-fetch
+    /// (SSRF) rules. Pure checks + injected production resolver; rejection
+    /// carries the host string only — never the credential-bearing URL.
+    fn guard_outbound_url(
+        &self,
+        url: &str,
+    ) -> Result<(), crate::security::outbound_fetch::OutboundFetchError> {
+        let parsed = reqwest::Url::parse(url).map_err(|_| {
+            crate::security::outbound_fetch::OutboundFetchError::UnresolvableHost {
+                host: url.to_owned(),
+            }
+        })?;
+        crate::security::outbound_fetch::validate_outbound_url(
+            &parsed,
+            &self.outbound,
+            &crate::security::outbound_fetch::std_resolve_host,
+        )
+    }
+
     async fn download_file(
         &self,
         asset: &ManagedFile,
         destination: &Path,
     ) -> Result<(), OnnxAssetError> {
+        self.guard_outbound_url(&asset.url).map_err(|error| {
+            let (host, reason) = error.host_and_reason();
+            tracing::warn!(
+                target: "security::outbound_fetch",
+                asset = asset.name,
+                host = %host,
+                reason = %reason,
+                "ONNX asset download rejected by outbound-fetch guard"
+            );
+            OnnxAssetError::Download {
+                asset: asset.name.to_owned(),
+                message: crate::security::outbound_fetch::outbound_fetch_rejection_warning(
+                    host, &reason,
+                ),
+            }
+        })?;
         self.download_to_file(
             asset.name,
             &asset.url,
@@ -814,5 +898,81 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    fn strict_outbound() -> crate::security::outbound_fetch::OutboundFetchConfig {
+        crate::security::outbound_fetch::OutboundFetchConfig::default()
+    }
+
+    fn permissive_outbound() -> crate::security::outbound_fetch::OutboundFetchConfig {
+        crate::security::outbound_fetch::OutboundFetchConfig {
+            caller: crate::security::outbound_fetch::CallerFetchConfig {
+                allow_private_hosts: true,
+                allow_http: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Literal link-local (cloud metadata) target: rejected under the strict
+    /// default config without any DNS or network I/O. https scheme isolates
+    /// the forbidden-address class as the rejection reason.
+    #[test]
+    fn outbound_guard_rejects_metadata_literal() {
+        let manager = OnnxAssetManager::with_outbound_config(strict_outbound()).unwrap();
+        let error = manager
+            .outbound_guard_status("https://169.254.169.254/latest/meta-data")
+            .expect_err("metadata literal must be rejected");
+        let (host, reason) = error.host_and_reason();
+        assert_eq!(host, "169.254.169.254");
+        assert!(reason.contains("link-local"), "unexpected reason: {reason}");
+    }
+
+    /// Positive flip: `allow_private_hosts = true` permits the same target.
+    #[test]
+    fn outbound_guard_allows_private_when_configured() {
+        let manager = OnnxAssetManager::with_outbound_config(permissive_outbound()).unwrap();
+        assert!(manager
+            .outbound_guard_status("http://169.254.169.254/latest/meta-data")
+            .is_ok());
+    }
+
+    /// Graceful degradation: an install whose download targets are rejected
+    /// must not panic or error — it completes with nothing installed and
+    /// `status` reports the assets as missing. Uses a manager whose manifest
+    /// points at a forbidden literal-IP host so no network is touched.
+    #[tokio::test]
+    async fn install_skips_downloads_when_guard_rejects() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = directory.path().join("model.onnx");
+        let mut manager = OnnxAssetManager::with_outbound_config(strict_outbound()).unwrap();
+        // Rewrite the manifest to forbidden literal-IP targets: validation
+        // rejects before any socket is opened.
+        manager.files = Arc::new(
+            production_files()
+                .into_iter()
+                .map(|mut file| {
+                    file.url = "http://127.0.0.1/forbidden".to_owned();
+                    file
+                })
+                .collect(),
+        );
+        manager.runtime.url = "http://127.0.0.1/forbidden".to_owned();
+
+        let result = manager
+            .install(&model)
+            .await
+            .expect("install degrades gracefully");
+        assert!(result.installed.is_empty(), "nothing may be installed");
+        assert!(result.skipped.is_empty());
+        assert!(!result.status.ready);
+        assert_eq!(
+            result.status.missing_assets,
+            ["model", "external_data", "tokenizer", "runtime"]
+        );
+        assert!(
+            !model.exists(),
+            "no file may be created for a rejected download"
+        );
     }
 }

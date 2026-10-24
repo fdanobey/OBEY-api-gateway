@@ -512,17 +512,19 @@ Notes:
 
 ### CORS
 
-Disabled by default. Enable it when browsers call the gateway directly:
+Disabled by default — when enabled with an empty origin list, the gateway emits **no CORS headers at all**. Enable it when browsers call the gateway directly:
 
 ```yaml
 cors:
   enabled: true
-  allowed_origins: ["https://app.example.com"]   # Default: ["*"]
+  allowed_origins: ["https://app.example.com"] # Explicit origins required
   allowed_methods: ["GET", "POST", "OPTIONS"]
   allowed_headers: ["Content-Type", "Authorization"]
 ```
 
-The `["*"]` origin default is convenient for local development but means any site can call the gateway from a user's browser. Since the gateway holds your provider keys, set an explicit origin allowlist before exposing it beyond localhost, and prefer [virtual keys](#virtual-key-management) over your real provider keys for browser-facing traffic.
+> **Migration note (wildcard CORS):** the default is no CORS headers. Earlier releases defaulted `allowed_origins` to `["*"]`, which meant any website could read gateway responses from a user's browser. If you relied on that, list your explicit origins as shown above. Wildcard origins combined with `Authorization` header exposure or `allow_credentials` are now rejected at config validation with an actionable error.
+
+Since the gateway holds your provider keys, keep an explicit origin allowlist before exposing it beyond localhost, and prefer [virtual keys](#virtual-key-management) over your real provider keys for browser-facing traffic.
 
 ### Environment Variables
 
@@ -1637,6 +1639,42 @@ Builds must be clean — zero errors and zero warnings:
 cargo check -p ai-gateway --all-targets
 cargo clippy -p ai-gateway
 ```
+
+## Security
+
+### Secrets: use the encrypted key store, not environment variables
+
+Environment variables are convenient for initial setup but are the weakest place to keep long-lived provider keys — they leak into `docker inspect`, crash dumps, platform dashboards, and child processes. The gateway's encrypted key store encrypts provider keys at rest with a machine-local master key and is the recommended storage once you move past a first deployment.
+
+The master key lives in the data directory, so mount a persistent volume on `AI_GATEWAY_DATA_DIR` when running in containers — otherwise the master key is regenerated on every redeploy and previously saved `api_key_encrypted` values can no longer be decrypted:
+
+```bash
+docker run -d \
+  -v ai-gateway-data:/data \
+  ... # rest of the docker run command from Quick Start
+```
+
+On ephemeral platforms (Railway, Zeabur, and similar), the volume note in [Quick Start](#quick-start) covers the same requirement. Plain env vars (`OPENAI_API_KEY`, etc.) remain supported and never touch the encrypted store — fine for trying things out, not what you want holding your production keys.
+
+### Firewall guidance for non-loopback binds
+
+When the gateway binds a non-loopback address (LAN deployments, `0.0.0.0`, container ports), the admin panel and dashboard become reachable from every machine that can reach the gateway. The gateway warns loudly at startup and in the UI, but a warning is not a boundary — put one up:
+
+- Prefer `admin.security_mode: authenticated` (Basic auth via `admin.auth.username_env`/`password_env`) or explicit `admin.auth` credentials whenever the bind is not loopback-only.
+- If the panel must stay open on a trusted LAN, `admin.security_mode: open-opt-in` records that as a deliberate choice; `open-warned-legacy` is what an old config without an `admin.auth` section resolves to.
+- Check `GET /admin/security-status` for the currently resolved mode (`{mode, unauthenticated_non_loopback}`).
+- At the network layer, restrict the gateway port (default 8080) to the hosts that legitimately need `/v1`, and keep admin/dashboard unreachable from untrusted segments — a firewall rule beats a warning.
+
+### Supply-chain checks
+
+CI runs [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) on every pull request (see [`deny.toml`](deny.toml)) checking RustSec advisories, duplicate/denied crates, license allowlist, and dependency sources against the committed `Cargo.lock`. For the same advisory coverage locally:
+
+```bash
+cargo install cargo-audit
+cargo audit
+```
+
+A test (`tests/supply_chain.rs`) asserts `Cargo.lock` stays committed and non-empty so the gates always check the exact resolved dependency set.
 
 ## Contributing
 

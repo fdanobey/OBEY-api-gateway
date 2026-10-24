@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Json, Path, Query, Request, State},
+    extract::{Json, Path, Query, RawQuery, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 
-use crate::config::{load_and_validate_config, save_config, Config};
+use crate::config::{load_and_validate_config, save_config, AdminSecurityMode, Config};
 use crate::gateway::apply_runtime_config_update;
 use crate::gateway::AppState;
 use crate::models::openai::{Message, OpenAIRequest};
@@ -21,6 +21,7 @@ use crate::smart_routing::ab_test::{ABTestAnalysisConfig, ABTestManager};
 use crate::smart_routing::config::{ABTestConfig, SmartRoutingConfig};
 use crate::smart_routing::{PinnedRoutingContext, SmartRouter, SmartRoutingInput};
 
+pub mod auth_policy;
 pub mod tool_compression;
 
 /// Embedded admin panel static assets (Req 13.17, 13.18, 1.3).
@@ -94,7 +95,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .nest("/tool-compression", tool_compression::routes())
         .nest("/smart-routing", smart_routing_api)
         .nest_service("/keys", virtual_keys_api)
-        .route("/providers/models", get(proxy_provider_models))
+        .route("/providers/models", post(proxy_provider_models))
         .route("/providers/{name}/budget", get(get_provider_budget))
         .route(
             "/providers/{name}/budget/reset",
@@ -109,32 +110,38 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/metrics/reset-active", post(reset_active_requests))
         .route("/circuit-breaker/states", get(get_circuit_breaker_states))
         .route("/circuit-breaker/reset", post(reset_circuit_breakers))
+        .route("/security-status", get(security_status_handler))
         .route("/", get(index_handler))
         .route("/{*path}", get(static_handler))
         .route_layer(middleware::from_fn_with_state(state, admin_auth_middleware))
 }
 
-/// HTTP Basic Authentication middleware for admin panel (Req 35.1-35.7).
+/// HTTP Basic Authentication middleware for admin panel (Req 35.1-35.7;
+/// spec black-october-security-hardening, Req 1).
 ///
-/// When `admin.auth.enabled` is true, requires valid Basic credentials.
-/// When disabled (default, Req 35.7), passes all requests through.
+/// The security posture is resolved per request from the current Config via
+/// `auth_policy::resolve_admin_security_mode` (pure function of config).
+/// `Authenticated` → existing Basic-auth path (constant-time comparison
+/// retained); `LoopbackOpen`/`OpenWarnedLegacy`/`OpenOptIn` → pass-through.
 /// Returns 401 with WWW-Authenticate header on invalid credentials (Req 35.4).
-/// Uses constant-time comparison to prevent timing attacks.
-async fn admin_auth_middleware(
+pub(crate) async fn admin_auth_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
     let config = state.config.read().await;
-    let auth_config = &config.admin.auth;
 
-    // Req 35.5, 35.7: when auth is disabled, allow unrestricted access
-    if !auth_config.enabled {
+    // Spec Req 1: resolve the security mode; only `Authenticated` enforces
+    // credentials. Every other mode passes through (bind-address-based
+    // decision — `server.host`, no ConnectInfo plumbing).
+    let mode = auth_policy::resolve_admin_security_mode(&config);
+    if mode != AdminSecurityMode::Authenticated {
         drop(config);
         return next.run(request).await;
     }
 
     // Resolve expected credentials from env vars (Req 35.6)
+    let auth_config = &config.admin.auth;
     let expected_username = match auth_config.username_env.as_ref() {
         Some(env_var) => match std::env::var(env_var) {
             Ok(val) => val,
@@ -319,43 +326,30 @@ fn mime_from_path(path: &str) -> &'static str {
 
 /// Redact sensitive fields from a Config before returning it to the client.
 ///
-/// For encrypted keys: Returns null in api_key_env (frontend shows "encrypted" status)
-/// For env var references: Resolves the actual value from the environment and returns it
-///                         in api_key_env so the frontend can display and re-save it
-/// For plaintext keys: Returns the plaintext value directly
+/// Key material is never returned (Req 3.2): encrypted keys, plaintext keys,
+/// and resolved values are all stripped. Env var references (e.g.
+/// `OPENAI_API_KEY`) are kept verbatim so the frontend can display and
+/// re-save the reference — the name is not a secret. Status booleans
+/// (`api_key_status`, `api_key_configured`) are the only key information
+/// exposed besides the env var name.
 fn redact_config_for_response(config: &Config) -> serde_json::Value {
     let mut body = serde_json::to_value(config).unwrap_or(json!({"error": "serialization failed"}));
 
     if let Some(providers) = body.get_mut("providers").and_then(|v| v.as_array_mut()) {
         for (provider_json, provider) in providers.iter_mut().zip(config.providers.iter()) {
             if let Some(obj) = provider_json.as_object_mut() {
-                // Handle api_key_env - resolve env var references to their actual values
-                // so the frontend can display and re-save them (which triggers encryption)
-                let resolved_key_value = if provider.has_encrypted_api_key() {
-                    // Already encrypted - don't show anything in the textbox
-                    // Frontend will show "encrypted" status
-                    None
-                } else if let Some(value) = provider.api_key_env.as_deref() {
-                    if secrets::is_env_var_reference(value) {
-                        // This is an env var name like OPENAI_API_KEY - resolve it
-                        std::env::var(value).ok().or_else(|| {
-                            // If env var not found, check if there's a resolved_api_key from startup
-                            provider.resolved_api_key.clone()
-                        })
-                    } else if secrets::looks_like_plaintext_secret(value) {
-                        // Already a plaintext secret - return as-is
-                        Some(value.to_string())
-                    } else {
-                        // Neither - treat as potentially invalid, return as-is
-                        Some(value.to_string())
-                    }
-                } else {
-                    None
-                };
-
+                // Env var references are safe to echo back (they are just names);
+                // encrypted or plaintext key material is replaced with null.
+                let visible_key_env = provider
+                    .api_key_env
+                    .as_deref()
+                    .filter(|_| !provider.has_encrypted_api_key())
+                    .and_then(|value| {
+                        (!secrets::looks_like_plaintext_secret(value)).then(|| value.to_string())
+                    });
                 obj.insert(
                     "api_key_env".to_string(),
-                    resolved_key_value
+                    visible_key_env
                         .map(serde_json::Value::String)
                         .unwrap_or(serde_json::Value::Null),
                 );
@@ -369,30 +363,40 @@ fn redact_config_for_response(config: &Config) -> serde_json::Value {
                     serde_json::Value::Bool(provider.has_api_key_configured()),
                 );
 
-                // Handle api_secret_env - resolve env var references to their actual values
-                let resolved_secret_value = if provider.has_encrypted_api_secret() {
-                    // Already encrypted - don't show anything in the textbox
-                    None
-                } else if let Some(value) = provider.api_secret_env.as_deref() {
-                    if secrets::is_env_var_reference(value) {
-                        // This is an env var name - resolve it
-                        std::env::var(value)
-                            .ok()
-                            .or_else(|| provider.resolved_api_secret.clone())
-                    } else if secrets::looks_like_plaintext_secret(value) {
-                        // Already a plaintext secret - return as-is
-                        Some(value.to_string())
-                    } else {
-                        // Neither - treat as potentially invalid, return as-is
-                        Some(value.to_string())
+                // Custom header values may carry credentials (Authorization/Bearer
+                // values, plaintext secrets, ${ENV} references). Redact the VALUE,
+                // keep the header name so the frontend can still display the pair.
+                if let Some(headers) = obj
+                    .get_mut("custom_headers")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    for (name, value) in headers.iter_mut() {
+                        let Some(text) = value.as_str() else { continue };
+                        let lower_name = name.to_ascii_lowercase();
+                        let lower_value = text.to_ascii_lowercase();
+                        let credential_bearing = lower_name.contains("authorization")
+                            || lower_name.contains("x-api-key")
+                            || lower_value.contains("authorization")
+                            || lower_value.contains("bearer")
+                            || lower_value.contains("x-api-key")
+                            || secrets::looks_like_plaintext_secret(text)
+                            || text.contains("${");
+                        if credential_bearing {
+                            *value = serde_json::Value::String("[configured]".to_string());
+                        }
                     }
-                } else {
-                    None
-                };
+                }
 
+                let visible_secret_env = provider
+                    .api_secret_env
+                    .as_deref()
+                    .filter(|_| !provider.has_encrypted_api_secret())
+                    .and_then(|value| {
+                        (!secrets::looks_like_plaintext_secret(value)).then(|| value.to_string())
+                    });
                 obj.insert(
                     "api_secret_env".to_string(),
-                    resolved_secret_value
+                    visible_secret_env
                         .map(serde_json::Value::String)
                         .unwrap_or(serde_json::Value::Null),
                 );
@@ -413,22 +417,73 @@ fn redact_config_for_response(config: &Config) -> serde_json::Value {
         .get_mut("smart_routing")
         .and_then(|v| v.as_object_mut())
     {
-        let jev_configured = config
-            .smart_routing
-            .jev
-            .as_ref()
-            .is_some_and(|jev| jev.has_api_key_configured());
-        if let Some(jev) = smart_routing.get_mut("jev").and_then(|v| v.as_object_mut()) {
-            jev.remove("api_key");
-            jev.remove("api_key_encrypted");
-            jev.insert(
-                "api_key_configured".to_string(),
-                serde_json::Value::Bool(jev_configured),
-            );
-        }
+        redact_jev_credentials(smart_routing, config.smart_routing.jev.as_ref());
+        redact_laya_credentials(smart_routing, config.smart_routing.laya.as_ref());
     }
 
     body
+}
+
+/// Strip Jev classifier credentials from a serialized `smart_routing` object,
+/// leaving only the `api_key_configured` status and, when the configured
+/// value is an env var reference, the env var name itself.
+fn redact_jev_credentials(
+    smart_routing: &mut serde_json::Map<String, serde_json::Value>,
+    jev_config: Option<&crate::smart_routing::config::JevConfig>,
+) {
+    let Some(jev) = smart_routing.get_mut("jev").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    let configured = jev_config.is_some_and(|jev| jev.has_api_key_configured());
+    let visible_env = jev_config
+        .and_then(|jev| jev.api_key_env.as_deref())
+        .and_then(|value| {
+            (!secrets::looks_like_plaintext_secret(value)).then(|| value.to_string())
+        });
+    jev.remove("api_key");
+    jev.remove("api_key_encrypted");
+    jev.insert(
+        "api_key_env".to_string(),
+        visible_env
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    jev.insert(
+        "api_key_configured".to_string(),
+        serde_json::Value::Bool(configured),
+    );
+}
+
+/// Strip Laya classifier credentials the same way as
+/// [`redact_jev_credentials`].
+fn redact_laya_credentials(
+    smart_routing: &mut serde_json::Map<String, serde_json::Value>,
+    laya_config: Option<&crate::smart_routing::config::LayaConfig>,
+) {
+    let Some(laya) = smart_routing
+        .get_mut("laya")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+    let configured = laya_config.is_some_and(|laya| laya.has_api_key_configured());
+    let visible_env = laya_config
+        .and_then(|laya| laya.api_key_env.as_deref())
+        .and_then(|value| {
+            (!secrets::looks_like_plaintext_secret(value)).then(|| value.to_string())
+        });
+    laya.remove("api_key");
+    laya.remove("api_key_encrypted");
+    laya.insert(
+        "api_key_env".to_string(),
+        visible_env
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    laya.insert(
+        "api_key_configured".to_string(),
+        serde_json::Value::Bool(configured),
+    );
 }
 
 fn provider_key_status(provider: &crate::config::Provider) -> &'static str {
@@ -773,18 +828,9 @@ async fn get_smart_routing_config(State(state): State<AppState>) -> Response {
     let config = state.config.read().await;
     let mut body = serde_json::to_value(config.smart_routing.clone())
         .unwrap_or_else(|_| serde_json::json!({}));
-    let jev_configured = config
-        .smart_routing
-        .jev
-        .as_ref()
-        .is_some_and(|jev| jev.has_api_key_configured());
-    if let Some(jev) = body.get_mut("jev").and_then(|v| v.as_object_mut()) {
-        jev.remove("api_key");
-        jev.remove("api_key_encrypted");
-        jev.insert(
-            "api_key_configured".to_string(),
-            serde_json::Value::Bool(jev_configured),
-        );
+    if let Some(smart_routing) = body.as_object_mut() {
+        redact_jev_credentials(smart_routing, config.smart_routing.jev.as_ref());
+        redact_laya_credentials(smart_routing, config.smart_routing.laya.as_ref());
     }
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -815,11 +861,14 @@ async fn update_smart_routing_config(
     }
     if let Err(errors) = candidate.validate() {
         return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":{"type":"validation_error","details":errors.iter().map(ToString::to_string).collect::<Vec<_>>()}})),
-        )
-            .into_response();
+ StatusCode::BAD_REQUEST,
+ Json(json!({"error":{"type":"validation_error","details":errors.iter().map(ToString::to_string).collect::<Vec<_>>()}})),
+ )
+ .into_response();
     }
+    // Stamp the resolved security mode (Req 1.10): every save path persists
+    // the migrated marker so the on-disk YAML no longer reads as legacy.
+    candidate.admin.security_mode = Some(auth_policy::resolve_admin_security_mode(&candidate));
     if let Err(error) = save_config(state.config_path.as_ref(), &candidate) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1182,21 +1231,22 @@ async fn get_config(State(state): State<AppState>) -> Response {
 async fn update_config(State(state): State<AppState>, Json(new_config): Json<Config>) -> Response {
     let current_config = state.config.read().await.clone();
 
-    let normalized_config = match normalize_config_for_storage(new_config, Some(&current_config)) {
-        Ok(config) => config,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": error,
-                        "type": "encryption_error"
-                    }
-                })),
-            )
-                .into_response();
-        }
-    };
+    let mut normalized_config =
+        match normalize_config_for_storage(new_config, Some(&current_config)) {
+            Ok(config) => config,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "message": error,
+                            "type": "encryption_error"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     // Validate first
     if let Err(errors) = normalized_config.validate() {
@@ -1213,6 +1263,11 @@ async fn update_config(State(state): State<AppState>, Json(new_config): Json<Con
         )
             .into_response();
     }
+
+    // Stamp the resolved security mode (Req 1.10): every save path persists
+    // the migrated marker so the on-disk YAML no longer reads as legacy.
+    normalized_config.admin.security_mode =
+        Some(auth_policy::resolve_admin_security_mode(&normalized_config));
 
     let config_path = state.config_path.as_ref();
     if let Err(e) = save_config(config_path, &normalized_config) {
@@ -1352,6 +1407,33 @@ async fn get_circuit_breaker_states(State(state): State<AppState>) -> Response {
         .map(|(key, st)| json!({ "provider": key, "state": st }))
         .collect();
     (StatusCode::OK, Json(json!({ "states": entries }))).into_response()
+}
+
+/// GET /admin/security-status — current admin security posture for the
+/// admin/dashboard warning banner (spec: black-october-security-hardening,
+/// Req 1.7, 1.9).
+///
+/// Reports the resolved [`AdminSecurityMode`] (kebab-case) and whether the
+/// panel is currently serving unauthenticated on a non-loopback bind
+/// (`OpenWarnedLegacy`/`OpenOptIn`). Deliberately credential-free: only the
+/// mode label and the exposure boolean — no usernames, env-var names, or
+/// other credential material. The endpoint itself sits behind
+/// `admin_auth_middleware` like every other admin route.
+async fn security_status_handler(State(state): State<AppState>) -> Response {
+    let config = state.config.read().await;
+    let mode = auth_policy::resolve_admin_security_mode(&config);
+    let unauthenticated_non_loopback = matches!(
+        mode,
+        AdminSecurityMode::OpenWarnedLegacy | AdminSecurityMode::OpenOptIn
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "mode": mode.wire_name(),
+            "unauthenticated_non_loopback": unauthenticated_non_loopback,
+        })),
+    )
+        .into_response()
 }
 
 /// POST /admin/circuit-breaker/reset ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â reset circuit breaker(s).
@@ -1659,10 +1741,19 @@ fn unknown_provider(name: &str) -> crate::error::GatewayError {
 /// Tests end-to-end connectivity for a Codex provider by issuing a minimal
 /// chat completion request. Response bodies never include access tokens,
 /// refresh tokens, or chatgpt-account-id (Req 11.6, 12.2).
+///
+/// Security (spec black-october-security-hardening, Req 2.1/3.1): credential
+/// query params are rejected 400 before any outbound work, and the Codex
+/// dispatch target is validated by the caller-tier outbound-fetch guard.
 async fn test_connection(
     State(state): State<AppState>,
+    RawQuery(query): RawQuery,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    if let Some(response) = reject_credential_query_params(query.as_deref().unwrap_or("")) {
+        return response;
+    }
+
     // Extract provider_name from body
     let provider_name = match body.get("provider_name").and_then(|v| v.as_str()) {
         Some(name) => name.to_string(),
@@ -1760,7 +1851,14 @@ async fn test_connection(
     };
 
     // Build CodexProviderClient and dispatch
-    let http = reqwest::Client::new();
+    let outbound_fetch_config = state.config.read().await.security.outbound_fetch.clone();
+    let http = reqwest::Client::builder()
+        .redirect(crate::security::outbound_fetch::guarded_redirect_policy(
+            outbound_fetch_config,
+            std::sync::Arc::new(crate::security::outbound_fetch::std_resolve_host),
+        ))
+        .build()
+        .unwrap_or_default();
     let codex_client = crate::codex::client::CodexProviderClient::new(
         provider_name.clone(),
         oauth,
@@ -1774,6 +1872,31 @@ async fn test_connection(
         state.config.read().await.xhigh_models_allowlist.clone(),
         state.config.read().await.reasoning_models_allowlist.clone(),
     );
+
+    // Caller-tier SSRF guard on the Codex dispatch target (override or the
+    // built-in default base URL). Rejection carries host+reason only; an
+    // unparseable target fails closed with the same 400 shape instead of
+    // silently skipping the guard.
+    {
+        let outbound_fetch_config = state.config.read().await.security.outbound_fetch.clone();
+        let target = match reqwest::Url::parse(codex_client.base_url()) {
+            Ok(url) => url,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid base_url" })),
+                )
+                    .into_response()
+            }
+        };
+        if let Err(error) = crate::security::outbound_fetch::validate_outbound_url(
+            &target,
+            &outbound_fetch_config,
+            &crate::security::outbound_fetch::std_resolve_host,
+        ) {
+            return outbound_guard_rejection(&error);
+        }
+    }
 
     let start = std::time::Instant::now();
     use crate::providers::ProviderClient;
@@ -2036,16 +2159,75 @@ async fn oauth_logout(State(state): State<AppState>) -> Response {
     (StatusCode::OK, Json(json!({ "status": "logged_out" }))).into_response()
 }
 
-/// Query parameters for the provider models proxy endpoint.
+/// Credential-in-URL defense (spec black-october-security-hardening, Req 3.1):
+/// reject any admin request carrying `api_key`/`api_key_env` as a query
+/// parameter before any outbound work. Returns the 400 response to emit.
+fn reject_credential_query_params(query: &str) -> Option<Response> {
+    let mut carries_credential = false;
+    for pair in query.split('&') {
+        let key = pair.split('=').next().unwrap_or("");
+        // Percent-decoding is unnecessary for the key name: both `api_key`
+        // and `api_key_env` contain no characters that URL-encoding alters.
+        if key == "api_key" || key == "api_key_env" {
+            carries_credential = true;
+            break;
+        }
+    }
+    carries_credential.then(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "api_key must be supplied in the JSON request body, never as a query parameter"
+            })),
+        )
+            .into_response()
+    })
+}
+
+/// Normalize a provider base URL the same way the router does for real
+/// dispatch traffic: strip trailing '/' and ensure a '/v1' suffix. Returns
+/// the normalized URL plus its scheme://host:port origin for host matching.
+fn normalize_provider_base_url(raw: &str) -> (String, Option<String>) {
+    let base = raw.trim_end_matches('/');
+    let base = if base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{}/v1", base)
+    };
+    // Origin extraction mirrors router.rs base-URL handling: reqwest::Url
+    // parses, then scheme+host(+port when explicit and non-default) form the
+    // origin. Scheme-default ports (https:443, http:80) normalize away so
+    // `https://host` == `https://host:443`.
+    let origin = reqwest::Url::parse(&base).ok().map(|url| {
+        let mut origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
+        let default_port = match url.scheme() {
+            "https" => Some(443),
+            "http" => Some(80),
+            _ => None,
+        };
+        if url.port().is_some_and(|port| Some(port) != default_port) {
+            origin.push_str(&format!(":{}", url.port().unwrap()));
+        }
+        origin
+    });
+    (base, origin)
+}
+
+/// JSON body for `POST /admin/providers/models` (spec
+/// black-october-security-hardening, Req 2.3/3.1). Unknown fields ignored.
 #[derive(serde::Deserialize)]
 struct ProxyModelsParams {
     /// The provider's base URL (e.g. `https://api.openai.com/v1` or a Mantle endpoint).
     base_url: String,
-    /// Optional Bearer token / API key for the upstream provider.
+    /// Optional Bearer token / API key for the upstream provider. Query
+    /// parameters carrying this value are rejected 400 (credential-in-URL
+    /// defense); body transport only.
     #[serde(default)]
-    api_key: String,
-    /// Optional provider name ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â when api_key is empty, the backend will look up
-    /// the resolved (decrypted) key from the live config for this provider.
+    api_key: Option<String>,
+    /// Optional provider name — when api_key is absent, the backend resolves
+    /// the (decrypted) key from the live config for this provider, and only
+    /// if the request's base_url host matches the provider's configured
+    /// base_url host.
     #[serde(default)]
     provider_name: Option<String>,
     /// Optional provider type. NVIDIA NIM uses its built-in fallback when live
@@ -2054,80 +2236,142 @@ struct ProxyModelsParams {
     provider_type: Option<String>,
 }
 
+/// Admin-safe 400 for outbound-fetch guard rejections: host + reason only,
+/// never the credential-bearing URL (Req 2.5).
+fn outbound_guard_rejection(
+    error: &crate::security::outbound_fetch::OutboundFetchError,
+) -> Response {
+    let (host, reason) = error.host_and_reason();
+    // Requester identity for the audit trail: no authenticated username or
+    // remote address is plumbed into this handler, so fall back to a short
+    // generated request id (never a credential-bearing value).
+    let request_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+    tracing::warn!(
+    route = "/admin/providers/models",
+    request_id = %request_id,
+    host = %host,
+    reason = %reason,
+    "outbound fetch rejected by caller-tier guard"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": format!("outbound fetch to host {:?} rejected: {}", host, reason)
+        })),
+    )
+        .into_response()
+}
+
 /// Proxy endpoint that fetches `/v1/models` from an upstream provider server-side,
 /// avoiding browser CORS restrictions.
 ///
-/// `GET /admin/providers/models?base_url=...&api_key=...&provider_name=...`
+/// `POST /admin/providers/models` with JSON body
+/// `{ base_url, api_key?, provider_name?, provider_type? }`.
+///
+/// Security (spec black-october-security-hardening, Req 2.1/2.3/3.1):
+/// - `api_key`/`api_key_env` in the query string → 400 before any outbound work;
+/// - caller-tier outbound-fetch guard validates `base_url` (SSRF defense);
+/// - credentials are forwarded only when the target host matches the named
+///   provider's configured base_url host.
 async fn proxy_provider_models(
     State(state): State<AppState>,
-    Query(params): Query<ProxyModelsParams>,
+    RawQuery(query): RawQuery,
+    Json(params): Json<ProxyModelsParams>,
 ) -> Response {
-    let base = params.base_url.trim_end_matches('/');
-    let models_url = if base.ends_with("/v1") || base.ends_with("/v1/") {
-        format!("{}/models", base.trim_end_matches('/'))
-    } else {
-        format!("{}/v1/models", base)
-    };
+    if let Some(response) = reject_credential_query_params(query.as_deref().unwrap_or("")) {
+        return response;
+    }
 
-    // Resolve the effective API key: use the provided key, or fall back to the
-    // decrypted key stored in the live config for the named provider. For
-    // OAuth-based providers (auth_method: oauth), return the static Codex model
-    // hints directly ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â the Codex OAuth token is not scoped for api.openai.com/v1/models.
-    let effective_api_key = if !params.api_key.is_empty() {
-        params.api_key.clone()
-    } else if let Some(ref name) = params.provider_name {
-        let config = state.config.read().await;
-        let provider = config.providers.iter().find(|p| &p.name == name);
-        match provider {
-            Some(p) if p.auth_method.as_deref() == Some("oauth") => {
-                // OAuth/Codex provider ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â use dynamic model discovery with
-                // caching and staleness fallback.
-                drop(config);
-                let (mut models_response, is_stale) =
-                    state.codex_models_discovery.get_models().await;
-                if is_stale {
-                    if let Some(obj) = models_response.as_object_mut() {
-                        obj.insert("stale".to_string(), serde_json::json!(true));
-                        obj.insert(
-                            "stale_reason".to_string(),
-                            serde_json::json!(
-                                "Could not fetch latest models from OpenAI. List may be outdated."
-                            ),
-                        );
-                    }
-                }
-                return (StatusCode::OK, Json(models_response)).into_response();
+    let (base, request_origin) = normalize_provider_base_url(&params.base_url);
+    let models_url = format!("{}/models", base);
+
+    let config = state.config.read().await;
+    let outbound_fetch_config = config.security.outbound_fetch.clone();
+    let provider = params
+        .provider_name
+        .as_ref()
+        .and_then(|name| config.providers.iter().find(|p| &p.name == name));
+    let provider_oauth = provider.is_some_and(|p| p.auth_method.as_deref() == Some("oauth"));
+    let provider_key = provider.map(|p| p.resolve_api_key().unwrap_or_default());
+    let provider_origin = provider
+        .and_then(|p| p.base_url.as_deref())
+        .and_then(|url| normalize_provider_base_url(url).1);
+    let effective_custom_headers = provider
+        .map(|p| p.effective_custom_headers())
+        .unwrap_or_default();
+    drop(config);
+
+    // OAuth providers never take the outbound path: the Codex OAuth token is
+    // not scoped for api.openai.com/v1/models, so dynamic model discovery
+    // with caching and staleness fallback serves the list instead.
+    if provider_oauth {
+        let (mut models_response, is_stale) = state.codex_models_discovery.get_models().await;
+        if is_stale {
+            if let Some(obj) = models_response.as_object_mut() {
+                obj.insert("stale".to_string(), serde_json::json!(true));
+                obj.insert(
+                    "stale_reason".to_string(),
+                    serde_json::json!(
+                        "Could not fetch latest models from OpenAI. List may be outdated."
+                    ),
+                );
             }
-            Some(p) => p.resolve_api_key().unwrap_or_default(),
-            None => String::new(),
         }
-    } else {
-        String::new()
+        return (StatusCode::OK, Json(models_response)).into_response();
+    }
+
+    // Caller-tier SSRF guard: validate before any outbound work. Rejection
+    // carries the host and reason only — never the credential-bearing URL.
+    let guard_target = match reqwest::Url::parse(&models_url) {
+        Ok(url) => url,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid base_url" })),
+            )
+                .into_response()
+        }
+    };
+    if let Err(error) = crate::security::outbound_fetch::validate_outbound_url(
+        &guard_target,
+        &outbound_fetch_config,
+        &crate::security::outbound_fetch::std_resolve_host,
+    ) {
+        return outbound_guard_rejection(&error);
+    }
+
+    // Credential forwarding (Req 2.3): the body key or the named provider's
+    // resolved key is attached only when the request targets that provider's
+    // own configured base_url host. Cross-host targets receive no
+    // Authorization header at all.
+    let credential_matches_host = provider_origin
+        .as_ref()
+        .is_some_and(|origin| Some(origin) == request_origin.as_ref());
+    let effective_api_key = match (&params.api_key, credential_matches_host) {
+        (Some(key), true) if !key.is_empty() => key.clone(),
+        (None, true) => provider_key.unwrap_or_default(),
+        _ => String::new(),
     };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .redirect(crate::security::outbound_fetch::guarded_redirect_policy(
+            outbound_fetch_config.clone(),
+            std::sync::Arc::new(crate::security::outbound_fetch::std_resolve_host),
+        ))
         .build()
         .unwrap_or_default();
-
-    // Apply the provider's custom headers / user agent (when the provider is
-    // resolvable by name) so discovery requests reach upstream with the same
-    // headers real traffic would send. Some providers reject model-list calls
-    // that lack a required header or user agent.
-    let mut effective_custom_headers = std::collections::HashMap::new();
-    if let Some(ref name) = params.provider_name {
-        let config = state.config.read().await;
-        if let Some(p) = config.providers.iter().find(|p| &p.name == name) {
-            effective_custom_headers = p.effective_custom_headers();
-        }
-    }
 
     let mut req = client.get(&models_url);
     if !effective_api_key.is_empty() {
         req = req.header("Authorization", format!("Bearer {}", effective_api_key));
     }
-    for (name, value) in &effective_custom_headers {
-        req = req.header(name.as_str(), value.as_str());
+    // Provider custom headers may carry ${ENV} secrets; forward them only
+    // to the provider's own host (same gate as the Authorization header).
+    if credential_matches_host {
+        for (name, value) in &effective_custom_headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
     }
 
     match req.send().await {
@@ -2191,7 +2435,7 @@ async fn proxy_provider_models(
                         .into_response()
                 }
                 Err(error) => (
-                    StatusCode::BAD_GATEWAY,
+                    StatusCode::BAD_REQUEST,
                     Json(
                         json!({ "error": format!("Failed to read upstream response: {}", error) }),
                     ),
@@ -2369,6 +2613,7 @@ mod tests {
                 let server = server.clone();
                 let provider = provider.clone();
                 arb_model_group(pname).prop_map(move |group| Config {
+                    security: Default::default(),
                     cache_aware_routing: Default::default(),
                     server: server.clone(),
                     tls: None,
@@ -2408,36 +2653,41 @@ mod tests {
     // Feature: ai-gateway, Property 35: Configuration Export-Import Round-Trip
     // **Validates: Requirements 32.1, 32.2, 32.4, 32.5, 32.7**
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
+           #![proptest_config(ProptestConfig::with_cases(64))]
 
-        #[test]
-        fn prop_config_export_import_round_trip(config in arb_config()) {
-            // Export: serialize to YAML (Req 32.1, 32.2)
-            let yaml = serde_yaml::to_string(&config)
-                .expect("Config should serialize to YAML");
+           #[test]
+           fn prop_config_export_import_round_trip(config in arb_config()) {
+               // Export: serialize to YAML (Req 32.1, 32.2)
+               let yaml = serde_yaml::to_string(&config)
+                   .expect("Config should serialize to YAML");
 
-            // Import: deserialize from YAML (Req 32.4, 32.5)
-            let imported: Config = serde_yaml::from_str(&yaml)
-                .expect("Exported YAML should deserialize back");
+               // Import: deserialize from YAML (Req 32.4, 32.5)
+               let imported: Config = serde_yaml::from_str(&yaml)
+                   .expect("Exported YAML should deserialize back");
 
-            // Round-trip equivalence
-            prop_assert_eq!(&config.server, &imported.server, "server mismatch");
-            prop_assert_eq!(config.providers.len(), imported.providers.len(), "providers count mismatch");
-            prop_assert_eq!(&config.providers[0].name, &imported.providers[0].name);
-            prop_assert_eq!(&config.providers[0].api_key_env, &imported.providers[0].api_key_env,
-                "Env var references must be preserved (Req 32.7)");
-            prop_assert_eq!(&config.providers[0].api_secret_env, &imported.providers[0].api_secret_env,
-                "Env var references must be preserved (Req 32.7)");
-            prop_assert_eq!(config.model_groups.len(), imported.model_groups.len(), "model_groups count mismatch");
-            prop_assert_eq!(&config.model_groups[0].name, &imported.model_groups[0].name);
-            prop_assert_eq!(config.model_groups[0].version_fallback_enabled, imported.model_groups[0].version_fallback_enabled);
-            prop_assert_eq!(config.model_groups[0].models.len(), imported.model_groups[0].models.len());
-            prop_assert_eq!(&config.circuit_breaker, &imported.circuit_breaker);
-            prop_assert_eq!(&config.retry, &imported.retry);
-            prop_assert_eq!(&config.admin, &imported.admin);
-            prop_assert_eq!(&config.cors, &imported.cors);
-        }
-    }
+               // Round-trip equivalence
+               prop_assert_eq!(&config.server, &imported.server, "server mismatch");
+               prop_assert_eq!(config.providers.len(), imported.providers.len(), "providers count mismatch");
+               prop_assert_eq!(&config.providers[0].name, &imported.providers[0].name);
+               prop_assert_eq!(&config.providers[0].api_key_env, &imported.providers[0].api_key_env,
+                   "Env var references must be preserved (Req 32.7)");
+               prop_assert_eq!(&config.providers[0].api_secret_env, &imported.providers[0].api_secret_env,
+                   "Env var references must be preserved (Req 32.7)");
+               prop_assert_eq!(config.model_groups.len(), imported.model_groups.len(), "model_groups count mismatch");
+               prop_assert_eq!(&config.model_groups[0].name, &imported.model_groups[0].name);
+               prop_assert_eq!(config.model_groups[0].version_fallback_enabled, imported.model_groups[0].version_fallback_enabled);
+               prop_assert_eq!(config.model_groups[0].models.len(), imported.model_groups[0].models.len());
+    prop_assert_eq!(&config.circuit_breaker, &imported.circuit_breaker);
+    prop_assert_eq!(&config.retry, &imported.retry);
+    // `auth_section_present` is a load-time derivation (never serialized);
+    // a round-trip legitimately sets it because the exported YAML always
+    // contains an explicit `auth:` section. Normalize before comparing.
+    let mut expected_admin = config.admin.clone();
+    expected_admin.auth_section_present = imported.admin.auth_section_present;
+    prop_assert_eq!(&expected_admin, &imported.admin);
+    prop_assert_eq!(&config.cors, &imported.cors);
+           }
+       }
 
     #[test]
     fn test_mime_from_path() {
@@ -2687,6 +2937,87 @@ retry:
             .contains("sk-jev-literal-secret"));
     }
 
+    /// Req 3.2 (black-october-security-hardening): the config GET response must
+    /// never contain resolved key material. An env var reference is echoed back
+    /// by name only; the env var's value, a startup-resolved key, and plaintext
+    /// typed into the key field must all stay out of the response.
+    #[test]
+    fn test_redact_config_for_response_never_resolves_key_values() {
+        let mut config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
+        let env_name = "ADMIN_REDACT_UNIT_TEST_KEY";
+        std::env::set_var(env_name, "sk-env-resolved-dummy-value-2468");
+        config.providers[0].api_key_env = Some(env_name.to_string());
+        config.providers[0].api_key_encrypted = None;
+        config.providers[0].resolved_api_key = Some("sk-startup-resolved-dummy-1357".to_string());
+
+        let redacted = redact_config_for_response(&config);
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !serialized.contains("sk-env-resolved-dummy-value-2468"),
+            "GET response leaked the resolved env var value: {serialized}"
+        );
+        assert!(
+            !serialized.contains("sk-startup-resolved-dummy-1357"),
+            "GET response leaked the startup-resolved key: {serialized}"
+        );
+        assert_eq!(redacted["providers"][0]["api_key_env"], env_name);
+        assert_eq!(redacted["providers"][0]["api_key_status"], "environment");
+        assert_eq!(redacted["providers"][0]["api_key_configured"], true);
+        std::env::remove_var(env_name);
+
+        // Plaintext sitting in the key field must be replaced with null.
+        config.providers[0].api_key_env = Some("sk-plain-in-field-dummy-987654321".to_string());
+        config.providers[0].resolved_api_key = None;
+        let redacted = redact_config_for_response(&config);
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !serialized.contains("sk-plain-in-field-dummy-987654321"),
+            "GET response leaked plaintext key: {serialized}"
+        );
+        assert!(redacted["providers"][0]["api_key_env"].is_null());
+        assert_eq!(redacted["providers"][0]["api_key_status"], "plaintext");
+    }
+
+    /// JEV classifier parity for Req 3.2: a plaintext value sitting in the
+    /// classifier's env field must not serialize; only the configured status
+    /// comes back.
+    #[test]
+    fn test_redact_config_for_response_hides_plaintext_in_jev_env_field() {
+        let mut config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
+        config.smart_routing.jev = Some({
+            let mut jev = crate::smart_routing::config::JevConfig::default();
+            jev.api_key_env = Some("sk-jev-env-field-plain-dummy-123".to_string());
+            jev
+        });
+        config.smart_routing.laya = Some({
+            let mut laya = crate::smart_routing::config::LayaConfig::default();
+            laya.api_key_env = Some("sk-laya-env-field-plain-dummy-456".to_string());
+            laya
+        });
+
+        let redacted = redact_config_for_response(&config);
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !serialized.contains("sk-jev-env-field-plain-dummy-123"),
+            "GET response leaked JEV key: {serialized}"
+        );
+        assert!(
+            !serialized.contains("sk-laya-env-field-plain-dummy-456"),
+            "GET response leaked Laya key: {serialized}"
+        );
+        for classifier in ["jev", "laya"] {
+            let section = &redacted["smart_routing"][classifier];
+            assert!(section["api_key_env"].is_null(), "{classifier}");
+            assert_eq!(section["api_key_configured"], true, "{classifier}");
+        }
+    }
+
     #[test]
     fn test_normalize_smart_routing_credentials_encrypts_literal_key() {
         let mut smart_routing = crate::smart_routing::config::SmartRoutingConfig::default();
@@ -2798,6 +3129,125 @@ retry:
         );
     }
 
+    /// Req 3.2 end-to-end: GET /admin/config with a provider whose api_key_env
+    /// resolves to a real environment value must return only the env var name
+    /// and status flags — never the value itself.
+    #[tokio::test]
+    async fn admin_config_get_never_returns_resolved_key_values() {
+        let env_name = "ADMIN_REDACT_E2E_TEST_KEY";
+        std::env::set_var(env_name, "sk-e2e-resolved-dummy-value-2468x");
+        let mut config = test_config_with_auth(false);
+        config.providers[0].api_key_env = Some(env_name.to_string());
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+
+        let request = axum::http::Request::get("/admin/config")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(server.build_router(), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !text.contains("sk-e2e-resolved-dummy-value-2468x"),
+            "GET /admin/config leaked resolved key material: {text}"
+        );
+        let json: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(json["providers"][0]["api_key_env"], env_name);
+        assert_eq!(json["providers"][0]["api_key_status"], "environment");
+        assert_eq!(json["providers"][0]["api_key_configured"], true);
+        std::env::remove_var(env_name);
+    }
+
+    /// PUT merge regression (Req 3.2): a GET → PUT round trip where the key
+    /// field is blank must preserve the stored encrypted key, both in the live
+    /// config and in the YAML file on disk.
+    #[tokio::test]
+    async fn admin_config_put_round_trip_preserves_stored_encrypted_key() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "obey-admin-key-preserve-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.yaml");
+        let mut initial = test_config_with_auth(false);
+        // PUT validates the full config; the shared fixture's port 0 does not pass.
+        initial.server.port = 8080;
+        initial.providers[0].api_key_encrypted =
+            Some(secrets::encrypt_provider_secret("sk-round-trip-stored-dummy").unwrap());
+        initial.providers[0].resolved_api_key = Some("sk-round-trip-stored-dummy".to_string());
+        let server = crate::gateway::GatewayServer::new(initial, Some(config_path.clone()))
+            .await
+            .unwrap();
+
+        let get = || {
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/admin/config")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let response = tower::ServiceExt::oneshot(server.build_router(), get())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let config = smart_routing_response_json(response).await;
+        // GET reports only the status flags; the key field is blank.
+        assert!(config["providers"][0]["api_key_env"].is_null());
+        assert_eq!(config["providers"][0]["api_key_status"], "encrypted");
+        assert_eq!(config["providers"][0]["api_key_configured"], true);
+
+        // PUT the body back exactly as the frontend would (blank key field).
+        let response = tower::ServiceExt::oneshot(
+            server.build_router(),
+            smart_routing_json_request("PUT", "/admin/config", config),
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        let body = smart_routing_response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "PUT /admin/config failed: {body}");
+
+        // Stored encrypted key survives the round trip in the live config...
+        let live = server.state.config.read().await;
+        assert!(
+            live.providers[0]
+                .api_key_encrypted
+                .as_deref()
+                .is_some_and(secrets::is_encrypted_secret),
+            "live config lost the stored encrypted key"
+        );
+        assert_eq!(
+            live.providers[0].resolved_api_key.as_deref(),
+            Some("sk-round-trip-stored-dummy"),
+            "live config lost the resolved key"
+        );
+        drop(live);
+        // ...and in the persisted YAML (resolved_api_key is serde-skipped by
+        // design; only the encrypted form is written).
+        let saved: Config =
+            serde_yaml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(
+            saved.providers[0]
+                .api_key_encrypted
+                .as_deref()
+                .is_some_and(secrets::is_encrypted_secret),
+            "saved YAML lost the stored encrypted key"
+        );
+        assert_eq!(
+            secrets::decrypt_provider_secret(
+                saved.providers[0].api_key_encrypted.as_deref().unwrap()
+            )
+            .unwrap(),
+            "sk-round-trip-stored-dummy"
+        );
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
     // --- Admin authentication tests (Req 35.1-35.7) ---
 
     #[test]
@@ -2832,6 +3282,7 @@ retry:
             std::env::temp_dir().join(format!("obey-admin-test-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&storage_dir).unwrap();
         let mut config = Config {
+            security: Default::default(),
             cache_aware_routing: Default::default(),
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
@@ -2847,7 +3298,10 @@ retry:
                     enabled,
                     username_env: Some(user_env.to_string()),
                     password_env: Some(pass_env.to_string()),
+                    allow_unauthenticated_non_loopback: false,
                 },
+                security_mode: None,
+                auth_section_present: false,
             },
             dashboard: DashboardConfig::default(),
             cors: CorsConfig::default(),
@@ -3159,6 +3613,79 @@ retry:
 
         let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        std::env::remove_var(user_env);
+        std::env::remove_var(pass_env);
+    }
+
+    // Spec: black-october-security-hardening, Req 1 middleware enforcement.
+    // Legacy config (no auth section, no security_mode) on a non-loopback bind
+    // resolves to OpenWarnedLegacy → serve unauthenticated, no 401.
+    #[tokio::test]
+    async fn test_legacy_config_non_loopback_serves_admin_unauthenticated() {
+        let mut cfg = test_config_with_auth(false);
+        cfg.server.host = "192.168.1.110".to_string();
+        cfg.admin.security_mode = None;
+        cfg.admin.auth_section_present = false;
+        assert_eq!(
+            auth_policy::resolve_admin_security_mode(&cfg),
+            AdminSecurityMode::OpenWarnedLegacy
+        );
+
+        let server = crate::gateway::GatewayServer::new(cfg, None).await.unwrap();
+        let app = server.build_router();
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/admin/config")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Spec: black-october-security-hardening, Req 1 middleware enforcement.
+    // Explicit new config (security_mode: Some(Authenticated), auth enabled,
+    // env credentials set) → 401 without credentials, 200 with them.
+    #[tokio::test]
+    async fn test_explicit_authenticated_mode_enforces_credentials() {
+        let user_env = "AUTH_TEST_EXPLICIT_MODE_USER";
+        let pass_env = "AUTH_TEST_EXPLICIT_MODE_PASS";
+        std::env::set_var(user_env, "admin");
+        std::env::set_var(pass_env, "secret");
+
+        let mut cfg = test_config_with_auth_env(true, user_env, pass_env);
+        cfg.server.host = "192.168.1.110".to_string();
+        cfg.admin.security_mode = Some(AdminSecurityMode::Authenticated);
+        cfg.admin.auth_section_present = true;
+        assert_eq!(
+            auth_policy::resolve_admin_security_mode(&cfg),
+            AdminSecurityMode::Authenticated
+        );
+
+        let server = crate::gateway::GatewayServer::new(cfg, None).await.unwrap();
+        let app = server.build_router();
+
+        let unauthorized = axum::http::Request::builder()
+            .method("GET")
+            .uri("/admin/config")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app.clone(), unauthorized)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get("www-authenticate").is_some());
+
+        let authorized = axum::http::Request::builder()
+            .method("GET")
+            .uri("/admin/config")
+            .header("Authorization", basic_auth_header("admin", "secret"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, authorized).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
 
         std::env::remove_var(user_env);
         std::env::remove_var(pass_env);
@@ -3981,5 +4508,586 @@ retry:
             assert!(!body.contains("\\private\\"));
             assert!(!body.contains("/home/private/"));
         }
+    }
+
+    // --- GET /admin/security-status (spec: black-october-security-hardening, Req 1.7) ---
+
+    #[tokio::test]
+    async fn security_status_requires_auth_in_authenticated_mode() {
+        let user_env = "SEC_STATUS_TEST_USER";
+        let pass_env = "SEC_STATUS_TEST_PASS";
+        std::env::set_var(user_env, "admin");
+        std::env::set_var(pass_env, "secret");
+        let config = test_config_with_auth_env(true, user_env, pass_env);
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        let request = axum::http::Request::get("/admin/security-status")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get("WWW-Authenticate")
+                .and_then(|v| v.to_str().ok()),
+            Some("Basic realm=\"OBEY-API Admin\"")
+        );
+
+        // Valid credentials reach the endpoint; shape + no credential material.
+        let authorized = axum::http::Request::get("/admin/security-status")
+            .header("Authorization", basic_auth_header("admin", "secret"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, authorized).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "authenticated");
+        assert_eq!(json["unauthenticated_non_loopback"], false);
+        assert_eq!(json.as_object().map(|o| o.len()), Some(2), "exact shape");
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !body_str.contains(user_env) && !body_str.contains(pass_env),
+            "must not leak credential env names"
+        );
+        std::env::remove_var(user_env);
+        std::env::remove_var(pass_env);
+    }
+
+    #[tokio::test]
+    async fn security_status_open_warned_legacy_on_non_loopback_bind() {
+        // Legacy config (no security_mode, no auth section) on a LAN bind.
+        let mut config = test_config_with_auth(false);
+        config.server.host = "192.168.1.110".to_string();
+        config.admin.security_mode = None;
+        config.admin.auth_section_present = false;
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        let request = axum::http::Request::get("/admin/security-status")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "open-warned-legacy");
+        assert_eq!(json["unauthenticated_non_loopback"], true);
+        assert_eq!(json.as_object().map(|o| o.len()), Some(2), "exact shape");
+    }
+
+    #[tokio::test]
+    async fn security_status_loopback_open_reports_no_exposure() {
+        // Legacy config on a loopback bind → LoopbackOpen, not exposed.
+        let mut config = test_config_with_auth(false);
+        config.server.host = "127.0.0.1".to_string();
+        config.admin.security_mode = None;
+        config.admin.auth_section_present = false;
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        let request = axum::http::Request::get("/admin/security-status")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "loopback-open");
+        assert_eq!(json["unauthenticated_non_loopback"], false);
+        assert_eq!(json.as_object().map(|o| o.len()), Some(2), "exact shape");
+    }
+
+    fn outbound_fetch_test_config(allow_private_hosts: bool) -> Config {
+        let mut config = test_config_with_auth(false);
+        config.security.outbound_fetch.caller.allow_private_hosts = allow_private_hosts;
+        config.security.outbound_fetch.caller.allow_http = true; // wiremock binds 127.0.0.1 over http
+        config
+    }
+
+    #[tokio::test]
+    async fn proxy_provider_models_rejects_api_key_in_query_params() {
+        // A wiremock URI keeps the reject-ordering assertion deterministic — no
+        // real network I/O even if the credential-query defense regresses.
+        let upstream = wiremock::MockServer::start().await;
+        let config = outbound_fetch_test_config(true);
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        // Credential-in-URL defense (Req 3.1): any api_key query param on the
+        // route must 400 before outbound work, regardless of body content.
+        let request = smart_routing_json_request(
+            "POST",
+            &format!(
+                "/admin/providers/models?base_url={}&api_key=sk-secret",
+                upstream.uri()
+            ),
+            json!({ "base_url": upstream.uri() }),
+        );
+        let response = tower::ServiceExt::oneshot(app.clone(), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body).into_owned();
+        assert!(!body_text.contains("sk-secret"));
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "reject must happen before any outbound work"
+        );
+
+        // api_key_env spelling is rejected identically.
+        let request = smart_routing_json_request(
+            "POST",
+            "/admin/providers/models?api_key_env=OPENAI_API_KEY",
+            json!({ "base_url": upstream.uri() }),
+        );
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn proxy_provider_models_post_body_proxies_models_list() {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .and(wiremock::matchers::header_exists("authorization"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{ "id": "gpt-4.1-nano" }]
+            })))
+            .mount(&upstream)
+            .await;
+
+        let mut config = outbound_fetch_test_config(true);
+        // Provider configured for the mock host; body key matches that host
+        // so the credential is forwarded.
+        config.providers[0].base_url = Some(upstream.uri());
+        config.providers[0].resolved_api_key = Some("sk-provider-key".to_string());
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        let request = smart_routing_json_request(
+            "POST",
+            "/admin/providers/models",
+            json!({
+            "base_url": upstream.uri(),
+            "api_key": "sk-body-key",
+            "provider_name": "test",
+            "provider_type": "openai"
+            }),
+        );
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["data"][0]["id"], "gpt-4.1-nano");
+        // Body key was forwarded to the provider's own host.
+        let requests = upstream.received_requests().await.unwrap();
+        assert!(requests.iter().any(|r| r
+            .headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap())
+            == Some("Bearer sk-body-key")));
+    }
+
+    #[tokio::test]
+    async fn proxy_provider_models_refuses_credentials_cross_host() {
+        let host_a = wiremock::MockServer::start().await;
+        let host_b = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": []
+            })))
+            .mount(&host_b)
+            .await;
+
+        let mut config = outbound_fetch_test_config(true);
+        // Provider configured for host A...
+        config.providers[0].base_url = Some(host_a.uri());
+        config.providers[0].resolved_api_key = Some("sk-never-leak".to_string());
+        // Custom headers may carry ${ENV} secrets — cross-host targets must not
+        // receive them either.
+        config.providers[0].custom_headers.insert(
+            "X-Custom-Secret".to_string(),
+            "sk-custom-header-secret".to_string(),
+        );
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        // ...but the request targets host B: no credential header may reach B,
+        // neither the provider-resolved key nor a body-supplied one.
+        let request = smart_routing_json_request(
+            "POST",
+            "/admin/providers/models",
+            json!({
+            "base_url": host_b.uri(),
+            "api_key": "sk-body-cross-host",
+            "provider_name": "test",
+            "provider_type": "openai"
+            }),
+        );
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = host_b.received_requests().await.unwrap();
+        assert!(!requests.is_empty(), "request reached host B");
+        assert!(
+            requests
+                .iter()
+                .all(|r| !r.headers.contains_key("authorization")),
+            "no Authorization header may reach a cross-host target"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|r| !r.headers.contains_key("x-custom-secret")),
+            "no custom credential header may reach a cross-host target"
+        );
+        assert!(host_a.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Req 1.10 (R2): every config save path stamps `admin.security_mode` with
+    /// the resolved posture. GET → PUT (round trip, unchanged) → GET. NOTE (R1
+    /// flip): the PUT body always carries an explicit `auth` section (Serialize
+    /// never skips it), so the deserialized candidate has
+    /// `auth_section_present == true`; marker-less + explicit section + disabled
+    /// auth on a non-loopback bind now fails closed → "authenticated".
+    #[tokio::test]
+    async fn admin_config_put_round_trip_stamps_resolved_security_mode() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "obey-admin-mode-stamp-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.yaml");
+        let mut initial = test_config_with_auth(false);
+        // Legacy fixture: no marker, non-loopback bind. The in-memory fixture
+        // has no auth section (OpenWarnedLegacy while running), but the PUT
+        // round trip re-introduces an explicit auth section → R1 fail closed.
+        initial.server.host = "192.168.1.110".to_string();
+        initial.server.port = 8080;
+        initial.admin.security_mode = None;
+        initial.admin.auth_section_present = false;
+        let server = crate::gateway::GatewayServer::new(initial, Some(config_path.clone()))
+            .await
+            .unwrap();
+
+        let get = || {
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/admin/config")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let response = tower::ServiceExt::oneshot(server.build_router(), get())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let config = smart_routing_response_json(response).await;
+        assert!(
+            config["admin"]["security_mode"].is_null(),
+            "legacy fixture must start without a marker"
+        );
+
+        // Round-trip PUT with the GET body unchanged.
+        let response = tower::ServiceExt::oneshot(
+            server.build_router(),
+            smart_routing_json_request("PUT", "/admin/config", config),
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        let body = smart_routing_response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "PUT /admin/config failed: {body}");
+
+        // The persisted YAML carries the stamped marker.
+        let saved: Config =
+            serde_yaml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            saved.admin.security_mode,
+            Some(AdminSecurityMode::Authenticated),
+            "save path must stamp the resolved mode (R1: explicit auth section fails closed)"
+        );
+
+        // Second GET reports the stamped marker. R1 flip: the live config is
+        // now Authenticated (explicit auth section, disabled, LAN bind), so
+        // the unauthenticated panel gets a 401 and a credentialed GET (env
+        // vars the fixture already references) is required to read it back.
+        let response = tower::ServiceExt::oneshot(server.build_router(), get())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        std::env::set_var("TEST_ADMIN_USER", "admin");
+        std::env::set_var("TEST_ADMIN_PASS", "secret");
+        let authenticated_get = || {
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/admin/config")
+                .header("Authorization", basic_auth_header("admin", "secret"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let response = tower::ServiceExt::oneshot(server.build_router(), authenticated_get())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let config = smart_routing_response_json(response).await;
+        assert_eq!(config["admin"]["security_mode"], "authenticated");
+        std::env::remove_var("TEST_ADMIN_USER");
+        std::env::remove_var("TEST_ADMIN_PASS");
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    /// R3: the guarded redirect policy stops cross-host redirect hops on the
+    /// models proxy. The mock host is allowed (allow_private_hosts=true,
+    /// allow_http=true so scheme is not the rejector), but its 302 Location
+    /// points at `http://127.0.0.1:1/` — the request must fail with a
+    /// host-only guard error.
+    #[tokio::test]
+    async fn proxy_provider_models_redirect_to_loopback_hop_is_stopped_by_guard() {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", "http://127.0.0.1:1/"),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let mut config = outbound_fetch_test_config(true);
+        config.providers[0].base_url = Some(upstream.uri());
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        let request = smart_routing_json_request(
+            "POST",
+            "/admin/providers/models",
+            json!({
+            "base_url": upstream.uri(),
+            "api_key": "sk-redirect-secret",
+            "provider_name": "test",
+            "provider_type": "openai"
+            }),
+        );
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            body_text.contains("127.0.0.1") && !body_text.contains("sk-redirect-secret"),
+            "guard error must carry the host only: {body_text}"
+        );
+    }
+
+    /// T2 (R3): caller-tier guard with `allow_private_hosts=false` rejects the
+    /// wiremock (127.0.0.1) base_url with a 400 whose body is host-only — no
+    /// full URL, no credential echo.
+    #[tokio::test]
+    async fn proxy_provider_models_guard_rejects_private_target_with_host_only_body() {
+        let upstream = wiremock::MockServer::start().await;
+        let config = outbound_fetch_test_config(false);
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        let request = smart_routing_json_request(
+            "POST",
+            "/admin/providers/models",
+            json!({
+            "base_url": format!("{}/v1", upstream.uri()),
+            "api_key": "sk-guard-secret",
+            "provider_name": "test",
+            "provider_type": "openai"
+            }),
+        );
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            body_text.contains("127.0.0.1"),
+            "guard body must name the rejected host: {body_text}"
+        );
+        assert!(
+            !body_text.contains(upstream.uri().trim_start_matches("http://")),
+            "guard body must not echo the full URL: {body_text}"
+        );
+        assert!(
+            !body_text.contains("sk-guard-secret"),
+            "guard body must not echo credentials: {body_text}"
+        );
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "guard must reject before any outbound work"
+        );
+    }
+
+    /// S7 (R2): credential-bearing custom header values are redacted in the
+    /// config GET response; the header name survives so the pair is visible.
+    #[test]
+    fn test_redact_config_for_response_redacts_credential_custom_headers() {
+        let mut config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
+        config.providers[0].custom_headers.insert(
+            "Authorization".to_string(),
+            "Bearer sk-custom-header-secret-abcdef".to_string(),
+        );
+        config.providers[0]
+            .custom_headers
+            .insert("X-Team".to_string(), "obey-core".to_string());
+
+        let redacted = redact_config_for_response(&config);
+        let headers = &redacted["providers"][0]["custom_headers"];
+        assert_eq!(
+            headers["Authorization"], "[configured]",
+            "credential-bearing value must be redacted"
+        );
+        assert_eq!(headers["X-Team"], "obey-core", "non-secret value must stay");
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !serialized.contains("sk-custom-header-secret-abcdef"),
+            "GET response leaked custom header secret: {serialized}"
+        );
+    }
+
+    /// C7 (R8): scheme-default ports normalize away in origin comparison, so
+    /// `https://host` and `https://host:443` are the same origin (and ditto
+    /// http/80).
+    #[test]
+    fn test_normalize_provider_base_url_treats_default_ports_as_same_origin() {
+        let (_, plain) = normalize_provider_base_url("https://api.example.com");
+        let (_, explicit) = normalize_provider_base_url("https://api.example.com:443");
+        assert_eq!(plain.as_deref(), Some("https://api.example.com"));
+        assert_eq!(explicit.as_deref(), Some("https://api.example.com"));
+        assert_eq!(plain, explicit);
+
+        let (_, http_plain) = normalize_provider_base_url("http://api.example.com");
+        let (_, http_explicit) = normalize_provider_base_url("http://api.example.com:80");
+        assert_eq!(http_plain, http_explicit);
+
+        // Non-default ports are still distinguished.
+        let (_, alt) = normalize_provider_base_url("https://api.example.com:8443");
+        assert_eq!(alt.as_deref(), Some("https://api.example.com:8443"));
+    }
+
+    /// R8/C6: `test_connection` with an unparseable base_url fails closed
+    /// with the same 400 shape as a guard rejection (invalid base_url).
+    #[tokio::test]
+    async fn test_connection_unparseable_base_url_fails_closed() {
+        // Isolate the OAuth token store so seeding a session never touches the
+        // operator's real ai-gateway data directory.
+        let data_dir = std::env::temp_dir().join(format!(
+            "obey-admin-oauth-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::env::set_var("AI_GATEWAY_DATA_DIR", &data_dir);
+        let mut config = test_config_with_auth(false);
+        config.providers[0].auth_method = Some("oauth".to_string());
+        config.providers[0].codex_base_url_override = Some("::::not a url::::".to_string());
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        std::env::remove_var("AI_GATEWAY_DATA_DIR");
+
+        // Seed an authenticated OAuth session so the handler passes the oauth
+        // checks and reaches the URL guard.
+        let manager = server.state.oauth_manager.clone().expect("oauth manager");
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        manager
+            .store_tokens(crate::oauth::store::StoredTokens {
+                access_token: "sk-test-access".to_string(),
+                refresh_token: "sk-test-refresh".to_string(),
+                expires_at,
+                scopes: "test".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let app = server.build_router();
+        let request = smart_routing_json_request(
+            "POST",
+            "/admin/test-connection",
+            json!({ "provider_name": "test" }),
+        );
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "invalid base_url");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// T5 (R1): OpenOptIn middleware pin — explicit `security_mode:
+    /// open-opt-in` plus the non-loopback acknowledgment serves the admin
+    /// panel without credentials on a LAN bind, and `/admin/security-status`
+    /// reports the mode.
+    #[tokio::test]
+    async fn security_status_open_opt_in_on_non_loopback_bind() {
+        let mut config = test_config_with_auth(false);
+        config.server.host = "192.168.1.110".to_string();
+        config.admin.security_mode = Some(AdminSecurityMode::OpenOptIn);
+        config.admin.auth_section_present = true;
+        config.admin.auth.allow_unauthenticated_non_loopback = true;
+        assert_eq!(
+            auth_policy::resolve_admin_security_mode(&config),
+            AdminSecurityMode::OpenOptIn
+        );
+
+        let server = crate::gateway::GatewayServer::new(config, None)
+            .await
+            .unwrap();
+        let app = server.build_router();
+
+        let request = axum::http::Request::get("/admin/config")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = axum::http::Request::get("/admin/security-status")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "open-opt-in");
+        assert_eq!(json["unauthenticated_non_loopback"], true);
     }
 }

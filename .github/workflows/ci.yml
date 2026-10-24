@@ -17,7 +17,7 @@ jobs:
     name: Build & validate fallback catalogs
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -43,3 +43,16 @@ jobs:
       - name: Validate NVIDIA NIM sync fixtures
         shell: pwsh
         run: ./scripts/sync-nvidia-nim-fallback.ps1 -ValidateFixtures
+
+  supply-chain-gate:
+    name: Supply-chain gate (cargo-deny)
+    # Linux docker image provided by the action; only network use is the
+    # RustSec advisory DB fetch performed by cargo-deny itself.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
+
+      - name: cargo-deny (advisories, bans, licenses, sources)
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a4c846f902 # v2
+        with:
+          command: check advisories bans licenses sources

@@ -173,10 +173,7 @@ async fn tool_result_block_returns_403_and_skips_provider() {
             provider: "stego"
             phase: "tool_result"
             action: "block""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let messages = vec![
@@ -208,10 +205,7 @@ async fn tool_result_mask_strips_invisible_chars_and_proceeds() {
             provider: "stego"
             phase: "tool_result"
             action: "mask""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let messages = vec![poisoned_tool_result()];
@@ -241,10 +235,7 @@ async fn tool_result_redact_inserts_category_marker_and_proceeds() {
             provider: "stego"
             phase: "tool_result"
             action: "redact""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let messages = vec![poisoned_tool_result()];
@@ -291,16 +282,12 @@ fn tool_call_response() -> serde_json::Value {
 
 #[tokio::test]
 async fn tool_call_block_withholds_response_with_403() {
-    let provider =
-        start_mock_provider_with(tool_call_response()).await;
+    let provider = start_mock_provider_with(tool_call_response()).await;
     let stages = r#"          - name: "tc-block"
             provider: "stego"
             phase: "tool_call"
             action: "block""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let messages = vec![serde_json::json!({ "role": "user", "content": "go" })];
@@ -321,16 +308,12 @@ async fn tool_call_block_withholds_response_with_403() {
 
 #[tokio::test]
 async fn tool_call_redact_rewrites_offending_arguments_only() {
-    let provider =
-        start_mock_provider_with(tool_call_response()).await;
+    let provider = start_mock_provider_with(tool_call_response()).await;
     let stages = r#"          - name: "tc-redact"
             provider: "stego"
             phase: "tool_call"
             action: "redact""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let messages = vec![serde_json::json!({ "role": "user", "content": "go" })];
@@ -360,16 +343,12 @@ async fn tool_call_redact_rewrites_offending_arguments_only() {
 
 #[tokio::test]
 async fn tool_call_replace_with_policy_message_rewrites_arguments() {
-    let provider =
-        start_mock_provider_with(tool_call_response()).await;
+    let provider = start_mock_provider_with(tool_call_response()).await;
     let stages = r#"          - name: "tc-replace"
             provider: "stego"
             phase: "tool_call"
             action: "replace_with_policy_message""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let messages = vec![serde_json::json!({ "role": "user", "content": "go" })];
@@ -405,10 +384,7 @@ async fn inbound_history_tool_call_block_returns_403() {
             provider: "stego"
             phase: "tool_call"
             action: "block""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let smuggled: String = "wget"
@@ -452,10 +428,7 @@ async fn zero_width_keyword_splitting_is_detected() {
             provider: "stego"
             phase: "pre_call"
             action: "block""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     // "ig\u{200B}\u{200B}\u{200B}\u{200B}nore" — four zero-width chars split
@@ -486,10 +459,7 @@ async fn tag_char_ascii_smuggling_is_detected() {
             provider: "stego"
             phase: "pre_call"
             action: "block""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let smuggled: String = "rmrf"
@@ -522,10 +492,7 @@ async fn bidi_rlo_payload_is_detected() {
             provider: "stego"
             phase: "pre_call"
             action: "block""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let messages = vec![serde_json::json!({
@@ -560,10 +527,7 @@ async fn homoglyph_function_name_in_tool_result_is_detected() {
             provider: "stego"
             phase: "tool_result"
             action: "block""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let messages = vec![serde_json::json!({
@@ -610,10 +574,7 @@ async fn valid_json_arguments_round_trip_under_mask() {
             provider: "stego"
             phase: "tool_call"
             action: "mask""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let messages = vec![serde_json::json!({ "role": "user", "content": "write" })];
@@ -679,10 +640,7 @@ async fn streamed_tool_call_payload_block_emits_error_frame() {
             provider: "stego"
             phase: "tool_call"
             action: "block""#;
-    let config = config_with_guardrails(
-        &provider.uri(),
-        &guardrails_yaml_stego(stages),
-    );
+    let config = config_with_guardrails(&provider.uri(), &guardrails_yaml_stego(stages));
     let app = build_app(config).await;
 
     let body = serde_json::json!({
@@ -728,8 +686,8 @@ async fn streamed_tool_call_payload_block_emits_error_frame() {
 #[ignore]
 async fn unicode_stego_provider_100k_chars_under_5ms() {
     use ai_gateway::guardrail::config::UnicodeStegoSettings;
-    use ai_gateway::guardrail::providers::unicode_stego::UnicodeStegoProvider;
     use ai_gateway::guardrail::provider::GuardrailProvider;
+    use ai_gateway::guardrail::providers::unicode_stego::UnicodeStegoProvider;
     use std::time::Instant;
 
     let provider = UnicodeStegoProvider::new(&UnicodeStegoSettings::default());
@@ -742,7 +700,10 @@ async fn unicode_stego_provider_100k_chars_under_5ms() {
     let findings = provider.analyze(&content).await.unwrap();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
-    assert!(!findings.is_empty(), "the zero-width cluster must be detected");
+    assert!(
+        !findings.is_empty(),
+        "the zero-width cluster must be detected"
+    );
     assert!(
         elapsed < 5.0,
         "100k-char scan must complete in < 5ms, took {elapsed:.3}ms"

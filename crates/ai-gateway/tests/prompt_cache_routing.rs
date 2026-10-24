@@ -22,6 +22,7 @@ mod common;
 /// Build a minimal valid Config with the given cache-aware routing settings.
 fn cache_config(cache: CacheAwareRouting) -> Config {
     Config {
+        security: Default::default(),
         cache_aware_routing: cache,
         server: ServerConfig {
             host: "127.0.0.1".to_string(),

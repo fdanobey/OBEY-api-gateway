@@ -17,7 +17,7 @@ use tower_http::trace::TraceLayer;
 use crate::admin;
 use crate::assistants::AssistantsStore;
 use crate::cache::{ExactCache, SemanticCache};
-use crate::config::Config;
+use crate::config::{AdminSecurityMode, Config};
 use crate::error::GatewayError;
 use crate::guardrail::GuardrailEngine;
 use crate::logger::RequestLogger;
@@ -260,6 +260,7 @@ impl GatewayServer {
                     &http_client,
                     cache.as_deref(),
                     Some(metrics.clone()),
+                    &config.security.outbound_fetch,
                 )
                 .map_err(|e| {
                     GatewayError::Configuration(format!("Failed to build guardrail engine: {e}"))
@@ -305,13 +306,16 @@ impl GatewayServer {
             compression_events,
             memory_events,
             active_requests: Arc::new(crate::active_requests::ActiveRequestRegistry::new()),
-            onnx_assets: Arc::new(crate::compression::assets::OnnxAssetManager::new().map_err(
-                |error| {
+            onnx_assets: Arc::new(
+                crate::compression::assets::OnnxAssetManager::with_outbound_config(
+                    config.security.outbound_fetch.clone(),
+                )
+                .map_err(|error| {
                     GatewayError::Configuration(format!(
                         "Failed to initialize ONNX asset manager: {error}"
                     ))
-                },
-            )?),
+                })?,
+            ),
             tool_compression_state: Arc::new(crate::tool_compression::ToolCompressionState::new(
                 &config.tool_compression,
             )),
@@ -459,26 +463,31 @@ impl GatewayServer {
         // --- Admin panel (Req 13.1-13.18) ---
         let (
             admin_enabled,
-            admin_auth_enabled,
             admin_path,
             dashboard_enabled,
             dashboard_path,
             prometheus_cfg,
+            admin_security_mode,
         ) = {
             let cfg = self.state.config.try_read().expect("config lock");
+            // Spec black-october-security-hardening, Req 1.9: resolve the admin
+            // security mode once at mount time (inside the existing read) and
+            // always log it. The middleware re-resolves per request so
+            // hot-reload changes apply without restart; this startup log
+            // reflects the mode at mount time.
             (
                 cfg.admin.enabled,
-                cfg.admin.auth.enabled,
                 cfg.admin.path.clone(),
                 cfg.dashboard.enabled,
                 cfg.dashboard.path.clone(),
                 cfg.prometheus.clone(),
+                crate::admin::auth_policy::resolve_admin_security_mode(&cfg),
             )
         };
-
         tracing::info!(
             admin_enabled,
             admin_path = %admin_path,
+            admin_security_mode = admin_security_mode.wire_name(),
             dashboard_enabled,
             dashboard_path = %dashboard_path,
             prometheus_enabled = prometheus_cfg.as_ref().is_some_and(|cfg| cfg.enabled),
@@ -491,9 +500,13 @@ impl GatewayServer {
         let mut router = Router::new().merge(api_routes);
 
         if admin_enabled {
-            tracing::info!(path = %admin_path, "Mounting admin routes");
+            tracing::info!(
+                path = %admin_path,
+                security_mode = admin_security_mode.wire_name(),
+                "Mounting admin routes"
+            );
             router = router.nest(&admin_path, admin::admin_routes(self.state.clone()));
-            if let Some(message) = admin_auth_warning(admin_enabled, admin_auth_enabled) {
+            if let Some(message) = admin_auth_warning(admin_security_mode) {
                 tracing::warn!("{}", message);
             }
         } else {
@@ -501,24 +514,45 @@ impl GatewayServer {
         }
 
         if dashboard_enabled {
+            // Dashboard policy parity (Req 1.7, C5): the dashboard nest runs the
+            // SAME `admin_auth_middleware` the admin panel uses, so it 401s
+            // exactly when admin would in Authenticated mode and passes through
+            // in the open modes. The `/dashboard/` trailing-slash redirect is
+            // wrapped in the same route_layer (a bare 301 leaked the dashboard's
+            // existence and skipped the 401). The middleware re-resolves the mode
+            // per request from the shared config, so hot-reload applies without a
+            // remount.
             let canonical_dashboard_path = dashboard_path.trim_end_matches('/').to_string();
             if !canonical_dashboard_path.is_empty() && canonical_dashboard_path != "/" {
                 let slash_dashboard_path = format!("{}/", canonical_dashboard_path);
                 let redirect_target = canonical_dashboard_path.clone();
                 tracing::info!(from = %slash_dashboard_path, to = %redirect_target, "Registering dashboard trailing-slash redirect");
-                router = router.route(
-                    &slash_dashboard_path,
-                    get(move || {
-                        let redirect_target = redirect_target.clone();
-                        async move { Redirect::permanent(&redirect_target) }
-                    }),
-                );
+                let redirect_router = Router::new()
+                    .route(
+                        &slash_dashboard_path,
+                        get(move || {
+                            let redirect_target = redirect_target.clone();
+                            async move { Redirect::permanent(&redirect_target) }
+                        }),
+                    )
+                    .route_layer(axum::middleware::from_fn_with_state(
+                        self.state.clone(),
+                        admin::admin_auth_middleware,
+                    ));
+                router = router.merge(redirect_router);
             }
             tracing::info!(path = %dashboard_path, "Mounting dashboard routes");
-            router = router.nest(
-                &dashboard_path,
-                crate::dashboard::dashboard_routes(self.state.clone()),
-            );
+            let dashboard_nest = crate::dashboard::dashboard_routes(self.state.clone())
+                .route_layer(axum::middleware::from_fn_with_state(
+                    self.state.clone(),
+                    admin::admin_auth_middleware,
+                ));
+            router = router.nest(&dashboard_path, dashboard_nest);
+            // Dashboard shares the admin security posture (Req 1.7): mirror the
+            // admin mount-time warning here.
+            if let Some(message) = admin_auth_warning(admin_security_mode) {
+                tracing::warn!("Dashboard shares this posture: {}", message);
+            }
         } else {
             tracing::warn!("Dashboard routes are disabled by configuration");
         }
@@ -632,10 +666,22 @@ impl GatewayServer {
     {
         let router = self.build_router();
 
-        let (host, port, tls) = {
+        let (host, port, tls, cors) = {
             let cfg = self.state.config.read().await;
-            (cfg.server.host.clone(), cfg.server.port, cfg.tls.clone())
+            (
+                cfg.server.host.clone(),
+                cfg.server.port,
+                cfg.tls.clone(),
+                cfg.cors.clone(),
+            )
         };
+
+        // CORS / LAN-exposure warning (black-october-security-hardening,
+        // Req 4.3/4.4): non-loopback bind with CORS disabled, empty-default,
+        // or wildcard origins.
+        if let Some(message) = cors_lan_warning(&cors, &host) {
+            tracing::warn!("{}", message);
+        }
 
         // Validate TLS before binding (Req 36.2-36.5)
         let rustls_config = Self::validate_tls(&tls).await?;
@@ -720,19 +766,14 @@ impl GatewayServer {
             return CorsLayer::new();
         }
 
-        let origins: Vec<HeaderValue> = config
-            .cors
-            .allowed_origins
-            .iter()
-            .filter_map(|o| {
-                if o == "*" {
-                    tracing::warn!(
-                        "CORS wildcard origin configured ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â review security implications"
-                    );
-                }
-                o.parse().ok()
-            })
-            .collect();
+        // SECURITY (black-october-security-hardening, Req 4.1): empty
+        // allowed_origins emits no CORS headers (same-origin default).
+        if config.cors.allowed_origins.is_empty() {
+            tracing::debug!(
+                "CORS enabled but cors.allowed_origins is empty; no CORS headers will be emitted"
+            );
+            return CorsLayer::new();
+        }
 
         let methods: Vec<Method> = config
             .cors
@@ -748,32 +789,104 @@ impl GatewayServer {
             .filter_map(|h| h.parse().ok())
             .collect();
 
-        CorsLayer::new()
+        if config.cors.allowed_origins.iter().any(|o| o == "*") {
+            // Wildcard must map to AllowOrigin::any(); AllowOrigin::list
+            // panics on `*` (tower-http 0.6).
+            tracing::warn!("CORS wildcard origin configured - any website can call this gateway from a browser; review security implications");
+            let layer = CorsLayer::new()
+                .allow_origin(tower_http::cors::AllowOrigin::any())
+                .allow_methods(methods)
+                .allow_headers(headers);
+            // S12 defense in depth: validation already rejects the
+            // wildcard+credentials combo; never honor allow_credentials on a
+            // wildcard origin at the layer level either.
+            if config.cors.allow_credentials {
+                tracing::warn!(
+                "CORS wildcard origin with allow_credentials=true: credentials are NOT enabled at the CORS layer (defense in depth)"
+            );
+            }
+            return layer;
+        }
+
+        let origins: Vec<HeaderValue> = config
+            .cors
+            .allowed_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+
+        let mut layer = CorsLayer::new()
             .allow_origin(origins)
             .allow_methods(methods)
-            .allow_headers(headers)
+            .allow_headers(headers);
+        if config.cors.allow_credentials {
+            layer = layer.allow_credentials(tower_http::cors::AllowCredentials::yes());
+        }
+        layer
     }
 }
 
-/// Returns the startup WARN message when the admin panel is mounted but its
-/// authentication is disabled, otherwise `None`. Config defaults are left
-/// unchanged (back-compat for existing deployments that rely on open admin);
-/// this surfaces the open-access risk at startup instead of silently serving
-/// unauthenticated admin endpoints.
-pub(crate) fn admin_auth_warning(
-    admin_enabled: bool,
-    admin_auth_enabled: bool,
-) -> Option<&'static str> {
-    if admin_enabled && !admin_auth_enabled {
-        Some(
-            "Admin panel is ENABLED but admin.auth.enabled is false: the admin \
-             endpoints are UNAUTHENTICATED and reachable by anyone who can reach \
-             the port. Set admin.auth.enabled = true with admin.auth.username_env \
-             and admin.auth.password_env to secure them.",
-        )
-    } else {
-        None
+/// Startup admin-security logging (spec: black-october-security-hardening,
+/// Req 1.5, 1.9). Always logs the resolved [`AdminSecurityMode`] for the
+/// mounted admin panel; returns a STARK WARN message when the panel is
+/// unauthenticated on a non-loopback bind (`OpenWarnedLegacy`/`OpenOptIn`),
+/// otherwise `None`.
+pub(crate) fn admin_auth_warning(mode: AdminSecurityMode) -> Option<&'static str> {
+    match mode {
+        AdminSecurityMode::Authenticated => None,
+        AdminSecurityMode::LoopbackOpen => None,
+        AdminSecurityMode::OpenWarnedLegacy => Some(
+            "SECURITY WARNING: admin panel mode is OPEN-WARNED-LEGACY — the admin \
+             endpoints are UNAUTHENTICATED on a non-loopback address and reachable \
+             by anyone who can reach the port. Restrict access NOW: block the port \
+             with firewall rules (or rebind server.host to 127.0.0.1/localhost), or \
+             set admin.auth.enabled = true with admin.auth.username_env and \
+             admin.auth.password_env to require credentials.",
+        ),
+        AdminSecurityMode::OpenOptIn => Some(
+            "SECURITY WARNING: admin panel mode is OPEN-OPT-IN — the admin \
+             endpoints are UNAUTHENTICATED on a non-loopback address by explicit \
+             operator opt-in (admin.auth.allow_unauthenticated_non_loopback). \
+             Restrict access NOW: block the port with firewall rules (or rebind \
+             server.host to 127.0.0.1/localhost), or set admin.auth.enabled = true \
+             with admin.auth.username_env and admin.auth.password_env to require \
+             credentials.",
+        ),
     }
+}
+
+/// Startup CORS/LAN-exposure warning (spec: black-october-security-hardening,
+/// Req 4.3/4.4). Returns a WARN message when the gateway binds a
+/// non-loopback interface AND cross-origin browser attacks are not blocked by
+/// an explicit origin allowlist — i.e. CORS is disabled, emits no headers due
+/// to the empty default (Req 4.1), or is configured with a wildcard origin.
+/// The referenced OpenCode localhost-attack class is a browser-based attacker
+/// on a LAN client reading gateway responses cross-origin.
+pub(crate) fn cors_lan_warning(cors: &crate::config::CorsConfig, host: &str) -> Option<String> {
+    if crate::admin::auth_policy::is_loopback_bind(host) {
+        return None;
+    }
+    let detail = if !cors.enabled {
+        "CORS is disabled (browser Same-Origin Policy still applies, but any \
+         LAN page that can bypass it — e.g. via DNS rebinding — reaches the \
+         gateway)"
+    } else if cors.allowed_origins.is_empty() {
+        "CORS is enabled but cors.allowed_origins is empty (new default), so \
+         no cross-origin reads are granted"
+    } else if cors.allowed_origins.iter().any(|o| o == "*") {
+        "CORS allows ANY origin (wildcard '*'): any website visited by a \
+         browser on a LAN client can call this gateway cross-origin"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "SECURITY WARNING: server.host '{}' is non-loopback and {}: this is \
+         the OpenCode localhost-attack class (a browser-based attacker on a \
+         LAN client reading gateway responses). Fix: rebind server.host to \
+         127.0.0.1/localhost for local-only use, firewall the port, or set \
+         cors.allowed_origins to an explicit list of trusted origins.",
+        host, detail
+    ))
 }
 
 async fn build_memory_vector_tier(
@@ -1046,6 +1159,7 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
                     &http_client,
                     state.cache.as_deref(),
                     Some(state.metrics.clone()),
+                    &cfg.security.outbound_fetch,
                 ) {
                     Ok(engine) => Some(Some(Arc::new(engine))),
                     Err(e) => {
@@ -1112,30 +1226,159 @@ mod tests {
 
     #[test]
     fn admin_auth_warning_present_when_disabled() {
-        let msg = admin_auth_warning(true, false);
+        let msg = admin_auth_warning(AdminSecurityMode::OpenWarnedLegacy);
         assert!(
             msg.is_some(),
-            "warning returned when admin auth is disabled"
+            "warning returned when admin resolves to open-warned-legacy"
         );
         let text = msg.unwrap();
         assert!(
             text.contains("UNAUTHENTICATED"),
             "warning names the unauthenticated risk"
         );
+        assert!(
+            text.contains("firewall"),
+            "warning gives explicit firewall guidance"
+        );
+    }
+
+    #[test]
+    fn admin_auth_warning_present_for_open_opt_in() {
+        let msg = admin_auth_warning(AdminSecurityMode::OpenOptIn);
+        assert!(
+            msg.is_some(),
+            "warning returned when admin resolves to open-opt-in"
+        );
+        let text = msg.unwrap();
+        assert!(
+            text.contains("UNAUTHENTICATED"),
+            "warning names the unauthenticated risk"
+        );
+        assert!(
+            text.contains("firewall"),
+            "warning gives explicit firewall guidance"
+        );
     }
 
     #[test]
     fn admin_auth_warning_absent_when_enabled() {
-        assert!(admin_auth_warning(true, true).is_none());
+        assert!(admin_auth_warning(AdminSecurityMode::Authenticated).is_none());
     }
 
     #[test]
-    fn admin_auth_warning_absent_when_admin_disabled() {
-        assert!(admin_auth_warning(false, false).is_none());
+    fn admin_auth_warning_absent_when_loopback_open() {
+        assert!(admin_auth_warning(AdminSecurityMode::LoopbackOpen).is_none());
+    }
+
+    // --- Dashboard policy parity + /admin/security-status (spec:
+    // black-october-security-hardening, Req 1.7) ---
+
+    fn security_parity_config(host: &str, auth_enabled: bool) -> (Config, std::path::PathBuf) {
+        let mut config = minimal_config();
+        config.server.host = host.to_string();
+        config.admin.auth.enabled = auth_enabled;
+        if auth_enabled {
+            config.admin.auth.username_env = Some("GW_DASH_PARITY_USER".to_string());
+            config.admin.auth.password_env = Some("GW_DASH_PARITY_PASS".to_string());
+        }
+        let storage_dir = with_parity_storage(&mut config);
+        (config, storage_dir)
+    }
+
+    /// T10: per-test storage dir for the obey-gw-parity fixtures; call
+    /// `cleanup` at test end.
+    fn parity_storage_dir() -> std::path::PathBuf {
+        let storage_dir =
+            std::env::temp_dir().join(format!("obey-gw-parity-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        storage_dir
+    }
+
+    fn with_parity_storage(config: &mut Config) -> std::path::PathBuf {
+        // Unique temp DB paths (mirrors admin test isolation) so concurrent
+        // GatewayServer instances never contend on ./logs.db.
+        let storage_dir = parity_storage_dir();
+        config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
+        config.virtual_keys.database_path =
+            storage_dir.join("keys.db").to_string_lossy().into_owned();
+        storage_dir
+    }
+
+    #[tokio::test]
+    async fn dashboard_and_security_status_require_auth_in_authenticated_mode() {
+        std::env::set_var("GW_DASH_PARITY_USER", "admin");
+        std::env::set_var("GW_DASH_PARITY_PASS", "secret");
+        // Auth.enabled wins even on a non-loopback bind (resolver step 1).
+        let (config, storage_dir) = security_parity_config("192.168.1.110", true);
+        let server = GatewayServer::new(config, None).await.unwrap();
+        let app = server.build_router();
+
+        // `/dashboard` (the nest root), the admin status endpoint, and the
+        // `/dashboard/` trailing-slash redirect (C5: registered INSIDE the
+        // auth-wrapped nest) are all behind the policy.
+        for uri in ["/dashboard", "/dashboard/", "/admin/security-status"] {
+            let request = Request::get(uri).body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        std::env::remove_var("GW_DASH_PARITY_USER");
+        std::env::remove_var("GW_DASH_PARITY_PASS");
+    }
+
+    #[tokio::test]
+    async fn dashboard_trailing_slash_redirect_passes_in_legacy_non_loopback_mode() {
+        // C5 counterpart: in the open modes the redirect still works (301 →
+        // /dashboard), so moving it inside the nest did not break routing.
+        let (config, storage_dir) = security_parity_config("192.168.1.110", false);
+        let server = GatewayServer::new(config, None).await.unwrap();
+        let app = server.build_router();
+
+        let request = Request::get("/dashboard/").body(Body::empty()).unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            response
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok()),
+            Some("/dashboard")
+        );
+
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn dashboard_open_and_security_status_warns_in_legacy_non_loopback_mode() {
+        // Legacy config (no security_mode, no auth section) on a LAN bind.
+        let (config, storage_dir) = security_parity_config("192.168.1.110", false);
+        let server = GatewayServer::new(config, None).await.unwrap();
+        let app = server.build_router();
+
+        let request = Request::get("/dashboard").body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = Request::get("/admin/security-status")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "open-warned-legacy");
+        assert_eq!(json["unauthenticated_non_loopback"], true);
+        assert_eq!(json.as_object().map(|o| o.len()), Some(2), "exact shape");
+
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     fn minimal_config() -> Config {
         Config {
+            security: Default::default(),
             cache_aware_routing: Default::default(),
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
@@ -1581,6 +1824,267 @@ mod tests {
         assert!(!cfg.enabled);
     }
 
+    #[test]
+    fn test_cors_default_origins_are_empty() {
+        // black-october-security-hardening Req 4.1: empty default — no CORS
+        // headers when unset.
+        let cfg = CorsConfig::default();
+        assert!(cfg.allowed_origins.is_empty());
+    }
+
+    // --- CORS preflight oneshot tests (black-october-security-hardening, Req 4.1) ---
+
+    async fn cors_test_router(cors: CorsConfig) -> Router {
+        let mut cfg = minimal_config();
+        cfg.cors = cors;
+        // T4: unique temp DB paths (security_parity_config pattern) so
+        // parallel preflight tests never contend on ./logs.db.
+        let storage_dir =
+            std::env::temp_dir().join(format!("obey-gw-cors-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        cfg.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
+        cfg.virtual_keys.database_path = storage_dir.join("keys.db").to_string_lossy().into_owned();
+        let server = GatewayServer::new(cfg, None).await.unwrap();
+        let router = server.build_router();
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        router
+    }
+
+    fn options_health_request(origin: &str) -> Request<Body> {
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/health")
+            .header("Origin", origin)
+            .header("Access-Control-Request-Method", "GET")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_empty_origins_emits_no_cors_headers() {
+        let app = cors_test_router(CorsConfig {
+            enabled: true,
+            allowed_origins: vec![], // new default
+            allowed_methods: vec!["GET".to_string(), "POST".to_string()],
+            allowed_headers: vec!["Content-Type".to_string()],
+            allow_credentials: false,
+        })
+        .await;
+
+        let resp = app
+            .oneshot(options_health_request("http://evil.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "empty allowed_origins must not emit ACAO"
+        );
+        assert!(
+            resp.headers().get("access-control-allow-methods").is_none(),
+            "empty allowed_origins must not emit ACAM"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_explicit_origin_gets_correct_acao() {
+        let app = cors_test_router(CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["http://localhost:3000".to_string()],
+            allowed_methods: vec!["GET".to_string(), "POST".to_string()],
+            allowed_headers: vec!["Content-Type".to_string()],
+            allow_credentials: false,
+        })
+        .await;
+
+        let resp = app
+            .clone()
+            .oneshot(options_health_request("http://localhost:3000"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:3000")
+        );
+
+        // Non-allowed origin gets no ACAO.
+        let resp2 = app
+            .oneshot(options_health_request("http://evil.example.com"))
+            .await
+            .unwrap();
+        assert!(resp2.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_wildcard_alone_still_works() {
+        // Wildcard without the Authorization/credentials combo passes validation
+        // (see validation tests) and must keep functioning at the layer level.
+        let app = cors_test_router(CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["Content-Type".to_string()],
+            allow_credentials: false,
+        })
+        .await;
+
+        let resp = app
+            .oneshot(options_health_request("http://anything.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+        // S12/T8: allow_credentials is false here; no credentials header.
+        assert!(
+            resp.headers()
+                .get("access-control-allow-credentials")
+                .is_none(),
+            "non-credentialed wildcard config must not emit ACAC"
+        );
+    }
+
+    /// T8: credentialed explicit-origin config emits
+    /// `Access-Control-Allow-Credentials: true`; the wildcard arm (S12) never
+    /// does, even if allow_credentials somehow stayed true.
+    #[tokio::test]
+    async fn cors_preflight_credentials_header_present_for_credentialed_explicit_origin() {
+        let app = cors_test_router(CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["http://localhost:3000".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["Content-Type".to_string()],
+            allow_credentials: true,
+        })
+        .await;
+
+        let resp = app
+            .oneshot(options_health_request("http://localhost:3000"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-credentials")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:3000")
+        );
+    }
+
+    /// T8/S12: wildcard origin with allow_credentials=true is rejected by
+    /// validation, but the layer must also refuse to emit the credentials
+    /// header for it (defense in depth).
+    #[tokio::test]
+    async fn cors_preflight_credentials_header_absent_for_wildcard_origin() {
+        let app = cors_test_router(CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["Content-Type".to_string()],
+            allow_credentials: true,
+        })
+        .await;
+
+        let resp = app
+            .oneshot(options_health_request("http://anything.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+        assert!(
+            resp.headers()
+                .get("access-control-allow-credentials")
+                .is_none(),
+            "wildcard origin must never emit ACAC at the layer level (S12)"
+        );
+    }
+
+    /// T8 counterpart: non-credentialed explicit-origin config emits no
+    /// credentials header.
+    #[tokio::test]
+    async fn cors_preflight_credentials_header_absent_without_allow_credentials() {
+        let app = cors_test_router(CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["http://localhost:3000".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["Content-Type".to_string()],
+            allow_credentials: false,
+        })
+        .await;
+
+        let resp = app
+            .oneshot(options_health_request("http://localhost:3000"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get("access-control-allow-credentials")
+                .is_none(),
+            "allow_credentials=false must not emit ACAC"
+        );
+    }
+
+    // --- cors_lan_warning unit tests (black-october-security-hardening, Req 4.3/4.4) ---
+
+    #[test]
+    fn cors_lan_warning_absent_for_loopback_bind() {
+        let cors = CorsConfig::default(); // disabled, empty origins
+        assert!(cors_lan_warning(&cors, "127.0.0.1").is_none());
+        assert!(cors_lan_warning(&cors, "localhost").is_none());
+    }
+
+    #[test]
+    fn cors_lan_warning_present_for_non_loopback_empty_default() {
+        let cors = CorsConfig::default(); // disabled + empty default origins
+        let msg = cors_lan_warning(&cors, "192.168.1.110").unwrap();
+        assert!(msg.contains("OpenCode localhost-attack class"));
+        assert!(msg.contains("192.168.1.110"));
+    }
+
+    #[test]
+    fn cors_lan_warning_present_for_non_loopback_wildcard() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["Content-Type".to_string()],
+            allow_credentials: false,
+        };
+        let msg = cors_lan_warning(&cors, "0.0.0.0").unwrap();
+        assert!(msg.contains("wildcard"));
+    }
+
+    #[test]
+    fn cors_lan_warning_absent_for_non_loopback_explicit_origins() {
+        let cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["http://localhost:3000".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["Content-Type".to_string()],
+            allow_credentials: false,
+        };
+        assert!(cors_lan_warning(&cors, "0.0.0.0").is_none());
+    }
+
     #[tokio::test]
     async fn test_default_body_limit() {
         // Validates: Req 45.3 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â default 10 MB
@@ -1850,6 +2354,7 @@ mod tests {
                        }
 
                        let cfg = Config {
+                           security: Default::default(),
                            cache_aware_routing: Default::default(),
                            server: ServerConfig {
                                host: "127.0.0.1".to_string(),
@@ -2029,14 +2534,15 @@ mod tests {
                 // Build a non-allowed origin that is guaranteed different
                 let non_allowed_origin = format!("http://not-allowed-{}.com", seed);
 
-                // Build config with CORS enabled and specific origins
-                let mut cfg = minimal_config();
-                cfg.cors = CorsConfig {
-                    enabled: true,
-                    allowed_origins: allowed_origins.clone(),
-                    allowed_methods: vec!["GET".to_string(), "POST".to_string()],
-                    allowed_headers: vec!["Content-Type".to_string()],
-                };
+            // Build config with CORS enabled and specific origins
+            let mut cfg = minimal_config();
+            cfg.cors = CorsConfig {
+                enabled: true,
+                allowed_origins: allowed_origins.clone(),
+                allowed_methods: vec!["GET".to_string(), "POST".to_string()],
+                allowed_headers: vec!["Content-Type".to_string()],
+                allow_credentials: false,
+            };
 
                 let server = GatewayServer::new(cfg, None).await.unwrap();
                 let app = server.build_router();
@@ -2392,6 +2898,7 @@ mod tests {
                        // 3. Build a NEW valid config with different settings
                        let new_provider_name = format!("prov-{}", provider_suffix);
                        let new_cfg = Config {
+                           security: Default::default(),
                            cache_aware_routing: Default::default(),
                            server: ServerConfig {
                                host: "127.0.0.1".to_string(),

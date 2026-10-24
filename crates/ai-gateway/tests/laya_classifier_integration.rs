@@ -211,13 +211,11 @@ async fn laya_classifier_pins_default_when_listing_has_no_laya_models() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/systemone"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "model": "typed-decisions",
-                "answers": {},
-                "usage": {"input_tokens": 1, "output_tokens": 0}
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "typed-decisions",
+            "answers": {},
+            "usage": {"input_tokens": 1, "output_tokens": 0}
+        })))
         .mount(&server)
         .await;
 
@@ -355,7 +353,10 @@ async fn laya_classifier_high_answer_confidence_produces_decision() {
         })
         .await
         .unwrap();
-    assert_eq!(output.task_type, Some(ai_gateway::smart_routing::tier::TaskType::CodeGeneration));
+    assert_eq!(
+        output.task_type,
+        Some(ai_gateway::smart_routing::tier::TaskType::CodeGeneration)
+    );
     assert_eq!(output.confidence, Some(0.95));
     assert_eq!(output.resolved_model.as_deref(), Some("typed-decisions"));
 }
