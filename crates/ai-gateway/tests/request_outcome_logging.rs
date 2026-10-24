@@ -120,11 +120,18 @@ async fn abandoned_stream_writes_client_disconnect_outcome_row() {
         )
         .mount(&upstream)
         .await;
-    let server = GatewayServer::new(outcome_config(&[("slow-provider", upstream.uri())], 0), None)
+    let server = GatewayServer::new(
+        outcome_config(&[("slow-provider", upstream.uri())], 0),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = server
+        .build_router()
+        .oneshot(chat_request(true))
         .await
         .unwrap();
-
-    let response = server.build_router().oneshot(chat_request(true)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
     let first = tokio::time::timeout(Duration::from_secs(5), body.next())
@@ -144,10 +151,7 @@ async fn abandoned_stream_writes_client_disconnect_outcome_row() {
         rows.iter().any(|row| row.status_code == 499)
     })
     .await;
-    let abandoned: Vec<&LogEntry> = rows
-        .iter()
-        .filter(|row| row.path == OUTCOME_PATH)
-        .collect();
+    let abandoned: Vec<&LogEntry> = rows.iter().filter(|row| row.path == OUTCOME_PATH).collect();
     assert_eq!(abandoned.len(), 1, "exactly one outcome row: {rows:?}");
     let row = abandoned[0];
     assert_eq!(row.status_code, 499);
@@ -164,11 +168,18 @@ async fn completed_stream_does_not_write_abandon_row() {
         .respond_with(ResponseTemplate::new(200).set_body_json(completion_body()))
         .mount(&upstream)
         .await;
-    let server = GatewayServer::new(outcome_config(&[("fast-provider", upstream.uri())], 0), None)
+    let server = GatewayServer::new(
+        outcome_config(&[("fast-provider", upstream.uri())], 0),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = server
+        .build_router()
+        .oneshot(chat_request(true))
         .await
         .unwrap();
-
-    let response = server.build_router().oneshot(chat_request(true)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
@@ -185,7 +196,9 @@ async fn completed_stream_does_not_write_abandon_row() {
     let outcomes: Vec<&LogEntry> = rows.iter().filter(|row| row.path == OUTCOME_PATH).collect();
     assert_eq!(outcomes.len(), 1, "one outcome row: {rows:?}");
     assert_eq!(outcomes[0].status_code, 200);
-    assert!(rows.iter().all(|row| row.status_code != 499 && row.status_code != 504));
+    assert!(rows
+        .iter()
+        .all(|row| row.status_code != 499 && row.status_code != 504));
 }
 
 #[tokio::test]
@@ -206,11 +219,18 @@ async fn same_provider_retry_failure_is_logged_as_attempt_row() {
         .respond_with(ResponseTemplate::new(200).set_body_json(completion_body()))
         .mount(&upstream)
         .await;
-    let server = GatewayServer::new(outcome_config(&[("retry-provider", upstream.uri())], 1), None)
+    let server = GatewayServer::new(
+        outcome_config(&[("retry-provider", upstream.uri())], 1),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = server
+        .build_router()
+        .oneshot(chat_request(false))
         .await
         .unwrap();
-
-    let response = server.build_router().oneshot(chat_request(false)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
@@ -226,7 +246,10 @@ async fn same_provider_retry_failure_is_logged_as_attempt_row() {
     assert_eq!(attempts.len(), 1, "{rows:?}");
     assert_eq!(attempts[0].status_code, 500);
     assert_eq!(attempts[0].provider, "retry-provider");
-    assert_eq!(attempts[0].error_class.as_deref(), Some("upstream_http_500"));
+    assert_eq!(
+        attempts[0].error_class.as_deref(),
+        Some("upstream_http_500")
+    );
     assert!(attempts[0].duration_ms > 0, "{:?}", attempts[0]);
     assert_eq!(attempts[0].trace_id, outcomes[0].trace_id);
 }
@@ -249,14 +272,20 @@ async fn all_providers_failed_logs_attempt_rows() {
     .await
     .unwrap();
 
-    let response = server.build_router().oneshot(chat_request(false)).await.unwrap();
+    let response = server
+        .build_router()
+        .oneshot(chat_request(false))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap();
     // The client-visible attempt list keeps its original shape.
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let attempts = json["error"]["attempts"].as_array().expect("attempts array");
+    let attempts = json["error"]["attempts"]
+        .as_array()
+        .expect("attempts array");
     assert_eq!(attempts.len(), 2);
     for attempt in attempts {
         assert!(attempt.get("duration_ms").is_none());
@@ -268,14 +297,20 @@ async fn all_providers_failed_logs_attempt_rows() {
     let attempt_rows: Vec<&LogEntry> = rows.iter().filter(|row| row.path == ATTEMPT_PATH).collect();
     assert_eq!(outcomes.len(), 1, "{rows:?}");
     assert_eq!(outcomes[0].status_code, 502);
-    assert_eq!(outcomes[0].error_class.as_deref(), Some("upstream_http_500"));
+    assert_eq!(
+        outcomes[0].error_class.as_deref(),
+        Some("upstream_http_500")
+    );
     assert_eq!(attempt_rows.len(), 2, "{rows:?}");
-    let mut providers: Vec<&str> = attempt_rows.iter().map(|row| row.provider.as_str()).collect();
+    let mut providers: Vec<&str> = attempt_rows
+        .iter()
+        .map(|row| row.provider.as_str())
+        .collect();
     providers.sort_unstable();
     assert_eq!(providers, vec!["first", "second"]);
-    assert!(attempt_rows
-        .iter()
-        .all(|row| row.status_code == 500 && row.error_class.as_deref() == Some("upstream_http_500")));
+    assert!(attempt_rows.iter().all(
+        |row| row.status_code == 500 && row.error_class.as_deref() == Some("upstream_http_500")
+    ));
 }
 
 // ─── Context-overflow observability (context-overflow spec, task 5.2) ──────
@@ -363,7 +398,8 @@ async fn reduce_policy_outcome_row_carries_context_reduction() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let rows = poll_logs(&server, Duration::from_secs(5), |rows| {
-        rows.iter().any(|row| row.path == OUTCOME_PATH && row.context_reduction.is_some())
+        rows.iter()
+            .any(|row| row.path == OUTCOME_PATH && row.context_reduction.is_some())
     })
     .await;
 
@@ -407,11 +443,7 @@ async fn route_larger_context_skip_attempt_row_carries_context_window_exceeded()
             .mount(upstream)
             .await;
     }
-    let mut config = overflow_outcome_config(
-        "route_larger_context",
-        &small.uri(),
-        &large.uri(),
-    );
+    let mut config = overflow_outcome_config("route_larger_context", &small.uri(), &large.uri());
     common::isolate_databases(&mut config);
     let server = GatewayServer::new(config, None).await.unwrap();
 
@@ -434,9 +466,12 @@ async fn route_larger_context_skip_attempt_row_carries_context_window_exceeded()
     assert_eq!(response.status(), StatusCode::OK);
 
     let rows = poll_logs(&server, Duration::from_secs(5), |rows| {
-        rows.iter().any(|row| row.path == ATTEMPT_PATH
-            && row.error_class.as_deref() == Some("context_window_exceeded"))
-            && rows.iter().any(|row| row.path == OUTCOME_PATH && row.status_code == 200)
+        rows.iter().any(|row| {
+            row.path == ATTEMPT_PATH
+                && row.error_class.as_deref() == Some("context_window_exceeded")
+        }) && rows
+            .iter()
+            .any(|row| row.path == OUTCOME_PATH && row.status_code == 200)
     })
     .await;
 
@@ -449,7 +484,10 @@ async fn route_larger_context_skip_attempt_row_carries_context_window_exceeded()
     assert_eq!(outcomes.len(), 1, "{rows:?}");
     let skip_rows: Vec<&LogEntry> = rows
         .iter()
-        .filter(|row| row.path == ATTEMPT_PATH && row.error_class.as_deref() == Some("context_window_exceeded"))
+        .filter(|row| {
+            row.path == ATTEMPT_PATH
+                && row.error_class.as_deref() == Some("context_window_exceeded")
+        })
         .collect();
     assert_eq!(skip_rows.len(), 1, "{rows:?}");
     assert_eq!(skip_rows[0].provider, "small");

@@ -57,6 +57,7 @@ pub fn budget_test_config(
     budget: Option<ProviderBudgetConfig>,
 ) -> Config {
     let mut config = Config {
+        security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),

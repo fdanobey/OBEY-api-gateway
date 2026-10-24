@@ -120,6 +120,7 @@ async fn build_app(
 
 fn base_config(provider_uri: &str) -> Config {
     Config {
+        security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),

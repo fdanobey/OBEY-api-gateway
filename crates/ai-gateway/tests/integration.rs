@@ -16,6 +16,7 @@ mod common;
 /// Build a minimal valid Config for integration tests.
 fn test_config() -> Config {
     Config {
+        security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),
@@ -559,6 +560,7 @@ async fn test_admin_auth_integration() {
         enabled: true,
         username_env: Some(user_env.to_string()),
         password_env: Some(pass_env.to_string()),
+        allow_unauthenticated_non_loopback: false,
     };
 
     let app = build_app(cfg).await;
@@ -1649,24 +1651,19 @@ async fn start_paced_sse_mock_raw(writes: Vec<Vec<u8>>, delay_ms: u64) -> String
     tokio::spawn(async move {
         // Bounded accept: without it a gateway that never dials the mock would
         // hang the test silently until the harness timeout.
-        let (mut socket, _) = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            listener.accept(),
-        )
-        .await
-        {
-            Ok(accepted) => accepted.expect("paced SSE mock: accept() failed"),
-            Err(_) => panic!("paced SSE mock: the gateway never connected within 10s"),
-        };
+        let (mut socket, _) =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await
+            {
+                Ok(accepted) => accepted.expect("paced SSE mock: accept() failed"),
+                Err(_) => panic!("paced SSE mock: the gateway never connected within 10s"),
+            };
         // Consume the request head (best-effort; the response is written
         // regardless — the gateway's client does not need it read first).
         let mut scratch = [0u8; 8192];
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            socket.read(&mut scratch),
-        )
-        .await;
-        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut scratch))
+            .await;
+        let head =
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
         socket.write_all(head.as_bytes()).await.unwrap();
         for chunk in writes {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -1713,8 +1710,8 @@ async fn relay_reasoning_frames_arrive_before_final_content() {
     // Relayed reasoning frames arrive BEFORE any content frame (Req 1.1).
     let first_reasoning = first_reasoning_index_in(&chunks)
         .expect("at least one reasoning frame must be relayed mid-stream");
-    let first_content = first_content_index_in(&chunks)
-        .expect("final content must be present in the replay");
+    let first_content =
+        first_content_index_in(&chunks).expect("final content must be present in the replay");
     assert!(
         first_reasoning < first_content,
         "relayed reasoning (index {first_reasoning}) must precede the first content frame (index {first_content})"
@@ -1738,7 +1735,10 @@ async fn relay_reasoning_frames_arrive_before_final_content() {
         .iter()
         .filter(|c| c.pointer("/choices/0/delta/role").is_some())
         .count();
-    assert_eq!(role_count, 1, "single role marker overall (the early event)");
+    assert_eq!(
+        role_count, 1,
+        "single role marker overall (the early event)"
+    );
     for (index, chunk) in chunks.iter().enumerate().skip(1) {
         assert!(
             chunk.pointer("/choices/0/delta/role").is_none(),
@@ -1762,7 +1762,10 @@ async fn relay_reasoning_frames_arrive_before_final_content() {
     // buffered pipeline into the replay chunk.
     let replay_content = chunks
         .iter()
-        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .filter_map(|c| {
+            c.pointer("/choices/0/delta/content")
+                .and_then(|v| v.as_str())
+        })
         .collect::<String>();
     assert_eq!(
         replay_content, "Hello from mock provider!",
@@ -1788,8 +1791,8 @@ async fn relay_disabled_keeps_reasoning_only_in_final_response() {
 
     // No reasoning frame BEFORE the first content frame: with the relay off,
     // reasoning only ever appears inside the final replay (legacy behavior).
-    let first_content = first_content_index_in(&chunks)
-        .expect("final content must be present in the replay");
+    let first_content =
+        first_content_index_in(&chunks).expect("final content must be present in the replay");
     for (index, chunk) in chunks.iter().enumerate() {
         if index < first_content {
             assert!(
@@ -1821,7 +1824,10 @@ async fn relay_disabled_keeps_reasoning_only_in_final_response() {
     // Content is complete and [DONE] terminated.
     let replay_content: String = chunks
         .iter()
-        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .filter_map(|c| {
+            c.pointer("/choices/0/delta/content")
+                .and_then(|v| v.as_str())
+        })
         .collect();
     assert_eq!(replay_content, "Hello from mock provider!");
 }
@@ -1931,10 +1937,10 @@ async fn relay_failover_after_truncated_primary_relays_reasoning_from_first() {
     );
     let backup = start_sse_streaming_mock(backup_body).await;
 
-let app = build_app(relay_failover_config(&primary_uri, &backup.uri())).await;
+    let app = build_app(relay_failover_config(&primary_uri, &backup.uri())).await;
 
-let (status, raw) = send_streaming(app).await;
-assert_eq!(status, StatusCode::OK);
+    let (status, raw) = send_streaming(app).await;
+    assert_eq!(status, StatusCode::OK);
 
     let data_lines = raw_sse_data_lines(&raw);
     assert!(
@@ -1970,7 +1976,10 @@ assert_eq!(status, StatusCode::OK);
     // Content came from the SECOND provider.
     let content: String = chunks
         .iter()
-        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .filter_map(|c| {
+            c.pointer("/choices/0/delta/content")
+                .and_then(|v| v.as_str())
+        })
         .collect();
     assert_eq!(
         content, "BACKUP_ANSWER",
@@ -1978,10 +1987,9 @@ assert_eq!(status, StatusCode::OK);
     );
 
     // Ordering guard: relayed reasoning before the final content.
-    let first_reasoning = first_reasoning_index_in(&chunks)
-        .expect("relayed reasoning frames present");
-    let first_content = first_content_index_in(&chunks)
-        .expect("final content present");
+    let first_reasoning =
+        first_reasoning_index_in(&chunks).expect("relayed reasoning frames present");
+    let first_content = first_content_index_in(&chunks).expect("final content present");
     assert!(first_reasoning < first_content);
 }
 
@@ -2054,7 +2062,11 @@ async fn relay_midstream_failure_emits_error_and_logs_relayed_frames() {
     let app = server.build_router();
 
     let (status, raw) = send_streaming(app).await;
-    assert_eq!(status, StatusCode::OK, "early event forces a 200 SSE stream");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "early event forces a 200 SSE stream"
+    );
 
     let data_lines = raw_sse_data_lines(&raw);
     assert!(
@@ -2072,8 +2084,8 @@ async fn relay_midstream_failure_emits_error_and_logs_relayed_frames() {
 
     // The frame before [DONE] is the graceful aggregated error event.
     let error_line = &data_lines[data_lines.len() - 2];
-    let error_json: serde_json::Value = serde_json::from_str(error_line)
-        .expect("error frame before [DONE] must be valid JSON");
+    let error_json: serde_json::Value =
+        serde_json::from_str(error_line).expect("error frame before [DONE] must be valid JSON");
     assert!(error_json["error"].is_object());
     assert!(
         error_json["error"]["message"]
@@ -2199,7 +2211,9 @@ async fn relay_first_frame_carries_role_when_early_event_disabled() {
         "single role marker overall (the first relayed frame)"
     );
     assert_eq!(
-        chunks[0].pointer("/choices/0/delta/role").and_then(|v| v.as_str()),
+        chunks[0]
+            .pointer("/choices/0/delta/role")
+            .and_then(|v| v.as_str()),
         Some("assistant"),
         "the first chunk must be the role-bearing relayed reasoning frame"
     );
@@ -2224,10 +2238,10 @@ async fn relay_first_frame_carries_role_when_early_event_disabled() {
     }
 
     // Reasoning relayed before content.
-    let first_reasoning = first_reasoning_index_in(&chunks)
-        .expect("at least one reasoning frame must be relayed");
-    let first_content = first_content_index_in(&chunks)
-        .expect("final content must be present in the replay");
+    let first_reasoning =
+        first_reasoning_index_in(&chunks).expect("at least one reasoning frame must be relayed");
+    let first_content =
+        first_content_index_in(&chunks).expect("final content must be present in the replay");
     assert!(
         first_reasoning < first_content,
         "relayed reasoning (index {first_reasoning}) must precede the first content frame (index {first_content})"
@@ -2260,7 +2274,10 @@ async fn relay_first_frame_carries_role_when_early_event_disabled() {
     // Final content complete.
     let replay_content: String = chunks
         .iter()
-        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .filter_map(|c| {
+            c.pointer("/choices/0/delta/content")
+                .and_then(|v| v.as_str())
+        })
         .collect();
     assert_eq!(
         replay_content, "Hello from mock provider!",
@@ -2342,10 +2359,7 @@ async fn relay_site3_buffered_arm_relays_reasoning() {
     assert_eq!(status, StatusCode::OK);
 
     let data_lines = raw_sse_data_lines(&raw);
-    let done_count = data_lines
-        .iter()
-        .filter(|l| l.as_str() == "[DONE]")
-        .count();
+    let done_count = data_lines.iter().filter(|l| l.as_str() == "[DONE]").count();
     assert_eq!(done_count, 1, "exactly one [DONE] sentinel");
     assert!(
         data_lines.last().map(String::as_str) == Some("[DONE]"),
@@ -2358,8 +2372,8 @@ async fn relay_site3_buffered_arm_relays_reasoning() {
     // Reasoning relayed live BEFORE the final assembled content.
     let first_reasoning = first_reasoning_index_in(&chunks)
         .expect("site 3 must relay reasoning live while buffering for post-call");
-    let first_content = first_content_index_in(&chunks)
-        .expect("final assembled content must be present");
+    let first_content =
+        first_content_index_in(&chunks).expect("final assembled content must be present");
     assert!(
         first_reasoning < first_content,
         "relayed reasoning (index {first_reasoning}) must precede the assembled content (index {first_content})"
@@ -2375,7 +2389,10 @@ async fn relay_site3_buffered_arm_relays_reasoning() {
     // Final assembled response intact after the benign post-call pass.
     let replay_content: String = chunks
         .iter()
-        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .filter_map(|c| {
+            c.pointer("/choices/0/delta/content")
+                .and_then(|v| v.as_str())
+        })
         .collect();
     assert_eq!(
         replay_content, "Hello from mock provider!",
@@ -2396,16 +2413,8 @@ async fn relay_multibyte_reasoning_split_across_chunks_survives() {
     // the bytes at split1/split2 must be UTF-8 continuation bytes (10xxxxxx).
     let split1 = char_start + 1;
     let split2 = char_start + 4;
-    assert_eq!(
-        bytes[split1] & 0xC0,
-        0x80,
-        "split1 must land mid-character"
-    );
-    assert_eq!(
-        bytes[split2] & 0xC0,
-        0x80,
-        "split2 must land mid-character"
-    );
+    assert_eq!(bytes[split1] & 0xC0, 0x80, "split1 must land mid-character");
+    assert_eq!(bytes[split2] & 0xC0, 0x80, "split2 must land mid-character");
 
     let uri = start_paced_sse_mock_raw(
         vec![
@@ -2445,7 +2454,10 @@ async fn relay_multibyte_reasoning_split_across_chunks_survives() {
 
     let replay_content: String = chunks
         .iter()
-        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(|v| v.as_str()))
+        .filter_map(|c| {
+            c.pointer("/choices/0/delta/content")
+                .and_then(|v| v.as_str())
+        })
         .collect();
     assert_eq!(
         replay_content, "final answer",

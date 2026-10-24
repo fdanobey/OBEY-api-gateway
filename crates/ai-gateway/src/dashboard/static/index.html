@@ -117,6 +117,12 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 .compression-detail-grid dt{color:var(--text);font-weight:600}
 .compression-detail-grid dd{overflow-wrap:anywhere}
 @media(max-width:700px){.compression-detail{min-width:12rem}.compression-detail-grid{grid-template-columns:1fr}}
+/* Security exposure banner (Req 1.8) */
+.sec-banner{position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;color:#fff;padding:.6rem 1rem;display:flex;align-items:center;gap:1rem;font-size:.9rem;box-shadow:var(--shadow)}
+.sec-banner .sec-banner-msg{flex:1}
+.sec-banner button{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.7);border-radius:4px;padding:.15rem .6rem;cursor:pointer;font:inherit}
+.sec-banner button:hover{background:rgba(255,255,255,.15)}
+body.sec-banner-active{padding-top:3.2rem}
 </style>
 </head>
 <body>
@@ -684,7 +690,7 @@ function seedRequestRateChart(){
     var tbody = $('inflight-tbody');
     var empty = $('inflight-empty');
     if(!list || !list.length){
-      tbody.innerHTML='';
+      tbody.innerHTML=''; /* xss-audit: static */
       empty.style.display='block';
       $('inflight-table').style.display='none';
       return;
@@ -727,7 +733,7 @@ function seedRequestRateChart(){
         + '<td>'+esc(vk)+'</td>'
         + '</tr>';
     });
-    tbody.innerHTML = html;
+    tbody.innerHTML = html; /* xss-audit: escaped via esc()/escHtml() in builder */
   }
 
 function renderProviders(providers, budgetStatus){
@@ -821,7 +827,7 @@ case 'last_failure_reason':va=a.last_failure_reason||'';vb=b.last_failure_reason
     });
 
     var tbody = $('provider-tbody');
-    if(!data.length){tbody.innerHTML='';$('provider-empty').style.display='block';return;}
+    if(!data.length){tbody.innerHTML=''; /* xss-audit: static */$('provider-empty').style.display='block';return;}
     $('provider-empty').style.display='none';
 
 var html='';
@@ -873,7 +879,7 @@ html+='<tr><td>'+esc(displayName)+'</td>'
  +'<td>'+budgetStateHtml(p.budgetStatus)+'</td>'
 +'<td>'+reasonHtml+'</td></tr>';
     });
-    tbody.innerHTML=html;
+    tbody.innerHTML=html; /* xss-audit: escaped via esc()/escHtml() in builder */
   }
 
   // Sortable headers
@@ -887,7 +893,7 @@ html+='<tr><td>'+esc(displayName)+'</td>'
 
   function renderCircuitBreakers(cbStates){
     var tbody=$('cb-tbody');
-    if(!cbStates||!cbStates.length){tbody.innerHTML='';$('cb-empty').style.display='block';return;}
+    if(!cbStates||!cbStates.length){tbody.innerHTML=''; /* xss-audit: static */$('cb-empty').style.display='block';return;}
     $('cb-empty').style.display='none';
     var html='';
     cbStates.forEach(function(entry){
@@ -899,12 +905,12 @@ html+='<tr><td>'+esc(displayName)+'</td>'
       html+='<tr><td>'+esc(provider)+'</td><td>'+esc(model)+'</td>'
         +'<td><span class="badge '+cls+'">'+esc(state)+'</span></td></tr>';
     });
-    tbody.innerHTML=html;
+    tbody.innerHTML=html; /* xss-audit: escaped via esc()/escHtml() in builder */
   }
 
   function renderCosts(costByProvider, total){
     var tbody=$('cost-tbody');
-    if(!costByProvider||!costByProvider.length){tbody.innerHTML='';$('cost-empty').style.display='block';return;}
+    if(!costByProvider||!costByProvider.length){tbody.innerHTML=''; /* xss-audit: static */$('cost-empty').style.display='block';return;}
     $('cost-empty').style.display='none';
 
     var html='';
@@ -913,7 +919,7 @@ html+='<tr><td>'+esc(displayName)+'</td>'
       var pct=total>0?((cost/total)*100).toFixed(1):'0.0';
       html+='<tr><td>'+esc(name)+'</td><td>'+fmtCost(cost)+'</td><td>'+pct+'%</td></tr>';
     });
-    tbody.innerHTML=html;
+    tbody.innerHTML=html; /* xss-audit: escaped via esc()/escHtml() in builder */
 
     if(costProviderChart){
       costProviderChart.data.labels=costByProvider.map(function(i){return i[0];});
@@ -924,7 +930,7 @@ html+='<tr><td>'+esc(displayName)+'</td>'
 
   function renderErrors(errors){
     var tbody=$('errors-tbody');
-    if(!errors||!errors.length){tbody.innerHTML='';$('errors-empty').style.display='block';return;}
+    if(!errors||!errors.length){tbody.innerHTML=''; /* xss-audit: static */$('errors-empty').style.display='block';return;}
     $('errors-empty').style.display='none';
 
     var html='';
@@ -943,7 +949,7 @@ html+='<tr><td>'+esc(displayName)+'</td>'
         +'<td class="failure-reason" title="'+esc(errorText)+'">'+esc(errorText)+'</td>'
         +'<td title="'+esc(trace)+'"><code>'+esc(trace.slice(0,8))+'</code></td></tr>';
     });
-    tbody.innerHTML=html;
+    tbody.innerHTML=html; /* xss-audit: escaped via esc()/escHtml() in builder */
   }
 
   // Human-readable text for the content-free error_class vocabulary
@@ -1223,7 +1229,7 @@ renderCosts(msg.data.cost_by_provider, msg.data.cumulative_cost);
   }
 
   $('log-filter-form').addEventListener('reset', function(){
-    setTimeout(function(){$('logs-tbody').innerHTML='';$('logs-empty').style.display='block';$('logs-empty').textContent='Use filters above to search logs';},0);
+    setTimeout(function(){$('logs-tbody').innerHTML=''; /* xss-audit: static */ $('logs-empty').style.display='block';$('logs-empty').textContent='Use filters above to search logs';},0);
   });
 
   // --- Fallback: poll metrics if WS unavailable ---
@@ -1721,7 +1727,7 @@ renderMemoryMetrics();
         + '<td>' + d.evictions + '</td>'
         + '<td style="font-size:.75rem">' + lastTime + '</td></tr>';
     });
-    tbody.innerHTML = html;
+    tbody.innerHTML = html; /* xss-audit: escaped via esc()/escHtml() in builder */
   }
 
   function escHtml(s) { var d = document.createElement('span'); d.textContent = s; return d.innerHTML; }
@@ -1756,7 +1762,43 @@ adminJson('/model/status').then(function(body){ $('sr-model').textContent=body.a
 adminJson('/ab-test/results').then(function(body){ $('sr-ab').textContent=JSON.stringify(body,null,2); }).catch(function(){});
 }
 
+// --- Security exposure banner ---
+var SEC_BANNER_KEY = 'sec-banner-dismissed';
+function renderSecurityBanner(mode) {
+  var banner = document.createElement('div');
+  banner.className = 'sec-banner';
+  banner.setAttribute('role','alert');
+  var msg = document.createElement('span');
+  msg.className = 'sec-banner-msg';
+  msg.textContent = 'Security warning (mode: ' + (mode || 'unknown') + '): this panel is exposed WITHOUT authentication on a non-loopback address. Set admin.auth credentials (username_env/password_env), or bind server.host to a loopback address, or firewall the port.';
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = 'Dismiss';
+  btn.addEventListener('click', function(){
+    banner.remove();
+    document.body.classList.remove('sec-banner-active');
+    try { sessionStorage.setItem(SEC_BANNER_KEY, '1'); } catch(e) { /* storage unavailable */ }
+  });
+  banner.appendChild(msg);
+  banner.appendChild(btn);
+  document.body.appendChild(banner);
+  document.body.classList.add('sec-banner-active');
+}
+function initSecurityBanner() {
+  fetch(adminBasePath + '/security-status', { signal: AbortSignal.timeout(10000) })
+    .then(function(r){ if(!r.ok) return null; return r.json(); })
+    .then(function(status){
+      if(!status || status.unauthenticated_non_loopback !== true) return;
+      var dismissed = false;
+      try { dismissed = sessionStorage.getItem(SEC_BANNER_KEY) === '1'; } catch(e) { /* storage unavailable */ }
+      if(dismissed) return;
+      renderSecurityBanner(status.mode);
+    })
+    .catch(function(err){ console.debug('security-status unavailable', err && err.message); });
+}
+
 // --- Init ---
+initSecurityBanner();
 initCharts();
 initTcSavingsChart();
 initMemoryCharts();

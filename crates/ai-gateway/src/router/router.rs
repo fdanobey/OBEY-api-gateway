@@ -5466,7 +5466,9 @@ impl Router {
                             total_deadline: started + total_timeout,
                             total_secs: total_timeout_secs,
                         };
-		match read_upstream_body(response, &limits, provider_name, relay.as_ref()).await {
+                        match read_upstream_body(response, &limits, provider_name, relay.as_ref())
+                            .await
+                        {
                             Ok(text) => Ok(Ok(text)),
                             Err(e) => {
                                 warn!(
@@ -12800,6 +12802,7 @@ mod tests {
 
     pub(super) fn create_test_config() -> Config {
         Config {
+            security: Default::default(),
             server: crate::config::ServerConfig {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
@@ -13619,9 +13622,11 @@ mod tests {
             Some(Duration::from_secs(10)),
             Duration::from_secs(30),
         );
-    let err = read_upstream_body(response, &limits, "p", None).await.unwrap_err();
-    assert!(matches!(err, GatewayError::TtfbTimeout(1)), "got {err:?}");
-}
+        let err = read_upstream_body(response, &limits, "p", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GatewayError::TtfbTimeout(1)), "got {err:?}");
+    }
 
     /// Key regression guard: a generation that keeps sending bytes must not be
     /// cut off by the TTFB timeout, however long it runs (up to the total cap).
@@ -13636,7 +13641,9 @@ mod tests {
             Duration::from_secs(30),
         );
         let started = tokio::time::Instant::now();
-        let body = read_upstream_body(response, &limits, "p", None).await.unwrap();
+        let body = read_upstream_body(response, &limits, "p", None)
+            .await
+            .unwrap();
         assert_eq!(body, "x".repeat(15));
         assert!(started.elapsed() >= Duration::from_secs(3));
     }
@@ -13652,26 +13659,30 @@ mod tests {
             Some(Duration::from_secs(1)),
             Duration::from_secs(30),
         );
-    let err = read_upstream_body(response, &limits, "p", None).await.unwrap_err();
-    assert!(matches!(err, GatewayError::ChunkTimeout(1)), "got {err:?}");
-}
+        let err = read_upstream_body(response, &limits, "p", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GatewayError::ChunkTimeout(1)), "got {err:?}");
+    }
 
-#[tokio::test(start_paused = true)]
-async fn buffered_sse_reader_total_timeout() {
-    let chunks: Vec<(Duration, &'static str)> =
-        (0..25).map(|_| (Duration::from_millis(200), "x")).collect();
-    let response = timed_body_response(chunks);
-    let limits = reader_limits(
-        Duration::from_secs(1),
-        Some(Duration::from_secs(1)),
-        Duration::from_secs(2),
-    );
-    let err = read_upstream_body(response, &limits, "p", None).await.unwrap_err();
-    assert!(matches!(err, GatewayError::TotalTimeout(2)), "got {err:?}");
-}
+    #[tokio::test(start_paused = true)]
+    async fn buffered_sse_reader_total_timeout() {
+        let chunks: Vec<(Duration, &'static str)> =
+            (0..25).map(|_| (Duration::from_millis(200), "x")).collect();
+        let response = timed_body_response(chunks);
+        let limits = reader_limits(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(2),
+        );
+        let err = read_upstream_body(response, &limits, "p", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GatewayError::TotalTimeout(2)), "got {err:?}");
+    }
 
-/// A full reasoning-first streamed turn the relay tests mount upstream.
-const RELAY_TURN_SSE: &str = concat!(
+    /// A full reasoning-first streamed turn the relay tests mount upstream.
+    const RELAY_TURN_SSE: &str = concat!(
     ": keep-alive\n\n",
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning\":\"step one\"}}],\"usage\":null}\n\n",
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-model\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"step two\"}}],\"usage\":null}\n\n",
@@ -13680,175 +13691,174 @@ const RELAY_TURN_SSE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
-/// Relayed RelayFrames drained after a body read completes.
-fn drain_relay(mut rx: tokio::sync::mpsc::Receiver<crate::reasoning_relay::RelayFrame>) -> Vec<String> {
-    let mut texts = Vec::new();
-    while let Ok(frame) = rx.try_recv() {
-        match frame {
-            crate::reasoning_relay::RelayFrame::Reasoning { text } => texts.push(text),
+    /// Relayed RelayFrames drained after a body read completes.
+    fn drain_relay(
+        mut rx: tokio::sync::mpsc::Receiver<crate::reasoning_relay::RelayFrame>,
+    ) -> Vec<String> {
+        let mut texts = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            match frame {
+                crate::reasoning_relay::RelayFrame::Reasoning { text } => texts.push(text),
+            }
         }
+        texts
     }
-    texts
-}
 
-#[tokio::test]
-async fn reasoning_frames_relayed_mid_read() {
-    let (relay, rx) = crate::reasoning_relay::RelayHandle::new();
-    let response = timed_body_response(vec![
+    #[tokio::test]
+    async fn reasoning_frames_relayed_mid_read() {
+        let (relay, rx) = crate::reasoning_relay::RelayHandle::new();
+        let response = timed_body_response(vec![
         (Duration::ZERO, ": keep-alive\n\n"),
         (Duration::ZERO, "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"step one\"}}]}\n\n"),
         (Duration::from_millis(100), "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"step two\"}}]}\n\n"),
         (Duration::from_millis(100), "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n"),
     ]);
-    let limits = reader_limits(
-        Duration::from_secs(1),
-        Some(Duration::from_secs(1)),
-        Duration::from_secs(5),
-    );
-    let body = read_upstream_body(response, &limits, "p", Some(&relay))
-        .await
-        .unwrap();
-    // Body unchanged: the tap scans but never mutates.
-    assert!(body.contains("\"reasoning\":\"step one\""));
-    assert!(body.contains("\"content\":\"Hello\""));
-    let frames = drain_relay(rx);
-    assert_eq!(frames, vec!["step one".to_string(), "step two".to_string()]);
-    assert_eq!(relay.sent(), 2);
-}
+        let limits = reader_limits(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(5),
+        );
+        let body = read_upstream_body(response, &limits, "p", Some(&relay))
+            .await
+            .unwrap();
+        // Body unchanged: the tap scans but never mutates.
+        assert!(body.contains("\"reasoning\":\"step one\""));
+        assert!(body.contains("\"content\":\"Hello\""));
+        let frames = drain_relay(rx);
+        assert_eq!(frames, vec!["step one".to_string(), "step two".to_string()]);
+        assert_eq!(relay.sent(), 2);
+    }
 
-#[tokio::test]
-async fn mixed_and_content_frames_are_not_relayed() {
-    let (relay, rx) = crate::reasoning_relay::RelayHandle::new();
-    let mixed = concat!(
+    #[tokio::test]
+    async fn mixed_and_content_frames_are_not_relayed() {
+        let (relay, rx) = crate::reasoning_relay::RelayHandle::new();
+        let mixed = concat!(
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"with content\",\"content\":\"txt\"}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"only\"}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"1\"}]}}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
-    let response = timed_body_response(vec![(Duration::ZERO, mixed)]);
-    let limits = reader_limits(
-        Duration::from_secs(1),
-        Some(Duration::from_secs(1)),
-        Duration::from_secs(5),
-    );
-    let body = read_upstream_body(response, &limits, "p", Some(&relay))
-        .await
-        .unwrap();
-    assert_eq!(body, mixed);
-    assert!(drain_relay(rx).is_empty());
-    assert_eq!(relay.sent(), 0);
-}
+        let response = timed_body_response(vec![(Duration::ZERO, mixed)]);
+        let limits = reader_limits(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(5),
+        );
+        let body = read_upstream_body(response, &limits, "p", Some(&relay))
+            .await
+            .unwrap();
+        assert_eq!(body, mixed);
+        assert!(drain_relay(rx).is_empty());
+        assert_eq!(relay.sent(), 0);
+    }
 
-#[tokio::test]
-async fn relay_none_path_returns_identical_body() {
-    let chunks: Vec<(Duration, &'static str)> = vec![
+    #[tokio::test]
+    async fn relay_none_path_returns_identical_body() {
+        let chunks: Vec<(Duration, &'static str)> = vec![
         (Duration::ZERO, ": keep-alive\n\n"),
         (Duration::ZERO, "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"r1\"}}]}\n\n"),
         (Duration::from_millis(50), "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"r2\"}}]}\n\n"),
         (Duration::from_millis(50), "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"),
     ];
-    let limits = reader_limits(
-        Duration::from_secs(1),
-        Some(Duration::from_secs(1)),
-        Duration::from_secs(5),
-    );
-    let expected: String = chunks.iter().map(|(_, c)| *c).collect();
-    let baseline = read_upstream_body(
-        timed_body_response(chunks.clone()),
-        &limits,
-        "p",
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(baseline, expected);
-    let (relay, rx) = crate::reasoning_relay::RelayHandle::new();
-    let with_relay = read_upstream_body(
-        timed_body_response(chunks.clone()),
-        &limits,
-        "p",
-        Some(&relay),
-    )
-    .await
-    .unwrap();
-    // Reasoning-bearing body: the tap relays both deltas out of band.
-    assert_eq!(with_relay, expected);
-    let frames = drain_relay(rx);
-    assert_eq!(frames, vec!["r1".to_string(), "r2".to_string()]);
-    assert_eq!(relay.sent(), 2);
-}
+        let limits = reader_limits(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(5),
+        );
+        let expected: String = chunks.iter().map(|(_, c)| *c).collect();
+        let baseline = read_upstream_body(timed_body_response(chunks.clone()), &limits, "p", None)
+            .await
+            .unwrap();
+        assert_eq!(baseline, expected);
+        let (relay, rx) = crate::reasoning_relay::RelayHandle::new();
+        let with_relay = read_upstream_body(
+            timed_body_response(chunks.clone()),
+            &limits,
+            "p",
+            Some(&relay),
+        )
+        .await
+        .unwrap();
+        // Reasoning-bearing body: the tap relays both deltas out of band.
+        assert_eq!(with_relay, expected);
+        let frames = drain_relay(rx);
+        assert_eq!(frames, vec!["r1".to_string(), "r2".to_string()]);
+        assert_eq!(relay.sent(), 2);
+    }
 
-#[tokio::test]
-async fn partial_line_across_chunks_relays_exactly_once() {
-    let (relay, rx) = crate::reasoning_relay::RelayHandle::new();
-    let full = "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"split brain\"}}]}\n\n";
-    let (first, second) = full.split_at(full.len() / 2);
-    let response = timed_body_response(vec![
+    #[tokio::test]
+    async fn partial_line_across_chunks_relays_exactly_once() {
+        let (relay, rx) = crate::reasoning_relay::RelayHandle::new();
+        let full =
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"split brain\"}}]}\n\n";
+        let (first, second) = full.split_at(full.len() / 2);
+        let response = timed_body_response(vec![
         (Duration::ZERO, ": ping\n\n"),
         (Duration::ZERO, first),
         (Duration::from_millis(50), second),
         (Duration::from_millis(50), "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"),
     ]);
-    let limits = reader_limits(
-        Duration::from_secs(1),
-        Some(Duration::from_secs(1)),
-        Duration::from_secs(5),
-    );
-    let body = read_upstream_body(response, &limits, "p", Some(&relay))
-        .await
-        .unwrap();
-    assert!(body.contains(full.trim()));
-    let frames = drain_relay(rx);
-    assert_eq!(frames, vec!["split brain".to_string()]);
-    assert_eq!(relay.sent(), 1);
-}
-
-#[tokio::test]
-async fn buffered_dispatch_relays_only_when_config_enabled() {
-    use crate::reasoning_relay::RelayHandle;
-    use wiremock::matchers::{method, path};
-
-    async fn run(relay_enabled: bool) -> (ActiveRequestHandle, crate::reasoning_relay::RelayHandle) {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(RELAY_TURN_SSE),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let mut config = create_test_config();
-        config.retry.max_retries_per_provider = 0;
-        config.streaming = Some(crate::config::StreamingConfig {
-            relay_reasoning_progress: relay_enabled,
-            ..crate::config::StreamingConfig::default()
-        });
-        config.providers = vec![test_provider("provider", server.uri())];
-        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
-        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
-
-        let handle = ledger_handle();
-        let (relay, _rx) = RelayHandle::new();
-        handle.attach_reasoning_relay(relay.clone());
-        router
-            .route_request(&compression_request(false), Some(handle.clone()))
+        let limits = reader_limits(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(5),
+        );
+        let body = read_upstream_body(response, &limits, "p", Some(&relay))
             .await
             .unwrap();
-        (handle, relay)
+        assert!(body.contains(full.trim()));
+        let frames = drain_relay(rx);
+        assert_eq!(frames, vec!["split brain".to_string()]);
+        assert_eq!(relay.sent(), 1);
     }
 
-    let (handle, relay) = run(true).await;
-    assert!(handle.reasoning_relay().is_some());
-    assert_eq!(relay.sent(), 2, "both reasoning deltas relayed");
+    #[tokio::test]
+    async fn buffered_dispatch_relays_only_when_config_enabled() {
+        use crate::reasoning_relay::RelayHandle;
+        use wiremock::matchers::{method, path};
 
-    let (_handle, relay) = run(false).await;
-    assert_eq!(relay.sent(), 0, "config off: nothing relayed");
-}
+        async fn run(
+            relay_enabled: bool,
+        ) -> (ActiveRequestHandle, crate::reasoning_relay::RelayHandle) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(RELAY_TURN_SSE),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut config = create_test_config();
+            config.retry.max_retries_per_provider = 0;
+            config.streaming = Some(crate::config::StreamingConfig {
+                relay_reasoning_progress: relay_enabled,
+                ..crate::config::StreamingConfig::default()
+            });
+            config.providers = vec![test_provider("provider", server.uri())];
+            config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+            let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
+            let handle = ledger_handle();
+            let (relay, _rx) = RelayHandle::new();
+            handle.attach_reasoning_relay(relay.clone());
+            router
+                .route_request(&compression_request(false), Some(handle.clone()))
+                .await
+                .unwrap();
+            (handle, relay)
+        }
+
+        let (handle, relay) = run(true).await;
+        assert!(handle.reasoning_relay().is_some());
+        assert_eq!(relay.sent(), 2, "both reasoning deltas relayed");
+
+        let (_handle, relay) = run(false).await;
+        assert_eq!(relay.sent(), 0, "config off: nothing relayed");
+    }
 
     /// Parsed JSON bodies of every chat-completions request the mock received.
     async fn received_chat_bodies(server: &MockServer) -> Vec<serde_json::Value> {

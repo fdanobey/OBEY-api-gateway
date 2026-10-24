@@ -97,33 +97,71 @@ pub enum ValidationError {
         max: usize,
     },
 
-#[error("Guardrail pipeline '{pipeline_name}' stage {stage_index} uses action '{action}' which is invalid for phase '{phase}'")]
-GuardrailInvalidPhaseAction {
-    pipeline_name: String,
-    stage_index: usize,
-    phase: String,
-    action: String,
-},
+    #[error("Guardrail pipeline '{pipeline_name}' stage {stage_index} uses action '{action}' which is invalid for phase '{phase}'")]
+    GuardrailInvalidPhaseAction {
+        pipeline_name: String,
+        stage_index: usize,
+        phase: String,
+        action: String,
+    },
 
-#[error("Guardrail provider '{provider}' unicode_stego field '{field}' must be within {min}..={max}, got: {value}")]
-GuardrailStegoThresholdOutOfRange {
-    provider: String,
-    field: String,
-    value: u32,
-    min: u32,
-    max: u32,
-},
+    #[error("Guardrail provider '{provider}' unicode_stego field '{field}' must be within {min}..={max}, got: {value}")]
+    GuardrailStegoThresholdOutOfRange {
+        provider: String,
+        field: String,
+        value: u32,
+        min: u32,
+        max: u32,
+    },
 
-#[error("Guardrail pipeline '{pipeline_name}' refusal_phrase_list entry {index} is invalid: {reason} (pattern: '{pattern}')")]
-GuardrailInvalidRefusalPhrase {
+    #[error("Guardrail pipeline '{pipeline_name}' refusal_phrase_list entry {index} is invalid: {reason} (pattern: '{pattern}')")]
+    GuardrailInvalidRefusalPhrase {
         pipeline_name: String,
         index: usize,
         pattern: String,
         reason: String,
     },
+
+    // --- CORS validation (black-october-security-hardening, Req 4.2) ---
+    #[error(
+        "Invalid CORS configuration: wildcard origin '*' combined with Authorization-header \
+         access. {reason}. Fix: replace '*' in cors.allowed_origins with the explicit list of \
+         trusted origins (e.g. ['http://localhost:3000']); wildcard CORS that lets any website \
+         send Authorization headers enables browser-based cross-origin attacks (the OpenCode \
+         localhost-attack class) where a malicious page on a LAN client reads gateway responses"
+    )]
+    CorsWildcardWithCredentials { reason: String },
 }
 
 pub type ValidationResult<T> = Result<T, Vec<ValidationError>>;
+
+/// Returns the offending credential channel when wildcard CORS origins are
+/// combined with Authorization-header exposure (black-october-security-
+/// hardening, Req 4.2). `None` when the combination is safe.
+fn cors_wildcard_credentials_reason(cors: &CorsConfig) -> Option<String> {
+    if !cors.enabled || !cors.allowed_origins.iter().any(|o| o == "*") {
+        return None;
+    }
+    if cors
+        .allowed_headers
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case("authorization") || h == "*")
+    {
+        Some(
+            "cors.allowed_headers includes 'Authorization' (or the wildcard \
+            '*', which covers it) while cors.allowed_origins includes '*'"
+                .to_string(),
+        )
+    } else if cors.allow_credentials {
+        Some(
+            "cors.allow_credentials is true while cors.allowed_origins \
+             includes '*'"
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
 
 /// Resolve configuration file path using priority order:
 /// 1. --config CLI flag
@@ -202,6 +240,13 @@ impl Config {
                         expected: "a valid loop detection configuration".to_string(),
                     }),
             );
+        }
+
+        // Validate CORS (black-october-security-hardening, Req 4.2): wildcard
+        // origins must not be combined with Authorization-header exposure
+        // (allowed_headers) or credentialed access.
+        if let Some(reason) = cors_wildcard_credentials_reason(&self.cors) {
+            errors.push(ValidationError::CorsWildcardWithCredentials { reason });
         }
 
         let configured_provider_names: std::collections::HashSet<&str> = self
@@ -509,37 +554,35 @@ impl Config {
             });
         }
 
-// stickiness_ttl_seconds: 0 is allowed (stickiness disabled), even
-// when cache-aware routing is enabled — warn so the intent is visible.
-if self.cache_aware_routing.enabled
-&& self.cache_aware_routing.stickiness_ttl_seconds == 0
-{
-tracing::warn!(
-"cache_aware_routing.enabled is true but stickiness_ttl_seconds is 0 — \
+        // stickiness_ttl_seconds: 0 is allowed (stickiness disabled), even
+        // when cache-aware routing is enabled — warn so the intent is visible.
+        if self.cache_aware_routing.enabled && self.cache_aware_routing.stickiness_ttl_seconds == 0
+        {
+            tracing::warn!(
+                "cache_aware_routing.enabled is true but stickiness_ttl_seconds is 0 — \
 prefix stickiness is disabled and routing uses normal priority/cost/latency sorting"
-);
-}
+            );
+        }
 
-// Validate reasoning_compat (reasoning-failover-compat spec, Task 6
-// wiring): effort-map completeness/budget floors and per_provider
-// override keys referencing configured providers. Runs on load and
-// hot-reload alongside the other section validations.
-let known_provider_names: Vec<&str> = self
-.providers
-.iter()
-.map(|provider| provider.name.as_str())
-.collect();
-if let Err(reasoning_compat_errors) =
-self.reasoning_compat.validate(&known_provider_names)
-{
-errors.extend(reasoning_compat_errors.into_iter().map(|error| {
-ValidationError::InvalidValue {
-field: "reasoning_compat".to_string(),
-value: error,
-expected: "a valid reasoning compatibility configuration".to_string(),
-}
-}));
-}
+        // Validate reasoning_compat (reasoning-failover-compat spec, Task 6
+        // wiring): effort-map completeness/budget floors and per_provider
+        // override keys referencing configured providers. Runs on load and
+        // hot-reload alongside the other section validations.
+        let known_provider_names: Vec<&str> = self
+            .providers
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect();
+        if let Err(reasoning_compat_errors) = self.reasoning_compat.validate(&known_provider_names)
+        {
+            errors.extend(reasoning_compat_errors.into_iter().map(|error| {
+                ValidationError::InvalidValue {
+                    field: "reasoning_compat".to_string(),
+                    value: error,
+                    expected: "a valid reasoning compatibility configuration".to_string(),
+                }
+            }));
+        }
 
         if let Some(ref codex_search) = self.codex_search {
             if let Err(msg) = codex_search.validate() {
@@ -634,8 +677,7 @@ expected: "a valid reasoning compatibility configuration".to_string(),
                     });
                 }
 
-                if let Some(PromptCacheSupport::Explicit { max_breakpoints }) =
-                    &model.cache_support
+                if let Some(PromptCacheSupport::Explicit { max_breakpoints }) = &model.cache_support
                 {
                     if !(1..=4).contains(max_breakpoints) {
                         errors.push(ValidationError::InvalidValue {
@@ -909,10 +951,7 @@ expected: "a valid reasoning compatibility configuration".to_string(),
             if provider.provider_type == GuardrailProviderType::UnicodeStego {
                 let stego = &provider.settings.unicode_stego;
                 let thresholds = [
-                    (
-                        "zero_width_threshold",
-                        stego.zero_width_threshold,
-                    ),
+                    ("zero_width_threshold", stego.zero_width_threshold),
                     ("tag_chars_threshold", stego.tag_chars_threshold),
                     ("bidi_threshold", stego.bidi_threshold),
                 ];
@@ -1160,6 +1199,7 @@ mod property_tests {
     // Helper to create minimal valid config
     fn minimal_valid_config() -> Config {
         Config {
+            security: Default::default(),
             server: ServerConfig {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
@@ -1189,9 +1229,9 @@ mod property_tests {
                 rate_limit_max_wait_ms: None,
                 max_connections: 100,
                 rate_limit_per_minute: 0,
-        custom_headers: Default::default(),
-        user_agent: None,
-        connection_pool: ProviderConnectionPoolConfig::default(),
+                custom_headers: Default::default(),
+                user_agent: None,
+                connection_pool: ProviderConnectionPoolConfig::default(),
                 budget: None,
                 manual_models: vec![],
                 global_inference_profile: false,
@@ -1212,24 +1252,24 @@ mod property_tests {
                 compression: None,
                 memory: None,
                 structured_output: None,
-        models: vec![ProviderModel {
-            provider: "test-provider".to_string(),
-            model: "gpt-4".to_string(),
-            cost_per_million_input_tokens: 10.0,
-            cost_per_million_output_tokens: 30.0,
-            priority: 100,
-            structured_output_passthrough: None,
-            tier: None,
-            context_window: 0,
-            specializations: vec![],
-            cost_per_million_cache_read_input_tokens: None,
-            cost_per_million_cache_creation_input_tokens: None,
-            cache_min_tokens: None,
-cache_support: None,
-cost_per_million_reasoning_tokens: None,
-reasoning_family: None,
-reasoning_parameter: None,
-}],
+                models: vec![ProviderModel {
+                    provider: "test-provider".to_string(),
+                    model: "gpt-4".to_string(),
+                    cost_per_million_input_tokens: 10.0,
+                    cost_per_million_output_tokens: 30.0,
+                    priority: 100,
+                    structured_output_passthrough: None,
+                    tier: None,
+                    context_window: 0,
+                    specializations: vec![],
+                    cost_per_million_cache_read_input_tokens: None,
+                    cost_per_million_cache_creation_input_tokens: None,
+                    cache_min_tokens: None,
+                    cache_support: None,
+                    cost_per_million_reasoning_tokens: None,
+                    reasoning_family: None,
+                    reasoning_parameter: None,
+                }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
             retry: RetryConfig::default(),
@@ -1250,13 +1290,13 @@ reasoning_parameter: None,
             guardrails: None,
             tool_compression: Default::default(),
             smart_routing: Default::default(),
-        xhigh_models_allowlist: Default::default(),
-        reasoning_models_allowlist: Default::default(),
-        codex_search: None,
-cache_aware_routing: Default::default(),
-reasoning_compat: Default::default(),
-}
-}
+            xhigh_models_allowlist: Default::default(),
+            reasoning_models_allowlist: Default::default(),
+            codex_search: None,
+            cache_aware_routing: Default::default(),
+            reasoning_compat: Default::default(),
+        }
+    }
 
     #[test]
     fn smart_routing_unknown_group_keys_are_rejected() {
@@ -1279,92 +1319,92 @@ reasoning_compat: Default::default(),
             ValidationError::InvalidValue { field, .. }
                 if field == "smart_routing.model_group_overrides.missing-override"
         )));
-    assert!(errors.iter().any(|error| matches!(
-        error,
-        ValidationError::InvalidValue { field, .. }
-        if field == "smart_routing.budget_limits.missing-budget"
-    )));
-}
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, .. }
+            if field == "smart_routing.budget_limits.missing-budget"
+        )));
+    }
 
-#[test]
-fn cache_aware_routing_hit_rate_boundaries_are_valid() {
-    for hit_rate in [0.0, 1.0] {
+    #[test]
+    fn cache_aware_routing_hit_rate_boundaries_are_valid() {
+        for hit_rate in [0.0, 1.0] {
+            let mut config = minimal_valid_config();
+            config.cache_aware_routing.enabled = true;
+            config.cache_aware_routing.cost_sort_hit_rate = hit_rate;
+            assert!(
+                config.validate().is_ok(),
+                "hit_rate {hit_rate} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_aware_routing_hit_rate_out_of_range_is_rejected() {
+        for hit_rate in [1.5, -0.1] {
+            let mut config = minimal_valid_config();
+            config.cache_aware_routing.enabled = true;
+            config.cache_aware_routing.cost_sort_hit_rate = hit_rate;
+            let errors = config.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error,
+                    ValidationError::InvalidValue { field, .. }
+                    if field == "cache_aware_routing.cost_sort_hit_rate"
+                )),
+                "hit_rate {hit_rate} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_cache_aware_routing_section_is_valid() {
+        // Defaults from an absent section: disabled, valid hit rate.
+        let config = minimal_valid_config();
+        assert!(!config.cache_aware_routing.enabled);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_stickiness_ttl_with_enabled_routing_is_allowed() {
+        // ttl 0 = stickiness disabled; allowed even when enabled.
         let mut config = minimal_valid_config();
         config.cache_aware_routing.enabled = true;
-        config.cache_aware_routing.cost_sort_hit_rate = hit_rate;
-        assert!(
-            config.validate().is_ok(),
-            "hit_rate {hit_rate} should be valid"
-        );
+        config.cache_aware_routing.stickiness_ttl_seconds = 0;
+        assert!(config.validate().is_ok());
     }
-}
 
-#[test]
-fn cache_aware_routing_hit_rate_out_of_range_is_rejected() {
-    for hit_rate in [1.5, -0.1] {
-        let mut config = minimal_valid_config();
-        config.cache_aware_routing.enabled = true;
-        config.cache_aware_routing.cost_sort_hit_rate = hit_rate;
-        let errors = config.validate().unwrap_err();
-        assert!(
-            errors.iter().any(|error| matches!(
-                error,
-                ValidationError::InvalidValue { field, .. }
-                if field == "cache_aware_routing.cost_sort_hit_rate"
-            )),
-            "hit_rate {hit_rate} should be rejected"
-        );
+    #[test]
+    fn explicit_cache_breakpoint_boundaries_are_valid() {
+        for max_breakpoints in [1u32, 4] {
+            let mut config = minimal_valid_config();
+            config.model_groups[0].models[0].cache_support =
+                Some(PromptCacheSupport::Explicit { max_breakpoints });
+            assert!(
+                config.validate().is_ok(),
+                "max_breakpoints {max_breakpoints} should be valid"
+            );
+        }
     }
-}
 
-#[test]
-fn absent_cache_aware_routing_section_is_valid() {
-    // Defaults from an absent section: disabled, valid hit rate.
-    let config = minimal_valid_config();
-    assert!(!config.cache_aware_routing.enabled);
-    assert!(config.validate().is_ok());
-}
-
-#[test]
-fn zero_stickiness_ttl_with_enabled_routing_is_allowed() {
-    // ttl 0 = stickiness disabled; allowed even when enabled.
-    let mut config = minimal_valid_config();
-    config.cache_aware_routing.enabled = true;
-    config.cache_aware_routing.stickiness_ttl_seconds = 0;
-    assert!(config.validate().is_ok());
-}
-
-#[test]
-fn explicit_cache_breakpoint_boundaries_are_valid() {
-    for max_breakpoints in [1u32, 4] {
-        let mut config = minimal_valid_config();
-        config.model_groups[0].models[0].cache_support =
-            Some(PromptCacheSupport::Explicit { max_breakpoints });
-        assert!(
-            config.validate().is_ok(),
-            "max_breakpoints {max_breakpoints} should be valid"
-        );
+    #[test]
+    fn explicit_cache_breakpoints_out_of_range_are_rejected() {
+        for max_breakpoints in [0u32, 5] {
+            let mut config = minimal_valid_config();
+            config.model_groups[0].models[0].cache_support =
+                Some(PromptCacheSupport::Explicit { max_breakpoints });
+            let errors = config.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error,
+                    ValidationError::InvalidValue { field, .. }
+                    if field
+                        == "model_groups.test-group.models.gpt-4.cache_support.max_breakpoints"
+                )),
+                "max_breakpoints {max_breakpoints} should be rejected"
+            );
+        }
     }
-}
-
-#[test]
-fn explicit_cache_breakpoints_out_of_range_are_rejected() {
-    for max_breakpoints in [0u32, 5] {
-        let mut config = minimal_valid_config();
-        config.model_groups[0].models[0].cache_support =
-            Some(PromptCacheSupport::Explicit { max_breakpoints });
-        let errors = config.validate().unwrap_err();
-        assert!(
-            errors.iter().any(|error| matches!(
-                error,
-                ValidationError::InvalidValue { field, .. }
-                if field
-                    == "model_groups.test-group.models.gpt-4.cache_support.max_breakpoints"
-            )),
-            "max_breakpoints {max_breakpoints} should be rejected"
-        );
-    }
-}
 
     #[test]
     fn provider_model_context_and_duplicate_specializations_are_rejected() {
@@ -1387,141 +1427,241 @@ fn explicit_cache_breakpoints_out_of_range_are_rejected() {
         )));
     }
 
-#[test]
-fn provider_model_zero_and_plausible_context_windows_are_valid() {
-    let mut config = minimal_valid_config();
-    config.model_groups[0].models[0].context_window = 0;
-    assert!(config.validate().is_ok());
-    config.model_groups[0].models[0].context_window = 1_000_000;
-    assert!(config.validate().is_ok());
-}
-
-// Context Overflow Management, Task 1.3: validation of the new
-// ContextConfig overflow fields. **Validates: Requirements US-2, US-3**
-
-fn context_overflow_error_fields(config: &Config) -> Vec<String> {
-    config
-        .validate()
-        .expect_err("config should be invalid")
-        .iter()
-        .filter_map(|error| match error {
-            ValidationError::InvalidValue { field, .. } if field.starts_with("context.") => {
-                Some(field.clone())
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-#[test]
-fn context_overflow_defaults_are_valid() {
-    let config = minimal_valid_config();
-    assert!(!config.context.proactive_enforcement);
-    assert_eq!(config.context.overflow_policy, "reduce");
-    assert_eq!(config.context.reduction_strategy, "remove_oldest");
-    assert!(config.validate().is_ok());
-}
-
-#[test]
-fn context_overflow_policy_values_are_validated() {
-    for policy in [
-        "reject",
-        "route_larger_context",
-        "reduce",
-        "route_then_reduce",
-    ] {
+    #[test]
+    fn provider_model_zero_and_plausible_context_windows_are_valid() {
         let mut config = minimal_valid_config();
-        config.context.overflow_policy = policy.to_string();
-        assert!(
-            config.validate().is_ok(),
-            "policy {policy} should be valid"
+        config.model_groups[0].models[0].context_window = 0;
+        assert!(config.validate().is_ok());
+        config.model_groups[0].models[0].context_window = 1_000_000;
+        assert!(config.validate().is_ok());
+    }
+
+    // --- CORS validation (black-october-security-hardening, Req 4.2) ---
+
+    #[test]
+    fn cors_wildcard_with_authorization_header_is_rejected() {
+        let mut config = minimal_valid_config();
+        config.cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["Content-Type".to_string(), "Authorization".to_string()],
+            allow_credentials: false,
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::CorsWildcardWithCredentials { reason }
+                if reason.contains("Authorization")
+        )));
+    }
+
+    #[test]
+    fn cors_wildcard_with_allow_credentials_is_rejected() {
+        let mut config = minimal_valid_config();
+        config.cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["Content-Type".to_string()],
+            allow_credentials: true,
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::CorsWildcardWithCredentials { reason }
+            if reason.contains("allow_credentials")
+        )));
+    }
+
+    /// C11: a literal `"*"` in allowed_headers covers Authorization, so a
+    /// wildcard origin plus wildcard headers must be rejected as an
+    /// Authorization-exposing combo.
+    #[test]
+    fn cors_wildcard_origin_with_wildcard_headers_is_rejected() {
+        let mut config = minimal_valid_config();
+        config.cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["*".to_string()],
+            allow_credentials: false,
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::CorsWildcardWithCredentials { reason }
+            if reason.contains("Authorization")
+        )));
+    }
+
+    #[test]
+    fn cors_explicit_origins_with_authorization_are_valid() {
+        let mut config = minimal_valid_config();
+        config.cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["http://localhost:3000".to_string()],
+            allowed_methods: vec!["GET".to_string(), "POST".to_string()],
+            allowed_headers: vec!["Content-Type".to_string(), "Authorization".to_string()],
+            allow_credentials: true,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn cors_wildcard_alone_without_auth_combo_is_valid() {
+        let mut config = minimal_valid_config();
+        config.cors = CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["Content-Type".to_string()],
+            allow_credentials: false,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn cors_empty_default_origins_are_valid() {
+        // New default (Req 4.1): empty allowed_origins, no CORS headers emitted.
+        let config = minimal_valid_config();
+        assert!(config.cors.allowed_origins.is_empty());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn cors_disabled_wildcard_auth_combo_is_not_flagged() {
+        // Validation only guards enabled CORS; a disabled section is inert.
+        let mut config = minimal_valid_config();
+        config.cors = CorsConfig {
+            enabled: false,
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["Authorization".to_string()],
+            allow_credentials: true,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    // Context Overflow Management, Task 1.3: validation of the new
+    // ContextConfig overflow fields. **Validates: Requirements US-2, US-3**
+
+    fn context_overflow_error_fields(config: &Config) -> Vec<String> {
+        config
+            .validate()
+            .expect_err("config should be invalid")
+            .iter()
+            .filter_map(|error| match error {
+                ValidationError::InvalidValue { field, .. } if field.starts_with("context.") => {
+                    Some(field.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn context_overflow_defaults_are_valid() {
+        let config = minimal_valid_config();
+        assert!(!config.context.proactive_enforcement);
+        assert_eq!(config.context.overflow_policy, "reduce");
+        assert_eq!(config.context.reduction_strategy, "remove_oldest");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn context_overflow_policy_values_are_validated() {
+        for policy in [
+            "reject",
+            "route_larger_context",
+            "reduce",
+            "route_then_reduce",
+        ] {
+            let mut config = minimal_valid_config();
+            config.context.overflow_policy = policy.to_string();
+            assert!(config.validate().is_ok(), "policy {policy} should be valid");
+        }
+
+        let mut config = minimal_valid_config();
+        config.context.overflow_policy = "explode".to_string();
+        assert_eq!(
+            context_overflow_error_fields(&config),
+            vec!["context.overflow_policy".to_string()]
         );
     }
 
-    let mut config = minimal_valid_config();
-    config.context.overflow_policy = "explode".to_string();
-    assert_eq!(
-        context_overflow_error_fields(&config),
-        vec!["context.overflow_policy".to_string()]
-    );
-}
+    #[test]
+    fn context_reduction_strategy_values_are_validated() {
+        for strategy in ["remove_oldest", "sliding_window", "clear_tools_then_remove"] {
+            let mut config = minimal_valid_config();
+            config.context.reduction_strategy = strategy.to_string();
+            assert!(
+                config.validate().is_ok(),
+                "strategy {strategy} should be valid"
+            );
+        }
 
-#[test]
-fn context_reduction_strategy_values_are_validated() {
-    for strategy in [
-        "remove_oldest",
-        "sliding_window",
-        "clear_tools_then_remove",
-    ] {
         let mut config = minimal_valid_config();
-        config.context.reduction_strategy = strategy.to_string();
-        assert!(
-            config.validate().is_ok(),
-            "strategy {strategy} should be valid"
+        config.context.reduction_strategy = "compress".to_string();
+        assert_eq!(
+            context_overflow_error_fields(&config),
+            vec!["context.reduction_strategy".to_string()]
         );
     }
 
-    let mut config = minimal_valid_config();
-    config.context.reduction_strategy = "compress".to_string();
-    assert_eq!(
-        context_overflow_error_fields(&config),
-        vec!["context.reduction_strategy".to_string()]
-    );
-}
+    #[test]
+    fn context_summarize_then_trim_requires_summarize_model() {
+        let mut config = minimal_valid_config();
+        config.context.reduction_strategy = "summarize_then_trim".to_string();
+        assert_eq!(
+            context_overflow_error_fields(&config),
+            vec!["context.summarize_model".to_string()]
+        );
 
-#[test]
-fn context_summarize_then_trim_requires_summarize_model() {
-    let mut config = minimal_valid_config();
-    config.context.reduction_strategy = "summarize_then_trim".to_string();
-    assert_eq!(
-        context_overflow_error_fields(&config),
-        vec!["context.summarize_model".to_string()]
-    );
+        config.context.summarize_model = Some("gpt-4o-mini".to_string());
+        assert!(config.validate().is_ok());
+    }
 
-    config.context.summarize_model = Some("gpt-4o-mini".to_string());
-    assert!(config.validate().is_ok());
-}
+    #[test]
+    fn context_summarize_target_must_be_strictly_below_trigger() {
+        let mut config = minimal_valid_config();
+        config.context.summarize_target_percent = 80;
+        assert_eq!(
+            context_overflow_error_fields(&config),
+            vec!["context.summarize_target_percent".to_string()]
+        );
 
-#[test]
-fn context_summarize_target_must_be_strictly_below_trigger() {
-    let mut config = minimal_valid_config();
-    config.context.summarize_target_percent = 80;
-    assert_eq!(
-        context_overflow_error_fields(&config),
-        vec!["context.summarize_target_percent".to_string()]
-    );
+        let mut config = minimal_valid_config();
+        config.context.summarize_target_percent = 90;
+        config.context.summarize_trigger_percent = 90;
+        assert_eq!(
+            context_overflow_error_fields(&config),
+            vec!["context.summarize_target_percent".to_string()]
+        );
+    }
 
-    let mut config = minimal_valid_config();
-    config.context.summarize_target_percent = 90;
-    config.context.summarize_trigger_percent = 90;
-    assert_eq!(
-        context_overflow_error_fields(&config),
-        vec!["context.summarize_target_percent".to_string()]
-    );
-}
+    #[test]
+    fn context_summarize_trigger_percent_must_be_in_range_1_to_100() {
+        let mut config = minimal_valid_config();
+        config.context.summarize_trigger_percent = 101;
+        assert_eq!(
+            context_overflow_error_fields(&config),
+            vec!["context.summarize_trigger_percent".to_string()]
+        );
 
-#[test]
-fn context_summarize_trigger_percent_must_be_in_range_1_to_100() {
-    let mut config = minimal_valid_config();
-    config.context.summarize_trigger_percent = 101;
-    assert_eq!(
-        context_overflow_error_fields(&config),
-        vec!["context.summarize_trigger_percent".to_string()]
-    );
+        let mut config = minimal_valid_config();
+        config.context.summarize_trigger_percent = 0;
+        assert_eq!(
+            context_overflow_error_fields(&config),
+            vec!["context.summarize_trigger_percent".to_string()],
+            "trigger=0 must be reported on the trigger field, not on target"
+        );
 
-    let mut config = minimal_valid_config();
-    config.context.summarize_trigger_percent = 0;
-    assert_eq!(
-        context_overflow_error_fields(&config),
-        vec!["context.summarize_trigger_percent".to_string()],
-        "trigger=0 must be reported on the trigger field, not on target"
-    );
-
-    let mut config = minimal_valid_config();
-    config.context.summarize_trigger_percent = 100;
-    config.context.summarize_target_percent = 99;
-    assert!(config.validate().is_ok());
-}
+        let mut config = minimal_valid_config();
+        config.context.summarize_trigger_percent = 100;
+        config.context.summarize_target_percent = 99;
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn test_load_config_resolves_plaintext_provider_key_to_runtime_only() {
@@ -2508,7 +2648,11 @@ model_groups:
 
     #[test]
     fn test_guardrail_stego_threshold_out_of_range_rejected() {
-        for field in ["zero_width_threshold", "tag_chars_threshold", "bidi_threshold"] {
+        for field in [
+            "zero_width_threshold",
+            "tag_chars_threshold",
+            "bidi_threshold",
+        ] {
             let mut guardrails = minimal_guardrails();
             let mut provider = stego_provider("stego");
             let yaml = format!("{field}: 1001");

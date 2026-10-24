@@ -4,7 +4,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use thiserror::Error;
 
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
     models::openai::Usage as OpenAIUsage,
     router::cache_cost::{compute_actual_cost, extract_cache_usage},
     router::sticky_cache::CacheUsage,
+    security::redact::redact_secrets,
 };
 
 #[derive(Debug, Error)]
@@ -694,13 +695,10 @@ impl BodySanitizer {
         self.apply_size_limit(&excluded)
     }
 
-    /// Redact API keys and authorization tokens from text
+    /// Redact credential spans (sk- keys, AWS keys, Bearer tokens,
+    /// Authorization/api_key values) via the security redaction layer.
     fn redact_api_keys(&self, text: &str) -> String {
-        let mut result = text.to_string();
-        for (pattern, replacement) in REDACTION_RULES.iter() {
-            result = pattern.replace_all(&result, *replacement).to_string();
-        }
-        result
+        redact_secrets(text)
     }
 
     /// Exclude configured fields from JSON body
@@ -760,27 +758,6 @@ impl BodySanitizer {
         }
     }
 }
-
-/// Precompiled redaction rules; compiling these per call dominated the old
-/// synchronous write path.
-static REDACTION_RULES: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::new(|| {
-    use regex::Regex;
-    vec![
-        // OpenAI keys: sk-... with 20+ chars (covers sk-proj-..., sk-svcacct-..., etc.)
-        (Regex::new(r"sk-[a-zA-Z0-9_\-]{20,}").unwrap(), "[REDACTED]"),
-        (
-            Regex::new(r"Bearer\s+[a-zA-Z0-9\-_.]+").unwrap(),
-            "Bearer [REDACTED]",
-        ),
-        (
-            Regex::new(r#"(?i)(api[_-]?key|authorization)["']?\s*[:=]\s*["']?[a-zA-Z0-9\-_.]+"#)
-                .unwrap(),
-            "$1: [REDACTED]",
-        ),
-        // AWS access keys: AKIA...
-        (Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(), "[REDACTED]"),
-    ]
-});
 
 /// Writer thread body: owns the only SQLite connection and processes
 /// commands in FIFO order, batching consecutive writes into a single
@@ -2018,20 +1995,69 @@ mod tests {
             r#"{"api_key":"sk-1234567890abcdefghijklmnopqrstuvwxyz1234567890ab","message":"test"}"#;
         let redacted = sanitizer.redact_api_keys(body);
         assert!(!redacted.contains("sk-1234567890"));
-        assert!(redacted.contains("[REDACTED]"));
+        assert!(redacted.contains("…REDACTED…"));
 
         // Longer project-scoped key (sk-proj-...)
         let body2 =
             r#"{"key":"sk-proj-abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrstuvwxyz"}"#;
         let redacted2 = sanitizer.redact_api_keys(body2);
         assert!(!redacted2.contains("sk-proj-"));
-        assert!(redacted2.contains("[REDACTED]"));
+        assert!(redacted2.contains("…REDACTED…"));
 
         // AWS access key
         let body3 = r#"{"aws_key":"AKIAIOSFODNN7EXAMPLE"}"#;
         let redacted3 = sanitizer.redact_api_keys(body3);
         assert!(!redacted3.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(redacted3.contains("[REDACTED]"));
+        assert!(redacted3.contains("…REDACTED…"));
+    }
+
+    /// Task 9 (black-october-security-hardening): a request log row whose
+    /// bodies carry an Authorization header (and other credential families)
+    /// must round-trip through the SQLite writer with every credential span
+    /// redacted while structured fields (model, token counts) survive intact.
+    #[test]
+    fn request_log_row_redacts_authorization_header_through_sqlite() {
+        let (logger, _temp) = create_test_logger();
+
+        let mut entry = sample_entry("redact-auth-header", None);
+        entry.request_body = Some(
+            r#"{"model":"gpt-4","Authorization":"Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"}"#
+                .to_owned(),
+        );
+        entry.response_body = Some(
+            "upstream echoed Authorization: Bearer abc.def.ghi and AKIAIOSFODNN7EXAMPLE".to_owned(),
+        );
+        logger.log(entry).unwrap();
+
+        let result = logger
+            .query(LogFilter {
+                trace_id: Some("redact-auth-header".to_owned()),
+                ..Default::default()
+            })
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let request_body = result.request_body.as_deref().unwrap();
+        assert!(request_body.contains("Authorization"), "{request_body}");
+        assert!(
+            !request_body.contains("eyJhbGciOiJIUzI1NiJ9"),
+            "{request_body}"
+        );
+        assert!(request_body.contains("…REDACTED…"), "{request_body}");
+        assert!(request_body.contains("gpt-4"), "{request_body}");
+
+        let response_body = result.response_body.as_deref().unwrap();
+        assert!(response_body.contains("Authorization:"), "{response_body}");
+        assert!(!response_body.contains("abc.def.ghi"), "{response_body}");
+        assert!(
+            !response_body.contains("AKIAIOSFODNN7EXAMPLE"),
+            "{response_body}"
+        );
+
+        // Structured non-credential columns survive redaction untouched.
+        assert_eq!(result.model, "gpt-4");
+        assert_eq!(result.status_code, 200);
     }
 
     #[test]

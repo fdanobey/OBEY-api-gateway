@@ -265,6 +265,12 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 .prov-http-headers>summary{cursor:pointer;font-weight:600;color:var(--primary);padding:.35rem 0;font-size:.9rem}
 .prov-header-row .form-group{margin:0}
 @media(max-width:700px){.compression-rule-grid,.compression-pre-row,.compression-pipeline-row{grid-template-columns:1fr}}
+/* Security exposure banner (Req 1.8) */
+.sec-banner{position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;color:#fff;padding:.6rem 1rem;display:flex;align-items:center;gap:1rem;font-size:.9rem;box-shadow:var(--shadow)}
+.sec-banner .sec-banner-msg{flex:1}
+.sec-banner button{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.7);border-radius:4px;padding:.15rem .6rem;cursor:pointer;font:inherit}
+.sec-banner button:hover{background:rgba(255,255,255,.15)}
+body.sec-banner-active{padding-top:3.2rem}
 </style>
 </head>
 <body>
@@ -2905,12 +2911,18 @@ if (m && m.model && !seen[m.model]) { seen[m.model] = true; models.push(m.model)
 });
 if (current && !seen[current]) models.push(current);
 models.sort();
-var opts = '<option value="">-- select model --</option>';
-models.forEach(function(m) {
-var esc = m.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-opts += '<option value="' + esc + '"' + (m === current ? ' selected' : '') + '>' + esc + '</option>';
-});
-sel.innerHTML = opts;
+	sel.textContent = '';
+	var placeholder = document.createElement('option');
+	placeholder.value = '';
+	placeholder.textContent = '-- select model --';
+	sel.appendChild(placeholder);
+	models.forEach(function(m) {
+		var opt = document.createElement('option');
+		opt.value = m;
+		opt.textContent = m;
+		if (m === current) opt.selected = true;
+		sel.appendChild(opt);
+	});
 }
 
 document.getElementById('context-strategy').addEventListener('change', updateContextOverflowVisibility);
@@ -2990,37 +3002,51 @@ document.getElementById('context-reduction-strategy').addEventListener('change',
     return validator ? validator() : true;
   }
 
-  // --- Provider Names Helper ---
-  function getProviderNames() {
-    var names = [];
-    document.querySelectorAll('#providers-list .item-card .prov-name').forEach(function(el) {
-      var n = el.value.trim(); if (n) names.push(n);
-    });
-    return names;
-  }
+// --- Provider Names Helper ---
+function getProviderNames() {
+	var names = [];
+	document.querySelectorAll('#providers-list .item-card .prov-name').forEach(function(el) {
+		var n = el.value.trim(); if (n) names.push(n);
+	});
+	return names;
+}
 
-  function populateProviderSelects() {
-    var names = getProviderNames();
-    document.querySelectorAll('.mdl-provider').forEach(function(sel) {
-      var cur = sel.value;
-      sel.innerHTML = '<option value="">-- select --</option>' + names.map(function(n){return '<option value="'+n+'"'+(n===cur?' selected':'')+'>'+n+'</option>';}).join('');
-    });
-    var cacheSel = document.getElementById('cache-embed-provider');
-    if (cacheSel) {
-      var cur = cacheSel.value;
-      cacheSel.innerHTML = '<option value="">-- select provider --</option>' + names.map(function(n){return '<option value="'+n+'"'+(n===cur?' selected':'')+'>'+n+'</option>';}).join('');
-    }
-    var memExtSel = document.getElementById('mem-extract-provider');
-    if (memExtSel) {
-      var cur = memExtSel.value;
-      memExtSel.innerHTML = '<option value="">-- select provider --</option>' + names.map(function(n){return '<option value="'+n+'"'+(n===cur?' selected':'')+'>'+n+'</option>';}).join('');
-    }
-    var memQdrantEmbedSel = document.getElementById('mem-qdrant-embed-provider');
-    if (memQdrantEmbedSel) {
-      var cur = memQdrantEmbedSel.value;
-      memQdrantEmbedSel.innerHTML = '<option value="">-- select provider --</option>' + names.map(function(n){return '<option value="'+n+'"'+(n===cur?' selected':'')+'>'+n+'</option>';}).join('');
-    }
-  }
+// XSS-safe select repopulation: every option is built with DOM APIs so
+// provider/model names from config or user input can never inject markup.
+function setSelectOptions(sel, placeholderText, names, selected) {
+	sel.textContent = '';
+	var placeholder = document.createElement('option');
+	placeholder.value = '';
+	placeholder.textContent = placeholderText;
+	sel.appendChild(placeholder);
+	names.forEach(function(n) {
+		var opt = document.createElement('option');
+		opt.value = n;
+		opt.textContent = n;
+		if (selected && n === selected) opt.selected = true;
+		sel.appendChild(opt);
+	});
+}
+
+function populateProviderSelects() {
+	var names = getProviderNames();
+	document.querySelectorAll('.mdl-provider').forEach(function(sel) {
+		var cur = sel.value;
+		setSelectOptions(sel, '-- select --', names, cur);
+	});
+	var cacheSel = document.getElementById('cache-embed-provider');
+	if (cacheSel) {
+		setSelectOptions(cacheSel, '-- select provider --', names, cacheSel.value);
+	}
+	var memExtSel = document.getElementById('mem-extract-provider');
+	if (memExtSel) {
+		setSelectOptions(memExtSel, '-- select provider --', names, memExtSel.value);
+	}
+	var memQdrantEmbedSel = document.getElementById('mem-qdrant-embed-provider');
+	if (memQdrantEmbedSel) {
+		setSelectOptions(memQdrantEmbedSel, '-- select provider --', names, memQdrantEmbedSel.value);
+	}
+}
 
   document.getElementById('providers-list').addEventListener('input', function(e) {
     if (e.target.classList.contains('prov-name')) populateProviderSelects();
@@ -3031,24 +3057,24 @@ document.getElementById('context-reduction-strategy').addEventListener('change',
     var prov = this.value;
     var mdlSel = document.getElementById('cache-embed-model');
     if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
-    else { mdlSel.innerHTML = '<option value="">-- select provider first --</option>'; }
-  });
+	else { setSelectOptions(mdlSel, '-- select provider first --', [], ''); }
+});
 
-  // When memory extraction provider changes, fetch its models
-  document.getElementById('mem-extract-provider').addEventListener('change', function() {
-    var prov = this.value;
-    var mdlSel = document.getElementById('mem-extract-model');
-    if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
-    else { mdlSel.innerHTML = '<option value="">-- select provider first --</option>'; }
-  });
+// When memory extraction provider changes, fetch its models
+document.getElementById('mem-extract-provider').addEventListener('change', function() {
+	var prov = this.value;
+	var mdlSel = document.getElementById('mem-extract-model');
+	if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
+	else { setSelectOptions(mdlSel, '-- select provider first --', [], ''); }
+});
 
-  // When memory Qdrant embedding provider changes, fetch its models
-  document.getElementById('mem-qdrant-embed-provider').addEventListener('change', function() {
-    var prov = this.value;
-    var mdlSel = document.getElementById('mem-qdrant-embed-model');
-    if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
-    else { mdlSel.innerHTML = '<option value="">-- select provider first --</option>'; }
-  });
+// When memory Qdrant embedding provider changes, fetch its models
+document.getElementById('mem-qdrant-embed-provider').addEventListener('change', function() {
+	var prov = this.value;
+	var mdlSel = document.getElementById('mem-qdrant-embed-model');
+	if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
+	else { setSelectOptions(mdlSel, '-- select provider first --', [], ''); }
+});
 
   // --- Dynamic Lists: Providers ---
   var provList = document.getElementById('providers-list');
@@ -3058,14 +3084,16 @@ document.getElementById('context-reduction-strategy').addEventListener('change',
     return /^[A-Z_][A-Z0-9_]*$/.test(value);
   }
 
-  function renderProviderKeyStatus(card) {
-    var input = card.querySelector('.prov-key-env');
-    var statusEl = card.querySelector('.prov-key-status');
-    var value = input.value.trim();
-    var storedStatus = card.dataset.apiKeyStatus || 'missing';
-    var configured = card.dataset.apiKeyConfigured === 'true';
+function renderProviderKeyStatus(card) {
+ var input = card.querySelector('.prov-key-env');
+ var statusEl = card.querySelector('.prov-key-status');
+ var value = input.value.trim();
+ var storedStatus = card.dataset.apiKeyStatus || 'missing';
+ var configured = card.dataset.apiKeyConfigured === 'true';
 
-    statusEl.className = 'secret-status prov-key-status';
+ statusEl.className = 'secret-status prov-key-status';
+ // Placeholder mirrors the stored (never echoed) key state; values are never prefilled.
+ input.placeholder = configured ? 'Configured (encrypted) — leave blank to keep' : 'sk-... or OPENAI_API_KEY (not configured)';
 
     if (value) {
       if (isEnvVarReference(value)) {
@@ -3096,9 +3124,25 @@ document.getElementById('context-reduction-strategy').addEventListener('change',
       return;
     }
 
-    statusEl.classList.add('status-missing');
-    statusEl.textContent = 'No API key configured.';
-  }
+ statusEl.classList.add('status-missing');
+ statusEl.textContent = 'No API key configured.';
+}
+
+/**
+* POST /admin/providers/models with a JSON body (spec
+* black-october-security-hardening, Req 3.1): credentials travel in the
+* request body only and never in the URL/query string.
+*/
+function postProviderModelsRequest(baseUrl, apiKey, providerName, providerType, timeoutMs) {
+ var body = { base_url: baseUrl, provider_name: providerName || '', provider_type: providerType || '' };
+ if (apiKey) { body.api_key = apiKey; }
+ return fetch(apiUrl('providers/models'), {
+ method: 'POST',
+ headers: { 'Content-Type': 'application/json' },
+ body: JSON.stringify(body),
+ signal: AbortSignal.timeout(timeoutMs || 12000)
+ });
+}
 
   function addProviderHeaderRow(listEl, key, value) {
     var row = document.createElement('div');
@@ -3287,16 +3331,12 @@ function addProviderCard(data) {
       resultEl.textContent = 'Testing…'; resultEl.style.color = 'var(--text-muted)';
       testBtn.disabled = true;
 
-      if (isBedrock) {
-        // Bedrock: proxy through backend to avoid CORS (Req 10.1–10.4)
-        var region = regionSelect.value || 'us-east-1';
-        var apiKey = card.querySelector('.prov-key-env').value.trim();
-        var mantleBase = 'https://bedrock-mantle.' + region + '.api.aws/v1';
-        var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(mantleBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(name) + '&provider_type=bedrock';
-        fetch(proxyUrl, {
-          method: 'GET',
-          signal: AbortSignal.timeout(10000)
-        }).then(function(resp) {
+ if (isBedrock) {
+ // Bedrock: proxy through backend to avoid CORS (Req 10.1–10.4)
+ var region = regionSelect.value || 'us-east-1';
+ var apiKey = card.querySelector('.prov-key-env').value.trim();
+ var mantleBase = 'https://bedrock-mantle.' + region + '.api.aws/v1';
+ postProviderModelsRequest(mantleBase, apiKey, name, 'bedrock', 10000).then(function(resp) {
           if (resp.ok) {
             resultEl.textContent = '✓ Reachable'; resultEl.style.color = 'var(--success)';
             setStatus('Connection test passed for ' + name);
@@ -3313,11 +3353,10 @@ function addProviderCard(data) {
         }).finally(function() {
           testBtn.disabled = false;
         });
-      } else {
-        // Non-bedrock: proxy through backend to avoid CORS with 10s timeout
-        var provApiKey = card.querySelector('.prov-key-env').value.trim();
-        var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(url) + '&api_key=' + encodeURIComponent(provApiKey || '') + '&provider_name=' + encodeURIComponent(name) + '&provider_type=' + encodeURIComponent(typeSelect.value || '');
-        fetch(proxyUrl, { method: 'GET', signal: AbortSignal.timeout(10000) })
+ } else {
+ // Non-bedrock: proxy through backend to avoid CORS with 10s timeout
+ var provApiKey = card.querySelector('.prov-key-env').value.trim();
+ postProviderModelsRequest(url, provApiKey, name, typeSelect.value, 10000)
           .then(function(resp) {
             if (resp.ok) { resultEl.textContent = '✓ Reachable'; resultEl.style.color = 'var(--success)'; setStatus('Connection test passed for ' + name); }
             else { resultEl.textContent = '✕ Unreachable'; resultEl.style.color = 'var(--danger)'; setStatus('Connection test failed for ' + name + ': HTTP ' + resp.status); }
@@ -3434,15 +3473,13 @@ var provBudgetResetBtn = card.querySelector('.prov-budget-reset-btn');
       return Promise.resolve({ models: [], failed: false, noBaseUrl: true });
     }
 
-    // For Bedrock, query both the standard /v1 and the OpenAI-specific /openai/v1 paths
-    if (provType === 'bedrock') {
-      var openaiBase = baseUrl.replace(/\/v1\/?$/, '/openai/v1');
-      var bedrockUrl1 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=bedrock';
-      var bedrockUrl2 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(openaiBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=bedrock';
-      return Promise.all([
-        fetch(bedrockUrl1, { signal: AbortSignal.timeout(12000) }).then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};}),
-        fetch(bedrockUrl2, { signal: AbortSignal.timeout(12000) }).then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};})
-      ]).then(function(results) {
+ // For Bedrock, query both the standard /v1 and the OpenAI-specific /openai/v1 paths
+ if (provType === 'bedrock') {
+ var openaiBase = baseUrl.replace(/\/v1\/?$/, '/openai/v1');
+ return Promise.all([
+ postProviderModelsRequest(baseUrl, apiKey, providerName, 'bedrock').then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};}),
+ postProviderModelsRequest(openaiBase, apiKey, providerName, 'bedrock').then(function(r){return r.ok?r.json():{data:[]};}).catch(function(){return {data:[]};})
+ ]).then(function(results) {
         var seen = {};
         var models = [];
         // Include only the catalog compatible with this provider's auth mode.
@@ -3460,10 +3497,9 @@ var provBudgetResetBtn = card.querySelector('.prov-budget-reset-btn');
       });
     }
 
-    // Proxy through backend to avoid CORS issues with external provider APIs
-    var proxyUrl = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(baseUrl) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName) + '&provider_type=' + encodeURIComponent(provType || '');
-    return fetch(proxyUrl, { signal: AbortSignal.timeout(12000) })
-      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+ // Proxy through backend to avoid CORS issues with external provider APIs
+ return postProviderModelsRequest(baseUrl, apiKey, providerName, provType)
+ .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function(data) {
         var models = (data.data || []).map(function(m) { return m.id || m.name || ''; }).filter(Boolean);
         return { models: models, failed: false, noBaseUrl: false };
@@ -3509,13 +3545,19 @@ var provBudgetResetBtn = card.querySelector('.prov-budget-reset-btn');
       var orphanModel = (currentModel && models.indexOf(currentModel) === -1) ? currentModel : null;
       if (orphanModel) models.push(orphanModel);
       models.sort();
-      if (!models.length) { selectEl.innerHTML = '<option value="">-- no models found --</option>'; return; }
-      var opts = '<option value="">-- select model --</option>';
-      models.forEach(function(m) {
-        var label = (m === orphanModel) ? m + ' (saved, not currently offered)' : m;
-        opts += '<option value="'+m+'"'+(m===currentModel?' selected':'')+'>'+label+'</option>';
-      });
-      selectEl.innerHTML = opts;
+	if (!models.length) { selectEl.textContent = ''; var noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '-- no models found --'; selectEl.appendChild(noneOpt); return; }
+	var placeholder = document.createElement('option');
+	placeholder.value = '';
+	placeholder.textContent = '-- select model --';
+	selectEl.textContent = '';
+	selectEl.appendChild(placeholder);
+	models.forEach(function(m) {
+		var opt = document.createElement('option');
+		opt.value = m;
+		opt.textContent = (m === orphanModel) ? m + ' (saved, not currently offered)' : m;
+		if (m === currentModel) opt.selected = true;
+		selectEl.appendChild(opt);
+	});
       // Sync the authoritative data-model attribute on the parent row so
       // refreshModelGroupModels always has a reliable fallback even if a
       // subsequent fetch briefly sets the select to "Loading…".
@@ -3523,19 +3565,19 @@ var provBudgetResetBtn = card.querySelector('.prov-budget-reset-btn');
       if (row && currentModel) { row.dataset.model = currentModel; }
     }
 
-    // No base URL and nothing to discover from: resolve locally, no request.
-    if (!baseUrl && provType !== 'bedrock' && !manualModels.length) {
-      selectEl.innerHTML = '<option value="">-- no base URL --</option>';
-      return;
-    }
-    if (baseUrl) { selectEl.innerHTML = '<option value="">Loading…</option>'; }
+// No base URL and nothing to discover from: resolve locally, no request.
+if (!baseUrl && provType !== 'bedrock' && !manualModels.length) {
+	selectEl.innerHTML = '<option value="">-- no base URL --</option>'; /* xss-audit: static */
+	return;
+}
+if (baseUrl) { selectEl.innerHTML = '<option value="">Loading…</option>'; /* xss-audit: static */ }
 
-    getProviderModels(providerName, maxAgeMs).then(function(res) {
-      if (res.noBaseUrl) {
-        if (manualModels.length) { populateSelect([]); return; }
-        selectEl.innerHTML = '<option value="">-- no base URL --</option>';
-        return;
-      }
+getProviderModels(providerName, maxAgeMs).then(function(res) {
+if (res.noBaseUrl) {
+	if (manualModels.length) { populateSelect([]); return; }
+	selectEl.innerHTML = '<option value="">-- no base URL --</option>'; /* xss-audit: static */
+	return;
+}
       if (res.failed) {
         if (manualModels.length) { populateSelect([]); return; }
         // Fallback: replace select with text input for manual model entry
@@ -3547,9 +3589,14 @@ var provBudgetResetBtn = card.querySelector('.prov-budget-reset-btn');
         textInput.style.cssText = selectEl.style.cssText;
         if (selectEl.parentNode) {
           selectEl.parentNode.replaceChild(textInput, selectEl);
-        } else {
-          selectEl.innerHTML = '<option value="' + (currentModel || '') + '">' + (currentModel || 'Type model name') + '</option>';
-        }
+} else {
+	// DOM option construction: currentModel is a saved config value.
+	var fallbackOpt = document.createElement('option');
+	fallbackOpt.value = currentModel || '';
+	fallbackOpt.textContent = currentModel || 'Type model name';
+	selectEl.textContent = '';
+	selectEl.appendChild(fallbackOpt);
+}
         return;
       }
       // Copy: populateSelect mutates the array, and the cached list is shared.
@@ -3571,16 +3618,13 @@ var provBudgetResetBtn = card.querySelector('.prov-budget-reset-btn');
   function fetchModelsForBedrock(region, apiKey, globalInference, selectEl, currentModel, manualModels, providerName) {
     var mantleBase = 'https://bedrock-mantle.' + region + '.api.aws/v1';
     var openaiBase = 'https://bedrock-mantle.' + region + '.api.aws/openai/v1';
-    selectEl.innerHTML = '<option value="">Loading…</option>';
+selectEl.innerHTML = '<option value="">Loading…</option>'; /* xss-audit: static */
 
-    // Query both Mantle paths: /v1/models (open-weight) and /openai/v1/models (GPT-5.5, GPT-5.4)
-    var proxyUrl1 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(mantleBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName || '') + '&provider_type=bedrock';
-    var proxyUrl2 = apiUrl('providers/models') + '?base_url=' + encodeURIComponent(openaiBase) + '&api_key=' + encodeURIComponent(apiKey || '') + '&provider_name=' + encodeURIComponent(providerName || '') + '&provider_type=bedrock';
-
-    var fetches = [
-      fetch(proxyUrl1, { signal: AbortSignal.timeout(12000) }).then(function(r) { return r.ok ? r.json() : { data: [] }; }).catch(function() { return { data: [] }; }),
-      fetch(proxyUrl2, { signal: AbortSignal.timeout(12000) }).then(function(r) { return r.ok ? r.json() : { data: [] }; }).catch(function() { return { data: [] }; })
-    ];
+ // Query both Mantle paths: /v1/models (open-weight) and /openai/v1/models (GPT-5.5, GPT-5.4)
+ var fetches = [
+ postProviderModelsRequest(mantleBase, apiKey, providerName, 'bedrock').then(function(r) { return r.ok ? r.json() : { data: [] }; }).catch(function() { return { data: [] }; }),
+ postProviderModelsRequest(openaiBase, apiKey, providerName, 'bedrock').then(function(r) { return r.ok ? r.json() : { data: [] }; }).catch(function() { return { data: [] }; })
+ ];
 
     Promise.all(fetches).then(function(results) {
       var seen = {};
@@ -3614,13 +3658,19 @@ var provBudgetResetBtn = card.querySelector('.prov-budget-reset-btn');
     var orphanModel = (currentModel && models.indexOf(currentModel) === -1) ? currentModel : null;
     if (orphanModel) models.push(orphanModel);
     models.sort();
-    if (!models.length) { selectEl.innerHTML = '<option value="">-- no models found --</option>'; return; }
-    var opts = '<option value="">-- select model --</option>';
-    models.forEach(function(m) {
-      var label = (m === orphanModel) ? m + ' (saved, not currently offered)' : m;
-      opts += '<option value="'+m+'"'+(m===currentModel?' selected':'')+'>'+label+'</option>';
-    });
-    selectEl.innerHTML = opts;
+if (!models.length) { selectEl.textContent = ''; var noneOpt = document.createElement('option'); noneOpt.value = ''; noneOpt.textContent = '-- no models found --'; selectEl.appendChild(noneOpt); return; }
+var placeholder = document.createElement('option');
+placeholder.value = '';
+placeholder.textContent = '-- select model --';
+selectEl.textContent = '';
+selectEl.appendChild(placeholder);
+models.forEach(function(m) {
+	var opt = document.createElement('option');
+	opt.value = m;
+	opt.textContent = (m === orphanModel) ? m + ' (saved, not currently offered)' : m;
+	if (m === currentModel) opt.selected = true;
+	selectEl.appendChild(opt);
+});
     // Sync data-model on parent row for race-condition resilience
     var row = selectEl.closest('.form-row');
     if (row && currentModel) { row.dataset.model = currentModel; }
@@ -3662,19 +3712,19 @@ var provBudgetResetBtn = card.querySelector('.prov-budget-reset-btn');
     container.appendChild(clone);
     var provSel = container.querySelector('.form-row:last-child .mdl-provider');
     var mdlSel = container.querySelector('.form-row:last-child .mdl-name');
-    if (provSel) {
-      var names = getProviderNames();
-      provSel.innerHTML = '<option value="">-- select --</option>' + names.map(function(n){return '<option value="'+n+'"'+(data&&n===data.provider?' selected':'')+'>'+n+'</option>';}).join('');
-      // Keep data-model in sync when the user manually picks a different model
-      mdlSel.addEventListener('change', function() {
-        if (this.value) { row.dataset.model = this.value; }
-      });
-      // When provider changes, fetch its models
-      provSel.addEventListener('change', function() {
-        var prov = this.value;
-        if (prov) { fetchModelsForProvider(prov, mdlSel, ''); }
-        else { mdlSel.innerHTML = '<option value="">-- select provider first --</option>'; }
-      });
+if (provSel) {
+	var names = getProviderNames();
+	setSelectOptions(provSel, '-- select --', names, (data && data.provider) || '');
+	// Keep data-model in sync when the user manually picks a different model
+	mdlSel.addEventListener('change', function() {
+		if (this.value) { row.dataset.model = this.value; }
+	});
+	// When provider changes, fetch its models
+	provSel.addEventListener('change', function() {
+		var prov = this.value;
+		if (prov) { fetchModelsForProvider(prov, mdlSel, ''); }
+		else { setSelectOptions(mdlSel, '-- select provider first --', [], ''); }
+	});
       // If loading existing data, fetch models for the selected provider
       if (data && data.provider) {
         fetchModelsForProvider(data.provider, mdlSel, data.model || '');
@@ -3983,7 +4033,7 @@ refreshReasoningProviderNames();
 
 function populateReasoningProviders(perProvider) {
 var list = document.getElementById('rc-providers-list');
-list.innerHTML = '';
+list.innerHTML = ''; /* xss-audit: static */
 Object.keys(perProvider || {}).forEach(function(name) {
 var card = addReasoningProviderCard(perProvider[name]);
 card.querySelector('.rc-prov-name').value = name;
@@ -4065,13 +4115,16 @@ return ok;
 }
 
 function refreshReasoningProviderNames() {
-var seen = {}, opts = '';
-getProviderNames().concat(((config && config.providers) || []).map(function(p) { return p.name || ''; })).forEach(function(n) {
-if (!n || seen[n]) { return; }
-seen[n] = true;
-opts += '<option value="' + n.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;') + '"></option>';
-});
-document.getElementById('rc-prov-names').innerHTML = opts;
+	var seen = {};
+	var datalist = document.getElementById('rc-prov-names');
+	datalist.textContent = '';
+	getProviderNames().concat(((config && config.providers) || []).map(function(p) { return p.name || ''; })).forEach(function(n) {
+		if (!n || seen[n]) { return; }
+		seen[n] = true;
+		var opt = document.createElement('option');
+		opt.value = n;
+		datalist.appendChild(opt);
+	});
 }
 
 // --- Load Config from API ---
@@ -4092,8 +4145,8 @@ document.getElementById('rc-prov-names').innerHTML = opts;
     document.getElementById('codex-url').value=cfg.codex_instructions_url||'';
 var cs=cfg.codex_search||{}; document.getElementById('codex-search-enabled').checked=cs.enabled!==false; document.getElementById('codex-search-output-chat').checked=cs.output_to_chat!==false; document.getElementById('codex-search-base-url').value=cs.base_url||''; document.getElementById('codex-search-timeout').value=cs.timeout_seconds||15; document.getElementById('codex-search-iterations').value=cs.max_iterations||5;
     var ec=cfg.exact_cache||{}; document.getElementById('ecache-enabled').checked=ec.enabled!==false; document.getElementById('ecache-max-entries').value=ec.max_entries||5000; document.getElementById('ecache-ttl').value=ec.ttl_seconds!=null?ec.ttl_seconds:3600; document.getElementById('ecache-temp-threshold').value=ec.temperature_threshold!=null?ec.temperature_threshold:0.15;
-    provList.innerHTML=''; if(cfg.providers){cfg.providers.forEach(function(p){addProviderCard(p);});}
-    grpList.innerHTML=''; if(cfg.model_groups){cfg.model_groups.forEach(function(g){addGroupCard(g);});}
+    provList.innerHTML=''; /* xss-audit: static */ if(cfg.providers){cfg.providers.forEach(function(p){addProviderCard(p);});}
+    grpList.innerHTML=''; /* xss-audit: static */ if(cfg.model_groups){cfg.model_groups.forEach(function(g){addGroupCard(g);});}
     if(cfg.retry){document.getElementById('retry-max').value=cfg.retry.max_retries_per_provider||1; document.getElementById('retry-backoff').value=(cfg.retry.backoff_sequence_seconds&&cfg.retry.backoff_sequence_seconds[0])||1; if(cfg.retry.backoff_sequence_seconds&&cfg.retry.backoff_sequence_seconds.length>1&&cfg.retry.backoff_sequence_seconds[0]){document.getElementById('retry-multiplier').value=(cfg.retry.backoff_sequence_seconds[1]/cfg.retry.backoff_sequence_seconds[0]).toFixed(2).replace(/\.00$/,'');}else{document.getElementById('retry-multiplier').value=2;} document.getElementById('retry-jitter-enabled').value=cfg.retry.jitter_enabled===false?'false':'true'; document.getElementById('retry-jitter-ratio').value=cfg.retry.jitter_ratio!=null?cfg.retry.jitter_ratio:0.2;}
     var car=cfg.cache_aware_routing||{};document.getElementById('car-enabled').checked=!!car.enabled;document.getElementById('car-ttl').value=car.stickiness_ttl_seconds!=null?car.stickiness_ttl_seconds:300;document.getElementById('car-default-min-tokens').value=car.default_cache_min_tokens!=null?car.default_cache_min_tokens:1024;document.getElementById('car-hit-rate').value=car.cost_sort_hit_rate!=null?car.cost_sort_hit_rate:0;
 populateReasoningCompat(cfg.reasoning_compat);
@@ -4342,7 +4395,7 @@ function loadCircuitBreakerStates() {
   var select = document.getElementById('cb-reset-provider');
   if (!select) return;
   var currentVal = select.value || 'all';
-  select.innerHTML = '<option value="all">All Providers</option>';
+	select.innerHTML = '<option value="all">All Providers</option>'; /* xss-audit: static */
   var errEl = document.getElementById('cb-reset-error');
   if (errEl) errEl.textContent = '';
   fetch(apiUrl('circuit-breaker/states'))
@@ -5316,7 +5369,7 @@ showToast('Failed to reset spend: ' + err.message, true);
   function vkRender() {
     var tbody = document.getElementById('vk-tbody');
     var empty = document.getElementById('vk-empty');
-    tbody.innerHTML = '';
+    tbody.innerHTML = ''; /* xss-audit: static */
 
     var rows = vkState.keys.slice();
     // Client-side search over the loaded page (Req 12.2)
@@ -5824,11 +5877,13 @@ showToast('Failed to reset spend: ' + err.message, true);
   var grProvList = document.getElementById('guardrail-providers-list');
   var grPipeList = document.getElementById('guardrail-pipelines-list');
 
-  function escapeHtml(value) {
-    var element = document.createElement('span');
-    element.textContent = String(value);
-    return element.innerHTML;
-  }
+function escapeHtml(value) {
+var element = document.createElement('span');
+element.textContent = String(value);
+// Quote replaces keep the output safe inside double-quoted attribute
+// values (value="..."), matching the dashboard esc() helper.
+return element.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 
   function uniqueGuardrailName(base, names) {
     var candidate = base;
@@ -5853,12 +5908,12 @@ showToast('Failed to reset spend: ' + err.message, true);
     var names = getGuardrailPipelineNames();
     var globalSel = document.getElementById('gr-global-pipeline');
     var cur = globalSel.value;
-    globalSel.innerHTML = '<option value="">— None —</option>';
+	globalSel.innerHTML = '<option value="">— None —</option>'; /* xss-audit: static */
     names.forEach(function(n) { var o = document.createElement('option'); o.value = n; o.textContent = n; globalSel.appendChild(o); });
     globalSel.value = cur;
     document.querySelectorAll('.gr-binding-pipeline').forEach(function(sel) {
       var cv = sel.value;
-      sel.innerHTML = '<option value="">— select —</option>';
+      sel.innerHTML = '<option value="">— select —</option>'; /* xss-audit: static */
       names.forEach(function(n) { var o = document.createElement('option'); o.value = n; o.textContent = n; sel.appendChild(o); });
       sel.value = cv;
     });
@@ -5868,7 +5923,7 @@ showToast('Failed to reset spend: ' + err.message, true);
     var names = getGuardrailProviderNames();
     document.querySelectorAll('.gr-stage-provider').forEach(function(sel) {
       var cv = sel.value;
-      sel.innerHTML = '<option value="">— select —</option>';
+      sel.innerHTML = '<option value="">— select —</option>'; /* xss-audit: static */
       names.forEach(function(n) { var o = document.createElement('option'); o.value = n; o.textContent = n; sel.appendChild(o); });
       sel.value = cv;
     });
@@ -5934,7 +5989,7 @@ showToast('Failed to reset spend: ' + err.message, true);
     var row = document.createElement('div');
     row.className = 'guardrail-pattern';
     row.innerHTML = '<div class="form-group" style="margin:0"><label>Pattern name</label><input type="text" class="gr-pat-name" value="' + escapeHtml(d.name || '') + '"><div class="hint">Example: US SSN</div></div>' +
-      '<div class="form-group" style="margin:0"><label>Regex pattern</label><input type="text" class="gr-pat-regex" value="' + ((d.regex || '').replace(/"/g, '&quot;')) + '"></div>' +
+      '<div class="form-group" style="margin:0"><label>Regex pattern</label><input type="text" class="gr-pat-regex" value="' + escapeHtml(d.regex || '') + '"></div>' +
       '<div class="form-group" style="margin:0"><label>Finding label</label><input type="text" class="gr-pat-entity" value="' + escapeHtml(d.entity || '') + '"><div class="hint">Short label used in logs.</div></div>' +
       '<div class="form-group" style="margin:0"><label>Use as</label><select class="gr-pat-mode"><option value="deny">Content to catch</option><option value="allow">Content to permit</option></select><div class="hint">Allowed matches override blocked matches.</div></div>' +
       '<button type="button" class="btn btn-danger btn-sm gr-remove-pattern" style="align-self:center" aria-label="Remove text pattern">✕</button>';
@@ -6023,7 +6078,7 @@ showToast('Failed to reset spend: ' + err.message, true);
       var item = {name:name + (phaseLabels[phase] || ''), action:row.querySelector('.gr-stage-action').selectedOptions[0].textContent};
       (phase === 'pre_call' || phase === 'tool_result' ? pre : post).push(item);
     });
-    flow.innerHTML = '';
+    flow.innerHTML = ''; /* xss-audit: static */
     function addStep(text, className) { var span = document.createElement('span'); span.className = 'guardrail-flow-step ' + (className || ''); span.textContent = text; flow.appendChild(span); }
     function addArrow() { var span = document.createElement('span'); span.className = 'guardrail-flow-arrow'; span.textContent = '→'; flow.appendChild(span); }
     addStep('Request');
@@ -6045,7 +6100,7 @@ showToast('Failed to reset spend: ' + err.message, true);
   }
 
   function populateGuardrailVirtualKeySelect(select, selectedId) {
-    select.innerHTML = '<option value="">— choose a virtual key —</option>';
+	select.innerHTML = '<option value="">— choose a virtual key —</option>'; /* xss-audit: static */
     guardrailVirtualKeys.forEach(function(key) {
       var isActive = !key.status || key.status === 'active';
       if (!isActive && key.id !== selectedId) return;
@@ -6084,7 +6139,7 @@ showToast('Failed to reset spend: ' + err.message, true);
   }
 
 function populateGuardrailModelGroupSelect(select, selectedName) {
-select.innerHTML = '<option value="">— choose a model group —</option>';
+	select.innerHTML = '<option value="">— choose a model group —</option>'; /* xss-audit: static */
 var groups = (config && config.model_groups) || [];
 groups.forEach(function(group) {
 if (!group || !group.name) return;
@@ -6111,6 +6166,7 @@ var targetField = isVirtualKey || isModelGroup
 ? '<select class="gr-binding-key"></select><div class="hint">' + (isVirtualKey ? 'Choose by name. The saved rule automatically uses the virtual key ID.' : 'Choose an existing model group from the configuration.') + '</div>'
 : '<input type="text" class="gr-binding-key" value="' + escapeHtml(key || '') + '"><div class="hint">Enter the exact route shown in this section.</div>';
 row.className = 'guardrail-binding-row';
+// xss-audit: static — only dynamic part is targetField, built from fixed markup + escapeHtml(key)
 row.innerHTML = '<div class="form-group" style="margin:0"><label>Apply to</label>' + targetField + '</div>' +
 '<div class="form-group" style="margin:0"><label>Rule</label><select class="gr-binding-pipeline"><option value="">— choose —</option></select><div class="hint">The guardrail rule to run for this target.</div></div>' +
 '<div class="form-check" style="margin:0;align-self:center"><input type="checkbox" class="gr-binding-failover"><label>Try another model after refusal</label></div>' +
@@ -6126,12 +6182,12 @@ var pipeSel = row.querySelector('.gr-binding-pipeline');
   }
 
   function populateGuardrails(guardrails) {
-    grProvList.innerHTML = '';
-    grPipeList.innerHTML = '';
-    document.getElementById('gr-bindings-vk').innerHTML = '';
-    document.getElementById('gr-bindings-mg').innerHTML = '';
-    document.getElementById('gr-bindings-routes').innerHTML = '';
-    document.getElementById('gr-global-pipeline').innerHTML = '<option value="">— None —</option>';
+    grProvList.innerHTML = ''; /* xss-audit: static */
+    grPipeList.innerHTML = ''; /* xss-audit: static */
+    document.getElementById('gr-bindings-vk').innerHTML = ''; /* xss-audit: static */
+    document.getElementById('gr-bindings-mg').innerHTML = ''; /* xss-audit: static */
+    document.getElementById('gr-bindings-routes').innerHTML = ''; /* xss-audit: static */
+	document.getElementById('gr-global-pipeline').innerHTML = '<option value="">— None —</option>'; /* xss-audit: static */
     if (!guardrails) return;
     if (guardrails.providers) { guardrails.providers.forEach(function(p) { addGuardrailProviderCard(p); }); }
     if (guardrails.pipelines) { guardrails.pipelines.forEach(function(p) { addGuardrailPipelineCard(p); }); }
@@ -6472,7 +6528,7 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
   // Always-include management
   function renderTcAlwaysInclude() {
     var container = document.getElementById('tc-always-list');
-    container.innerHTML = '';
+    container.innerHTML = ''; /* xss-audit: static */
     tcAlwaysIncludeList.forEach(function(item) {
       var tag = document.createElement('span');
       tag.style.cssText = 'display:inline-flex;align-items:center;gap:.3rem;padding:.2rem .5rem;border-radius:999px;background:rgba(13,110,253,.08);border:1px solid rgba(13,110,253,.2);font-size:.8rem;color:var(--primary)';
@@ -6488,7 +6544,7 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
       container.appendChild(tag);
     });
     if (!tcAlwaysIncludeList.length) {
-      container.innerHTML = '<span style="font-size:.8rem;color:var(--text-muted)">No patterns configured</span>';
+		container.innerHTML = '<span style="font-size:.8rem;color:var(--text-muted)">No patterns configured</span>'; /* xss-audit: static */
     }
   }
 
@@ -6508,7 +6564,7 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
   // Override management
   function renderTcOverrides() {
     var tbody = document.getElementById('tc-overrides-tbody');
-    tbody.innerHTML = '';
+    tbody.innerHTML = ''; /* xss-audit: static */
     var keys = Object.keys(tcOverridesData);
     if (!keys.length) {
       document.getElementById('tc-overrides-table-wrap').hidden = true;
@@ -6614,7 +6670,7 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
     if (mem.auto_extract_provider) {
       fetchModelsForProvider(mem.auto_extract_provider, document.getElementById('mem-extract-model'), mem.auto_extract_model || '');
     } else {
-      document.getElementById('mem-extract-model').innerHTML = '<option value="">-- select provider first --</option>';
+      setSelectOptions(document.getElementById('mem-extract-model'), '-- select provider first --', [], '');
     }
     document.getElementById('mem-extract-min-turns').value = mem.auto_extract_min_turns || 4;
     var q = mem.qdrant || {};
@@ -6624,7 +6680,7 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
     if (q.embedding_provider) {
       fetchModelsForProvider(q.embedding_provider, document.getElementById('mem-qdrant-embed-model'), q.embedding_model || '');
     } else {
-      document.getElementById('mem-qdrant-embed-model').innerHTML = '<option value="">-- select provider first --</option>';
+      setSelectOptions(document.getElementById('mem-qdrant-embed-model'), '-- select provider first --', [], '');
     }
 document.getElementById('mem-qdrant-fts-weight').value = q.fts_weight != null ? q.fts_weight : 0.4;
 document.getElementById('mem-qdrant-vector-weight').value = q.vector_weight != null ? q.vector_weight : 0.5;
@@ -6706,7 +6762,7 @@ mem.qdrant.vector_dimension = parseInt(vdVal, 10) || null;
           contexts = Object.keys(contexts).map(function(namespace) { var value = contexts[namespace]; return typeof value === 'object' ? Object.assign({ namespace: namespace }, value) : { namespace: namespace, entry_count: value }; });
         }
         var tbody = document.getElementById('mem-projects-tbody');
-        tbody.innerHTML = '';
+        tbody.innerHTML = ''; /* xss-audit: static */
         if (!contexts || !contexts.length) {
           document.getElementById('mem-projects-wrap').style.display = 'none';
           document.getElementById('mem-projects-empty').textContent = 'No detected contexts';
@@ -6746,7 +6802,7 @@ mem.qdrant.vector_dimension = parseInt(vdVal, 10) || null;
       .then(function(data) {
         var entries = data.entries || [];
         var tbody = document.getElementById('mem-entries-tbody');
-        tbody.innerHTML = '';
+        tbody.innerHTML = ''; /* xss-audit: static */
         if (!entries.length) {
           document.getElementById('mem-entries-wrap').style.display = 'none';
           document.getElementById('mem-entries-empty').textContent = 'No entries in this namespace';
@@ -6890,7 +6946,43 @@ document.getElementById('mem-qdrant-recreate').addEventListener('click', functio
     if (config) populateMemory(config.memory);
   });
 
+  // --- Security exposure banner (Req 1.8) ---
+  var SEC_BANNER_KEY = 'sec-banner-dismissed';
+  function renderSecurityBanner(mode) {
+    var banner = document.createElement('div');
+    banner.className = 'sec-banner';
+    banner.setAttribute('role', 'alert');
+    var msg = document.createElement('span');
+    msg.className = 'sec-banner-msg';
+    msg.textContent = 'Security warning (mode: ' + (mode || 'unknown') + '): this panel is exposed WITHOUT authentication on a non-loopback address. Set admin.auth credentials (username_env/password_env), or bind server.host to a loopback address, or firewall the port.';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = 'Dismiss';
+    btn.addEventListener('click', function() {
+      banner.remove();
+      document.body.classList.remove('sec-banner-active');
+      try { sessionStorage.setItem(SEC_BANNER_KEY, '1'); } catch (e) { /* storage unavailable */ }
+    });
+    banner.appendChild(msg);
+    banner.appendChild(btn);
+    document.body.appendChild(banner);
+    document.body.classList.add('sec-banner-active');
+  }
+  function initSecurityBanner() {
+    fetch(apiUrl('security-status'), { signal: AbortSignal.timeout(10000) })
+      .then(function(r) { if (!r.ok) return null; return r.json(); })
+      .then(function(status) {
+        if (!status || status.unauthenticated_non_loopback !== true) return;
+        var dismissed = false;
+        try { dismissed = sessionStorage.getItem(SEC_BANNER_KEY) === '1'; } catch (e) { /* storage unavailable */ }
+        if (dismissed) return;
+        renderSecurityBanner(status.mode);
+      })
+      .catch(function(err) { console.debug('security-status unavailable', err && err.message); });
+  }
+
   // --- Init: load config on startup ---
+  initSecurityBanner();
   loadConfig();
 })();
 </script>

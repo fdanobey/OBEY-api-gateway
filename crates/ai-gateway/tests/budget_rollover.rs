@@ -38,6 +38,7 @@ fn isolated_config(db_dir: &std::path::Path) -> Config {
 
 fn base_config() -> Config {
     Config {
+        security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),

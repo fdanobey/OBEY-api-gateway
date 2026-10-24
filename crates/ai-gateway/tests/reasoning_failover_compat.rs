@@ -43,6 +43,7 @@ mod common;
 /// the same sticky cache) is live.
 fn compat_config(compat: ReasoningCompatConfig, max_retries: u32) -> Config {
     Config {
+        security: Default::default(),
         cache_aware_routing: CacheAwareRouting {
             enabled: false,
             stickiness_ttl_seconds: 300,

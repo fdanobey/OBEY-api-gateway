@@ -76,6 +76,7 @@ async fn start_mock_provider() -> MockServer {
 /// virtual-key store at `db_path`.
 fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) -> Config {
     Config {
+        security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {
             host: "127.0.0.1".to_string(),

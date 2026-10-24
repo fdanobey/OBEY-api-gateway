@@ -72,7 +72,10 @@ impl TestServer {
         config.virtual_keys.enforcement = EnforcementMode::Disabled;
         common::isolate_databases(&mut config);
         let server = GatewayServer::new(config, None).await.unwrap();
-        Self { server, _mock: mock }
+        Self {
+            server,
+            _mock: mock,
+        }
     }
 
     /// Server with virtual-key enforcement set to `required`.
@@ -83,7 +86,10 @@ impl TestServer {
         config.virtual_keys.enforcement = EnforcementMode::Required;
         common::isolate_databases(&mut config);
         let server = GatewayServer::new(config, None).await.unwrap();
-        Self { server, _mock: mock }
+        Self {
+            server,
+            _mock: mock,
+        }
     }
 
     fn router(&self, identity: Option<&str>) -> axum::Router {
