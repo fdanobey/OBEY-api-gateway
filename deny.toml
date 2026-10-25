@@ -11,14 +11,29 @@ all-features = false
 no-default-features = false
 
 [advisories]
+# Config schema v2 (cargo-deny >= 0.18). In v2 the `vulnerability`, `unsound`,
+# `notice` and `severity-threshold` fields are removed: every vulnerability and
+# unsound advisory now errors unless listed in `ignore` below.
+version = 2
 db-urls = ["https://github.com/RustSec/advisory-db"]
-# Empty initially. When an advisory cannot be fixed immediately, add an entry
-# with a reason and an expiry so it cannot be forgotten:
-#   { id = "RUSTSEC-0000-0000", reason = "...", expiry = "P30D" }
-ignore = []
+# When an advisory cannot be fixed immediately, add an entry with a reason so
+# the decision is explicit and reviewable:
+#   { id = "RUSTSEC-0000-0000", reason = "..." }
+ignore = [
+    # windows 0.24.0 (RUSTSEC-2022-0008 / GHSA-x4mq-m75f-mx8m): delegate
+    # functions missing `Send` bound. Pulled only by tray-item 0.10.0 (latest
+    # release) under the Windows-only, optional `tray` feature. tray-item caps
+    # `windows` at 0.24, so no semver-compatible bump is available; the default
+    # library and the Linux CI build never compile this crate. Informational
+    # "unsound" advisory, not a network-facing exploit. Revisit when tray-item
+    # ships a release depending on windows >= 0.32.
+    { id = "RUSTSEC-2022-0008", reason = "windows crate capped by tray-item 0.10 under the optional Windows-only tray feature; informational unsound advisory, not remotely exploitable" },
+]
 yanked = "deny"
 unmaintained = "all"
-unsound = "workspace"
+# The windows ignore above only matches on Windows targets; the Linux CI graph
+# never compiles it, so do not fail/warn when the ignore is "unused" there.
+unused-ignored-advisory = "allow"
 
 [licenses]
 # Allowlist derived from the current Cargo.lock license set (verified against

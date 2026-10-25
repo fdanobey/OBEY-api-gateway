@@ -765,7 +765,11 @@ fn extract_runtime_library<R: Read + std::io::Seek>(
                 let mut entry = archive
                     .by_index(index)
                     .map_err(|error| OnnxAssetError::Archive(error.to_string()))?;
-                if entry.name().replace('\\', "/").ends_with(suffix) && entry.is_file() {
+                let entry_name = entry
+                    .name()
+                    .map_err(|error| OnnxAssetError::Archive(error.to_string()))?
+                    .replace('\\', "/");
+                if entry_name.ends_with(suffix) && entry.is_file() {
                     let mut bytes = Vec::with_capacity(entry.size() as usize);
                     entry
                         .read_to_end(&mut bytes)
