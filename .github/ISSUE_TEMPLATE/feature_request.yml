@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest an enhancement or new capability
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Keep in mind that every YAML-configurable
+        feature also needs matching controls in the embedded admin panel, so
+        ideas that require admin-UI work take longer to land.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What are you trying to do that the gateway makes hard today?
+      placeholder: I'm trying to ... but the gateway currently ...
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What should it do?
+      description: Describe the behavior you want. Config fields, routing changes, admin-UI controls — sketch what you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Workarounds, other tools, or features that almost cover it.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Routing / failover
+        - Providers
+        - Admin UI / dashboard
+        - Configuration
+        - Guardrails
+        - Rate limiting / budgets
+        - Logging / request outcomes
+        - Build / CI
+        - Other
+    validations:
+      required: true
