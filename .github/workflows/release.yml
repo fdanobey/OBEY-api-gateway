@@ -12,7 +12,7 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -22,7 +22,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -109,7 +109,7 @@ jobs:
           Set-Content -Path "release-notes.md" -Value $body -Encoding utf8NoBOM
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: release-notes.md
           files: |

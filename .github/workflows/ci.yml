@@ -17,7 +17,7 @@ jobs:
     name: Build & validate fallback catalogs
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -25,7 +25,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -50,7 +50,7 @@ jobs:
     # RustSec advisory DB fetch performed by cargo-deny itself.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: cargo-deny (advisories, bans, licenses, sources)
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
