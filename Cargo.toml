@@ -11,7 +11,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 jsonschema = { version = "0.48.2", default-features = false }
 serde_yaml = "0.9"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 aws-sdk-bedrockruntime = { version = "1.76", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-bedrock = { version = "1.145", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
