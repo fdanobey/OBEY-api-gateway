@@ -255,12 +255,18 @@ transaction.execute(
         });
         sql.push_str(&format!(" LIMIT ?{}", if cursor_values.is_some() { 4 } else { 2 }));
 
-let rows: Vec<ResponseRow> = match &cursor_values {
-Some((cursor, cursor_created_at)) => {
-query_response_rows(&conn, &sql, params![owner, cursor_created_at, cursor, params.limit])?
-}
-None => query_response_rows(&conn, &sql, params![owner, params.limit])?,
-};
+ let rows: Vec<ResponseRow> = match &cursor_values {
+ Some((cursor, cursor_created_at)) => query_response_rows(
+ &conn,
+ &sql,
+ params![owner, cursor_created_at, cursor, i64::try_from(params.limit).unwrap_or(i64::MAX)],
+ )?,
+ None => query_response_rows(
+ &conn,
+ &sql,
+ params![owner, i64::try_from(params.limit).unwrap_or(i64::MAX)],
+ )?,
+ };
 rows.into_iter().map(decode_response_row).collect()
 }
 
