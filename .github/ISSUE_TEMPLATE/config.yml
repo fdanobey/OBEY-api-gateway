@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & support
+    url: https://github.com/fdanobey/OBEY-api-gateway/discussions
+    about: Ask questions and get help in Discussions — issues are for bugs and feature requests only.
+  - name: Security vulnerabilities
+    url: https://github.com/fdanobey/OBEY-api-gateway/security/advisories/new
+    about: Report security issues privately — do not open a public issue.

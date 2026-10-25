@@ -1,0 +1,61 @@
+name: Bug report
+description: Something isn't working
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Before you file this, check
+        [existing issues](https://github.com/fdanobey/OBEY-api-gateway/issues?q=is%3Aissue%20label%3Abug)
+        and the [Discussions](https://github.com/fdanobey/OBEY-api-gateway/discussions) area
+        in case it's already known. Questions go to Discussions, not here.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Also tell us what you expected to happen.
+      placeholder: |
+        Steps to reproduce:
+        1. Send request '...'
+        2. ...
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the gateway is affected?
+      options:
+        - Routing / failover
+        - Providers
+        - Admin UI / dashboard
+        - Configuration
+        - Guardrails
+        - Rate limiting / budgets
+        - Logging / request outcomes
+        - Build / CI
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: gateway-version
+    attributes:
+      label: Gateway version and platform
+      description: Commit SHA or release tag, plus OS.
+      placeholder: master@abcdef0, Windows 11 x64
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config
+      description: Paste the config sections involved. Redact API keys and Authorization headers.
+      render: yaml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output
+      description: Errors-tab output or stderr. Never paste provider API keys.
+      render: text
