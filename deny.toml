@@ -42,6 +42,21 @@ ignore = [
 # our YAML config parser; migrating to serde_yaml_ng or serde-nihilist-
 # remnant is a deliberate follow-up, not an emergency.
 { id = "RUSTSEC-2024-0449", reason = "serde_yaml (our YAML config parser) depends on unsafe-libyaml; no fixed release within serde_yaml 0.9, migration to a maintained YAML crate tracked separately" },
+# quick-xml 0.39.4 (RUSTSEC-2026-0194/-0195): quadratic attribute-check and
+# NsReader namespace-allocation DoS, patched in >=0.41. Our quick-xml comes
+# only from wayland-scanner 0.31.9 (cap ^0.39) under winit 0.30 — a
+# build-time protocol-code generator for the optional Windows-only `tray`
+# feature. It never parses untrusted XML at runtime: the advisory's attack
+# path (crafted XML fed to attributes()/NsReader) is unreachable. The deny
+# graph includes lockfile target deps regardless of platform. Revisit when
+# winit/wayland-scanner move to quick-xml >=0.41.
+{ id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39 reachable only via wayland-scanner build-time codegen under optional Windows tray feature; never parses untrusted XML at runtime; upstream cap ^0.39, patched in 0.41" },
+{ id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39 reachable only via wayland-scanner build-time codegen under optional Windows tray feature; never parses untrusted XML at runtime; upstream cap ^0.39, patched in 0.41" },
+# ttf-parser 0.25.1 (RUSTSEC-2026-0192): crate unmaintained upstream. Pulled
+# by ab_glyph/sctk-adwaita under winit 0.30 for the optional Windows-only
+# `tray` feature (adwaita CSD decorations on Linux; on Windows winit uses
+# the Win32 backend and this path is dead code in the shipped binary).
+{ id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; only reachable via winit sctk-adwaita decorations for the optional tray feature; dead code in the Windows build; no fixed release exists" },
 ]
 yanked = "deny"
 unmaintained = "all"
