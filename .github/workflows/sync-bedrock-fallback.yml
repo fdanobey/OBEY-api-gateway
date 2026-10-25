@@ -24,12 +24,12 @@ jobs:
         run: |
           "STATE_DIR=${{ runner.temp }}\bedrock-sync-state" >> $env:GITHUB_ENV
           "SUMMARY_FILE=${{ runner.temp }}\bedrock-sync-summary.json" >> $env:GITHUB_ENV
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Restore consecutive-run state
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.STATE_DIR }}
           key: bedrock-fallback-state-${{ github.run_id }}
