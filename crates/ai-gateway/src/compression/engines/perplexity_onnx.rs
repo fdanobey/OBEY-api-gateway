@@ -16,7 +16,7 @@ use crate::compression::assets::OnnxAssetManager;
 
 const MODEL_NAME: &str = "kompress-small-onnx";
 const DEFAULT_MAX_SEQUENCE_LENGTH: usize = 8_192;
-static ORT_INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
+static ORT_INITIALIZED: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
 
 #[derive(Debug, Default)]
 pub struct OnnxRedundancyScorerLoader;
@@ -55,10 +55,10 @@ impl RedundancyScorerLoader for OnnxRedundancyScorerLoader {
                 reason: "install the ONNX runtime from the admin Compression page".to_owned(),
             });
         }
-        ensure_runtime(&runtime_path).map_err(|reason| ScorerError::RuntimeUnavailable {
-            path: runtime_path,
-            reason,
-        })?;
+ let environment = ensure_runtime(&runtime_path).map_err(|reason| ScorerError::RuntimeUnavailable {
+ path: runtime_path,
+ reason,
+ })?;
 
         let mut tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|error| ScorerError::ScoringFailed {
@@ -77,12 +77,12 @@ impl RedundancyScorerLoader for OnnxRedundancyScorerLoader {
                 scorer: MODEL_NAME.to_owned(),
                 reason: format!("failed to configure tokenizer truncation: {error}"),
             })?;
-        let session = Session::builder()
-            .and_then(|builder| builder.commit_from_file(model_path))
-            .map_err(|error| ScorerError::ScoringFailed {
-                scorer: MODEL_NAME.to_owned(),
-                reason: format!("failed to load model `{}`: {error}", model_path.display()),
-            })?;
+ let session = Session::builder(&environment)
+ .and_then(|mut builder| builder.commit_from_file(model_path))
+ .map_err(|error| ScorerError::ScoringFailed {
+ scorer: MODEL_NAME.to_owned(),
+ reason: format!("failed to load model `{}`: {error}", model_path.display()),
+ })?;
 
         Ok(Arc::new(OnnxRedundancyScorer {
             tokenizer,
@@ -91,16 +91,16 @@ impl RedundancyScorerLoader for OnnxRedundancyScorerLoader {
     }
 }
 
-fn ensure_runtime(runtime_path: &Path) -> Result<(), String> {
-    ORT_INITIALIZED
-        .get_or_init(|| {
-            ort::init_from(runtime_path.display().to_string())
-                .with_name("obey-api-gateway")
-                .commit()
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
-        .clone()
+fn ensure_runtime(runtime_path: &Path) -> Result<ort::environment::Environment, String> {
+ ORT_INITIALIZED
+ .get_or_init(|| {
+ ort::init_from(runtime_path.display().to_string())
+ .map_err(|error| error.to_string())?
+ .with_name("obey-api-gateway")
+ .build()
+ .map_err(|error| error.to_string())
+ })
+ .clone()
 }
 
 pub struct OnnxRedundancyScorer {
