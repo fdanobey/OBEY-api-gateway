@@ -77,7 +77,7 @@ dependencies = [
  "ort",
  "proptest",
  "qdrant-client",
- "rand 0.8.8",
+ "rand 0.10.3",
  "rcgen",
  "regex",
  "reqwest",
