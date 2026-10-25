@@ -28,6 +28,20 @@ ignore = [
     # "unsound" advisory, not a network-facing exploit. Revisit when tray-item
     # ships a release depending on windows >= 0.32.
     { id = "RUSTSEC-2022-0008", reason = "windows crate capped by tray-item 0.10 under the optional Windows-only tray feature; informational unsound advisory, not remotely exploitable" },
+# paste 1.0.15 (RUSTSEC-2024-0436): archived upstream, no fixed release exists.
+# Pulled only by tokenizers 0.23 via macro_rules_attribute (build-time proc
+# macro); never executes at runtime. Revisit when tokenizers drops the dep.
+{ id = "RUSTSEC-2024-0436", reason = "paste is a build-time proc-macro via tokenizers/macro_rules_attribute; upstream archived, no fixed release, no runtime exposure" },
+# rustls-pemfile 2.2.0 (RUSTSEC-2025-0134): repo archived Aug 2025; the crate
+# is a thin wrapper over rustls-pki-types PEM parsing (which we also use).
+# Pulled by axum-server 0.7 (TLS acceptor) and tonic 0.12 via qdrant-client.
+# Revisit when axum-server/tonic migrate to rustls-pki-types PemObject.
+{ id = "RUSTSEC-2025-0134", reason = "rustls-pemfile archived upstream, thin wrapper over rustls-pki-types which stays current; transitive via axum-server/tonic, no fixed release available" },
+# unsafe-libyaml 0.2.11 (RUSTSEC-2024-0449): maintenance moved into serde_yaml
+# upstream (libyaml-safer project). serde_yaml 0.9 itself is deprecated but is
+# our YAML config parser; migrating to serde_yaml_ng or serde-nihilist-
+# remnant is a deliberate follow-up, not an emergency.
+{ id = "RUSTSEC-2024-0449", reason = "serde_yaml (our YAML config parser) depends on unsafe-libyaml; no fixed release within serde_yaml 0.9, migration to a maintained YAML crate tracked separately" },
 ]
 yanked = "deny"
 unmaintained = "all"
