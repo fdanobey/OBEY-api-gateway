@@ -20,14 +20,6 @@ db-urls = ["https://github.com/RustSec/advisory-db"]
 # the decision is explicit and reviewable:
 #   { id = "RUSTSEC-0000-0000", reason = "..." }
 ignore = [
-    # windows 0.24.0 (RUSTSEC-2022-0008 / GHSA-x4mq-m75f-mx8m): delegate
-    # functions missing `Send` bound. Pulled only by tray-item 0.10.0 (latest
-    # release) under the Windows-only, optional `tray` feature. tray-item caps
-    # `windows` at 0.24, so no semver-compatible bump is available; the default
-    # library and the Linux CI build never compile this crate. Informational
-    # "unsound" advisory, not a network-facing exploit. Revisit when tray-item
-    # ships a release depending on windows >= 0.32.
-    { id = "RUSTSEC-2022-0008", reason = "windows crate capped by tray-item 0.10 under the optional Windows-only tray feature; informational unsound advisory, not remotely exploitable" },
 # paste 1.0.15 (RUSTSEC-2024-0436): archived upstream, no fixed release exists.
 # Pulled only by tokenizers 0.23 via macro_rules_attribute (build-time proc
 # macro); never executes at runtime. Revisit when tokenizers drops the dep.
