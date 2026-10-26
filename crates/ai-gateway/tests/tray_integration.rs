@@ -112,10 +112,13 @@ fn test_config() -> Config {
         smart_routing: Default::default(),
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
-        codex_search: None,
-        structured_output: None,
-        reasoning_compat: Default::default(),
-    }
+ codex_search: None,
+ structured_output: None,
+ reasoning_compat: Default::default(),
+ loop_detection: Default::default(),
+ cache_aware_routing: Default::default(),
+ security: Default::default(),
+ }
 }
 
 #[tokio::test]
