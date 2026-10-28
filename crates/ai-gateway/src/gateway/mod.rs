@@ -58,7 +58,7 @@ pub struct AppState {
     /// `None` (inner) when no `guardrails` section is configured. Wrapped in an
     /// `Arc<RwLock<..>>` so hot-reload can swap in a freshly built engine while
     /// in-flight requests keep the `Arc<GuardrailEngine>` they cloned at request
-    /// start ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â mirroring how `config: Arc<RwLock<Config>>` is snapshotted.
+    /// start — mirroring how `config: Arc<RwLock<Config>>` is snapshotted.
     /// Handlers (tasks 13.2/13.3) take a snapshot with
     /// `state.guardrail_engine.read().await.clone()` and run the whole request
     /// against that clone.
@@ -350,7 +350,7 @@ impl GatewayServer {
         use handlers::*;
 
         let api_routes = Router::new()
-            // Chat completions ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â streaming & non-streaming (Req 2.1)
+            // Chat completions — streaming & non-streaming (Req 2.1)
             .route("/v1/chat/completions", post(chat_completions))
             // Legacy completions (Req 2.2)
             .route("/v1/completions", post(completions))
@@ -433,7 +433,17 @@ impl GatewayServer {
             .route(
                 "/v1/responses/{response_id}/input_items",
                 get(responses_input_items),
-            );
+            )
+            // Anthropic Messages front door (Req: anthropic-messages-front-door).
+            // Path-only matching: query strings like `?beta=true` still hit
+            // the route (axum default); `anthropic-version` handling lives in
+            // the handler. `/v1/messages/count_tokens` must be registered
+            // BEFORE `/v1/messages` so it is not shadowed.
+            .route(
+                "/v1/messages/count_tokens",
+                post(anthropic_count_tokens),
+            )
+            .route("/v1/messages", post(anthropic_create));
 
         let api_routes =
             api_routes.layer(crate::loop_detection::middleware::LoopDetectorLayer::new(
@@ -557,7 +567,7 @@ impl GatewayServer {
             tracing::warn!("Dashboard routes are disabled by configuration");
         }
 
-        // Prometheus metrics endpoint (Req 20.7-20.11) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â conditional on config
+        // Prometheus metrics endpoint (Req 20.7-20.11) — conditional on config
         if let Some(prom) = prometheus_cfg {
             if prom.enabled {
                 router = router.route(&prom.path, get(handlers::prometheus_metrics));
@@ -603,6 +613,13 @@ impl GatewayServer {
         let health_routes = Router::new()
             .route("/health", get(handlers::health_check))
             .route("/ping", get(handlers::ping))
+            // Claude Code liveness probe (anthropic-messages-front-door Req
+            // 4.3): liveness-class only — no auth, no policy, no logging
+            // side-effects. HEAD with an empty 200 body.
+            .route(
+                "/api/hello",
+                axum::routing::head(|| async { axum::http::StatusCode::OK }),
+            )
             .layer(cors)
             .layer(trace_layer)
             .with_state(self.state.clone());
@@ -742,9 +759,9 @@ impl GatewayServer {
                 .map_err(|e| GatewayError::Http(format!("Server error: {}", e)))?;
         }
 
-        // Server has stopped ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â all in-flight requests are complete.
+        // Server has stopped — all in-flight requests are complete.
         // Flush metrics and close database connections (Req 18.3, 18.4).
-        tracing::info!("In-flight requests drained, cleaning up resourcesÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦");
+        tracing::info!("In-flight requests drained, cleaning up resources…");
         metrics.flush();
         logger.flush();
         tracing::info!("Graceful shutdown complete");
@@ -1205,8 +1222,8 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => tracing::info!("Received SIGINT, shutting downÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦"),
-        _ = terminate => tracing::info!("Received SIGTERM, shutting downÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦"),
+        _ = ctrl_c => tracing::info!("Received SIGINT, shutting down…"),
+        _ = terminate => tracing::info!("Received SIGTERM, shutting down…"),
     }
 }
 
@@ -1485,6 +1502,91 @@ mod tests {
         assert!(server.state.cache.is_none());
         assert!(server.state.memory_system.read().await.is_none());
         assert!(Arc::strong_count(&server.state.compression_events) >= 2);
+    }
+
+    #[tokio::test]
+    async fn anthropic_routes_reject_missing_version_header() {
+        // Route registration + Req 4.1 enforcement: POST /v1/messages (with a
+        // query string — path-only matching) and /v1/messages/count_tokens
+        // must exist and return a 400 invalid_request_error Anthropic body
+        // when anthropic-version is missing.
+        let server = GatewayServer::new(minimal_config(), None).await.unwrap();
+        let app = server.build_router();
+
+        for uri in ["/v1/messages?beta=true", "/v1/messages/count_tokens"] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["type"], "error", "{uri}");
+            assert_eq!(json["error"]["type"], "invalid_request_error", "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_hello_head_returns_200_empty() {
+        let server = GatewayServer::new(minimal_config(), None).await.unwrap();
+        let app = server.build_router();
+
+        let request = Request::builder()
+            .method("HEAD")
+            .uri("/api/hello")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn models_list_switches_to_anthropic_shape() {
+        // Req 4.2/6.6: anthropic-version header or ?beta=true flips the
+        // /v1/models response to the Anthropic {type:"model", display_name}
+        // shape; without either the OpenAI shape is unchanged.
+        let server = GatewayServer::new(minimal_config(), None).await.unwrap();
+        let app = server.build_router();
+
+        for uri in ["/v1/models?beta=true"] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let first = &json["data"][0];
+            assert_eq!(first["type"], "model", "{uri}");
+            assert!(first.get("display_name").is_some(), "{uri}");
+            assert!(first.get("created_at").is_some(), "{uri}");
+        }
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["object"], "list");
+        let first = &json["data"][0];
+        assert_eq!(first["object"], "model");
+        assert!(first.get("display_name").is_none());
     }
 
     #[tokio::test]
@@ -2087,7 +2189,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_body_limit() {
-        // Validates: Req 45.3 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â default 10 MB
+        // Validates: Req 45.3 — default 10 MB
         let cfg = minimal_config();
         assert_eq!(cfg.server.max_request_size_mb, 10);
         let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -2203,7 +2305,7 @@ mod tests {
         let trace_layer = TraceLayer::new_for_http();
         drop(config);
 
-        // A trivial handler that consumes the full body ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â triggers limit check
+        // A trivial handler that consumes the full body — triggers limit check
         async fn echo_handler(body: Bytes) -> String {
             format!("{}", body.len())
         }
@@ -2426,7 +2528,7 @@ mod tests {
                            );
                        }
 
-                       // Req 24.2: union ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â every unique model from config must appear
+                       // Req 24.2: union — every unique model from config must appear
                        for model_id in expected_unique_models.keys() {
                            prop_assert!(
                                seen_ids.contains(model_id.as_str()),
@@ -2616,7 +2718,7 @@ mod tests {
                 let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
                 if !tls_enabled {
-                    // Case: TLS disabled explicitly ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ validate_tls returns Ok(None) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ HTTP mode
+                    // Case: TLS disabled explicitly → validate_tls returns Ok(None) → HTTP mode
                     let tls_cfg = Some(TlsConfig {
                         enabled: false,
                         cert_path: "/nonexistent/cert.pem".to_string(),
@@ -2626,12 +2728,12 @@ mod tests {
                     prop_assert!(result.is_ok(), "Disabled TLS should return Ok");
                     prop_assert!(result.unwrap().is_none(), "Disabled TLS should return None (HTTP mode)");
 
-                    // Case: TLS config is None ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ validate_tls returns Ok(None) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ HTTP mode
+                    // Case: TLS config is None → validate_tls returns Ok(None) → HTTP mode
                     let result_none = GatewayServer::validate_tls(&None).await;
                     prop_assert!(result_none.is_ok(), "None TLS should return Ok");
                     prop_assert!(result_none.unwrap().is_none(), "None TLS should return None (HTTP mode)");
                 } else if !has_valid_files {
-                    // Case: TLS enabled but cert/key files don't exist ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ must error
+                    // Case: TLS enabled but cert/key files don't exist → must error
                     let tls_cfg = Some(TlsConfig {
                         enabled: true,
                         cert_path: "/nonexistent/cert.pem".to_string(),
@@ -2640,7 +2742,7 @@ mod tests {
                     let result = GatewayServer::validate_tls(&tls_cfg).await;
                     prop_assert!(result.is_err(), "TLS enabled with missing files must return Err");
                 } else {
-                    // Case: TLS enabled with valid cert/key files ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ must return Ok(Some(_)) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ HTTPS mode
+                    // Case: TLS enabled with valid cert/key files → must return Ok(Some(_)) → HTTPS mode
                     let key_pair = rcgen::KeyPair::generate().unwrap();
                     let cert_signed = rcgen::CertificateParams::new(vec!["localhost".to_string()])
                         .unwrap()
@@ -2809,7 +2911,7 @@ mod tests {
                 let server = GatewayServer::new(cfg, None).await.unwrap();
                 let app = build_test_router(&server);
 
-                // --- Oversized request: body exceeds limit by 1 byte ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ must get 413 ---
+                // --- Oversized request: body exceeds limit by 1 byte → must get 413 ---
                 let oversized_body = vec![b'x'; expected_limit_bytes + 1];
                 let req = Request::builder()
                     .method("POST")
@@ -2827,7 +2929,7 @@ mod tests {
                     max_mb
                 );
 
-                // --- Within-limit request: body exactly at limit ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ must NOT get 413 ---
+                // --- Within-limit request: body exactly at limit → must NOT get 413 ---
                 let ok_body = vec![b'x'; expected_limit_bytes];
                 let req = Request::builder()
                     .method("POST")

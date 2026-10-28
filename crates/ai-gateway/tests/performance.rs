@@ -20,6 +20,10 @@ use axum::http::{Request, StatusCode};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
+use ai_gateway::anthropic::{
+    synthesize_anthropic_response, translate as translate_anthropic, AnthropicRequest,
+    AnthropicSynthesisContext,
+};
 use ai_gateway::compression::pipeline::{CompressionPipeline, CompressionRequestMetadata};
 use ai_gateway::compression::token_counter::TokenCounter;
 use ai_gateway::compression::{CompressiblePayload, CompressionContext, CompressionLevel};
@@ -889,6 +893,61 @@ async fn test_forwarding_overhead() {
         }
         let models_avg = start.elapsed() / iterations as u32;
 
+        // Measure /v1/messages translation (spec NFR, Req 8.2: translation
+        // adds ≤ 1 ms median to the under-10 ms gateway overhead budget).
+        // Pure translate+synthesize per iteration — the handler's /v1/messages
+        // path minus network I/O — mirroring the measured request/response
+        // loop style above.
+        let anthropic_req: AnthropicRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-group",
+            "max_tokens": 1024,
+            "messages": [
+                { "role": "user", "content": "Translate this prompt for latency measurement." }
+            ]
+        }))
+        .expect("anthropic request fixture must parse");
+        let chat_response = OpenAIResponse {
+            id: "chatcmpl-perf".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1_700_000_000,
+            model: "gpt-4".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("Response from the gateway."),
+                    extra: serde_json::Map::new(),
+                },
+                finish_reason: Some("stop".to_string()),
+                extra: serde_json::Map::new(),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                extra: serde_json::Map::new(),
+            },
+            extra: serde_json::Map::new(),
+        };
+        let stop_sequences: Vec<String> = Vec::new();
+        let synth_ctx = AnthropicSynthesisContext {
+            request_model: &anthropic_req.model,
+            stop_sequences: &stop_sequences,
+        };
+        // Warm up the translation path.
+        for _ in 0..5 {
+            let translated = translate_anthropic(&anthropic_req).unwrap();
+            let _ = synthesize_anthropic_response(&chat_response, &synth_ctx);
+            drop(translated);
+        }
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let translated = std::hint::black_box(translate_anthropic(&anthropic_req).unwrap());
+            let _ = std::hint::black_box(synthesize_anthropic_response(&chat_response, &synth_ctx));
+            drop(translated);
+        }
+        let messages_avg = start.elapsed() / iterations as u32;
+
         assert!(
             health_avg < Duration::from_millis(10),
             "/health avg {:?} exceeds 10ms target (Req 17.2)",
@@ -898,6 +957,11 @@ async fn test_forwarding_overhead() {
             models_avg < Duration::from_millis(10),
             "/v1/models avg {:?} exceeds 10ms target (Req 17.2)",
             models_avg
+        );
+        assert!(
+            messages_avg < Duration::from_millis(1),
+            "/v1/messages translate+synthesize avg {:?} exceeds 1ms translation budget (Req 8.2)",
+            messages_avg
         );
     })
     .await;

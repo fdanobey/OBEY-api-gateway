@@ -518,6 +518,8 @@ async fn logs_handler(
         status_code: params.status_code,
         min_status_code: None,
         compression_level: params.compression_level,
+        client_protocol: None,
+        claude_session_id: None,
         limit: params.limit,
     };
 
@@ -1447,6 +1449,8 @@ mod tests {
                     reasoning_compat_actions: None,
                     error_class: None,
                     context_reduction: None,
+                    client_protocol: None,
+                    claude_session_id: None,
                 })
                 .unwrap();
         }
@@ -1509,6 +1513,8 @@ mod tests {
                 reasoning_compat_actions: None,
                 error_class: None,
                 context_reduction: None,
+                client_protocol: None,
+                claude_session_id: None,
             })
             .unwrap();
 
@@ -1565,6 +1571,8 @@ mod tests {
             reasoning_compat_actions: None,
             error_class: error_class.map(str::to_owned),
             context_reduction: None,
+            client_protocol: None,
+            claude_session_id: None,
         }
     }
 

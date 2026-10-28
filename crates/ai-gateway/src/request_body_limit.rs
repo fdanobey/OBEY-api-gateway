@@ -18,7 +18,7 @@
 //! 1. Requests whose declared `Content-Length` already exceeds the limit are
 //!    rejected with 413 before the body is downloaded.
 //! 2. Otherwise, the per-request extension makes body-consuming extractors
-//!    (`Json`, `Bytes`, `Multipart`) enforce the dynamic limit natively Ã¢â‚¬â€
+//!    (`Json`, `Bytes`, `Multipart`) enforce the dynamic limit natively —
 //!    including for chunked bodies that have no `Content-Length`.
 
 use axum::{

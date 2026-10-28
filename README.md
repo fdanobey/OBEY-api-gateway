@@ -47,6 +47,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Response caching** — built-in two-tier cache: in-memory exact-match (default-on, no setup) plus optional semantic Qdrant tier; works for both streaming and non-streaming requests, including tool-using clients
 - **OpenAI OAuth login** — browser-based sign-in with your ChatGPT Plus/Pro subscription (PKCE flow, automatic token refresh)
 - **Responses API front door** — native `/v1/responses` endpoint that accepts the OpenAI Responses wire format (used by Codex CLI and the OpenAI SDK's `responses.create`) and bridges it to Chat-Completions-native providers; translates requests inbound, synthesizes Responses-shaped output (streaming + non-streaming), and offers stateful persistence via `store` / `previous_response_id` with retrieval, list, and delete endpoints (see [Responses API](#responses-api))
+- **Anthropic Messages front door** — native `/v1/messages` endpoint that accepts the Anthropic Messages wire format (used by Claude Code and the Anthropic SDKs) and bridges it to Chat-Completions-native providers; translates requests inbound, synthesizes Messages-shaped responses and SSE streams, and adds `/v1/messages/count_tokens`, an Anthropic-shaped `/v1/models` listing, and the Claude Code `HEAD /api/hello` probe — on by default, zero configuration, with native passthrough for Bedrock Mantle Messages-family models (see [Anthropic Messages API](#anthropic-messages-api))
 - **Codex backend translation** — transparently routes OAuth-authenticated requests through the ChatGPT Codex backend, translating Chat Completions ↔ Responses API on the fly
 - **Codex web search** — automatic web-search tool injection available to every model group while a valid OpenAI OAuth token is active; the routed provider serves the completion while search calls execute server-side against the Codex search API (configurable timeout, max iterations, base URL, and chat output so results survive context compression) (see [Codex Web Search](#codex-web-search))
 - **Guardrail pipelines** — configurable pre-call and post-call policy enforcement with PII redaction/re-injection, regex scanning, Presidio NLP, OpenAI Moderation, Lakera, semantic prompt guard, and custom HTTP providers; includes refusal detection with automatic failover (see [Guardrail Pipelines](#guardrail-pipelines))
@@ -1443,6 +1444,54 @@ When the selected provider uses `auth_method: oauth` (Codex / ChatGPT backend), 
 #### Accepted-but-local-only fields
 
 Fields such as `service_tier`, `safety_identifier`, `prompt_cache_key`, `user`, and `include[]` are accepted via the request's `#[serde(flatten)] extra` catch-all so that clients sending them do not receive a parse error, but they have no gateway-side effect. The gateway applies `include`/usage flags only where it holds the underlying data (e.g. `cached_tokens`, `reasoning_tokens`); other accepted flags are stored/echoed but not acted upon.
+
+## Anthropic Messages API
+
+The gateway exposes a native `/v1/messages` endpoint that speaks the Anthropic Messages wire format — the format used by Claude Code and the Anthropic SDKs. Clients that hardcode the Messages shape work against any Chat-Completions-native provider in your config, because the gateway bridges the two formats in both directions. The routes are on by default; no YAML configuration is needed.
+
+### Connect Claude Code
+
+Two environment variables point Claude Code at the gateway:
+
+```bash
+export ANTHROPIC_BASE_URL=http://<gateway-host>:8080
+export ANTHROPIC_AUTH_TOKEN=<virtual key>
+```
+
+Set `ANTHROPIC_AUTH_TOKEN` to a virtual key (`vk_…`) created through the admin API or the admin panel's **Virtual Keys** tab (see [Virtual Key Management](#virtual-key-management)); with `virtual_keys.enforcement: required`, Claude Code cannot reach the gateway without one:
+
+```bash
+curl -X POST http://localhost:8080/admin/keys \
+-H 'Content-Type: application/json' \
+-d '{"name":"claude-code"}'
+```
+
+Authentication accepts `Authorization: Bearer <vk_…>` on every route; the Anthropic-style `x-api-key: <vk_…>` header is additionally accepted on `/v1/messages` and `/v1/messages/count_tokens` only (Bearer wins when both are present).
+
+Requests routed to a Bedrock Mantle Messages-family provider (`anthropic.claude*` model IDs on the bedrock-mantle endpoint) bypass translation: the exact client JSON is forwarded natively with the client's `anthropic-version` and `anthropic-beta` headers passed through verbatim, and the upstream Anthropic wire (JSON or SSE) is relayed unchanged.
+
+### Anthropic Messages Compatibility Matrix
+
+The table below documents which Messages request capabilities the gateway translates, and which are explicitly rejected with a field-naming error before any provider dispatch. Unsupported capabilities never degrade silently.
+
+| Capability | Status | Notes |
+|------------|--------|-------|
+| `text` content blocks | Supported | Plain string and typed-block content |
+| `image` content blocks | Supported | Base64 sources become `data:` URLs; URL sources pass through |
+| `tool_use` / `tool_result` blocks | Supported | Multi-turn tool history maps to chat `tool_calls` / `tool` messages |
+| `thinking` + replayed `thinking` / `redacted_thinking` | Supported | `thinking` config feeds reasoning-compat controls; replayed blocks preserved verbatim (strip/preserve on model change follows [Reasoning-State Failover Compatibility](#reasoning-state-failover-compatibility)) |
+| `system` (string or text-block array) | Supported | Becomes a single leading system message |
+| `stop_sequences` | Supported | Maps to chat `stop`; a hit maps back to `stop_reason: "stop_sequence"` |
+| `tool_choice` (incl. `disable_parallel_tool_use`) | Supported | `auto`/`any`/`none`/`tool` map to chat equivalents |
+| Hosted tools (`web_search`, `computer`, `code_execution`, `text_editor`, `bash`, `mcp_connector`) | Rejected 400 | `tool type '<name>' is not supported` — error names the tool |
+| `document` content blocks | Rejected 400 | `content block type 'document' is not supported` |
+| `context_management` | Rejected 400 | `context_management is not supported` |
+| `pause_turn` stop reason | Never synthesized | Synthesized stop reasons are `end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, and `refusal` |
+| Subscription OAuth (Claude Pro/Max accounts) | Intentionally unsupported | See the security note below |
+
+### Security note: subscription OAuth
+
+Claude/Anthropic subscription OAuth login (Claude Pro/Max accounts) is intentionally unsupported. Anthropic bans accounts that route subscription credentials through third-party gateways; upstream provider authentication uses API keys only, exactly like every other gateway feature. Virtual keys are the supported credential for the Messages front door.
 
 ## Assistants API
 

@@ -404,20 +404,20 @@ impl Config {
                     && env::var(env_var).is_err()
                     && provider.resolved_api_key.is_none()
                 {
-                    tracing::warn!("Environment variable '{}' for provider '{}' is not set Ã¢â‚¬â€ provider will be unavailable until configured", env_var, provider.name);
+                    tracing::warn!("Environment variable '{}' for provider '{}' is not set — provider will be unavailable until configured", env_var, provider.name);
                 }
             }
 
             if provider.api_key_encrypted.is_some() && provider.resolved_api_key.is_none() {
                 tracing::warn!(
-                    "Encrypted API key for provider '{}' could not be resolved Ã¢â‚¬â€ provider will be unavailable until the key is re-entered",
+                    "Encrypted API key for provider '{}' could not be resolved — provider will be unavailable until the key is re-entered",
                     provider.name
                 );
             }
 
             if let Some(ref env_var) = provider.api_secret_env {
                 if !env_var.is_empty() && env::var(env_var).is_err() {
-                    tracing::warn!("Environment variable '{}' for provider '{}' is not set Ã¢â‚¬â€ provider will be unavailable until configured", env_var, provider.name);
+                    tracing::warn!("Environment variable '{}' for provider '{}' is not set — provider will be unavailable until configured", env_var, provider.name);
                 }
             }
 
@@ -458,7 +458,7 @@ impl Config {
                 }
             }
 
-            // Req 10.9 Ã¢â‚¬â€ codex_model_override must be non-empty when set
+            // Req 10.9 — codex_model_override must be non-empty when set
             if let Some(ref m) = provider.codex_model_override {
                 if m.trim().is_empty() {
                     errors.push(ValidationError::InvalidCodexField {
@@ -468,11 +468,11 @@ impl Config {
                 }
             }
 
-            // Req 12.6 Ã¢â‚¬â€ ToS warning when Codex provider active with admin auth disabled
+            // Req 12.6 — ToS warning when Codex provider active with admin auth disabled
             if is_codex_capable && !self.admin.auth.enabled {
                 tracing::warn!(
                     provider = %provider.name,
-                    "Codex provider active with admin auth disabled Ã¢â‚¬â€ ToS risk: \
+                    "Codex provider active with admin auth disabled — ToS risk: \
                      a shared ChatGPT session over an unauthenticated admin panel \
                      violates OpenAI terms. Enable admin.auth.enabled = true."
                 );
@@ -486,7 +486,7 @@ impl Config {
 
                 if !provider.has_api_key_configured() {
                     tracing::warn!(
-                        "Bedrock provider '{}' has no API key configured Ã¢â‚¬â€ authentication is required for Bedrock Mantle endpoints",
+                        "Bedrock provider '{}' has no API key configured — authentication is required for Bedrock Mantle endpoints",
                         provider.name
                     );
                 }
@@ -523,7 +523,7 @@ impl Config {
         // The whole `streaming` section is re-read on hot-reload via
         // `apply_runtime_config_update`, which validates through this path.
         if let Some(ref streaming) = self.streaming {
-            // keepalive_interval_seconds must be within 0Ã¢â‚¬â€œ60 (0 = disabled).
+            // keepalive_interval_seconds must be within 0–60 (0 = disabled).
             if streaming.keepalive_interval_seconds > 60 {
                 errors.push(ValidationError::InvalidValue {
                     field: "streaming.keepalive_interval_seconds".to_string(),
@@ -600,7 +600,7 @@ prefix stickiness is disabled and routing uses normal priority/cost/latency sort
 
             if codex_search.effective_enabled(has_codex_provider) && !has_codex_provider {
                 tracing::warn!(
-    "codex_search.enabled is true but no Codex (oauth+openai) provider is configured Ã¢â‚¬â€ \
+    "codex_search.enabled is true but no Codex (oauth+openai) provider is configured — \
     search tools will not be injected and no upstream search calls will be made"
     );
             }
@@ -610,12 +610,12 @@ prefix stickiness is disabled and routing uses normal priority/cost/latency sort
         if self.admin.auth.enabled {
             if let Some(ref env_var) = self.admin.auth.username_env {
                 if env::var(env_var).is_err() {
-                    tracing::warn!("Admin auth env var '{}' is not set Ã¢â‚¬â€ admin auth will be disabled until configured", env_var);
+                    tracing::warn!("Admin auth env var '{}' is not set — admin auth will be disabled until configured", env_var);
                 }
             }
             if let Some(ref env_var) = self.admin.auth.password_env {
                 if env::var(env_var).is_err() {
-                    tracing::warn!("Admin auth env var '{}' is not set Ã¢â‚¬â€ admin auth will be disabled until configured", env_var);
+                    tracing::warn!("Admin auth env var '{}' is not set — admin auth will be disabled until configured", env_var);
                 }
             }
         }
@@ -878,7 +878,7 @@ prefix stickiness is disabled and routing uses normal priority/cost/latency sort
         /// Maximum stego suppression threshold (indirect-injection defense).
         const MAX_STEGO_THRESHOLD: u32 = 1000;
 
-        /// Phase Ã— action validity matrix (design Â§2.4). `replace_with_policy_message`
+        /// Phase × action validity matrix (design §2.4). `replace_with_policy_message`
         /// is invalid for the two inbound phases; all other actions are valid
         /// everywhere.
         fn phase_allows_action(phase: StagePhase, action: PolicyAction) -> bool {
@@ -1006,7 +1006,7 @@ prefix stickiness is disabled and routing uses normal priority/cost/latency sort
                     });
                 }
 
-                // Phase Ã— action validity matrix (design Â§2.4, task 1.3).
+                // Phase × action validity matrix (design §2.4, task 1.3).
                 if !phase_allows_action(stage.phase, stage.action) {
                     errors.push(ValidationError::GuardrailInvalidPhaseAction {
                         pipeline_name: pipeline.name.clone(),
@@ -1056,7 +1056,7 @@ prefix stickiness is disabled and routing uses normal priority/cost/latency sort
         }
 
         // Every binding (virtual_keys / model_groups / routes) must reference a
-        // defined pipeline; undefined Ã¢â€ â€™ error identifying binding target and
+        // defined pipeline; undefined → error identifying binding target and
         // pipeline name (Req 1.10).
         let binding_groups: [(&str, &std::collections::HashMap<String, String>); 3] = [
             ("virtual_keys", &guardrails.bindings.virtual_keys),
@@ -2406,7 +2406,7 @@ model_groups:
                 yaml.push_str(&format!("api_key_env: \"{key}\"\n"));
             }
 
-            // Deserialize Ã¢â‚¬â€ must succeed
+            // Deserialize — must succeed
             let provider: Provider = serde_yaml::from_str(&yaml)
                 .expect("Provider YAML without auth_method must deserialize successfully");
 
@@ -2542,7 +2542,7 @@ model_groups:
         assert!(config.validate().is_ok());
     }
 
-    // Feature: indirect-injection-defense, task 1.3/1.4 â€” phase Ã— action
+    // Feature: indirect-injection-defense, task 1.3/1.4 — phase × action
     // matrix and unicode_stego threshold bounds.
 
     #[test]
@@ -2597,8 +2597,8 @@ model_groups:
 
     #[test]
     fn test_guardrail_matrix_accepts_field_actions_in_inbound_phases() {
-        // allow/block/mask/redact are valid in every phase (design Â§2.4 rows
-        // 1â€“2).
+        // allow/block/mask/redact are valid in every phase (design §2.4 rows
+        // 1–2).
         for phase in [StagePhase::PreCall, StagePhase::ToolResult] {
             for action in [
                 PolicyAction::Allow,
@@ -2816,7 +2816,7 @@ model_groups:
             timeout_seconds: 5,
             settings: ProviderSettings {
                 endpoint: Some("http://presidio:3000/analyze".to_string()),
-                entities: vec![], // empty Ã¢â€ â€™ rejected (Req 6.3)
+                entities: vec![], // empty → rejected (Req 6.3)
                 ..Default::default()
             },
         });
@@ -2965,7 +2965,7 @@ model_groups:
         let mut guardrails = minimal_guardrails();
         guardrails.pipelines[0].refusal_phrase_list = Some(vec![
             "i can't help".to_string(),
-            "".to_string(), // empty Ã¢â€ â€™ rejected (Req 12.13)
+            "".to_string(), // empty → rejected (Req 12.13)
         ]);
         let config = config_with_guardrails(guardrails);
 
@@ -2986,7 +2986,7 @@ model_groups:
         let mut guardrails = minimal_guardrails();
         guardrails.pipelines[0].refusal_phrase_list = Some(vec![
             "i can'?t (help|assist)".to_string(), // valid
-            "(unclosed".to_string(),              // invalid regex Ã¢â€ â€™ rejected (Req 12.13)
+            "(unclosed".to_string(),              // invalid regex → rejected (Req 12.13)
         ]);
         let config = config_with_guardrails(guardrails);
 
@@ -3019,7 +3019,7 @@ model_groups:
 
     #[test]
     fn test_guardrail_refusal_phrase_list_none_accepted() {
-        // When refusal_phrase_list is None, default list is used Ã¢â‚¬â€ no validation needed.
+        // When refusal_phrase_list is None, default list is used — no validation needed.
         let guardrails = minimal_guardrails();
         assert!(guardrails.pipelines[0].refusal_phrase_list.is_none());
         let config = config_with_guardrails(guardrails);
@@ -3027,7 +3027,7 @@ model_groups:
     }
 
     // ---------------------------------------------------------------------
-    // Feature: guardrail-pipelines, Task 3.2 Ã¢â‚¬â€ Property 3: Pipeline
+    // Feature: guardrail-pipelines, Task 3.2 — Property 3: Pipeline
     // configuration validation.
     // **Validates: Requirements 1.1, 1.2, 1.9, 1.10**
     //
@@ -3045,7 +3045,7 @@ model_groups:
     // exercised. This lets the test independently recompute expected validity
     // and match it exactly (both directions of the iff). `PolicyAction` and
     // `StagePhase` are enums, so an invalid action/phase is unrepresentable and
-    // rejected at deserialization Ã¢â‚¬â€ validity is structurally guaranteed and not
+    // rejected at deserialization — validity is structurally guaranteed and not
     // separately generated here.
 
     /// Provider names declared by every generated config.
@@ -3234,7 +3234,7 @@ model_groups:
                 }
             }
 
-            // Design Â§2.4: phase Ã— action matrix â€” `replace_with_policy_message`
+            // Design §2.4: phase × action matrix — `replace_with_policy_message`
             // is invalid for the two inbound phases.
             let matrix_violations: Vec<(&str, usize)> = gen_pipelines
                 .iter()
@@ -3315,7 +3315,7 @@ model_groups:
     }
 
     // -------------------------------------------------------------------------
-    // Feature: guardrail-pipelines, Task 16.6 Ã¢â‚¬â€ Property 34: Refusal
+    // Feature: guardrail-pipelines, Task 16.6 — Property 34: Refusal
     // phrase-list validation rejects malformed entries.
     // **Validates: Requirements 12.13**
     //

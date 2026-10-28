@@ -52,6 +52,8 @@ fn log_entry(trace_id: &str, timestamp: DateTime<Utc>) -> LogEntry {
         reasoning_compat_actions: None,
         error_class: None,
         context_reduction: None,
+        client_protocol: None,
+        claude_session_id: None,
     }
 }
 

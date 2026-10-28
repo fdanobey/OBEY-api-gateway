@@ -2723,24 +2723,34 @@ impl BedrockProvider {
         })
     }
 
-    /// Reachable only through [`Self::dispatch_mantle`] /
-    /// [`Self::dispatch_mantle_stream`]. See `normalization` note on
-    /// [`Self::chat_completion_api_key`].
-    async fn chat_completion_messages_api(
-        &self,
-        request: OpenAIRequest,
-        http_client: &Client,
-        api_key: &str,
-        base_url: &str,
-        custom_headers: &HashMap<String, String>,
-        normalization: &TriggerNormalization,
-    ) -> Result<ProviderResponse, GatewayError> {
-        // Messages family needs no survivor placement: the seam's removal already
-        // reduced the payload to <=1 trigger, Anthropic Messages does not use
-        // `compaction_trigger`, and this adapter flattens content via
-        // `content_as_text()`. The normalization outcome is intentionally unused.
-        let _ = normalization;
-        let start = Instant::now();
+/// Reachable only through [`Self::dispatch_mantle`] /
+/// [`Self::dispatch_mantle_stream`]. See `normalization` note on
+/// [`Self::chat_completion_api_key`].
+///
+/// When the request arrived through the `/v1/messages` front door (spec
+/// `anthropic-messages-front-door` decision D2, Req 4.3), the verbatim
+/// passthrough branch in [`Self::chat_completion_messages_passthrough`]
+/// runs instead of the lossy translated rebuild.
+async fn chat_completion_messages_api(
+    &self,
+    request: OpenAIRequest,
+    http_client: &Client,
+    api_key: &str,
+    base_url: &str,
+    custom_headers: &HashMap<String, String>,
+    normalization: &TriggerNormalization,
+) -> Result<ProviderResponse, GatewayError> {
+    // Messages family needs no survivor placement: the seam's removal already
+    // reduced the payload to <=1 trigger, Anthropic Messages does not use
+    // `compaction_trigger`, and this adapter flattens content via
+    // `content_as_text()`. The normalization outcome is intentionally unused.
+    let _ = normalization;
+    if let Some(ctx) = crate::anthropic::passthrough::current() {
+        return self
+            .chat_completion_messages_passthrough(http_client, api_key, base_url, custom_headers, &ctx)
+            .await;
+    }
+    let start = Instant::now();
         // AWS serves the Anthropic Messages surface under the `/anthropic/v1`
         // prefix on the Mantle endpoint (see the Claude model cards'
         // "Programmatic Access" table:
@@ -2817,7 +2827,165 @@ impl BedrockProvider {
         })
     }
 
-    async fn post_mantle_json(
+/// Upper bound on the buffered upstream wire the Anthropic passthrough
+/// streaming loop will accumulate before aborting (mirrors the gateway-wide
+/// guardrail stream-buffer cap: runaway upstream bodies must fail, not grow
+/// the buffer without bound).
+pub(crate) const ANTHROPIC_PASSTHROUGH_WIRE_CAP_BYTES: usize =
+    crate::guardrail::stream::MAX_STREAM_BUFFER_BYTES;
+
+/// Native Anthropic passthrough (spec `anthropic-messages-front-door`
+/// decision D2, Req 4.3): forward the ORIGINAL client body verbatim to
+/// `{root}/anthropic/v1/messages` with the client's `anthropic-version`
+/// and `anthropic-beta` headers forwarded VERBATIM, and relay the
+/// upstream wire (JSON or SSE) unchanged to the front door through the
+/// reserved response-extras stash. The stash travels out-of-band (a
+/// task-local set by the handler), so no marker key can ever appear in
+/// any other provider's request body.
+async fn chat_completion_messages_passthrough(
+        &self,
+        http_client: &Client,
+        api_key: &str,
+        base_url: &str,
+        custom_headers: &HashMap<String, String>,
+        ctx: &crate::anthropic::passthrough::PassthroughContext,
+    ) -> Result<ProviderResponse, GatewayError> {
+        let start = Instant::now();
+        let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+        let url = format!("{}/anthropic/v1/messages", root);
+        let mut request = http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .header("anthropic-version", &ctx.anthropic_version)
+            .json(&ctx.body);
+        if let Some(beta) = &ctx.anthropic_beta {
+            // Multiple arriving anthropic-beta header lines were already
+            // comma-joined in arrival order (deterministic) — one header.
+            request = request.header("anthropic-beta", beta);
+        }
+        for (key, value) in custom_headers {
+            request = request.header(key.as_str(), resolve_header_value(value));
+        }
+        let response = request.send().await.map_err(|error| {
+            tracing::warn!(
+                provider = %self.name,
+                %url,
+                error = %error,
+                "Anthropic passthrough: transport error (no HTTP response)"
+            );
+            GatewayError::Network(format!("Request to {} failed: {}", url, error))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                provider = %self.name,
+                %url,
+                status = status.as_u16(),
+                upstream_body = %text,
+                "Anthropic passthrough: rejected by upstream"
+            );
+            return Err(GatewayError::Provider {
+                provider: self.name.clone(),
+                message: format!("HTTP {}: {}", status.as_u16(), text),
+                status_code: Some(status.as_u16()),
+            });
+        }
+    // stream:true upstream wire is SSE (relayed verbatim); otherwise the
+    // upstream returns an Anthropic Messages JSON body.
+    let wants_stream = ctx
+        .body
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+let wire = if wants_stream {
+Self::read_passthrough_wire(
+response,
+&self.name,
+&url,
+Self::ANTHROPIC_PASSTHROUGH_WIRE_CAP_BYTES,
+std::time::Duration::from_secs(
+crate::config::StreamingConfig::default().chunk_timeout_seconds,
+),
+)
+.await?
+} else {
+        response.text().await.map_err(|error| {
+            GatewayError::Network(format!("Failed to read Anthropic passthrough body: {}", error))
+        })?
+    };
+        tracing::debug!(
+            provider = %self.name,
+            %url,
+            stream = wants_stream,
+            body_bytes = wire.len(),
+            "Anthropic passthrough: relaying upstream wire verbatim"
+        );
+        let response = crate::anthropic::passthrough::verbatim_response_from_wire(
+            &wire,
+            &ctx.body
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            &self.name,
+        )?;
+        Ok(ProviderResponse {
+            response,
+            provider_name: self.name.clone(),
+            latency_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// Buffer the upstream Anthropic streaming wire under a byte cap and a
+/// per-read idle timeout, mirroring the chat-side buffered dispatch
+/// discipline: a runaway upstream body must fail (cap) rather than grow the
+/// buffer without bound, and a stalled upstream must fail (`ChunkTimeout`)
+/// rather than hold the request slot indefinitely. Raw bytes are
+/// accumulated and UTF-8 decoded once over the assembled buffer, so a
+/// multi-byte char split across chunk boundaries is never corrupted (the
+/// per-chunk `from_utf8_lossy` this replaces could split such chars).
+pub(crate) async fn read_passthrough_wire(
+response: reqwest::Response,
+provider_name: &str,
+url: &str,
+cap_bytes: usize,
+chunk_timeout: std::time::Duration,
+) -> Result<String, GatewayError> {
+    use futures::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut wire: Vec<u8> = Vec::new();
+    loop {
+        let next = tokio::time::timeout(chunk_timeout, stream.next()).await.map_err(|_| {
+            tracing::warn!(
+                provider = %provider_name,
+                %url,
+                "Anthropic passthrough: chunk timeout while buffering upstream wire"
+            );
+            GatewayError::ChunkTimeout(chunk_timeout.as_secs())
+        })?;
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|error| {
+            GatewayError::Network(format!("Anthropic passthrough stream: {}", error))
+        })?;
+        if wire.len().saturating_add(chunk.len()) > cap_bytes {
+            tracing::warn!(
+                provider = %provider_name,
+                %url,
+                cap = cap_bytes,
+                "Anthropic passthrough: buffered wire exceeded cap, aborting"
+            );
+            return Err(GatewayError::GuardrailUnavailable(format!(
+                "Anthropic passthrough buffered wire exceeded the {} byte limit",
+                cap_bytes
+            )));
+        }
+        wire.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&wire).into_owned())
+}
+
+async fn post_mantle_json(
         &self,
         http_client: &Client,
         api_key: &str,
@@ -6556,15 +6724,421 @@ mod compaction_trigger_bug_exploration {
         ));
     }
 
-    #[test]
-    fn is_duplicate_compaction_trigger_error_rejects_4xx_without_phrase() {
-        // Mentions compaction_trigger but neither phrasing anchor is present.
-        assert!(!is_duplicate_compaction_trigger_error(
-            400,
-            "unexpected compaction_trigger field in payload"
-        ));
+#[test]
+fn is_duplicate_compaction_trigger_error_rejects_4xx_without_phrase() {
+// Mentions compaction_trigger but neither phrasing anchor is present.
+assert!(!is_duplicate_compaction_trigger_error(
+400,
+"unexpected compaction_trigger field in payload"
+));
+}
+}
+
+/// Native Anthropic passthrough for the Mantle Messages family (spec
+/// `anthropic-messages-front-door` decision D2, Req 4.3): the adapter must
+/// forward the ORIGINAL client body and the client's `anthropic-version` /
+/// `anthropic-beta` headers verbatim, and must park the raw upstream wire on
+/// the response stash — while every OTHER Mantle family keeps building its
+/// own body with no passthrough marker anywhere in it.
+#[cfg(test)]
+mod anthropic_passthrough {
+use super::*;
+use crate::anthropic::passthrough::{
+    current, AnthropicPassthroughScope, PassthroughContext, VERBATIM_RESPONSE_KEY,
+    VERBATIM_SSE_KEY,
+};
+use std::collections::HashMap;
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn provider_for(base_url: String) -> BedrockProvider {
+BedrockProvider {
+name: "bedrock-test".to_string(),
+region: "us-east-1".to_string(),
+auth_mode: BedrockAuthMode::ApiKey {
+http_client: Client::builder().build().expect("client"),
+api_key: "test-api-key".to_string(),
+base_url,
+custom_headers: HashMap::new(),
+},
+}
+}
+
+fn anthropic_client_body() -> serde_json::Value {
+serde_json::json!({
+"model": "anthropic.claude-sonnet-4-6",
+"max_tokens": 64,
+"stream": false,
+"system": [{"type": "text", "text": "be terse"}],
+"messages": [{"role": "user", "content": [
+{"type": "text", "text": "hi"},
+{"type": "text", "text": "there", "cache_control": {"type": "ephemeral"}}
+]}]
+})
+}
+
+fn anthropic_upstream_json() -> serde_json::Value {
+serde_json::json!({
+"id": "msg_passthrough",
+"type": "message",
+"role": "assistant",
+"model": "anthropic.claude-sonnet-4-6",
+"content": [{"type": "text", "text": "hello"}],
+"stop_reason": "end_turn",
+"usage": {
+"input_tokens": 21,
+"output_tokens": 4,
+"cache_read_input_tokens": 8,
+"cache_creation_input_tokens": 2
+}
+})
+}
+
+fn chat_request_for(model: &str) -> OpenAIRequest {
+OpenAIRequest {
+model: model.to_string(),
+messages: vec![Message {
+role: "user".to_string(),
+content: serde_json::Value::String("hi".to_string()),
+extra: Default::default(),
+}],
+temperature: None,
+max_tokens: Some(64),
+stream: false,
+extra: Default::default(),
+}
+}
+
+fn passthrough_scope(body: &serde_json::Value) -> AnthropicPassthroughScope {
+AnthropicPassthroughScope::new(
+body.clone(),
+"2023-06-01".to_string(),
+Some("context-1m-2025-08-07".to_string()),
+)
+}
+
+#[tokio::test]
+async fn messages_family_forwards_verbatim_body_and_headers() {
+let server = MockServer::start().await;
+let upstream = anthropic_upstream_json();
+Mock::given(method("POST"))
+.and(path("/anthropic/v1/messages"))
+.and(header("anthropic-version", "2023-06-01"))
+.and(header("anthropic-beta", "context-1m-2025-08-07"))
+.respond_with(ResponseTemplate::new(200).set_body_json(upstream.clone()))
+.expect(1)
+.mount(&server)
+.await;
+
+let body = anthropic_client_body();
+let provider = provider_for(server.uri());
+let result = passthrough_scope(&body)
+.scope(async {
+provider
+.chat_completion(chat_request_for("anthropic.claude-sonnet-4-6"))
+.await
+})
+.await
+.expect("passthrough dispatch succeeds");
+
+// Raw upstream JSON parked verbatim on the stash; usage parsed into the
+// chat shape (incl. cache split) for cost/logging (Req 6.2).
+assert_eq!(
+result.response.extra.get(VERBATIM_RESPONSE_KEY),
+Some(&upstream)
+);
+assert_eq!(result.response.usage.prompt_tokens, 21);
+assert_eq!(result.response.usage.completion_tokens, 4);
+assert_eq!(
+result.response
+.usage
+.extra
+.get("cache_read_input_tokens")
+.and_then(|v| v.as_u64()),
+Some(8)
+);
+assert_eq!(
+result.response
+.usage
+.extra
+.get("cache_creation_input_tokens")
+.and_then(|v| v.as_u64()),
+Some(2)
+);
+
+// The EXACT client body left the gateway — cache_control and unknown
+// fields intact, no compaction/de-dup rewriting.
+let requests = server.received_requests().await.expect("captured");
+assert_eq!(requests.len(), 1);
+let sent: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+assert_eq!(sent, body);
+}
+
+#[tokio::test]
+async fn messages_family_without_scope_keeps_translated_rebuild() {
+let server = MockServer::start().await;
+Mock::given(method("POST"))
+.and(path("/anthropic/v1/messages"))
+.respond_with(ResponseTemplate::new(200).set_body_json(anthropic_upstream_json()))
+.expect(1)
+.mount(&server)
+.await;
+
+let provider = provider_for(server.uri());
+let result = provider
+.chat_completion(chat_request_for("anthropic.claude-sonnet-4-6"))
+.await
+.expect("translated dispatch succeeds");
+
+// No stash: the legacy lossy-rebuild adapter ran (Req: translation path
+// unchanged when the front door did not install the scope).
+assert!(result.response.extra.get(VERBATIM_RESPONSE_KEY).is_none());
+assert!(result.response.extra.get(VERBATIM_SSE_KEY).is_none());
+assert_eq!(result.response.choices[0].message.content, serde_json::json!("hello"));
+}
+
+#[tokio::test]
+async fn messages_family_streams_verbatim_sse_wire() {
+let server = MockServer::start().await;
+let sse = concat!(
+"event: message_start\n",
+"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n",
+"event: content_block_start\n",
+"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+"event: content_block_delta\n",
+"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+"event: content_block_stop\n",
+"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+"event: message_delta\n",
+"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+"event: message_stop\n",
+"data: {\"type\":\"message_stop\"}\n\n"
+);
+Mock::given(method("POST"))
+.and(path("/anthropic/v1/messages"))
+.respond_with(
+ResponseTemplate::new(200)
+.insert_header("Content-Type", "text/event-stream")
+.set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+)
+.expect(1)
+.mount(&server)
+.await;
+
+let mut body = anthropic_client_body();
+body["stream"] = serde_json::Value::Bool(true);
+let provider = provider_for(server.uri());
+let result = passthrough_scope(&body)
+.scope(async {
+provider
+.chat_completion(chat_request_for("anthropic.claude-sonnet-4-6"))
+.await
+})
+.await
+.expect("streaming passthrough dispatch succeeds");
+
+assert_eq!(
+result.response.extra.get(VERBATIM_SSE_KEY).and_then(|v| v.as_str()),
+Some(sse)
+);
+assert_eq!(result.response.choices[0].message.content, serde_json::json!("hi"));
+assert_eq!(result.response.usage.prompt_tokens, 11);
+assert_eq!(result.response.usage.completion_tokens, 2);
+}
+
+#[tokio::test]
+async fn upstream_error_fails_over_without_stash() {
+let server = MockServer::start().await;
+Mock::given(method("POST"))
+.and(path("/anthropic/v1/messages"))
+.respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+.expect(1)
+.mount(&server)
+.await;
+
+let body = anthropic_client_body();
+let provider = provider_for(server.uri());
+let err = passthrough_scope(&body)
+.scope(async {
+provider
+.chat_completion(chat_request_for("anthropic.claude-sonnet-4-6"))
+.await
+})
+.await
+.expect_err("upstream 500 must surface as provider error");
+match err {
+GatewayError::Provider { status_code, .. } => assert_eq!(status_code, Some(500)),
+other => panic!("expected provider error, got {:?}", other),
+}
+}
+
+/// Chat-family and Responses-family bodies must never contain any
+/// `x-obey-anthropic-*` marker even while the passthrough scope is live —
+/// proving failover onto another Mantle API keeps today's translation path.
+#[tokio::test]
+async fn chat_and_responses_families_carry_no_passthrough_markers() {
+let server = MockServer::start().await;
+let ok = serde_json::json!({
+"id": "resp_test",
+"object": "chat.completion",
+"created": 1234567890i64,
+"model": "gpt-test",
+"choices": [{
+"index": 0,
+"message": {"role": "assistant", "content": "ok"},
+"finish_reason": "stop"
+}],
+"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+});
+Mock::given(method("POST"))
+.and(path("/v1/chat/completions"))
+.respond_with(ResponseTemplate::new(200).set_body_json(ok.clone()))
+.mount(&server)
+.await;
+
+for model in ["zai.glm-5", "openai.gpt-5.6"] {
+let body = anthropic_client_body();
+let provider = provider_for(server.uri());
+let result = passthrough_scope(&body)
+.scope(async {
+provider.chat_completion(chat_request_for(model)).await
+})
+.await;
+// Adapters may error parsing the generic mock body; the marker
+// assertion below is about what was SENT, not the response.
+let _ = result;
+}
+
+let requests = server.received_requests().await.expect("captured");
+assert_eq!(
+requests.len(),
+2,
+"one upstream POST per non-Messages model"
+);
+for request in &requests {
+let body = String::from_utf8_lossy(&request.body);
+assert!(
+!body.contains("x-obey-anthropic-"),
+"passthrough marker leaked into a non-Messages upstream body: {}",
+body
+);
+}
+}
+
+/// The task-local must be unset the moment the handler's scope ends, so a
+/// later plain chat dispatch on the same task can never see the stash.
+#[tokio::test]
+async fn scope_exit_clears_passthrough_context() {
+let body = anthropic_client_body();
+passthrough_scope(&body)
+.scope(async {
+assert!(current().is_some());
+})
+.await;
+assert!(current().is_none());
+}
+
+/// Multiple anthropic-beta header lines are comma-joined deterministically.
+#[test]
+fn passthrough_context_shape_is_transportable() {
+let ctx = PassthroughContext {
+body: anthropic_client_body(),
+anthropic_version: "2023-06-01".to_string(),
+anthropic_beta: Some("a-2025-01-01,b-2025-02-02".to_string()),
+};
+assert_eq!(ctx.anthropic_version, "2023-06-01");
+assert!(ctx.body.get("cache_control").is_none());
+}
+
+/// A runaway streaming upstream body exceeding the buffered-wire cap must
+/// ABORT with an error (not hang, not grow without bound). Drives the
+/// bounded read loop directly with a short test cap; a bounded test
+/// timeout guards the "must not hang" half.
+#[tokio::test]
+async fn streaming_wire_exceeding_cap_aborts_with_error() {
+    let server = MockServer::start().await;
+    // Well past the 64 KB test cap.
+    let huge = format!(
+        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}\n\n",
+        "x".repeat(128 * 1024)
+    );
+    Mock::given(method("POST"))
+        .and(path("/anthropic/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/event-stream")
+                .set_body_raw(huge.into_bytes(), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/anthropic/v1/messages", server.uri()))
+        .header("Authorization", "Bearer test-api-key")
+        .json(&anthropic_client_body())
+        .send()
+        .await
+        .expect("upstream request");
+let result = tokio::time::timeout(
+std::time::Duration::from_secs(30),
+BedrockProvider::read_passthrough_wire(
+response,
+"bedrock-test",
+&server.uri(),
+64 * 1024,
+std::time::Duration::from_secs(5),
+),
+)
+    .await
+    .expect("capped read must terminate, not hang");
+    match result.expect_err("oversized wire must abort with an error") {
+        GatewayError::GuardrailUnavailable(message) => {
+            assert!(message.contains("exceeded"), "message: {message}");
+        }
+        other => panic!("expected oversize abort error, got {:?}", other),
     }
 }
+
+/// A stalled streaming upstream (bytes, then silence) must fail with
+/// ChunkTimeout instead of holding the request slot indefinitely. The
+/// mock streams one chunk then stalls; the read loop uses a short idle
+/// window so the test stays fast.
+#[tokio::test]
+async fn streaming_wire_stall_fails_with_chunk_timeout() {
+    use futures::StreamExt;
+    // First chunk arrives immediately; the second never resolves (pending
+    // future), emulating an upstream that went silent mid-body.
+    let stream = futures::stream::iter(vec![
+        Ok::<_, std::io::Error>(b"event: message_start\n".to_vec()),
+    ])
+.chain(futures::stream::once(async {
+// Item type matches the first stream: a Result per chunk. The future
+// never resolves, emulating an upstream that went silent mid-body.
+futures::future::pending::<Result<Vec<u8>, std::io::Error>>().await
+}));
+    let http_response = axum::http::Response::new(reqwest::Body::wrap_stream(stream));
+    let response = reqwest::Response::from(http_response);
+
+let result = tokio::time::timeout(
+std::time::Duration::from_secs(10),
+BedrockProvider::read_passthrough_wire(
+response,
+"bedrock-test",
+"http://stalled-upstream",
+1024 * 1024,
+std::time::Duration::from_millis(100),
+),
+)
+    .await
+    .expect("stalled read must terminate, not hang");
+    match result.expect_err("stall must time out") {
+        GatewayError::ChunkTimeout(_) => {}
+        other => panic!("expected ChunkTimeout, got {:?}", other),
+    }
+}
+}
+
 
 #[cfg(test)]
 mod property_tests {

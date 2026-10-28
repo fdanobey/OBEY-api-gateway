@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e266954079ecafde76a391cb25e6e25e65708881bd2551f9a878308b0b327115 # shrinks to system = None, leading = None, groups = [GroupSpec { preamble: " ", calls: [CallSpec { id: "toolu_A0", foreign: "toolu_B0", result: " ", mismatch: false }], followup: Some(" ") }], trailing = None, empty_block_user = false
