@@ -2763,6 +2763,7 @@ async fn chat_completions_stream(
         enum RelayStep {
             Frame(RelayFrame),
             Routing(Result<StreamingResponse, GatewayError>),
+            Heartbeat,
         }
         let (routing_result, relayed_frames, dropped_frames) = if streaming_config_relay.relay_reasoning_progress {
                 let (relay_handle, mut relay_rx) = RelayHandle::new();
@@ -2779,7 +2780,21 @@ async fn chat_completions_stream(
         // immediately; the `if relay_open` guard disables that branch so
         // the loop then waits on the routing task only.
         let mut relay_open = true;
-            let routing_result = loop {
+        // Data-carrying heartbeat cadence (Req 3): fires only when neither
+        // the relay nor routing has produced anything for this long; 0
+        // disables (comment keep-alives alone, the legacy behavior).
+        let heartbeat_every = if streaming_config_relay.heartbeat_interval_seconds > 0 {
+            Some(std::time::Duration::from_secs(
+                streaming_config_relay.heartbeat_interval_seconds,
+            ))
+        } else {
+            None
+        };
+        let mut heartbeat_tick = heartbeat_every.map(|every| tokio::time::interval_at(tokio::time::Instant::now() + every, every));
+        if let Some(tick) = heartbeat_tick.as_mut() {
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        }
+        let routing_result = loop {
             let step = tokio::select! {
                 frame = relay_rx.recv(), if relay_open => match frame {
                     Some(frame) => RelayStep::Frame(frame),
@@ -2788,24 +2803,39 @@ async fn chat_completions_stream(
                         continue;
                     }
                 },
-        res = &mut routing_task.0.as_mut().expect("routing handle lives until Routing arm") => RelayStep::Routing(
-        res.unwrap_or_else(|join_err| {
-        // JoinError (panic/cancel): map to the generic
-        // network class; the graceful SSE error path
-        // below emits the terminal event (design,
-        // Error Scenarios 3) — never a second final
-        // response afterwards.
-        tracing::error!(
-        trace_id = %stream_trace_id,
-        error = %join_err,
-        "Routing task failed while relaying reasoning progress"
-        );
-        Err(GatewayError::Network("routing task failed".to_string()))
-        }),
-        ),
-        };
-        match step {
-        RelayStep::Frame(RelayFrame::Reasoning { text }) => {
+                res = &mut routing_task.0.as_mut().expect("routing handle lives until Routing arm") => RelayStep::Routing(
+                    res.unwrap_or_else(|join_err| {
+                        // JoinError (panic/cancel): map to the generic
+                        // network class; the graceful SSE error path
+                        // below emits the terminal event (design,
+                        // Error Scenarios 3) — never a second final
+                        // response afterwards.
+                        tracing::error!(
+                            trace_id = %stream_trace_id,
+                            error = %join_err,
+                            "Routing task failed while relaying reasoning progress"
+                        );
+                        Err(GatewayError::Network("routing task failed".to_string()))
+                    }),
+                ),
+                _ = async {
+                    match heartbeat_tick.as_mut() {
+                        Some(tick) => tick.tick().await,
+                        // Never resolves when heartbeats are disabled; the
+                        // branch is also disabled via the precondition.
+                        None => std::future::pending::<tokio::time::Instant>().await,
+                    }
+                }, if heartbeat_tick.is_some() => RelayStep::Heartbeat,
+            };
+            match step {
+                RelayStep::Heartbeat => {
+                    // Req 1/2: empty-delta data event resets data-aware
+                    // client chunk timers; idempotent for reassembly.
+                    yield Ok::<_, Infallible>(Event::default().data(
+                        heartbeat_chunk(&response_id, created, &requested_model).to_string(),
+                    ));
+                }
+                RelayStep::Frame(RelayFrame::Reasoning { text }) => {
         // Extra `data:` event between keep-alives: same
         // id/created as the early event, reasoning-only
         // delta, no `role`, never retracted (Req 1.5).
@@ -3488,6 +3518,7 @@ async fn chat_completions_stream(
         enum RelayStep {
             Frame(RelayFrame),
             Routing(Result<OpenAIResponse, GatewayError>),
+            Heartbeat,
         }
         let (relay_handle, mut relay_rx) = RelayHandle::new();
         active_handle_stream.attach_reasoning_relay(relay_handle.clone());
@@ -3505,27 +3536,47 @@ async fn chat_completions_stream(
         // before any relay frame was emitted, return the original HTTP error
         // status exactly like the relay-disabled branch (Req 1.6).
         let mut relay_open = true;
+        // Data-carrying heartbeat cadence (Req 3): 0 disables.
+        let heartbeat_every = if streaming_config_relay.heartbeat_interval_seconds > 0 {
+            Some(std::time::Duration::from_secs(
+                streaming_config_relay.heartbeat_interval_seconds,
+            ))
+        } else {
+            None
+        };
+        let mut heartbeat_tick = heartbeat_every.map(|every| tokio::time::interval_at(tokio::time::Instant::now() + every, every));
+        if let Some(tick) = heartbeat_tick.as_mut() {
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        }
         let first_step = loop {
             tokio::select! {
-            frame = relay_rx.recv(), if relay_open => match frame {
-            Some(frame) => break RelayStep::Frame(frame),
-            None => {
-            relay_open = false;
-            continue;
-            }
-            },
-            res = &mut routing_task.0.as_mut().expect("routing handle lives until Routing arm") => break RelayStep::Routing(
-            res.unwrap_or_else(|join_err| {
-            // JoinError (panic/cancel): map to the generic
-            // network class below.
-            tracing::error!(
-            trace_id = %stream_trace_id,
-            error = %join_err,
-            "Routing task failed while relaying reasoning progress (early event disabled)"
-            );
-            Err(GatewayError::Network("routing task failed".to_string()))
-            })
-            ),
+                frame = relay_rx.recv(), if relay_open => match frame {
+                    Some(frame) => break RelayStep::Frame(frame),
+                    None => {
+                        relay_open = false;
+                        continue;
+                    }
+                },
+                res = &mut routing_task.0.as_mut().expect("routing handle lives until Routing arm") => break RelayStep::Routing(
+                    res.unwrap_or_else(|join_err| {
+                        // JoinError (panic/cancel): map to the generic
+                        // network class below.
+                        tracing::error!(
+                            trace_id = %stream_trace_id,
+                            error = %join_err,
+                            "Routing task failed while relaying reasoning progress (early event disabled)"
+                        );
+                        Err(GatewayError::Network("routing task failed".to_string()))
+                    })
+                ),
+                _ = async {
+                    match heartbeat_tick.as_mut() {
+                        Some(tick) => tick.tick().await,
+                        // Never resolves when heartbeats are disabled; the
+                        // branch is also disabled via the precondition.
+                        None => std::future::pending::<tokio::time::Instant>().await,
+                    }
+                }, if heartbeat_tick.is_some() => break RelayStep::Heartbeat,
             }
         };
         let first_step = match first_step {
@@ -3554,37 +3605,54 @@ async fn chat_completions_stream(
 
         // Continuation of the select loop after the handler-driven first
         // step above: identical frame/routing handling, with the first step
-        // replayed through the same match arms.
+        // replayed through the same match arms. The heartbeat ticker is
+        // captured from the handler scope so both loops share one cadence.
+        let mut heartbeat_tick = heartbeat_tick;
         let mut first = Some(first_step);
         let routing_result = loop {
-        let step = match first.take() {
-        Some(step) => step,
-        None => tokio::select! {
-        frame = relay_rx.recv(), if relay_open => match frame {
-        Some(frame) => RelayStep::Frame(frame),
-        None => {
-        relay_open = false;
-        continue;
-        }
-        },
-        res = &mut routing_task.0.as_mut().expect("routing handle lives until Routing arm") => RelayStep::Routing(
-        res.unwrap_or_else(|join_err| {
-        // JoinError (panic/cancel): map to the generic
-        // network class; the graceful SSE error path
-        // below emits the terminal event (design,
-        // Error Scenarios 3).
-        tracing::error!(
-        trace_id = %stream_trace_id,
-        error = %join_err,
-        "Routing task failed while relaying reasoning progress (early event disabled)"
-        );
-        Err(GatewayError::Network("routing task failed".to_string()))
-        })
-        ),
-        },
-        };
-        match step {
-        RelayStep::Frame(RelayFrame::Reasoning { text }) => {
+            let step = match first.take() {
+                Some(step) => step,
+                None => tokio::select! {
+                    frame = relay_rx.recv(), if relay_open => match frame {
+                        Some(frame) => RelayStep::Frame(frame),
+                        None => {
+                            relay_open = false;
+                            continue;
+                        }
+                    },
+                    res = &mut routing_task.0.as_mut().expect("routing handle lives until Routing arm") => RelayStep::Routing(
+                        res.unwrap_or_else(|join_err| {
+                            // JoinError (panic/cancel): map to the generic
+                            // network class; the graceful SSE error path
+                            // below emits the terminal event (design,
+                            // Error Scenarios 3).
+                            tracing::error!(
+                                trace_id = %stream_trace_id,
+                                error = %join_err,
+                                "Routing task failed while relaying reasoning progress (early event disabled)"
+                            );
+                            Err(GatewayError::Network("routing task failed".to_string()))
+                        })
+                    ),
+                    _ = async {
+                        match heartbeat_tick.as_mut() {
+                            Some(tick) => tick.tick().await,
+                            // Never resolves when heartbeats are disabled; the
+                            // branch is also disabled via the precondition.
+                            None => std::future::pending::<tokio::time::Instant>().await,
+                        }
+                    }, if heartbeat_tick.is_some() => RelayStep::Heartbeat,
+                },
+            };
+            match step {
+                RelayStep::Heartbeat => {
+                    // Req 1/2: empty-delta data event resets data-aware
+                    // client chunk timers; idempotent for reassembly.
+                    yield Ok::<_, Infallible>(Event::default().data(
+                        heartbeat_chunk(&response_id, created, &requested_model).to_string(),
+                    ));
+                }
+                RelayStep::Frame(RelayFrame::Reasoning { text }) => {
         // Req 2.5: no early role event was sent, so the
         // first relayed frame carries the role marker
         // exactly once; later frames omit it.
@@ -4739,20 +4807,42 @@ async fn stream_buffered_with_post_call(
             // completed upstream line and relay reasoning-only deltas to the
             // client live (Req 1.1/1.2/1.5); content, tool calls, usage and
             // finish reasons stay buffered for the post-call pipeline.
-    let mut buf = guardrail_stream::SseBuffer::with_default_cap();
-// Partial-line carry for the incremental relay scan: RAW BYTES —
-// only the trailing incomplete line is retained between chunks, and
-// each complete line is decoded on its own so split multibyte
-// characters never bake U+FFFD into relayed text.
-    let mut relay_carry: Vec<u8> = Vec::new();
-            let mut bytes = byte_stream.bytes_stream();
-            let mut too_large = false;
-            loop {
-                match tokio::time::timeout(keepalive_interval, bytes.next()).await {
-                    // Idle gap while buffering: keep the client alive (Req 10.2).
-                    Err(_elapsed) => {
-                        yield Ok(Event::default().comment("keepalive"));
-                    }
+                let mut buf = guardrail_stream::SseBuffer::with_default_cap();
+                // Partial-line carry for the incremental relay scan: RAW BYTES —
+                // only the trailing incomplete line is retained between chunks, and
+                // each complete line is decoded on its own so split multibyte
+                // characters never bake U+FFFD into relayed text.
+                let mut relay_carry: Vec<u8> = Vec::new();
+                let mut bytes = byte_stream.bytes_stream();
+                let mut too_large = false;
+                // Timestamp of the last data-carrying heartbeat on this loop.
+                let mut last_heartbeat: Option<std::time::Instant> = None;
+                // Data-carrying heartbeat cadence (Req 3): 0 disables; the
+                // comment keep-alive below still fires every keepalive_interval.
+                let heartbeat_every = if streaming_config.heartbeat_interval_seconds > 0 {
+                    Some(std::time::Duration::from_secs(
+                        streaming_config.heartbeat_interval_seconds,
+                    ))
+                } else {
+                    None
+                };
+                loop {
+                    match tokio::time::timeout(keepalive_interval, bytes.next()).await {
+                        // Idle gap while buffering: keep the client alive (Req 10.2)
+                        // with BOTH the comment keep-alive and — when enabled — a
+                        // data-carrying heartbeat chunk so chunk timers that only
+                        // observe `data:` events (e.g. Kilo's) also reset.
+                        Err(_elapsed) => {
+                            yield Ok(Event::default().comment("keepalive"));
+                            if let Some(every) = heartbeat_every {
+                                if last_heartbeat.map(|t: std::time::Instant| t.elapsed() >= every).unwrap_or(true) {
+                                    last_heartbeat = Some(std::time::Instant::now());
+                                    yield Ok(Event::default().data(
+                                        heartbeat_chunk(&response_id, created, &requested_model).to_string(),
+                                    ));
+                                }
+                            }
+                        }
                     // Upstream stream ended.
                     Ok(None) => break,
                     Ok(Some(Ok(b))) => {
@@ -5263,6 +5353,31 @@ fn reasoning_relay_chunk_with_role(
         delta.insert("role".to_string(), serde_json::json!("assistant"));
     }
     chunk
+}
+
+/// Build a data-carrying heartbeat chunk (streaming heartbeat chunks, Req 1/2):
+/// same envelope convention as [`early_event_chunk`] — shared `id`/`created`,
+/// `chat.completion.chunk` object — carrying a completely empty delta (no
+/// `role`, no `content`, no `reasoning`) with `finish_reason: null`.
+///
+/// Purpose: SSE comment keep-alives (`: keepalive`) are invisible to clients
+/// whose chunk timers only count `data:` events, so a silent buffered
+/// dispatch (provider stall, silent NIM-style attempts) still starves them.
+/// This chunk is a real `data:` event those timers observe; because the delta
+/// is empty it is idempotent for stream reassembly and never duplicated in
+/// the final replay (the replay is emitted verbatim regardless).
+fn heartbeat_chunk(id: &str, created: i64, model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": null
+        }]
+    })
 }
 
 /// Build a graceful SSE error termination: an `error` data event followed by
@@ -5805,10 +5920,26 @@ fn relay_passthrough_stream(
     memory_extraction: Option<RelayMemoryExtraction>,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
-    // Rebound mutable so the single reassembly point can `.take()` it.
-    let mut memory_extraction = memory_extraction;
-    let chunk_timeout = Duration::from_secs(streaming_config.chunk_timeout_seconds);
-    let deadline = tokio::time::Instant::now() + total_timeout;
+        // Rebound mutable so the single reassembly point can `.take()` it.
+        let mut memory_extraction = memory_extraction;
+        let chunk_timeout = Duration::from_secs(streaming_config.chunk_timeout_seconds);
+        let deadline = tokio::time::Instant::now() + total_timeout;
+        // Data-carrying heartbeat cadence (Req 3): fires while NO content has
+        // been forwarded yet and upstream stays silent longer than this; 0
+        // disables. Heartbeats stop permanently once content flows, keeping
+        // the forwarded stream verbatim from the first real byte on.
+        let heartbeat_every = if streaming_config.heartbeat_interval_seconds > 0 {
+            Some(Duration::from_secs(streaming_config.heartbeat_interval_seconds))
+        } else {
+            None
+        };
+        // Stable synthetic envelope for heartbeats on this relay: distinct
+        // from the provider's own ids, `chatcmpl-` shaped like every other
+        // chunk so generic clients parse it without special-casing.
+        let heartbeat_id = format!("chatcmpl-hb-{}", uuid::Uuid::new_v4());
+        let heartbeat_created = chrono::Utc::now().timestamp();
+        let heartbeat_model = request.model.clone();
+        let mut last_forward_activity = tokio::time::Instant::now();
     let (
     upstream_version,
     upstream_content_encoding,
@@ -5857,18 +5988,60 @@ fn relay_passthrough_stream(
                    terminated = true;
                    break 'relay;
                }
-               let per_chunk_wait = chunk_timeout.min(deadline - now);
+        let per_chunk_wait = chunk_timeout.min(deadline - now);
 
-               let mut stream_ended = false;
-               match tokio::time::timeout(per_chunk_wait, byte_stream.next()).await {
-    Ok(Some(Ok(bytes))) => {
-    bytes_received = bytes_received.saturating_add(bytes.len());
-    buffer.push_str(&String::from_utf8_lossy(&bytes));
-    }
-    Ok(Some(Err(e))) => {
-    // Reqwest labels every HTTP body/frame failure as a decode error,
-    // including HTTP/1 truncation and HTTP/2 resets. Preserve the source
-    // chain so the client and logs expose the actual transport failure.
+        let mut stream_ended = false;
+        // Heartbeat-aware wait (Req 1/3): while NO content has been
+        // forwarded yet, split the per-chunk wait into slices no longer
+        // than the heartbeat cadence and emit a data-carrying empty-delta
+        // chunk whenever upstream silence exceeds it. Once content has
+        // flowed the original single wait is used verbatim so the relayed
+        // stream stays byte-exact from the first real delta on. The block
+        // evaluates to `Option<Result<Option<Bytes>, Elapsed>>` where the
+        // outer `None` marks the terminal per-chunk timeout (the original
+        // `Err(_)` arm below fires unchanged).
+        let next = 'wait: {
+            if content_forwarded || heartbeat_every.is_none() {
+                break 'wait Some(tokio::time::timeout(per_chunk_wait, byte_stream.next()).await);
+            }
+            let cadence = heartbeat_every
+                .expect("heartbeat cadence present on this path")
+                .min(per_chunk_wait);
+            let mut waited = Duration::ZERO;
+            loop {
+                let slice = cadence.min(per_chunk_wait - waited);
+                match tokio::time::timeout(slice, byte_stream.next()).await {
+                    Ok(item) => break 'wait Some(Ok(item)),
+                    Err(_) => {
+                        waited += slice;
+                        if waited >= per_chunk_wait {
+                            // Hand the terminal timeout to the original
+                            // Err arm below unchanged.
+                            break 'wait None;
+                        }
+                        // Emit a heartbeat only if silence has actually
+                        // spanned the cadence since the last activity.
+                        if last_forward_activity.elapsed() >= cadence {
+                            last_forward_activity = tokio::time::Instant::now();
+                            yield Ok(Event::default().data(
+                                heartbeat_chunk(&heartbeat_id, heartbeat_created, &heartbeat_model)
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        };
+        match next {
+            Some(Ok(Some(Ok(bytes)))) => {
+                last_forward_activity = tokio::time::Instant::now();
+                bytes_received = bytes_received.saturating_add(bytes.len());
+                buffer.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        Some(Ok(Some(Err(e)))) => {
+            // Reqwest labels every HTTP body/frame failure as a decode error,
+            // including HTTP/1 truncation and HTTP/2 resets. Preserve the source
+            // chain so the client and logs expose the actual transport failure.
     let error_chain = reqwest_error_chain(&e);
     let message = format!("Stream error: {error_chain}");
     tracing::warn!(
@@ -5897,15 +6070,15 @@ fn relay_passthrough_stream(
                        terminated = true;
                        break 'relay;
                    }
-                   Ok(None) => {
-                       // Upstream finished — flush any trailing partial line by
-                       // forcing the line-drain loop to process the remainder.
-                       stream_ended = true;
-                       if !buffer.is_empty() && !buffer.ends_with('\n') {
-                           buffer.push('\n');
-                       }
-                   }
-                   Err(_) => {
+        Some(Ok(None)) => {
+            // Upstream finished — flush any trailing partial line by
+            // forcing the line-drain loop to process the remainder.
+            stream_ended = true;
+            if !buffer.is_empty() && !buffer.ends_with('\n') {
+                buffer.push('\n');
+            }
+        }
+        Some(Err(_)) | None => {
                        // Distinguish total-timeout (Req 3.11) from inter-chunk
                        // timeout (Req 3.12): the wait was min(chunk, remaining_total).
                        let (error_type, message) = if tokio::time::Instant::now() >= deadline {
@@ -7860,8 +8033,8 @@ mod tests {
         build_keepalive, cache_allowed_for_validation, chunk_carries_answer, chunk_carries_content,
         classify_relay_line, classify_stream_error, collect_structured_output_failure,
         eager_sse_response, early_event_chunk, emit_sse_error_event, force_eager_structured_stream,
-        is_tool_call_turn, is_transient_stream_truncation, json_model, memory_feedback_chunk,
-        multipart_model, openai_json_response, prepare_response_for_client,
+        heartbeat_chunk, is_tool_call_turn, is_transient_stream_truncation, json_model,
+        memory_feedback_chunk, multipart_model, openai_json_response, prepare_response_for_client,
         provider_pass_through_response, reasoning_relay_chunk, reasoning_relay_chunk_with_role,
         rechunk_structured_response, relay_passthrough_stream, requests_structured_output,
         should_cache_eager_structured, smart_routing_headers, sse_error_payload,
@@ -9108,6 +9281,29 @@ mod tests {
         assert!(chunk["choices"][0]["delta"].get("content").is_none());
     }
 
+    /// Data-carrying heartbeat chunks (Req 1/2): the chunk keeps the shared
+    /// envelope (id/object/created/model) but its delta is COMPLETELY empty —
+    /// no role, no content, no reasoning — and `finish_reason` stays null so
+    /// generic stream reassembly treats it as a no-op.
+    #[test]
+    fn heartbeat_chunk_has_empty_delta_and_chunk_envelope() {
+        let chunk = heartbeat_chunk("chatcmpl-hb-id", 1700, "gpt-4o");
+
+        assert_eq!(chunk["id"], "chatcmpl-hb-id");
+        assert_eq!(chunk["object"], "chat.completion.chunk");
+        assert_eq!(chunk["created"], 1700);
+        assert_eq!(chunk["model"], "gpt-4o");
+        assert_eq!(chunk["choices"][0]["index"], 0);
+        assert!(chunk["choices"][0]["finish_reason"].is_null());
+        let delta = chunk["choices"][0]["delta"].as_object().unwrap();
+        assert!(
+            delta.is_empty(),
+            "heartbeat delta must be empty (no role/content/reasoning), got {delta:?}"
+        );
+        // Distinguishable from the early event: no role marker inside delta.
+        assert!(delta.get("role").is_none());
+    }
+
     /// Buffered reasoning progress relay (Task 5): a relayed reasoning frame
     /// reuses the early event's `id`/`created`, keeps the chunk envelope, and
     /// carries a reasoning-only delta with NO `role` field (the early event
@@ -9561,13 +9757,25 @@ mod tests {
         ));
     }
 
-    /// Build a synthetic streaming `reqwest::Response` from raw SSE bytes so the
-    /// relay loop can be driven without a live server.
-    fn fake_streaming_response(body: &'static str) -> reqwest::Response {
-        let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(body.as_bytes()) });
-        let http_response = axum::http::Response::new(reqwest::Body::wrap_stream(stream));
-        reqwest::Response::from(http_response)
-    }
+/// Build a synthetic streaming `reqwest::Response` from raw SSE bytes so the
+/// relay loop can be driven without a live server.
+fn fake_streaming_response(body: &'static str) -> reqwest::Response {
+    let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(body.as_bytes()) });
+    let http_response = axum::http::Response::new(reqwest::Body::wrap_stream(stream));
+    reqwest::Response::from(http_response)
+}
+
+/// Like [`fake_streaming_response`] but the body only arrives after `delay`,
+/// simulating an upstream that accepted the request then went silent (the
+/// exact condition data-carrying heartbeats exist for).
+fn fake_delayed_streaming_response(body: &'static str, delay: Duration) -> reqwest::Response {
+    let stream = futures::stream::once(async move {
+        tokio::time::sleep(delay).await;
+        Ok::<_, std::io::Error>(body.as_bytes())
+    });
+    let http_response = axum::http::Response::new(reqwest::Body::wrap_stream(stream));
+    reqwest::Response::from(http_response)
+}
 
     /// Build the caching dependencies the relay needs (task 5.4). Caching is a
     /// no-op for these tests because the requests are streaming/ineligible, but
@@ -9605,9 +9813,9 @@ mod tests {
     #[tokio::test]
     async fn relay_forwards_chunks_and_emits_single_done() {
         let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n\
-                    data: not-json\n\n\
-                    data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n\n\
-                    data: [DONE]\n\n";
+data: not-json\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n\n\
+data: [DONE]\n\n";
         let response = fake_streaming_response(body);
         let (exact_cache, metrics, request) = relay_cache_deps();
         let stream = relay_passthrough_stream(
@@ -9627,6 +9835,89 @@ mod tests {
         // 2 forwarded chunks + 1 terminal [DONE]. Malformed + upstream [DONE] dropped.
         assert_eq!(events.len(), 3);
         assert!(events.iter().all(|e| e.is_ok()));
+    }
+
+    /// Data-carrying heartbeat chunks, Req 1/3 (pass-through site): when the
+    /// upstream goes silent before its first content byte for longer than
+    /// `heartbeat_interval_seconds`, the relay emits empty-delta `data:`
+    /// chunks so data-aware client timers reset. Heartbeats use paused
+    /// virtual time — the 35s silence below completes in microseconds.
+    #[tokio::test(start_paused = true)]
+    async fn relay_emits_heartbeat_data_chunks_during_pre_content_silence() {
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n\
+data: [DONE]\n\n";
+        // 35s silence > 15s default heartbeat cadence => ~2 heartbeats.
+        let response = fake_delayed_streaming_response(body, Duration::from_secs(35));
+        let (exact_cache, metrics, request) = relay_cache_deps();
+        let cfg = StreamingConfig::default();
+        assert_eq!(cfg.heartbeat_interval_seconds, 15);
+        let stream = relay_passthrough_stream(
+            response,
+            cfg,
+            "tr-hb".to_string(),
+            Duration::from_secs(120),
+            exact_cache,
+            metrics,
+            request,
+            mk_outcome(),
+            None,
+            None,
+            None,
+        );
+        let text = relay_to_sse_text(stream).await;
+
+        // Heartbeats present: empty-delta chunks with the dedicated hb id.
+        let hb_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("data: ") && l.contains("chatcmpl-hb-"))
+            .collect();
+        assert!(
+            !hb_lines.is_empty(),
+            "expected at least one heartbeat data chunk during the 35s silence, got:\n{text}"
+        );
+        for line in &hb_lines {
+            let payload = line.strip_prefix("data: ").unwrap();
+            let json: serde_json::Value = serde_json::from_str(payload).unwrap();
+            assert_eq!(json["object"], "chat.completion.chunk");
+            assert!(json["choices"][0]["finish_reason"].is_null());
+            assert!(json["choices"][0]["delta"].as_object().unwrap().is_empty());
+        }
+        // The real content still flows after the silence and [DONE] terminates.
+        assert!(text.contains("\"content\":\"a\""));
+        assert!(text.trim_end().ends_with("data: [DONE]"));
+    }
+
+    /// Data-carrying heartbeat chunks, Req 3 (disable switch):
+    /// `heartbeat_interval_seconds: 0` restores the legacy silent wait —
+    /// no `chatcmpl-hb-` data chunks are emitted during pre-content silence.
+    #[tokio::test(start_paused = true)]
+    async fn relay_heartbeat_disabled_when_interval_zero() {
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n\
+data: [DONE]\n\n";
+        let response = fake_delayed_streaming_response(body, Duration::from_secs(20));
+        let (exact_cache, metrics, request) = relay_cache_deps();
+        let stream = relay_passthrough_stream(
+            response,
+            StreamingConfig {
+                heartbeat_interval_seconds: 0,
+                ..StreamingConfig::default()
+            },
+            "tr-hb-off".to_string(),
+            Duration::from_secs(120),
+            exact_cache,
+            metrics,
+            request,
+            mk_outcome(),
+            None,
+            None,
+            None,
+        );
+        let text = relay_to_sse_text(stream).await;
+        assert!(
+            !text.contains("chatcmpl-hb-"),
+            "no heartbeat chunks expected when disabled, got:\n{text}"
+        );
+        assert!(text.contains("\"content\":\"a\""));
     }
 
     /// Req 3.6 / Req 5: a mid-stream error frame produces a graceful error event

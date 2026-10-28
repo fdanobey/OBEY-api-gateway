@@ -1442,6 +1442,15 @@ pub struct StreamingConfig {
     /// behavior where nothing is relayed during buffering.
     #[serde(default = "default_true")]
     pub relay_reasoning_progress: bool,
+
+    /// Data-carrying heartbeat cadence in seconds while a streaming response
+    /// is otherwise silent (no relay frames, no upstream content): the
+    /// gateway emits an empty-delta `chat.completion.chunk` `data:` event so
+    /// clients whose chunk timers ignore SSE comment keep-alives never starve
+    /// during long provider stalls or silent buffered dispatch. 0 disables
+    /// (comment keep-alives alone, the legacy behavior).
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_seconds: u64,
 }
 
 impl Default for StreamingConfig {
@@ -1454,6 +1463,7 @@ impl Default for StreamingConfig {
             retry_on_truncation: true,
             retry_on_stream_truncation: true,
             relay_reasoning_progress: true,
+            heartbeat_interval_seconds: default_heartbeat_interval(),
         }
     }
 }
@@ -1468,6 +1478,10 @@ impl StreamingConfig {
 
 fn default_keepalive_interval() -> u64 {
     5
+}
+
+fn default_heartbeat_interval() -> u64 {
+    15
 }
 
 fn default_chunk_timeout() -> u64 {
@@ -1557,20 +1571,22 @@ chunk_timeout_seconds: 30
 retry_on_truncation: false
 retry_on_stream_truncation: false
 relay_reasoning_progress: false
+heartbeat_interval_seconds: 0
 "#;
-        let cfg: StreamingConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(
-            cfg,
-            StreamingConfig {
-                emit_early_event: false,
-                keepalive_interval_seconds: 10,
-                passthrough_enabled: false,
-                chunk_timeout_seconds: 30,
-                retry_on_truncation: false,
-                retry_on_stream_truncation: false,
-                relay_reasoning_progress: false,
-            }
-        );
+    let cfg: StreamingConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(
+        cfg,
+        StreamingConfig {
+            emit_early_event: false,
+            keepalive_interval_seconds: 10,
+            passthrough_enabled: false,
+            chunk_timeout_seconds: 30,
+            retry_on_truncation: false,
+            retry_on_stream_truncation: false,
+            relay_reasoning_progress: false,
+            heartbeat_interval_seconds: 0,
+        }
+    );
     }
 
     #[test]
@@ -1644,7 +1660,56 @@ model_groups:
         assert!(serialized.contains("relay_reasoning_progress: false"));
     }
 
-    // Context Overflow Management, Task 1.3: ContextConfig deserialization
+    // Data-carrying heartbeat chunks: heartbeat_interval_seconds defaults to 15
+// so existing configs gain the heartbeat without edits; 0 disables.
+
+#[test]
+fn test_streaming_config_heartbeat_interval_default_is_15() {
+    assert_eq!(
+        StreamingConfig::default().heartbeat_interval_seconds,
+        15,
+        "heartbeat default must be 15s"
+    );
+}
+
+#[test]
+fn test_streaming_config_absent_section_defaults_heartbeat_15() {
+    let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers:
+- name: "openai"
+  type: "openai"
+  base_url: "https://api.openai.com/v1"
+  timeout_seconds: 30
+model_groups:
+- name: "default"
+  version_fallback_enabled: false
+  models:
+  - provider: "openai"
+    model: "gpt-4"
+    priority: 100
+"#;
+    let cfg: crate::config::Config = serde_yaml::from_str(yaml).unwrap();
+    assert!(cfg.streaming.is_none());
+    assert_eq!(
+        cfg.streaming.unwrap_or_default().heartbeat_interval_seconds,
+        15
+    );
+}
+
+#[test]
+fn test_streaming_config_heartbeat_interval_zero_round_trips() {
+    let cfg: StreamingConfig = serde_yaml::from_str("heartbeat_interval_seconds: 0").unwrap();
+    assert_eq!(cfg.heartbeat_interval_seconds, 0);
+    let serialized = serde_yaml::to_string(&cfg).unwrap();
+    assert!(serialized.contains("heartbeat_interval_seconds: 0"));
+}
+
+// Context Overflow Management, Task 1.3: ContextConfig deserialization
     // **Validates: Requirements US-4, US-6**
 
     #[test]
