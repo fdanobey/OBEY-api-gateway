@@ -3580,10 +3580,15 @@ if (res.noBaseUrl) {
 }
       if (res.failed) {
         if (manualModels.length) { populateSelect([]); return; }
-        // Fallback: replace select with text input for manual model entry
-        var textInput = document.createElement('input');
-        textInput.type = 'text';
-        textInput.className = 'mdl-name';
+		// Fallback: replace select with text input for manual model entry
+		var textInput = document.createElement('input');
+		textInput.type = 'text';
+		textInput.className = 'mdl-name';
+		// Preserve identity so config collection (getElementById) and change
+		// handlers keep working after the select is swapped out.
+		textInput.id = selectEl.id;
+		textInput.name = selectEl.name;
+		textInput.disabled = selectEl.disabled;
         textInput.placeholder = 'Type model name (e.g. meta/llama-3.1-8b-instruct)';
         textInput.value = currentModel || '';
         textInput.style.cssText = selectEl.style.cssText;
