@@ -507,15 +507,17 @@ mod tests {
                 relevance_score: 0.5,
                 created_at: timestamp,
                 last_accessed_at: timestamp,
-                access_count: 0,
-                source_request_id: None,
-            },
-            final_score: score,
-            estimated_tokens: 0,
-        }
-    }
+        access_count: 0,
+        source_request_id: None,
+        updated_at: None,
+        superseded_by: None,
+    },
+    final_score: score,
+    estimated_tokens: 0,
+}
+}
 
-    fn injector() -> MemoryInjector {
+fn injector() -> MemoryInjector {
         MemoryInjector::new(
             Arc::new(MemoryStore::new(Path::new(":memory:")).expect("store must open")),
             TokenCounter::new(),

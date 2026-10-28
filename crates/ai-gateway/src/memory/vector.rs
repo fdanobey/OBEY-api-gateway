@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qdrant_client::qdrant::{
-    vectors_config, CreateCollectionBuilder, Distance, PointStruct, SearchPointsBuilder,
-    UpsertPointsBuilder, VectorParamsBuilder,
+    vectors_config, Condition, CreateCollectionBuilder, DeletePointsBuilder, Distance, Filter,
+    PointStruct, PointsIdsList, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use reqwest::Client;
@@ -29,6 +29,16 @@ pub struct VectorMatch {
 pub trait MemoryVectorTier: Send + Sync {
     async fn index(&self, entry: &MemoryEntry) -> Result<(), MemoryError>;
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<VectorMatch>, MemoryError>;
+
+    /// Remove one entry's point. Default no-op so non-Qdrant tiers are unchanged.
+    async fn delete_entry(&self, _id: Uuid) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    /// Remove every point in a namespace. Default no-op so non-Qdrant tiers are unchanged.
+    async fn delete_namespace(&self, _namespace: &str) -> Result<(), MemoryError> {
+        Ok(())
+    }
 }
 
 pub struct QdrantMemoryVectorTier {
@@ -228,8 +238,39 @@ impl MemoryVectorTier for QdrantMemoryVectorTier {
                 )
                 .wait(true),
             )
+        .await
+        .map_err(|error| MemoryError::Qdrant(format!("Qdrant upsert failed: {error}")))?;
+        Ok(())
+    }
+
+    async fn delete_entry(&self, id: Uuid) -> Result<(), MemoryError> {
+        self.qdrant
+            .delete_points(
+                DeletePointsBuilder::new(&self.collection)
+                    .points(PointsIdsList {
+                        ids: vec![id.to_string().into()],
+                    })
+                    .wait(true),
+            )
             .await
-            .map_err(|error| MemoryError::Qdrant(format!("Qdrant upsert failed: {error}")))?;
+            .map_err(|error| MemoryError::Qdrant(format!("Qdrant delete failed: {error}")))?;
+        Ok(())
+    }
+
+    async fn delete_namespace(&self, namespace: &str) -> Result<(), MemoryError> {
+        self.qdrant
+            .delete_points(
+                DeletePointsBuilder::new(&self.collection)
+                    .points(Filter::must([Condition::matches(
+                        "namespace",
+                        namespace.to_owned(),
+                    )]))
+                    .wait(true),
+            )
+            .await
+            .map_err(|error| {
+                MemoryError::Qdrant(format!("Qdrant namespace delete failed: {error}"))
+            })?;
         Ok(())
     }
 

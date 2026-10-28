@@ -17,9 +17,11 @@ fn entry(id: u128, namespace: String, content: String) -> MemoryEntry {
         relevance_score: 0.75,
         created_at: at(1_700_000_000),
         last_accessed_at: at(1_700_000_100),
-        access_count: 7,
-        source_request_id: Some(Uuid::from_u128(id.saturating_add(1))),
-    }
+    access_count: 7,
+    source_request_id: Some(Uuid::from_u128(id.saturating_add(1))),
+    updated_at: None,
+    superseded_by: None,
+}
 }
 
 fn safe_segment() -> impl Strategy<Value = String> {

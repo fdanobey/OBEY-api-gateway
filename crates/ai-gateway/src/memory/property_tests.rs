@@ -34,13 +34,15 @@ fn scored(id: u128, memory_type: MemoryType, content: String, score: f64) -> Sco
             relevance_score: 0.75,
             created_at: timestamp(),
             last_accessed_at: timestamp(),
-            access_count: 0,
-            source_request_id: None,
-        },
-        final_score: score,
-        estimated_tokens: 0,
+                access_count: 0,
+                source_request_id: None,
+                updated_at: None,
+                superseded_by: None,
+            },
+            final_score: score,
+            estimated_tokens: 0,
+        }
     }
-}
 
 fn memory_type(index: usize) -> MemoryType {
     [

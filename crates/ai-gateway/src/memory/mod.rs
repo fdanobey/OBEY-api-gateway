@@ -158,6 +158,12 @@ pub struct MemoryEntry {
     pub last_accessed_at: DateTime<Utc>,
     pub access_count: u64,
     pub source_request_id: Option<Uuid>,
+    /// When the entry content was last edited; `None` for never-edited entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    /// Entry that superseded this one; `None` while the entry is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<Uuid>,
 }
 
 /// Context classification produced by automatic context detection.
@@ -390,8 +396,8 @@ impl MemorySystem {
         namespace: String,
         content: String,
         memory_type: MemoryType,
-    ) -> Result<MemoryEntry, AdminCreateError> {
-        if !validate_namespace(&namespace) {
+) -> Result<MemoryEntry, AdminCreateError> {
+    if !validate_namespace(&namespace) {
             return Err(AdminCreateError::InvalidNamespace);
         }
         let content_length = content.chars().count();
@@ -436,6 +442,91 @@ impl MemorySystem {
             .map_err(AdminCreateError::Memory)?;
         self.schedule_vector_index(entry.clone()).await;
         Ok(entry)
+    }
+
+    /// Validates and synchronously edits one stored entry, then re-indexes it.
+    ///
+    /// The same length and sensitive-content screening applied to
+    /// [`MemorySystem::admin_create`] runs before any write; on success the
+    /// old vector point is removed and the updated content is re-indexed.
+    /// Returns `Ok(None)` when `id` does not match a stored entry; vector
+    /// work is best-effort and never fails the store commit.
+    pub async fn admin_edit(
+        &self,
+        id: Uuid,
+        content: &str,
+        memory_type: &str,
+    ) -> Result<Option<MemoryEntry>, AdminCreateError> {
+        let content_length = content.chars().count();
+        if content_length < 5 {
+            return Err(AdminCreateError::InvalidContent(
+                "content must be at least 5 characters".to_owned(),
+            ));
+        }
+        if content_length > 4096 {
+            return Err(AdminCreateError::InvalidContent(
+                "content must be at most 4096 characters".to_owned(),
+            ));
+        }
+
+        let config = self.config.read().await.clone();
+        let scan = self
+            .sensitive_scanner
+            .scan_with_options(
+                content,
+                SensitiveScanOptions {
+                    allow_sensitive_storage: config.allow_sensitive_storage,
+                    ..SensitiveScanOptions::default()
+                },
+            )
+            .await
+            .map_err(|error| AdminCreateError::Scan(error.to_string()))?;
+        if scan.contains_sensitive {
+            return Err(AdminCreateError::SensitiveContent);
+        }
+
+        let store = Arc::clone(&self.store);
+        let content = content.to_owned();
+        let memory_type = memory_type.to_owned();
+        let updated = spawn_store_task(move || {
+            store.update_entry(id, &content, &memory_type)
+        })
+        .await
+        .map_err(AdminCreateError::Memory)?;
+        match updated {
+            None => Ok(None),
+            Some(entry) => {
+                self.schedule_vector_delete(entry.id).await;
+                self.schedule_vector_index(entry.clone()).await;
+                Ok(Some(entry))
+            }
+        }
+    }
+
+    /// Deletes one entry, then removes its vector point best-effort.
+    ///
+    /// Returns `Ok(false)` when `id` does not match a stored entry; vector
+    /// work never fails the store commit.
+    pub async fn admin_delete(&self, id: Uuid) -> Result<bool, MemoryError> {
+        let store = Arc::clone(&self.store);
+        let deleted = spawn_store_task(move || store.delete_entry(id)).await?;
+        if deleted {
+            self.schedule_vector_delete(id).await;
+        }
+        Ok(deleted)
+    }
+
+    /// Clears a namespace, then removes its vector points best-effort.
+    ///
+    /// Vector work never fails the store commit.
+    pub async fn admin_clear(&self, namespace: &str) -> Result<u64, MemoryError> {
+        let store = Arc::clone(&self.store);
+        let namespace_for_store = namespace.to_owned();
+        let deleted =
+            spawn_store_task(move || store.delete_namespace(&namespace_for_store)).await?;
+        self.schedule_vector_delete_namespace(namespace.to_owned())
+            .await;
+        Ok(deleted)
     }
 
     pub fn set_eviction_publisher(
@@ -676,6 +767,16 @@ impl MemorySystem {
         );
     }
 
+    /// Best-effort removal of one entry's vector point; never fails callers.
+    pub async fn schedule_vector_delete(&self, id: Uuid) {
+        schedule_vector_delete_task(self.vector_tier.clone(), id).await;
+    }
+
+    /// Best-effort removal of a namespace's vector points; never fails callers.
+    pub async fn schedule_vector_delete_namespace(&self, namespace: String) {
+        schedule_vector_delete_namespace_task(self.vector_tier.clone(), namespace).await;
+    }
+
     pub async fn retry_pending_vector_indexes(&self) -> Result<u64, MemoryError> {
         MemoryVectorRetryCallback {
             store: self.store.clone(),
@@ -766,6 +867,42 @@ fn mark_vector_retry(store: &MemoryStore, id: Uuid, attempted_at: DateTime<Utc>,
         tracing::warn!(entry_id = %id, error = %store_error, "failed to mark memory vector retry");
     } else {
         tracing::warn!(entry_id = %id, error = %error, "memory vector indexing failed; retry scheduled");
+    }
+}
+
+/// Await one best-effort tier delete, logging sanitized failures inline.
+async fn run_vector_delete(result: Result<(), MemoryError>, key: impl std::fmt::Display) {
+    if let Err(error) = result {
+        tracing::warn!(key = %key, error = %error, "memory vector delete failed");
+    }
+}
+
+async fn schedule_vector_delete_task(
+    vector_tier: Arc<RwLock<Option<Arc<dyn MemoryVectorTier>>>>,
+    id: Uuid,
+) {
+    let Some(tier) = vector_tier.read().await.clone() else {
+        return;
+    };
+    let result = tokio::time::timeout(vector::VECTOR_INDEX_TIMEOUT, tier.delete_entry(id)).await;
+    match result {
+        Ok(result) => run_vector_delete(result, id).await,
+        Err(_) => tracing::warn!(entry_id = %id, "memory vector delete timed out"),
+    }
+}
+
+async fn schedule_vector_delete_namespace_task(
+    vector_tier: Arc<RwLock<Option<Arc<dyn MemoryVectorTier>>>>,
+    namespace: String,
+) {
+    let Some(tier) = vector_tier.read().await.clone() else {
+        return;
+    };
+    let result =
+        tokio::time::timeout(vector::VECTOR_INDEX_TIMEOUT, tier.delete_namespace(&namespace)).await;
+    match result {
+        Ok(result) => run_vector_delete(result, namespace).await,
+        Err(_) => tracing::warn!(namespace = %namespace, "memory vector namespace delete timed out"),
     }
 }
 
@@ -873,6 +1010,63 @@ mod tests {
             _limit: usize,
         ) -> Result<Vec<VectorMatch>, MemoryError> {
             Ok(Vec::new())
+        }
+    }
+
+    /// Records index/delete calls for sequencing assertions.
+    struct RecordingVectorTier {
+        fail_deletes: bool,
+        events: Mutex<Vec<String>>,
+    }
+
+    impl RecordingVectorTier {
+        fn new() -> Self {
+            Self {
+                fail_deletes: false,
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl MemoryVectorTier for RecordingVectorTier {
+        async fn index(&self, entry: &MemoryEntry) -> Result<(), MemoryError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("index:{}", entry.id));
+            Ok(())
+        }
+
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<VectorMatch>, MemoryError> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_entry(&self, id: Uuid) -> Result<(), MemoryError> {
+            self.events.lock().unwrap().push(format!("delete:{id}"));
+            if self.fail_deletes {
+                return Err(MemoryError::Qdrant("mock delete failure".to_owned()));
+            }
+            Ok(())
+        }
+
+        async fn delete_namespace(&self, namespace: &str) -> Result<(), MemoryError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("delete_namespace:{namespace}"));
+            if self.fail_deletes {
+                return Err(MemoryError::Qdrant("mock delete failure".to_owned()));
+            }
+            Ok(())
         }
     }
 
@@ -1020,11 +1214,223 @@ mod tests {
                 [entry.id.to_string()],
             )
             .unwrap();
-        assert_eq!(system.retry_pending_vector_indexes().await.unwrap(), 1);
+    assert_eq!(system.retry_pending_vector_indexes().await.unwrap(), 1);
+    assert_eq!(
+        system.store.vector_status(entry.id).unwrap().unwrap().0,
+        "indexed"
+    );
+    }
+
+    fn vector_config() -> MemoryConfig {
+        MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            qdrant: Some(MemoryQdrantConfig {
+                qdrant_url: "http://localhost:6333".to_owned(),
+                embedding_provider: "mock".to_owned(),
+                embedding_model: "text-embedding-3-small".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn wait_for_events(tier: &RecordingVectorTier, expected: usize) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let events = tier.events();
+                if events.len() >= expected {
+                    return events;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tier events must be recorded")
+    }
+
+    #[tokio::test]
+    async fn admin_edit_rejects_disallowed_content_before_write() {
+        let system = system(MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            ..Default::default()
+        })
+        .await;
+        let entry = system
+            .admin_create(
+                "user::edit".to_owned(),
+                "Original safe stored content.".to_owned(),
+                MemoryType::Fact,
+            )
+            .await
+            .unwrap();
+
+        let rejected = system
+            .admin_edit(entry.id, "key sk-ABCDEFGHIJKLMNOPQRSTUVWXY", "fact")
+            .await
+            .unwrap_err();
+        assert!(matches!(rejected, AdminCreateError::SensitiveContent));
+        let short = system.admin_edit(entry.id, "tiny", "fact").await.unwrap_err();
+        assert!(matches!(short, AdminCreateError::InvalidContent(_)));
+        let stored = system.store.get_entry_by_id(entry.id).unwrap().unwrap();
+        assert_eq!(stored.content, "Original safe stored content.");
+    }
+
+    #[tokio::test]
+    async fn admin_edit_updates_store_and_tier_observes_delete_then_reindex() {
+        let tier = Arc::new(RecordingVectorTier::new());
+        let system = MemorySystem::new_with_vector(
+            vector_config(),
+            None,
+            None,
+            Some(tier.clone() as Arc<dyn MemoryVectorTier>),
+        )
+        .await
+        .unwrap();
+    let entry = system
+        .admin_create(
+            "user::edit".to_owned(),
+            "Vector indexing remains asynchronous.".to_owned(),
+            MemoryType::Fact,
+        )
+        .await
+        .unwrap();
+    let create_events = wait_for_events(&tier, 1).await;
+    assert_eq!(create_events[0], format!("index:{}", entry.id));
+
+    let updated = system
+        .admin_edit(entry.id, "Edited content stays safe.", "decision")
+        .await
+        .unwrap()
+        .expect("entry must exist");
+    assert_eq!(updated.content, "Edited content stays safe.");
+    assert_eq!(updated.memory_type, MemoryType::Decision);
+    assert!(updated.updated_at.is_some());
+
+    let events = wait_for_events(&tier, 3).await;
+    assert_eq!(events[1], format!("delete:{}", entry.id));
+    assert_eq!(events[2], format!("index:{}", entry.id));
         assert_eq!(
-            system.store.vector_status(entry.id).unwrap().unwrap().0,
-            "indexed"
+            system.store.get_entry_by_id(entry.id).unwrap().unwrap(),
+            updated
         );
+    }
+
+    #[tokio::test]
+    async fn admin_edit_returns_none_for_missing_id() {
+        let system = system(MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            ..Default::default()
+        })
+        .await;
+        assert!(
+            system
+                .admin_edit(Uuid::from_u128(4242), "Missing entry content.", "fact")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_edit_survives_vector_delete_failure() {
+        let tier = Arc::new(RecordingVectorTier {
+            fail_deletes: true,
+            events: Mutex::new(Vec::new()),
+        });
+        let system = MemorySystem::new_with_vector(
+            vector_config(),
+            None,
+            None,
+            Some(tier.clone() as Arc<dyn MemoryVectorTier>),
+        )
+        .await
+        .unwrap();
+        let entry = system
+            .admin_create(
+                "user::edit".to_owned(),
+                "Vector indexing remains asynchronous.".to_owned(),
+                MemoryType::Fact,
+            )
+            .await
+            .unwrap();
+        wait_for_events(&tier, 1).await;
+
+        let updated = system
+            .admin_edit(entry.id, "Edited content stays safe.", "fact")
+            .await
+            .unwrap()
+            .expect("edit must succeed despite tier delete failure");
+        assert_eq!(updated.content, "Edited content stays safe.");
+        let events = wait_for_events(&tier, 3).await;
+        assert_eq!(events[1], format!("delete:{}", entry.id));
+        assert!(system.store.get_entry_by_id(entry.id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn default_trait_delete_methods_are_noops() {
+        struct BareTier;
+        #[async_trait]
+        impl MemoryVectorTier for BareTier {
+            async fn index(&self, _entry: &MemoryEntry) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            async fn search(
+                &self,
+                _query: &str,
+                _limit: usize,
+            ) -> Result<Vec<VectorMatch>, MemoryError> {
+                Ok(Vec::new())
+            }
+        }
+        let tier = BareTier;
+        tier.delete_entry(Uuid::new_v4()).await.unwrap();
+        tier.delete_namespace("user::bare").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_delete_and_clear_trigger_tier_deletes_best_effort() {
+        let tier = Arc::new(RecordingVectorTier::new());
+        let system = MemorySystem::new_with_vector(
+            vector_config(),
+            None,
+            None,
+            Some(tier.clone() as Arc<dyn MemoryVectorTier>),
+        )
+        .await
+        .unwrap();
+        let first = system
+            .admin_create(
+                "user::purge".to_owned(),
+                "First purge candidate content.".to_owned(),
+                MemoryType::Fact,
+            )
+            .await
+            .unwrap();
+        let second = system
+            .admin_create(
+                "user::purge".to_owned(),
+                "Second purge candidate content.".to_owned(),
+                MemoryType::Fact,
+            )
+            .await
+            .unwrap();
+        wait_for_events(&tier, 2).await;
+
+        assert!(system.admin_delete(first.id).await.unwrap());
+        assert!(!system.admin_delete(first.id).await.unwrap());
+        assert_eq!(system.admin_clear("user::purge").await.unwrap(), 1);
+        assert_eq!(
+            system.store.get_entry_by_id(second.id).unwrap(),
+            None,
+            "second entry must be cleared with the namespace"
+        );
+
+        let events = wait_for_events(&tier, 4).await;
+        assert_eq!(events[2], format!("delete:{}", first.id));
+        assert_eq!(events[3], "delete_namespace:user::purge");
     }
 
     #[test]
@@ -1237,10 +1643,12 @@ mod tests {
             relevance_score: 0.75,
             created_at,
             last_accessed_at,
-            access_count: 3,
-            source_request_id: Some(Uuid::from_u128(2)),
-        }
+        access_count: 3,
+        source_request_id: Some(Uuid::from_u128(2)),
+        updated_at: None,
+        superseded_by: None,
     }
+}
 
     #[test]
     fn feedback_suffix_formats_activity_and_sensitive_rejections() {
