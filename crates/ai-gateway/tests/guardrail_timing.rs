@@ -1,4 +1,4 @@
-﻿//! Representative smoke timing checks for guardrail latency budgets (task 13.6).
+//! Representative smoke timing checks for guardrail latency budgets (task 13.6).
 //!
 //! These are *smoke* checks, not micro-benchmarks: they assert that the pure,
 //! in-process guardrail hot paths complete comfortably under their specified
@@ -13,8 +13,8 @@
 //!   and a >50 KB body.
 //! - Streaming forward-within-500 ms (Req 10.6): after post-call analysis, the
 //!   assembled response is re-chunked into SSE and forwarded within 500 ms. We
-//!   measure the deterministic in-process path â€” `stream::assemble` + a regex
-//!   `run_post_call` + `stream::rechunk_full` â€” rather than a flaky endpoint.
+//!   measure the deterministic in-process path — `stream::assemble` + a regex
+//!   `run_post_call` + `stream::rechunk_full` — rather than a flaky endpoint.
 
 use std::time::Instant;
 
@@ -139,7 +139,7 @@ fn moderate_sse_body() -> String {
     body.push_str(
         "data: {\"id\":\"chatcmpl-x\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
     );
-    // ~200 content deltas of a short phrase â†’ a few KB assembled.
+    // ~200 content deltas of a short phrase → a few KB assembled.
     for i in 0..200 {
         let frag = format!("chunk {i} of the streamed answer; ");
         let escaped = frag.replace('"', "\\\"");
@@ -156,7 +156,7 @@ fn moderate_sse_body() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Req 2.8 â€” pre-call latency budget
+// Req 2.8 — pre-call latency budget
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -220,7 +220,7 @@ async fn pre_call_scan_of_large_body_completes_well_under_500ms() {
 }
 
 // ---------------------------------------------------------------------------
-// Req 10.6 â€” streaming forward-within-500ms (analysis + re-chunk)
+// Req 10.6 — streaming forward-within-500ms (analysis + re-chunk)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

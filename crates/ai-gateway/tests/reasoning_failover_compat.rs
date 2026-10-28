@@ -2,16 +2,16 @@
 //! feature (spec: reasoning-failover-compat, design "Integration Testing").
 //!
 //! Exercises the full gateway HTTP surface via `tower::ServiceExt::oneshot()`
-//! with wiremock providers â€” no real ports bound, isolated SQLite databases
+//! with wiremock providers — no real ports bound, isolated SQLite databases
 //! (same harness conventions as `tests/prompt_cache_routing.rs`).
 //!
 //! Covered scenarios:
-//! - Claude-thinking conversation fails over to another Claude model â†’
+//! - Claude-thinking conversation fails over to another Claude model →
 //!   thinking / signature / redacted_thinking stripped from the backup body
-//! - Same-model continuation (tool loop) â†’ thinking preserved verbatim
+//! - Same-model continuation (tool loop) → thinking preserved verbatim
 //! - Sticky conversation-model affinity keeps the serving provider ahead of
 //!   a higher-priority competitor and preserves same-model thinking
-//! - DeepSeek `reasoning_content` history â†’ stripped for an OpenAI target
+//! - DeepSeek `reasoning_content` history → stripped for an OpenAI target
 //! - `reasoning_effort` normalization: Anthropic manual budget, Anthropic
 //!   adaptive, OpenAI-reasoning passthrough (name-based family classify)
 //! - Bedrock `budget_tokens` replaces the legacy 4096 hardcode
@@ -297,7 +297,7 @@ fn deepseek_history_request() -> serde_json::Value {
 }
 
 /// Two-turn conversation sharing the prefix
-/// `[system, user, assistant(thinking)]` across calls â€” only the final
+/// `[system, user, assistant(thinking)]` across calls — only the final
 /// user turn differs, so the sticky prefix hash stays identical.
 fn affinity_request(tail: &str) -> serde_json::Value {
     serde_json::json!({
@@ -428,7 +428,7 @@ async fn cross_model_failover_strips_thinking() {
 #[tokio::test]
 async fn cross_model_failover_strips_deepseek_reasoning_content() {
     let primary = MockServer::start().await; // deepseek-chat, priority 1
-    let backup = MockServer::start().await; // gpt-4o (name â†’ None family), priority 2
+    let backup = MockServer::start().await; // gpt-4o (name → None family), priority 2
 
     let mut config = compat_config(ReasoningCompatConfig::default(), 0);
     config.providers = vec![
@@ -477,7 +477,7 @@ async fn cross_model_failover_strips_deepseek_reasoning_content() {
 // Same-model continuation preserves reasoning state verbatim
 // ---------------------------------------------------------------------------
 
-/// Single manual-family provider (family resolved from the model NAME â€”
+/// Single manual-family provider (family resolved from the model NAME —
 /// no explicit reasoning_family), signed thinking + redacted_thinking +
 /// tool_calls history: everything is forwarded verbatim (mid-tool-loop
 /// continuation; the echo must be bit-identical for signature validation).
@@ -574,7 +574,7 @@ async fn same_model_via_affinity_preserves() {
 
     // Turn 2: same conversation prefix, new tail. Priority alone would pick
     // `priority-first` (which would strip the manual-family thinking), but
-    // the affinity entry promotes `sticky-claude` â€” same resolved model, so
+    // the affinity entry promotes `sticky-claude` — same resolved model, so
     // the thinking state is preserved verbatim.
     let (status, _) = post_chat_json(app, affinity_request("turn two")).await;
     assert_eq!(status, StatusCode::OK);
@@ -603,7 +603,7 @@ async fn same_model_via_affinity_preserves() {
 // reasoning_effort normalization per target family
 // ---------------------------------------------------------------------------
 
-/// `reasoning_effort: "high"` â†’ manual-family target (family resolved from
+/// `reasoning_effort: "high"` → manual-family target (family resolved from
 /// the model name) receives `thinking: {type: "enabled", budget_tokens:
 /// 16384}` (the default high budget), the effort field is removed, and
 /// conflicting sampling parameters are dropped.
@@ -647,9 +647,9 @@ async fn reasoning_effort_normalized_for_anthropic_manual() {
     );
 }
 
-/// `reasoning_effort: "high"` â†’ adaptive-family target (name-classified
+/// `reasoning_effort: "high"` → adaptive-family target (name-classified
 /// claude-4-7) receives `thinking: {type: "adaptive"}` + `output_config.
-/// effort` â€” NEVER `type: "enabled"` (a 400 on Claude 4.7+).
+/// effort` — NEVER `type: "enabled"` (a 400 on Claude 4.7+).
 #[tokio::test]
 async fn reasoning_effort_adaptive_for_47() {
     let upstream = MockServer::start().await;
@@ -688,7 +688,7 @@ async fn reasoning_effort_adaptive_for_47() {
     assert!(body.get("reasoning_effort").is_none());
 }
 
-/// `reasoning_effort: "high"` â†’ OpenAI-reasoning target (name-classified
+/// `reasoning_effort: "high"` → OpenAI-reasoning target (name-classified
 /// o3) keeps `reasoning_effort` as-is and gets no Anthropic `thinking`.
 #[tokio::test]
 async fn reasoning_effort_kept_for_openai_reasoning() {
@@ -731,9 +731,9 @@ async fn reasoning_effort_kept_for_openai_reasoning() {
 
 /// With reasoning_compat enabled, a `reasoning_effort: "minimal"` request to
 /// a bedrock reasoning model must emit `budget_tokens: 1024` (the minimal
-/// default) â€” not the legacy hardcoded 4096.
+/// default) — not the legacy hardcoded 4096.
 ///
-/// #[ignore] â€” REAL IMPLEMENTATION BUG (observed 2026-08-30): the wire body
+/// #[ignore] — REAL IMPLEMENTATION BUG (observed 2026-08-30): the wire body
 /// carries NO `thinking` parameter at all. The normalizer correctly emits
 /// `thinking: {type:"enabled", budget_tokens:1024}` into the outgoing
 /// request, but `Router::sanitize_request_for_provider(.., "bedrock")`
@@ -786,13 +786,13 @@ async fn budget_replaces_bedrock_hardcode() {
 /// still injects the hardcoded `budget_tokens: 4096` when the provider
 /// enables reasoning (opt-out reproduces old behavior exactly).
 ///
-/// #[ignore] â€” REAL IMPLEMENTATION BUG (observed 2026-08-30): the legacy
+/// #[ignore] — REAL IMPLEMENTATION BUG (observed 2026-08-30): the legacy
 /// injection (`router.rs` "Inject reasoning/extended thinking parameter for
 /// Bedrock providers" block) writes `thinking: {type:"enabled",
 /// budget_tokens:4096}` into the outgoing request, but the subsequent
 /// `sanitize_mantle_chat_request` pass deletes it because `thinking` is
 /// missing from `MANTLE_CHAT_ALLOWED` (providers/bedrock.rs). The legacy
-/// bedrock thinking injection is dead on this path â€” the provider never
+/// bedrock thinking injection is dead on this path — the provider never
 /// receives any thinking parameter. Same root cause as
 /// `budget_replaces_bedrock_hardcode`.
 #[tokio::test]
@@ -1003,7 +1003,7 @@ async fn reasoning_tokens_logged_and_metricd() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Provider health: 500 reasoning tokens priced at $2.00/M â†’ $0.001.
+    // Provider health: 500 reasoning tokens priced at $2.00/M → $0.001.
     let snapshot = server.state.metrics.snapshot();
     let health = snapshot
         .provider_health

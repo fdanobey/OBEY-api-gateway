@@ -64,6 +64,12 @@ static SECRET_SPANS: LazyLock<Regex> = LazyLock::new(|| {
         r#"|xai-[A-Za-z0-9_-]{16,}"#,
         r#"|AIza[0-9A-Za-z_-]{30,}"#,
         r#"|xox[bp]-[A-Za-z0-9-]{16,})"#,
+        // Credential-bearing URL userinfo (group 9, prefix re-emitted): keep
+        // scheme://user:, redact the password up to the terminator so client
+        // error bodies cannot leak embedded credentials.
+        r#"|([a-z][a-z0-9+.-]*://[^/@:\s]+:)[^@/\s]+"#,
+        // Gateway virtual keys: full span replaced.
+        r#"|vk_[A-Za-z0-9_-]{8,}"#,
     ))
     .expect("secret redaction pattern must compile")
 });
@@ -96,8 +102,13 @@ pub fn redact_secrets(text: &str) -> String {
                     return format!("{}{}", m.as_str(), REDACTED);
                 }
             }
-            // AWS access key (group 7) and known-prefix token families
-            // (group 8): full span replaced.
+            // Credential-bearing URL userinfo (group 9): keep
+            // scheme://user:, redact the password.
+            if let Some(prefix) = caps.get(9) {
+                return format!("{}{}", prefix.as_str(), REDACTED);
+            }
+            // AWS access key (group 7), known-prefix token families
+            // (group 8), and virtual keys (group 10): full span replaced.
             REDACTED.to_owned()
         })
         .into_owned()
@@ -301,14 +312,31 @@ fn redacts_known_token_prefix_families() {
         );
     }
 
-    #[test]
-    fn leaves_json_literal_values_untouched() {
-        for text in [
-            r#"{"api_key": null}"#,
-            r#"{"api_key":true}"#,
-            r#"{"api-key": "false"}"#,
-        ] {
-            assert_eq!(redact_secrets(text), text, "JSON literal corrupted: {text}");
-        }
+#[test]
+fn leaves_json_literal_values_untouched() {
+    for text in [
+        r#"{"api_key": null}"#,
+        r#"{"api_key":true}"#,
+        r#"{"api-key": "false"}"#,
+    ] {
+        assert_eq!(redact_secrets(text), text, "JSON literal corrupted: {text}");
     }
+}
+
+#[test]
+fn redacts_url_userinfo_passwords_keeping_scheme_and_user() {
+    let redacted = redact_secrets("upstream https://alice:super-secret@example.test/v1 said no");
+    assert!(!redacted.contains("super-secret"), "{redacted}");
+    assert!(redacted.contains("https://alice:"), "{redacted}");
+    assert!(redacted.contains("example.test/v1"), "{redacted}");
+}
+
+#[test]
+fn redacts_virtual_keys() {
+    let redacted = redact_secrets("key vk_SuperSecret9123456 denied");
+    assert!(!redacted.contains("vk_SuperSecret9123456"), "{redacted}");
+    assert!(redacted.contains("key […REDACTED…] denied"), "{redacted}");
+    // Short non-key vk_ spans stay untouched (avoid false positives).
+    assert_eq!(redact_secrets("vk_short"), "vk_short");
+}
 }

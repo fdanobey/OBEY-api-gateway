@@ -267,6 +267,18 @@ pub struct LogEntry {
     /// spec, task 5.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_reduction: Option<ContextReductionLog>,
+    /// Client wire protocol that produced this request: `chat`,
+    /// `responses`, or `anthropic` (anthropic-messages-front-door Req
+    /// 6.3). `None` (column NULL) means the classic chat front door and
+    /// pre-protocol rows, so legacy traffic stays NULL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_protocol: Option<String>,
+    /// Opaque Claude Code session/agent identifier
+    /// (`x-claude-code-session-id` / `x-claude-code-agent-id`) recorded
+    /// for session/subagent cost attribution (Req 5.5). Stored verbatim;
+    /// never parsed out of prompt content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
 }
 
 impl LogEntry {
@@ -371,6 +383,12 @@ pub struct LogFilter {
     /// followed them).
     pub min_status_code: Option<u16>,
     pub compression_level: Option<String>,
+    /// Exact-match `client_protocol` filter (`chat` | `responses` |
+    /// `anthropic`). Rows with a NULL `client_protocol` (legacy chat
+    /// traffic) never match, per SQL NULL semantics.
+    pub client_protocol: Option<String>,
+    /// Exact-match Claude session/agent identifier filter (Req 5.5).
+    pub claude_session_id: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -512,7 +530,9 @@ impl RequestLogger {
             reasoning_compat_actions TEXT,
             error_class TEXT,
             reasoning_relayed_frames INTEGER,
-            context_reduction TEXT
+            context_reduction TEXT,
+            client_protocol TEXT,
+            claude_session_id TEXT
         )",
             [],
         )?;
@@ -532,6 +552,8 @@ impl RequestLogger {
         Self::ensure_column(conn, "error_class", "TEXT")?;
         Self::ensure_column(conn, "reasoning_relayed_frames", "INTEGER")?;
         Self::ensure_column(conn, "context_reduction", "TEXT")?;
+        Self::ensure_column(conn, "client_protocol", "TEXT")?;
+        Self::ensure_column(conn, "claude_session_id", "TEXT")?;
 
         // Create indexes for common query patterns
         conn.execute(
@@ -918,10 +940,11 @@ fn insert_entry(
             memories_injected, memories_stored, injection_tokens, detected_project,
             cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
             reasoning_tokens, reasoning_compat_actions, error_class, reasoning_relayed_frames,
-            context_reduction
+            context_reduction, client_protocol, claude_session_id
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+            ?29, ?30
         )",
         params![
             entry.trace_id,
@@ -952,6 +975,8 @@ fn insert_entry(
             entry.error_class,
             reasoning_relayed_frames.map(|frames| i64::try_from(frames).unwrap_or(i64::MAX)),
             context_reduction,
+            entry.client_protocol,
+            entry.claude_session_id,
         ],
     )?;
 
@@ -960,7 +985,7 @@ fn insert_entry(
 
 /// Query log entries with optional filtering. Runs on the writer thread.
 fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
-    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class, context_reduction FROM requests WHERE 1=1");
+    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class, context_reduction, client_protocol, claude_session_id FROM requests WHERE 1=1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     if let Some(ref trace_id) = filter.trace_id {
@@ -1003,6 +1028,16 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
         params.push(Box::new(compression_level.clone()));
     }
 
+    if let Some(ref client_protocol) = filter.client_protocol {
+        query.push_str(" AND client_protocol = ?");
+        params.push(Box::new(client_protocol.clone()));
+    }
+
+    if let Some(ref claude_session_id) = filter.claude_session_id {
+        query.push_str(" AND claude_session_id = ?");
+        params.push(Box::new(claude_session_id.clone()));
+    }
+
     query.push_str(" ORDER BY timestamp DESC");
 
     if let Some(limit) = filter.limit {
@@ -1023,7 +1058,6 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
             let context_reduction = context_reduction_json
                 .as_deref()
                 .and_then(context_reduction_log_from_json);
-
             Ok(LogEntry {
                 trace_id: row.get(0)?,
                 timestamp: DateTime::from_timestamp(row.get(1)?, 0).unwrap(),
@@ -1053,6 +1087,8 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
                 reasoning_compat_actions: row.get(23)?,
                 error_class: row.get(24)?,
                 context_reduction,
+                client_protocol: row.get(26)?,
+                claude_session_id: row.get(27)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1158,6 +1194,8 @@ mod tests {
             reasoning_compat_actions: None,
             error_class: None,
             context_reduction: None,
+            client_protocol: None,
+            claude_session_id: None,
         }
     }
 
@@ -1658,6 +1696,175 @@ mod tests {
     }
 
     #[test]
+    fn protocol_columns_migrate_round_trip_and_survive_reopen() {
+        // Legacy table with every column except client_protocol and
+        // claude_session_id, plus one pre-existing row that must survive
+        // the in-place migration with NULL protocol columns.
+        let temp_file = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(temp_file.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE requests (
+                id INTEGER PRIMARY KEY,
+                trace_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                cost REAL NOT NULL,
+                request_body TEXT,
+                response_body TEXT,
+                requested_model TEXT,
+                responded_model TEXT,
+                compression_metadata TEXT,
+                compression_level TEXT,
+                memories_injected INTEGER NOT NULL DEFAULT 0,
+                memories_stored INTEGER NOT NULL DEFAULT 0,
+                injection_tokens INTEGER NOT NULL DEFAULT 0,
+                detected_project TEXT,
+                cache_read_tokens INTEGER,
+                cache_creation_tokens INTEGER,
+                cache_savings_cents INTEGER,
+                prefix_hash TEXT,
+                reasoning_tokens INTEGER,
+                reasoning_compat_actions TEXT,
+                error_class TEXT,
+                reasoning_relayed_frames INTEGER,
+                context_reduction TEXT
+            );
+            INSERT INTO requests (
+                trace_id, timestamp, method, path, model, provider,
+                status_code, duration_ms, cost
+            ) VALUES (
+                'legacy-chat', 1700000000, 'POST', '/v1/chat/completions', 'gpt-4',
+                'openai', 200, 10, 0.0
+            );",
+            )
+            .unwrap();
+        }
+
+        let database_path = temp_file.path().to_string_lossy().into_owned();
+        let config = LoggingConfig {
+            database_path: database_path.clone(),
+            ..Default::default()
+        };
+
+        // First open migrates in place: columns added, old row intact
+        // with NULL protocol columns.
+        {
+            let logger = RequestLogger::new(config.clone()).unwrap();
+            let legacy = logger
+                .query(LogFilter {
+                    trace_id: Some("legacy-chat".to_owned()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(legacy.len(), 1);
+            assert_eq!(legacy[0].trace_id, "legacy-chat");
+            assert!(legacy[0].client_protocol.is_none());
+            assert!(legacy[0].claude_session_id.is_none());
+
+            // New writes populate the protocol columns.
+            let mut entry = sample_entry("anthropic-turn", None);
+            entry.client_protocol = Some("anthropic".to_owned());
+            entry.claude_session_id = Some("session-1234".to_owned());
+            logger.log(entry).unwrap();
+
+            let mut chat_entry = sample_entry("chat-turn", None);
+            chat_entry.client_protocol = Some("chat".to_owned());
+            logger.log(chat_entry).unwrap();
+
+            logger.log(sample_entry("legacy-default", None)).unwrap();
+
+            // Round trip through the query path.
+            let anthropic_rows = logger
+                .query(LogFilter {
+                    client_protocol: Some("anthropic".to_owned()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(anthropic_rows.len(), 1);
+            assert_eq!(anthropic_rows[0].trace_id, "anthropic-turn");
+            assert_eq!(
+                anthropic_rows[0].claude_session_id.as_deref(),
+                Some("session-1234")
+            );
+
+            // Filters compose with existing filters.
+            let session_rows = logger
+                .query(LogFilter {
+                    claude_session_id: Some("session-1234".to_owned()),
+                    status_code: Some(200),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(session_rows.len(), 1);
+            assert_eq!(session_rows[0].trace_id, "anthropic-turn");
+
+            // NULL protocol rows never match a protocol filter (SQL
+            // NULL semantics); the chat filter must not swallow them.
+            let chat_rows = logger
+                .query(LogFilter {
+                    client_protocol: Some("chat".to_owned()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(chat_rows.len(), 1);
+            assert_eq!(chat_rows[0].trace_id, "chat-turn");
+        }
+
+        // Re-open on the already-migrated database is a no-op and the
+        // migrated data survives.
+        {
+            let logger = RequestLogger::new(config).unwrap();
+            let anthropic_rows = logger
+                .query(LogFilter {
+                    client_protocol: Some("anthropic".to_owned()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(anthropic_rows.len(), 1);
+            assert_eq!(anthropic_rows[0].trace_id, "anthropic-turn");
+            assert_eq!(
+                anthropic_rows[0].claude_session_id.as_deref(),
+                Some("session-1234")
+            );
+
+            let conn = Connection::open(&database_path).unwrap();
+            let columns = conn
+                .prepare("PRAGMA table_info(requests)")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(columns.contains(&"client_protocol".to_owned()));
+            assert!(columns.contains(&"claude_session_id".to_owned()));
+            // Exactly one migration ran: no duplicated columns.
+            assert_eq!(
+                columns
+                    .iter()
+                    .filter(|column| column.as_str() == "client_protocol")
+                    .count(),
+                1
+            );
+            // Old row intact with NULL protocol columns.
+            let legacy = logger
+                .query(LogFilter {
+                    trace_id: Some("legacy-chat".to_owned()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(legacy.len(), 1);
+            assert!(legacy[0].client_protocol.is_none());
+            assert!(legacy[0].claude_session_id.is_none());
+        }
+    }
+
+    #[test]
     fn context_reduction_round_trips_and_serializes_into_api_payload() {
         let (logger, _temp) = create_test_logger();
         let outcome = ReductionOutcome {
@@ -1940,6 +2147,8 @@ mod tests {
             reasoning_compat_actions: None,
             error_class: None,
             context_reduction: None,
+            client_protocol: None,
+            claude_session_id: None,
         };
 
         logger.log(entry.clone()).unwrap();
@@ -2116,6 +2325,8 @@ mod tests {
             reasoning_compat_actions: None,
             error_class: None,
             context_reduction: None,
+            client_protocol: None,
+            claude_session_id: None,
         };
 
         logger.log(old_entry).unwrap();
@@ -2148,6 +2359,8 @@ mod tests {
             reasoning_compat_actions: None,
             error_class: None,
             context_reduction: None,
+            client_protocol: None,
+            claude_session_id: None,
         };
 
         logger.log(recent_entry).unwrap();
@@ -2229,8 +2442,10 @@ mod property_tests {
                         reasoning_tokens: None,
                         reasoning_compat_actions: None,
                         error_class: None,
-                        context_reduction: None,
-                    }
+            context_reduction: None,
+            client_protocol: None,
+            claude_session_id: None,
+            }
                 },
             )
     }
@@ -2325,7 +2540,9 @@ mod property_tests {
             reasoning_compat_actions: None,
             error_class: None,
             context_reduction: None,
-            };
+            client_protocol: None,
+            claude_session_id: None,
+        };
 
             logger.log(entry.clone()).unwrap();
 
@@ -2400,7 +2617,9 @@ mod property_tests {
             reasoning_compat_actions: None,
             error_class: None,
             context_reduction: None,
-            };
+            client_protocol: None,
+            claude_session_id: None,
+        };
 
             logger.log(entry).unwrap();
 
@@ -2472,7 +2691,9 @@ mod property_tests {
             reasoning_compat_actions: None,
             error_class: None,
             context_reduction: None,
-            };
+            client_protocol: None,
+            claude_session_id: None,
+        };
 
             logger.log(entry).unwrap();
 
@@ -2542,7 +2763,9 @@ mod property_tests {
             reasoning_compat_actions: None,
             error_class: None,
             context_reduction: None,
-            };
+            client_protocol: None,
+            claude_session_id: None,
+        };
 
             logger.log(entry).unwrap();
 
@@ -2623,7 +2846,9 @@ mod property_tests {
             reasoning_compat_actions: None,
             error_class: None,
             context_reduction: None,
-            };
+            client_protocol: None,
+            claude_session_id: None,
+        };
 
             logger.log(entry).unwrap();
 

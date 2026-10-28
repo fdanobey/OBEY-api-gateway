@@ -56,6 +56,14 @@ use crate::virtual_keys::access::AccessError;
 use crate::virtual_keys::models::AuthenticatedKey;
 
 use crate::codex::sse::ResponsesEvent as CodexResponsesEvent;
+use crate::anthropic::{
+    count_tokens as anthropic_count_tokens_estimate, from_gateway_error,
+    from_translator_rejection, sse_event_parts, translate as translate_anthropic,
+    AnthropicErrorResponse, AnthropicRequest, AnthropicSynthesisContext, ChatDelta,
+    MessageStreamAssembler,
+};
+use crate::anthropic::models::error_types as anthropic_error_types;
+use crate::anthropic::errors::{error_response as anthropic_error_response, http_status as anthropic_http_status};
 use crate::responses::{
     synthesize as synthesize_responses, translate as translate_responses, EasyInputContent,
     EasyInputMessage, InputItem, InputTokensDetails, OutputContentPart, OutputFunctionCall,
@@ -128,6 +136,13 @@ struct RequestLogContext {
     /// Content-free metadata of the proactive context reduction applied to
     /// the attempt that served this request (context-overflow spec 5.1).
     context_reduction: Option<crate::logger::ContextReductionLog>,
+    /// Client wire protocol (`anthropic` for `/v1/messages`; `None` = chat).
+    client_protocol: Option<&'static str>,
+    /// Opaque Claude Code session/agent id from
+    /// `x-claude-code-session-id`/`x-claude-code-agent-id` (Req 5.5).
+    claude_session_id: Option<String>,
+    /// Log row `path` (front door that served the request).
+    log_path: &'static str,
 }
 
 impl RequestLogContext {
@@ -272,6 +287,9 @@ fn with_memory(
                 }
             }),
         error_class: None,
+        client_protocol: None,
+        claude_session_id: None,
+        log_path: "/v1/chat/completions",
     }
 }
 
@@ -309,6 +327,9 @@ fn with_memory(
         reasoning_relayed_frames: None,
         context_reduction: None,
         error_class: None,
+        client_protocol: None,
+        claude_session_id: None,
+        log_path: "/v1/chat/completions",
     }
 }
 
@@ -356,17 +377,31 @@ fn with_memory(
             cache_creation_tokens: None,
             cache_savings_cents: None,
             prefix_hash: None,
-            reasoning_tokens: None,
-            reasoning_compat_actions: None,
-            reasoning_relayed_frames: None,
-            // Error paths carry no reduction: the request never completed, and
-            // gate-skipped attempts surface as context_window_exceeded
-            // `#attempt` rows instead.
-            context_reduction: None,
-            error_class: Some(crate::error::error_class_for(error)),
+        reasoning_tokens: None,
+        reasoning_compat_actions: None,
+        reasoning_relayed_frames: None,
+        // Error paths carry no reduction: the request never completed, and
+        // gate-skipped attempts surface as context_window_exceeded
+        // `#attempt` rows instead.
+        context_reduction: None,
+        error_class: Some(crate::error::error_class_for(error)),
+        client_protocol: None,
+        claude_session_id: None,
+        log_path: "/v1/chat/completions",
     }
 }
+
+    /// Tag this log context as originating from the Anthropic Messages
+    /// front door (`/v1/messages`): sets `client_protocol = "anthropic"`
+    /// and records the Claude Code session/agent id (Req 5.5, 6.3).
+    fn with_anthropic_protocol(mut self, claude_session_id: Option<String>) -> Self {
+        self.client_protocol = Some("anthropic");
+        self.claude_session_id = claude_session_id;
+        self.log_path = "/v1/messages";
+        self
+    }
 }
+
 
 /// Write the terminal outcome row for a chat request: first drain the
 /// request's attempt ledger into `#attempt` rows, then write the outcome row,
@@ -406,7 +441,7 @@ fn write_request_log(
         trace_id: context.trace_id.clone(),
         timestamp: chrono::Utc::now(),
         method: "POST".to_string(),
-        path: "/v1/chat/completions".to_string(),
+        path: context.log_path.to_string(),
         model: context
             .responded_model
             .clone()
@@ -435,6 +470,8 @@ fn write_request_log(
         reasoning_compat_actions: context.reasoning_compat_actions.clone(),
         error_class: context.error_class.clone(),
         context_reduction: context.context_reduction.clone(),
+        client_protocol: context.client_protocol.map(str::to_string),
+        claude_session_id: context.claude_session_id.clone(),
     };
     logger.log_with_reasoning_relay(entry, context.reasoning_relayed_frames)
 }
@@ -500,6 +537,8 @@ fn log_failed_attempts(
         reasoning_tokens: None,
         reasoning_compat_actions: None,
         context_reduction: None,
+        client_protocol: None,
+        claude_session_id: None,
         error_class: Some(
             attempt
                 .error_class
@@ -1451,6 +1490,8 @@ impl AbandonLogger {
         reasoning_tokens: None,
         reasoning_compat_actions: None,
         context_reduction: None,
+        client_protocol: None,
+        claude_session_id: None,
         error_class: Some(error_class.to_string()),
     };
         tracing::info!(
@@ -6433,6 +6474,1385 @@ fn reasoning_delta(choice: Option<&Choice>) -> Option<serde_json::Value> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// POST /v1/messages — Anthropic Messages front door (anthropic-messages-front-door)
+// ---------------------------------------------------------------------------
+
+/// Anthropic-shaped JSON error response (Req 3.1).
+fn anthropic_json_error(status: StatusCode, body: &AnthropicErrorResponse) -> Response {
+    let mut response = Json(body).into_response();
+    *response.status_mut() = status;
+    response
+}
+
+/// 400 `invalid_request_error` with `message`.
+fn anthropic_invalid_request(message: impl Into<String>) -> Response {
+    let body = from_translator_rejection(&message.into());
+    anthropic_json_error(
+        StatusCode::from_u16(anthropic_http_status(anthropic_error_types::INVALID_REQUEST_ERROR))
+            .unwrap_or(StatusCode::BAD_REQUEST),
+        &body,
+    )
+}
+
+/// 404 `not_found_error` (unknown model, Req 1.1/3.1).
+fn anthropic_not_found(message: impl Into<String>) -> Response {
+    let body = anthropic_error_response(anthropic_error_types::NOT_FOUND_ERROR, message);
+    anthropic_json_error(StatusCode::NOT_FOUND, &body)
+}
+
+/// `anthropic-version` gate (Req 4.1): dated values before 2023-06-01 are
+/// rejected with 400; undated non-empty values are accepted verbatim.
+/// Returns the rejection message when the version is too old (or empty).
+fn rejected_version_reason(version: &str) -> Option<String> {
+    let version = version.trim();
+    if version.is_empty() {
+        return Some("anthropic-version header is required".to_string());
+    }
+    // Parse a leading YYYY-MM-DD date (the documented version shape); a
+    // shorter date-like prefix (YYYY-MM) still compares correctly against
+    // the 2023-06-01 floor.
+    let digits: String = version.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+    let parts: Vec<&str> = digits.split('-').filter(|p| !p.is_empty()).collect();
+    if parts.len() >= 2 && parts.iter().all(|p| p.len() >= 4 || p.len() == 2) {
+        let year: u32 = parts[0].parse().ok()?;
+        let month: u32 = if parts.len() >= 2 { parts[1].parse().ok()? } else { 1 };
+        let day: u32 = if parts.len() >= 3 {
+            parts[2].parse().ok()?
+        } else {
+            1
+        };
+        let is_before = (year, month, day) < (2023, 6, 1);
+        if is_before {
+            return Some(format!(
+                "anthropic-version {version} is not supported; earliest supported version is 2023-06-01"
+            ));
+        }
+    }
+    None
+}
+
+/// Minimal request validation before translation (Req 1.1): messages
+/// non-empty, `max_tokens >= 1`, roles limited to `user`/`assistant`.
+/// Returns the first field-level rejection as an
+/// `invalid_request_error` message naming the field.
+fn anthropic_request_rejection(request: &AnthropicRequest) -> Option<String> {
+    if request.messages.is_empty() {
+        return Some("messages: at least one message is required".to_string());
+    }
+    if request.max_tokens < 1 {
+        return Some("max_tokens: must be at least 1".to_string());
+    }
+    for (index, message) in request.messages.iter().enumerate() {
+        if message.role != "user" && message.role != "assistant" {
+            return Some(format!(
+                "messages[{index}].role: unknown role '{}'; expected 'user' or 'assistant'",
+                message.role
+            ));
+        }
+    }
+    None
+}
+
+/// Claude Code session/agent id from `x-claude-code-session-id` (preferred),
+/// `x-claude-code-agent-id`, or `metadata.user_id` as a last resort
+/// (Req 5.5).
+fn claude_session_id_from(headers: &HeaderMap, request: &AnthropicRequest) -> Option<String> {
+    headers
+        .get("x-claude-code-session-id")
+        .or_else(|| headers.get("x-claude-code-agent-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            request
+                .metadata
+                .as_ref()
+                .and_then(|m| m.user_id.clone())
+        })
+}
+
+/// Map a [`GatewayError`] to an Anthropic-shaped error response (Req 3.4).
+fn anthropic_gateway_error_response(err: &GatewayError) -> Response {
+    let body = from_gateway_error(err);
+    let status = StatusCode::from_u16(anthropic_http_status(&body.error.kind))
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    anthropic_json_error(status, &body)
+}
+
+/// Anthropic-shaped guardrail terminal outcome (Req 6.1 parity with
+/// `guardrail_error_response`): log the outcome, complete the request
+/// guard, and return the mapped Anthropic error body.
+#[allow(clippy::too_many_arguments)]
+fn anthropic_guardrail_error_response(
+    state: &AppState,
+    chat_request: &OpenAIRequest,
+    claude_session_id: &Option<String>,
+    request_guard: &mut RequestCompleteGuard,
+    trace_id: &str,
+    active_handle: &crate::active_requests::ActiveRequestHandle,
+    err: GatewayError,
+) -> Response {
+    let duration_ms = request_guard.complete();
+    let log_context = RequestLogContext::from_error(
+        chat_request,
+        trace_id.to_string(),
+        duration_ms,
+        &err,
+    )
+    .with_anthropic_protocol(claude_session_id.clone());
+    log_outcome(state, chat_request, &log_context, Some(active_handle));
+    tracing::warn!(
+        trace_id = %trace_id,
+        error = %err,
+        "Anthropic request rejected by guardrail policy"
+    );
+    anthropic_gateway_error_response(&err)
+}
+
+/// Extract ChatDeltas from a chat-completions SSE chunk (delta shape only;
+/// usage/finish are handled separately).
+fn chat_deltas_from_chunk(chunk: &serde_json::Value) -> Vec<ChatDelta> {
+    let mut deltas = Vec::new();
+    // Wire shape: chat-completions SSE chunks carry the delta nested at
+    // `choices[0].delta` (both live upstream chunks and the buffered replay
+    // synthesizer `build_chunk_payload`); the top-level `delta` key is kept
+    // as a fallback carrier shape.
+    let Some(delta) = chunk
+        .pointer("/choices/0/delta")
+        .or_else(|| chunk.get("delta"))
+        .and_then(|d| d.as_object())
+    else {
+        return deltas;
+    };
+    if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+        if !text.is_empty() {
+            deltas.push(ChatDelta::Text {
+                text: text.to_string(),
+            });
+        }
+    }
+    if let Some(reasoning) = delta
+        .get("reasoning")
+        .or_else(|| delta.get("reasoning_content"))
+        .and_then(|r| r.as_str())
+    {
+        if !reasoning.is_empty() {
+            deltas.push(ChatDelta::Thinking {
+                thinking: reasoning.to_string(),
+                signature: None,
+            });
+        }
+    }
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+        for call in tool_calls {
+            let index = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+            let function = call.get("function");
+            let id = function
+                .and_then(|f| f.get("id"))
+                .or_else(|| call.get("id"))
+                .and_then(|i| i.as_str())
+                .map(String::from);
+            let name = function
+                .and_then(|f| f.get("name"))
+                .or_else(|| call.get("name"))
+                .and_then(|n| n.as_str())
+                .map(String::from);
+            let arguments = function
+                .and_then(|f| f.get("arguments"))
+                .or_else(|| call.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_none() && name.is_none() && arguments.is_empty() {
+                continue;
+            }
+            deltas.push(ChatDelta::ToolCall {
+                index,
+                id,
+                name,
+                arguments,
+            });
+        }
+    }
+    deltas
+}
+
+/// Build the native-passthrough task-local scope (decision D2, Req 4.3): the
+/// exact client JSON plus the `anthropic-version` / comma-joined
+/// `anthropic-beta` header values, visible only to the Bedrock Mantle
+/// Messages adapter during dispatch.
+fn anthropic_passthrough_scope(
+    raw_body: &serde_json::Value,
+    headers: &HeaderMap,
+) -> crate::anthropic::passthrough::AnthropicPassthroughScope {
+    let version = headers
+        .get("anthropic-version")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("2023-06-01")
+        .to_string();
+    crate::anthropic::passthrough::AnthropicPassthroughScope::new(
+        raw_body.clone(),
+        version,
+        crate::anthropic::passthrough::beta_header_value(headers),
+    )
+}
+
+/// Anthropic finish mapping for a streamed chat `finish_reason` (mirrors
+/// [`crate::anthropic::synthesize_response`]'s buffered mapping).
+fn anthropic_stop_reason(finish_reason: Option<&str>) -> crate::anthropic::StopReason {
+    match finish_reason {
+        Some("length") => crate::anthropic::StopReason::MaxTokens,
+        Some("tool_calls") => crate::anthropic::StopReason::ToolUse,
+        Some("content_filter") => crate::anthropic::StopReason::Refusal,
+        _ => crate::anthropic::StopReason::EndTurn,
+    }
+}
+
+/// Ping cadence for the /v1/messages streaming relay (Req 2.4): reuse the
+/// keep-alive interval; when keep-alive is disabled (0) fall back to the
+/// chunk-timeout interval so stalls still get liveness. Clamped to at least
+/// 1s so a zero-default config can never busy-loop pings.
+fn keep_alive_ping_interval(streaming_config: &StreamingConfig) -> Duration {
+    let seconds = if streaming_config.keepalive_interval_seconds > 0 {
+        streaming_config.keepalive_interval_seconds
+    } else {
+        streaming_config.chunk_timeout_seconds
+    }
+    .max(1);
+    Duration::from_secs(seconds)
+}
+
+/// Anthropic [`Usage`] from a streamed chat usage object (any carrier shape).
+fn anthropic_stream_usage(usage: Option<&serde_json::Value>) -> crate::anthropic::Usage {
+    use crate::models::openai::Usage as ChatUsage;
+    match usage.and_then(|u| serde_json::from_value::<ChatUsage>(u.clone()).ok()) {
+        Some(chat) => {
+            let cache = crate::router::cache_cost::extract_cache_usage(&chat);
+            crate::anthropic::Usage {
+                input_tokens: u64::from(chat.prompt_tokens),
+                output_tokens: u64::from(chat.completion_tokens),
+                cache_read_input_tokens: (cache.cache_read_input_tokens > 0)
+                    .then_some(cache.cache_read_input_tokens),
+                cache_creation_input_tokens: (cache.cache_creation_input_tokens > 0)
+                    .then_some(cache.cache_creation_input_tokens),
+                extra: Default::default(),
+            }
+        }
+        None => crate::anthropic::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            extra: Default::default(),
+        },
+    }
+}
+
+/// POST /v1/messages — Anthropic Messages create (Req 1.1, 2.1).
+///
+/// Thin front door: parse → auth (VK pipeline via middleware) → translate →
+/// existing chat dispatch → synthesize. `anthropic-version` is required
+/// (missing → 400; dated values before 2023-06-01 → 400, undated values
+/// accepted, Req 4.1); `anthropic-beta` is tolerated with an open list
+/// (Req 4.3).
+pub async fn anthropic_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    authenticated_key: Option<Extension<AuthenticatedKey>>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(version) = headers.get("anthropic-version") {
+        let version = version.to_str().unwrap_or_default();
+        if let Some(rejected) = rejected_version_reason(version) {
+            return anthropic_invalid_request(rejected);
+        }
+    } else {
+        return anthropic_invalid_request("anthropic-version header is required");
+    }
+    let request: AnthropicRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return anthropic_invalid_request(format!("invalid JSON body: {e}"));
+        }
+    };
+    if let Some(rejection) = anthropic_request_rejection(&request) {
+        return anthropic_invalid_request(rejection);
+    }
+    let trace_id = trace_id_from_headers(&headers);
+    let claude_session_id = claude_session_id_from(&headers, &request);
+    let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
+
+    tracing::info!(
+        model = %request.model,
+        stream = request.stream,
+        trace_id = %trace_id,
+        "Received Anthropic messages request"
+    );
+    // Req 4.2: anthropic-beta is tolerated with an open list; the values
+    // are debug-logged on the translation path for observability.
+    if let Some(beta) = crate::anthropic::passthrough::beta_header_value(&headers) {
+        tracing::debug!(beta = %beta, "anthropic-beta values tolerated");
+    }
+
+    // Model-group resolution mirrors the chat handler: unknown model → 404
+    // not_found_error (Req 1.1).
+    if state.router.find_model_group(&request.model).await.is_err() {
+        return anthropic_not_found(format!("model: {} was not found", request.model));
+    }
+
+    let (chat_request, request_stop_sequences, raw_body) = {
+        let mut chat_request = match translate_anthropic(&request) {
+            Ok(translated) => translated,
+            Err(rejection) => {
+                return anthropic_invalid_request(rejection);
+            }
+        };
+        chat_request.stream = request.stream;
+        // Verbatim passthrough context (decision D2, Req 4.3): the exact
+        // client JSON plus the client's anthropic-version/-beta headers.
+        // The translated chat request still runs unchanged through the
+        // whole dispatch pipeline; the stash travels out-of-band so no
+        // other provider's request body can ever carry a marker key.
+        let raw_body: serde_json::Value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| serde_json::to_value(&request).unwrap_or_default());
+        (chat_request, request.stop_sequences.clone(), raw_body)
+    };
+
+    if request.stream {
+        anthropic_create_stream(
+            state,
+            request,
+            chat_request,
+            request_stop_sequences,
+            trace_id,
+            claude_session_id,
+            virtual_key_id,
+            raw_body,
+            headers,
+        )
+        .await
+    } else {
+        anthropic_create_buffered(
+            state,
+            request,
+            chat_request,
+            request_stop_sequences,
+            trace_id,
+            claude_session_id,
+            virtual_key_id,
+            raw_body,
+            headers,
+        )
+        .await
+    }
+}
+
+/// Buffered (non-streaming) /v1/messages path.
+#[allow(clippy::too_many_arguments)]
+async fn anthropic_create_buffered(
+    state: AppState,
+    request: AnthropicRequest,
+    mut chat_request: OpenAIRequest,
+    request_stop_sequences: Vec<String>,
+    trace_id: String,
+    claude_session_id: Option<String>,
+    virtual_key_id: Option<String>,
+    raw_body: serde_json::Value,
+    headers: HeaderMap,
+) -> Response {
+    state.metrics.start_request();
+    let start = std::time::Instant::now();
+    let owner_id = virtual_key_id.clone().unwrap_or_else(|| "anonymous".to_string());
+    let active_handle = state.active_requests.register(build_active_request_info(
+        &trace_id,
+        &request.model,
+        Some(&owner_id),
+        crate::active_requests::RequestKind::Chat,
+    ));
+    let mut request_guard = RequestCompleteGuard::new(
+        state.metrics.clone(),
+        start,
+        Some((state.active_requests.clone(), trace_id.clone())),
+    );
+
+    // Snapshot request-scoped engines once and release the hot-reload lock
+    // before cache lookup, guardrail evaluation, or routing (mirrors
+    // `chat_completions_non_stream`).
+    let guardrail_engine = state.guardrail_engine.read().await.clone();
+
+    // Tier-1 exact cache (Req 6.5): translated /v1/messages requests share
+ // the chat handler's cache key space (keyed on the translated chat
+ // form), so an identical Anthropic body served twice is answered from
+ // cache with identical Anthropic-shaped output. Mirrors the chat
+ // handler's hit path: record_cache_hit, complete the guard, log the
+ // outcome, synthesize from the cached chat response.
+ if let Some(cached_json) = state.exact_cache.get(&chat_request) {
+ if let Ok(cached_chat) =
+ serde_json::from_str::<crate::models::openai::OpenAIResponse>(&cached_json)
+ {
+ state.metrics.record_cache_hit();
+ let duration_ms =
+ u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+ let log_context = RequestLogContext::from_response(
+ &chat_request,
+ trace_id.clone(),
+ duration_ms,
+ &cached_chat,
+ )
+ .with_anthropic_protocol(claude_session_id);
+ log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+ request_guard.complete();
+ let synthesis_ctx = AnthropicSynthesisContext {
+ request_model: &request.model,
+ stop_sequences: &request_stop_sequences,
+ };
+ let response = crate::anthropic::synthesize_anthropic_response(
+ &cached_chat,
+ &synthesis_ctx,
+ );
+ let mut http = Json(&response).into_response();
+ attach_trace_id_header(&mut http, &trace_id);
+ return http;
+ }
+    } else if state.exact_cache.is_eligible(&chat_request) {
+        state.metrics.record_cache_miss();
+    }
+
+    // -----------------------------------------------------------------
+    // Guardrail pipeline parity (Req 6.1): the translated chat request
+    // runs the same pre-call hooks as the chat handler — engine snapshot,
+    // BindingSelector on virtual key/model/route, pre-call
+    // redaction/blocking, then dispatch. Post-call runs on the routed
+    // chat response before synthesis below. Cache hits above are served
+    // without guardrail evaluation, matching the chat handler's known
+    // limitation (a cached reply already passed guardrails when first
+    // produced).
+    // -----------------------------------------------------------------
+    let mut guardrail_ctx = guardrail_engine
+        .as_ref()
+        .map(|e| e.new_context())
+        .unwrap_or_default();
+    let selector = BindingSelector::new(
+        virtual_key_id.clone(),
+        Some(chat_request.model.clone()),
+        Some("/v1/messages".to_string()),
+    );
+    if let Some(engine) = guardrail_engine.as_ref() {
+        match engine
+            .run_pre_call(&mut chat_request, &selector, &mut guardrail_ctx, &trace_id)
+            .await
+        {
+            PreCallOutcome::Proceed => {}
+            PreCallOutcome::Block(block) => {
+                let err = GatewayError::GuardrailPolicyViolation {
+                    category: block.entity_label,
+                };
+                return anthropic_guardrail_error_response(
+                    &state,
+                    &chat_request,
+                    &claude_session_id,
+                    &mut request_guard,
+                    &trace_id,
+                    &active_handle,
+                    err,
+                );
+            }
+            PreCallOutcome::InvalidAction => {
+                return anthropic_guardrail_error_response(
+                    &state,
+                    &chat_request,
+                    &claude_session_id,
+                    &mut request_guard,
+                    &trace_id,
+                    &active_handle,
+                    GatewayError::GuardrailInvalidAction,
+                );
+            }
+            PreCallOutcome::Timeout => {
+                let err = GatewayError::GuardrailUnavailable("guardrail scan timeout".to_string());
+                return anthropic_guardrail_error_response(
+                    &state,
+                    &chat_request,
+                    &claude_session_id,
+                    &mut request_guard,
+                    &trace_id,
+                    &active_handle,
+                    err,
+                );
+            }
+            PreCallOutcome::ServiceFailure => {
+                let err =
+                    GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
+                return anthropic_guardrail_error_response(
+                    &state,
+                    &chat_request,
+                    &claude_session_id,
+                    &mut request_guard,
+                    &trace_id,
+                    &active_handle,
+                    err,
+                );
+            }
+        }
+    }
+
+    // Memory injection + context-overflow compression (Req 6.1 best-effort
+    // parity with the chat path): the centralized post-truncation boundary
+    // and memory preprocessing both mutate the translated chat request
+    // exactly as in `chat_completions_non_stream` before dispatch.
+    chat_request = state.router.prepare_post_truncation_request(&chat_request);
+    let memory_context =
+        preprocess_memory_request(&state, &mut chat_request, virtual_key_id.as_deref()).await;
+
+    let passthrough_scope = anthropic_passthrough_scope(&raw_body, &headers);
+    let result = passthrough_scope
+        .scope(async {
+            state
+                .router
+                .route_request(&chat_request, Some(active_handle.clone()))
+                .await
+        })
+        .await;
+
+    match result {
+        Ok(mut chat_response) => {
+            // Post-call guardrails run on the routed chat response BEFORE
+            // verbatim relay, synthesis, or cache write, using the SAME ctx
+            // so PII re-injection works (Req 6.1/9.5 parity with the chat
+            // path).
+            if let Some(engine) = guardrail_engine.as_ref() {
+                let tool_ctx = tool_context(&chat_request, &chat_response);
+                let (post_outcome, refusal_decision) = engine
+                    .run_post_call(
+                        &mut chat_response,
+                        &selector,
+                        &mut guardrail_ctx,
+                        &trace_id,
+                        &tool_ctx,
+                    )
+                    .await;
+                match post_outcome {
+                    // Proceed/Replaced without refusal-failover: the chat
+                    // handler's bounded refusal re-dispatch loop (Req 12.5)
+                    // is deliberately NOT mirrored here — the Anthropic
+                    // surface keeps the first provider's answer (with
+                    // re-injection applied) to preserve verbatim-relay and
+                    // stop-sequence semantics; a refusal still surfaces via
+                    // the logged RefusalDecision.
+                    PostCallOutcome::Proceed
+                    | PostCallOutcome::Replaced => {
+                        if !matches!(post_outcome, PostCallOutcome::Replaced)
+                            && matches!(
+                                refusal_decision,
+                                RefusalDecision::Refusal(_)
+                            )
+                        {
+                            engine.reinject_response(&mut chat_response, &guardrail_ctx);
+                        }
+                    }
+                    PostCallOutcome::Block(block) => {
+                        let err = GatewayError::GuardrailPolicyViolation {
+                            category: block.entity_label,
+                        };
+                        return anthropic_guardrail_error_response(
+                            &state,
+                            &chat_request,
+                            &claude_session_id,
+                            &mut request_guard,
+                            &trace_id,
+                            &active_handle,
+                            err,
+                        );
+                    }
+                    PostCallOutcome::ServiceFailure => {
+                        let err = GatewayError::GuardrailUnavailable(
+                            "guardrail service unavailable".to_string(),
+                        );
+                        return anthropic_guardrail_error_response(
+                            &state,
+                            &chat_request,
+                            &claude_session_id,
+                            &mut request_guard,
+                            &trace_id,
+                            &active_handle,
+                            err,
+                        );
+                    }
+                }
+            }
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let log_context = RequestLogContext::from_response(
+                &chat_request,
+                trace_id.clone(),
+                duration_ms,
+                &chat_response,
+            )
+            .with_anthropic_protocol(claude_session_id.clone())
+            .with_memory(
+                memory_context
+                    .as_ref()
+                    .map(|memory| (&memory.context, &memory.injection)),
+                None,
+            );
+            log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+            request_guard.complete();
+
+            // Verbatim relay (decision D2, Req 2.1): a stashed upstream
+            // Anthropic body is emitted unchanged, including fields the
+            // gateway's own wire types do not model.
+            if let Some(raw) = chat_response
+                .extra
+                .get(crate::anthropic::passthrough::VERBATIM_RESPONSE_KEY)
+            {
+                let mut http = Json(&raw).into_response();
+                attach_trace_id_header(&mut http, &trace_id);
+                return http;
+            }
+
+ let synthesis_ctx = AnthropicSynthesisContext {
+ request_model: &request.model,
+ stop_sequences: &request_stop_sequences,
+ };
+ let response = crate::anthropic::synthesize_anthropic_response(
+ &chat_response,
+ &synthesis_ctx,
+ );
+ // Cache write (Req 6.5): mirror the chat handler's gating — only
+ // responses safe to replay (`should_cache_response`) on an eligible
+ // translated request are stored, keyed on the translated chat form so
+ // both surfaces share one entry. The verbatim-passthrough arm above
+ // intentionally never writes: its body is a native Anthropic payload,
+ // not a chat response the chat path could replay.
+ if crate::router::router::Router::should_cache_response(&chat_response) {
+ let response_json = serde_json::to_string(&chat_response).unwrap_or_default();
+ if !response_json.is_empty() {
+ state.exact_cache.set(&chat_request, response_json);
+ }
+ }
+ let mut http = Json(&response).into_response();
+ attach_trace_id_header(&mut http, &trace_id);
+ http
+ }
+ Err(err) => {
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let log_context = RequestLogContext::from_error(
+                &chat_request,
+                trace_id.clone(),
+                duration_ms,
+                &err,
+            )
+            .with_anthropic_protocol(claude_session_id);
+            log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+            request_guard.complete();
+            anthropic_gateway_error_response(&err)
+        }
+    }
+}
+
+/// Streaming /v1/messages path (Req 2.1, 2.5, 2.6): buffered dispatch
+/// through the existing streaming pipeline, chat deltas fed into
+/// [`MessageStreamAssembler`], `message_start` emitted only after the first
+/// upstream delta so pre-content failover stays transparent.
+///
+/// Guardrail parity (Req 6.1): pre-call hooks run on the translated chat
+/// request before routing (terminal outcomes return an Anthropic-shaped
+/// JSON error, mirroring the chat streaming handler's plain-JSON early
+/// return). Post-call parity on the PassThrough arm is deferred: post-call
+/// analysis requires assembling the full body before any byte reaches the
+/// caller (the chat handler forces `stream_buffered_with_post_call`), while
+/// this arm's value is byte-faithful pass-through relay. The Buffered arm
+/// below still gets full post-call treatment because its body is already
+/// assembled; a bound post-call stage additionally forces the Buffered arm
+/// via `route_request` fallback (see `post_call_forces_buffered`).
+#[allow(clippy::too_many_arguments)]
+async fn anthropic_create_stream(
+    state: AppState,
+    request: AnthropicRequest,
+    mut chat_request: OpenAIRequest,
+    request_stop_sequences: Vec<String>,
+    trace_id: String,
+    claude_session_id: Option<String>,
+    virtual_key_id: Option<String>,
+    raw_body: serde_json::Value,
+    headers: HeaderMap,
+) -> Response {
+    let streaming_config = state
+        .config
+        .read()
+        .await
+        .streaming
+        .clone()
+        .unwrap_or_default();
+
+    state.metrics.start_request();
+    let start = std::time::Instant::now();
+    let owner_id = virtual_key_id.clone().unwrap_or_else(|| "anonymous".to_string());
+    let active_handle = state.active_requests.register(build_active_request_info(
+        &trace_id,
+        &request.model,
+        Some(&owner_id),
+        crate::active_requests::RequestKind::Chat,
+    ));
+    let mut request_guard = RequestCompleteGuard::new(
+        state.metrics.clone(),
+        start,
+        Some((state.active_requests.clone(), trace_id.clone())),
+    );
+
+    // Snapshot request-scoped engine once (mirrors the chat streaming
+    // handler) so the hot-reload lock is never held across an await.
+    let guardrail_engine = state.guardrail_engine.read().await.clone();
+
+    // -----------------------------------------------------------------
+    // Guardrail pre-call parity (Req 6.1): same hooks as the chat
+    // streaming handler, on the translated chat request. Terminal
+    // outcomes return an Anthropic-shaped JSON error before any SSE
+    // byte is written.
+    // -----------------------------------------------------------------
+    let mut guardrail_ctx = guardrail_engine
+        .as_ref()
+        .map(|e| e.new_context())
+        .unwrap_or_default();
+    let selector = BindingSelector::new(
+        virtual_key_id.clone(),
+        Some(chat_request.model.clone()),
+        Some("/v1/messages".to_string()),
+    );
+    let mut post_call_forces_buffered = false;
+    if let Some(engine) = guardrail_engine.as_ref() {
+        match engine
+            .run_pre_call(&mut chat_request, &selector, &mut guardrail_ctx, &trace_id)
+            .await
+        {
+            PreCallOutcome::Proceed => {}
+            PreCallOutcome::Block(block) => {
+                let err = GatewayError::GuardrailPolicyViolation {
+                    category: block.entity_label,
+                };
+                return anthropic_guardrail_error_response(
+                    &state,
+                    &chat_request,
+                    &claude_session_id,
+                    &mut request_guard,
+                    &trace_id,
+                    &active_handle,
+                    err,
+                );
+            }
+            PreCallOutcome::InvalidAction => {
+                return anthropic_guardrail_error_response(
+                    &state,
+                    &chat_request,
+                    &claude_session_id,
+                    &mut request_guard,
+                    &trace_id,
+                    &active_handle,
+                    GatewayError::GuardrailInvalidAction,
+                );
+            }
+            PreCallOutcome::Timeout => {
+                let err = GatewayError::GuardrailUnavailable("guardrail scan timeout".to_string());
+                return anthropic_guardrail_error_response(
+                    &state,
+                    &chat_request,
+                    &claude_session_id,
+                    &mut request_guard,
+                    &trace_id,
+                    &active_handle,
+                    err,
+                );
+            }
+            PreCallOutcome::ServiceFailure => {
+                let err =
+                    GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
+                return anthropic_guardrail_error_response(
+                    &state,
+                    &chat_request,
+                    &claude_session_id,
+                    &mut request_guard,
+                    &trace_id,
+                    &active_handle,
+                    err,
+                );
+            }
+        }
+
+        // Mirror the chat streaming handler's buffering force: a bound
+        // post-call stage or pending re-injection means the assembled
+        // response must be analyzed before any byte reaches the caller,
+        // so dispatch falls back to the fully-buffered `route_request`
+        // path (whose Ok arm below applies full post-call treatment).
+        let post_call_bound = engine
+            .resolver()
+            .resolve(&selector)
+            .iter()
+            .any(|s| matches!(s.phase, StagePhase::PostCall | StagePhase::ToolCall));
+        post_call_forces_buffered = post_call_bound || !guardrail_ctx.is_empty();
+    }
+
+    // Memory injection + context-overflow compression (Req 6.1 best-effort
+    // parity with the chat streaming handler).
+    chat_request = state.router.prepare_post_truncation_request(&chat_request);
+    let memory_context =
+        preprocess_memory_request(&state, &mut chat_request, virtual_key_id.as_deref()).await;
+
+    // Input-side usage estimate (Req 2.1): tokenizer estimate on the
+    // translated request, the same counting helper `/v1/messages/count_tokens`
+    // uses, so `message_start.usage.input_tokens` is populated even before
+    // the provider reports usage.
+    let input_usage = crate::anthropic::anthropic_input_usage_estimate(&chat_request);
+
+    let passthrough_scope = anthropic_passthrough_scope(&raw_body, &headers);
+    let result = if post_call_forces_buffered {
+        // Buffered dispatch for post-call analysis; the Buffered arm below
+        // runs the full post-call pipeline on the assembled response.
+        passthrough_scope
+            .scope(async {
+                state
+                    .router
+                    .route_request(&chat_request, Some(active_handle.clone()))
+                    .await
+                    .map(StreamingResponse::Buffered)
+            })
+            .await
+    } else {
+        passthrough_scope
+            .scope(async {
+                state
+                    .router
+                    .route_request_streaming(&chat_request, Some(active_handle.clone()))
+                    .await
+            })
+            .await
+    };
+
+match result {
+Ok(StreamingResponse::Buffered(mut chat_response)) => {
+// Post-call guardrail parity (Req 6.1): when the pipeline forced the
+// buffered dispatch (bound post-call stage or pending re-injection),
+// the assembled response is analyzed before any byte reaches the
+// caller. The verbatim stash below is relayed byte-faithfully per
+// decision D2 regardless — post-call cannot rewrite a native
+// Anthropic body — but a `block` outcome still discards it.
+if let Some(engine) = guardrail_engine.as_ref() {
+if post_call_forces_buffered {
+let tool_ctx = tool_context(&chat_request, &chat_response);
+let (post_outcome, refusal_decision) = engine
+.run_post_call(
+&mut chat_response,
+&selector,
+&mut guardrail_ctx,
+&trace_id,
+&tool_ctx,
+)
+.await;
+match post_outcome {
+PostCallOutcome::Proceed | PostCallOutcome::Replaced => {
+if !matches!(post_outcome, PostCallOutcome::Replaced)
+&& matches!(
+refusal_decision,
+RefusalDecision::Refusal(_)
+)
+{
+engine.reinject_response(&mut chat_response, &guardrail_ctx);
+}
+}
+PostCallOutcome::Block(block) => {
+let err = GatewayError::GuardrailPolicyViolation {
+category: block.entity_label,
+};
+return anthropic_guardrail_error_response(
+&state,
+&chat_request,
+&claude_session_id,
+&mut request_guard,
+&trace_id,
+&active_handle,
+err,
+);
+}
+PostCallOutcome::ServiceFailure => {
+let err = GatewayError::GuardrailUnavailable(
+"guardrail service unavailable".to_string(),
+);
+return anthropic_guardrail_error_response(
+&state,
+&chat_request,
+&claude_session_id,
+&mut request_guard,
+&trace_id,
+&active_handle,
+err,
+);
+}
+}
+}
+}
+
+// Verbatim SSE relay (decision D2, Req 2.1): the stashed upstream
+// Anthropic SSE text is replayed to the client byte-for-byte;
+// nothing is emitted before the buffered body existed, so
+// pre-content failover stays transparent.
+if let Some(raw_sse) = chat_response
+.extra
+.get(crate::anthropic::passthrough::VERBATIM_SSE_KEY)
+.and_then(|v| v.as_str())
+{
+let duration_ms =
+u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+let log_context = RequestLogContext::from_response(
+&chat_request,
+trace_id.clone(),
+duration_ms,
+&chat_response,
+)
+.with_anthropic_protocol(claude_session_id.clone())
+.with_memory(
+memory_context
+.as_ref()
+.map(|memory| (&memory.context, &memory.injection)),
+None,
+);
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+request_guard.complete();
+
+let text = raw_sse.to_string();
+let stream = async_stream::stream! {
+for (event, data) in
+crate::anthropic::passthrough::sse_relay_frames(&text)
+{
+// Event-less upstream frames relay as data-only
+// frames (empty name → no `event:` field emitted).
+let mut frame = Event::default().data(data);
+if !event.is_empty() {
+frame = frame.event(event);
+}
+yield Ok::<_, Infallible>(frame);
+}
+};
+let mut sse = Sse::new(stream)
+.keep_alive(build_keepalive(&streaming_config))
+.into_response();
+attach_trace_id_header(&mut sse, &trace_id);
+return sse;
+}
+
+// Reuse the buffered synthesizer's chunk replay: convert the
+// response into chat streaming chunks, then feed the assembler.
+let chunks = streaming_chunks_from_response(&chat_response);
+let response_usage = chat_response.usage.clone();
+let finish_reason = chat_response
+.choices
+.first()
+.and_then(|c| c.finish_reason.clone());
+
+let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+let log_context = RequestLogContext::from_response(
+&chat_request,
+trace_id.clone(),
+duration_ms,
+&chat_response,
+)
+.with_anthropic_protocol(claude_session_id.clone())
+.with_memory(
+memory_context
+.as_ref()
+.map(|memory| (&memory.context, &memory.injection)),
+None,
+);
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+request_guard.complete();
+
+let stream = anthropic_replay_stream(
+&request.model,
+chunks,
+finish_reason,
+response_usage,
+input_usage,
+request_stop_sequences.clone(),
+);
+            let mut sse = Sse::new(stream)
+                .keep_alive(build_keepalive(&streaming_config))
+                .into_response();
+            attach_trace_id_header(&mut sse, &trace_id);
+            sse
+        }
+Ok(StreamingResponse::PassThrough {
+byte_stream,
+provider,
+model,
+compression,
+concurrency_permit: _,
+smart_routing: _,
+}) => {
+let stream_trace_id = trace_id.clone();
+let ping_interval = keep_alive_ping_interval(&streaming_config);
+let stop_sequences = request_stop_sequences.clone();
+let input_token_estimate = input_usage.input_tokens;
+let stream = async_stream::stream! {
+let mut _guard = request_guard;
+// Input-side usage = tokenizer estimate on the translated
+// request (Req 2.1), so message_start carries a real input
+// token count even before the provider reports usage.
+let mut assembler = MessageStreamAssembler::new(
+&request.model,
+None,
+input_usage,
+);
+// Raw byte buffer: SSE lines are extracted by scanning for
+// b'\n' and only COMPLETE lines are decoded, so a multi-byte
+// UTF-8 char split across chunk boundaries is never corrupted
+// (from_utf8_lossy runs per line, never per chunk).
+let mut buffer: Vec<u8> = Vec::new();
+let mut bytes_stream = byte_stream.bytes_stream();
+let mut final_usage: Option<crate::anthropic::Usage> = None;
+let mut finish_reason: Option<String> = None;
+let mut stream_error: Option<GatewayError> = None;
+// Req 2.4: liveness during stalls is an Anthropic `ping`
+// event, not just the axum `: keepalive` comment. The ping
+// frame is allowed anywhere in the Anthropic stream shape,
+// so it is emitted on every keep-alive interval elapsed
+// with no upstream bytes (`ping_interval` is computed
+// outside the coroutine since it borrows
+// `streaming_config`).
+let mut last_emit = std::time::Instant::now();
+let mut generated_text = String::new();
+
+loop {
+let chunk_result =
+match tokio::time::timeout(ping_interval, bytes_stream.next()).await {
+Ok(chunk_result) => chunk_result,
+Err(_) => {
+if last_emit.elapsed() >= ping_interval {
+last_emit = std::time::Instant::now();
+if let Some((name, data)) =
+sse_event_parts(&assembler.ping())
+{
+yield Ok::<_, Infallible>(
+Event::default().event(name).data(data),
+);
+}
+}
+continue;
+}
+};
+let Some(chunk_result) = chunk_result else {
+break;
+};
+let bytes = match chunk_result {
+Ok(b) => b,
+Err(e) => {
+stream_error = Some(GatewayError::Network(e.to_string()));
+break;
+}
+};
+last_emit = std::time::Instant::now();
+buffer.extend_from_slice(&bytes);
+
+// Cursor-based line extraction (no O(n²) full drain per
+// line): consume only up to and including each newline.
+let mut cursor = 0usize;
+while let Some(offset) = buffer[cursor..].iter().position(|b| *b == b'\n') {
+let newline_idx = cursor + offset;
+let line_bytes: Vec<u8> = buffer[cursor..=newline_idx].to_vec();
+cursor = newline_idx + 1;
+let raw = String::from_utf8_lossy(&line_bytes);
+let line = raw.trim_end_matches(|c| c == '\n' || c == '\r');
+if line.is_empty() {
+continue;
+}
+let payload = match line.strip_prefix("data:") {
+Some(rest) => rest.trim_start(),
+None => continue,
+};
+if payload == "[DONE]" {
+continue;
+}
+let chunk: serde_json::Value = match serde_json::from_str(payload) {
+Ok(v) => v,
+Err(_) => continue,
+};
+if let Some(usage) = chunk.get("usage") {
+if !usage.is_null() {
+final_usage = Some(anthropic_stream_usage(Some(usage)));
+}
+}
+if let Some(finish) = chunk
+.pointer("/choices/0/finish_reason")
+.and_then(|f| f.as_str())
+{
+finish_reason = Some(finish.to_string());
+}
+for delta in chat_deltas_from_chunk(&chunk) {
+match &delta {
+ChatDelta::Text { text } => generated_text.push_str(text),
+ChatDelta::Thinking { thinking, .. } => {
+generated_text.push_str(thinking)
+}
+ChatDelta::ToolCall { arguments, .. } => {
+generated_text.push_str(arguments)
+}
+}
+last_emit = std::time::Instant::now();
+for event in assembler.feed(delta) {
+if let Some((name, data)) = sse_event_parts(&event) {
+yield Ok::<_, Infallible>(
+Event::default().event(name).data(data),
+);
+}
+}
+}
+}
+// Keep only the unconsumed remainder (incomplete last line).
+buffer.drain(..cursor);
+}
+
+// Trailing final line (no closing newline): process a
+// non-empty remainder as the last SSE line instead of
+// silently dropping it.
+if !buffer.is_empty() {
+let raw = String::from_utf8_lossy(&buffer);
+let line = raw.trim_end_matches(|c| c == '\n' || c == '\r');
+if !line.is_empty() {
+if let Some(payload) = line.strip_prefix("data:").map(str::trim_start) {
+if payload != "[DONE]" {
+if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(payload) {
+if let Some(usage) = chunk.get("usage") {
+if !usage.is_null() {
+final_usage = Some(anthropic_stream_usage(Some(usage)));
+}
+}
+if let Some(finish) = chunk
+.pointer("/choices/0/finish_reason")
+.and_then(|f| f.as_str())
+{
+finish_reason = Some(finish.to_string());
+}
+for delta in chat_deltas_from_chunk(&chunk) {
+match &delta {
+ChatDelta::Text { text } => generated_text.push_str(text),
+ChatDelta::Thinking { thinking, .. } => {
+generated_text.push_str(thinking)
+}
+ChatDelta::ToolCall { arguments, .. } => {
+generated_text.push_str(arguments)
+}
+}
+for event in assembler.feed(delta) {
+if let Some((name, data)) = sse_event_parts(&event) {
+yield Ok::<_, Infallible>(
+Event::default().event(name).data(data),
+);
+}
+}
+}
+}
+}
+}
+}
+buffer.clear();
+}
+
+// Same suffix-match rule as the buffered synthesizer
+// (`map_stop`): finish_reason "stop" + generated text ending
+// with a requested stop sequence → stop_reason
+// "stop_sequence" carrying the matched sequence.
+let (stop_reason, stop_sequence) = match finish_reason.as_deref() {
+Some("stop") => {
+match stop_sequences
+.iter()
+.find(|seq| !seq.is_empty() && generated_text.ends_with(seq.as_str()))
+{
+Some(seq) => (
+crate::anthropic::StopReason::StopSequence,
+Some(seq.clone()),
+),
+None => (anthropic_stop_reason(finish_reason.as_deref()), None),
+}
+}
+other => (anthropic_stop_reason(other), None),
+};
+
+if let Some(err) = stream_error {
+for event in assembler.error(from_gateway_error(&err).error) {
+if let Some((name, data)) = sse_event_parts(&event) {
+yield Ok(Event::default().event(name).data(data));
+}
+}
+let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+let log_context = RequestLogContext::from_error(
+&chat_request,
+stream_trace_id.clone(),
+duration_ms,
+&err,
+)
+.with_anthropic_protocol(claude_session_id.clone());
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+} else {
+// Estimate output tokens when the provider never sent a
+// usage frame (pass-through dispatch does not inject
+// `stream_options.include_usage`; same convention as the
+// buffered reassembly path).
+let mut cumulative = final_usage.unwrap_or_default();
+if cumulative.output_tokens == 0 {
+cumulative.output_tokens = u64::from(
+crate::compression::token_counter::TokenCounter::estimate_heuristic(
+&generated_text,
+),
+);
+}
+        if cumulative.input_tokens == 0 {
+            cumulative.input_tokens = input_token_estimate;
+        }
+        for event in assembler.finish(stop_reason, stop_sequence, cumulative) {
+if let Some((name, data)) = sse_event_parts(&event) {
+yield Ok(Event::default().event(name).data(data));
+}
+}
+let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+let log_context = RequestLogContext::from_streaming_success(
+&chat_request,
+stream_trace_id.clone(),
+duration_ms,
+provider.clone(),
+model.clone(),
+compression.clone(),
+)
+.with_anthropic_protocol(claude_session_id.clone());
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+}
+};
+let mut sse = Sse::new(stream)
+.keep_alive(build_keepalive(&streaming_config))
+.into_response();
+attach_trace_id_header(&mut sse, &trace_id);
+sse
+}
+        Err(err) => {
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let log_context = RequestLogContext::from_error(
+                &chat_request,
+                trace_id.clone(),
+                duration_ms,
+                &err,
+            )
+            .with_anthropic_protocol(claude_session_id);
+            log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+            request_guard.complete();
+            anthropic_gateway_error_response(&err)
+        }
+    }
+}
+
+/// Replay a buffered response as Anthropic SSE events (used by the Buffered
+/// streaming arm so both streaming arms share the assembler semantics).
+/// `input_usage` seeds `message_start.usage.input_tokens` (Req 2.1) and
+/// `stop_sequences` apply the buffered synthesizer's suffix-match rule on a
+/// `stop` finish.
+fn anthropic_replay_stream(
+    model: &str,
+    chunks: Vec<serde_json::Value>,
+    finish_reason: Option<String>,
+    usage: crate::models::openai::Usage,
+    input_usage: crate::anthropic::Usage,
+    stop_sequences: Vec<String>,
+) -> impl futures::Stream<Item = Result<Event, Infallible>> + use<> {
+    let model = model.to_string();
+    let input_token_estimate = input_usage.input_tokens;
+    async_stream::stream! {
+        let mut assembler = MessageStreamAssembler::new(&model, None, input_usage);
+        let mut generated_text = String::new();
+        for chunk in chunks {
+            for delta in chat_deltas_from_chunk(&chunk) {
+                match &delta {
+                    ChatDelta::Text { text } => generated_text.push_str(text),
+                    ChatDelta::Thinking { thinking, .. } => generated_text.push_str(thinking),
+                    ChatDelta::ToolCall { arguments, .. } => generated_text.push_str(arguments),
+                }
+                for event in assembler.feed(delta) {
+                    if let Some((name, data)) = sse_event_parts(&event) {
+                        yield Ok::<_, Infallible>(Event::default().event(name).data(data));
+                    }
+                }
+            }
+        }
+        // Same suffix-match rule as the buffered synthesizer (`map_stop`).
+        let (stop, stop_sequence) = match finish_reason.as_deref() {
+            Some("stop") => {
+                match stop_sequences
+                    .iter()
+                    .find(|seq| !seq.is_empty() && generated_text.ends_with(seq.as_str()))
+                {
+                    Some(seq) => (
+                        crate::anthropic::StopReason::StopSequence,
+                        Some(seq.clone()),
+                    ),
+                    None => (anthropic_stop_reason(finish_reason.as_deref()), None),
+                }
+            }
+            other => (anthropic_stop_reason(other), None),
+        };
+        let mut cumulative = anthropic_stream_usage(Some(&serde_json::to_value(&usage).unwrap_or_default()));
+        if cumulative.input_tokens == 0 {
+            cumulative.input_tokens = input_token_estimate;
+        }
+        for event in assembler.finish(stop, stop_sequence, cumulative) {
+            if let Some((name, data)) = sse_event_parts(&event) {
+                yield Ok(Event::default().event(name).data(data));
+            }
+        }
+    }
+}
+
+/// POST /v1/messages/count_tokens — Anthropic token counting (Req 5.1).
+///
+/// Resolves the group primary model like the chat handler resolves defaults,
+/// then estimates via [`crate::anthropic::count_tokens`].
+pub async fn anthropic_count_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    authenticated_key: Option<Extension<AuthenticatedKey>>,
+    body: axum::body::Bytes,
+) -> Response {
+    if headers.get("anthropic-version").is_none() {
+        return anthropic_invalid_request("anthropic-version header is required");
+    }
+    let request: AnthropicRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return anthropic_invalid_request(format!("invalid JSON body: {e}"));
+        }
+    };
+    let _ = authenticated_key;
+    let trace_id = trace_id_from_headers(&headers);
+
+    // Model-group resolution mirrors anthropic_create: unknown model → 404
+    // not_found_error (Req 5.1).
+    let model = match state.router.first_provider_for_model(&request.model).await {
+        Ok(Some((_provider_cfg, provider_model))) => provider_model.model.clone(),
+        _ => {
+            return anthropic_not_found(format!("model: {} was not found", request.model));
+        }
+    };
+
+    let counter = crate::compression::token_counter::TokenCounter::new();
+    let input_tokens = match anthropic_count_tokens_estimate(&request, &counter, &model) {
+        Ok(tokens) => tokens,
+        Err(reason) => {
+            return anthropic_invalid_request(reason);
+        }
+    };
+    tracing::info!(
+        trace_id = %trace_id,
+        model = %request.model,
+        input_tokens,
+        "Anthropic count_tokens"
+    );
+    let mut response = Json(serde_json::json!({ "input_tokens": input_tokens })).into_response();
+    attach_trace_id_header(&mut response, &trace_id);
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -9149,6 +10569,11 @@ pub struct ModelsListResponse {
 }
 
 /// Aggregated models endpoint — queries all configured providers.
+///
+/// When the request carries an `anthropic-version` header or `?beta=true`
+/// query (anthropic-messages-front-door Req 4.2/6.6), the same model list is
+/// returned in the Anthropic `{data:[{type:"model",id,display_name,...}]}`
+/// shape; otherwise the existing OpenAI shape is unchanged.
 pub async fn list_models(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -9156,6 +10581,14 @@ pub async fn list_models(
     // Extract the authenticated key from request extensions (set by the vk
     // auth middleware when a valid virtual key is presented).
     let authenticated_key = request.extensions().get::<AuthenticatedKey>().cloned();
+    let anthropic_shape = request
+        .headers()
+        .get("anthropic-version")
+        .is_some()
+        || request
+            .uri()
+            .query()
+            .is_some_and(|q| q.split('&').any(|pair| pair == "beta=true"));
 
     let config = state.config.read().await;
     let mut all_models: Vec<Model> = Vec::new();
@@ -9240,6 +10673,21 @@ pub async fn list_models(
             }
             all_models.retain(|m| visible.contains(m.id.as_str()));
         }
+    }
+
+    if anthropic_shape {
+        let data: Vec<serde_json::Value> = all_models
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "type": "model",
+                    "id": m.id,
+                    "display_name": m.id,
+                    "created_at": chrono::Utc::now().to_rfc3339(),
+                })
+            })
+            .collect();
+        return Json(serde_json::json!({ "data": data, "has_more": false, "first_id": null, "last_id": null })).into_response();
     }
 
     let response = ModelsListResponse {

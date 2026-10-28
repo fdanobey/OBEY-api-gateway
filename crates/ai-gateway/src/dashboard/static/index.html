@@ -69,6 +69,11 @@ tbody tr:hover{background:rgba(59,130,246,.06)}
 .badge-exhausted{background:rgba(239,68,68,.15);color:var(--danger)}
 .badge-ok{background:rgba(34,197,94,.15);color:var(--success)}
 
+/* Client protocol badges (anthropic-messages-front-door Req 6.3) */
+.badge-protocol-anthropic{background:rgba(217,119,6,.18);color:#d97706}
+.badge-protocol-responses{background:rgba(59,130,246,.15);color:var(--primary)}
+.badge-protocol-chat{background:rgba(148,163,184,.15);color:var(--text-muted)}
+
 /* In-flight request phase badges */
 .inflight-pending{background:rgba(148,163,184,.18);color:var(--text-muted)}
 .inflight-primary{background:rgba(34,197,94,.15);color:var(--success)}
@@ -114,6 +119,7 @@ color:var(--text);padding:.4rem .6rem;font-size:.8rem}
 .compression-detail summary{color:var(--primary);cursor:pointer;white-space:nowrap}
 .compression-detail summary:focus-visible{outline:2px solid var(--primary);outline-offset:2px;border-radius:3px}
 .compression-detail-grid{display:grid;grid-template-columns:max-content 1fr;gap:.2rem .6rem;margin-top:.5rem;color:var(--text-muted);font-size:.75rem}
+.session-id-cell{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.75rem;overflow-wrap:anywhere;max-width:14rem}
 .compression-detail-grid dt{color:var(--text);font-weight:600}
 .compression-detail-grid dd{overflow-wrap:anywhere}
 @media(max-width:700px){.compression-detail{min-width:12rem}.compression-detail-grid{grid-template-columns:1fr}}
@@ -465,8 +471,17 @@ body.sec-banner-active{padding-top:3.2rem}
         <label for="f-trace">Trace ID</label>
         <input type="text" id="f-trace" placeholder="Any">
       </div>
-      <div class="fg">
-        <label for="f-compression-level">Compression Level</label>
+<div class="fg">
+<label for="f-protocol">Protocol</label>
+<select id="f-protocol">
+<option value="">All</option>
+<option value="chat">Chat</option>
+<option value="responses">Responses</option>
+<option value="anthropic">Anthropic</option>
+</select>
+</div>
+<div class="fg">
+<label for="f-compression-level">Compression Level</label>
         <select id="f-compression-level">
           <option value="">All</option>
           <option value="none">None</option>
@@ -485,8 +500,8 @@ body.sec-banner-active{padding-top:3.2rem}
       <table aria-label="Request logs">
         <thead>
           <tr>
-            <th>Timestamp</th><th>Trace ID</th><th>Provider</th><th>Model</th>
-            <th>Status</th><th>Duration</th><th>Cost</th><th>Compression</th><th>Reduction</th>
+<th>Timestamp</th><th>Trace ID</th><th>Provider</th><th>Model</th><th>Protocol</th>
+<th>Status</th><th>Duration</th><th>Cost</th><th>Compression</th><th>Reduction</th><th>Session</th>
           </tr>
         </thead>
         <tbody id="logs-tbody"></tbody>
@@ -1123,26 +1138,41 @@ html+='<tr><td>'+esc(displayName)+'</td>'
     row.appendChild(cell);
  }
 
-  function renderLogs(logs){
-    var tbody=$('logs-tbody');
-    clearNode(tbody);
-    if(!logs||!logs.length){$('logs-empty').style.display='block';$('logs-empty').textContent='No logs match the selected filters';return;}
-    $('logs-empty').style.display='none';
+// Client protocol badge (anthropic-messages-front-door Req 6.3): NULL or
+// "chat" is the classic chat front door, so it renders as the (subtle)
+// default; "responses" and "anthropic" mark the other front doors.
+function appendProtocolBadge(row, protocol){
+var cell=document.createElement('td');
+var value=String(protocol||'chat');
+var badge=document.createElement('span');
+badge.className='badge badge-protocol-'+value;
+badge.textContent=value==='anthropic'?'Anthropic':(value==='responses'?'Responses':'Chat');
+cell.appendChild(badge);
+row.appendChild(cell);
+}
 
-    logs.forEach(function(log){
-      var row=document.createElement('tr');
-      appendTextCell(row,fmtTime(log.timestamp));
-      appendTextCell(row,String(log.trace_id||''));
-      appendTextCell(row,String(log.provider||''));
-      appendTextCell(row,String(log.model||''));
-      appendTextCell(row,String(log.status_code==null?'':log.status_code));
-      appendTextCell(row,fmtMs(log.duration_ms));
-      appendTextCell(row,fmtCost(log.cost));
-      appendCompressionDetail(row,log.compression);
-      appendReductionDetail(row,log.context_reduction);
-      tbody.appendChild(row);
- });
- }
+function renderLogs(logs){
+var tbody=$('logs-tbody');
+clearNode(tbody);
+if(!logs||!logs.length){$('logs-empty').style.display='block';$('logs-empty').textContent='No logs match the selected filters';return;}
+$('logs-empty').style.display='none';
+
+logs.forEach(function(log){
+var row=document.createElement('tr');
+appendTextCell(row,fmtTime(log.timestamp));
+appendTextCell(row,String(log.trace_id||''));
+appendTextCell(row,String(log.provider||''));
+appendTextCell(row,String(log.model||''));
+appendProtocolBadge(row,log.client_protocol);
+appendTextCell(row,String(log.status_code==null?'':log.status_code));
+appendTextCell(row,fmtMs(log.duration_ms));
+appendTextCell(row,fmtCost(log.cost));
+appendCompressionDetail(row,log.compression);
+appendReductionDetail(row,log.context_reduction);
+appendTextCell(row,log.claude_session_id?String(log.claude_session_id):'—','session-id-cell');
+tbody.appendChild(row);
+});
+}
 
  // --- WebSocket (Req 16.14, 40.1-40.7) ---
   var ws = null;
@@ -1210,8 +1240,9 @@ renderCosts(msg.data.cost_by_provider, msg.data.cumulative_cost);
     var prov=$('f-provider').value.trim(); if(prov) params.set('provider',prov);
     var model=$('f-model').value.trim(); if(model) params.set('model',model);
     var status=$('f-status').value.trim(); if(status) params.set('status_code',status);
-    var trace=$('f-trace').value.trim(); if(trace) params.set('trace_id',trace);
-    var compressionLevel=$('f-compression-level').value; if(compressionLevel) params.set('compression_level',compressionLevel);
+var trace=$('f-trace').value.trim(); if(trace) params.set('trace_id',trace);
+var protocol=$('f-protocol').value; if(protocol) params.set('client_protocol',protocol);
+var compressionLevel=$('f-compression-level').value; if(compressionLevel) params.set('compression_level',compressionLevel);
 
     $('logs-empty').style.display='block';
     $('logs-empty').textContent='Loading logs…';

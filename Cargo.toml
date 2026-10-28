@@ -16,7 +16,10 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 aws-sdk-bedrockruntime = { version = "1.76", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-bedrock = { version = "1.145", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-config = { version = "1.5", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
-qdrant-client = "1.13"
+# Pinned to the deployed Qdrant server minor (1.18.x): the client refuses a
+# minor gap > 1 at startup ("Client version ... not compatible with server
+# version ..."). Bump together with the Qdrant server.
+qdrant-client = "=1.18.0"
 rust-embed = { version = "8.5", features = ["compression"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

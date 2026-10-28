@@ -17,6 +17,20 @@
 //! - [`AuthError::InvalidKey`] → 401 `{"error": "Invalid or unrecognized API key"}`
 //! - [`AuthError::Expired`]    → 403 `{"error": "API key has expired"}`
 //! - [`AuthError::Revoked`]    → 403 `{"error": "API key has been revoked"}`
+//!
+//! On the Anthropic Messages front-door paths (`/v1/messages`,
+//! `/v1/messages/count_tokens`) middleware rejections are instead emitted in
+//! the Anthropic error envelope `{"type":"error","error":{"type","message"}}`
+//! (anthropic-messages-front-door Req 3.3): missing/invalid key → 401
+//! `authentication_error`, expired/revoked key or model-access denial → 403
+//! `permission_error`, budget exhaustion and per-key rate limit → 429
+//! `rate_limit_error`.
+//!
+//! Credential shapes: `Authorization: Bearer <vk_...>` everywhere, plus
+//! `x-api-key: <vk_...>` as an alias accepted ONLY on the Anthropic Messages
+//! front-door paths `/v1/messages` and `/v1/messages/count_tokens`
+//! (anthropic-messages-front-door Req 5.4, design D3); both flow through the
+//! identical `authenticate` + enforcement pipeline.`
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,6 +46,10 @@ use axum::{
 use chrono::Utc;
 use serde_json::json;
 
+use crate::anthropic::errors::{
+    error_response as anthropic_error_response, http_status as anthropic_http_status,
+};
+use crate::anthropic::models::error_types as anthropic_error_types;
 use crate::config::{Config, EnforcementMode};
 use crate::gateway::handlers::multipart_model;
 use crate::gateway::AppState;
@@ -84,6 +102,19 @@ impl IntoResponse for AuthError {
             Json(json!({ "error": self.client_message() })),
         )
             .into_response()
+    }
+}
+
+impl AuthError {
+    /// Anthropic-envelope response for this error (front-door Req 3.3):
+    /// `InvalidKey` → 401 `authentication_error`; `Expired`/`Revoked` → 403
+    /// `permission_error` per Anthropic semantics.
+    fn into_anthropic_response(&self) -> Response {
+        let kind = match self {
+            AuthError::InvalidKey => anthropic_error_types::AUTHENTICATION_ERROR,
+            AuthError::Expired | AuthError::Revoked => anthropic_error_types::PERMISSION_ERROR,
+        };
+        anthropic_shaped_error(kind, self.client_message())
     }
 }
 
@@ -191,14 +222,78 @@ fn extract_bearer(request: &Request) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// Whether a request path is one of the Anthropic Messages front-door
+/// endpoints that additionally accept `x-api-key` as a credential alias
+/// (anthropic-messages-front-door Req 5.4; design D3).
+///
+/// Exact, path-only matches: query strings (e.g. `/v1/messages?beta=true`)
+/// are excluded by callers passing `uri().path()`. Any other `/v1/*` route —
+/// notably `/v1/chat/completions` — is structurally outside the alias, so
+/// Bearer remains the only accepted credential shape there.
+fn is_messages_front_door_path(path: &str) -> bool {
+    path == "/v1/messages" || path == "/v1/messages/count_tokens"
+}
+
+/// Extract the credential alias from the `x-api-key` header, applicable ONLY
+/// on the Messages front-door paths (Req 5.4; design D3).
+///
+/// Returns `None` on every other path regardless of header presence, making
+/// the alias structurally unable to apply to non-messages routes.
+fn extract_x_api_key_alias(request: &Request) -> Option<String> {
+    if !is_messages_front_door_path(request.uri().path()) {
+        return None;
+    }
+    request
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Resolve the virtual-key credential for a request (Req 5.4).
+///
+/// `Authorization: Bearer <vk_...>` wins when present and valid-shaped (i.e.
+/// `vk_`-prefixed). Otherwise, on the Messages front-door paths only, a
+/// `vk_`-prefixed `x-api-key` value is tried through the exact same
+/// `authenticate` + enforcement pipeline. Non-`vk_` values are ignored for
+/// both shapes, and non-messages paths never consult `x-api-key`.
+fn extract_virtual_key_credential(request: &Request) -> Option<String> {
+    extract_bearer(request)
+        .filter(|t| t.starts_with("vk_"))
+        .or_else(|| extract_x_api_key_alias(request))
+        .filter(|t| t.starts_with("vk_"))
+}
+
 /// JSON 401 response used when `enforcement=required` and no valid virtual key
-/// is presented (Req 11.2).
-fn required_auth_missing_response() -> Response {
+/// is presented (Req 11.2). Anthropic-shaped on the Messages front-door paths
+/// (401 `authentication_error`, front-door Req 3.3); legacy envelope elsewhere.
+fn required_auth_missing_response(messages_path: bool) -> Response {
+    if messages_path {
+        let body = anthropic_error_response(
+            anthropic_error_types::AUTHENTICATION_ERROR,
+            "Virtual key authentication is required",
+        );
+        let status = StatusCode::from_u16(anthropic_http_status(
+            anthropic_error_types::AUTHENTICATION_ERROR,
+        ))
+        .unwrap_or(StatusCode::UNAUTHORIZED);
+        return (status, Json(body)).into_response();
+    }
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({ "error": "Virtual key authentication is required" })),
     )
         .into_response()
+}
+
+/// Build an Anthropic-envelope error response (front-door Req 3.3) with the
+/// status derived from the error type.
+fn anthropic_shaped_error(kind: &str, message: impl Into<String>) -> Response {
+    let body = anthropic_error_response(kind, message);
+    let status =
+        StatusCode::from_u16(anthropic_http_status(kind)).unwrap_or(StatusCode::BAD_REQUEST);
+    (status, Json(body)).into_response()
 }
 
 /// Axum middleware enforcing the configured virtual key policy.
@@ -232,8 +327,15 @@ pub async fn virtual_key_auth_middleware(
     // Manager is always present on AppState (constructed at startup).
     let manager = Arc::clone(&state.virtual_key_manager);
 
-    // Only Bearer tokens with the `vk_` prefix are treated as virtual keys.
-    let vk_token = extract_bearer(&request).filter(|t| t.starts_with("vk_"));
+    // Only `vk_`-prefixed credentials are treated as virtual keys. Bearer is
+    // always considered; `x-api-key` is an alias accepted ONLY on the Messages
+    // front-door paths (Req 5.4, design D3) and is structurally unreachable on
+    // any other route. Bearer wins when present and valid-shaped.
+    let vk_token = extract_virtual_key_credential(&request);
+    // Anthropic Messages front-door paths get Anthropic-shaped middleware
+    // rejections (front-door Req 3.3); every other route keeps the legacy
+    // `{"error": "..."}` envelope.
+    let messages_path = is_messages_front_door_path(request.uri().path());
 
     match enforcement {
         // Handled above; retained for exhaustiveness.
@@ -243,8 +345,10 @@ pub async fn virtual_key_auth_middleware(
         // using provider keys directly (Req 11.4, 2.4).
         EnforcementMode::Optional => match vk_token {
             Some(token) => match manager.authenticate(&token).await {
-                Ok(key) => Ok(enforce_authenticated(&state, &manager, key, request, next).await),
-                Err(err) => Err(err.into_response()),
+                Ok(key) => {
+                    Ok(enforce_authenticated(&state, &manager, key, request, next).await)
+                }
+                Err(err) => Err(auth_error_response(&err, messages_path)),
             },
             None => Ok(next.run(request).await),
         },
@@ -252,13 +356,26 @@ pub async fn virtual_key_auth_middleware(
         // `required`: a valid `vk_` key is mandatory (Req 11.2).
         EnforcementMode::Required => {
             let Some(token) = vk_token else {
-                return Err(required_auth_missing_response());
+                return Err(required_auth_missing_response(messages_path));
             };
             match manager.authenticate(&token).await {
-                Ok(key) => Ok(enforce_authenticated(&state, &manager, key, request, next).await),
-                Err(err) => Err(err.into_response()),
+                Ok(key) => {
+                    Ok(enforce_authenticated(&state, &manager, key, request, next).await)
+                }
+                Err(err) => Err(auth_error_response(&err, messages_path)),
             }
         }
+    }
+}
+
+/// Render an [`AuthError`] for the client: Anthropic envelope on the Messages
+/// front-door paths (front-door Req 3.3), legacy `{"error": "..."}` envelope
+/// elsewhere.
+fn auth_error_response(err: &AuthError, messages_path: bool) -> Response {
+    if messages_path {
+        err.into_anthropic_response()
+    } else {
+        err.clone().into_response()
     }
 }
 
@@ -290,6 +407,7 @@ async fn enforce_authenticated(
     request: Request,
     next: Next,
 ) -> Response {
+    let messages_path = is_messages_front_door_path(request.uri().path());
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -331,24 +449,24 @@ async fn enforce_authenticated(
 
         // Req 6.4: model access is checked BEFORE budget / rate limit so denied
         // requests consume no budget or rate-limit capacity.
-        if let Some(model) = &model {
-            if let Err(err) = manager.check_model_access(&key, model) {
-                return access_denied_response(&err);
-            }
-        }
+ if let Some(model) = &model {
+ if let Err(err) = manager.check_model_access(&key, model) {
+ return access_denied_response(&err, messages_path);
+ }
+ }
 
-        (Request::from_parts(parts, Body::from(bytes)), model)
-    } else {
-        (request, None)
-    };
+ (Request::from_parts(parts, Body::from(bytes)), model)
+ } else {
+ (request, None)
+ };
 
-    // Budget (Req 3.2 / 4.2) then per-key rate limit (Req 5.1-5.5).
-    if let Err(err) = manager.check_budget(&key) {
-        return budget_exhausted_response(&err);
-    }
-    if let Err(err) = manager.check_rate_limit(&key) {
-        return rate_limited_response(&err);
-    }
+ // Budget (Req 3.2 / 4.2) then per-key rate limit (Req 5.1-5.5).
+ if let Err(err) = manager.check_budget(&key) {
+ return budget_exhausted_response(&err, messages_path);
+ }
+ if let Err(err) = manager.check_rate_limit(&key) {
+ return rate_limited_response(&err, messages_path);
+ }
 
     // Carry the authenticated key downstream (Req 2.1) and forward.
     let key_id = key.id.clone();
@@ -359,8 +477,13 @@ async fn enforce_authenticated(
     record_usage_from_response(state, manager, &key_id, requested_model, response).await
 }
 
-/// Map an [`AccessError`] to its HTTP 403 response (design HTTP Error Mapping).
-fn access_denied_response(err: &AccessError) -> Response {
+/// Map an [`AccessError`] to its HTTP 403 response (design HTTP Error
+/// Mapping). Anthropic `permission_error` envelope on the Messages front-door
+/// paths (front-door Req 3.3).
+fn access_denied_response(err: &AccessError, messages_path: bool) -> Response {
+    if messages_path {
+        return anthropic_shaped_error(anthropic_error_types::PERMISSION_ERROR, err.to_string());
+    }
     let AccessError::ModelDenied { model, allowed } = err;
     (
         StatusCode::FORBIDDEN,
@@ -374,7 +497,12 @@ fn access_denied_response(err: &AccessError) -> Response {
 }
 
 /// Map a [`BudgetError`] to HTTP 429 (design HTTP Error Mapping).
-fn budget_exhausted_response(err: &BudgetError) -> Response {
+/// Anthropic `rate_limit_error` envelope on the Messages front-door paths
+/// (front-door Req 3.3).
+fn budget_exhausted_response(err: &BudgetError, messages_path: bool) -> Response {
+    if messages_path {
+        return anthropic_shaped_error(anthropic_error_types::RATE_LIMIT_ERROR, err.to_string());
+    }
     let message = match err {
         BudgetError::BudgetExhausted => "USD budget limit reached",
         BudgetError::TokenBudgetExhausted => "Token budget limit reached",
@@ -387,8 +515,10 @@ fn budget_exhausted_response(err: &BudgetError) -> Response {
 }
 
 /// Map a [`RateLimitError`] to HTTP 429 + `Retry-After` (design HTTP Error
-/// Mapping, Req 5.2 / 5.4).
-fn rate_limited_response(err: &RateLimitError) -> Response {
+/// Mapping, Req 5.2 / 5.4). Anthropic `rate_limit_error` envelope on the
+/// Messages front-door paths (front-door Req 3.3); the `Retry-After` header
+/// is preserved in both shapes.
+fn rate_limited_response(err: &RateLimitError, messages_path: bool) -> Response {
     let (message, retry_after) = match err {
         RateLimitError::RpmExceeded {
             retry_after_seconds,
@@ -397,12 +527,16 @@ fn rate_limited_response(err: &RateLimitError) -> Response {
             retry_after_seconds,
         } => ("Token rate limit exceeded", *retry_after_seconds),
     };
-    (
-        StatusCode::TOO_MANY_REQUESTS,
-        [(header::RETRY_AFTER, retry_after.to_string())],
-        Json(json!({ "error": message })),
-    )
-        .into_response()
+    let headers = [(header::RETRY_AFTER, retry_after.to_string())];
+    if messages_path {
+        let body = anthropic_error_response(anthropic_error_types::RATE_LIMIT_ERROR, message);
+        let status = StatusCode::from_u16(anthropic_http_status(
+            anthropic_error_types::RATE_LIMIT_ERROR,
+        ))
+        .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
+        return (status, headers, Json(body)).into_response();
+    }
+    (StatusCode::TOO_MANY_REQUESTS, headers, Json(json!({ "error": message }))).into_response()
 }
 
 /// Record usage from a completed provider response, when possible.
@@ -467,12 +601,13 @@ async fn build_usage_record(
 ) -> Option<(UsageRecord, u64)> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let usage = value.get("usage");
-    let input_tokens = usage
-        .and_then(|u| u.get("prompt_tokens"))
-        .and_then(serde_json::Value::as_u64);
-    let output_tokens = usage
-        .and_then(|u| u.get("completion_tokens"))
-        .and_then(serde_json::Value::as_u64);
+    // OpenAI-shaped counters first; Anthropic Messages bodies carry
+    // `input_tokens`/`output_tokens` instead, so they serve as fallbacks when
+    // the OpenAI spellings are absent or zero (anthropic-messages-front-door:
+    // without this, VK spend/token budgets/TPM were never recorded on the
+    // /v1/messages front door).
+    let input_tokens = usage_tokens(usage, "prompt_tokens", "input_tokens");
+    let output_tokens = usage_tokens(usage, "completion_tokens", "output_tokens");
 
     // Req 3.6: a response without usage counts is not recorded.
     // Embedding responses commonly omit completion_tokens; accept input-only usage.
@@ -523,6 +658,26 @@ async fn build_usage_record(
         timestamp: Utc::now(),
     };
     Some((record, input_tokens.saturating_add(output_tokens)))
+}
+
+/// Read a token counter from a `usage` object: the primary (OpenAI) key wins
+/// when present and non-zero; otherwise the Anthropic fallback key is
+/// consulted. Returns `None` when neither spelling carries a non-zero count.
+fn usage_tokens(
+    usage: Option<&serde_json::Value>,
+    primary: &str,
+    fallback: &str,
+) -> Option<u64> {
+    let primary = usage
+        .and_then(|u| u.get(primary))
+        .and_then(serde_json::Value::as_u64);
+    if primary.is_some_and(|tokens| tokens > 0) {
+        return primary;
+    }
+    usage
+        .and_then(|u| u.get(fallback))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|tokens| *tokens > 0)
 }
 
 /// Resolve `(input_rate, output_rate)` per-million-token cost rates for the
@@ -695,6 +850,186 @@ mod tests {
         let enc = secrets::encrypt_provider_secret("vk_probe").unwrap();
         assert_eq!(secrets::decrypt_provider_secret(&enc).unwrap(), "vk_probe");
     }
+
+    // ---------------------------------------------------------------------
+    // x-api-key credential alias (anthropic-messages-front-door Req 5.4, D3)
+    // ---------------------------------------------------------------------
+
+    use axum::http::Request as HttpRequest;
+
+    fn request_for(path_and_query: &str, headers: &[(&str, &str)]) -> Request {
+        let builder = HttpRequest::builder()
+            .method("POST")
+            .uri(path_and_query);
+        let builder = headers
+            .iter()
+            .fold(builder, |b, (k, v)| b.header(*k, *v));
+        builder.body(Body::empty()).unwrap()
+    }
+
+    /// Path predicate admits exactly the two Messages front-door endpoints,
+    /// path-only (query strings ignored).
+    #[test]
+    fn front_door_path_predicate_is_exact_and_path_only() {
+        assert!(is_messages_front_door_path("/v1/messages"));
+        assert!(is_messages_front_door_path("/v1/messages/count_tokens"));
+        // Everything else — including near-misses — is excluded.
+        for path in [
+            "/v1/chat/completions",
+            "/v1/messages/",
+            "/v1/messages/count_tokens/",
+            "/v1/v1/messages",
+            "/v1/models",
+            "/v1/embeddings",
+            "/messages",
+        ] {
+            assert!(!is_messages_front_door_path(path), "{path} must not match");
+        }
+    }
+
+    /// `x-api-key` resolves on both front-door paths, with query strings
+    /// ignored (Req 5.4).
+    #[test]
+    fn x_api_key_alias_extracted_on_front_door_paths() {
+        for uri in ["/v1/messages", "/v1/messages?beta=true", "/v1/messages/count_tokens"] {
+            let request = request_for(uri, &[("x-api-key", "vk_alias")]);
+            assert_eq!(
+                extract_virtual_key_credential(&request).as_deref(),
+                Some("vk_alias"),
+                "alias must resolve on {uri}"
+            );
+        }
+    }
+
+    /// On non-messages paths the alias is structurally ignored: a request
+    /// carrying ONLY `x-api-key` resolves no credential (Req 5.4, D3), so in
+    /// `required` mode it still 401s and in `optional` mode it passes through
+    /// unauthenticated — exactly the pre-alias Bearer-only behavior.
+    #[test]
+    fn x_api_key_alias_ignored_on_non_front_door_paths() {
+        let request = request_for("/v1/chat/completions", &[("x-api-key", "vk_alias")]);
+        assert_eq!(extract_virtual_key_credential(&request), None);
+    }
+
+    /// Bearer wins over `x-api-key` when both are present and Bearer is
+    /// valid-shaped; a valid-shaped alias also wins over a non-`vk_` Bearer.
+    #[test]
+    fn bearer_takes_precedence_over_alias() {
+        let request = request_for(
+            "/v1/messages",
+            &[("authorization", "Bearer vk_bearer"), ("x-api-key", "vk_alias")],
+        );
+        assert_eq!(extract_virtual_key_credential(&request).as_deref(), Some("vk_bearer"));
+
+        // Non-`vk_` Bearer is not a virtual key; the front-door alias applies.
+        let request = request_for(
+            "/v1/messages",
+            &[("authorization", "Bearer sk-upstream"), ("x-api-key", "vk_alias")],
+        );
+        assert_eq!(extract_virtual_key_credential(&request).as_deref(), Some("vk_alias"));
+    }
+
+    /// Bearer continues to resolve everywhere, including the messages routes,
+    /// with or without a concurrent `x-api-key` header.
+    #[test]
+    fn bearer_resolves_everywhere() {
+        for uri in ["/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens"] {
+            let request = request_for(uri, &[("authorization", "Bearer vk_bearer")]);
+            assert_eq!(
+                extract_virtual_key_credential(&request).as_deref(),
+                Some("vk_bearer"),
+                "Bearer must resolve on {uri}"
+            );
+        }
+    }
+
+/// Non-`vk_` `x-api-key` values are ignored on front-door paths too — the
+/// same `vk_` prefix filtering the Bearer path applies (Req 5.4).
+#[test]
+fn non_vk_alias_values_are_ignored() {
+    let request = request_for("/v1/messages", &[("x-api-key", "sk-ant-upstream")]);
+    assert_eq!(extract_virtual_key_credential(&request), None);
+}
+
+// ---------------------------------------------------------------------
+// Anthropic-shaped usage recording (budget bypass fix)
+// ---------------------------------------------------------------------
+
+/// Minimal YAML config (same shape as the front-door integration harness)
+/// whose `anthropic-group` carries rates `lookup_model_rates` can resolve.
+fn anthropic_usage_test_config() -> crate::config::Config {
+    let mut config: crate::config::Config = serde_yaml::from_str(
+        "server:\n  host: 127.0.0.1\n  port: 0\nproviders:\n  - name: p\n    type: openai\n    base_url: http://localhost\n    timeout_seconds: 30\nmodel_groups:\n  - name: anthropic-group\n    models:\n      - provider: p\n        model: claude-sonnet-4-6\n        cost_per_million_input_tokens: 3.0\n        cost_per_million_output_tokens: 6.0\n",
+    )
+    .unwrap();
+    // Isolated SQLite databases so parallel tests never share ./logs.db.
+    let dir = tempfile::tempdir().unwrap().keep();
+    config.logging.database_path = dir.join("logs.db").to_string_lossy().into_owned();
+    config.virtual_keys.database_path = dir.join("keys.db").to_string_lossy().into_owned();
+    config
+}
+
+/// `build_usage_record` accepts Anthropic Messages `input_tokens`/
+/// `output_tokens` when the OpenAI spellings are absent, so /v1/messages
+/// responses record VK spend/token budgets/TPM instead of silently
+/// skipping (the budget bypass this fixes).
+#[tokio::test]
+async fn anthropic_shaped_usage_is_recorded() {
+    let server = crate::gateway::GatewayServer::new(anthropic_usage_test_config(), None)
+        .await
+        .expect("test server");
+    let body = serde_json::json!({
+        "id": "msg_usage",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{ "type": "text", "text": "hi" }],
+        "usage": { "input_tokens": 21, "output_tokens": 4 }
+    });
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let (record, tpm) = build_usage_record(
+        &server.state,
+        "key_anthropic",
+        "anthropic-group",
+        &bytes,
+    )
+    .await
+    .expect("Anthropic-shaped usage must be recorded");
+    assert_eq!(record.input_tokens, 21);
+    assert_eq!(record.output_tokens, 4);
+    assert_eq!(record.model, "claude-sonnet-4-6");
+    assert_eq!(tpm, 21 + 4);
+    // Rates resolve from the group config: $3/M in, $6/M out.
+    assert!((record.cost_usd - compute_cost(21, 4, 3.0, 6.0)).abs() < 1e-12);
+}
+
+/// A body carrying BOTH spellings prefers the non-zero OpenAI counters.
+#[tokio::test]
+async fn openai_spelling_wins_when_present() {
+    let server = crate::gateway::GatewayServer::new(anthropic_usage_test_config(), None)
+        .await
+        .expect("test server");
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "input_tokens": 999,
+            "output_tokens": 999
+        }
+    });
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let (record, _) = build_usage_record(
+        &server.state,
+        "key_mixed",
+        "anthropic-group",
+        &bytes,
+    )
+    .await
+    .expect("mixed-shape usage must be recorded");
+    assert_eq!(record.input_tokens, 10);
+    assert_eq!(record.output_tokens, 5);
+}
 
     // ---------------------------------------------------------------------
     // Property-based tests

@@ -1,5 +1,6 @@
 pub mod active_requests;
 pub mod admin;
+pub mod anthropic;
 pub mod assistants;
 pub mod cache;
 pub mod codex;

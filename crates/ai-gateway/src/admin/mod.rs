@@ -30,15 +30,15 @@ pub mod tool_compression;
 struct AdminAssets;
 
 /// Build the admin panel router.
-/// All routes are relative ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â the caller nests them under the configured admin path.
+/// All routes are relative — the caller nests them under the configured admin path.
 ///
 /// Config API endpoints (Req 13.11-13.15, 32.1-32.7):
-///   GET    /config          ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â return current configuration
-///   PUT    /config          ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â update configuration (validate, write YAML, apply)
-///   POST   /config/validate ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â validate configuration without applying
-///   POST   /config/reload   ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â hot-reload from disk
-///   GET    /config/export   ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â download YAML
-///   POST   /config/import   ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â upload YAML, validate, return parsed config
+///   GET    /config          — return current configuration
+///   PUT    /config          — update configuration (validate, write YAML, apply)
+///   POST   /config/validate — validate configuration without applying
+///   POST   /config/reload   — hot-reload from disk
+///   GET    /config/export   — download YAML
+///   POST   /config/import   — upload YAML, validate, return parsed config
 ///
 /// Authentication (Req 35.1-35.7):
 ///   When admin.auth.enabled is true, all endpoints require HTTP Basic Auth.
@@ -1214,7 +1214,7 @@ async fn stop_smart_routing_ab_test() -> Response {
     (StatusCode::OK, Json(json!({"status":"stopped"}))).into_response()
 }
 
-/// GET /admin/config ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â return current configuration (Req 13.12)
+/// GET /admin/config — return current configuration (Req 13.12)
 ///
 /// Returns the live config as JSON with API key env var names only (never
 /// resolved values).
@@ -1224,7 +1224,7 @@ async fn get_config(State(state): State<AppState>) -> Response {
     (StatusCode::OK, Json(body)).into_response()
 }
 
-/// PUT /admin/config ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â validate, persist to YAML, and apply (Req 13.11)
+/// PUT /admin/config — validate, persist to YAML, and apply (Req 13.11)
 ///
 /// Accepts a full Config JSON body. On success the new config is written to
 /// the YAML file and swapped into the live state.
@@ -1302,7 +1302,7 @@ async fn update_config(State(state): State<AppState>, Json(new_config): Json<Con
         .into_response()
 }
 
-/// POST /admin/config/validate ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â dry-run validation (Req 13.11, 13.16)
+/// POST /admin/config/validate — dry-run validation (Req 13.11, 13.16)
 ///
 /// Accepts a Config JSON body, validates it, and returns success or a list of
 /// validation errors without applying any changes.
@@ -1330,7 +1330,7 @@ async fn validate_config(Json(config): Json<Config>) -> Response {
     }
 }
 
-/// POST /admin/config/reload ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â hot-reload from disk (Req 26.1-26.7)
+/// POST /admin/config/reload — hot-reload from disk (Req 26.1-26.7)
 ///
 /// Delegates to the same logic as the existing reload handler in
 /// gateway/handlers.rs.
@@ -1368,7 +1368,7 @@ async fn reload_config(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// POST /admin/metrics/reset-active ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â reset the active request counter
+/// POST /admin/metrics/reset-active — reset the active request counter
 ///
 /// Recovery mechanism for accumulated counter drift caused by process
 /// aborts, panics, or other scenarios where `complete_request` was not
@@ -1396,7 +1396,7 @@ async fn reset_active_requests(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// GET /admin/circuit-breaker/states ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â list current circuit breaker states.
+/// GET /admin/circuit-breaker/states — list current circuit breaker states.
 ///
 /// Returns the set of provider keys that currently have circuit breaker
 /// entries along with their state label ("closed", "open", or "half_open").
@@ -1436,7 +1436,7 @@ async fn security_status_handler(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// POST /admin/circuit-breaker/reset ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â reset circuit breaker(s).
+/// POST /admin/circuit-breaker/reset — reset circuit breaker(s).
 ///
 /// Request body: `{ "provider": "<key>" | "all" }`
 /// When `provider` is `"all"` every circuit breaker is cleared. Otherwise
@@ -1489,7 +1489,7 @@ async fn reset_circuit_breakers(
     }
 }
 
-/// GET /admin/config/export ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â download current config as YAML (Req 32.1, 32.2, 32.7)
+/// GET /admin/config/export — download current config as YAML (Req 32.1, 32.2, 32.7)
 ///
 /// Returns the current configuration serialized as YAML with a
 /// Content-Disposition header to trigger a browser download.
@@ -1526,11 +1526,11 @@ async fn export_config(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// POST /admin/config/import ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â upload YAML, validate, return parsed config
+/// POST /admin/config/import — upload YAML, validate, return parsed config
 /// (Req 32.3-32.7)
 ///
 /// Accepts a raw YAML body, deserializes and validates it, then returns the
-/// parsed config as JSON. Does NOT apply the config ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â the caller can review
+/// parsed config as JSON. Does NOT apply the config — the caller can review
 /// and then PUT /admin/config to apply.
 async fn import_config(body: String) -> Response {
     if body.trim().is_empty() {
@@ -1950,10 +1950,10 @@ async fn test_connection(
 // OAuth admin endpoints (Req 1.1, 1.6, 7.1, 7.2, 7.3, 8.5)
 // ---------------------------------------------------------------------------
 
-/// POST /admin/oauth/openai/login ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Initiate OAuth login flow (Req 1.1, 1.6)
+/// POST /admin/oauth/openai/login — Initiate OAuth login flow (Req 1.1, 1.6)
 ///
 /// On success (browser opened): `{ "status": "initiated", "message": "Browser opened for authentication" }`
-/// On browser-open failure: `{ "status": "manual_required", "auth_url": "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦" }`
+/// On browser-open failure: `{ "status": "manual_required", "auth_url": "…" }`
 /// If OAuth is not configured: 500 with "OAuth not configured"
 async fn oauth_login(State(state): State<AppState>) -> Response {
     let manager = match &state.oauth_manager {
@@ -2007,7 +2007,7 @@ async fn oauth_login(State(state): State<AppState>) -> Response {
     }
 }
 
-/// POST /admin/oauth/openai/complete ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Complete login with a manually-pasted
+/// POST /admin/oauth/openai/complete — Complete login with a manually-pasted
 /// authorization code (headless / remote Docker case).
 ///
 /// Body: `{ "code": "<authorization code or full redirect URL>" }`
@@ -2049,7 +2049,7 @@ async fn oauth_complete(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": {
-                    "message": "Missing 'code' ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â paste the authorization code or the full redirect URL",
+                    "message": "Missing 'code' — paste the authorization code or the full redirect URL",
                     "type": "invalid_request"
                 }
             })),
@@ -2079,7 +2079,7 @@ async fn oauth_complete(
     }
 }
 
-/// GET /admin/oauth/openai/status ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Return OAuth session status (Req 7.1, 7.2, 8.4)
+/// GET /admin/oauth/openai/status — Return OAuth session status (Req 7.1, 7.2, 8.4)
 ///
 /// Returns `{ "state": "...", "expires_at": ..., "scopes": "..." }`.
 /// NEVER includes access_token or refresh_token values.
@@ -2121,7 +2121,7 @@ async fn oauth_status(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// GET /admin/oauth/openai/usage ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Return current rate-limit usage snapshot.
+/// GET /admin/oauth/openai/usage — Return current rate-limit usage snapshot.
 ///
 /// Returns the captured `x-ratelimit-*` header data so the admin UI can
 /// display the 5h / weekly usage windows for browser-login accounts.
@@ -2130,7 +2130,7 @@ async fn oauth_usage(State(state): State<AppState>) -> Response {
     (StatusCode::OK, Json(json!(snapshot))).into_response()
 }
 
-/// POST /admin/oauth/openai/logout ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Clear stored tokens (Req 7.3)
+/// POST /admin/oauth/openai/logout — Clear stored tokens (Req 7.3)
 ///
 /// Deletes tokens via `OAuthTokenStore::delete`, sets session to
 /// `Unauthenticated`, and returns `{ "status": "logged_out" }`.
@@ -2138,7 +2138,7 @@ async fn oauth_logout(State(state): State<AppState>) -> Response {
     let manager = match &state.oauth_manager {
         Some(m) => m.clone(),
         None => {
-            // No OAuth configured ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â already effectively logged out.
+            // No OAuth configured — already effectively logged out.
             return (StatusCode::OK, Json(json!({ "status": "logged_out" }))).into_response();
         }
     };
@@ -3525,7 +3525,7 @@ retry:
 
     #[tokio::test]
     async fn test_auth_disabled_allows_all_requests() {
-        // Req 35.5, 35.7: auth disabled ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ unrestricted access
+        // Req 35.5, 35.7: auth disabled → unrestricted access
         let cfg = test_config_with_auth(false);
         let server = crate::gateway::GatewayServer::new(cfg, None).await.unwrap();
         let app = server.build_router();
@@ -3542,7 +3542,7 @@ retry:
 
     #[tokio::test]
     async fn test_auth_enabled_rejects_no_credentials() {
-        // Req 35.1, 35.4: auth enabled, no credentials ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 401
+        // Req 35.1, 35.4: auth enabled, no credentials → 401
         let user_env = "AUTH_TEST_NOCRED_USER";
         let pass_env = "AUTH_TEST_NOCRED_PASS";
         std::env::set_var(user_env, "admin");
@@ -3568,7 +3568,7 @@ retry:
 
     #[tokio::test]
     async fn test_auth_enabled_accepts_valid_credentials() {
-        // Req 35.1, 35.3: auth enabled, valid Basic credentials ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ pass through
+        // Req 35.1, 35.3: auth enabled, valid Basic credentials → pass through
         let user_env = "AUTH_TEST_VALID_USER";
         let pass_env = "AUTH_TEST_VALID_PASS";
         std::env::set_var(user_env, "admin");
@@ -3594,7 +3594,7 @@ retry:
 
     #[tokio::test]
     async fn test_auth_enabled_rejects_wrong_password() {
-        // Req 35.4: invalid credentials ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 401
+        // Req 35.4: invalid credentials → 401
         let user_env = "AUTH_TEST_WRONGPW_USER";
         let pass_env = "AUTH_TEST_WRONGPW_PASS";
         std::env::set_var(user_env, "admin");
@@ -3724,7 +3724,7 @@ retry:
                 let server = crate::gateway::GatewayServer::new(cfg_enabled, None).await.unwrap();
                 let app = server.build_router();
 
-                // 1) No credentials ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 401 (Req 35.1, 35.4)
+                // 1) No credentials → 401 (Req 35.1, 35.4)
                 let req = axum::http::Request::builder()
                     .method("GET")
                     .uri("/admin/config")
@@ -3734,7 +3734,7 @@ retry:
                 assert_eq!(resp.status(), StatusCode::UNAUTHORIZED,
                     "Auth enabled + no creds must be 401");
 
-                // 2) Valid credentials ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 200 (Req 35.1, 35.3)
+                // 2) Valid credentials → 200 (Req 35.1, 35.3)
                 let server2 = crate::gateway::GatewayServer::new(
                     test_config_with_auth_env(true, &user_env, &pass_env), None
                 ).await.unwrap();
@@ -3749,7 +3749,7 @@ retry:
                 assert_eq!(resp.status(), StatusCode::OK,
                     "Auth enabled + valid creds must be 200");
 
-                // 3) Invalid credentials ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 401 (Req 35.4)
+                // 3) Invalid credentials → 401 (Req 35.4)
                 // Ensure bad creds differ from good ones
                 let wrong_user = if bad_user == username {
                     format!("x{}", bad_user)
@@ -3776,7 +3776,7 @@ retry:
                 assert_eq!(resp.status(), StatusCode::UNAUTHORIZED,
                     "Auth enabled + wrong creds must be 401");
 
-                // --- Auth DISABLED ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ pass through (Req 35.5, 35.7) ---
+                // --- Auth DISABLED → pass through (Req 35.5, 35.7) ---
                 let cfg_disabled = test_config_with_auth_env(false, &user_env, &pass_env);
                 let server4 = crate::gateway::GatewayServer::new(cfg_disabled, None).await.unwrap();
                 let app4 = server4.build_router();
@@ -3798,7 +3798,7 @@ retry:
 
     #[tokio::test]
     async fn test_auth_enabled_rejects_wrong_username() {
-        // Req 35.4: invalid credentials ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 401
+        // Req 35.4: invalid credentials → 401
         let user_env = "AUTH_TEST_WRONGUN_USER";
         let pass_env = "AUTH_TEST_WRONGUN_PASS";
         std::env::set_var(user_env, "admin");
@@ -3823,7 +3823,7 @@ retry:
     }
 
     // -----------------------------------------------------------------------
-    // Property 7 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â No Tokens in Status Response (Req 7.2, 8.4)
+    // Property 7 — No Tokens in Status Response (Req 7.2, 8.4)
     // -----------------------------------------------------------------------
     //
     // For all `OAuthSessionState` values, the serialized status JSON response
@@ -3904,7 +3904,7 @@ retry:
     }
 
     // -----------------------------------------------------------------------
-    // Task 14.7 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Integration tests for admin OAuth endpoints (Req 7.1, 7.3)
+    // Task 14.7 — Integration tests for admin OAuth endpoints (Req 7.1, 7.3)
     // -----------------------------------------------------------------------
 
     /// Helper: build a GatewayServer with OAuth enabled (using a temp dir for
@@ -3915,7 +3915,7 @@ retry:
         server.build_router()
     }
 
-    /// POST /admin/oauth/openai/login ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â in a headless test environment the
+    /// POST /admin/oauth/openai/login — in a headless test environment the
     /// browser cannot open, so we expect the `manual_required` variant with
     /// an `auth_url` field (Req 1.6).
     #[tokio::test]
@@ -3956,7 +3956,7 @@ retry:
         }
     }
 
-    /// GET /admin/oauth/openai/status ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â verify response shape has `state`,
+    /// GET /admin/oauth/openai/status — verify response shape has `state`,
     /// `expires_at`, `scopes` fields. When no login has occurred, state
     /// should be `unauthenticated` (Req 7.1).
     #[tokio::test]
@@ -3989,13 +3989,13 @@ retry:
             "response must have 'scopes' field"
         );
 
-        // Fresh server with no prior login ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ unauthenticated
+        // Fresh server with no prior login → unauthenticated
         assert_eq!(json["state"], "unauthenticated");
         assert!(json["expires_at"].is_null());
         assert!(json["scopes"].is_null());
     }
 
-    /// POST /admin/oauth/openai/logout ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â verify returns `{ "status": "logged_out" }`;
+    /// POST /admin/oauth/openai/logout — verify returns `{ "status": "logged_out" }`;
     /// subsequent GET to status returns `unauthenticated` (Req 7.3).
     #[tokio::test]
     async fn test_oauth_logout_clears_tokens_and_status_becomes_unauthenticated() {
@@ -4034,7 +4034,7 @@ retry:
     }
 
     // -----------------------------------------------------------------------
-    // Task 16.3 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Admin-auth protection test (Req 8.5)
+    // Task 16.3 — Admin-auth protection test (Req 8.5)
     // -----------------------------------------------------------------------
     //
     // With admin auth enabled and no credentials, all three OAuth endpoints

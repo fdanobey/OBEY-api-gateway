@@ -2,12 +2,12 @@
 //!
 //! Two cost surfaces live here:
 //!
-//! 1. **Routing estimate** â€” [`ProviderModel::total_cost_with_hit_rate`] blends
+//! 1. **Routing estimate** — [`ProviderModel::total_cost_with_hit_rate`] blends
 //!    the cache-read and cache-creation prices with an assumed hit rate. When
 //!    the hit rate is `None` or `0.0` it is bit-identical to the existing
 //!    [`ProviderModel::total_cost`] comparator, so wiring can switch over
 //!    without changing any behavior for cache-unaware providers.
-//! 2. **Actual cost** â€” [`compute_actual_cost`] prices a completed response's
+//! 2. **Actual cost** — [`compute_actual_cost`] prices a completed response's
 //!    usage split into uncached, cache-read, and cache-creation prompt tokens
 //!    (plus completion tokens) at their respective per-million rates.
 //!

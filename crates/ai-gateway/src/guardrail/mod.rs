@@ -3,12 +3,12 @@
 //! This module tree adds pre-call and post-call policy evaluation to the
 //! request lifecycle. It is organized as:
 //!
-//! - [`config`]      â€” configuration data model (`guardrails` section).
-//! - `provider`      â€” `GuardrailProvider` trait, `Finding`, registry (task 2).
-//! - `pipeline`      â€” binding resolution and stage ordering (task 9).
-//! - `pii`           â€” PII placeholder generation and re-injection (task 4).
-//! - `stream`        â€” SSE buffering and re-chunking for post-call (task 13).
-//! - [`providers`]   â€” provider backend implementations.
+//! - [`config`]      — configuration data model (`guardrails` section).
+//! - `provider`      — `GuardrailProvider` trait, `Finding`, registry (task 2).
+//! - `pipeline`      — binding resolution and stage ordering (task 9).
+//! - `pii`           — PII placeholder generation and re-injection (task 4).
+//! - `stream`        — SSE buffering and re-chunking for post-call (task 13).
+//! - [`providers`]   — provider backend implementations.
 //!
 //! Only [`config`] and [`providers`] exist so far; the remaining submodules are
 //! declared as work lands in later tasks to keep the crate compiling.
@@ -124,8 +124,8 @@ pub struct GuardrailBlock {
 /// Outcome of [`GuardrailEngine::run_pre_call`].
 ///
 /// The handler (task 13.2) maps these to HTTP responses:
-/// `Proceed` â†’ forward to the router; `Block` â†’ 403 policy violation;
-/// `InvalidAction` â†’ 400; `Timeout` â†’ 503 scan timeout; `ServiceFailure` â†’ 503
+/// `Proceed` → forward to the router; `Block` → 403 policy violation;
+/// `InvalidAction` → 400; `Timeout` → 503 scan timeout; `ServiceFailure` → 503
 /// guardrail service failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreCallOutcome {
@@ -147,9 +147,9 @@ pub enum PreCallOutcome {
 
 /// Outcome of [`GuardrailEngine::run_post_call`].
 ///
-/// `Proceed` â†’ return the (possibly redacted + re-injected) response;
-/// `Block` â†’ 403; `Replaced` â†’ 200 with the policy message; `ServiceFailure`
-/// â†’ 503.
+/// `Proceed` → return the (possibly redacted + re-injected) response;
+/// `Block` → 403; `Replaced` → 200 with the policy message; `ServiceFailure`
+/// → 503.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostCallOutcome {
     /// `allow`/`redact` applied and re-injection completed; return the response
@@ -302,7 +302,7 @@ impl GuardrailEngine {
     /// Record a refusal-failover outcome, best-effort (Req 12.11, 11.7).
     ///
     /// Called by the handler after the bounded re-dispatch loop settles.
-    /// `pipeline` is the effective pipeline label, `outcome` âˆˆ {recovered,
+    /// `pipeline` is the effective pipeline label, `outcome` ∈ {recovered,
     /// exhausted}, and `attempt_count` is the total number of provider targets
     /// attempted (including the original). Emits an INFO log and increments
     /// the `obey_api_guardrail_refusal_failover_total` counter. Never fails the
@@ -357,7 +357,7 @@ impl GuardrailEngine {
         let mut terminal: Option<PreCallOutcome> = None;
 
         for stage in pre_stages {
-            // An action invalid for the pre-call phase â†’ HTTP 400 (Req 2.7).
+            // An action invalid for the pre-call phase → HTTP 400 (Req 2.7).
             // No provider is executed, so this stage is not counted/metered.
             if stage.action == PolicyAction::ReplaceWithPolicyMessage {
                 terminal = Some(PreCallOutcome::InvalidAction);
@@ -548,8 +548,8 @@ impl GuardrailEngine {
             }
         }
 
-        // Req 4.4, 4.8â€“4.11, 4.13: inject the redaction-notice instruction iff
-        // redaction recorded at least one Re_Injection_Map entry â€” only when proceeding.
+        // Req 4.4, 4.8–4.11, 4.13: inject the redaction-notice instruction iff
+        // redaction recorded at least one Re_Injection_Map entry — only when proceeding.
         if terminal.is_none() {
             let (override_instruction, insertion_mode) =
                 self.resolver.resolve_instruction_config(selector);
@@ -816,7 +816,7 @@ impl GuardrailEngine {
                         .map(|s| s.pipeline_name.as_str())
                         .unwrap_or("unknown");
 
-                    // Req 12.11: INFO log on refusal detection â€” never includes
+                    // Req 12.11: INFO log on refusal detection — never includes
                     // response content.
                     tracing::info!(
                         target: "guardrail",
@@ -1636,7 +1636,7 @@ fn derive_action_label(
 
 #[cfg(test)]
 mod engine_tests {
-    //! Task 10.1 â€” core engine behavior with stub providers.
+    //! Task 10.1 — core engine behavior with stub providers.
 
     use super::*;
     use crate::guardrail::config::{
@@ -2133,7 +2133,7 @@ mod engine_tests {
     }
 
     // =====================================================================
-    // Tasks 10.2â€“10.11 â€” engine property tests and error-mapping unit tests.
+    // Tasks 10.2–10.11 — engine property tests and error-mapping unit tests.
     //
     // These reuse the stub providers / builders above and add a few extra
     // stubs (`Slow`, `Recorder`) plus a multi-provider engine builder for
@@ -2273,7 +2273,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.2 â€” Feature: guardrail-pipelines, Property 4: Allow action is identity
+    // 10.2 — Feature: guardrail-pipelines, Property 4: Allow action is identity
     // **Validates: Requirements 2.4, 3.4**
     //
     // Applying an `allow` stage (even when the provider reports a whole-content
@@ -2328,7 +2328,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.3 â€” Feature: guardrail-pipelines, Property 9: All message content is
+    // 10.3 — Feature: guardrail-pipelines, Property 9: All message content is
     //        scanned regardless of role or shape
     // **Validates: Requirements 2.5, 3.5**
     //
@@ -2439,7 +2439,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.4 â€” Feature: guardrail-pipelines, Property 10: Post-call block
+    // 10.4 — Feature: guardrail-pipelines, Property 10: Post-call block
     //        discards; replace rewrites; redact preserves structure elsewhere
     // **Validates: Requirements 3.1, 3.2, 3.3**
     // -----------------------------------------------------------------
@@ -2454,7 +2454,7 @@ mod engine_tests {
             let text = format!("{pre}BAD{post}");
             let sel = BindingSelector::default();
 
-            // block â†’ 403-mapped Block outcome, response discarded.
+            // block → 403-mapped Block outcome, response discarded.
             let e_block = make_engine(
                 Arc::new(Substr("BAD", "CAT")),
                 FailurePolicy::FailClose,
@@ -2471,7 +2471,7 @@ mod engine_tests {
                 other => prop_assert!(false, "expected Block, got {:?}", other),
             }
 
-            // replace_with_policy_message â†’ assistant content replaced, 200.
+            // replace_with_policy_message → assistant content replaced, 200.
             let e_rep = make_engine(
                 Arc::new(Substr("BAD", "CAT")),
                 FailurePolicy::FailClose,
@@ -2491,7 +2491,7 @@ mod engine_tests {
             prop_assert_eq!(r_rep.choices.len(), 1);
             prop_assert_eq!(r_rep.choices[0].finish_reason.as_deref(), Some("stop"));
 
-            // redact â†’ each matched span â†’ [REDACTED]; other fields unchanged.
+            // redact → each matched span → [REDACTED]; other fields unchanged.
             let e_red = make_engine(
                 Arc::new(Substr("BAD", "CAT")),
                 FailurePolicy::FailClose,
@@ -2513,7 +2513,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.5 â€” Feature: guardrail-pipelines, Property 11: Pre-call block carries
+    // 10.5 — Feature: guardrail-pipelines, Property 11: Pre-call block carries
     //        the triggering category and forwards nothing
     // **Validates: Requirements 2.2**
     //
@@ -2559,7 +2559,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.6 â€” Feature: guardrail-pipelines, Property 18: Content is clamped
+    // 10.6 — Feature: guardrail-pipelines, Property 18: Content is clamped
     //        before provider analysis
     // **Validates: Requirements 8.1**
     // -----------------------------------------------------------------
@@ -2591,7 +2591,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.7 â€” Feature: guardrail-pipelines, Property 20: In-order execution and
+    // 10.7 — Feature: guardrail-pipelines, Property 20: In-order execution and
     //        continuation for non-halting actions
     // **Validates: Requirements 9.1, 9.3**
     // -----------------------------------------------------------------
@@ -2645,7 +2645,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.8 â€” Feature: guardrail-pipelines, Property 21: Halting actions
+    // 10.8 — Feature: guardrail-pipelines, Property 21: Halting actions
     //        short-circuit the pipeline
     // **Validates: Requirements 9.2, 9.4**
     // -----------------------------------------------------------------
@@ -2708,7 +2708,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.9 â€” Feature: guardrail-pipelines, Property 22: Re-injection runs
+    // 10.9 — Feature: guardrail-pipelines, Property 22: Re-injection runs
     //        exactly once as the final post-call step
     // **Validates: Requirements 9.5**
     //
@@ -2798,7 +2798,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.10 â€” Feature: guardrail-pipelines, Property 23: fail_open skips,
+    // 10.10 — Feature: guardrail-pipelines, Property 23: fail_open skips,
     //         fail_close halts
     // **Validates: Requirements 8.6, 9.6, 9.7**
     // -----------------------------------------------------------------
@@ -2865,7 +2865,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 10.11 â€” Unit tests for engine error mapping.
+    // 10.11 — Unit tests for engine error mapping.
     // **Validates: Requirements 2.7, 2.9, 3.6, 8.6**
     // -----------------------------------------------------------------
 
@@ -2931,7 +2931,7 @@ mod engine_tests {
             choices: vec![Choice {
                 index: 0,
                 message: Message {
-                    // Not an assistant message â†’ skipped by the scanner.
+                    // Not an assistant message → skipped by the scanner.
                     role: "user".to_string(),
                     content: Value::String("some content".to_string()),
                     extra: serde_json::Map::new(),
@@ -3021,7 +3021,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // 12.2 â€” Metrics/log emission wiring.
+    // 12.2 — Metrics/log emission wiring.
     // **Validates: Requirements 11.1, 11.2, 11.6, 11.7**
     //
     // Minimal coverage that per-stage counters/latency are recorded on the
@@ -3167,7 +3167,7 @@ mod engine_tests {
     }
 
     // -----------------------------------------------------------------
-    // Task 12.3 â€” metric/log field coverage complementary to 12.2.
+    // Task 12.3 — metric/log field coverage complementary to 12.2.
     //
     // 12.2 already asserts the `redact`, `pass`, and `error` action labels
     // and one latency `_count` sample. The tests below add the remaining
@@ -3315,7 +3315,7 @@ mod engine_tests {
 
         let mut out = String::new();
         metrics.write_guardrail_prometheus(&mut out);
-        // One latency observation per stage execution (3 requests â†’ 3).
+        // One latency observation per stage execution (3 requests → 3).
         assert!(out.contains(
             "obey_api_guardrail_stage_latency_ms_count{pipeline=\"pl\",stage=\"scan\",provider=\"regex\",phase=\"pre_call\"} 3"
         ));
@@ -3326,7 +3326,7 @@ mod engine_tests {
     /// `actions` list, and `total_latency_ms`. Asserted indirectly through the
     /// per-stage counters that feed the summary (see module NOTE):
     /// two stages execute (stages_executed == 2), stage "a" redacts (a non-pass
-    /// entry in the actions list) and stage "b" â€” seeing only the placeholder â€”
+    /// entry in the actions list) and stage "b" — seeing only the placeholder —
     /// passes (excluded from the list). One latency sample per stage confirms
     /// total latency aggregates both executions.
     #[tokio::test]
@@ -3353,11 +3353,11 @@ mod engine_tests {
 
         // summary.stages_executed == 2.
         assert_eq!(total_stage_executions(&out), 2);
-        // Stage "a" redacted the sole occurrence â†’ non-pass entry in the list.
+        // Stage "a" redacted the sole occurrence → non-pass entry in the list.
         assert!(out.contains(
             "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"a\",provider=\"regex\",phase=\"pre_call\",action=\"redact\"} 1"
         ));
-        // Stage "b" saw only the placeholder â†’ no findings â†’ pass (not listed).
+        // Stage "b" saw only the placeholder → no findings → pass (not listed).
         assert!(out.contains(
             "obey_api_guardrail_stage_executions_total{pipeline=\"pl\",stage=\"b\",provider=\"regex\",phase=\"pre_call\",action=\"pass\"} 1"
         ));
@@ -3372,7 +3372,7 @@ mod engine_tests {
 
     /// Req 11.7: with no metrics handle, the INFO (enforcement) and WARN
     /// (provider error) log paths are still exercised and enforcement still
-    /// applies â€” best-effort recording never fails the request.
+    /// applies — best-effort recording never fails the request.
     #[tokio::test]
     async fn no_metrics_handle_warn_and_info_paths_still_enforce() {
         // WARN path: provider error under fail_open still proceeds.
