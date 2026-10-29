@@ -244,8 +244,6 @@ pub struct ConsolidationContext {
     pub scanner: Arc<SensitiveContentScanner>,
     pub vector_tier: Option<Arc<dyn MemoryVectorTier>>,
     pub allow_sensitive_storage: bool,
-    /// Legacy configuration snapshot retained for callers; consolidation has its own scan limit.
-    pub max_memories_per_namespace: usize,
     pub provider_name: String,
     pub model: String,
     pub maximum_concurrent_provider_calls: usize,
@@ -822,7 +820,6 @@ mod tests {
             scanner,
             vector_tier: tier.map(|tier| tier as Arc<dyn MemoryVectorTier>),
             allow_sensitive_storage: false,
-            max_memories_per_namespace: 1_000,
             provider_name: "internal-provider".to_owned(),
             model: "consolidator-model".to_owned(),
             maximum_concurrent_provider_calls: 1,

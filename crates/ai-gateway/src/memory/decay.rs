@@ -242,13 +242,18 @@ fn publish_evictions(publisher: Option<&dyn EvictionEventPublisher>, result: &De
     }
 }
 
-/// Run one consolidation pass in an isolated spawned task.
+/// Run one consolidation pass in an isolated blocking-pool task.
 ///
-/// A panic is caught as a `JoinError` and logged; the scheduler loop and
-/// request serving are unaffected either way.
+/// The pass is driven by `Handle::block_on` on a blocking thread so its
+/// CPU-bound grouping and decision-parsing sections never occupy a Tokio
+/// worker (consistent with the rest of this module's blocking-pool
+/// dispatch). A panic is caught as a `JoinError` and logged; the scheduler
+/// loop and request serving are unaffected either way.
 async fn run_consolidation_hook_fail_safe(hook: &Arc<dyn ConsolidationHook>) {
     let hook = Arc::clone(hook);
-    match tokio::spawn(async move { hook.run_consolidation_pass().await }).await {
+    let handle = tokio::runtime::Handle::current();
+    match tokio::task::spawn_blocking(move || handle.block_on(hook.run_consolidation_pass())).await
+    {
         Ok(()) => {}
         Err(error) => error!(error = %error, "memory consolidation pass failed"),
     }

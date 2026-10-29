@@ -5,10 +5,11 @@
 //!   `updated_at`, re-indexes in the fake vector tier, 404s on missing ids,
 //!   and 400s on invalid/sensitive content.
 //! * Req 2 (supersession): supersede excludes an entry from retrieval (the
-//!   injector's candidate source) while keeping it visible with
-//!   `include_superseded`; deleting a superseded entry still works and
-//!   removes its vector point; a v3-shaped database migrates to v4 with
-//!   rows and FTS content preserved.
+//! injector's candidate source) while keeping it visible with
+//! `include_superseded`; deleting a superseded entry still works and
+//! removes its vector point; the admin DELETE endpoint routes through
+//! `admin_delete` and issues the vector point delete; a v3-shaped
+//! database migrates to v4 with rows and FTS content preserved.
 //! * Req 3 (consolidation): end-to-end merge through a fake extraction
 //!   provider (merged entry created, both sources superseded, counts and
 //!   last-pass metrics correct, vector deletes/index observed); malformed
@@ -20,8 +21,9 @@
 //!   back to the filtered listing, export includes superseded entries plus
 //!   a total.
 //! * Req 8 (per-request memory mode): `X-Obey-Memory-Mode: off` skips
-//!   injection AND extraction; `read-only` injects but skips extraction;
-//!   an absent header leaves configured behavior unchanged.
+//! injection AND extraction (non-stream and buffered streaming paths);
+//! `read-only` injects but skips extraction; an absent or unrecognized
+//! header value leaves configured behavior unchanged.
 //!
 //! Conventions follow `guardrail_e2e.rs`: the full Axum router is driven
 //! through `tower::ServiceExt::oneshot()` (no port binding), wiremock plays
@@ -161,13 +163,21 @@ fn memory_config(db_path: &str) -> MemoryConfig {
     }
 }
 
-/// Build a `MemorySystem` with a recording vector tier and a fake extraction
-/// provider, backed by a fresh temp-database path.
-async fn memory_system_with(
-    provider: Arc<FakeExtractionProvider>,
-) -> (Arc<MemorySystem>, Arc<RecordingVectorTier>, String) {
+/// Memory system plus recording tier plus the temp directory backing the
+/// database. Fields drop in declaration order, so the system's SQLite
+/// handle closes before the directory cleanup runs (Windows cannot delete
+/// open files) — no temp dir leaks per run.
+struct MemoryFixture {
+    system: Arc<MemorySystem>,
+    tier: Arc<RecordingVectorTier>,
+    _dir: tempfile::TempDir,
+}
+
+/// Build a `MemoryFixture`: a `MemorySystem` with a recording vector tier
+/// and a fake extraction provider, backed by a fresh temp-database path.
+async fn memory_system_with(provider: Arc<FakeExtractionProvider>) -> MemoryFixture {
     let dir = tempfile::tempdir().expect("create temp dir for memory database");
-    let db_path = dir.keep().join("memory.db");
+    let db_path = dir.path().join("memory.db");
     let system = Arc::new(
         MemorySystem::new_with_vector(
             memory_config(db_path.to_string_lossy().as_ref()),
@@ -182,11 +192,11 @@ async fn memory_system_with(
     system
         .set_vector_tier(Some(tier.clone() as Arc<dyn MemoryVectorTier>))
         .await;
-    (
+    MemoryFixture {
         system,
         tier,
-        db_path.to_string_lossy().into_owned(),
-    )
+        _dir: dir,
+    }
 }
 
 async fn create_entry(system: &MemorySystem, namespace: &str, content: &str) -> MemoryEntry {
@@ -266,6 +276,8 @@ model_groups:
 retry:
   max_retries_per_provider: 0
   backoff_sequence_seconds: [1, 2, 4]
+streaming:
+  passthrough_enabled: false
 memory:
   enabled: true
   auto_extract_enabled: true
@@ -286,14 +298,23 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     (status, body.to_vec())
 }
 
+/// Gateway plus its app, live memory system, config, and the temp dir
+/// backing the memory database (cleaned up on drop, after the server's
+/// SQLite handle closes — no temp dir leaks per run).
+struct GatewayFixture {
+    server: GatewayServer,
+    app: axum::Router,
+    system: Arc<MemorySystem>,
+    config: Config,
+    _dir: tempfile::TempDir,
+}
+
 /// Seed a gateway with one injectable memory fact; returns the server (for
 /// hot-reload), its app, and the live memory system for post-request
 /// assertions.
-async fn gateway_with_memory(
-    mock_uri: &str,
-) -> (GatewayServer, axum::Router, Arc<MemorySystem>, Config) {
+async fn gateway_with_memory(mock_uri: &str) -> GatewayFixture {
     let dir = tempfile::tempdir().expect("create temp dir for gateway memory database");
-    let db_path = dir.keep().join("memory.db");
+    let db_path = dir.path().join("memory.db");
     let memory_yaml = format!(
         "  database_path: \"{}\"",
         db_path.to_string_lossy().replace('\\', "/")
@@ -310,14 +331,30 @@ async fn gateway_with_memory(
         .expect("memory system should initialize");
     create_entry(&system, "user::default", "The user prefers dark mode in editors").await;
     let app = server.build_router();
-    (server, app, system, config)
+    GatewayFixture {
+        server,
+        app,
+        system,
+        config,
+        _dir: dir,
+    }
 }
 
 fn chat_request(headers: &[(&str, &str)], user_content: &str) -> Request<Body> {
+    chat_request_with_stream(headers, user_content, false)
+}
+
+/// Same as `chat_request` but with control over `stream` for the buffered
+/// streaming path (mirrors `post_stream` in `guardrail_streaming.rs`).
+fn chat_request_with_stream(
+    headers: &[(&str, &str)],
+    user_content: &str,
+    stream: bool,
+) -> Request<Body> {
     let body = serde_json::json!({
         "model": "gpt-4",
         "messages": [{ "role": "user", "content": user_content }],
-        "stream": false
+        "stream": stream
     });
     let mut builder = Request::post("/v1/chat/completions")
         .header("content-type", "application/json");
@@ -360,7 +397,7 @@ fn any_message_contains(body: &serde_json::Value, needle: &str) -> bool {
 #[tokio::test]
 async fn admin_edit_updates_content_type_and_reindexes() {
     let provider = Arc::new(FakeExtractionProvider::new());
-    let (system, tier, _db) = memory_system_with(provider).await;
+    let MemoryFixture { system, tier, .. } = memory_system_with(provider).await;
     let entry = create_entry(&system, "user::edit", "Original safe stored content.").await;
 
     let app = ai_gateway::memory::admin::routes(system.clone());
@@ -393,7 +430,7 @@ async fn admin_edit_updates_content_type_and_reindexes() {
 #[tokio::test]
 async fn admin_edit_returns_404_for_missing_id() {
     let provider = Arc::new(FakeExtractionProvider::new());
-    let (system, _tier, _db) = memory_system_with(provider).await;
+    let MemoryFixture { system, .. } = memory_system_with(provider).await;
     let app = ai_gateway::memory::admin::routes(system);
     let missing = Uuid::new_v4();
     let request = Request::patch(format!("/entries/{missing}"))
@@ -413,7 +450,7 @@ async fn admin_edit_returns_404_for_missing_id() {
 #[tokio::test]
 async fn admin_edit_rejects_invalid_and_sensitive_content() {
     let provider = Arc::new(FakeExtractionProvider::new());
-    let (system, _tier, _db) = memory_system_with(provider).await;
+    let MemoryFixture { system, .. } = memory_system_with(provider).await;
     let entry = create_entry(&system, "user::edit", "Original safe stored content.").await;
     let app = ai_gateway::memory::admin::routes(system.clone());
 
@@ -445,7 +482,7 @@ async fn admin_edit_rejects_invalid_and_sensitive_content() {
 #[tokio::test]
 async fn superseded_entry_is_excluded_from_retrieval_but_listed() {
     let provider = Arc::new(FakeExtractionProvider::new());
-    let (system, _tier, _db) = memory_system_with(provider).await;
+    let MemoryFixture { system, .. } = memory_system_with(provider).await;
     let old =
         create_entry(&system, "user::default", "The API endpoint is example.com/api/v1").await;
     let new =
@@ -502,7 +539,7 @@ async fn superseded_entry_is_excluded_from_retrieval_but_listed() {
 #[tokio::test]
 async fn deleting_superseded_entry_still_removes_vector_point() {
     let provider = Arc::new(FakeExtractionProvider::new());
-    let (system, tier, _db) = memory_system_with(provider).await;
+    let MemoryFixture { system, tier, .. } = memory_system_with(provider).await;
     let old = create_entry(&system, "user::delete", DUP_A).await;
     let new = create_entry(&system, "user::delete", DUP_B).await;
     system
@@ -520,38 +557,71 @@ async fn deleting_superseded_entry_still_removes_vector_point() {
     assert!(system.store.get_entry_by_id(new.id).unwrap().is_some());
 }
 
+/// The admin HTTP DELETE endpoint routes through `admin_delete`, so the
+/// fake tier must observe the vector point delete for the deleted id —
+/// the same cleanup the store-level test above asserts on the direct
+/// `MemorySystem::admin_delete` path.
+#[tokio::test]
+async fn admin_delete_endpoint_issues_vector_point_delete() {
+    let provider = Arc::new(FakeExtractionProvider::new());
+    let MemoryFixture { system, tier, .. } = memory_system_with(provider).await;
+    let entry = create_entry(&system, "user::delete-http", DUP_A).await;
+
+    let app = ai_gateway::memory::admin::routes(system.clone());
+    let request = Request::delete(format!("/entries/{}", entry.id)).body(Body::empty()).unwrap();
+    let (status, _body) = send(app, request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    assert!(system.store.get_entry_by_id(entry.id).unwrap().is_none());
+    assert_eq!(
+        tier.count(&format!("delete:{}", entry.id)),
+        1,
+        "HTTP DELETE must issue the vector point delete via admin_delete"
+    );
+
+    // A repeated DELETE answers 404 without a second tier delete.
+    let app = ai_gateway::memory::admin::routes(system);
+    let request = Request::delete(format!("/entries/{}", entry.id)).body(Body::empty()).unwrap();
+    let (status, _body) = send(app, request).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(tier.count(&format!("delete:{}", entry.id)), 1);
+}
+
 #[tokio::test]
 async fn v3_database_migrates_to_v4_preserving_rows() {
     use rusqlite::Connection;
 
     let dir = tempfile::tempdir().expect("create temp dir for v3 database");
-    let db_path = dir.keep().join("memory.db");
+    let db_path = dir.path().join("memory.db");
     {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "CREATE TABLE memories (
-                id TEXT PRIMARY KEY, namespace TEXT NOT NULL, content TEXT NOT NULL,
-                memory_type TEXT NOT NULL, relevance_score REAL NOT NULL,
-                created_at INTEGER NOT NULL, last_accessed_at INTEGER NOT NULL,
-                access_count INTEGER NOT NULL, source_request_id TEXT,
-                vector_index_status TEXT NOT NULL DEFAULT 'not_configured'
-                CHECK(vector_index_status IN ('not_configured', 'pending', 'indexed', 'retry')),
-                vector_retry_count INTEGER NOT NULL DEFAULT 0 CHECK(vector_retry_count >= 0),
-                vector_last_attempt_at INTEGER, vector_next_retry_at INTEGER, vector_last_error TEXT
-            );
-            INSERT INTO memories (
-                id, namespace, content, memory_type, relevance_score,
-                created_at, last_accessed_at, access_count, source_request_id
-            ) VALUES (
-                '00000000-0000-0000-0000-000000000001', 'user::v3',
-                'legacy searchable content', 'fact', 1.0, 1700000000, 1700000000, 0, NULL
-            );
-            PRAGMA user_version = 3;",
+id TEXT PRIMARY KEY, namespace TEXT NOT NULL, content TEXT NOT NULL,
+memory_type TEXT NOT NULL, relevance_score REAL NOT NULL,
+created_at INTEGER NOT NULL, last_accessed_at INTEGER NOT NULL,
+access_count INTEGER NOT NULL, source_request_id TEXT,
+vector_index_status TEXT NOT NULL DEFAULT 'not_configured'
+CHECK(vector_index_status IN ('not_configured', 'pending', 'indexed', 'retry')),
+vector_retry_count INTEGER NOT NULL DEFAULT 0 CHECK(vector_retry_count >= 0),
+vector_last_attempt_at INTEGER, vector_next_retry_at INTEGER, vector_last_error TEXT
+);
+INSERT INTO memories (
+id, namespace, content, memory_type, relevance_score,
+created_at, last_accessed_at, access_count, source_request_id
+) VALUES (
+'00000000-0000-0000-0000-000000000001', 'user::v3',
+'legacy searchable content', 'fact', 1.0, 1700000000, 1700000000, 0, NULL
+);
+PRAGMA user_version = 3;",
         )
         .unwrap();
     }
 
-    // Opening through MemorySystem applies the migration (Req 2.4).
+    // Opening through MemorySystem applies the migration (Req 2.4). Only
+    // user-visible outcomes are asserted here — entry readability and FTS
+    // hit after migration, plus the resulting user_version; schema and
+    // column introspection stays with the store unit test.
     let system = MemorySystem::new(
         memory_config(db_path.to_string_lossy().as_ref()),
         None,
@@ -564,33 +634,23 @@ async fn v3_database_migrates_to_v4_preserving_rows() {
         .store
         .get_entry_by_id(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap())
         .unwrap()
-        .expect("v3 row must survive migration");
+        .expect("v3 row must survive migration and stay readable");
     assert_eq!(migrated.content, "legacy searchable content");
     assert_eq!(migrated.updated_at, None);
     assert_eq!(migrated.superseded_by, None);
 
-    // Schema is v4 with the supersession columns; WAL mode permits a second
-    // reader connection while the store keeps its handle open.
+    // Schema reached v4 (WAL mode permits a second reader connection while
+    // the store keeps its handle open).
     let reader = Connection::open(&db_path).unwrap();
     let version: i64 = reader
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, 4);
-    let columns: Vec<String> = {
-        let mut statement = reader.prepare("PRAGMA table_info(memories)").unwrap();
-        statement
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    };
-    assert!(columns.iter().any(|column| column == "superseded_by"));
-    assert!(columns.iter().any(|column| column == "updated_at"));
 
     // The migrated row is searchable through the rebuilt FTS index. The
     // 2023 fixture timestamps decay the recency boost below the retrieval
-    // scoring threshold, so FTS membership is asserted directly (mirroring
-    // the src migration unit test) rather than through `retrieve`.
+    // scoring threshold, so FTS membership is asserted directly rather
+    // than through `retrieve`.
     let fts_hits: i64 = reader
         .query_row(
             "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'legacy'",
@@ -608,7 +668,7 @@ async fn v3_database_migrates_to_v4_preserving_rows() {
 #[tokio::test]
 async fn consolidation_merges_near_duplicates_and_supersedes_sources() {
     let provider = Arc::new(FakeExtractionProvider::new());
-    let (system, tier, _db) = memory_system_with(provider.clone()).await;
+    let MemoryFixture { system, tier, .. } = memory_system_with(provider.clone()).await;
     let a = create_entry(&system, "user::consolidate", DUP_A).await;
     let b = create_entry(&system, "user::consolidate", DUP_B).await;
 
@@ -673,7 +733,7 @@ async fn consolidation_merges_near_duplicates_and_supersedes_sources() {
 #[tokio::test]
 async fn malformed_provider_output_skips_batch_and_serving_continues() {
     let provider = Arc::new(FakeExtractionProvider::new());
-    let (system, _tier, _db) = memory_system_with(provider.clone()).await;
+    let MemoryFixture { system, .. } = memory_system_with(provider.clone()).await;
     let a = create_entry(&system, "user::malformed", DUP_A).await;
     let _b = create_entry(&system, "user::malformed", DUP_B).await;
 
@@ -713,7 +773,7 @@ async fn malformed_provider_output_skips_batch_and_serving_continues() {
 #[tokio::test]
 async fn admin_search_finds_entries_across_namespaces() {
     let provider = Arc::new(FakeExtractionProvider::new());
-    let (system, _tier, _db) = memory_system_with(provider).await;
+    let MemoryFixture { system, .. } = memory_system_with(provider).await;
     create_entry(&system, "user::alpha", "Kubernetes rollout strategy notes").await;
     create_entry(&system, "user::beta", "Kubernetes ingress configuration details").await;
     create_entry(&system, "user::gamma", "Unrelated lunch preferences listed here").await;
@@ -739,7 +799,7 @@ async fn admin_search_finds_entries_across_namespaces() {
 #[tokio::test]
 async fn admin_search_empty_query_falls_back_to_listing() {
     let provider = Arc::new(FakeExtractionProvider::new());
-    let (system, _tier, _db) = memory_system_with(provider).await;
+    let MemoryFixture { system, .. } = memory_system_with(provider).await;
     create_entry(&system, "user::alpha", "First searchable stored fact").await;
     create_entry(&system, "user::beta", "Second searchable stored fact").await;
 
@@ -755,7 +815,7 @@ async fn admin_search_empty_query_falls_back_to_listing() {
 #[tokio::test]
 async fn admin_export_includes_superseded_entries_and_total() {
     let provider = Arc::new(FakeExtractionProvider::new());
-    let (system, _tier, _db) = memory_system_with(provider).await;
+    let MemoryFixture { system, .. } = memory_system_with(provider).await;
     let old = create_entry(&system, "user::export", "Exported superseded memory entry").await;
     let new = create_entry(&system, "user::export", "Exported active memory entry").await;
     system
@@ -794,7 +854,7 @@ async fn admin_export_includes_superseded_entries_and_total() {
 async fn memory_mode_off_skips_injection_and_extraction() {
     let mock = start_mock_provider().await;
     let server_uri = mock.uri();
-    let (_server, app, system, _config) = gateway_with_memory(&server_uri).await;
+    let GatewayFixture { app, system, .. } = gateway_with_memory(&server_uri).await;
 
     // The content carries an extraction trigger ("I prefer") and retrieval
     // tokens ("dark mode"), so both memory paths would fire if not gated.
@@ -823,7 +883,7 @@ async fn memory_mode_off_skips_injection_and_extraction() {
 async fn memory_mode_read_only_injects_but_skips_extraction() {
     let mock = start_mock_provider().await;
     let server_uri = mock.uri();
-    let (_server, app, system, _config) = gateway_with_memory(&server_uri).await;
+    let GatewayFixture { app, system, .. } = gateway_with_memory(&server_uri).await;
 
     let request = chat_request(
         &[("x-obey-memory-mode", "read-only")],
@@ -850,7 +910,7 @@ async fn memory_mode_read_only_injects_but_skips_extraction() {
 async fn absent_memory_mode_header_applies_configured_behavior() {
     let mock = start_mock_provider().await;
     let server_uri = mock.uri();
-    let (_server, app, system, _config) = gateway_with_memory(&server_uri).await;
+    let GatewayFixture { app, system, .. } = gateway_with_memory(&server_uri).await;
 
     // The content both shares retrieval tokens with the seeded memory and
     // carries an explicit "Remember this" trigger, so the configured path
@@ -871,6 +931,67 @@ async fn absent_memory_mode_header_applies_configured_behavior() {
     assert!(
         system.store.stats().unwrap().total_count >= 2,
         "absent header must let configured extraction store the new memory"
+    );
+}
+
+#[tokio::test]
+async fn memory_mode_off_skips_injection_and_extraction_on_streaming_path() {
+    let mock = start_mock_provider().await;
+    let server_uri = mock.uri();
+    let GatewayFixture { app, system, .. } = gateway_with_memory(&server_uri).await;
+
+    // Buffered streaming path (`stream: true`, pass-through disabled in the
+    // fixture config): dispatch streams upstream and reassembles the SSE.
+    let request = chat_request_with_stream(
+        &[("x-obey-memory-mode", "off")],
+        "Remember that I prefer dark mode everywhere.",
+        true,
+    );
+    let (status, body) = send(app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(text.contains("data: "), "streaming response must be SSE");
+    assert!(text.contains("[DONE]"), "stream must terminate with [DONE]");
+
+    let bodies = upstream_bodies(&mock).await;
+    assert!(
+        bodies
+            .iter()
+            .all(|body| !any_message_contains(body, "[Recalled memories]")),
+        "mode off must skip injection on the streaming path"
+    );
+    assert_eq!(
+        system.store.stats().unwrap().total_count,
+        1,
+        "mode off must skip extraction on the streaming path (only the seeded entry remains)"
+    );
+}
+
+#[tokio::test]
+async fn unrecognized_memory_mode_value_applies_configured_behavior() {
+    let mock = start_mock_provider().await;
+    let server_uri = mock.uri();
+    let GatewayFixture { app, system, .. } = gateway_with_memory(&server_uri).await;
+
+    // "full" is not a recognized mode (only `off` and `read-only` parse), so
+    // the header must fall back to `Configured`: inject + extract.
+    let request = chat_request(
+        &[("x-obey-memory-mode", "full")],
+        "Remember this: I like dark mode themes.",
+    );
+    let (status, _body) = send(app, request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let bodies = upstream_bodies(&mock).await;
+    assert!(
+        bodies
+            .iter()
+            .any(|body| any_message_contains(body, "[Recalled memories]")),
+        "unrecognized mode value must fall back to configured injection"
+    );
+    assert!(
+        system.store.stats().unwrap().total_count >= 2,
+        "unrecognized mode value must fall back to configured extraction"
     );
 }
 
@@ -921,7 +1042,7 @@ fn consolidation_falls_back_to_auto_extract_pair() {
 async fn gateway_hot_reload_applies_consolidation_settings() {
     let mock = start_mock_provider().await;
     let server_uri = mock.uri();
-    let (server, _app, system, mut config) = gateway_with_memory(&server_uri).await;
+    let GatewayFixture { server, system, mut config, .. } = gateway_with_memory(&server_uri).await;
     assert!(
         !system.config.read().await.consolidation_enabled,
         "consolidation must start disabled"
