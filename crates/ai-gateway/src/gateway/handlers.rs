@@ -714,9 +714,11 @@ impl MemoryMode {
 
 /// Parse `X-Obey-Memory-Mode` (`off` | `read-only`), O(1) header read.
 /// Header names are already case-insensitive in axum; values match
-/// case-insensitively with surrounding whitespace tolerated. Absent or
-/// unrecognized values fall back to `Configured`; unrecognized values are
-/// logged at DEBUG without conversation content (Req 8.3).
+/// case-insensitively with surrounding whitespace tolerated. If the header
+/// is repeated, only the first value is read — a deterministic choice; the
+/// remaining values are ignored. Absent or unrecognized values fall back
+/// to `Configured`; unrecognized values are logged at DEBUG without
+/// conversation content (Req 8.3).
 fn memory_mode(headers: &HeaderMap) -> MemoryMode {
     let Some(value) = headers
         .get("x-obey-memory-mode")

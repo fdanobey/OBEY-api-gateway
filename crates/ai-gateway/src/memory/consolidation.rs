@@ -21,8 +21,8 @@ use super::sensitive::{SensitiveContentScanner, SensitiveScanOptions};
 use super::store::MemoryStore;
 use super::vector::VECTOR_INDEX_TIMEOUT;
 use super::{
-    spawn_store_task, MemoryEntry, MemoryError, MemoryType, MemoryVectorTier,
-    MEMORY_EXTRACTION_INTERNAL_TAG,
+    spawn_store_task, validate_memory_content_words, MemoryEntry, MemoryError, MemoryType,
+    MemoryVectorTier, MEMORY_EXTRACTION_INTERNAL_TAG,
 };
 
 /// Maximum entries sent to the provider in one consolidation batch.
@@ -456,6 +456,10 @@ async fn validate_merge(context: &ConsolidationContext, group: &[MemoryEntry], s
     }
     if !(5..=4096).contains(&merged_content.chars().count()) {
         tracing::warn!("memory consolidation merged content has invalid length");
+        return false;
+    }
+    if validate_memory_content_words(merged_content).is_err() {
+        tracing::warn!("memory consolidation merged content is below minimum word count");
         return false;
     }
     let scan = match context.scanner.scan_with_options(merged_content, SensitiveScanOptions {
@@ -961,11 +965,28 @@ mod tests {
         assert_eq!(store.list_entries("user::test", 10, 0).unwrap().entries.len(), 2);
         assert!(store.get_entry_by_id(first).unwrap().unwrap().superseded_by.is_none());
 
-        // allow_sensitive_storage bypasses the scan and the merge applies.
-        context.allow_sensitive_storage = true;
-        let counts = run_consolidation(context).await.unwrap();
-        assert_eq!(counts.merged, 1);
-    }
+    // allow_sensitive_storage bypasses the scan and the merge applies.
+    context.allow_sensitive_storage = true;
+    let counts = run_consolidation(context).await.unwrap();
+    assert_eq!(counts.merged, 1);
+}
+
+#[tokio::test]
+async fn single_word_merged_content_is_skipped() {
+    let provider = Arc::new(FakeConsolidationProvider::decisions(String::new()));
+    let (context, store) = test_context(provider.clone(), None).await;
+    let (first, second) = seed_near_duplicates(&store).await;
+    *provider.contents.lock().unwrap() = vec![format!(
+        "[{{\"action\":\"merge\",\"source_ids\":[\"{first}\",\"{second}\"],\"merged_content\":\"sufficiently-long-single-word\"}}]"
+    )];
+
+    let counts = run_consolidation(context).await.unwrap();
+
+    assert_eq!(counts.skipped_batches, 1);
+    assert_eq!(counts.merged, 0);
+    assert_eq!(store.list_entries("user::test", 10, 0).unwrap().entries.len(), 2);
+    assert!(store.get_entry_by_id(first).unwrap().unwrap().superseded_by.is_none());
+}
 
 #[tokio::test]
 async fn batches_are_capped_at_forty_entries_per_provider_call() {

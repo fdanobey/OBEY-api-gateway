@@ -2120,7 +2120,7 @@ body.sec-banner-active{padding-top:3.2rem}
 <div class="form-group">
 <label for="mem-consolidation-model">Consolidation Model</label>
 <select id="mem-consolidation-model"><option value="">-- select provider first --</option></select>
-<div class="hint">Empty falls back to the auto-extract model</div>
+<div class="hint">Empty falls back to the auto-extract model; list shows the effective (fallback) provider's models</div>
 </div>
 </div>
 </fieldset>
@@ -3140,11 +3140,13 @@ if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
 else { setSelectOptions(mdlSel, '-- select provider first --', [], ''); }
 });
 
-// When memory consolidation provider changes, fetch its models
+// When memory consolidation provider changes, fetch its models; when cleared,
+// fall back to the auto-extract provider (mirrors server-side effective resolution).
 document.getElementById('mem-consolidation-provider').addEventListener('change', function() {
 var prov = this.value;
 var mdlSel = document.getElementById('mem-consolidation-model');
-if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
+var effProv = prov || document.getElementById('mem-extract-provider').value || '';
+if (effProv) { fetchModelsForProvider(effProv, mdlSel, mdlSel.value || ''); }
 else { setSelectOptions(mdlSel, '-- select provider first --', [], ''); }
 });
 
@@ -6747,8 +6749,9 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
     document.getElementById('mem-extract-min-turns').value = mem.auto_extract_min_turns || 4;
 document.getElementById('mem-consolidation-enabled').checked = !!mem.consolidation_enabled;
 document.getElementById('mem-consolidation-provider').value = mem.consolidation_provider || '';
-if (mem.consolidation_provider) {
-fetchModelsForProvider(mem.consolidation_provider, document.getElementById('mem-consolidation-model'), mem.consolidation_model || '');
+var consolEffProv = mem.consolidation_provider || mem.auto_extract_provider || '';
+if (consolEffProv) {
+fetchModelsForProvider(consolEffProv, document.getElementById('mem-consolidation-model'), mem.consolidation_model || '');
 } else {
 setSelectOptions(document.getElementById('mem-consolidation-model'), '-- select provider first --', [], '');
 }
@@ -7033,11 +7036,12 @@ memSearchEntries();
 
 // Generic one-input modal following the vk-modal conventions (focus trap via
 // keyboard nav, Escape closes, backdrop click closes).
-var memPromptState = { lastFocus: null };
+var memPromptState = { lastFocus: null, onConfirm: null };
 
 function memPromptClose() {
 var bd = document.getElementById('mem-prompt-backdrop');
 if (bd) { bd.classList.remove('open'); }
+memPromptState.onConfirm = null;
 var restore = memPromptState.lastFocus;
 memPromptState.lastFocus = null;
 if (restore && typeof restore.focus === 'function') { restore.focus(); }
@@ -7075,11 +7079,11 @@ modal.appendChild(body);
 modal.appendChild(actions);
 bd.appendChild(modal);
 document.body.appendChild(bd);
-ok.addEventListener('click', function() {
-var cb = bd.dataset.onConfirm;
-memPromptClose();
-if (cb && window[cb]) { window[cb](); }
-});
+  ok.addEventListener('click', function() {
+  var cb = memPromptState.onConfirm;
+  memPromptClose();
+  if (cb) { cb(); }
+  });
 cancel.addEventListener('click', memPromptClose);
 bd.addEventListener('click', function(e) { if (e.target === bd) { memPromptClose(); } });
 document.addEventListener('keydown', function(e) {
@@ -7093,10 +7097,9 @@ bodyEl.textContent = '';
 if (opts.input) { bodyEl.appendChild(opts.input); }
 var okBtn = document.getElementById('mem-prompt-ok');
 okBtn.textContent = opts.confirmLabel || 'OK';
-// Register the callback under a fresh name so repeated prompts never invoke a stale closure.
-var cbName = '__memPromptCb' + Date.now();
-window[cbName] = function() { delete window[cbName]; if (opts.onConfirm) { opts.onConfirm(); } };
-document.getElementById('mem-prompt-backdrop').dataset.onConfirm = cbName;
+// Hold the callback in module state so rapid re-prompts replace (not stack) the
+// pending callback and nothing is ever attached to window.
+memPromptState.onConfirm = opts.onConfirm || null;
 memPromptState.lastFocus = document.activeElement;
 bd.classList.add('open');
 var focusTarget = opts.input || okBtn;
@@ -7164,10 +7167,16 @@ document.getElementById('mem-prompt-body').appendChild(input);
 }
 
   function memDeleteEntry(id) {
-    if (!confirm('Delete this memory entry?')) return;
-    fetch(memApiUrl('entries/' + id), { method: 'DELETE' })
-      .then(function(r) { if (!r.ok && r.status !== 204) throw new Error('HTTP ' + r.status); showToast('Entry deleted'); memBrowseEntries(); })
-      .catch(function(err) { showToast('Delete failed: ' + err.message, true); });
+    memPrompt({
+      title: 'Delete memory entry',
+      message: 'Delete this memory entry? This cannot be undone.',
+      confirmLabel: 'Delete',
+      onConfirm: function() {
+        fetch(memApiUrl('entries/' + id), { method: 'DELETE' })
+          .then(function(r) { if (!r.ok && r.status !== 204) throw new Error('HTTP ' + r.status); showToast('Entry deleted'); memBrowseEntries(); })
+          .catch(function(err) { showToast('Delete failed: ' + err.message, true); });
+      }
+    });
   }
 
   function memClearNamespace() {

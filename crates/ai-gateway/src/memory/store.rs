@@ -1457,21 +1457,21 @@ mod tests {
         DateTime::<Utc>::from_timestamp(seconds, 0).unwrap()
     }
 
-fn entry(id: u128, namespace: &str, content: &str) -> MemoryEntry {
-    MemoryEntry {
-        id: Uuid::from_u128(id),
-        namespace: namespace.to_string(),
-        content: content.to_string(),
-        memory_type: MemoryType::Fact,
-        relevance_score: 0.5,
-        created_at: at(1_700_000_000 + id as i64),
-        last_accessed_at: at(1_700_000_100 + id as i64),
-        access_count: id as u64,
-        source_request_id: Some(Uuid::from_u128(id + 100)),
-        updated_at: None,
-        superseded_by: None,
+    fn entry(id: u128, namespace: &str, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: Uuid::from_u128(id),
+            namespace: namespace.to_string(),
+            content: content.to_string(),
+            memory_type: MemoryType::Fact,
+            relevance_score: 0.5,
+            created_at: at(1_700_000_000 + id as i64),
+            last_accessed_at: at(1_700_000_100 + id as i64),
+            access_count: id as u64,
+            source_request_id: Some(Uuid::from_u128(id + 100)),
+            updated_at: None,
+            superseded_by: None,
+        }
     }
-}
 
     fn schema_objects(store: &MemoryStore, object_type: &str) -> BTreeSet<String> {
         let conn = store.connection().unwrap();

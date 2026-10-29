@@ -518,12 +518,17 @@ async fn consolidate(State(state): State<MemoryAdminState>) -> Response {
             "provider_errors": counts.provider_errors,
         }))
         .into_response(),
-            Err(MemoryError::Config(_)) => error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "consolidation provider is not configured",
-                "consolidation_unavailable",
-            ),
-            Err(error) => memory_error_response(error),
+        Err(MemoryError::Config(_)) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "consolidation provider is not configured",
+            "consolidation_unavailable",
+        ),
+        Err(MemoryError::Conflict(_)) => error_response(
+            StatusCode::CONFLICT,
+            "consolidation already in progress",
+            "consolidation_in_progress",
+        ),
+        Err(error) => memory_error_response(error),
     }
 }
 
@@ -716,12 +721,17 @@ fn bad_request(message: &str) -> Response {
 /// Centralized `MemoryError` → HTTP mapping for store failures.
 ///
 /// [`MemoryError::Config`] carries actionable filter/validation messages and
-/// maps to 400; everything else is infrastructure failure and maps to 500
-/// sanitized. Route-specific exceptions (consolidate's unconfigured-provider
-/// 503) are matched before delegating here.
+/// maps to 400; [`MemoryError::Conflict`] carries sanitized state-conflict
+/// messages and maps to 409, matching the supersede endpoint's
+/// `already_superseded` convention; everything else is infrastructure failure
+/// and maps to 500 sanitized. Route-specific exceptions (consolidate's
+/// unconfigured-provider 503) are matched before delegating here.
 fn memory_error_response(error: MemoryError) -> Response {
     match error {
         MemoryError::Config(message) => bad_request(&message),
+        MemoryError::Conflict(message) => {
+            error_response(StatusCode::CONFLICT, message, "already_superseded")
+        }
         error => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &error.to_string(),
@@ -1001,14 +1011,14 @@ use crate::memory::{
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"]["message"].is_string());
 
-        let missing = format!("/entries/{}", Uuid::new_v4());
-        let (status, body) = request(
-            app,
-            "PATCH",
-            &missing,
-            Some(json!({"content": "valid content", "memory_type": "fact"})),
-        )
-        .await;
+    let missing = format!("/entries/{}", Uuid::new_v4());
+    let (status, body) = request(
+        app,
+        "PATCH",
+        &missing,
+        Some(json!({"content": "valid realistic content", "memory_type": "fact"})),
+    )
+    .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["type"], "not_found");
     }
@@ -1389,5 +1399,84 @@ async fn consolidate_resolves_pair_through_auto_extract_fallback() {
     assert_eq!(counts["merged"], 0);
     assert_eq!(counts["superseded"], 0);
     assert_eq!(counts["kept"], 1);
+}
+
+#[tokio::test]
+async fn consolidate_reports_conflict_while_pass_is_running() {
+    let config = MemoryConfig {
+        database_path: ":memory:".to_owned(),
+        consolidation_provider: "fake-provider".to_owned(),
+        consolidation_model: "fake-model".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let system = consolidation_system(config).await;
+    // Hold the shared pass gate as a background pass would, so the manual
+    // trigger must answer 409 instead of racing the running pass.
+    let _gate = system.consolidation_pass_gate.try_lock().unwrap();
+    let app = routes(Arc::clone(&system));
+    let (status, body) = request(app, "POST", "/consolidate", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["type"], "consolidation_in_progress");
+}
+
+#[tokio::test]
+async fn edit_reports_conflict_for_superseded_entry() {
+    let app = routes(system().await);
+    let (_, created) = request(
+        app.clone(),
+        "POST",
+        "/entries",
+        Some(entry("user::superseded", "first useful fact", "fact")),
+    )
+    .await;
+    let (_, replacement) = request(
+        app.clone(),
+        "POST",
+        "/entries",
+        Some(entry("user::superseded", "second useful fact", "fact")),
+    )
+    .await;
+    let target_uri = format!("/entries/{}", created["id"].as_str().unwrap());
+    request(
+        app.clone(),
+        "POST",
+        &format!(
+            "/entries/{}/supersede",
+            created["id"].as_str().unwrap()
+        ),
+        Some(json!({"superseded_by": replacement["id"].as_str().unwrap()})),
+    )
+    .await;
+    let (status, body) = request(
+        app,
+        "PATCH",
+        &target_uri,
+        Some(json!({"content": "revised useful fact", "memory_type": "fact"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["type"], "already_superseded");
+}
+
+#[tokio::test]
+async fn edit_rejects_single_word_content() {
+    let app = routes(system().await);
+    let (_, created) = request(
+        app.clone(),
+        "POST",
+        "/entries",
+        Some(entry("user::edit-words", "original useful fact", "fact")),
+    )
+    .await;
+    let uri = format!("/entries/{}", created["id"].as_str().unwrap());
+    let (status, body) = request(
+        app,
+        "PATCH",
+        &uri,
+        Some(json!({"content": "sufficiently-long-word", "memory_type": "fact"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "invalid_request");
 }
 }

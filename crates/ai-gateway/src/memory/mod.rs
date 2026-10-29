@@ -93,6 +93,14 @@ pub enum MemoryError {
     #[error("memory configuration error: {0}")]
     Config(String),
 
+    /// The request conflicts with the current state of the store.
+    ///
+    /// Carries a sanitized, client-safe static message (no internal detail)
+    /// and maps to HTTP 409 at the admin layer, matching the conflict-status
+    /// convention of the supersede endpoint.
+    #[error("{0}")]
+    Conflict(&'static str),
+
     /// An optional Qdrant operation failed.
     #[error("memory Qdrant error: {0}")]
     Qdrant(String),
@@ -141,6 +149,24 @@ pub enum AdminCreateError {
     Scan(String),
     #[error(transparent)]
     Memory(#[from] MemoryError),
+}
+
+/// Minimum whitespace-separated words for admin-edited and
+/// consolidation-merged content, mirroring the extraction-grade rule in
+/// `extractor.rs` (`MIN_MEMORY_WORDS`, private there). Single words and bare
+/// paths carry no reusable meaning on their own.
+pub(crate) const MIN_MEMORY_WORD_COUNT: usize = 3;
+
+/// Shared extraction-grade word-count check for admin-edited and
+/// consolidation-merged content; character limits are enforced separately by
+/// each caller.
+pub(crate) fn validate_memory_content_words(content: &str) -> Result<(), AdminCreateError> {
+    if content.split_whitespace().count() < MIN_MEMORY_WORD_COUNT {
+        return Err(AdminCreateError::InvalidContent(
+            "content must be at least 3 words".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Memory classification used for namespace assignment and decay behavior.
@@ -611,34 +637,34 @@ impl MemorySystem {
                 "content must be at least 5 characters".to_owned(),
             ));
         }
-        if content_length > 4096 {
-            return Err(AdminCreateError::InvalidContent(
-                "content must be at most 4096 characters".to_owned(),
-            ));
-        }
+    if content_length > 4096 {
+        return Err(AdminCreateError::InvalidContent(
+            "content must be at most 4096 characters".to_owned(),
+        ));
+    }
+    validate_memory_content_words(content)?;
 
-        let config = self.config.read().await.clone();
-        let scan = self
-            .sensitive_scanner
-            .scan_with_options(
-                content,
-                SensitiveScanOptions {
-                    allow_sensitive_storage: config.allow_sensitive_storage,
-                    ..SensitiveScanOptions::default()
-                },
-            )
-            .await
-            .map_err(|error| AdminCreateError::Scan(error.to_string()))?;
-        if scan.contains_sensitive {
-            return Err(AdminCreateError::SensitiveContent);
-        }
+    let config = self.config.read().await.clone();
+    let scan = self
+        .sensitive_scanner
+        .scan_with_options(
+            content,
+            SensitiveScanOptions {
+                allow_sensitive_storage: config.allow_sensitive_storage,
+                ..SensitiveScanOptions::default()
+            },
+        )
+        .await
+        .map_err(|error| AdminCreateError::Scan(error.to_string()))?;
+    if scan.contains_sensitive {
+        return Err(AdminCreateError::SensitiveContent);
+    }
 
-        // Reject superseded entries before any write: fetch and update run
+    // Reject superseded entries before any write: fetch and update run
         // in one blocking task against the same connection so a concurrent
-        // supersession cannot slip between the check and the update. The
-        // rejection reuses `InvalidContent` (client-error shape) because the
-        // admin layer has no conflict arm for edits yet; mapping it to 409
-        // needs a dedicated `AdminCreateError` variant (follow-up).
+        // supersession cannot slip between the check and the update; the
+        // conflict error maps to 409 at the admin layer (the entry is dead
+        // weight and must not be re-indexed).
         let store = Arc::clone(&self.store);
         let content = content.to_owned();
         let memory_type = memory_type.to_owned();
@@ -647,11 +673,11 @@ impl MemorySystem {
             match existing {
                 None => Ok(None),
                 Some(entry) => {
-                    if entry.superseded_by.is_some() {
-                        return Err(MemoryError::Config(
-                            "memory entry is already superseded".to_owned(),
-                        ));
-                    }
+                if entry.superseded_by.is_some() {
+                    return Err(MemoryError::Conflict(
+                        "memory entry is already superseded",
+                    ));
+                }
                     store.update_entry(id, &content, &memory_type)
                 }
             }
@@ -705,16 +731,14 @@ impl MemorySystem {
     /// false, as long as the provider/model pair resolves; it is the caller's
     /// responsibility to answer 503 when the pair does not resolve. When a
     /// background (or other manual) pass is already running, this answers a
-    /// conflict error instead of racing it; the sanitized `Config` message
-    /// maps to a client-facing 4xx at the admin layer without leaking any
-    /// internal detail.
+    /// conflict error instead of racing it; the sanitized `Conflict` message
+    /// maps to HTTP 409 at the admin layer without leaking any internal
+    /// detail.
     pub async fn run_consolidation_now(&self) -> Result<ConsolidationCounts, MemoryError> {
         let runner =
             MemoryConsolidationRunner::from_system(self, Arc::clone(&self.consolidation_pass_gate));
         let Ok(_gate) = runner.pass_gate.try_lock() else {
-            return Err(MemoryError::Config(
-                "consolidation already in progress".to_owned(),
-            ));
+            return Err(MemoryError::Conflict("consolidation already in progress"));
         };
         let context = runner
             .context_for_pass(false)
@@ -1552,16 +1576,24 @@ mod tests {
             .await
             .unwrap();
 
-        let rejected = system
-            .admin_edit(entry.id, "key sk-ABCDEFGHIJKLMNOPQRSTUVWXY", "fact")
-            .await
-            .unwrap_err();
-        assert!(matches!(rejected, AdminCreateError::SensitiveContent));
-        let short = system.admin_edit(entry.id, "tiny", "fact").await.unwrap_err();
-        assert!(matches!(short, AdminCreateError::InvalidContent(_)));
-        let stored = system.store.get_entry_by_id(entry.id).unwrap().unwrap();
-        assert_eq!(stored.content, "Original safe stored content.");
-    }
+    let rejected = system
+        .admin_edit(entry.id, "api key sk-ABCDEFGHIJKLMNOPQRSTUVWXY", "fact")
+        .await
+        .unwrap_err();
+    assert!(matches!(rejected, AdminCreateError::SensitiveContent));
+    let short = system
+        .admin_edit(entry.id, "tiny two", "fact")
+        .await
+        .unwrap_err();
+    assert!(matches!(short, AdminCreateError::InvalidContent(_)));
+    let single_word = system
+        .admin_edit(entry.id, "sufficiently-long-word", "fact")
+        .await
+        .unwrap_err();
+    assert!(matches!(single_word, AdminCreateError::InvalidContent(_)));
+    let stored = system.store.get_entry_by_id(entry.id).unwrap().unwrap();
+    assert_eq!(stored.content, "Original safe stored content.");
+}
 
     #[tokio::test]
     async fn admin_edit_updates_store_and_tier_observes_delete_then_reindex() {
@@ -1657,12 +1689,12 @@ mod tests {
             .admin_edit(source.id, "Attempting to edit dead weight.", "fact")
             .await
             .unwrap_err();
-        match error {
-            AdminCreateError::Memory(MemoryError::Config(message)) => {
-                assert_eq!(message, "memory entry is already superseded");
-            }
-            other => panic!("expected superseded-entry conflict, got {other:?}"),
+    match error {
+        AdminCreateError::Memory(MemoryError::Conflict(message)) => {
+            assert_eq!(message, "memory entry is already superseded");
         }
+        other => panic!("expected superseded-entry conflict, got {other:?}"),
+    }
 
         // No write, no re-index: content unchanged and no new tier events
         // beyond the two create-index calls.
