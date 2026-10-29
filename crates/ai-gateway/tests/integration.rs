@@ -797,11 +797,11 @@ fn assert_stream_has_provider_content(chunks: &[serde_json::Value]) {
 /// behavioral guarantee is that the configured stream works end-to-end.)
 #[tokio::test]
 async fn test_streaming_custom_keepalive_interval_produces_working_stream() {
-    let mock = start_streaming_mock().await;
-    let app = build_app(streaming_keepalive_config(&mock.uri(), 5)).await;
+let mock = start_streaming_mock().await;
+let app = build_app(streaming_keepalive_config(&mock.uri(), 5)).await;
 
-    let chunks = post_stream(app).await;
-    assert_stream_has_provider_content(&chunks);
+let chunks = post_stream(app).await;
+assert_stream_has_provider_content(&chunks);
 }
 
 /// Req 2.5: a keep-alive interval of 0 disables the custom interval and falls
@@ -809,11 +809,11 @@ async fn test_streaming_custom_keepalive_interval_produces_working_stream() {
 /// streams the expected chunks.
 #[tokio::test]
 async fn test_streaming_keepalive_interval_zero_falls_back_to_default() {
-    let mock = start_streaming_mock().await;
-    let app = build_app(streaming_keepalive_config(&mock.uri(), 0)).await;
+let mock = start_streaming_mock().await;
+let app = build_app(streaming_keepalive_config(&mock.uri(), 0)).await;
 
-    let chunks = post_stream(app).await;
-    assert_stream_has_provider_content(&chunks);
+let chunks = post_stream(app).await;
+assert_stream_has_provider_content(&chunks);
 }
 
 // ---------------------------------------------------------------------------
@@ -942,10 +942,98 @@ async fn test_streaming_ttfb_timeout_emits_error_event_then_done() {
         "error frame must include a trace_id for correlation (Req 5.5)"
     );
 
-    // The first data line is the synthetic early event (role delta, no content),
-    // proving the client was already in SSE mode before the error frame.
-    let first_json: serde_json::Value = serde_json::from_str(&data_lines[0]).unwrap();
-    assert_eq!(first_json["choices"][0]["delta"]["role"], "assistant");
+// The first data line is the synthetic early event (role delta, no content),
+// proving the client was already in SSE mode before the error frame.
+let first_json: serde_json::Value = serde_json::from_str(&data_lines[0]).unwrap();
+assert_eq!(first_json["choices"][0]["delta"]["role"], "assistant");
+}
+
+// ---------------------------------------------------------------------------
+// 11b. Data-carrying heartbeat chunks (streaming-heartbeat-chunks)
+// ---------------------------------------------------------------------------
+
+/// Req 1/3 (buffered site A): when routing takes longer than
+/// `heartbeat_interval_seconds` and the relay produces no frames, the stream
+/// carries empty-delta `data:` heartbeat chunks between the early event and
+/// the final replay so data-aware client timers (e.g. Kilo's chunkTimeout)
+/// reset instead of aborting. The 3s mock delay is real wall-clock time.
+#[tokio::test]
+async fn test_streaming_buffered_dispatch_emits_heartbeat_chunks_during_silence() {
+    let mock = start_slow_streaming_mock(3).await;
+    let mut cfg = streaming_test_config(&mock.uri(), true);
+    cfg.streaming = Some(StreamingConfig {
+        // 1s heartbeat < 3s mock delay => at least one heartbeat fires.
+        heartbeat_interval_seconds: 1,
+        ..cfg.streaming.unwrap()
+    });
+    let app = build_app(cfg).await;
+
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(streaming_request_body())
+        .unwrap();
+    let (status, raw) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let chunks = parse_sse_chunks(&raw);
+    assert!(
+        chunks.iter().any(|c| {
+            let delta = c["choices"][0]["delta"].as_object();
+            delta.is_some_and(|d| d.is_empty())
+                // The replay's terminal chunk has an empty delta too, but it
+                // carries finish_reason; heartbeats always have finish_reason
+                // null.
+                && c["choices"][0]["finish_reason"].is_null()
+        }),
+        "expected at least one empty-delta heartbeat chunk, got:\n{}",
+        String::from_utf8_lossy(&raw)
+    );
+    // The final replay still reconstructs the provider content (Req 2).
+    let content: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(content, "too late", "replay reconstructs the slow mock's content");
+    // Heartbeat chunks carry the shared id, not a foreign id.
+    let early_id = chunks[0]["id"].as_str().unwrap();
+    assert!(chunks.iter().all(|c| c["id"].as_str() == Some(early_id)));
+}
+
+/// Req 3 (disable switch): `heartbeat_interval_seconds: 0` keeps the legacy
+/// silent wait — no empty-delta chunks appear between the early event and
+/// the replay.
+#[tokio::test]
+async fn test_streaming_heartbeat_zero_disables_heartbeat_chunks() {
+    let mock = start_slow_streaming_mock(2).await;
+    let mut cfg = streaming_test_config(&mock.uri(), true);
+    cfg.streaming = Some(StreamingConfig {
+        heartbeat_interval_seconds: 0,
+        ..cfg.streaming.unwrap()
+    });
+    let app = build_app(cfg).await;
+
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(streaming_request_body())
+        .unwrap();
+    let (status, raw) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let chunks = parse_sse_chunks(&raw);
+    assert!(
+        chunks.iter().all(|c| {
+            let delta = c["choices"][0]["delta"].as_object();
+            !(delta.is_some_and(|d| d.is_empty())
+                && c["choices"][0]["finish_reason"].is_null())
+        }),
+        "no empty-delta heartbeat chunk expected when disabled, got:\n{}",
+        String::from_utf8_lossy(&raw)
+    );
+    let content: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(content, "too late", "replay reconstructs the slow mock's content");
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,13 +1123,13 @@ async fn test_streaming_passthrough_forwards_provider_chunks_and_terminates() {
     let (status, raw) = send(app, req).await;
     assert_eq!(status, StatusCode::OK, "pass-through stream returns 200");
 
-    // The forwarded provider chunks reconstruct the upstream content (Req 3.2).
-    let chunks = parse_sse_chunks(&raw);
-    assert_stream_has_provider_content(&chunks);
+// The forwarded provider chunks reconstruct the upstream content (Req 3.2).
+let chunks = parse_sse_chunks(&raw);
+assert_stream_has_provider_content(&chunks);
 
-    // The first data line is the synthetic early event (role delta, fresh id),
-    // proving the client was in SSE mode before any provider chunk arrived.
-    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+// The first data line is the synthetic early event (role delta, fresh id),
+// proving the client was already in SSE mode before any provider chunk arrived.
+assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
     assert_ne!(
         chunks[0]["id"], MOCK_PROVIDER_ID,
         "early event uses a fresh id"
@@ -1176,10 +1264,10 @@ async fn test_streaming_bedrock_uses_buffered_mode() {
     // rather than the Bedrock Mantle endpoint.
     let app = build_app(cfg).await;
 
-    let chunks = post_stream(app).await;
-    // Buffered re-chunk path reconstructs the provider's content; a pass-through
-    // attempt on a JSON body would have yielded no content chunks at all.
-    assert_stream_has_provider_content(&chunks);
+let chunks = post_stream(app).await;
+// Buffered re-chunk path reconstructs the provider's content; a pass-through
+// attempt on a JSON body would have yielded no content chunks at all.
+assert_stream_has_provider_content(&chunks);
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,13 +1391,13 @@ async fn test_streaming_failover_before_content_is_transparent() {
     let (status, raw) = send(app, req).await;
     assert_eq!(status, StatusCode::OK, "failover stream returns 200");
 
-    let chunks = parse_sse_chunks(&raw);
+let chunks = parse_sse_chunks(&raw);
 
-    // The backup provider's content is delivered intact (Req 4.1).
-    assert_stream_has_provider_content(&chunks);
+// The backup provider's content is delivered intact (Req 4.1).
+assert_stream_has_provider_content(&chunks);
 
-    // Exactly ONE role event — the synthetic early event. The pre-content
-    // failover must NOT emit a second `role: assistant` event (Req 4.4).
+// Exactly ONE role event — the synthetic early event. The pre-content
+// failover must NOT emit a second `role: assistant` event (Req 4.4).
     let role_events = chunks
         .iter()
         .filter(|c| c["choices"][0]["delta"]["role"] == "assistant")
