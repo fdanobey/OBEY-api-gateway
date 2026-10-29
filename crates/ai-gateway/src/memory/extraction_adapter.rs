@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::memory::extractor::{
-    ExtractionMessage, ExtractionRole, MemoryExtractionProvider, MemoryExtractionProviderError,
+    ExtractionMessage, ExtractionMessageOrigin, ExtractionRole, MemoryExtractionProvider, MemoryExtractionProviderError,
     MemoryExtractionProviderRequest, StructuredMemoryCandidate, MEMORY_EXTRACTION_INTERNAL_TAG,
 };
 use crate::memory::MemoryType;
@@ -53,6 +53,9 @@ Respond as a JSON array of objects with "content" and "memory_type" fields:
 [{"content": "...", "memory_type": "preference"}, ...]
 
 If nothing durable and reusable can be extracted, respond with an empty array: []"#;
+
+/// System prompt for raw, strictly parsed consolidation decisions.
+const CONSOLIDATION_SYSTEM_PROMPT: &str = "You are a memory consolidation assistant. Follow the user's decision schema exactly. Respond ONLY with a JSON array of merge, supersede, or keep decisions; do not extract memories or wrap the array in prose or markdown.";
 
 /// Production adapter that calls a configured provider's chat-completions
 /// endpoint to extract structured memories from conversation messages.
@@ -94,12 +97,13 @@ impl GatewayExtractionAdapter {
 
     /// Build the outgoing request body as serde_json::Value.
     fn build_request_body(model: &str, messages: &[ExtractionMessage]) -> serde_json::Value {
+        let consolidation = Self::is_consolidation_request(messages);
+        let system_prompt = if consolidation { CONSOLIDATION_SYSTEM_PROMPT } else { EXTRACTION_SYSTEM_PROMPT };
         let mut chat_messages = Vec::with_capacity(messages.len() + 1);
 
-        // System prompt
         chat_messages.push(serde_json::json!({
             "role": "system",
-            "content": EXTRACTION_SYSTEM_PROMPT,
+            "content": system_prompt,
         }));
 
         // Conversation messages
@@ -121,6 +125,15 @@ impl GatewayExtractionAdapter {
             "temperature": 0.1,
             "stream": false,
         })
+    }
+
+    fn is_consolidation_request(messages: &[ExtractionMessage]) -> bool {
+        messages.len() == 1
+            && messages[0].origin == ExtractionMessageOrigin::Injected
+            && serde_json::from_str::<serde_json::Value>(&messages[0].content)
+                .ok()
+                .is_some_and(|value| value.get("entries").is_some_and(serde_json::Value::is_array)
+                    && value.get("instructions").is_some_and(serde_json::Value::is_string))
     }
 
     /// Parse the LLM response content into structured memory candidates.
@@ -270,6 +283,23 @@ impl GatewayExtractionAdapter {
             _ => None,
         }
     }
+    fn parse_provider_payload(response_json: &serde_json::Value, consolidation: bool) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+        let content = response_json
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if consolidation {
+            Ok(vec![StructuredMemoryCandidate {
+                content: content.to_owned(),
+                memory_type: MemoryType::Fact,
+            }])
+        } else {
+            Self::parse_response(content)
+        }
+    }
 }
 
 #[async_trait]
@@ -310,22 +340,14 @@ impl MemoryExtractionProvider for GatewayExtractionAdapter {
         let response = builder
             .send()
             .await
-            .map_err(|e| MemoryExtractionProviderError {
-                message: format!("extraction HTTP request failed: {e}"),
+            .map_err(|_| MemoryExtractionProviderError {
+                message: "extraction HTTP request failed".to_owned(),
             })?;
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unknown error".to_string());
             return Err(MemoryExtractionProviderError {
-                message: format!(
-                    "extraction provider returned HTTP {}: {}",
-                    status.as_u16(),
-                    error_text
-                ),
+                message: format!("extraction provider returned HTTP {}", status.as_u16()),
             });
         }
 
@@ -333,20 +355,11 @@ impl MemoryExtractionProvider for GatewayExtractionAdapter {
             response
                 .json()
                 .await
-                .map_err(|e| MemoryExtractionProviderError {
-                    message: format!("failed to parse extraction response body: {e}"),
+                .map_err(|_| MemoryExtractionProviderError {
+                    message: "failed to parse extraction response body".to_owned(),
                 })?;
 
-        // Extract the assistant message content from the OpenAI-format response
-        let content = response_json
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-
-        Self::parse_response(content)
+        Self::parse_provider_payload(&response_json, Self::is_consolidation_request(&request.messages))
     }
 }
 
@@ -390,5 +403,103 @@ mod tests {
         let candidates = GatewayExtractionAdapter::parse_response(input)
             .expect("unparseable output degrades to Ok(empty), not Err");
         assert!(candidates.is_empty());
+    }
+
+    fn consolidation_messages() -> Vec<ExtractionMessage> {
+        vec![ExtractionMessage::injected(
+            ExtractionRole::User,
+            serde_json::json!({
+                "entries": [{"id": "00000000-0000-0000-0000-000000000001", "content": "a"}],
+                "instructions": "decide"
+            })
+            .to_string(),
+        )]
+    }
+
+    fn extraction_messages() -> Vec<ExtractionMessage> {
+        vec![
+            ExtractionMessage::caller(ExtractionRole::User, "hello"),
+            ExtractionMessage::caller(ExtractionRole::Assistant, "hi"),
+        ]
+    }
+
+    fn provider_payload(content: &str) -> serde_json::Value {
+        serde_json::json!({ "choices": [{ "message": { "content": content } }] })
+    }
+
+    #[test]
+    fn consolidation_request_detection_requires_injected_entries_payload() {
+        assert!(GatewayExtractionAdapter::is_consolidation_request(
+            &consolidation_messages()
+        ));
+        // Caller-origin conversation is never treated as consolidation even
+        // when its text happens to parse as an entries payload.
+        let caller_entries = vec![ExtractionMessage::caller(
+            ExtractionRole::User,
+            consolidation_messages()[0].content.clone(),
+        )];
+        assert!(!GatewayExtractionAdapter::is_consolidation_request(&caller_entries));
+        assert!(!GatewayExtractionAdapter::is_consolidation_request(&extraction_messages()));
+    }
+
+    #[test]
+    fn consolidation_payload_returns_raw_decision_text() {
+        // A canned provider response carrying strict decision JSON must come
+        // back verbatim as one candidate so parse_decisions sees the raw text
+        // (candidate {content, memory_type} parsing is bypassed).
+        let raw = "[{\"action\":\"keep\",\"id\":\"00000000-0000-0000-0000-000000000001\"}]";
+        let candidates = GatewayExtractionAdapter::parse_provider_payload(
+            &provider_payload(raw),
+            true,
+        )
+        .expect("consolidation payload parses");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].content, raw);
+    }
+
+    #[test]
+    fn consolidation_payload_prose_wrapped_decision_text_is_preserved() {
+        let raw = "Decisions:\n[{\"action\":\"keep\",\"id\":\"00000000-0000-0000-0000-000000000001\"}]";
+        let candidates = GatewayExtractionAdapter::parse_provider_payload(
+            &provider_payload(raw),
+            true,
+        )
+        .expect("consolidation payload parses");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].content, raw);
+    }
+
+    #[test]
+    fn extraction_payload_keeps_candidate_parsing() {
+        let raw = "[{\"content\":\"uses snake_case\",\"memory_type\":\"preference\"}]";
+        let candidates = GatewayExtractionAdapter::parse_provider_payload(
+            &provider_payload(raw),
+            false,
+        )
+        .expect("extraction payload parses");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].content, "uses snake_case");
+        assert_eq!(candidates[0].memory_type, MemoryType::Preference);
+    }
+
+    #[test]
+    fn build_request_body_selects_prompt_by_request_kind() {
+        let consolidation = GatewayExtractionAdapter::build_request_body(
+            "model",
+            &consolidation_messages(),
+        );
+        assert_eq!(
+            consolidation["messages"][0]["content"],
+            CONSOLIDATION_SYSTEM_PROMPT
+        );
+        assert_eq!(consolidation["messages"].as_array().unwrap().len(), 2);
+
+        let extraction =
+            GatewayExtractionAdapter::build_request_body("model", &extraction_messages());
+        assert_eq!(
+            extraction["messages"][0]["content"],
+            EXTRACTION_SYSTEM_PROMPT
+        );
+        assert_eq!(extraction["messages"].as_array().unwrap().len(), 3);
     }
 }

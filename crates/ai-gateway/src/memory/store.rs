@@ -21,7 +21,9 @@ use super::{MemoryEntry, MemoryError, MemoryType, ScoredMemory};
 
 const SCHEMA_VERSION: i64 = 4;
 pub const DEFAULT_MAX_MEMORIES_PER_NAMESPACE: usize = 1_000;
-const MAX_LIST_LIMIT: usize = 200;
+/// Maximum rows one public listing page may return; internal callers that
+/// need complete listings (consolidation) paginate with this page size.
+pub(crate) const MAX_LIST_LIMIT: usize = 200;
 const MAX_RETRIEVAL_CANDIDATES: usize = 50;
 const DEFAULT_MIN_RELEVANCE_THRESHOLD: f64 = 0.25;
 pub(crate) const CONTEXT_SCOPE_BOOST: f64 = 1.5;
@@ -340,8 +342,8 @@ impl MemoryStore {
     /// Used only by the consolidation engine: the merged entry is inserted and
     /// every `source_ids` row is annotated with `superseded_by` inside a single
     /// transaction, so a crash can never leave a merged entry without its
-    /// supersession links or vice versa. Rows already superseded, missing ids,
-    /// and self-supersession are skipped, mirroring [`Self::mark_superseded`].
+    /// supersession links or vice versa. Every source must be distinct, present,
+    /// active, and in the same namespace or the transaction is rolled back.
     pub fn create_merged_entry_with_supersession(
         &self,
         namespace: &str,
@@ -390,10 +392,16 @@ impl MemoryStore {
         {
             let mut statement = transaction.prepare(
                 "UPDATE memories SET superseded_by = ?2
-                 WHERE id = ?1 AND superseded_by IS NULL AND id <> ?2",
+                 WHERE id = ?1 AND namespace = ?3 AND superseded_by IS NULL AND id <> ?2",
             )?;
+            if source_ids.is_empty() {
+                return Err(MemoryError::Config("merge requires active source entries".to_owned()));
+            }
+            let mut seen = std::collections::HashSet::new();
             for id in source_ids {
-                statement.execute(params![id.to_string(), entry.id.to_string()])?;
+                if !seen.insert(id) || statement.execute(params![id.to_string(), entry.id.to_string(), namespace])? != 1 {
+                    return Err(MemoryError::Config("merge source is missing or already superseded".to_owned()));
+                }
             }
         }
         transaction.commit()?;
@@ -473,11 +481,12 @@ impl MemoryStore {
 /// The query is escaped exactly like [`MemoryStore::retrieve`]: each
 /// whitespace-separated token is stripped of non-alphanumeric edge characters,
 /// wrapped in double quotes with internal quotes doubled, and tokens are
-/// joined with `OR`, so FTS5-special characters in user input can never
-/// produce invalid MATCH syntax. If SQLite still rejects the statement the
-/// error surfaces as [`MemoryError::Store`] (the established rusqlite
-/// mapping), never a panic. Results join back to `memories` for full rows and
-/// are ordered by bm25 relevance ascending (best first), like retrieval.
+    /// joined with `OR`, so ordinary FTS5 operators cannot produce invalid
+    /// MATCH syntax. If SQLite nevertheless rejects the sanitized MATCH query,
+    /// it becomes [`MemoryError::Config`] (HTTP 400) instead of a silent listing
+    /// fallback. This is a defensive branch: quoted tokens normally parse.
+    /// Results join back to `memories` for full rows and
+    /// are ordered by bm25 relevance ascending (best first), like retrieval.
 /// Namespace, memory type, and supersession filters are applied server-side;
 /// `include_superseded = false` adds `superseded_by IS NULL`. An empty or
 /// whitespace-only query falls back to the default filtered listing
@@ -518,13 +527,14 @@ pub fn search_entries(
             AND (?2 IS NULL OR m.namespace = ?2)
             AND (?3 IS NULL OR m.memory_type = ?3)
             AND (?4 = 1 OR m.superseded_by IS NULL)",
-            params![
-                fts_query,
-                namespace_filter,
-                memory_type_filter,
-                superseded_flag
-            ],
-        )?;
+        params![
+            fts_query,
+            namespace_filter,
+            memory_type_filter,
+            superseded_flag
+        ],
+        )
+        .map_err(map_fts_match_error)?;
         let mut statement = conn.prepare(
             "SELECT m.id, m.namespace, m.content, m.memory_type, m.relevance_score,
             m.created_at, m.last_accessed_at, m.access_count, m.source_request_id,
@@ -538,7 +548,7 @@ pub fn search_entries(
             AND (?4 = 1 OR m.superseded_by IS NULL)
             ORDER BY raw_rank ASC, m.rowid ASC
             LIMIT ?5 OFFSET ?6",
-        )?;
+        ).map_err(map_fts_match_error)?;
         let entries = statement
             .query_map(
                 params![
@@ -550,7 +560,8 @@ pub fn search_entries(
                     sql_offset
                 ],
                 memory_entry_from_row,
-            )?
+            )
+            .map_err(map_fts_match_error)?
             .collect::<Result<Vec<_>, _>>()?;
         (total_count, entries)
     } else {
@@ -610,8 +621,9 @@ pub fn export_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
         updated_at, superseded_by
         FROM memories
         ORDER BY namespace ASC, created_at ASC, id ASC",
-    )?;
-    let entries = statement
+        )
+        .map_err(map_fts_match_error)?;
+        let entries = statement
         .query_map([], memory_entry_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(entries)
@@ -707,15 +719,26 @@ WHERE vector_index_status = 'not_configured'",
     }
 
     pub fn get_entries_by_ids(&self, ids: &[Uuid]) -> Result<Vec<MemoryEntry>, MemoryError> {
-        let mut entries = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(entry) = self.get_entry_by_id(*id)? {
-                if entry.superseded_by.is_none() {
-                    entries.push(entry);
-                }
-            }
+        if ids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(entries)
+        let conn = self.connection()?;
+        let id_strings = ids.iter().map(Uuid::to_string).collect::<Vec<_>>();
+        let placeholders = std::iter::repeat_n("?", id_strings.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, namespace, content, memory_type, relevance_score,
+             created_at, last_accessed_at, access_count, source_request_id,
+             updated_at, superseded_by FROM memories
+             WHERE superseded_by IS NULL AND id IN ({placeholders})"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let found = statement
+            .query_map(rusqlite::params_from_iter(&id_strings), memory_entry_from_row)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| (entry.id, entry))
+            .collect::<std::collections::HashMap<_, _>>();
+        Ok(ids.iter().filter_map(|id| found.get(id).cloned()).collect())
     }
 
     pub fn retrieve(
@@ -1203,6 +1226,16 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 fn sanitize_vector_error(error: &str) -> String {
     let first_line = error.lines().next().unwrap_or("vector indexing failed");
     first_line.chars().take(512).collect()
+}
+
+fn map_fts_match_error(error: impl Into<MemoryError>) -> MemoryError {
+    let error = error.into();
+    if let MemoryError::Store(rusqlite::Error::SqliteFailure(_, Some(message))) = &error {
+        if message.contains("fts5: syntax error") || message.contains("unterminated string") {
+            return MemoryError::Config("invalid FTS5 search query; use plain words without operators".to_owned());
+        }
+    }
+    error
 }
 
 fn fts_query_from_user_text(query: &str) -> Option<String> {
@@ -2182,6 +2215,135 @@ fn vector_candidate_recheck_excludes_superseded_entries() {
 }
 
 #[test]
+fn merged_entry_supersession_is_transactional_and_namespace_guarded() {
+    let store = in_memory_store();
+    let first = store
+        .store_entry(entry(1, "user::merge", "alpha one shared"), None)
+        .unwrap();
+    let second = store
+        .store_entry(entry(2, "user::merge", "alpha two shared"), None)
+        .unwrap();
+
+    let merged = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "alpha merged summary",
+            MemoryType::Fact,
+            &[first.id, second.id],
+        )
+        .unwrap();
+    assert_eq!(merged.namespace, "user::merge");
+    for source in [&first, &second] {
+        let row = store.get_entry_by_id(source.id).unwrap().unwrap();
+        assert_eq!(row.superseded_by, Some(merged.id));
+    }
+
+    // A source id that exists in a DIFFERENT namespace must be rejected inside
+    // the transaction (namespace guard), with nothing committed.
+    let foreign = store
+        .store_entry(entry(3, "user::other", "alpha three shared"), None)
+        .unwrap();
+    let local = store
+        .store_entry(entry(4, "user::merge", "alpha four shared"), None)
+        .unwrap();
+    let error = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "alpha second summary",
+            MemoryType::Fact,
+            &[local.id, foreign.id],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Config(_)), "got {error:?}");
+    // Rollback verified: no merged row appeared and no source was marked.
+    assert!(store.get_entry_by_id(local.id).unwrap().unwrap().superseded_by.is_none());
+    assert!(store.get_entry_by_id(foreign.id).unwrap().unwrap().superseded_by.is_none());
+    // Active rows are exactly the first merge plus `local`.
+    assert_eq!(store.list_entries("user::merge", 50, 0).unwrap().entries.len(), 2);
+}
+
+#[test]
+fn merged_entry_rejects_unknown_superseded_or_duplicate_sources() {
+    let store = in_memory_store();
+    let first = store
+        .store_entry(entry(1, "user::merge", "beta one shared"), None)
+        .unwrap();
+    let second = store
+        .store_entry(entry(2, "user::merge", "beta two shared"), None)
+        .unwrap();
+    let survivor = store
+        .store_entry(entry(3, "user::merge", "beta three shared"), None)
+        .unwrap();
+    store
+        .mark_superseded(&[first.id], second.id)
+        .unwrap();
+
+    // Unknown id.
+    let error = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "beta merged summary",
+            MemoryType::Fact,
+            &[Uuid::new_v4()],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Config(_)));
+
+    // Already-superseded source: transaction must roll back entirely.
+    let error = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "beta merged summary",
+            MemoryType::Fact,
+            &[survivor.id, first.id],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Config(_)), "got {error:?}");
+    assert!(store.get_entry_by_id(survivor.id).unwrap().unwrap().superseded_by.is_none());
+
+    // Duplicate source ids.
+    let error = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "beta merged summary",
+            MemoryType::Fact,
+            &[second.id, second.id],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Config(_)));
+
+    // Empty source list.
+    let error = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "beta merged summary",
+            MemoryType::Fact,
+            &[],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Config(_)));
+
+    // Nothing above committed any merge; active rows are second + survivor.
+    assert_eq!(store.list_entries("user::merge", 50, 0).unwrap().entries.len(), 2);
+}
+
+#[test]
+fn get_entries_by_ids_returns_input_order_and_skips_missing() {
+    let store = in_memory_store();
+    let first = store
+        .store_entry(entry(1, "user::ids", "id lookup one"), None)
+        .unwrap();
+    let second = store
+        .store_entry(entry(2, "user::ids", "id lookup two"), None)
+        .unwrap();
+    let missing = Uuid::new_v4();
+
+    let results = store.get_entries_by_ids(&[first.id, missing, second.id]).unwrap();
+    assert_eq!(results, vec![first.clone(), second.clone()]);
+    assert!(store.get_entries_by_ids(&[]).unwrap().is_empty());
+}
+
+#[test]
 fn update_entry_round_trips_and_reindexes_fts() {
     let store = in_memory_store();
     let saved = store
@@ -2441,6 +2603,37 @@ fn search_with_fts5_special_characters_never_panics() {
         .search_entries("\"ands\"", None, None, false, MAX_LIST_LIMIT, 0)
         .unwrap();
     assert_eq!(page.total_count, 1);
+}
+
+#[test]
+fn fts_syntax_errors_map_to_config_not_silent_fallback() {
+    // All public input is sanitized to quoted literals, so a sanitized MATCH
+    // query cannot normally produce an FTS5 syntax error; this exercises the
+    // defensive branch directly with the raw SQLite failure it guards.
+    let fts_failure = MemoryError::Store(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some("fts5: syntax error near \"OR\"".to_owned()),
+    ));
+    match map_fts_match_error(fts_failure) {
+        MemoryError::Config(message) => assert!(message.contains("FTS5")),
+        other => panic!("expected Config, got {other:?}"),
+    }
+    let unterminated = MemoryError::Store(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some("unterminated string".to_owned()),
+    ));
+    assert!(matches!(map_fts_match_error(unterminated), MemoryError::Config(_)));
+    // Unrelated SQLite failures pass through unchanged.
+    let unrelated = MemoryError::Store(rusqlite::Error::QueryReturnedNoRows);
+    assert!(matches!(
+        map_fts_match_error(unrelated),
+        MemoryError::Store(rusqlite::Error::QueryReturnedNoRows)
+    ));
+    // The sanitizer itself keeps quoting every token.
+    assert_eq!(
+        fts_query_from_user_text("a\"b AND *c*"),
+        Some("\"a\"\"b\" OR \"AND\" OR \"c\"".to_owned())
+    );
 }
 
 #[test]

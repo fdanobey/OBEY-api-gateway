@@ -2,16 +2,15 @@
 //!
 //! The engine groups active entries within a namespace deterministically, asks
 //! the extraction provider for strict-JSON merge/supersede/keep decisions, and
-//! applies them transactionally. Grouping and parsing are pure functions; every
-//! provider failure or parse failure skips only its batch with sanitized
-//! logging and the pass continues.
+//! applies each merge transactionally. Grouping and parsing are pure functions;
+//! provider failure or invalid decisions skip a batch before writes. A write
+//! failure after prior decisions is reported with the actual committed counts.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use super::extractor::{
@@ -245,6 +244,7 @@ pub struct ConsolidationContext {
     pub scanner: Arc<SensitiveContentScanner>,
     pub vector_tier: Option<Arc<dyn MemoryVectorTier>>,
     pub allow_sensitive_storage: bool,
+    /// Legacy configuration snapshot retained for callers; consolidation has its own scan limit.
     pub max_memories_per_namespace: usize,
     pub provider_name: String,
     pub model: String,
@@ -276,19 +276,27 @@ pub async fn run_consolidation(
         spawn_store_task(move || store.list_namespaces()).await?
     };
 
-    let semaphore = Arc::new(Semaphore::new(context.maximum_concurrent_provider_calls));
     let mut counts = ConsolidationCounts::default();
     for namespace in namespaces {
         let namespace_name = namespace.namespace.clone();
-        let page = {
-            let store = Arc::clone(&context.store);
-            let namespace = namespace_name.clone();
-            spawn_store_task(move || {
-                store.list_entries(&namespace, MAX_ENTRIES_PER_NAMESPACE, 0)
-            })
-            .await?
-        };
-        let groups = group_candidates(&page.entries);
+        let mut entries = Vec::new();
+        while entries.len() < MAX_ENTRIES_PER_NAMESPACE {
+            let offset = entries.len();
+            let page = {
+                let store = Arc::clone(&context.store);
+                let namespace = namespace_name.clone();
+                spawn_store_task(move || {
+                    store.list_entries(&namespace, MAX_ENTRIES_PER_NAMESPACE - offset, offset)
+                })
+                .await?
+            };
+            let page_len = page.entries.len();
+            entries.extend(page.entries);
+            if page_len < page.limit || entries.len() >= page.total_count as usize {
+                break;
+            }
+        }
+        let groups = group_candidates(&entries);
         for mut group in groups {
             if group.len() < 2 {
                 counts.kept += 1;
@@ -297,25 +305,17 @@ pub async fn run_consolidation(
             // Hard cap per provider call; overflow entries are not sent and
             // stay untouched, so they are accounted as kept.
             if group.len() > MAX_ENTRIES_PER_PROVIDER_CALL {
-                let overflow = group.len() - MAX_ENTRIES_PER_PROVIDER_CALL;
-                counts.kept += u32::try_from(overflow).unwrap_or(u32::MAX);
-                group.truncate(MAX_ENTRIES_PER_PROVIDER_CALL);
+            let overflow = group.len() - MAX_ENTRIES_PER_PROVIDER_CALL;
+            counts.kept = saturating_count(counts.kept as usize + overflow);
+            group.truncate(MAX_ENTRIES_PER_PROVIDER_CALL);
             }
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    tracing::warn!("memory consolidation semaphore closed");
-                    counts.provider_errors += 1;
-                    continue;
-                }
-            };
             let result = process_batch(&context, &group).await;
-            drop(permit);
             match result {
                 BatchOutcome::Applied(applied) => {
-                    counts.merged += applied.merged;
-                    counts.superseded += applied.superseded;
-                    counts.kept += applied.kept;
+                    counts.merged = saturating_count(counts.merged as usize + applied.merged);
+                    counts.superseded =
+                        saturating_count(counts.superseded as usize + applied.superseded);
+                    counts.kept = saturating_count(counts.kept as usize + applied.kept);
                 }
                 BatchOutcome::ProviderError => counts.provider_errors += 1,
                 BatchOutcome::BatchSkipped => counts.skipped_batches += 1,
@@ -333,17 +333,21 @@ enum BatchOutcome {
 
 #[derive(Default)]
 struct AppliedCounts {
-    merged: u32,
-    superseded: u32,
-    kept: u32,
+    merged: usize,
+    superseded: usize,
+    kept: usize,
+}
+
+fn saturating_count(count: usize) -> u32 {
+    count.min(u32::MAX as usize) as u32
 }
 
 /// Ask the provider for decisions on one batch and apply them.
 ///
 /// The provider returns raw decision JSON through its candidate contents (the
-/// shared [`MemoryExtractionProvider`] boundary is text-in/text-out); strict
-/// parsing and application follow. Any provider, parse, scan, or store failure
-/// skips the batch; nothing is ever partially applied.
+/// shared [`MemoryExtractionProvider`] boundary is text-in/text-out). All
+/// decisions are checked before writing; if a later write fails, committed
+/// decisions retain their counts and the remaining decisions are abandoned.
 async fn process_batch(context: &ConsolidationContext, group: &[MemoryEntry]) -> BatchOutcome {
     let valid_ids = group.iter().map(|entry| entry.id).collect::<HashSet<_>>();
     let request = MemoryExtractionProviderRequest {
@@ -367,8 +371,8 @@ async fn process_batch(context: &ConsolidationContext, group: &[MemoryEntry]) ->
             tracing::warn!("memory consolidation provider timed out");
             return BatchOutcome::ProviderError;
         }
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "memory consolidation provider failed");
+        Ok(Err(_error)) => {
+            tracing::warn!("memory consolidation provider failed");
             return BatchOutcome::ProviderError;
         }
         Ok(Ok(candidates)) => candidates
@@ -386,92 +390,83 @@ async fn process_batch(context: &ConsolidationContext, group: &[MemoryEntry]) ->
         }
     };
 
+    for decision in &decisions {
+        if let Decision::Merge { source_ids, merged_content } = decision {
+            if !validate_merge(context, group, source_ids, merged_content).await {
+                return BatchOutcome::BatchSkipped;
+            }
+        }
+    }
+
     let mut applied = AppliedCounts::default();
     for decision in decisions {
-        match decision {
-            Decision::Merge {
-                source_ids,
-                merged_content,
-            } => {
-                if apply_merge(context, group, &source_ids, &merged_content).await {
-                    applied.merged += 1;
-                    applied.superseded += u32::try_from(source_ids.len()).unwrap_or(u32::MAX);
-                } else {
-                    return BatchOutcome::BatchSkipped;
-                }
+        if !apply_decision(context, group, decision, &mut applied).await {
+            if applied.merged == 0 && applied.superseded == 0 && applied.kept == 0 {
+                return BatchOutcome::BatchSkipped;
             }
-            Decision::Supersede {
-                superseded_id,
-                superseded_by_id,
-            } => {
-                let marked = match spawn_store_task({
-                    let store = Arc::clone(&context.store);
-                    move || store.mark_superseded(&[superseded_id], superseded_by_id)
-                })
-                .await
-                {
-                    Ok(marked) => marked,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "memory consolidation supersede failed");
-                        return BatchOutcome::BatchSkipped;
-                    }
-                };
-                applied.superseded += u32::try_from(marked).unwrap_or(u32::MAX);
-                schedule_vector_delete(context, superseded_id).await;
-            }
-            Decision::Keep { id } => {
-                if group.iter().any(|entry| entry.id == id) {
-                    applied.kept += 1;
-                }
-            }
+            tracing::warn!(merged = applied.merged, superseded = applied.superseded, kept = applied.kept, "memory consolidation batch partially applied");
+            break;
         }
     }
     BatchOutcome::Applied(applied)
 }
 
-/// Validate and persist one merge atomically, then update the vector tier.
-///
-/// The merged content must pass the same sensitive scan as manual creation and
-/// share the sources' namespace and type. On any failure the sources stay
-/// untouched and the caller skips the batch.
-async fn apply_merge(
-    context: &ConsolidationContext,
-    group: &[MemoryEntry],
-    source_ids: &[Uuid],
-    merged_content: &str,
-) -> bool {
-    let sources = source_ids
-        .iter()
-        .filter_map(|id| group.iter().find(|entry| &entry.id == id))
-        .collect::<Vec<_>>();
-    if sources.is_empty() {
-        tracing::warn!("memory consolidation merge referenced no known sources");
+async fn apply_decision(context: &ConsolidationContext, group: &[MemoryEntry], decision: Decision, applied: &mut AppliedCounts) -> bool {
+    match decision {
+        Decision::Merge { source_ids, merged_content } => {
+            let Some(marked) = apply_merge(context, group, &source_ids, &merged_content).await else {
+                return false;
+            };
+            applied.merged += 1;
+            applied.superseded += marked;
+        }
+        Decision::Supersede { superseded_id, superseded_by_id } => {
+            let marked = match spawn_store_task({
+                let store = Arc::clone(&context.store);
+                move || store.mark_superseded(&[superseded_id], superseded_by_id)
+            }).await {
+                Ok(marked) => marked,
+                Err(_) => {
+                    tracing::warn!("memory consolidation supersede failed");
+                    return false;
+                }
+            };
+            applied.superseded += marked;
+            if marked != 0 { schedule_vector_delete(context, superseded_id).await; }
+        }
+        Decision::Keep { id } => {
+            if group.iter().any(|entry| entry.id == id) {
+                applied.kept += 1;
+            }
+        }
+    }
+    true
+}
+
+/// Validate a merge before any batch write.
+async fn validate_merge(context: &ConsolidationContext, group: &[MemoryEntry], source_ids: &[Uuid], merged_content: &str) -> bool {
+    let sources = source_ids.iter().filter_map(|id| group.iter().find(|entry| &entry.id == id)).collect::<Vec<_>>();
+    if sources.len() != source_ids.len() || sources.is_empty() || source_ids.iter().collect::<HashSet<_>>().len() != source_ids.len() {
+        tracing::warn!("memory consolidation merge has invalid sources");
         return false;
     }
-    let namespace = sources[0].namespace.clone();
+    let namespace = &sources[0].namespace;
     let memory_type = sources[0].memory_type;
-    if sources
-        .iter()
-        .any(|entry| entry.namespace != namespace || entry.memory_type != memory_type)
-    {
+    if sources.iter().any(|entry| &entry.namespace != namespace || entry.memory_type != memory_type) {
         tracing::warn!("memory consolidation merge mixes namespaces or types");
         return false;
     }
-
-    let scan = match context
-        .scanner
-        .scan_with_options(
-            merged_content,
-            SensitiveScanOptions {
-                allow_sensitive_storage: context.allow_sensitive_storage,
-                ..SensitiveScanOptions::default()
-            },
-        )
-        .await
-    {
+    if !(5..=4096).contains(&merged_content.chars().count()) {
+        tracing::warn!("memory consolidation merged content has invalid length");
+        return false;
+    }
+    let scan = match context.scanner.scan_with_options(merged_content, SensitiveScanOptions {
+        allow_sensitive_storage: context.allow_sensitive_storage,
+        ..SensitiveScanOptions::default()
+    }).await {
         Ok(scan) => scan,
-        Err(error) => {
-            tracing::warn!(error = %error, "memory consolidation sensitive scan failed");
+        Err(_) => {
+            tracing::warn!("memory consolidation sensitive scan failed");
             return false;
         }
     };
@@ -479,29 +474,34 @@ async fn apply_merge(
         tracing::warn!("memory consolidation merged content rejected as sensitive");
         return false;
     }
+    true
+}
 
+/// Persist one prevalidated merge atomically and update vectors.
+///
+/// Returns the number of sources actually marked superseded. The store
+/// helper's transaction requires every source UPDATE to affect exactly one
+/// row (or the whole merge rolls back), so a successful commit marks
+/// exactly `source_ids.len()` rows.
+async fn apply_merge(context: &ConsolidationContext, group: &[MemoryEntry], source_ids: &[Uuid], merged_content: &str) -> Option<usize> {
+    let first = group.iter().find(|entry| entry.id == source_ids[0])?;
+    let namespace = first.namespace.clone();
+    let memory_type = first.memory_type;
     let merged = {
         let store = Arc::clone(&context.store);
-        let namespace = namespace.clone();
         let content = merged_content.to_owned();
         let source_ids = source_ids.to_vec();
-        match spawn_store_task(move || {
-            store.create_merged_entry_with_supersession(&namespace, &content, memory_type, &source_ids)
-        })
-        .await
-        {
+        match spawn_store_task(move || store.create_merged_entry_with_supersession(&namespace, &content, memory_type, &source_ids)).await {
             Ok(merged) => merged,
-            Err(error) => {
-                tracing::warn!(error = %error, "memory consolidation merge write failed");
-                return false;
+            Err(_) => {
+                tracing::warn!("memory consolidation merge write failed");
+                return None;
             }
         }
     };
     schedule_vector_index(context, merged).await;
-    for id in source_ids {
-        schedule_vector_delete(context, *id).await;
-    }
-    true
+    for id in source_ids { schedule_vector_delete(context, *id).await; }
+    Some(source_ids.len())
 }
 
 /// Best-effort vector index of a merged entry; sanitized logging only.
@@ -566,7 +566,9 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::super::extractor::MemoryExtractionProviderError;
+    use crate::memory::extractor::MemoryExtractionProviderError;
+    use crate::memory::store::NewMemoryEntry;
+    use crate::memory::{StructuredMemoryCandidate, VectorMatch};
 
     fn entry(id: u128, namespace: &str, memory_type: MemoryType, content: &str) -> MemoryEntry {
         let now = chrono::Utc::now();
@@ -757,7 +759,7 @@ mod tests {
         async fn extract(
             &self,
             request: MemoryExtractionProviderRequest,
-        ) -> Result<Vec<super::super::StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+        ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
             assert_eq!(request.internal_tag, MEMORY_EXTRACTION_INTERNAL_TAG);
             assert!(request.bypass_memory);
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -776,7 +778,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|content| super::super::StructuredMemoryCandidate {
+                .map(|content| StructuredMemoryCandidate {
                     content: content.clone(),
                     memory_type: MemoryType::Fact,
                 })
@@ -798,7 +800,7 @@ mod tests {
             Ok(())
         }
 
-        async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<super::super::VectorMatch>, MemoryError> {
+        async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<VectorMatch>, MemoryError> {
             Ok(Vec::new())
         }
 
@@ -833,7 +835,7 @@ mod tests {
     async fn seed_near_duplicates(store: &MemoryStore) -> (Uuid, Uuid) {
         let first = store
             .store_entry(
-                super::super::store::NewMemoryEntry {
+                NewMemoryEntry {
                     namespace: "user::test".to_owned(),
                     content: "The deploy target is fly.io eu-west".to_owned(),
                     memory_type: MemoryType::Fact,
@@ -844,7 +846,7 @@ mod tests {
             .unwrap();
         let second = store
             .store_entry(
-                super::super::store::NewMemoryEntry {
+                NewMemoryEntry {
                     namespace: "user::test".to_owned(),
                     content: "The deploy target is fly.io eu-west region".to_owned(),
                     memory_type: MemoryType::Fact,
@@ -912,7 +914,7 @@ mod tests {
         let (first, _second) = seed_near_duplicates(&store).await;
         store
             .store_entry(
-                super::super::store::NewMemoryEntry {
+                NewMemoryEntry {
                     namespace: "user::other".to_owned(),
                     content: "Completely different project context entry".to_owned(),
                     memory_type: MemoryType::Fact,
@@ -968,34 +970,155 @@ mod tests {
         assert_eq!(counts.merged, 1);
     }
 
-    #[tokio::test]
-    async fn batches_are_capped_at_forty_entries_per_provider_call() {
-        let provider = Arc::new(FakeConsolidationProvider::decisions("[]".to_owned()));
-        let (context, store) = test_context(provider.clone(), None).await;
-        for index in 0..45 {
-            store
-                .store_entry(
-                    super::super::store::NewMemoryEntry {
-                        namespace: "user::cap".to_owned(),
-                        content: format!("Shared alpha beta gamma token number {index}"),
-                        memory_type: MemoryType::Fact,
-                        source_request_id: None,
-                    },
-                    None,
-                )
-                .unwrap();
-        }
-
-        let counts = run_consolidation(context).await.unwrap();
-
-        assert_eq!(provider.calls(), 1);
-        assert_eq!(
-            provider.max_payload_entries.load(Ordering::SeqCst),
-            MAX_ENTRIES_PER_PROVIDER_CALL
-        );
-        // One capped batch (provider answered []) plus the five overflow
-        // entries fall outside the cap and are accounted as kept.
-        assert_eq!(counts.kept, 5);
-        assert_eq!(counts.skipped_batches, 0);
+#[tokio::test]
+async fn batches_are_capped_at_forty_entries_per_provider_call() {
+    let provider = Arc::new(FakeConsolidationProvider::decisions("[]".to_owned()));
+    let (context, store) = test_context(provider.clone(), None).await;
+    for index in 0..45 {
+        store
+            .store_entry(
+                NewMemoryEntry {
+                    namespace: "user::cap".to_owned(),
+                    content: format!("Shared alpha beta gamma token number {index}"),
+                    memory_type: MemoryType::Fact,
+                    source_request_id: None,
+                },
+                None,
+            )
+            .unwrap();
     }
+
+    let counts = run_consolidation(context).await.unwrap();
+
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(
+        provider.max_payload_entries.load(Ordering::SeqCst),
+        MAX_ENTRIES_PER_PROVIDER_CALL
+    );
+    // One capped batch (provider answered []) plus the five overflow
+    // entries fall outside the cap and are accounted as kept.
+    assert_eq!(counts.kept, 5);
+    assert_eq!(counts.skipped_batches, 0);
+}
+
+#[tokio::test]
+async fn namespaces_beyond_the_list_limit_are_fully_paginated() {
+    // MAX_LIST_LIMIT clamps every list_entries page to 200 rows; a
+    // near-duplicate pair seeded as the two oldest entries lands on the
+    // second page (listing is created_at DESC). Without pagination the pair
+    // is never listed, never grouped, and the provider is never called.
+    let provider = Arc::new(FakeConsolidationProvider::decisions(String::new()));
+    let (context, store) = test_context(provider.clone(), None).await;
+
+    let base = 1_700_000_000i64;
+    let filler_count = crate::memory::store::MAX_LIST_LIMIT;
+    for index in 0..filler_count {
+        store
+            .store_entry(
+                MemoryEntry {
+                    id: Uuid::from_u128(1_000 + index as u128),
+                    namespace: "user::paged".to_owned(),
+                    content: format!("omega{index} sigma{index} tau{index} rho{index}"),
+                    memory_type: MemoryType::Fact,
+                    relevance_score: 1.0,
+                    created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
+                        base + index as i64,
+                        0,
+                    )
+                    .unwrap(),
+                    last_accessed_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
+                        base + index as i64,
+                        0,
+                    )
+                    .unwrap(),
+                    access_count: 0,
+                    source_request_id: None,
+                    updated_at: None,
+                    superseded_by: None,
+                },
+                None,
+            )
+            .unwrap();
+    }
+    let pair_base = base - 10;
+    let mut pair_ids = Vec::new();
+    for offset in 0..2 {
+        let content = if offset == 0 {
+            "The deploy target is fly.io eu-west".to_owned()
+        } else {
+            "The deploy target is fly.io eu-west region".to_owned()
+        };
+        let entry = store
+            .store_entry(
+                MemoryEntry {
+                    id: Uuid::from_u128(2_000 + offset),
+                    namespace: "user::paged".to_owned(),
+                    content,
+                    memory_type: MemoryType::Fact,
+                    relevance_score: 1.0,
+                    created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
+                        pair_base - offset as i64,
+                        0,
+                    )
+                    .unwrap(),
+                    last_accessed_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
+                        pair_base - offset as i64,
+                        0,
+                    )
+                    .unwrap(),
+                    access_count: 0,
+                    source_request_id: None,
+                    updated_at: None,
+                    superseded_by: None,
+                },
+                None,
+            )
+            .unwrap();
+        pair_ids.push(entry.id);
+    }
+
+    *provider.contents.lock().unwrap() = vec![merge_decisions_json(&pair_ids)];
+    let counts = run_consolidation(context).await.unwrap();
+
+    assert_eq!(provider.calls(), 1, "the second-page pair must reach the provider");
+    assert_eq!(counts.merged, 1);
+    assert_eq!(counts.superseded, 2);
+    // The dissimilar fillers stay kept (one group each); the pair was merged.
+    assert_eq!(counts.kept as usize, filler_count);
+    let active = store.list_entries("user::paged", 10, 0).unwrap();
+    assert_eq!(active.total_count, 201);
+}
+
+#[tokio::test]
+async fn batch_with_any_invalid_merge_is_skipped_before_writes() {
+    // The whole decision set is validated before any write: a valid merge
+    // followed by an invalid (sensitive) merge must skip the batch with
+    // nothing persisted, not apply the first merge and then stop.
+    let provider = Arc::new(FakeConsolidationProvider::decisions(String::new()));
+    let (context, store) = test_context(provider.clone(), None).await;
+    let (first, second) = seed_near_duplicates(&store).await;
+    // A second near-duplicate pair in another namespace shares the batch?
+    // No: batches never mix namespaces, so put both decisions in one batch
+    // by making the single group's decision list contain two merges: one
+    // valid for the real pair and one whose sources are the same pair but
+    // with sensitive merged content.
+    let ids = [first, second];
+    let id_list = ids
+        .iter()
+        .map(|id| format!("\"{id}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    *provider.contents.lock().unwrap() = vec![format!(
+        "[{{\"action\":\"merge\",\"source_ids\":[{id_list}],\"merged_content\":\"Deployments run on fly.io in eu-west.\"}}, \
+          {{\"action\":\"merge\",\"source_ids\":[{id_list}],\"merged_content\":\"The api key is sk-abcdefghijklmnopqrst\"}}]"
+    )];
+
+    let counts = run_consolidation(context).await.unwrap();
+
+    assert_eq!(counts.skipped_batches, 1);
+    assert_eq!(counts.merged, 0);
+    assert_eq!(counts.superseded, 0);
+    assert_eq!(store.list_entries("user::test", 10, 0).unwrap().entries.len(), 2);
+    assert!(store.get_entry_by_id(first).unwrap().unwrap().superseded_by.is_none());
+}
 }
