@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod consolidation;
 pub mod context_detector;
 pub mod decay;
 pub mod extraction_adapter;
@@ -22,6 +23,10 @@ pub use config::{
     MemoryValidationResult, ModelGroupMemoryOverride, ProviderMemoryOverride,
 };
 pub use context_detector::{sanitize_label, ContextDetector, DetectedContext};
+pub use consolidation::{
+    group_candidates, parse_decisions, run_consolidation, ConsolidationContext, ConsolidationCounts,
+    ConsolidationError, Decision,
+};
 pub use decay::{DecayScheduler, EvictionEventPublisher, VectorRetryCallback};
 pub use extraction_adapter::GatewayExtractionAdapter;
 pub use extractor::{

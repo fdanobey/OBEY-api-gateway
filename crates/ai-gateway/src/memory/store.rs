@@ -335,6 +335,71 @@ impl MemoryStore {
         Ok(marked)
     }
 
+    /// Create one merged entry and mark its sources superseded by it atomically.
+    ///
+    /// Used only by the consolidation engine: the merged entry is inserted and
+    /// every `source_ids` row is annotated with `superseded_by` inside a single
+    /// transaction, so a crash can never leave a merged entry without its
+    /// supersession links or vice versa. Rows already superseded, missing ids,
+    /// and self-supersession are skipped, mirroring [`Self::mark_superseded`].
+    pub fn create_merged_entry_with_supersession(
+        &self,
+        namespace: &str,
+        content: &str,
+        memory_type: MemoryType,
+        source_ids: &[Uuid],
+    ) -> Result<MemoryEntry, MemoryError> {
+        validate_namespace(namespace)?;
+        validate_content(content)?;
+        let now = Utc::now();
+        let entry = MemoryEntry {
+            id: Uuid::new_v4(),
+            namespace: namespace.to_owned(),
+            content: content.to_owned(),
+            memory_type,
+            relevance_score: 1.0,
+            created_at: now,
+            last_accessed_at: now,
+            access_count: 0,
+            source_request_id: None,
+            updated_at: None,
+            superseded_by: None,
+        };
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "INSERT INTO memories (
+                id, namespace, content, memory_type, relevance_score,
+                created_at, last_accessed_at, access_count, source_request_id,
+                updated_at, superseded_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                entry.id.to_string(),
+                entry.namespace,
+                entry.content,
+                memory_type_as_str(entry.memory_type),
+                entry.relevance_score,
+                entry.created_at.timestamp(),
+                entry.last_accessed_at.timestamp(),
+                i64::try_from(entry.access_count).map_err(store_external_error)?,
+                entry.source_request_id.map(|id| id.to_string()),
+                entry.updated_at,
+                entry.superseded_by.map(|id| id.to_string()),
+            ],
+        )?;
+        {
+            let mut statement = transaction.prepare(
+                "UPDATE memories SET superseded_by = ?2
+                 WHERE id = ?1 AND superseded_by IS NULL AND id <> ?2",
+            )?;
+            for id in source_ids {
+                statement.execute(params![id.to_string(), entry.id.to_string()])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(entry)
+    }
+
     pub fn list_entries(
         &self,
         namespace: &str,
