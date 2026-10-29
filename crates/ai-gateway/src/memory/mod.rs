@@ -27,7 +27,7 @@ pub use consolidation::{
     group_candidates, parse_decisions, run_consolidation, ConsolidationContext, ConsolidationCounts,
     ConsolidationError, Decision,
 };
-pub use decay::{DecayScheduler, EvictionEventPublisher, VectorRetryCallback};
+pub use decay::{ConsolidationHook, DecayScheduler, EvictionEventPublisher, VectorRetryCallback};
 pub use extraction_adapter::GatewayExtractionAdapter;
 pub use extractor::{
     AsyncExtractionOutcome, AsyncExtractionRequest, AsyncExtractionSchedule,
@@ -41,7 +41,7 @@ pub use injector::{
     available_budget, format_memories, merge_retrieval_scores, retrieve_with_vector_fallback,
     strip_formatting, MemoryInjector,
 };
-pub use metrics::MemoryMetrics;
+pub use metrics::{ConsolidationLastPass, MemoryMetrics};
 pub use namespace::{sanitize_vk_id, validate_namespace, MAX_NAMESPACE_CHARS, MAX_VK_ID_CHARS};
 pub use scoring::{apply_decay, compute_score, recency_boost};
 pub use sensitive::{
@@ -71,6 +71,8 @@ use uuid::Uuid;
 use crate::compression::token_counter::TokenCounter;
 use crate::guardrail::provider::GuardrailProvider;
 use crate::models::openai::OpenAIRequest;
+
+use decay::DisabledConsolidationHook;
 
 /// Errors produced by memory configuration, persistence, and processing.
 #[derive(Debug, thiserror::Error)]
@@ -244,6 +246,58 @@ impl MemoryExtractionProvider for DisabledExtractionProvider {
 
 static SENSITIVE_STORAGE_WARNING: Once = Once::new();
 
+/// Runs one bounded consolidation pass after each decay cycle (requirement 3.6).
+struct MemoryConsolidationRunner {
+    store: Arc<MemoryStore>,
+    provider: Arc<dyn MemoryExtractionProvider>,
+    scanner: Arc<SensitiveContentScanner>,
+    vector_tier: Arc<RwLock<Option<Arc<dyn MemoryVectorTier>>>>,
+    config: Arc<RwLock<MemoryConfig>>,
+    metrics: Arc<MemoryMetrics>,
+}
+
+#[async_trait]
+impl ConsolidationHook for MemoryConsolidationRunner {
+    async fn run_consolidation_pass(&self) {
+        let config = self.config.read().await.clone();
+        if !config.consolidation_enabled {
+            return;
+        }
+        let Some((provider_name, model)) = config.resolve_consolidation_pair() else {
+            return;
+        };
+        let vector_tier = self.vector_tier.read().await.clone();
+        let context = ConsolidationContext {
+            store: Arc::clone(&self.store),
+            provider: Arc::clone(&self.provider),
+            scanner: Arc::clone(&self.scanner),
+            vector_tier,
+            allow_sensitive_storage: config.allow_sensitive_storage,
+            max_memories_per_namespace: config.max_memories_per_namespace as usize,
+            provider_name,
+            model,
+            maximum_concurrent_provider_calls: 1,
+            provider_timeout: Duration::from_secs(120),
+        };
+        match run_consolidation(context).await {
+            Ok(counts) => {
+                tracing::info!(
+                    merged = counts.merged,
+                    superseded = counts.superseded,
+                    kept = counts.kept,
+                    skipped_batches = counts.skipped_batches,
+                    provider_errors = counts.provider_errors,
+                    "memory consolidation pass completed"
+                );
+                self.metrics.record_consolidation_pass(counts);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "memory consolidation pass failed")
+            }
+        }
+    }
+}
+
 struct MemoryVectorRetryCallback {
     store: Arc<MemoryStore>,
     vector_tier: Arc<RwLock<Option<Arc<dyn MemoryVectorTier>>>>,
@@ -298,6 +352,7 @@ pub struct MemorySystem {
     vector_index_semaphore: Arc<tokio::sync::Semaphore>,
     sensitive_scanner: Arc<SensitiveContentScanner>,
     decay_scheduler: Mutex<DecayScheduler>,
+    extraction_provider: Arc<dyn MemoryExtractionProvider>,
     extraction_provider_available: bool,
 }
 
@@ -355,7 +410,7 @@ impl MemorySystem {
             MemoryExtractor::with_metrics(
                 store.clone(),
                 scanner.clone(),
-                provider,
+                Arc::clone(&provider),
                 1,
                 Duration::from_secs(30),
                 metrics.clone(),
@@ -369,11 +424,26 @@ impl MemorySystem {
                 );
             })),
         );
-        let mut decay_scheduler = DecayScheduler::with_metrics(
+        let config = Arc::new(RwLock::new(config));
+        let consolidation_hook: Arc<dyn ConsolidationHook> =
+            if config.read().await.consolidation_enabled {
+                Arc::new(MemoryConsolidationRunner {
+                    store: Arc::clone(&store),
+                    provider: Arc::clone(&provider),
+                    scanner: Arc::clone(&scanner),
+                    vector_tier: Arc::clone(&vector_tier),
+                    config: Arc::clone(&config),
+                    metrics: Arc::clone(&metrics),
+                })
+            } else {
+                Arc::new(DisabledConsolidationHook)
+            };
+        let mut decay_scheduler = DecayScheduler::with_parts(
             (*store).clone(),
-            config.decay_schedule_hours,
-            config.max_memories_per_namespace as usize,
+            config.read().await.decay_schedule_hours,
+            config.read().await.max_memories_per_namespace as usize,
             metrics.clone(),
+            consolidation_hook,
         )?;
         decay_scheduler.set_vector_retry_callback(Arc::new(MemoryVectorRetryCallback {
             store: store.clone(),
@@ -386,11 +456,12 @@ impl MemorySystem {
             injector,
             extractor,
             metrics,
-            config: Arc::new(RwLock::new(config)),
+            config,
             vector_tier,
             vector_index_semaphore,
             sensitive_scanner: scanner.clone(),
             decay_scheduler: Mutex::new(decay_scheduler),
+            extraction_provider: provider,
             extraction_provider_available,
         })
     }
@@ -812,16 +883,31 @@ impl MemorySystem {
         warn_sensitive_storage_once(&new_config);
 
         let previous_qdrant = self.config.read().await.qdrant.clone();
-        self.decay_scheduler
-            .lock()
-            .map_err(|_| {
+        *self.config.write().await = new_config.clone();
+        {
+            let mut scheduler = self.decay_scheduler.lock().map_err(|_| {
                 MemoryError::Config("memory decay scheduler mutex was poisoned".to_owned())
-            })?
-            .restart_decay_scheduler(
+            })?;
+            // Refresh the consolidation hook from the new config before the
+            // restart re-spawns the background task.
+            let hook: Arc<dyn ConsolidationHook> = if new_config.consolidation_enabled {
+                Arc::new(MemoryConsolidationRunner {
+                    store: Arc::clone(&self.store),
+                    provider: Arc::clone(&self.extraction_provider),
+                    scanner: Arc::clone(&self.sensitive_scanner),
+                    vector_tier: Arc::clone(&self.vector_tier),
+                    config: Arc::clone(&self.config),
+                    metrics: Arc::clone(&self.metrics),
+                })
+            } else {
+                Arc::new(DisabledConsolidationHook)
+            };
+            scheduler.set_consolidation_hook(hook);
+            scheduler.restart_decay_scheduler(
                 new_config.decay_schedule_hours,
                 new_config.max_memories_per_namespace as usize,
             )?;
-        *self.config.write().await = new_config.clone();
+        }
         if previous_qdrant != new_config.qdrant {
             *self.vector_tier.write().await = None;
         }
@@ -1531,11 +1617,123 @@ mod tests {
         assert_eq!(system.config.read().await.max_injection_tokens, 321);
         assert!(system.store.get_entry_by_id(stored.id).unwrap().is_some());
 
-        config.database_path = "other-memory.db".to_owned();
-        let error = system.reload(config).await.unwrap_err();
-        assert!(error.to_string().contains("requires a gateway restart"));
-        assert!(system.store.get_entry_by_id(stored.id).unwrap().is_some());
+    config.database_path = "other-memory.db".to_owned();
+    let error = system.reload(config).await.unwrap_err();
+    assert!(error.to_string().contains("requires a gateway restart"));
+    assert!(system.store.get_entry_by_id(stored.id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn decay_cycle_triggers_consolidation_when_enabled_and_not_when_disabled() {
+    let provider = Arc::new(TestExtractionProvider {
+        calls: AtomicUsize::new(0),
+    });
+
+    let config = MemoryConfig {
+        enabled: true,
+        database_path: ":memory:".to_owned(),
+        consolidation_enabled: true,
+        consolidation_provider: "provider".to_owned(),
+        consolidation_model: "model".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let system = MemorySystem::new_with_vector(config, None, Some(provider.clone()), None)
+        .await
+        .unwrap();
+    seed_near_duplicates(&system);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+    let scheduler = system.decay_scheduler.lock().unwrap();
+    scheduler.run_once().await.unwrap();
+    drop(scheduler);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert!(system.metrics.last_consolidation_pass().is_some());
+
+    // Disabled (default): no provider call on decay completion.
+    let disabled_provider = Arc::new(TestExtractionProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let config = MemoryConfig {
+        enabled: true,
+        database_path: ":memory:".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let disabled = MemorySystem::new_with_vector(
+        config,
+        None,
+        Some(disabled_provider.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    seed_near_duplicates(&disabled);
+    let scheduler = disabled.decay_scheduler.lock().unwrap();
+    scheduler.run_once().await.unwrap();
+    drop(scheduler);
+    assert_eq!(disabled_provider.calls.load(Ordering::SeqCst), 0);
+    assert!(disabled.metrics.last_consolidation_pass().is_none());
+}
+
+fn seed_near_duplicates(system: &MemorySystem) {
+    for content in [
+        "The deploy target is fly.io eu-west",
+        "The deploy target is fly.io eu-west region",
+    ] {
+        system
+            .store
+            .store_entry(
+                NewMemoryEntry {
+                    namespace: "user::consolidation".to_owned(),
+                    content: content.to_owned(),
+                    memory_type: MemoryType::Fact,
+                    source_request_id: None,
+                },
+                None,
+            )
+            .unwrap();
     }
+}
+
+#[tokio::test]
+async fn reload_applies_consolidation_settings_without_dropping_store() {
+    let provider = Arc::new(TestExtractionProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let config = MemoryConfig {
+        enabled: true,
+        database_path: ":memory:".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let system = MemorySystem::new_with_vector(config.clone(), None, Some(provider.clone()), None)
+        .await
+        .unwrap();
+    seed_near_duplicates(&system);
+    let stored = system
+        .store
+        .store_entry(
+            NewMemoryEntry {
+                namespace: "user::consolidation-reload".to_owned(),
+                content: "Survives consolidation hot reload.".to_owned(),
+                memory_type: MemoryType::Fact,
+                source_request_id: None,
+            },
+            None,
+        )
+        .unwrap();
+
+    let mut enabled = config.clone();
+    enabled.consolidation_enabled = true;
+    enabled.consolidation_provider = "provider".to_owned();
+    enabled.consolidation_model = "model".to_owned();
+    system.reload(enabled).await.unwrap();
+    assert!(system.config.read().await.consolidation_enabled);
+
+    let scheduler = system.decay_scheduler.lock().unwrap();
+    scheduler.run_once().await.unwrap();
+    drop(scheduler);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert!(system.store.get_entry_by_id(stored.id).unwrap().is_some());
+}
 
     #[tokio::test]
     async fn request_and_response_round_trip_injects_then_extracts() {

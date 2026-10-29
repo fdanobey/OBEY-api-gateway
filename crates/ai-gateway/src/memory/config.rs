@@ -25,8 +25,11 @@ pub struct MemoryConfig {
     pub auto_extract_enabled: bool,
     pub auto_extract_provider: String,
     pub auto_extract_model: String,
-    pub auto_extract_min_turns: u32,
-    pub decay_schedule_hours: u32,
+pub auto_extract_min_turns: u32,
+pub decay_schedule_hours: u32,
+pub consolidation_enabled: bool,
+pub consolidation_provider: String,
+pub consolidation_model: String,
     pub max_memories_per_namespace: u32,
     pub allow_sensitive_storage: bool,
     pub show_feedback: bool,
@@ -45,8 +48,11 @@ impl Default for MemoryConfig {
             auto_extract_enabled: false,
             auto_extract_provider: String::new(),
             auto_extract_model: String::new(),
-            auto_extract_min_turns: 4,
-            decay_schedule_hours: 24,
+auto_extract_min_turns: 4,
+decay_schedule_hours: 24,
+consolidation_enabled: false,
+consolidation_provider: String::new(),
+consolidation_model: String::new(),
             max_memories_per_namespace: 1_000,
             allow_sensitive_storage: false,
             show_feedback: true,
@@ -148,6 +154,29 @@ impl MemoryConfig {
         validation_result(errors)
     }
 
+    /// Resolves the effective consolidation provider/model pair.
+    ///
+    /// Empty `consolidation_provider`/`consolidation_model` values fall back to
+    /// the auto-extraction pair (requirement 3.7). Returns `None` when neither
+    /// pair resolves to a non-empty provider and model.
+    pub fn resolve_consolidation_pair(&self) -> Option<(String, String)> {
+        let provider = if self.consolidation_provider.trim().is_empty() {
+            self.auto_extract_provider.trim()
+        } else {
+            self.consolidation_provider.trim()
+        };
+        let model = if self.consolidation_model.trim().is_empty() {
+            self.auto_extract_model.trim()
+        } else {
+            self.consolidation_model.trim()
+        };
+        if provider.is_empty() || model.is_empty() {
+            None
+        } else {
+            Some((provider.to_owned(), model.to_owned()))
+        }
+    }
+
     /// Validates local fields and resolves the auto-extraction provider name.
     ///
     /// The Wave 1 parent integration should pass every configured provider name
@@ -160,9 +189,9 @@ impl MemoryConfig {
         I: IntoIterator<Item = &'a str>,
     {
         let mut errors = self.validate().err().unwrap_or_default();
+        let configured: HashSet<&str> = provider_names.into_iter().collect();
 
         if self.auto_extract_enabled && !self.auto_extract_provider.trim().is_empty() {
-            let configured: HashSet<&str> = provider_names.into_iter().collect();
             if !configured.contains(self.auto_extract_provider.trim()) {
                 errors.push(MemoryConfigError::new(
                     "auto_extract_provider",
@@ -170,6 +199,42 @@ impl MemoryConfig {
                         "has unresolved value {:?}; expected the name of a configured provider",
                         self.auto_extract_provider
                     ),
+                ));
+            }
+        }
+
+        if self.consolidation_enabled {
+            // Requirement 3.7: empty consolidation fields fall back to the
+            // auto-extraction pair; validation fails only when the resolved
+            // pair is incomplete or the provider is not configured.
+            let provider = if self.consolidation_provider.trim().is_empty() {
+                self.auto_extract_provider.trim()
+            } else {
+                self.consolidation_provider.trim()
+            };
+            if provider.is_empty() {
+                errors.push(MemoryConfigError::new(
+                    "consolidation_provider",
+                    "must not be empty when consolidation_enabled is true and no auto_extract_provider fallback is configured",
+                ));
+            } else if !configured.contains(provider) {
+                errors.push(MemoryConfigError::new(
+                    "consolidation_provider",
+                    format!(
+                        "has unresolved value {provider:?}; expected the name of a configured provider"
+                    ),
+                ));
+            }
+
+            let model = if self.consolidation_model.trim().is_empty() {
+                self.auto_extract_model.trim()
+            } else {
+                self.consolidation_model.trim()
+            };
+            if model.is_empty() {
+                errors.push(MemoryConfigError::new(
+                    "consolidation_model",
+                    "must not be empty when consolidation_enabled is true and no auto_extract_model fallback is configured",
                 ));
             }
         }
@@ -741,10 +806,141 @@ mod tests {
             "auto_extract_provider",
             "unresolved value"
         ));
-        config
-            .validate_with_provider_names(["missing", "openai"])
-            .unwrap();
-    }
+    config
+        .validate_with_provider_names(["missing", "openai"])
+        .unwrap();
+}
+
+#[test]
+fn consolidation_defaults_are_off_and_legacy_configs_validate_unchanged() {
+    let config: MemoryConfig = serde_yaml::from_str(
+        r#"
+enabled: true
+database_path: ./state/memory.db
+auto_extract_enabled: true
+auto_extract_provider: openai
+auto_extract_model: gpt-4.1-mini
+decay_schedule_hours: 48
+"#,
+    )
+    .unwrap();
+    assert!(!config.consolidation_enabled);
+    assert!(config.consolidation_provider.is_empty());
+    assert!(config.consolidation_model.is_empty());
+    config.validate_with_provider_names(["openai"]).unwrap();
+    assert_eq!(config.resolve_consolidation_pair().unwrap().0, "openai");
+    assert_eq!(MemoryConfig::default().resolve_consolidation_pair(), None);
+}
+
+#[test]
+fn consolidation_enabled_with_unresolved_provider_is_a_field_error() {
+    let config = MemoryConfig {
+        consolidation_enabled: true,
+        consolidation_provider: "missing".to_owned(),
+        consolidation_model: "consolidator".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let errors = config
+        .validate_with_provider_names(["openai", "anthropic"])
+        .unwrap_err();
+    assert!(has_error(
+        &errors,
+        "consolidation_provider",
+        "unresolved value"
+    ));
+    config
+        .validate_with_provider_names(["missing", "openai"])
+        .unwrap();
+}
+
+#[test]
+fn consolidation_falls_back_to_auto_extract_pair() {
+    let config = MemoryConfig {
+        consolidation_enabled: true,
+        auto_extract_provider: "openai".to_owned(),
+        auto_extract_model: "gpt-4.1-mini".to_owned(),
+        ..MemoryConfig::default()
+    };
+    config.validate_with_provider_names(["openai"]).unwrap();
+    assert_eq!(
+        config.resolve_consolidation_pair(),
+        Some(("openai".to_owned(), "gpt-4.1-mini".to_owned()))
+    );
+
+    // Mixed fallback: explicit provider, model from auto-extract.
+    let config = MemoryConfig {
+        consolidation_enabled: true,
+        consolidation_provider: "anthropic".to_owned(),
+        auto_extract_provider: "openai".to_owned(),
+        auto_extract_model: "gpt-4.1-mini".to_owned(),
+        ..MemoryConfig::default()
+    };
+    config
+        .validate_with_provider_names(["openai", "anthropic"])
+        .unwrap();
+    assert_eq!(
+        config.resolve_consolidation_pair(),
+        Some(("anthropic".to_owned(), "gpt-4.1-mini".to_owned()))
+    );
+}
+
+#[test]
+fn consolidation_enabled_with_no_resolvable_pair_is_an_error() {
+    // Neither consolidation_* nor auto_extract_* set at all.
+    let config = MemoryConfig {
+        consolidation_enabled: true,
+        ..MemoryConfig::default()
+    };
+    let errors = config
+        .validate_with_provider_names(["openai"])
+        .unwrap_err();
+    assert!(has_error(
+        &errors,
+        "consolidation_provider",
+        "must not be empty"
+    ));
+    assert!(has_error(
+        &errors,
+        "consolidation_model",
+        "must not be empty"
+    ));
+
+    // Fallback provider exists but neither model resolves.
+    let config = MemoryConfig {
+        consolidation_enabled: true,
+        auto_extract_provider: "openai".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let errors = config
+        .validate_with_provider_names(["openai"])
+        .unwrap_err();
+    assert!(has_error(
+        &errors,
+        "consolidation_model",
+        "must not be empty"
+    ));
+}
+
+#[test]
+fn consolidation_with_provider_but_no_model_is_a_field_error() {
+    let config = MemoryConfig {
+        consolidation_enabled: true,
+        consolidation_provider: "openai".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let errors = config
+        .validate_with_provider_names(["openai"])
+        .unwrap_err();
+    assert!(has_error(
+        &errors,
+        "consolidation_model",
+        "must not be empty"
+    ));
+    assert_eq!(
+        errors.iter().filter(|error| error.field == "consolidation_provider").count(),
+        0
+    );
+}
 
     #[test]
     fn invalid_qdrant_schemes_hosts_and_credentials_are_rejected() {
