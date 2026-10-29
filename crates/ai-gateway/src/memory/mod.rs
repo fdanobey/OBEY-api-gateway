@@ -246,7 +246,8 @@ impl MemoryExtractionProvider for DisabledExtractionProvider {
 
 static SENSITIVE_STORAGE_WARNING: Once = Once::new();
 
-/// Runs one bounded consolidation pass after each decay cycle (requirement 3.6).
+/// Runs one bounded consolidation pass after each decay cycle (requirement
+/// 3.6) and backs the on-demand admin trigger (requirement 3.8).
 struct MemoryConsolidationRunner {
     store: Arc<MemoryStore>,
     provider: Arc<dyn MemoryExtractionProvider>,
@@ -256,18 +257,24 @@ struct MemoryConsolidationRunner {
     metrics: Arc<MemoryMetrics>,
 }
 
-#[async_trait]
-impl ConsolidationHook for MemoryConsolidationRunner {
-    async fn run_consolidation_pass(&self) {
+impl MemoryConsolidationRunner {
+    /// Build the context for one pass from the current config snapshot.
+    ///
+    /// `None` when consolidation is disabled (background passes only — a
+    /// manual trigger passes `require_enabled = false` so an explicit
+    /// operator request runs even while background consolidation is off) or
+    /// when the provider/model pair does not resolve through the requirement
+    /// 3.7 fallback chain.
+    async fn context_for_pass(&self, require_enabled: bool) -> Option<ConsolidationContext> {
         let config = self.config.read().await.clone();
-        if !config.consolidation_enabled {
-            return;
+        if require_enabled && !config.consolidation_enabled {
+            return None;
         }
         let Some((provider_name, model)) = config.resolve_consolidation_pair() else {
-            return;
+            return None;
         };
         let vector_tier = self.vector_tier.read().await.clone();
-        let context = ConsolidationContext {
+        Some(ConsolidationContext {
             store: Arc::clone(&self.store),
             provider: Arc::clone(&self.provider),
             scanner: Arc::clone(&self.scanner),
@@ -278,22 +285,36 @@ impl ConsolidationHook for MemoryConsolidationRunner {
             model,
             maximum_concurrent_provider_calls: 1,
             provider_timeout: Duration::from_secs(120),
+        })
+    }
+
+    /// Run one pass, record its counts (requirement 3.6), and log completion.
+    async fn execute_pass(
+        &self,
+        context: ConsolidationContext,
+    ) -> Result<ConsolidationCounts, MemoryError> {
+        let counts = run_consolidation(context).await?;
+        tracing::info!(
+            merged = counts.merged,
+            superseded = counts.superseded,
+            kept = counts.kept,
+            skipped_batches = counts.skipped_batches,
+            provider_errors = counts.provider_errors,
+            "memory consolidation pass completed"
+        );
+        self.metrics.record_consolidation_pass(counts);
+        Ok(counts)
+    }
+}
+
+#[async_trait]
+impl ConsolidationHook for MemoryConsolidationRunner {
+    async fn run_consolidation_pass(&self) {
+        let Some(context) = self.context_for_pass(true).await else {
+            return;
         };
-        match run_consolidation(context).await {
-            Ok(counts) => {
-                tracing::info!(
-                    merged = counts.merged,
-                    superseded = counts.superseded,
-                    kept = counts.kept,
-                    skipped_batches = counts.skipped_batches,
-                    provider_errors = counts.provider_errors,
-                    "memory consolidation pass completed"
-                );
-                self.metrics.record_consolidation_pass(counts);
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "memory consolidation pass failed")
-            }
+        if let Err(error) = self.execute_pass(context).await {
+            tracing::warn!(error = %error, "memory consolidation pass failed")
         }
     }
 }
@@ -595,15 +616,38 @@ impl MemorySystem {
     /// Clears a namespace, then removes its vector points best-effort.
     ///
     /// Vector work never fails the store commit.
-    pub async fn admin_clear(&self, namespace: &str) -> Result<u64, MemoryError> {
-        let store = Arc::clone(&self.store);
-        let namespace_for_store = namespace.to_owned();
-        let deleted =
-            spawn_store_task(move || store.delete_namespace(&namespace_for_store)).await?;
-        self.schedule_vector_delete_namespace(namespace.to_owned())
-            .await;
-        Ok(deleted)
-    }
+ pub async fn admin_clear(&self, namespace: &str) -> Result<u64, MemoryError> {
+ let store = Arc::clone(&self.store);
+ let namespace_for_store = namespace.to_owned();
+ let deleted =
+ spawn_store_task(move || store.delete_namespace(&namespace_for_store)).await?;
+ self.schedule_vector_delete_namespace(namespace.to_owned())
+ .await;
+ Ok(deleted)
+ }
+
+ /// Runs one consolidation pass immediately and returns its counts (Req
+ /// 3.8), sharing the context construction, execution, and metric recording
+ /// of the post-decay background hook (Req 3.6) so both paths cannot drift.
+ ///
+ /// A manual operator trigger runs even while `consolidation_enabled` is
+ /// false, as long as the provider/model pair resolves; it is the caller's
+ /// responsibility to answer 503 when the pair does not resolve.
+ pub async fn run_consolidation_now(&self) -> Result<ConsolidationCounts, MemoryError> {
+ let runner = MemoryConsolidationRunner {
+ store: Arc::clone(&self.store),
+ provider: Arc::clone(&self.extraction_provider),
+ scanner: Arc::clone(&self.sensitive_scanner),
+ vector_tier: Arc::clone(&self.vector_tier),
+ config: Arc::clone(&self.config),
+ metrics: Arc::clone(&self.metrics),
+ };
+ let context = runner
+ .context_for_pass(false)
+ .await
+ .ok_or_else(|| MemoryError::Config("consolidation provider is not configured".to_owned()))?;
+ runner.execute_pass(context).await
+ }
 
     pub fn set_eviction_publisher(
         &self,

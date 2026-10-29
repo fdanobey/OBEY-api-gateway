@@ -403,39 +403,43 @@ async fn export(State(state): State<MemoryAdminState>) -> Response {
 /// Run one consolidation pass immediately and return its outcome counts
 /// (Req 3.8).
 ///
-/// Seam: a live pass needs the extraction provider and sensitive scanner
-/// handles, which `MemorySystem` does not expose yet, and the dedicated
-/// consolidation config fields are landing in a concurrent wave. Until the
-/// provider is reachable, manual passes answer 503 `consolidation_unavailable`
-/// — never a half-configured 500. The provider name resolves through the
-/// Req 3.7 fallback chain (`consolidation_provider` once it exists, then
-/// `auto_extract_provider`).
+/// The pass itself is delegated to [`MemorySystem::run_consolidation_now`],
+/// which shares the context construction and metric recording of the
+/// post-decay background hook (Req 3.6). A manual operator trigger runs even
+/// while `consolidation_enabled` is false; the only 503 is the unconfigured
+/// case, when the provider/model pair does not resolve through the Req 3.7
+/// fallback chain (`consolidation_provider` falling back to
+/// `auto_extract_provider`). Failures inside the pass are per-batch and come
+/// back as `provider_errors`/`skipped_batches` counts; only infrastructure
+/// errors surface here, sanitized through the shared `MemoryError` mapping.
 async fn consolidate(State(state): State<MemoryAdminState>) -> Response {
     let system = match resolve_system(&state).await {
         Ok(system) => system,
         Err(response) => return response,
     };
-    let config = system.config.read().await;
-    if consolidation_provider_name(&config).is_empty() {
+    if system.config.read().await.resolve_consolidation_pair().is_none() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "consolidation provider is not configured",
             "consolidation_unavailable",
         );
     }
-    error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "consolidation is not available until the provider is wired into the memory system",
-        "consolidation_unavailable",
-    )
-}
-
-/// Resolve the consolidation provider name with the Req 3.7 fallback chain.
-///
-/// The dedicated `consolidation_provider` field does not exist yet in this
-/// tree; swap it in here when the concurrent config wave lands.
-fn consolidation_provider_name(config: &super::MemoryConfig) -> &str {
-    &config.auto_extract_provider
+    match system.run_consolidation_now().await {
+        Ok(counts) => Json(json!({
+            "merged": counts.merged,
+            "superseded": counts.superseded,
+            "kept": counts.kept,
+            "skipped_batches": counts.skipped_batches,
+            "provider_errors": counts.provider_errors,
+        }))
+        .into_response(),
+        Err(MemoryError::Config(_)) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "consolidation provider is not configured",
+            "consolidation_unavailable",
+        ),
+        Err(error) => memory_error(error),
+    }
 }
 
 async fn clear_namespace(
@@ -461,14 +465,32 @@ async fn stats(State(state): State<MemoryAdminState>) -> Response {
         Err(response) => return response,
     };
     match system.store.stats() {
-        Ok(stats) => Json(json!({
-            "total_count": stats.total_count,
-            "memories_per_namespace": stats.memories_per_namespace,
-            "average_relevance_score": stats.average_relevance_score,
-            "storage_size_bytes": stats.storage_size_bytes,
-            "last_decay_cycle": stats.last_decay_cycle,
-        }))
-        .into_response(),
+        Ok(stats) => {
+            // Last-pass consolidation summary (Req 3.6); present only after a
+            // pass — manual or post-decay — has completed at least once.
+            let consolidation = system
+                .metrics
+                .last_consolidation_pass()
+                .map(|pass| {
+                    json!({
+                        "merged": pass.counts.merged,
+                        "superseded": pass.counts.superseded,
+                        "kept": pass.counts.kept,
+                        "skipped_batches": pass.counts.skipped_batches,
+                        "provider_errors": pass.counts.provider_errors,
+                        "last_run": pass.completed_at,
+                    })
+                });
+            Json(json!({
+                "total_count": stats.total_count,
+                "memories_per_namespace": stats.memories_per_namespace,
+                "average_relevance_score": stats.average_relevance_score,
+                "storage_size_bytes": stats.storage_size_bytes,
+                "last_decay_cycle": stats.last_decay_cycle,
+                "consolidation": consolidation,
+            }))
+            .into_response()
+        }
         Err(error) => memory_error(error),
     }
 }
@@ -618,8 +640,11 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    use super::*;
-    use crate::memory::MemoryConfig;
+use super::*;
+use crate::memory::{
+    MemoryConfig, MemoryExtractionProvider, MemoryExtractionProviderError,
+    MemoryExtractionProviderRequest, StructuredMemoryCandidate,
+};
 
     async fn system() -> Arc<MemorySystem> {
         let config = MemoryConfig {
@@ -1053,23 +1078,133 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
-    async fn consolidate_reports_unavailable_until_provider_wired() {
-        let app = routes(system().await);
-        let (status, body) = request(app.clone(), "POST", "/consolidate", None).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["type"], "consolidation_unavailable");
+#[tokio::test]
+async fn consolidate_reports_unavailable_without_resolvable_pair() {
+    let app = routes(system().await);
+    let (status, body) = request(app, "POST", "/consolidate", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["type"], "consolidation_unavailable");
 
-        let config = MemoryConfig {
-            database_path: ":memory:".to_owned(),
-            auto_extract_provider: "test-provider".to_owned(),
-            ..MemoryConfig::default()
-        };
-        let configured =
-            Arc::new(MemorySystem::new(config, None, None).await.unwrap());
-        let app = routes(configured);
-        let (status, body) = request(app, "POST", "/consolidate", None).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["type"], "consolidation_unavailable");
+    // A provider name without a model does not resolve the Req 3.7 pair.
+    let config = MemoryConfig {
+        database_path: ":memory:".to_owned(),
+        auto_extract_provider: "test-provider".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let configured =
+        Arc::new(MemorySystem::new(config, None, None).await.unwrap());
+    let app = routes(configured);
+    let (status, body) = request(app, "POST", "/consolidate", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["type"], "consolidation_unavailable");
+}
+
+/// Fake provider that merges every batch it is asked about, mirroring the
+/// consolidation.rs test fakes: decisions travel as candidate contents.
+struct FakeConsolidationProvider;
+
+#[async_trait::async_trait]
+impl MemoryExtractionProvider for FakeConsolidationProvider {
+    async fn extract(
+        &self,
+        request: MemoryExtractionProviderRequest,
+    ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+        let payload: Value = serde_json::from_str(&request.messages[0].content).unwrap();
+        let source_ids: Vec<String> = payload["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect();
+        let decision = json!([{
+            "action": "merge",
+            "source_ids": source_ids,
+            "merged_content": "merged consolidation fact",
+        }])
+        .to_string();
+        Ok(vec![StructuredMemoryCandidate {
+            content: decision,
+            memory_type: MemoryType::Fact,
+        }])
     }
+}
+
+async fn consolidation_system(config: MemoryConfig) -> Arc<MemorySystem> {
+    Arc::new(
+        MemorySystem::new(config, None, Some(Arc::new(FakeConsolidationProvider)))
+            .await
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn consolidate_runs_one_pass_and_stats_reports_last_pass() {
+    let config = MemoryConfig {
+        database_path: ":memory:".to_owned(),
+        consolidation_provider: "fake-provider".to_owned(),
+        consolidation_model: "fake-model".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let app = routes(consolidation_system(config).await);
+    for content in [
+        "the deploy target is fly.io eu-west",
+        "the deploy target is fly.io eu-west region",
+    ] {
+        request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::dup", content, "fact")),
+        )
+        .await;
+    }
+
+    let (status, stats) = request(app.clone(), "GET", "/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(stats["consolidation"].is_null());
+
+    let (status, counts) = request(app.clone(), "POST", "/consolidate", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(counts["merged"], 1);
+    assert_eq!(counts["superseded"], 2);
+    assert_eq!(counts["kept"], 0);
+    assert_eq!(counts["skipped_batches"], 0);
+    assert_eq!(counts["provider_errors"], 0);
+
+    let (status, stats) = request(app, "GET", "/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stats["consolidation"]["merged"], 1);
+    assert_eq!(stats["consolidation"]["superseded"], 2);
+    assert_eq!(stats["consolidation"]["kept"], 0);
+    assert_eq!(stats["consolidation"]["skipped_batches"], 0);
+    assert_eq!(stats["consolidation"]["provider_errors"], 0);
+    assert!(stats["consolidation"]["last_run"].is_string());
+}
+
+#[tokio::test]
+async fn consolidate_resolves_pair_through_auto_extract_fallback() {
+    let config = MemoryConfig {
+        database_path: ":memory:".to_owned(),
+        auto_extract_provider: "fake-provider".to_owned(),
+        auto_extract_model: "fake-model".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let app = routes(consolidation_system(config).await);
+    request(
+        app.clone(),
+        "POST",
+        "/entries",
+        Some(entry(
+            "user::fallback",
+            "rust is the primary language here",
+            "fact",
+        )),
+    )
+    .await;
+    let (status, counts) = request(app, "POST", "/consolidate", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(counts["merged"], 0);
+    assert_eq!(counts["superseded"], 0);
+    assert_eq!(counts["kept"], 1);
+}
 }
