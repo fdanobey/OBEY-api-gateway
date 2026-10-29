@@ -690,6 +690,56 @@ fn trace_id_from_headers(headers: &HeaderMap) -> String {
     generate_trace_id(request_id)
 }
 
+/// Per-request memory override from `X-Obey-Memory-Mode` (memory spec
+/// Req 8.1-8.3). `Configured` is the default: no override, configured
+/// memory behavior applies unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryMode {
+    /// Skip memory retrieval/injection and extraction for this request.
+    Off,
+    /// Inject memories as usual but skip extraction for this request.
+    ReadOnly,
+    /// No override: apply configured memory behavior.
+    Configured,
+}
+
+impl MemoryMode {
+    /// True when extraction may run: only the default (no override)
+    /// permits it — `Off` and `ReadOnly` both skip extraction
+    /// (Req 8.1/8.2).
+    fn extraction_allowed(self) -> bool {
+        matches!(self, MemoryMode::Configured)
+    }
+}
+
+/// Parse `X-Obey-Memory-Mode` (`off` | `read-only`), O(1) header read.
+/// Header names are already case-insensitive in axum; values match
+/// case-insensitively with surrounding whitespace tolerated. If the header
+/// is repeated, only the first value is read — a deterministic choice; the
+/// remaining values are ignored. Absent or unrecognized values fall back
+/// to `Configured`; unrecognized values are logged at DEBUG without
+/// conversation content (Req 8.3).
+fn memory_mode(headers: &HeaderMap) -> MemoryMode {
+    let Some(value) = headers
+        .get("x-obey-memory-mode")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return MemoryMode::Configured;
+    };
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") {
+        MemoryMode::Off
+    } else if value.eq_ignore_ascii_case("read-only") {
+        MemoryMode::ReadOnly
+    } else {
+        tracing::debug!(
+            value,
+            "Unrecognized X-Obey-Memory-Mode value; applying configured memory behavior"
+        );
+        MemoryMode::Configured
+    }
+}
+
 fn attach_trace_id_header(response: &mut Response, trace_id: &str) {
     let header_name = HeaderName::from_static("x-trace-id");
     if let Ok(header_value) = HeaderValue::from_str(trace_id) {
@@ -944,13 +994,27 @@ struct MemoryRequestContext {
     effective: EffectiveMemoryConfig,
     injection: InjectionResult,
     extraction_messages: Vec<ExtractionMessage>,
+    /// Per-request override from `X-Obey-Memory-Mode`. `Off` requests
+    /// never reach this point (preprocess returns `None`); `ReadOnly`
+    /// keeps injection but must skip the extraction paths downstream.
+    mode: MemoryMode,
 }
 
 async fn preprocess_memory_request(
     state: &AppState,
     request: &mut OpenAIRequest,
     virtual_key_id: Option<&str>,
+    mode: MemoryMode,
 ) -> Option<MemoryRequestContext> {
+    // Req 8.1: mode `off` skips memory retrieval/injection entirely —
+    // before any lock read, so no memory work happens at all.
+    if mode == MemoryMode::Off {
+        tracing::info!(
+            memory_mode = "off",
+            "Memory bypassed for this request via X-Obey-Memory-Mode"
+        );
+        return None;
+    }
     let system = state.memory_system.read().await.clone()?;
     let model_group = state.router.find_model_group(&request.model).await.ok()?;
     let ordered = state.router.select_provider_order(&model_group).await;
@@ -1046,14 +1110,15 @@ async fn preprocess_memory_request(
             ));
     }
 
-    Some(MemoryRequestContext {
-        system,
-        context: result.context,
-        namespace: result.namespace,
-        effective,
-        injection: result.injection,
-        extraction_messages,
-    })
+	Some(MemoryRequestContext {
+		system,
+		context: result.context,
+		namespace: result.namespace,
+		effective,
+		injection: result.injection,
+		extraction_messages,
+		mode,
+	})
 }
 
 /// Truncate a retrieval query to at most `max_chars` characters, keeping the
@@ -1109,6 +1174,27 @@ async fn finalize_memory_response(
     let Some(memory) = memory else {
         return (None, ExtractionCounts::default());
     };
+    // Req 8.1/8.2: `off` never reaches here (no memory context at all);
+    // `read-only` keeps injection but skips explicit AND automatic
+    // extraction for this request. The feedback suffix reflects injection
+    // only — the same shape the streaming path always uses.
+    if !memory.mode.extraction_allowed() {
+        tracing::info!(
+            memory_mode = "read-only",
+            "Memory extraction skipped for this request via X-Obey-Memory-Mode"
+        );
+        let suffix = if !memory.effective.show_feedback || requests_structured_output(request) {
+            None
+        } else {
+            format_feedback_suffix(
+                memory.injection.memories_injected,
+                0,
+                0,
+                is_thread_start,
+            )
+        };
+        return (suffix, ExtractionCounts::default());
+    }
     let response_content = response
         .choices
         .first()
@@ -1176,6 +1262,15 @@ fn spawn_streaming_memory_extraction(
     response_content: String,
     request_id: Option<uuid::Uuid>,
 ) {
+    // Req 8.1/8.2: `off` never produces a memory context; `read-only`
+    // must also skip extraction on the streaming paths.
+    if !memory.mode.extraction_allowed() {
+        tracing::info!(
+            memory_mode = "read-only",
+            "Streaming memory extraction skipped for this request via X-Obey-Memory-Mode"
+        );
+        return;
+    }
     let system = memory.system.clone();
     let extraction_messages = memory.extraction_messages.clone();
     let namespace = memory.namespace.clone();
@@ -1659,10 +1754,11 @@ pub async fn chat_completions(
     tracing::info!(model = %request.model, stream = request.stream, "Received chat completion request");
     let trace_id = trace_id_from_headers(&headers);
     let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
+    let mode = memory_mode(&headers);
     if request.stream {
-        chat_completions_stream(state, request, trace_id, virtual_key_id).await
+        chat_completions_stream(state, request, trace_id, virtual_key_id, mode).await
     } else {
-        chat_completions_non_stream(state, request, trace_id, virtual_key_id).await
+        chat_completions_non_stream(state, request, trace_id, virtual_key_id, mode).await
     }
 }
 
@@ -1671,6 +1767,7 @@ async fn chat_completions_non_stream(
     mut request: OpenAIRequest,
     trace_id: String,
     virtual_key_id: Option<String>,
+    memory_mode: MemoryMode,
 ) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
@@ -1834,8 +1931,13 @@ async fn chat_completions_non_stream(
     // post-truncation request. Router compression remains provider-specific and
     // therefore runs only after this handler-side injection boundary.
     request = state.router.prepare_post_truncation_request(&request);
-    let memory_context =
-        preprocess_memory_request(&state, &mut request, virtual_key_id.as_deref()).await;
+    let memory_context = preprocess_memory_request(
+        &state,
+        &mut request,
+        virtual_key_id.as_deref(),
+        memory_mode,
+    )
+    .await;
 
     match state
         .router
@@ -2499,6 +2601,7 @@ async fn chat_completions_stream(
     mut request: OpenAIRequest,
     trace_id: String,
     virtual_key_id: Option<String>,
+    memory_mode: MemoryMode,
 ) -> Response {
     state.metrics.start_request();
     let start = Instant::now();
@@ -2521,8 +2624,13 @@ async fn chat_completions_stream(
     );
 
     request = state.router.prepare_post_truncation_request(&request);
-    let memory_context =
-        preprocess_memory_request(&state, &mut request, virtual_key_id.as_deref()).await;
+    let memory_context = preprocess_memory_request(
+        &state,
+        &mut request,
+        virtual_key_id.as_deref(),
+        memory_mode,
+    )
+    .await;
 
     // Memory extraction is deliberately kept OFF the pre-routing critical path.
     // The previous implementation awaited `extract_explicit_response` here,
@@ -3082,15 +3190,16 @@ async fn chat_completions_stream(
                                         } else {
                                             None
                                         };
-                                        let relay_memory_extraction = memory_context.as_ref().map(|memory| {
-                                            RelayMemoryExtraction {
-                                                system: memory.system.clone(),
-                                                extraction_messages: memory.extraction_messages.clone(),
-                                                namespace: memory.namespace.clone(),
-                                                memory_events: state.memory_events.clone(),
-                                                request_id: uuid::Uuid::parse_str(&stream_trace_id).ok(),
-                                            }
-                                        });
+		let relay_memory_extraction = memory_context.as_ref().map(|memory| {
+			RelayMemoryExtraction {
+				system: memory.system.clone(),
+				extraction_messages: memory.extraction_messages.clone(),
+				namespace: memory.namespace.clone(),
+				memory_events: state.memory_events.clone(),
+				request_id: uuid::Uuid::parse_str(&stream_trace_id).ok(),
+				mode: memory.mode,
+			}
+		});
                                         let relay = relay_passthrough_stream(
                                             current_stream,
                                             streaming_config_relay.clone(),
@@ -5859,20 +5968,33 @@ struct RelayMemoryExtraction {
     namespace: ResolvedNamespace,
     memory_events: Arc<crate::dashboard::MemoryEventHub>,
     request_id: Option<uuid::Uuid>,
+    /// Per-request memory mode; extraction is skipped unless this is
+    /// `Configured` (Req 8.1/8.2).
+    mode: MemoryMode,
 }
 
 impl RelayMemoryExtraction {
     /// Spawn explicit + automatic extraction against the reassembled response
     /// content. Mirrors `spawn_streaming_memory_extraction` but is self-owned so
     /// the relay does not depend on `AppState`.
-    fn spawn(self, response_content: String) {
-        let RelayMemoryExtraction {
-            system,
-            extraction_messages,
-            namespace,
-            memory_events,
-            request_id,
-        } = self;
+	fn spawn(self, response_content: String) {
+		let RelayMemoryExtraction {
+			system,
+			extraction_messages,
+			namespace,
+			memory_events,
+			request_id,
+			mode,
+		} = self;
+		// Req 8.1/8.2: the relay never spawns for `off` (no memory
+		// context); `read-only` skips extraction here too.
+		if !mode.extraction_allowed() {
+			tracing::info!(
+				memory_mode = "read-only",
+				"Relay memory extraction skipped for this request via X-Obey-Memory-Mode"
+			);
+			return;
+		}
         tokio::spawn(async move {
             match system
                 .extract_explicit_response(&extraction_messages, &namespace, request_id)
@@ -6942,18 +7064,19 @@ pub async fn anthropic_create(
     } else {
         return anthropic_invalid_request("anthropic-version header is required");
     }
-    let request: AnthropicRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => {
-            return anthropic_invalid_request(format!("invalid JSON body: {e}"));
-        }
-    };
-    if let Some(rejection) = anthropic_request_rejection(&request) {
-        return anthropic_invalid_request(rejection);
-    }
-    let trace_id = trace_id_from_headers(&headers);
-    let claude_session_id = claude_session_id_from(&headers, &request);
-    let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
+	let request: AnthropicRequest = match serde_json::from_slice(&body) {
+		Ok(r) => r,
+		Err(e) => {
+			return anthropic_invalid_request(format!("invalid JSON body: {e}"));
+		}
+	};
+	if let Some(rejection) = anthropic_request_rejection(&request) {
+		return anthropic_invalid_request(rejection);
+	}
+	let trace_id = trace_id_from_headers(&headers);
+	let claude_session_id = claude_session_id_from(&headers, &request);
+	let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
+	let memory_mode = memory_mode(&headers);
 
     tracing::info!(
         model = %request.model,
@@ -6991,47 +7114,50 @@ pub async fn anthropic_create(
         (chat_request, request.stop_sequences.clone(), raw_body)
     };
 
-    if request.stream {
-        anthropic_create_stream(
-            state,
-            request,
-            chat_request,
-            request_stop_sequences,
-            trace_id,
-            claude_session_id,
-            virtual_key_id,
-            raw_body,
-            headers,
-        )
-        .await
-    } else {
-        anthropic_create_buffered(
-            state,
-            request,
-            chat_request,
-            request_stop_sequences,
-            trace_id,
-            claude_session_id,
-            virtual_key_id,
-            raw_body,
-            headers,
-        )
-        .await
-    }
+	if request.stream {
+		anthropic_create_stream(
+			state,
+			request,
+			chat_request,
+			request_stop_sequences,
+			trace_id,
+			claude_session_id,
+			virtual_key_id,
+			raw_body,
+			headers,
+			memory_mode,
+		)
+		.await
+	} else {
+		anthropic_create_buffered(
+			state,
+			request,
+			chat_request,
+			request_stop_sequences,
+			trace_id,
+			claude_session_id,
+			virtual_key_id,
+			raw_body,
+			headers,
+			memory_mode,
+		)
+		.await
+	}
 }
 
 /// Buffered (non-streaming) /v1/messages path.
 #[allow(clippy::too_many_arguments)]
 async fn anthropic_create_buffered(
-    state: AppState,
-    request: AnthropicRequest,
-    mut chat_request: OpenAIRequest,
-    request_stop_sequences: Vec<String>,
-    trace_id: String,
-    claude_session_id: Option<String>,
-    virtual_key_id: Option<String>,
-    raw_body: serde_json::Value,
-    headers: HeaderMap,
+	state: AppState,
+	request: AnthropicRequest,
+	mut chat_request: OpenAIRequest,
+	request_stop_sequences: Vec<String>,
+	trace_id: String,
+	claude_session_id: Option<String>,
+	virtual_key_id: Option<String>,
+	raw_body: serde_json::Value,
+	headers: HeaderMap,
+	memory_mode: MemoryMode,
 ) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
@@ -7169,23 +7295,28 @@ async fn anthropic_create_buffered(
         }
     }
 
-    // Memory injection + context-overflow compression (Req 6.1 best-effort
-    // parity with the chat path): the centralized post-truncation boundary
-    // and memory preprocessing both mutate the translated chat request
-    // exactly as in `chat_completions_non_stream` before dispatch.
-    chat_request = state.router.prepare_post_truncation_request(&chat_request);
-    let memory_context =
-        preprocess_memory_request(&state, &mut chat_request, virtual_key_id.as_deref()).await;
+	// Memory injection + context-overflow compression (Req 6.1 best-effort
+	// parity with the chat path): the centralized post-truncation boundary
+	// and memory preprocessing both mutate the translated chat request
+	// exactly as in `chat_completions_non_stream` before dispatch.
+	chat_request = state.router.prepare_post_truncation_request(&chat_request);
+	let memory_context = preprocess_memory_request(
+		&state,
+		&mut chat_request,
+		virtual_key_id.as_deref(),
+		memory_mode,
+	)
+	.await;
 
-    let passthrough_scope = anthropic_passthrough_scope(&raw_body, &headers);
-    let result = passthrough_scope
-        .scope(async {
-            state
-                .router
-                .route_request(&chat_request, Some(active_handle.clone()))
-                .await
-        })
-        .await;
+	let passthrough_scope = anthropic_passthrough_scope(&raw_body, &headers);
+	let result = passthrough_scope
+		.scope(async {
+			state
+				.router
+				.route_request(&chat_request, Some(active_handle.clone()))
+				.await
+		})
+		.await;
 
     match result {
         Ok(mut chat_response) => {
@@ -7339,15 +7470,16 @@ async fn anthropic_create_buffered(
 /// via `route_request` fallback (see `post_call_forces_buffered`).
 #[allow(clippy::too_many_arguments)]
 async fn anthropic_create_stream(
-    state: AppState,
-    request: AnthropicRequest,
-    mut chat_request: OpenAIRequest,
-    request_stop_sequences: Vec<String>,
-    trace_id: String,
-    claude_session_id: Option<String>,
-    virtual_key_id: Option<String>,
-    raw_body: serde_json::Value,
-    headers: HeaderMap,
+	state: AppState,
+	request: AnthropicRequest,
+	mut chat_request: OpenAIRequest,
+	request_stop_sequences: Vec<String>,
+	trace_id: String,
+	claude_session_id: Option<String>,
+	virtual_key_id: Option<String>,
+	raw_body: serde_json::Value,
+	headers: HeaderMap,
+	memory_mode: MemoryMode,
 ) -> Response {
     let streaming_config = state
         .config
@@ -7463,11 +7595,16 @@ async fn anthropic_create_stream(
         post_call_forces_buffered = post_call_bound || !guardrail_ctx.is_empty();
     }
 
-    // Memory injection + context-overflow compression (Req 6.1 best-effort
-    // parity with the chat streaming handler).
-    chat_request = state.router.prepare_post_truncation_request(&chat_request);
-    let memory_context =
-        preprocess_memory_request(&state, &mut chat_request, virtual_key_id.as_deref()).await;
+	// Memory injection + context-overflow compression (Req 6.1 best-effort
+	// parity with the chat streaming handler).
+	chat_request = state.router.prepare_post_truncation_request(&chat_request);
+	let memory_context = preprocess_memory_request(
+		&state,
+		&mut chat_request,
+		virtual_key_id.as_deref(),
+		memory_mode,
+	)
+	.await;
 
     // Input-side usage estimate (Req 2.1): tokenizer estimate on the
     // translated request, the same counting helper `/v1/messages/count_tokens`
@@ -8033,14 +8170,15 @@ mod tests {
         build_keepalive, cache_allowed_for_validation, chunk_carries_answer, chunk_carries_content,
         classify_relay_line, classify_stream_error, collect_structured_output_failure,
         eager_sse_response, early_event_chunk, emit_sse_error_event, force_eager_structured_stream,
-        heartbeat_chunk, is_tool_call_turn, is_transient_stream_truncation, json_model,
-        memory_feedback_chunk, multipart_model, openai_json_response, prepare_response_for_client,
+    heartbeat_chunk, is_tool_call_turn, is_transient_stream_truncation, json_model,
+    memory_feedback_chunk, memory_mode, multipart_model, openai_json_response,
+    prepare_response_for_client,
         provider_pass_through_response, reasoning_relay_chunk, reasoning_relay_chunk_with_role,
         rechunk_structured_response, relay_passthrough_stream, requests_structured_output,
         should_cache_eager_structured, smart_routing_headers, sse_error_payload,
         streaming_chunks_after_early_event, streaming_chunks_after_early_event_suppress_reasoning,
         streaming_chunks_from_response, structured_stream_overflow_events,
-        upstream_stream_metadata, RelayLineAction, RelayOutcome, RequestCompleteGuard,
+        upstream_stream_metadata, MemoryMode, RelayLineAction, RelayOutcome, RequestCompleteGuard,
         RequestLogContext, ValidationResponseStatus,
     };
     use crate::compression::{stats::CompressionStats, CompressionLevel};
@@ -8064,10 +8202,62 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    #[test]
-    fn pass_through_extracts_models_without_mutating_bodies() {
-        let json = br#"{"model":"embedding-group","input":["hello"]}"#;
-        assert_eq!(json_model(json).unwrap(), "embedding-group");
+	#[test]
+	fn memory_mode_parses_off_read_only_absent_unrecognized_and_case_variants() {
+		let mut headers = axum::http::HeaderMap::new();
+		// Absent header → configured behavior (Req 8.3).
+		assert_eq!(memory_mode(&headers), MemoryMode::Configured);
+
+		// Exact values.
+		headers.insert(
+			axum::http::HeaderName::from_static("x-obey-memory-mode"),
+			axum::http::HeaderValue::from_static("off"),
+		);
+		assert_eq!(memory_mode(&headers), MemoryMode::Off);
+		headers.insert(
+			axum::http::HeaderName::from_static("x-obey-memory-mode"),
+			axum::http::HeaderValue::from_static("read-only"),
+		);
+		assert_eq!(memory_mode(&headers), MemoryMode::ReadOnly);
+
+		// Case-insensitive value matching.
+		headers.insert(
+			axum::http::HeaderName::from_static("x-obey-memory-mode"),
+			axum::http::HeaderValue::from_static("OFF"),
+		);
+		assert_eq!(memory_mode(&headers), MemoryMode::Off);
+		headers.insert(
+			axum::http::HeaderName::from_static("x-obey-memory-mode"),
+			axum::http::HeaderValue::from_static("Read-Only"),
+		);
+		assert_eq!(memory_mode(&headers), MemoryMode::ReadOnly);
+
+		// Surrounding whitespace is tolerated.
+		headers.insert(
+			axum::http::HeaderName::from_static("x-obey-memory-mode"),
+			axum::http::HeaderValue::from_static("  off  "),
+		);
+		assert_eq!(memory_mode(&headers), MemoryMode::Off);
+
+		// Unrecognized values fall back to configured behavior (Req 8.3).
+		for unrecognized in ["on", "readonly", "full", ""] {
+			headers.insert(
+				axum::http::HeaderName::from_static("x-obey-memory-mode"),
+				axum::http::HeaderValue::from_static(unrecognized),
+			);
+			assert_eq!(memory_mode(&headers), MemoryMode::Configured);
+		}
+
+		// Extraction gating follows the mode (Req 8.1/8.2).
+		assert!(!MemoryMode::Off.extraction_allowed());
+		assert!(!MemoryMode::ReadOnly.extraction_allowed());
+		assert!(MemoryMode::Configured.extraction_allowed());
+	}
+
+#[test]
+fn pass_through_extracts_models_without_mutating_bodies() {
+	let json = br#"{"model":"embedding-group","input":["hello"]}"#;
+	assert_eq!(json_model(json).unwrap(), "embedding-group");
 
         let multipart = b"--raw-boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\naudio-group\r\n--raw-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: application/octet-stream\r\n\r\n\x00\xff\x80raw-audio\r\n--raw-boundary--\r\n";
         assert_eq!(
@@ -10605,11 +10795,12 @@ pub async fn completions(
     authenticated_key: Option<Extension<AuthenticatedKey>>,
     Json(request): Json<OpenAIRequest>,
 ) -> Response {
-    // Reuse chat completions routing; the OpenAI completions format is close enough
-    // for provider pass-through. Full translation can be refined later.
-    let trace_id = trace_id_from_headers(&headers);
-    let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
-    chat_completions_non_stream(state, request, trace_id, virtual_key_id).await
+	// Reuse chat completions routing; the OpenAI completions format is close enough
+	// for provider pass-through. Full translation can be refined later.
+	let trace_id = trace_id_from_headers(&headers);
+	let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
+	let memory_mode = memory_mode(&headers);
+	chat_completions_non_stream(state, request, trace_id, virtual_key_id, memory_mode).await
 }
 // ---------------------------------------------------------------------------
 // Provider pass-through endpoints (Req 2.3-2.5)

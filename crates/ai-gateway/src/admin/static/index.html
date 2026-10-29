@@ -175,6 +175,9 @@ table.vk-table th[aria-sort="descending"]::after{content:" \25BC";font-size:.7em
 table.vk-table tbody tr:hover{background:rgba(13,110,253,.04)}
 .vk-key-prefix{font-family:monospace}
 .vk-empty{padding:2rem 1rem;text-align:center;color:var(--text-muted)}
+/* Memory browser superseded badge (memory spec Req 6.2, 9.2) */
+.mem-superseded-badge{display:inline-block;margin-top:.2rem;font-size:.7rem;padding:.1rem .45rem;border-radius:999px;font-weight:600;background:rgba(255,193,7,.12);color:#8a6d0b;border:1px solid rgba(255,193,7,.4);cursor:pointer;font-family:monospace}
+.mem-superseded-badge:hover,.mem-superseded-badge:focus-visible{background:rgba(255,193,7,.25);outline:none}
 .vk-status-badge{font-size:.7rem;padding:.15rem .5rem;border-radius:999px;font-weight:600;text-transform:capitalize}
 .vk-status-active{background:rgba(25,135,84,.1);color:var(--success);border:1px solid rgba(25,135,84,.25)}
 .vk-status-expired{background:rgba(108,117,125,.12);color:var(--text-muted);border:1px solid rgba(108,117,125,.3)}
@@ -2103,12 +2106,29 @@ body.sec-banner-active{padding-top:3.2rem}
           <select id="mem-extract-model"><option value="">-- select provider first --</option></select>
         </div>
       </div>
-      <div class="form-group">
-        <label for="mem-extract-min-turns">Min Turns Before Extraction</label>
-        <input type="number" id="mem-extract-min-turns" value="4" min="1" max="100" style="max-width:200px">
-        <div class="hint">Minimum conversation turns before triggering extraction</div>
-      </div>
-    </fieldset>
+<div class="form-group">
+<label for="mem-extract-min-turns">Min Turns Before Extraction</label>
+<input type="number" id="mem-extract-min-turns" value="4" min="1" max="100" style="max-width:200px">
+<div class="hint">Minimum conversation turns before triggering extraction</div>
+</div>
+</fieldset>
+
+<fieldset><legend>Background Consolidation</legend>
+<p class="hint" style="margin-bottom:.75rem">Runs with the decay cycle: merges near-duplicates and supersedes contradictory memories via the configured provider.</p>
+<div class="form-check" style="margin-bottom:1rem"><input type="checkbox" id="mem-consolidation-enabled"><label for="mem-consolidation-enabled">Enable Consolidation</label></div>
+<div class="form-row">
+<div class="form-group">
+<label for="mem-consolidation-provider">Consolidation Provider</label>
+<select id="mem-consolidation-provider"><option value="">-- select provider --</option></select>
+<div class="hint">Empty falls back to the auto-extract provider</div>
+</div>
+<div class="form-group">
+<label for="mem-consolidation-model">Consolidation Model</label>
+<select id="mem-consolidation-model"><option value="">-- select provider first --</option></select>
+<div class="hint">Empty falls back to the auto-extract model; list shows the effective (fallback) provider's models</div>
+</div>
+</div>
+</fieldset>
 
     <fieldset><legend>Vector Search (Qdrant)</legend>
       <p class="hint" style="margin-bottom:.75rem">Optional Qdrant integration for semantic memory retrieval alongside BM25 lexical search. Requires an embedding provider and model.</p>
@@ -2175,41 +2195,81 @@ body.sec-banner-active{padding-top:3.2rem}
             <div style="font-size:.7rem;color:var(--text-muted);text-transform:uppercase">Storage Size</div>
             <div style="font-size:1.2rem;font-weight:700" id="mem-stat-size">—</div>
           </div>
-          <div style="padding:.6rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)">
-            <div style="font-size:.7rem;color:var(--text-muted);text-transform:uppercase">Last Decay</div>
-            <div style="font-size:1.2rem;font-weight:700" id="mem-stat-decay">—</div>
-          </div>
-        </div>
-        <button class="btn btn-secondary btn-sm" id="mem-refresh-stats" style="margin-top:.75rem">Refresh Stats</button>
-      </div>
-    </fieldset>
+<div style="padding:.6rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)">
+<div style="font-size:.7rem;color:var(--text-muted);text-transform:uppercase">Last Decay</div>
+<div style="font-size:1.2rem;font-weight:700" id="mem-stat-decay">—</div>
+</div>
+<div style="padding:.6rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)">
+<div style="font-size:.7rem;color:var(--text-muted);text-transform:uppercase">Last Consolidation</div>
+<div style="font-size:1.2rem;font-weight:700" id="mem-stat-consolidation">—</div>
+</div>
+</div>
+<button class="btn btn-secondary btn-sm" id="mem-refresh-stats" style="margin-top:.75rem">Refresh Stats</button>
+</div>
+</fieldset>
 
-    <fieldset><legend>Memory Browser</legend>
-      <div style="display:flex;gap:.5rem;align-items:end;margin-bottom:1rem;flex-wrap:wrap">
-        <div class="form-group" style="flex:1;min-width:200px;margin:0">
-          <label for="mem-browse-ns">Namespace</label>
-          <input type="text" id="mem-browse-ns" placeholder="user::project::abc123" autocomplete="off">
-        </div>
-        <button class="btn btn-primary btn-sm" id="mem-browse-btn">List Entries</button>
-        <button class="btn btn-danger btn-sm" id="mem-clear-ns-btn" title="Delete all entries in this namespace">Clear Namespace</button>
-      </div>
-      <div id="mem-entries-wrap" style="display:none">
-        <div style="overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)">
-          <table style="width:100%;border-collapse:collapse;font-size:.8rem" aria-label="Memory entries">
-            <thead><tr>
-              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Content</th>
-              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Type</th>
-              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Score</th>
-              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Accessed</th>
-              <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Actions</th>
-            </tr></thead>
-            <tbody id="mem-entries-tbody"></tbody>
-          </table>
-        </div>
-        <div style="font-size:.75rem;color:var(--text-muted);margin-top:.5rem" id="mem-entries-info"></div>
-      </div>
-      <div id="mem-entries-empty" style="text-align:center;padding:1rem;color:var(--text-muted);font-size:.85rem">Enter a namespace to browse memories</div>
-    </fieldset>
+<fieldset><legend>Memory Browser</legend>
+<div style="display:flex;gap:.5rem;align-items:end;margin-bottom:1rem;flex-wrap:wrap">
+<div class="form-group" style="flex:1;min-width:200px;margin:0">
+<label for="mem-browse-ns">Namespace</label>
+<input type="text" id="mem-browse-ns" placeholder="user::project::abc123" autocomplete="off">
+</div>
+<button class="btn btn-primary btn-sm" id="mem-browse-btn">List Entries</button>
+<button class="btn btn-danger btn-sm" id="mem-clear-ns-btn" title="Delete all entries in this namespace">Clear Namespace</button>
+</div>
+<div style="display:flex;gap:.5rem;align-items:end;margin-bottom:1rem;flex-wrap:wrap;border-top:1px solid var(--border);padding-top:1rem">
+<div class="form-group" style="flex:1;min-width:220px;margin:0">
+<label for="mem-search-q">Search</label>
+<input type="search" id="mem-search-q" placeholder="Search memory content (FTS)" autocomplete="off">
+<div class="hint">Full-text search across namespaces; empty query lists newest entries</div>
+</div>
+<div class="form-group" style="min-width:140px;margin:0">
+<label for="mem-search-ns">Namespace Filter</label>
+<input type="text" id="mem-search-ns" placeholder="all namespaces" autocomplete="off">
+</div>
+<div class="form-group" style="min-width:130px;margin:0">
+<label for="mem-search-type">Memory Type</label>
+<select id="mem-search-type">
+<option value="">all types</option>
+<option value="preference">preference</option>
+<option value="fact">fact</option>
+<option value="context">context</option>
+<option value="decision">decision</option>
+</select>
+</div>
+<div class="form-group" style="margin:0">
+<div class="form-check"><input type="checkbox" id="mem-search-include-superseded"><label for="mem-search-include-superseded">Include superseded</label></div>
+</div>
+<button class="btn btn-primary btn-sm" id="mem-search-btn">Search</button>
+<button class="btn btn-secondary btn-sm" id="mem-search-clear-btn">Clear</button>
+</div>
+<div style="display:flex;gap:.5rem;margin-bottom:1rem;flex-wrap:wrap">
+<button class="btn btn-secondary btn-sm" id="mem-export-btn">Export All (JSON)</button>
+<button class="btn btn-secondary btn-sm" id="mem-consolidate-btn">Run Consolidation</button>
+<span id="mem-consolidate-status" style="font-size:.8rem;color:var(--text-muted);align-self:center"></span>
+</div>
+<div id="mem-entries-wrap" style="display:none">
+<div style="overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)">
+<table style="width:100%;border-collapse:collapse;font-size:.8rem" aria-label="Memory entries">
+<thead><tr>
+<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Content</th>
+<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Type</th>
+<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Score</th>
+<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Namespace</th>
+<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Created</th>
+<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Updated</th>
+<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Accessed</th>
+<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Hits</th>
+<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Source Req</th>
+<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Actions</th>
+</tr></thead>
+<tbody id="mem-entries-tbody"></tbody>
+</table>
+</div>
+<div style="font-size:.75rem;color:var(--text-muted);margin-top:.5rem" id="mem-entries-info"></div>
+</div>
+<div id="mem-entries-empty" style="text-align:center;padding:1rem;color:var(--text-muted);font-size:.85rem">Enter a namespace or search to browse memories</div>
+</fieldset>
 
     <fieldset><legend>Create Memory Entry</legend>
       <div class="form-row">
@@ -3054,6 +3114,10 @@ function populateProviderSelects() {
 	if (memQdrantEmbedSel) {
 		setSelectOptions(memQdrantEmbedSel, '-- select provider --', names, memQdrantEmbedSel.value);
 	}
+	var memConsolSel = document.getElementById('mem-consolidation-provider');
+	if (memConsolSel) {
+		setSelectOptions(memConsolSel, '-- select provider --', names, memConsolSel.value);
+	}
 }
 
   document.getElementById('providers-list').addEventListener('input', function(e) {
@@ -3078,10 +3142,20 @@ document.getElementById('mem-extract-provider').addEventListener('change', funct
 
 // When memory Qdrant embedding provider changes, fetch its models
 document.getElementById('mem-qdrant-embed-provider').addEventListener('change', function() {
-	var prov = this.value;
-	var mdlSel = document.getElementById('mem-qdrant-embed-model');
-	if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
-	else { setSelectOptions(mdlSel, '-- select provider first --', [], ''); }
+var prov = this.value;
+var mdlSel = document.getElementById('mem-qdrant-embed-model');
+if (prov) { fetchModelsForProvider(prov, mdlSel, mdlSel.value || ''); }
+else { setSelectOptions(mdlSel, '-- select provider first --', [], ''); }
+});
+
+// When memory consolidation provider changes, fetch its models; when cleared,
+// fall back to the auto-extract provider (mirrors server-side effective resolution).
+document.getElementById('mem-consolidation-provider').addEventListener('change', function() {
+var prov = this.value;
+var mdlSel = document.getElementById('mem-consolidation-model');
+var effProv = prov || document.getElementById('mem-extract-provider').value || '';
+if (effProv) { fetchModelsForProvider(effProv, mdlSel, mdlSel.value || ''); }
+else { setSelectOptions(mdlSel, '-- select provider first --', [], ''); }
 });
 
   // --- Dynamic Lists: Providers ---
@@ -6686,6 +6760,14 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
       setSelectOptions(document.getElementById('mem-extract-model'), '-- select provider first --', [], '');
     }
     document.getElementById('mem-extract-min-turns').value = mem.auto_extract_min_turns || 4;
+document.getElementById('mem-consolidation-enabled').checked = !!mem.consolidation_enabled;
+document.getElementById('mem-consolidation-provider').value = mem.consolidation_provider || '';
+var consolEffProv = mem.consolidation_provider || mem.auto_extract_provider || '';
+if (consolEffProv) {
+fetchModelsForProvider(consolEffProv, document.getElementById('mem-consolidation-model'), mem.consolidation_model || '');
+} else {
+setSelectOptions(document.getElementById('mem-consolidation-model'), '-- select provider first --', [], '');
+}
     var q = mem.qdrant || {};
     document.getElementById('mem-qdrant-url').value = q.qdrant_url || '';
     document.getElementById('mem-qdrant-collection').value = q.qdrant_collection || '';
@@ -6713,6 +6795,9 @@ memLoadStats();
       auto_extract_provider: document.getElementById('mem-extract-provider').value.trim(),
       auto_extract_model: document.getElementById('mem-extract-model').value.trim(),
       auto_extract_min_turns: parseInt(document.getElementById('mem-extract-min-turns').value, 10) || 4,
+consolidation_enabled: document.getElementById('mem-consolidation-enabled').checked,
+consolidation_provider: document.getElementById('mem-consolidation-provider').value.trim(),
+consolidation_model: document.getElementById('mem-consolidation-model').value.trim(),
       decay_schedule_hours: parseInt(document.getElementById('mem-decay-hours').value, 10) || 24,
       max_memories_per_namespace: parseInt(document.getElementById('mem-max-per-ns').value, 10) || 1000,
       allow_sensitive_storage: document.getElementById('mem-allow-sensitive').checked,
@@ -6749,15 +6834,27 @@ mem.qdrant.vector_dimension = parseInt(vdVal, 10) || null;
         document.getElementById('mem-stat-ns').textContent = nsCount;
         document.getElementById('mem-stat-relevance').textContent = s.average_relevance_score != null ? s.average_relevance_score.toFixed(3) : '—';
         document.getElementById('mem-stat-size').textContent = s.storage_size_bytes != null ? formatBytes(s.storage_size_bytes) : '—';
-        document.getElementById('mem-stat-decay').textContent = s.last_decay_cycle ? new Date(s.last_decay_cycle).toLocaleString() : 'Never';
-      })
-      .catch(function() {
-        document.getElementById('mem-stat-total').textContent = '—';
-        document.getElementById('mem-stat-ns').textContent = '—';
-        document.getElementById('mem-stat-relevance').textContent = '—';
-        document.getElementById('mem-stat-size').textContent = '—';
-        document.getElementById('mem-stat-decay').textContent = '—';
-      });
+document.getElementById('mem-stat-decay').textContent = s.last_decay_cycle ? new Date(s.last_decay_cycle).toLocaleString() : 'Never';
+var lastPass = s.consolidation_last_pass;
+document.getElementById('mem-stat-consolidation').textContent = lastPass
+? new Date(lastPass.completed_at || lastPass.completed_at_ms).toLocaleString()
+: 'Never';
+document.getElementById('mem-stat-consolidation').title = lastPass
+? 'Merged ' + (lastPass.counts && lastPass.counts.merged != null ? lastPass.counts.merged : '?')
++ ', superseded ' + (lastPass.counts && lastPass.counts.superseded != null ? lastPass.counts.superseded : '?')
++ ', kept ' + (lastPass.counts && lastPass.counts.kept != null ? lastPass.counts.kept : '?')
++ ', skipped batches ' + (lastPass.counts && lastPass.counts.skipped_batches != null ? lastPass.counts.skipped_batches : '?')
++ ', provider errors ' + (lastPass.counts && lastPass.counts.provider_errors != null ? lastPass.counts.provider_errors : '?')
+: '';
+})
+.catch(function() {
+document.getElementById('mem-stat-total').textContent = '—';
+document.getElementById('mem-stat-ns').textContent = '—';
+document.getElementById('mem-stat-relevance').textContent = '—';
+document.getElementById('mem-stat-size').textContent = '—';
+document.getElementById('mem-stat-decay').textContent = '—';
+document.getElementById('mem-stat-consolidation').textContent = '—';
+});
   }
 
   function formatBytes(bytes) {
@@ -6807,53 +6904,292 @@ mem.qdrant.vector_dimension = parseInt(vdVal, 10) || null;
       });
   }
 
-  function memBrowseEntries() {
-    var ns = document.getElementById('mem-browse-ns').value.trim();
-    if (!ns) { document.getElementById('mem-entries-empty').textContent = 'Enter a namespace'; return; }
-    fetch(memApiUrl('entries') + '?namespace=' + encodeURIComponent(ns) + '&limit=50')
-      .then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
-      .then(function(data) {
-        var entries = data.entries || [];
-        var tbody = document.getElementById('mem-entries-tbody');
-        tbody.innerHTML = ''; /* xss-audit: static */
-        if (!entries.length) {
-          document.getElementById('mem-entries-wrap').style.display = 'none';
-          document.getElementById('mem-entries-empty').textContent = 'No entries in this namespace';
-          document.getElementById('mem-entries-empty').style.display = 'block';
-          return;
-        }
-        document.getElementById('mem-entries-wrap').style.display = 'block';
-        document.getElementById('mem-entries-empty').style.display = 'none';
-        document.getElementById('mem-entries-info').textContent = 'Showing ' + entries.length + ' of ' + (data.total_count || entries.length) + ' entries';
-        entries.forEach(function(entry) {
-          var row = document.createElement('tr');
-          var td1 = document.createElement('td'); td1.textContent = entry.content.length > 80 ? entry.content.substring(0, 80) + '…' : entry.content; td1.style.padding = '.4rem .5rem'; td1.style.maxWidth = '300px'; td1.style.overflow = 'hidden'; td1.title = entry.content; row.appendChild(td1);
-          var td2 = document.createElement('td'); td2.textContent = entry.memory_type || '—'; td2.style.padding = '.4rem .5rem'; row.appendChild(td2);
-          var td3 = document.createElement('td'); td3.textContent = entry.relevance_score != null ? entry.relevance_score.toFixed(3) : '—'; td3.style.padding = '.4rem .5rem'; row.appendChild(td3);
-          var td4 = document.createElement('td'); td4.textContent = entry.last_accessed_at ? new Date(entry.last_accessed_at).toLocaleString() : '—'; td4.style.padding = '.4rem .5rem'; td4.style.fontSize = '.75rem'; row.appendChild(td4);
-          var td5 = document.createElement('td'); td5.style.padding = '.4rem .5rem';
-          var delBtn = document.createElement('button');
-          delBtn.className = 'btn btn-danger btn-sm';
-          delBtn.textContent = 'Delete';
-          delBtn.title = 'Delete entry ' + entry.id;
-          delBtn.addEventListener('click', function() { memDeleteEntry(entry.id); });
-          td5.appendChild(delBtn);
-          row.appendChild(td5);
-          tbody.appendChild(row);
-        });
-      })
-      .catch(function(err) {
-        document.getElementById('mem-entries-wrap').style.display = 'none';
-        document.getElementById('mem-entries-empty').textContent = 'Error: ' + err.message;
-        document.getElementById('mem-entries-empty').style.display = 'block';
-      });
-  }
+// Filled in by the last entries/search listing so per-row actions can refresh
+// the same view (search vs namespace browse) after edit/supersede/delete.
+var memLastListUrl = null;
+
+function memRenderEntries(data) {
+var entries = data.entries || [];
+var tbody = document.getElementById('mem-entries-tbody');
+tbody.innerHTML = ''; /* xss-audit: static */
+if (!entries.length) {
+document.getElementById('mem-entries-wrap').style.display = 'none';
+document.getElementById('mem-entries-empty').textContent = 'No entries match';
+document.getElementById('mem-entries-empty').style.display = 'block';
+return;
+}
+document.getElementById('mem-entries-wrap').style.display = 'block';
+document.getElementById('mem-entries-empty').style.display = 'none';
+document.getElementById('mem-entries-info').textContent = 'Showing ' + entries.length + ' of ' + (data.total_count || entries.length) + ' entries';
+entries.forEach(function(entry) {
+var row = document.createElement('tr');
+var td1 = document.createElement('td'); td1.style.padding = '.4rem .5rem'; td1.style.maxWidth = '300px'; td1.style.overflow = 'hidden'; td1.title = entry.content;
+var c1Div = document.createElement('div'); c1Div.textContent = entry.content.length > 80 ? entry.content.substring(0, 80) + '…' : entry.content;
+td1.appendChild(c1Div);
+if (entry.superseded_by) {
+var badge = document.createElement('button');
+badge.type = 'button';
+badge.className = 'mem-superseded-badge';
+badge.textContent = 'superseded → ' + String(entry.superseded_by).slice(0, 8) + '…';
+badge.title = 'Superseded by ' + entry.superseded_by + ' — click to inspect';
+badge.addEventListener('click', function() { memInspectEntry(entry.superseded_by); });
+td1.appendChild(badge);
+}
+row.appendChild(td1);
+var td2 = document.createElement('td'); td2.textContent = entry.memory_type || '—'; td2.style.padding = '.4rem .5rem'; row.appendChild(td2);
+var td3 = document.createElement('td'); td3.textContent = entry.relevance_score != null ? entry.relevance_score.toFixed(3) : '—'; td3.style.padding = '.4rem .5rem'; row.appendChild(td3);
+var tdNs = document.createElement('td'); tdNs.textContent = entry.namespace || '—'; tdNs.style.padding = '.4rem .5rem'; tdNs.style.maxWidth = '160px'; tdNs.style.overflow = 'hidden'; tdNs.style.textOverflow = 'ellipsis'; tdNs.style.whiteSpace = 'nowrap'; tdNs.title = entry.namespace || ''; tdNs.style.fontFamily = 'monospace'; tdNs.style.fontSize = '.75rem'; row.appendChild(tdNs);
+var tdCr = document.createElement('td'); tdCr.textContent = entry.created_at ? new Date(entry.created_at * 1000).toLocaleString() : '—'; tdCr.style.padding = '.4rem .5rem'; tdCr.style.fontSize = '.75rem'; row.appendChild(tdCr);
+var tdUp = document.createElement('td'); tdUp.textContent = entry.updated_at ? new Date(entry.updated_at * 1000).toLocaleString() : '—'; tdUp.style.padding = '.4rem .5rem'; tdUp.style.fontSize = '.75rem'; row.appendChild(tdUp);
+var tdAc = document.createElement('td'); var accTs = entry.last_accessed_at; tdAc.textContent = accTs ? new Date(typeof accTs === 'number' ? accTs * 1000 : accTs).toLocaleString() : '—'; tdAc.style.padding = '.4rem .5rem'; tdAc.style.fontSize = '.75rem'; row.appendChild(tdAc);
+var tdHits = document.createElement('td'); tdHits.textContent = entry.access_count != null ? entry.access_count : '—'; tdHits.style.padding = '.4rem .5rem'; row.appendChild(tdHits);
+var tdSrc = document.createElement('td'); tdSrc.textContent = entry.source_request_id ? String(entry.source_request_id).slice(0, 8) + '…' : '—'; tdSrc.title = entry.source_request_id || ''; tdSrc.style.padding = '.4rem .5rem'; tdSrc.style.fontFamily = 'monospace'; tdSrc.style.fontSize = '.75rem'; row.appendChild(tdSrc);
+var tdAct = document.createElement('td'); tdAct.style.padding = '.4rem .5rem'; tdAct.style.whiteSpace = 'nowrap';
+var editBtn = document.createElement('button');
+editBtn.type = 'button';
+editBtn.className = 'btn btn-secondary btn-sm';
+editBtn.textContent = 'Edit';
+editBtn.title = 'Edit entry ' + entry.id;
+editBtn.style.marginRight = '.25rem';
+editBtn.addEventListener('click', function() { memEditEntry(entry); });
+tdAct.appendChild(editBtn);
+var supBtn = document.createElement('button');
+supBtn.type = 'button';
+supBtn.className = 'btn btn-secondary btn-sm';
+supBtn.textContent = 'Supersede';
+supBtn.title = 'Mark entry ' + entry.id + ' superseded by another entry id';
+supBtn.style.marginRight = '.25rem';
+if (entry.superseded_by) { supBtn.disabled = true; supBtn.title = 'Entry already superseded'; }
+supBtn.addEventListener('click', function() { memSupersedeEntry(entry); });
+tdAct.appendChild(supBtn);
+var delBtn = document.createElement('button');
+delBtn.type = 'button';
+delBtn.className = 'btn btn-danger btn-sm';
+delBtn.textContent = 'Delete';
+delBtn.title = 'Delete entry ' + entry.id;
+delBtn.addEventListener('click', function() { memDeleteEntry(entry.id); });
+tdAct.appendChild(delBtn);
+row.appendChild(tdAct);
+tbody.appendChild(row);
+});
+}
+
+function memRefreshList() {
+if (memLastListUrl) {
+fetch(memLastListUrl)
+.then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
+.then(memRenderEntries)
+.catch(function(err) { showToast('Refresh failed: ' + err.message, true); });
+}
+}
+
+function memInspectEntry(id) {
+var input = document.createElement('input');
+input.type = 'text';
+input.value = String(id || '');
+input.placeholder = 'Entry id (UUID) to open';
+memPrompt({
+title: 'Inspect memory entry',
+message: 'Superseded by entry id below. Show that entry\'s content (fetched via search by id is not supported; copy the id for audits).',
+confirmLabel: 'Copy id',
+input: input,
+onConfirm: function() {
+if (input.value) {
+try { navigator.clipboard.writeText(input.value); showToast('Entry id copied'); } catch (_) { showToast('Copy failed — id: ' + input.value); }
+}
+}
+});
+}
+
+function memBrowseEntries() {
+var ns = document.getElementById('mem-browse-ns').value.trim();
+if (!ns) { document.getElementById('mem-entries-empty').textContent = 'Enter a namespace'; return; }
+var includeSuperseded = document.getElementById('mem-search-include-superseded').checked;
+var url = memApiUrl('entries') + '?namespace=' + encodeURIComponent(ns) + '&limit=50&include_superseded=' + (includeSuperseded ? 'true' : 'false');
+memLastListUrl = url;
+fetch(url)
+.then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
+.then(memRenderEntries)
+.catch(function(err) {
+document.getElementById('mem-entries-wrap').style.display = 'none';
+document.getElementById('mem-entries-empty').textContent = 'Error: ' + err.message;
+document.getElementById('mem-entries-empty').style.display = 'block';
+});
+}
+
+function memSearchEntries() {
+var params = new URLSearchParams();
+var q = document.getElementById('mem-search-q').value.trim();
+if (q) { params.set('q', q); }
+var ns = document.getElementById('mem-search-ns').value.trim();
+if (ns) { params.set('namespace', ns); }
+var memType = document.getElementById('mem-search-type').value;
+if (memType) { params.set('memory_type', memType); }
+if (document.getElementById('mem-search-include-superseded').checked) { params.set('include_superseded', 'true'); }
+params.set('limit', '50');
+var url = memApiUrl('search') + '?' + params.toString();
+memLastListUrl = url;
+fetch(url)
+.then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
+.then(memRenderEntries)
+.catch(function(err) {
+document.getElementById('mem-entries-wrap').style.display = 'none';
+document.getElementById('mem-entries-empty').textContent = 'Error: ' + err.message;
+document.getElementById('mem-entries-empty').style.display = 'block';
+});
+}
+
+function memClearSearch() {
+document.getElementById('mem-search-q').value = '';
+document.getElementById('mem-search-ns').value = '';
+document.getElementById('mem-search-type').value = '';
+document.getElementById('mem-search-include-superseded').checked = false;
+memSearchEntries();
+}
+
+// Generic one-input modal following the vk-modal conventions (focus trap via
+// keyboard nav, Escape closes, backdrop click closes).
+var memPromptState = { lastFocus: null, onConfirm: null };
+
+function memPromptClose() {
+var bd = document.getElementById('mem-prompt-backdrop');
+if (bd) { bd.classList.remove('open'); }
+memPromptState.onConfirm = null;
+var restore = memPromptState.lastFocus;
+memPromptState.lastFocus = null;
+if (restore && typeof restore.focus === 'function') { restore.focus(); }
+}
+
+function memPrompt(opts) {
+var bd = document.getElementById('mem-prompt-backdrop');
+if (!bd) {
+bd = document.createElement('div');
+bd.className = 'vk-modal-backdrop';
+bd.id = 'mem-prompt-backdrop';
+var modal = document.createElement('div');
+modal.className = 'vk-modal';
+modal.setAttribute('role', 'dialog');
+modal.setAttribute('aria-modal', 'true');
+var title = document.createElement('h3');
+title.id = 'mem-prompt-title';
+var msg = document.createElement('p');
+msg.id = 'mem-prompt-msg';
+msg.style.fontSize = '.9rem';
+var body = document.createElement('div');
+body.id = 'mem-prompt-body';
+body.style.marginBottom = '1rem';
+var actions = document.createElement('div');
+actions.className = 'actions';
+var ok = document.createElement('button');
+ok.type = 'button'; ok.className = 'btn btn-primary'; ok.id = 'mem-prompt-ok';
+var cancel = document.createElement('button');
+cancel.type = 'button'; cancel.className = 'btn btn-secondary'; cancel.textContent = 'Cancel';
+actions.appendChild(ok);
+actions.appendChild(cancel);
+modal.appendChild(title);
+modal.appendChild(msg);
+modal.appendChild(body);
+modal.appendChild(actions);
+bd.appendChild(modal);
+document.body.appendChild(bd);
+  ok.addEventListener('click', function() {
+  var cb = memPromptState.onConfirm;
+  memPromptClose();
+  if (cb) { cb(); }
+  });
+cancel.addEventListener('click', memPromptClose);
+bd.addEventListener('click', function(e) { if (e.target === bd) { memPromptClose(); } });
+document.addEventListener('keydown', function(e) {
+if (e.key === 'Escape' && bd.classList.contains('open')) { e.preventDefault(); memPromptClose(); }
+});
+}
+document.getElementById('mem-prompt-title').textContent = opts.title || 'Prompt';
+document.getElementById('mem-prompt-msg').textContent = opts.message || '';
+var bodyEl = document.getElementById('mem-prompt-body');
+bodyEl.textContent = '';
+if (opts.input) { bodyEl.appendChild(opts.input); }
+var okBtn = document.getElementById('mem-prompt-ok');
+okBtn.textContent = opts.confirmLabel || 'OK';
+// Hold the callback in module state so rapid re-prompts replace (not stack) the
+// pending callback and nothing is ever attached to window.
+memPromptState.onConfirm = opts.onConfirm || null;
+memPromptState.lastFocus = document.activeElement;
+bd.classList.add('open');
+var focusTarget = opts.input || okBtn;
+if (focusTarget.focus) { focusTarget.focus(); }
+}
+
+function memEditEntry(entry) {
+var ta = document.createElement('textarea');
+ta.rows = 3;
+ta.value = entry.content || '';
+var typeSel = document.createElement('select');
+['preference', 'fact', 'context', 'decision'].forEach(function(t) {
+var opt = document.createElement('option');
+opt.value = t; opt.textContent = t;
+if (entry.memory_type === t) { opt.selected = true; }
+typeSel.appendChild(opt);
+});
+memPrompt({
+title: 'Edit memory entry',
+message: 'Update content and memory type. Validation and sensitive screening run server-side.',
+confirmLabel: 'Save',
+onConfirm: function() {
+var content = ta.value.trim();
+if (!content) { showToast('Content must not be empty', true); return; }
+fetch(memApiUrl('entries/' + entry.id), {
+method: 'PATCH',
+headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify({ content: content, memory_type: typeSel.value })
+})
+.then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
+.then(function() { showToast('Entry updated'); memRefreshList(); memLoadStats(); })
+.catch(function(err) { showToast('Edit failed: ' + err.message, true); });
+}
+});
+var wrap = document.createElement('div');
+wrap.appendChild(ta);
+wrap.appendChild(typeSel);
+wrap.style.marginTop = '.5rem';
+document.getElementById('mem-prompt-body').appendChild(wrap);
+}
+
+function memSupersedeEntry(entry) {
+var input = document.createElement('input');
+input.type = 'text';
+input.placeholder = 'UUID of the superseding entry';
+input.value = '';
+memPrompt({
+title: 'Supersede memory entry',
+message: 'Mark this entry as superseded by another active entry. Both ids must exist; the target must not already be superseded.',
+confirmLabel: 'Supersede',
+onConfirm: function() {
+var supersededBy = input.value.trim();
+if (!supersededBy) { showToast('superseded_by id is required', true); return; }
+fetch(memApiUrl('entries/' + entry.id + '/supersede'), {
+method: 'POST',
+headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify({ superseded_by: supersededBy })
+})
+.then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
+.then(function() { showToast('Entry superseded'); memRefreshList(); memLoadStats(); })
+.catch(function(err) { showToast('Supersede failed: ' + err.message, true); });
+}
+});
+document.getElementById('mem-prompt-body').appendChild(input);
+}
 
   function memDeleteEntry(id) {
-    if (!confirm('Delete this memory entry?')) return;
-    fetch(memApiUrl('entries/' + id), { method: 'DELETE' })
-      .then(function(r) { if (!r.ok && r.status !== 204) throw new Error('HTTP ' + r.status); showToast('Entry deleted'); memBrowseEntries(); })
-      .catch(function(err) { showToast('Delete failed: ' + err.message, true); });
+    memPrompt({
+      title: 'Delete memory entry',
+      message: 'Delete this memory entry? This cannot be undone.',
+      confirmLabel: 'Delete',
+      onConfirm: function() {
+        fetch(memApiUrl('entries/' + id), { method: 'DELETE' })
+          .then(function(r) { if (!r.ok && r.status !== 204) throw new Error('HTTP ' + r.status); showToast('Entry deleted'); memBrowseEntries(); })
+          .catch(function(err) { showToast('Delete failed: ' + err.message, true); });
+      }
+    });
   }
 
   function memClearNamespace() {
@@ -6883,11 +7219,59 @@ mem.qdrant.vector_dimension = parseInt(vdVal, 10) || null;
       .catch(function(err) { statusEl.textContent = 'Error: ' + err.message; statusEl.style.color = 'var(--danger)'; });
   }
 
-  document.getElementById('mem-refresh-stats').addEventListener('click', memLoadStats);
-  document.getElementById('mem-refresh-projects').addEventListener('click', memLoadProjects);
-  document.getElementById('mem-browse-btn').addEventListener('click', memBrowseEntries);
-  document.getElementById('mem-clear-ns-btn').addEventListener('click', memClearNamespace);
-  document.getElementById('mem-create-btn').addEventListener('click', memCreateEntry);
+document.getElementById('mem-refresh-stats').addEventListener('click', memLoadStats);
+document.getElementById('mem-refresh-projects').addEventListener('click', memLoadProjects);
+document.getElementById('mem-browse-btn').addEventListener('click', memBrowseEntries);
+document.getElementById('mem-clear-ns-btn').addEventListener('click', memClearNamespace);
+document.getElementById('mem-create-btn').addEventListener('click', memCreateEntry);
+document.getElementById('mem-search-btn').addEventListener('click', memSearchEntries);
+document.getElementById('mem-search-clear-btn').addEventListener('click', memClearSearch);
+document.getElementById('mem-search-q').addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); memSearchEntries(); } });
+document.getElementById('mem-export-btn').addEventListener('click', function() {
+setStatus('Exporting memories…');
+fetch(memApiUrl('export'))
+.then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
+.then(function(data) {
+var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+var a = document.createElement('a');
+a.href = URL.createObjectURL(blob);
+a.download = 'memory-export.json';
+a.click();
+URL.revokeObjectURL(a.href);
+setStatus('Memory export downloaded (' + (data.total != null ? data.total : (data.entries ? data.entries.length : 0)) + ' entries)');
+})
+.catch(function(err) { setStatus('Memory export failed: ' + err.message); showToast('Export failed: ' + err.message, true); });
+});
+document.getElementById('mem-consolidate-btn').addEventListener('click', function() {
+var btn = document.getElementById('mem-consolidate-btn');
+var statusEl = document.getElementById('mem-consolidate-status');
+btn.disabled = true;
+statusEl.textContent = 'Running…';
+statusEl.style.color = 'var(--text-muted)';
+fetch(memApiUrl('consolidate'), { method: 'POST' })
+.then(function(r) { return r.json().then(function(d) { if (!r.ok) throw Object.assign(new Error((d.error && d.error.message) || 'HTTP ' + r.status), { status: r.status, type: d.error && d.error.type }); return d; }); })
+.then(function(counts) {
+btn.disabled = false;
+statusEl.textContent = 'Merged ' + (counts.merged != null ? counts.merged : '?') +
+', superseded ' + (counts.superseded != null ? counts.superseded : '?') +
+', kept ' + (counts.kept != null ? counts.kept : '?') +
+', skipped ' + (counts.skipped_batches != null ? counts.skipped_batches : '?') +
+', errors ' + (counts.provider_errors != null ? counts.provider_errors : '?');
+statusEl.style.color = 'var(--success)';
+setStatus('Consolidation pass completed');
+showToast('Consolidation pass completed');
+memLoadStats();
+if (memLastListUrl) { memRefreshList(); }
+})
+.catch(function(err) {
+btn.disabled = false;
+statusEl.textContent = 'Unavailable';
+statusEl.style.color = 'var(--danger)';
+statusEl.title = err.message || 'Consolidation unavailable';
+setStatus('Consolidation failed: ' + err.message);
+showToast('Consolidation failed: ' + err.message, true);
+});
+});
 
 document.getElementById('mem-qdrant-recreate').addEventListener('click', function() {
   var btn = document.getElementById('mem-qdrant-recreate');

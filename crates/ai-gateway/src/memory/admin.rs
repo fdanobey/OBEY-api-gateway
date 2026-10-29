@@ -17,10 +17,13 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use super::{validate_namespace, AdminCreateError, MemoryError, MemorySystem, MemoryType};
+use super::{
+    spawn_store_task, validate_namespace, AdminCreateError, MemoryError, MemorySystem, MemoryType,
+};
 
 const DEFAULT_LIMIT: usize = 50;
-const MAX_LIMIT: usize = 200;
+const MAX_LIST_LIMIT: usize = 200;
+const MAX_LIST_OFFSET: usize = 1_000_000;
 
 type OptionalMemorySystem = Arc<RwLock<Option<Arc<MemorySystem>>>>;
 
@@ -48,7 +51,17 @@ where
 {
     Router::new()
         .route("/entries", get(list_entries).post(create_entry))
-        .route("/entries/{id}", axum::routing::delete(delete_entry))
+        .route(
+            "/entries/{id}",
+            axum::routing::delete(delete_entry).patch(edit_entry),
+        )
+        .route(
+            "/entries/{id}/supersede",
+            axum::routing::post(supersede_entry),
+        )
+        .route("/search", get(search))
+        .route("/export", get(export))
+        .route("/consolidate", axum::routing::post(consolidate))
         .route(
             "/namespaces/{namespace}",
             axum::routing::delete(clear_namespace),
@@ -66,6 +79,21 @@ where
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     namespace: Option<String>,
+    #[serde(default)]
+    include_superseded: bool,
+    #[serde(default = "default_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+    namespace: Option<String>,
+    memory_type: Option<String>,
+    #[serde(default)]
+    include_superseded: bool,
     #[serde(default = "default_limit")]
     limit: usize,
     #[serde(default)]
@@ -76,12 +104,44 @@ fn default_limit() -> usize {
     DEFAULT_LIMIT
 }
 
+/// Clamps list/search pagination into handler-enforced bounds.
+///
+/// `limit` of 0 or anything above [`MAX_LIST_LIMIT`], or an `offset` above
+/// [`MAX_LIST_OFFSET`], answers 400 actionable instead of reaching the store,
+/// where extreme offsets would overflow the i64 SQL bind and surface as 500.
+fn clamp_pagination(limit: usize, offset: usize) -> Result<(usize, usize), Response> {
+    if limit == 0 || limit > MAX_LIST_LIMIT {
+        return Err(bad_request(&format!(
+            "limit must be between 1 and {MAX_LIST_LIMIT}"
+        )));
+    }
+    if offset > MAX_LIST_OFFSET {
+        return Err(bad_request(&format!(
+            "offset must be between 0 and {MAX_LIST_OFFSET}"
+        )));
+    }
+    Ok((limit, offset))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateEntry {
     namespace: String,
     content: String,
     memory_type: MemoryType,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditEntry {
+    content: String,
+    memory_type: MemoryType,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupersedeEntry {
+    superseded_by: String,
 }
 
 async fn resolve_system(state: &MemoryAdminState) -> Result<Arc<MemorySystem>, Response> {
@@ -107,22 +167,107 @@ async fn list_entries(
     if !validate_namespace(&namespace) {
         return bad_request("namespace is invalid");
     }
+    let (limit, offset) = match clamp_pagination(query.limit, query.offset) {
+        Ok(bounds) => bounds,
+        Err(response) => return response,
+    };
+    let include_superseded = query.include_superseded;
     let system = match resolve_system(&state).await {
         Ok(system) => system,
         Err(response) => return response,
     };
-    match system
-        .store
-        .list_entries(&namespace, query.limit.min(MAX_LIMIT), query.offset)
-    {
-        Ok(page) => Json(json!({
-            "entries": page.entries,
-            "total_count": page.total_count,
-            "limit": page.limit,
-            "offset": page.offset,
-        }))
-        .into_response(),
-        Err(error) => memory_error(error),
+    let page = {
+        let store = Arc::clone(&system.store);
+        let namespace = namespace.clone();
+        match spawn_store_task(move || {
+            store.list_entries_with_superseded(&namespace, limit, offset, include_superseded)
+        })
+        .await
+        {
+            Ok(page) => page,
+            Err(error) => return memory_error_response(error),
+        }
+    };
+    Json(json!({
+        "entries": page.entries,
+        "total_count": page.total_count,
+        "limit": page.limit,
+        "offset": page.offset,
+    }))
+    .into_response()
+}
+
+/// Search memory content across namespaces through the FTS5 index (Req 4.1).
+///
+/// An empty or whitespace-only `q` falls back to the default filtered listing
+/// inside [`MemoryStore::search_entries`], so it always answers 200. Filters
+/// are validated here for actionable 400 responses before reaching the store,
+/// where they would otherwise surface as configuration errors.
+async fn search(State(state): State<MemoryAdminState>, Query(query): Query<SearchQuery>) -> Response {
+    if let Some(namespace) = &query.namespace {
+        if !validate_namespace(namespace) {
+            return bad_request("namespace is invalid");
+        }
+    }
+    if let Some(memory_type) = &query.memory_type {
+        if !is_valid_memory_type(memory_type) {
+            return bad_request("memory_type must be one of preference, fact, context, decision");
+        }
+    }
+    let (limit, offset) = match clamp_pagination(query.limit, query.offset) {
+        Ok(bounds) => bounds,
+        Err(response) => return response,
+    };
+    let include_superseded = query.include_superseded;
+    let system = match resolve_system(&state).await {
+        Ok(system) => system,
+        Err(response) => return response,
+    };
+    let query_text = query.q.as_deref().map(str::trim).unwrap_or("").to_owned();
+    let page = {
+        let store = Arc::clone(&system.store);
+        let namespace = query.namespace.clone();
+        let memory_type = query.memory_type.clone();
+        match spawn_store_task(move || {
+            store.search_entries(
+                &query_text,
+                namespace.as_deref(),
+                memory_type.as_deref(),
+                include_superseded,
+                limit,
+                offset,
+            )
+        })
+        .await
+        {
+            Ok(page) => page,
+            // Sanitized filter failures (unreachable behind the pre-validation
+            // above) still answer 400 actionable rather than 500.
+            Err(error) => return memory_error_response(error),
+        }
+    };
+    Json(json!({
+        "entries": page.entries,
+        "total_count": page.total_count,
+        "limit": page.limit,
+        "offset": page.offset,
+    }))
+    .into_response()
+}
+
+fn is_valid_memory_type(memory_type: &str) -> bool {
+    matches!(
+        memory_type,
+        "preference" | "fact" | "context" | "decision"
+    )
+}
+
+fn memory_type_label(memory_type: MemoryType) -> &'static str {
+    match memory_type {
+        MemoryType::Preference => "preference",
+        MemoryType::Fact => "fact",
+        MemoryType::Context => "context",
+        MemoryType::Decision => "decision",
     }
 }
 
@@ -153,7 +298,49 @@ async fn create_entry(
         Err(AdminCreateError::Scan(message)) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &message, "server_error")
         }
-        Err(AdminCreateError::Memory(error)) => memory_error(error),
+        Err(AdminCreateError::Memory(error)) => memory_error_response(error),
+    }
+}
+
+/// Edit one stored entry in place (Req 1.1-1.4).
+///
+/// Validation and sensitive screening run inside [`MemorySystem::admin_edit`];
+/// a missing id maps to 404 and actionable rejections to 400, matching the
+/// create-entry error mapping.
+async fn edit_entry(
+    State(state): State<MemoryAdminState>,
+    Path(id): Path<String>,
+    payload: Result<Json<EditEntry>, JsonRejection>,
+) -> Response {
+    let id = match Uuid::parse_str(&id) {
+        Ok(id) => id,
+        Err(_) => return bad_request("entry id must be a UUID"),
+    };
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return bad_request(&error.body_text()),
+    };
+    let system = match resolve_system(&state).await {
+        Ok(system) => system,
+        Err(response) => return response,
+    };
+    match system
+        .admin_edit(id, &payload.content, memory_type_label(payload.memory_type))
+        .await
+    {
+        Ok(Some(entry)) => Json(entry).into_response(),
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "memory entry not found", "not_found"),
+        Err(AdminCreateError::InvalidNamespace) => bad_request("namespace is invalid"),
+        Err(AdminCreateError::InvalidContent(message)) => bad_request(&message),
+        Err(AdminCreateError::SensitiveContent) => error_response(
+            StatusCode::BAD_REQUEST,
+            "content contains sensitive information",
+            "sensitive_content",
+        ),
+        Err(AdminCreateError::Scan(message)) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, &message, "server_error")
+        }
+        Err(AdminCreateError::Memory(error)) => memory_error_response(error),
     }
 }
 
@@ -166,10 +353,182 @@ async fn delete_entry(State(state): State<MemoryAdminState>, Path(id): Path<Stri
         Ok(system) => system,
         Err(response) => return response,
     };
-    match system.store.delete_entry(id) {
+    match system.admin_delete(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => error_response(StatusCode::NOT_FOUND, "memory entry not found", "not_found"),
-        Err(error) => memory_error(error),
+        Err(error) => memory_error_response(error),
+    }
+}
+
+/// Mark one entry as superseded by another (Req 2.1, 2.3).
+///
+/// Both ids must exist in the same namespace, the target must not already be
+/// superseded, and self-supersede is rejected; missing ids map to 404, an
+/// already-superseded target to 409, and a cross-namespace pair to 400,
+/// following the conflict-status convention used by the virtual-keys admin API.
+///
+/// Handler-side validation narrows — but cannot fully close — the check-then-mark
+/// race: two concurrent requests can both pass the active check, and the loser
+/// returns via the post-mark re-check below (marked 0 with a superseded row →
+/// 409). Full atomicity lands with the store-level checked update in
+/// `mark_superseded`, owned by a separate change.
+async fn supersede_entry(
+    State(state): State<MemoryAdminState>,
+    Path(id): Path<String>,
+    payload: Result<Json<SupersedeEntry>, JsonRejection>,
+) -> Response {
+    let id = match Uuid::parse_str(&id) {
+        Ok(id) => id,
+        Err(_) => return bad_request("entry id must be a UUID"),
+    };
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return bad_request(&error.body_text()),
+    };
+    let superseded_by = match Uuid::parse_str(&payload.superseded_by) {
+        Ok(id) => id,
+        Err(_) => return bad_request("superseded_by must be a UUID"),
+    };
+    if superseded_by == id {
+        return bad_request("an entry cannot supersede itself");
+    }
+    let system = match resolve_system(&state).await {
+        Ok(system) => system,
+        Err(response) => return response,
+    };
+    let (target, replacement) = {
+        let store = Arc::clone(&system.store);
+        match spawn_store_task(move || {
+            Ok((store.get_entry_by_id(id)?, store.get_entry_by_id(superseded_by)?))
+        })
+        .await
+        {
+            Ok(pair) => pair,
+            Err(error) => return memory_error_response(error),
+        }
+    };
+    let Some(target) = target else {
+        return error_response(StatusCode::NOT_FOUND, "memory entry not found", "not_found");
+    };
+    let Some(replacement) = replacement else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "superseded_by entry not found",
+            "not_found",
+        );
+    };
+    if target.superseded_by.is_some() {
+        return error_response(
+            StatusCode::CONFLICT,
+            "memory entry is already superseded",
+            "already_superseded",
+        );
+    }
+    if target.namespace != replacement.namespace {
+        return bad_request("superseded_by entry must belong to the same namespace");
+    }
+    let marked = {
+        let store = Arc::clone(&system.store);
+        match spawn_store_task(move || store.mark_superseded(&[id], superseded_by)).await {
+            Ok(marked) => marked,
+            Err(error) => return memory_error_response(error),
+        }
+    };
+    let entry = {
+        let store = Arc::clone(&system.store);
+        match spawn_store_task(move || store.get_entry_by_id(id)).await {
+            Ok(entry) => entry,
+            Err(error) => return memory_error_response(error),
+        }
+    };
+    if marked == 0 {
+        // Lost a race: another writer marked or deleted the row between the
+        // active check and the update. Re-check to answer precisely.
+        return match entry {
+            Some(entry) if entry.superseded_by.is_some() => error_response(
+                StatusCode::CONFLICT,
+                "memory entry is already superseded",
+                "already_superseded",
+            ),
+            _ => error_response(StatusCode::NOT_FOUND, "memory entry not found", "not_found"),
+        };
+    }
+    match entry {
+        Some(entry) => Json(json!({
+            "marked_count": marked,
+            "entry": entry,
+        }))
+        .into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "memory entry not found", "not_found"),
+    }
+}
+
+/// Export every stored entry, superseded ones included, as one JSON document
+/// (Req 5.1-5.2). Annotations travel on each entry through `updated_at` and
+/// `superseded_by`.
+async fn export(State(state): State<MemoryAdminState>) -> Response {
+    let system = match resolve_system(&state).await {
+        Ok(system) => system,
+        Err(response) => return response,
+    };
+    let entries = {
+        let store = Arc::clone(&system.store);
+        match spawn_store_task(move || store.export_all()).await {
+            Ok(entries) => entries,
+            Err(error) => return memory_error_response(error),
+        }
+    };
+    Json(json!({
+        "total": entries.len(),
+        "entries": entries,
+    }))
+    .into_response()
+}
+
+/// Run one consolidation pass immediately and return its outcome counts
+/// (Req 3.8).
+///
+/// The pass itself is delegated to [`MemorySystem::run_consolidation_now`],
+/// which shares the context construction and metric recording of the
+/// post-decay background hook (Req 3.6). A manual operator trigger runs even
+/// while `consolidation_enabled` is false; the only 503 is the unconfigured
+/// case, when the provider/model pair does not resolve through the Req 3.7
+/// fallback chain (`consolidation_provider` falling back to
+/// `auto_extract_provider`). Failures inside the pass are per-batch and come
+/// back as `provider_errors`/`skipped_batches` counts; only infrastructure
+/// errors surface here, sanitized through the shared `MemoryError` mapping.
+async fn consolidate(State(state): State<MemoryAdminState>) -> Response {
+    let system = match resolve_system(&state).await {
+        Ok(system) => system,
+        Err(response) => return response,
+    };
+    if system.config.read().await.resolve_consolidation_pair().is_none() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "consolidation provider is not configured",
+            "consolidation_unavailable",
+        );
+    }
+    match system.run_consolidation_now().await {
+        Ok(counts) => Json(json!({
+            "merged": counts.merged,
+            "superseded": counts.superseded,
+            "kept": counts.kept,
+            "skipped_batches": counts.skipped_batches,
+            "provider_errors": counts.provider_errors,
+        }))
+        .into_response(),
+        Err(MemoryError::Config(_)) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "consolidation provider is not configured",
+            "consolidation_unavailable",
+        ),
+        Err(MemoryError::Conflict(_)) => error_response(
+            StatusCode::CONFLICT,
+            "consolidation already in progress",
+            "consolidation_in_progress",
+        ),
+        Err(error) => memory_error_response(error),
     }
 }
 
@@ -184,9 +543,9 @@ async fn clear_namespace(
         Ok(system) => system,
         Err(response) => return response,
     };
-    match system.store.delete_namespace(&namespace) {
+    match system.admin_clear(&namespace).await {
         Ok(deleted_count) => Json(json!({ "deleted_count": deleted_count })).into_response(),
-        Err(error) => memory_error(error),
+        Err(error) => memory_error_response(error),
     }
 }
 
@@ -195,16 +554,38 @@ async fn stats(State(state): State<MemoryAdminState>) -> Response {
         Ok(system) => system,
         Err(response) => return response,
     };
-    match system.store.stats() {
-        Ok(stats) => Json(json!({
+    let stats = {
+        let store = Arc::clone(&system.store);
+        match spawn_store_task(move || store.stats()).await {
+            Ok(stats) => stats,
+            Err(error) => return memory_error_response(error),
+        }
+    };
+    {
+        // Last-pass consolidation summary (Req 3.6); present only after a
+        // pass — manual or post-decay — has completed at least once.
+        let consolidation = system
+            .metrics
+            .last_consolidation_pass()
+            .map(|pass| {
+                json!({
+                    "merged": pass.counts.merged,
+                    "superseded": pass.counts.superseded,
+                    "kept": pass.counts.kept,
+                    "skipped_batches": pass.counts.skipped_batches,
+                    "provider_errors": pass.counts.provider_errors,
+                    "last_run": pass.completed_at,
+                })
+            });
+        Json(json!({
             "total_count": stats.total_count,
             "memories_per_namespace": stats.memories_per_namespace,
             "average_relevance_score": stats.average_relevance_score,
             "storage_size_bytes": stats.storage_size_bytes,
             "last_decay_cycle": stats.last_decay_cycle,
+            "consolidation": consolidation,
         }))
-        .into_response(),
-        Err(error) => memory_error(error),
+        .into_response()
     }
 }
 
@@ -213,25 +594,29 @@ async fn namespaces(State(state): State<MemoryAdminState>) -> Response {
         Ok(system) => system,
         Err(response) => return response,
     };
-    match system.store.list_namespaces() {
-        Ok(namespaces) => Json(
-            namespaces
-                .into_iter()
-                .map(|item| {
-                    json!({
-                        "namespace": item.namespace,
-                        "context_kind": item.context_kind,
-                        "display_name": item.display_name,
-                        "client_name": item.client_name,
-                        "entry_count": item.entry_count,
-                        "last_activity": item.last_activity,
-                    })
+    let namespaces = {
+        let store = Arc::clone(&system.store);
+        match spawn_store_task(move || store.list_namespaces()).await {
+            Ok(namespaces) => namespaces,
+            Err(error) => return memory_error_response(error),
+        }
+    };
+    Json(
+        namespaces
+            .into_iter()
+            .map(|item| {
+                json!({
+                    "namespace": item.namespace,
+                    "context_kind": item.context_kind,
+                    "display_name": item.display_name,
+                    "client_name": item.client_name,
+                    "entry_count": item.entry_count,
+                    "last_activity": item.last_activity,
                 })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(error) => memory_error(error),
-    }
+            })
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
 }
 
 async fn projects(State(state): State<MemoryAdminState>) -> Response {
@@ -239,25 +624,29 @@ async fn projects(State(state): State<MemoryAdminState>) -> Response {
         Ok(system) => system,
         Err(response) => return response,
     };
-    match system.store.list_namespaces() {
-        Ok(projects) => Json(Value::Array(
-            projects
-                .into_iter()
-                .map(|project| {
-                    json!({
-                        "namespace": project.namespace,
-                        "context_kind": project.context_kind,
-                        "display_name": project.display_name,
-                        "client_name": project.client_name,
-                        "entry_count": project.entry_count,
-                        "last_activity": project.last_activity,
-                    })
+    let projects = {
+        let store = Arc::clone(&system.store);
+        match spawn_store_task(move || store.list_namespaces()).await {
+            Ok(projects) => projects,
+            Err(error) => return memory_error_response(error),
+        }
+    };
+    Json(Value::Array(
+        projects
+            .into_iter()
+            .map(|project| {
+                json!({
+                    "namespace": project.namespace,
+                    "context_kind": project.context_kind,
+                    "display_name": project.display_name,
+                    "client_name": project.client_name,
+                    "entry_count": project.entry_count,
+                    "last_activity": project.last_activity,
                 })
-                .collect(),
-        ))
-        .into_response(),
-        Err(error) => memory_error(error),
-    }
+            })
+            .collect(),
+    ))
+    .into_response()
 }
 
 async fn recreate_qdrant_collection(State(state): State<MemoryAdminState>) -> Response {
@@ -307,33 +696,48 @@ async fn recreate_qdrant_collection(State(state): State<MemoryAdminState>) -> Re
             );
         }
     }
-    let providers = system.config.read().await;
-    let provider_config = system.config.read().await;
-    drop(providers);
-    let _ = provider_config;
     system.set_vector_tier(None).await;
-    if let Err(error) = system.store.mark_all_vector_entries_pending() {
-        tracing::warn!(error = %error, "Failed to mark vector entries pending after collection recreation");
+    {
+        let store = Arc::clone(&system.store);
+        if let Err(error) =
+            spawn_store_task(move || store.mark_all_vector_entries_pending()).await
+        {
+            tracing::warn!(error = %error, "Failed to mark vector entries pending after collection recreation");
+        }
     }
     (
-StatusCode::OK,
-Json(json!({
-"message": format!("Qdrant collection '{}' recreated successfully. Reload config or restart gateway to reinitialize vector tier.", collection)
-})),
-)
-.into_response()
+        StatusCode::OK,
+        Json(json!({
+            "message": format!("Qdrant collection '{}' recreated successfully. Reload config or restart gateway to reinitialize vector tier.", collection)
+        })),
+    )
+    .into_response()
 }
 
 fn bad_request(message: &str) -> Response {
     error_response(StatusCode::BAD_REQUEST, message, "invalid_request")
 }
 
-fn memory_error(error: MemoryError) -> Response {
-    error_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        &error.to_string(),
-        "server_error",
-    )
+/// Centralized `MemoryError` → HTTP mapping for store failures.
+///
+/// [`MemoryError::Config`] carries actionable filter/validation messages and
+/// maps to 400; [`MemoryError::Conflict`] carries sanitized state-conflict
+/// messages and maps to 409, matching the supersede endpoint's
+/// `already_superseded` convention; everything else is infrastructure failure
+/// and maps to 500 sanitized. Route-specific exceptions (consolidate's
+/// unconfigured-provider 503) are matched before delegating here.
+fn memory_error_response(error: MemoryError) -> Response {
+    match error {
+        MemoryError::Config(message) => bad_request(&message),
+        MemoryError::Conflict(message) => {
+            error_response(StatusCode::CONFLICT, message, "already_superseded")
+        }
+        error => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error.to_string(),
+            "server_error",
+        ),
+    }
 }
 
 fn error_response(status: StatusCode, message: &str, error_type: &str) -> Response {
@@ -353,8 +757,11 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    use super::*;
-    use crate::memory::MemoryConfig;
+use super::*;
+use crate::memory::{
+    MemoryConfig, MemoryExtractionProvider, MemoryExtractionProviderError,
+    MemoryExtractionProviderRequest, StructuredMemoryCandidate,
+};
 
     async fn system() -> Arc<MemorySystem> {
         let config = MemoryConfig {
@@ -544,16 +951,532 @@ mod tests {
 
     #[tokio::test]
     async fn optional_disabled_state_returns_json_503() {
-        let handle: OptionalMemorySystem = Arc::new(RwLock::new(None));
-        let app = routes(handle);
-        for (method, uri) in [
-            ("GET", "/entries?namespace=user%3A%3Aalpha"),
-            ("GET", "/stats"),
-            ("GET", "/projects"),
-        ] {
-            let (status, body) = request(app.clone(), method, uri, None).await;
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(body["error"]["type"], "service_unavailable");
-        }
+    let handle: OptionalMemorySystem = Arc::new(RwLock::new(None));
+    let app = routes(handle);
+    for (method, uri) in [
+        ("GET", "/entries?namespace=user%3A%3Aalpha"),
+        ("GET", "/stats"),
+        ("GET", "/projects"),
+        ("GET", "/search?q=anything"),
+        ("GET", "/export"),
+        ("POST", "/consolidate"),
+        ("DELETE", &format!("/entries/{}", Uuid::new_v4())),
+        ("DELETE", "/namespaces/user%3A%3Aalpha"),
+    ] {
+        let (status, body) = request(app.clone(), method, uri, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "service_unavailable");
     }
+    let (status, body) = request(
+        app,
+        "POST",
+        &format!("/entries/{}/supersede", Uuid::new_v4()),
+        Some(json!({"superseded_by": Uuid::new_v4().to_string()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["type"], "service_unavailable");
+    }
+
+    #[tokio::test]
+    async fn edit_updates_entry_and_reports_errors() {
+        let app = routes(system().await);
+        let (_, created) = request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::edit", "original useful fact", "fact")),
+        )
+        .await;
+        let uri = format!("/entries/{}", created["id"].as_str().unwrap());
+        let (status, updated) = request(
+            app.clone(),
+            "PATCH",
+            &uri,
+            Some(json!({"content": "revised useful fact", "memory_type": "decision"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["content"], "revised useful fact");
+        assert_eq!(updated["memory_type"], "decision");
+        assert!(updated["updated_at"].is_i64());
+
+        let (status, body) = request(
+            app.clone(),
+            "PATCH",
+            &uri,
+            Some(json!({"content": "tiny", "memory_type": "fact"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]["message"].is_string());
+
+    let missing = format!("/entries/{}", Uuid::new_v4());
+    let (status, body) = request(
+        app,
+        "PATCH",
+        &missing,
+        Some(json!({"content": "valid realistic content", "memory_type": "fact"})),
+    )
+    .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["type"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn search_matches_filters_and_falls_back_on_empty_query() {
+        let app = routes(system().await);
+        request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::one", "kubernetes cluster fact", "fact")),
+        )
+        .await;
+        request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::two", "unrelated preference text", "preference")),
+        )
+        .await;
+        let (status, page) = request(app.clone(), "GET", "/search?q=kubernetes", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["total_count"], 1);
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        assert!(page["entries"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("kubernetes"));
+
+        let (status, page) = request(app.clone(), "GET", "/search?q=", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["total_count"], 2);
+
+        let (status, page) = request(
+            app.clone(),
+            "GET",
+            "/search?q=&memory_type=preference",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["total_count"], 1);
+
+        let (status, body) = request(app.clone(), "GET", "/search?q=x&memory_type=bogus", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request");
+
+        let (status, _) = request(app.clone(), "GET", "/search?q=x&namespace=user%3A%3A%2A", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn export_returns_single_document_with_total() {
+        let app = routes(system().await);
+        request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::beta", "beta export content", "fact")),
+        )
+        .await;
+        request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::alpha", "alpha export content", "fact")),
+        )
+        .await;
+        let (status, document) = request(app, "GET", "/export", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(document["total"], 2);
+        assert_eq!(document["entries"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn supersede_marks_entry_and_validates_ids() {
+        let app = routes(system().await);
+        let (_, target) = request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::supersede", "outdated fact content", "fact")),
+        )
+        .await;
+        let (_, replacement) = request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::supersede", "replacement fact content", "fact")),
+        )
+        .await;
+        let uri = format!("/entries/{}/supersede", target["id"].as_str().unwrap());
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            &uri,
+            Some(json!({"superseded_by": replacement["id"].as_str().unwrap()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["marked_count"], 1);
+        assert_eq!(body["entry"]["superseded_by"], replacement["id"]);
+
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            &uri,
+            Some(json!({"superseded_by": replacement["id"].as_str().unwrap()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"], "already_superseded");
+
+        let missing = format!("/entries/{}/supersede", Uuid::new_v4());
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            &missing,
+            Some(json!({"superseded_by": replacement["id"].as_str().unwrap()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["type"], "not_found");
+
+    let missing_by = format!(
+        "/entries/{}/supersede",
+        replacement["id"].as_str().unwrap()
+    );
+    let (status, _) = request(
+        app,
+        "POST",
+        &missing_by,
+        Some(json!({"superseded_by": Uuid::new_v4().to_string()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn supersede_rejects_self_and_cross_namespace_pairs() {
+    let app = routes(system().await);
+    let (_, target) = request(
+        app.clone(),
+        "POST",
+        "/entries",
+        Some(entry("user::same", "same namespace fact", "fact")),
+    )
+    .await;
+    let (_, other_namespace) = request(
+        app.clone(),
+        "POST",
+        "/entries",
+        Some(entry("user::other", "other namespace fact", "fact")),
+    )
+    .await;
+    let uri = format!("/entries/{}/supersede", target["id"].as_str().unwrap());
+
+    let (status, body) = request(
+        app.clone(),
+        "POST",
+        &uri,
+        Some(json!({"superseded_by": target["id"].as_str().unwrap()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "invalid_request");
+
+    let (status, body) = request(
+        app,
+        "POST",
+        &uri,
+        Some(json!({"superseded_by": other_namespace["id"].as_str().unwrap()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"].as_str().unwrap().contains("namespace"));
+}
+
+#[tokio::test]
+async fn pagination_out_of_range_is_actionable_400() {
+    let app = routes(system().await);
+    for uri in [
+        "/entries?namespace=user%3A%3Aalpha&limit=0",
+        "/entries?namespace=user%3A%3Aalpha&limit=201",
+        "/entries?namespace=user%3A%3Aalpha&offset=1000001",
+        "/search?q=x&limit=0",
+        "/search?q=x&limit=201",
+        "/search?q=x&offset=1000001",
+    ] {
+        let (status, body) = request(app.clone(), "GET", uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "uri: {uri}");
+        assert_eq!(body["error"]["type"], "invalid_request");
+    }
+    let (status, _) = request(
+        app,
+        "GET",
+        "/entries?namespace=user%3A%3Aalpha&limit=200&offset=1000000",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+    #[tokio::test]
+    async fn list_includes_superseded_only_when_requested() {
+        let app = routes(system().await);
+        let (_, target) = request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::history", "first history fact", "fact")),
+        )
+        .await;
+        let (_, replacement) = request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::history", "second history fact", "fact")),
+        )
+        .await;
+        request(
+            app.clone(),
+            "POST",
+            &format!("/entries/{}/supersede", target["id"].as_str().unwrap()),
+            Some(json!({"superseded_by": replacement["id"].as_str().unwrap()})),
+        )
+        .await;
+        let (status, page) = request(
+            app.clone(),
+            "GET",
+            "/entries?namespace=user%3A%3Ahistory",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["total_count"], 1);
+
+        let (status, page) = request(
+            app,
+            "GET",
+            "/entries?namespace=user%3A%3Ahistory&include_superseded=true",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["total_count"], 2);
+        assert!(page["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["superseded_by"].is_string()
+        }));
+    }
+
+#[tokio::test]
+async fn consolidate_reports_unavailable_without_resolvable_pair() {
+    let app = routes(system().await);
+    let (status, body) = request(app, "POST", "/consolidate", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["type"], "consolidation_unavailable");
+
+    // A provider name without a model does not resolve the Req 3.7 pair.
+    let config = MemoryConfig {
+        database_path: ":memory:".to_owned(),
+        auto_extract_provider: "test-provider".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let configured =
+        Arc::new(MemorySystem::new(config, None, None).await.unwrap());
+    let app = routes(configured);
+    let (status, body) = request(app, "POST", "/consolidate", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["type"], "consolidation_unavailable");
+}
+
+/// Fake provider that merges every batch it is asked about, mirroring the
+/// consolidation.rs test fakes: decisions travel as candidate contents.
+struct FakeConsolidationProvider;
+
+#[async_trait::async_trait]
+impl MemoryExtractionProvider for FakeConsolidationProvider {
+    async fn extract(
+        &self,
+        request: MemoryExtractionProviderRequest,
+    ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+        let payload: Value = serde_json::from_str(&request.messages[0].content).unwrap();
+        let source_ids: Vec<String> = payload["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect();
+        let decision = json!([{
+            "action": "merge",
+            "source_ids": source_ids,
+            "merged_content": "merged consolidation fact",
+        }])
+        .to_string();
+        Ok(vec![StructuredMemoryCandidate {
+            content: decision,
+            memory_type: MemoryType::Fact,
+        }])
+    }
+}
+
+async fn consolidation_system(config: MemoryConfig) -> Arc<MemorySystem> {
+    Arc::new(
+        MemorySystem::new(config, None, Some(Arc::new(FakeConsolidationProvider)))
+            .await
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn consolidate_runs_one_pass_and_stats_reports_last_pass() {
+    let config = MemoryConfig {
+        database_path: ":memory:".to_owned(),
+        consolidation_provider: "fake-provider".to_owned(),
+        consolidation_model: "fake-model".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let app = routes(consolidation_system(config).await);
+    for content in [
+        "the deploy target is fly.io eu-west",
+        "the deploy target is fly.io eu-west region",
+    ] {
+        request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::dup", content, "fact")),
+        )
+        .await;
+    }
+
+    let (status, stats) = request(app.clone(), "GET", "/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(stats["consolidation"].is_null());
+
+    let (status, counts) = request(app.clone(), "POST", "/consolidate", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(counts["merged"], 1);
+    assert_eq!(counts["superseded"], 2);
+    assert_eq!(counts["kept"], 0);
+    assert_eq!(counts["skipped_batches"], 0);
+    assert_eq!(counts["provider_errors"], 0);
+
+    let (status, stats) = request(app, "GET", "/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stats["consolidation"]["merged"], 1);
+    assert_eq!(stats["consolidation"]["superseded"], 2);
+    assert_eq!(stats["consolidation"]["kept"], 0);
+    assert_eq!(stats["consolidation"]["skipped_batches"], 0);
+    assert_eq!(stats["consolidation"]["provider_errors"], 0);
+    assert!(stats["consolidation"]["last_run"].is_string());
+}
+
+#[tokio::test]
+async fn consolidate_resolves_pair_through_auto_extract_fallback() {
+    let config = MemoryConfig {
+        database_path: ":memory:".to_owned(),
+        auto_extract_provider: "fake-provider".to_owned(),
+        auto_extract_model: "fake-model".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let app = routes(consolidation_system(config).await);
+    request(
+        app.clone(),
+        "POST",
+        "/entries",
+        Some(entry(
+            "user::fallback",
+            "rust is the primary language here",
+            "fact",
+        )),
+    )
+    .await;
+    let (status, counts) = request(app, "POST", "/consolidate", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(counts["merged"], 0);
+    assert_eq!(counts["superseded"], 0);
+    assert_eq!(counts["kept"], 1);
+}
+
+#[tokio::test]
+async fn consolidate_reports_conflict_while_pass_is_running() {
+    let config = MemoryConfig {
+        database_path: ":memory:".to_owned(),
+        consolidation_provider: "fake-provider".to_owned(),
+        consolidation_model: "fake-model".to_owned(),
+        ..MemoryConfig::default()
+    };
+    let system = consolidation_system(config).await;
+    // Hold the shared pass gate as a background pass would, so the manual
+    // trigger must answer 409 instead of racing the running pass.
+    let _gate = system.consolidation_pass_gate.try_lock().unwrap();
+    let app = routes(Arc::clone(&system));
+    let (status, body) = request(app, "POST", "/consolidate", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["type"], "consolidation_in_progress");
+}
+
+#[tokio::test]
+async fn edit_reports_conflict_for_superseded_entry() {
+    let app = routes(system().await);
+    let (_, created) = request(
+        app.clone(),
+        "POST",
+        "/entries",
+        Some(entry("user::superseded", "first useful fact", "fact")),
+    )
+    .await;
+    let (_, replacement) = request(
+        app.clone(),
+        "POST",
+        "/entries",
+        Some(entry("user::superseded", "second useful fact", "fact")),
+    )
+    .await;
+    let target_uri = format!("/entries/{}", created["id"].as_str().unwrap());
+    request(
+        app.clone(),
+        "POST",
+        &format!(
+            "/entries/{}/supersede",
+            created["id"].as_str().unwrap()
+        ),
+        Some(json!({"superseded_by": replacement["id"].as_str().unwrap()})),
+    )
+    .await;
+    let (status, body) = request(
+        app,
+        "PATCH",
+        &target_uri,
+        Some(json!({"content": "revised useful fact", "memory_type": "fact"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["type"], "already_superseded");
+}
+
+#[tokio::test]
+async fn edit_rejects_single_word_content() {
+    let app = routes(system().await);
+    let (_, created) = request(
+        app.clone(),
+        "POST",
+        "/entries",
+        Some(entry("user::edit-words", "original useful fact", "fact")),
+    )
+    .await;
+    let uri = format!("/entries/{}", created["id"].as_str().unwrap());
+    let (status, body) = request(
+        app,
+        "PATCH",
+        &uri,
+        Some(json!({"content": "sufficiently-long-word", "memory_type": "fact"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "invalid_request");
+}
 }

@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod consolidation;
 pub mod context_detector;
 pub mod decay;
 pub mod extraction_adapter;
@@ -22,7 +23,11 @@ pub use config::{
     MemoryValidationResult, ModelGroupMemoryOverride, ProviderMemoryOverride,
 };
 pub use context_detector::{sanitize_label, ContextDetector, DetectedContext};
-pub use decay::{DecayScheduler, EvictionEventPublisher, VectorRetryCallback};
+pub use consolidation::{
+    group_candidates, parse_decisions, run_consolidation, ConsolidationContext, ConsolidationCounts,
+    ConsolidationError, Decision,
+};
+pub use decay::{ConsolidationHook, DecayScheduler, EvictionEventPublisher, VectorRetryCallback};
 pub use extraction_adapter::GatewayExtractionAdapter;
 pub use extractor::{
     AsyncExtractionOutcome, AsyncExtractionRequest, AsyncExtractionSchedule,
@@ -36,7 +41,7 @@ pub use injector::{
     available_budget, format_memories, merge_retrieval_scores, retrieve_with_vector_fallback,
     strip_formatting, MemoryInjector,
 };
-pub use metrics::MemoryMetrics;
+pub use metrics::{ConsolidationLastPass, MemoryMetrics};
 pub use namespace::{sanitize_vk_id, validate_namespace, MAX_NAMESPACE_CHARS, MAX_VK_ID_CHARS};
 pub use scoring::{apply_decay, compute_score, recency_boost};
 pub use sensitive::{
@@ -67,6 +72,8 @@ use crate::compression::token_counter::TokenCounter;
 use crate::guardrail::provider::GuardrailProvider;
 use crate::models::openai::OpenAIRequest;
 
+use decay::DisabledConsolidationHook;
+
 /// Errors produced by memory configuration, persistence, and processing.
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
@@ -85,6 +92,14 @@ pub enum MemoryError {
     /// Memory configuration is invalid.
     #[error("memory configuration error: {0}")]
     Config(String),
+
+    /// The request conflicts with the current state of the store.
+    ///
+    /// Carries a sanitized, client-safe static message (no internal detail)
+    /// and maps to HTTP 409 at the admin layer, matching the conflict-status
+    /// convention of the supersede endpoint.
+    #[error("{0}")]
+    Conflict(&'static str),
 
     /// An optional Qdrant operation failed.
     #[error("memory Qdrant error: {0}")]
@@ -136,6 +151,24 @@ pub enum AdminCreateError {
     Memory(#[from] MemoryError),
 }
 
+/// Minimum whitespace-separated words for admin-edited and
+/// consolidation-merged content, mirroring the extraction-grade rule in
+/// `extractor.rs` (`MIN_MEMORY_WORDS`, private there). Single words and bare
+/// paths carry no reusable meaning on their own.
+pub(crate) const MIN_MEMORY_WORD_COUNT: usize = 3;
+
+/// Shared extraction-grade word-count check for admin-edited and
+/// consolidation-merged content; character limits are enforced separately by
+/// each caller.
+pub(crate) fn validate_memory_content_words(content: &str) -> Result<(), AdminCreateError> {
+    if content.split_whitespace().count() < MIN_MEMORY_WORD_COUNT {
+        return Err(AdminCreateError::InvalidContent(
+            "content must be at least 3 words".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Memory classification used for namespace assignment and decay behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +191,12 @@ pub struct MemoryEntry {
     pub last_accessed_at: DateTime<Utc>,
     pub access_count: u64,
     pub source_request_id: Option<Uuid>,
+    /// When the entry content was last edited; `None` for never-edited entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    /// Entry that superseded this one; `None` while the entry is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<Uuid>,
 }
 
 /// Context classification produced by automatic context detection.
@@ -233,6 +272,122 @@ impl MemoryExtractionProvider for DisabledExtractionProvider {
 
 static SENSITIVE_STORAGE_WARNING: Once = Once::new();
 
+/// Runs one bounded consolidation pass after each decay cycle (requirement
+/// 3.6) and backs the on-demand admin trigger (requirement 3.8).
+struct MemoryConsolidationRunner {
+    store: Arc<MemoryStore>,
+    provider: Arc<dyn MemoryExtractionProvider>,
+    scanner: Arc<SensitiveContentScanner>,
+    vector_tier: Arc<RwLock<Option<Arc<dyn MemoryVectorTier>>>>,
+    config: Arc<RwLock<MemoryConfig>>,
+    metrics: Arc<MemoryMetrics>,
+    /// Serializes passes: the post-decay hook and the manual admin trigger
+    /// share one gate so two concurrent passes can never read the same
+    /// active sources and double-merge them.
+    pass_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl MemoryConsolidationRunner {
+    /// Single construction path for the startup hook, the hot-reload hook,
+    /// and the manual admin trigger so the three call sites cannot drift.
+    fn new(
+        store: Arc<MemoryStore>,
+        provider: Arc<dyn MemoryExtractionProvider>,
+        scanner: Arc<SensitiveContentScanner>,
+        vector_tier: Arc<RwLock<Option<Arc<dyn MemoryVectorTier>>>>,
+        config: Arc<RwLock<MemoryConfig>>,
+        metrics: Arc<MemoryMetrics>,
+        pass_gate: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
+        Self {
+            store,
+            provider,
+            scanner,
+            vector_tier,
+            config,
+            metrics,
+            pass_gate,
+        }
+    }
+
+    /// Convenience wrapper mirroring [`Self::new`] for callers holding a
+    /// [`MemorySystem`] reference, such as the manual admin trigger and the
+    /// hot-reload hook replacement.
+    fn from_system(system: &MemorySystem, pass_gate: Arc<tokio::sync::Mutex<()>>) -> Self {
+        Self::new(
+            Arc::clone(&system.store),
+            Arc::clone(&system.extraction_provider),
+            Arc::clone(&system.sensitive_scanner),
+            Arc::clone(&system.vector_tier),
+            Arc::clone(&system.config),
+            Arc::clone(&system.metrics),
+            pass_gate,
+        )
+    }
+
+    /// Build the context for one pass from the current config snapshot.
+    ///
+    /// `None` when consolidation is disabled (background passes only — a
+    /// manual trigger passes `require_enabled = false` so an explicit
+    /// operator request runs even while background consolidation is off) or
+    /// when the provider/model pair does not resolve through the requirement
+    /// 3.7 fallback chain.
+    async fn context_for_pass(&self, require_enabled: bool) -> Option<ConsolidationContext> {
+        let config = self.config.read().await.clone();
+        if require_enabled && !config.consolidation_enabled {
+            return None;
+        }
+        let Some((provider_name, model)) = config.resolve_consolidation_pair() else {
+            return None;
+        };
+        let vector_tier = self.vector_tier.read().await.clone();
+        Some(ConsolidationContext {
+            store: Arc::clone(&self.store),
+            provider: Arc::clone(&self.provider),
+            scanner: Arc::clone(&self.scanner),
+            vector_tier,
+            allow_sensitive_storage: config.allow_sensitive_storage,
+            provider_name,
+            model,
+            maximum_concurrent_provider_calls: 1,
+            provider_timeout: Duration::from_secs(120),
+        })
+    }
+
+    /// Run one pass, record its counts (requirement 3.6), and log completion.
+    async fn execute_pass(
+        &self,
+        context: ConsolidationContext,
+    ) -> Result<ConsolidationCounts, MemoryError> {
+        let counts = run_consolidation(context).await?;
+        tracing::info!(
+            merged = counts.merged,
+            superseded = counts.superseded,
+            kept = counts.kept,
+            skipped_batches = counts.skipped_batches,
+            provider_errors = counts.provider_errors,
+            "memory consolidation pass completed"
+        );
+        self.metrics.record_consolidation_pass(counts);
+        Ok(counts)
+    }
+}
+
+#[async_trait]
+impl ConsolidationHook for MemoryConsolidationRunner {
+    async fn run_consolidation_pass(&self) {
+        // Hold the shared pass gate for the whole pass so the manual admin
+        // trigger cannot start a concurrent pass over the same sources.
+        let _gate = self.pass_gate.lock().await;
+        let Some(context) = self.context_for_pass(true).await else {
+            return;
+        };
+        if let Err(error) = self.execute_pass(context).await {
+            tracing::warn!(error = %error, "memory consolidation pass failed")
+        }
+    }
+}
+
 struct MemoryVectorRetryCallback {
     store: Arc<MemoryStore>,
     vector_tier: Arc<RwLock<Option<Arc<dyn MemoryVectorTier>>>>,
@@ -287,7 +442,11 @@ pub struct MemorySystem {
     vector_index_semaphore: Arc<tokio::sync::Semaphore>,
     sensitive_scanner: Arc<SensitiveContentScanner>,
     decay_scheduler: Mutex<DecayScheduler>,
+    extraction_provider: Arc<dyn MemoryExtractionProvider>,
     extraction_provider_available: bool,
+    /// Shared consolidation pass gate: one holder at a time across the
+    /// post-decay hook and the manual admin trigger.
+    consolidation_pass_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl MemorySystem {
@@ -344,7 +503,7 @@ impl MemorySystem {
             MemoryExtractor::with_metrics(
                 store.clone(),
                 scanner.clone(),
-                provider,
+                Arc::clone(&provider),
                 1,
                 Duration::from_secs(30),
                 metrics.clone(),
@@ -358,11 +517,28 @@ impl MemorySystem {
                 );
             })),
         );
-        let mut decay_scheduler = DecayScheduler::with_metrics(
+        let config = Arc::new(RwLock::new(config));
+        let consolidation_pass_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let consolidation_hook: Arc<dyn ConsolidationHook> =
+            if config.read().await.consolidation_enabled {
+                Arc::new(MemoryConsolidationRunner::new(
+                    Arc::clone(&store),
+                    Arc::clone(&provider),
+                    Arc::clone(&scanner),
+                    Arc::clone(&vector_tier),
+                    Arc::clone(&config),
+                    Arc::clone(&metrics),
+                    Arc::clone(&consolidation_pass_gate),
+                ))
+            } else {
+                Arc::new(DisabledConsolidationHook)
+            };
+        let mut decay_scheduler = DecayScheduler::with_parts(
             (*store).clone(),
-            config.decay_schedule_hours,
-            config.max_memories_per_namespace as usize,
+            config.read().await.decay_schedule_hours,
+            config.read().await.max_memories_per_namespace as usize,
             metrics.clone(),
+            consolidation_hook,
         )?;
         decay_scheduler.set_vector_retry_callback(Arc::new(MemoryVectorRetryCallback {
             store: store.clone(),
@@ -375,12 +551,14 @@ impl MemorySystem {
             injector,
             extractor,
             metrics,
-            config: Arc::new(RwLock::new(config)),
+            config,
             vector_tier,
             vector_index_semaphore,
             sensitive_scanner: scanner.clone(),
             decay_scheduler: Mutex::new(decay_scheduler),
+            extraction_provider: provider,
             extraction_provider_available,
+            consolidation_pass_gate,
         })
     }
 
@@ -436,6 +614,137 @@ impl MemorySystem {
             .map_err(AdminCreateError::Memory)?;
         self.schedule_vector_index(entry.clone()).await;
         Ok(entry)
+    }
+
+    /// Validates and synchronously edits one stored entry, then re-indexes it.
+    ///
+    /// The same length and sensitive-content screening applied to
+    /// [`MemorySystem::admin_create`] runs before any write; on success the
+    /// old vector point is removed and the updated content is re-indexed.
+    /// Returns `Ok(None)` when `id` does not match a stored entry; editing an
+    /// entry that a consolidation merge already superseded is rejected with a
+    /// conflict error (the entry is dead weight and must not be re-indexed);
+    /// vector work is best-effort and never fails the store commit.
+    pub async fn admin_edit(
+        &self,
+        id: Uuid,
+        content: &str,
+        memory_type: &str,
+    ) -> Result<Option<MemoryEntry>, AdminCreateError> {
+        let content_length = content.chars().count();
+        if content_length < 5 {
+            return Err(AdminCreateError::InvalidContent(
+                "content must be at least 5 characters".to_owned(),
+            ));
+        }
+    if content_length > 4096 {
+        return Err(AdminCreateError::InvalidContent(
+            "content must be at most 4096 characters".to_owned(),
+        ));
+    }
+    validate_memory_content_words(content)?;
+
+    let config = self.config.read().await.clone();
+    let scan = self
+        .sensitive_scanner
+        .scan_with_options(
+            content,
+            SensitiveScanOptions {
+                allow_sensitive_storage: config.allow_sensitive_storage,
+                ..SensitiveScanOptions::default()
+            },
+        )
+        .await
+        .map_err(|error| AdminCreateError::Scan(error.to_string()))?;
+    if scan.contains_sensitive {
+        return Err(AdminCreateError::SensitiveContent);
+    }
+
+    // Reject superseded entries before any write: fetch and update run
+        // in one blocking task against the same connection so a concurrent
+        // supersession cannot slip between the check and the update; the
+        // conflict error maps to 409 at the admin layer (the entry is dead
+        // weight and must not be re-indexed).
+        let store = Arc::clone(&self.store);
+        let content = content.to_owned();
+        let memory_type = memory_type.to_owned();
+        let updated = match spawn_store_task(move || {
+            let existing = store.get_entry_by_id(id)?;
+            match existing {
+                None => Ok(None),
+                Some(entry) => {
+                if entry.superseded_by.is_some() {
+                    return Err(MemoryError::Conflict(
+                        "memory entry is already superseded",
+                    ));
+                }
+                    store.update_entry(id, &content, &memory_type)
+                }
+            }
+        })
+        .await
+        {
+            Ok(updated) => updated,
+            Err(error) => return Err(AdminCreateError::Memory(error)),
+        };
+        match updated {
+            None => Ok(None),
+            Some(entry) => {
+                self.schedule_vector_delete(entry.id).await;
+                self.schedule_vector_index(entry.clone()).await;
+                Ok(Some(entry))
+            }
+        }
+    }
+
+    /// Deletes one entry, then removes its vector point best-effort.
+    ///
+    /// Returns `Ok(false)` when `id` does not match a stored entry; vector
+    /// work never fails the store commit.
+    pub async fn admin_delete(&self, id: Uuid) -> Result<bool, MemoryError> {
+        let store = Arc::clone(&self.store);
+        let deleted = spawn_store_task(move || store.delete_entry(id)).await?;
+        if deleted {
+            self.schedule_vector_delete(id).await;
+        }
+        Ok(deleted)
+    }
+
+    /// Clears a namespace, then removes its vector points best-effort.
+    ///
+    /// Vector work never fails the store commit.
+ pub async fn admin_clear(&self, namespace: &str) -> Result<u64, MemoryError> {
+ let store = Arc::clone(&self.store);
+ let namespace_for_store = namespace.to_owned();
+ let deleted =
+ spawn_store_task(move || store.delete_namespace(&namespace_for_store)).await?;
+ self.schedule_vector_delete_namespace(namespace.to_owned())
+ .await;
+ Ok(deleted)
+ }
+
+    /// Runs one consolidation pass immediately and returns its counts (Req
+    /// 3.8), sharing the context construction, execution, and metric recording
+    /// of the post-decay background hook (Req 3.6) so both paths cannot drift.
+    ///
+    /// A manual operator trigger runs even while `consolidation_enabled` is
+    /// false, as long as the provider/model pair resolves; it is the caller's
+    /// responsibility to answer 503 when the pair does not resolve. When a
+    /// background (or other manual) pass is already running, this answers a
+    /// conflict error instead of racing it; the sanitized `Conflict` message
+    /// maps to HTTP 409 at the admin layer without leaking any internal
+    /// detail.
+    pub async fn run_consolidation_now(&self) -> Result<ConsolidationCounts, MemoryError> {
+        let runner =
+            MemoryConsolidationRunner::from_system(self, Arc::clone(&self.consolidation_pass_gate));
+        let Ok(_gate) = runner.pass_gate.try_lock() else {
+            return Err(MemoryError::Conflict("consolidation already in progress"));
+        };
+        let context = runner
+            .context_for_pass(false)
+            .await
+            .ok_or_else(|| MemoryError::Config("consolidation provider is not configured".to_owned()))?;
+        runner.execute_pass(context).await
     }
 
     pub fn set_eviction_publisher(
@@ -676,6 +985,16 @@ impl MemorySystem {
         );
     }
 
+    /// Best-effort removal of one entry's vector point; never fails callers.
+    pub async fn schedule_vector_delete(&self, id: Uuid) {
+        schedule_vector_delete_task(self.vector_tier.clone(), id).await;
+    }
+
+    /// Best-effort removal of a namespace's vector points; never fails callers.
+    pub async fn schedule_vector_delete_namespace(&self, namespace: String) {
+        schedule_vector_delete_namespace_task(self.vector_tier.clone(), namespace).await;
+    }
+
     pub async fn retry_pending_vector_indexes(&self) -> Result<u64, MemoryError> {
         MemoryVectorRetryCallback {
             store: self.store.clone(),
@@ -706,16 +1025,28 @@ impl MemorySystem {
         warn_sensitive_storage_once(&new_config);
 
         let previous_qdrant = self.config.read().await.qdrant.clone();
-        self.decay_scheduler
-            .lock()
-            .map_err(|_| {
+        *self.config.write().await = new_config.clone();
+        {
+            let mut scheduler = self.decay_scheduler.lock().map_err(|_| {
                 MemoryError::Config("memory decay scheduler mutex was poisoned".to_owned())
-            })?
-            .restart_decay_scheduler(
+            })?;
+        // Refresh the consolidation hook from the new config before the
+        // restart re-spawns the background task. The shared pass gate is
+        // carried over so an in-flight pass still excludes the manual trigger.
+        let hook: Arc<dyn ConsolidationHook> = if new_config.consolidation_enabled {
+            Arc::new(MemoryConsolidationRunner::from_system(
+                self,
+                Arc::clone(&self.consolidation_pass_gate),
+            ))
+        } else {
+            Arc::new(DisabledConsolidationHook)
+        };
+            scheduler.set_consolidation_hook(hook);
+            scheduler.restart_decay_scheduler(
                 new_config.decay_schedule_hours,
                 new_config.max_memories_per_namespace as usize,
             )?;
-        *self.config.write().await = new_config.clone();
+        }
         if previous_qdrant != new_config.qdrant {
             *self.vector_tier.write().await = None;
         }
@@ -766,6 +1097,42 @@ fn mark_vector_retry(store: &MemoryStore, id: Uuid, attempted_at: DateTime<Utc>,
         tracing::warn!(entry_id = %id, error = %store_error, "failed to mark memory vector retry");
     } else {
         tracing::warn!(entry_id = %id, error = %error, "memory vector indexing failed; retry scheduled");
+    }
+}
+
+/// Await one best-effort tier delete, logging sanitized failures inline.
+async fn run_vector_delete(result: Result<(), MemoryError>, key: impl std::fmt::Display) {
+    if let Err(error) = result {
+        tracing::warn!(key = %key, error = %error, "memory vector delete failed");
+    }
+}
+
+async fn schedule_vector_delete_task(
+    vector_tier: Arc<RwLock<Option<Arc<dyn MemoryVectorTier>>>>,
+    id: Uuid,
+) {
+    let Some(tier) = vector_tier.read().await.clone() else {
+        return;
+    };
+    let result = tokio::time::timeout(vector::VECTOR_INDEX_TIMEOUT, tier.delete_entry(id)).await;
+    match result {
+        Ok(result) => run_vector_delete(result, id).await,
+        Err(_) => tracing::warn!(entry_id = %id, "memory vector delete timed out"),
+    }
+}
+
+async fn schedule_vector_delete_namespace_task(
+    vector_tier: Arc<RwLock<Option<Arc<dyn MemoryVectorTier>>>>,
+    namespace: String,
+) {
+    let Some(tier) = vector_tier.read().await.clone() else {
+        return;
+    };
+    let result =
+        tokio::time::timeout(vector::VECTOR_INDEX_TIMEOUT, tier.delete_namespace(&namespace)).await;
+    match result {
+        Ok(result) => run_vector_delete(result, namespace).await,
+        Err(_) => tracing::warn!(namespace = %namespace, "memory vector namespace delete timed out"),
     }
 }
 
@@ -833,6 +1200,78 @@ pub fn format_feedback_suffix(
     Some(suffix)
 }
 
+/// Shared test doubles for vector tiers used across this module's tests.
+///
+/// Kept as a `#[cfg(test)]` submodule of this file so every `mod.rs` test
+/// imports one fake instead of drifting copies; other test files still use
+/// their own fakes (cross-file unification is a follow-up).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use uuid::Uuid;
+
+    use super::{MemoryEntry, MemoryError, MemoryVectorTier, VectorMatch};
+
+    /// Records index/delete calls for sequencing assertions.
+    pub(crate) struct RecordingVectorTier {
+        pub fail_deletes: bool,
+        pub events: Mutex<Vec<String>>,
+    }
+
+    impl RecordingVectorTier {
+        pub fn new() -> Self {
+            Self {
+                fail_deletes: false,
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl MemoryVectorTier for RecordingVectorTier {
+        async fn index(&self, entry: &MemoryEntry) -> Result<(), MemoryError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("index:{}", entry.id));
+            Ok(())
+        }
+
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<VectorMatch>, MemoryError> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_entry(&self, id: Uuid) -> Result<(), MemoryError> {
+            self.events.lock().unwrap().push(format!("delete:{id}"));
+            if self.fail_deletes {
+                return Err(MemoryError::Qdrant("mock delete failure".to_owned()));
+            }
+            Ok(())
+        }
+
+        async fn delete_namespace(&self, namespace: &str) -> Result<(), MemoryError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("delete_namespace:{namespace}"));
+            if self.fail_deletes {
+                return Err(MemoryError::Qdrant("mock delete failure".to_owned()));
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -840,6 +1279,7 @@ mod tests {
     use serde_json::{json, Map};
     use tempfile::tempdir;
 
+    use super::test_support::RecordingVectorTier;
     use super::*;
 
     struct FailingVectorTier;
@@ -889,6 +1329,70 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Vec::new())
         }
+    }
+
+    /// Extraction provider whose calls park while paused, used to hold a
+    /// consolidation pass mid-flight for gate-contention tests. Unpaused
+    /// calls return immediately with an empty candidate list.
+    struct PausableExtractionProvider {
+        calls: AtomicUsize,
+        paused: Mutex<bool>,
+        release: tokio::sync::Notify,
+    }
+
+    impl Default for PausableExtractionProvider {
+        fn default() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                paused: Mutex::new(false),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl PausableExtractionProvider {
+        /// Park subsequent provider calls until the returned guard drops.
+        async fn hold(&self) -> ReleaseGuard<'_> {
+            *self.paused.lock().unwrap() = true;
+            ReleaseGuard { provider: self }
+        }
+    }
+
+    struct ReleaseGuard<'a> {
+        provider: &'a PausableExtractionProvider,
+    }
+
+    impl Drop for ReleaseGuard<'_> {
+        fn drop(&mut self) {
+            *self.provider.paused.lock().unwrap() = false;
+            // notify_one stores a permit when nothing is parked yet, so a
+            // release that races the call's parking cannot be lost.
+            self.provider.release.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl MemoryExtractionProvider for PausableExtractionProvider {
+        async fn extract(
+            &self,
+            _request: MemoryExtractionProviderRequest,
+        ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            while *self.paused.lock().unwrap() {
+                self.release.notified().await;
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    async fn wait_for_calls(provider: &PausableExtractionProvider, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while provider.calls.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider calls must be recorded");
     }
 
     fn request(content: &str) -> OpenAIRequest {
@@ -1020,11 +1524,354 @@ mod tests {
                 [entry.id.to_string()],
             )
             .unwrap();
-        assert_eq!(system.retry_pending_vector_indexes().await.unwrap(), 1);
+    assert_eq!(system.retry_pending_vector_indexes().await.unwrap(), 1);
+    assert_eq!(
+        system.store.vector_status(entry.id).unwrap().unwrap().0,
+        "indexed"
+    );
+    }
+
+    fn vector_config() -> MemoryConfig {
+        MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            qdrant: Some(MemoryQdrantConfig {
+                qdrant_url: "http://localhost:6333".to_owned(),
+                embedding_provider: "mock".to_owned(),
+                embedding_model: "text-embedding-3-small".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn wait_for_events(tier: &RecordingVectorTier, expected: usize) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let events = tier.events();
+                if events.len() >= expected {
+                    return events;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tier events must be recorded")
+    }
+
+    #[tokio::test]
+    async fn admin_edit_rejects_disallowed_content_before_write() {
+        let system = system(MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            ..Default::default()
+        })
+        .await;
+        let entry = system
+            .admin_create(
+                "user::edit".to_owned(),
+                "Original safe stored content.".to_owned(),
+                MemoryType::Fact,
+            )
+            .await
+            .unwrap();
+
+    let rejected = system
+        .admin_edit(entry.id, "api key sk-ABCDEFGHIJKLMNOPQRSTUVWXY", "fact")
+        .await
+        .unwrap_err();
+    assert!(matches!(rejected, AdminCreateError::SensitiveContent));
+    let short = system
+        .admin_edit(entry.id, "tiny two", "fact")
+        .await
+        .unwrap_err();
+    assert!(matches!(short, AdminCreateError::InvalidContent(_)));
+    let single_word = system
+        .admin_edit(entry.id, "sufficiently-long-word", "fact")
+        .await
+        .unwrap_err();
+    assert!(matches!(single_word, AdminCreateError::InvalidContent(_)));
+    let stored = system.store.get_entry_by_id(entry.id).unwrap().unwrap();
+    assert_eq!(stored.content, "Original safe stored content.");
+}
+
+    #[tokio::test]
+    async fn admin_edit_updates_store_and_tier_observes_delete_then_reindex() {
+        let tier = Arc::new(RecordingVectorTier::new());
+        let system = MemorySystem::new_with_vector(
+            vector_config(),
+            None,
+            None,
+            Some(tier.clone() as Arc<dyn MemoryVectorTier>),
+        )
+        .await
+        .unwrap();
+    let entry = system
+        .admin_create(
+            "user::edit".to_owned(),
+            "Vector indexing remains asynchronous.".to_owned(),
+            MemoryType::Fact,
+        )
+        .await
+        .unwrap();
+    let create_events = wait_for_events(&tier, 1).await;
+    assert_eq!(create_events[0], format!("index:{}", entry.id));
+
+    let updated = system
+        .admin_edit(entry.id, "Edited content stays safe.", "decision")
+        .await
+        .unwrap()
+        .expect("entry must exist");
+    assert_eq!(updated.content, "Edited content stays safe.");
+    assert_eq!(updated.memory_type, MemoryType::Decision);
+    assert!(updated.updated_at.is_some());
+
+    let events = wait_for_events(&tier, 3).await;
+    assert_eq!(events[1], format!("delete:{}", entry.id));
+    assert_eq!(events[2], format!("index:{}", entry.id));
         assert_eq!(
-            system.store.vector_status(entry.id).unwrap().unwrap().0,
-            "indexed"
+            system.store.get_entry_by_id(entry.id).unwrap().unwrap(),
+            updated
         );
+    }
+
+    #[tokio::test]
+    async fn admin_edit_returns_none_for_missing_id() {
+        let system = system(MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            ..Default::default()
+        })
+        .await;
+        assert!(
+            system
+                .admin_edit(Uuid::from_u128(4242), "Missing entry content.", "fact")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_edit_rejects_superseded_entry_without_write_or_reindex() {
+        let tier = Arc::new(RecordingVectorTier::new());
+        let system = MemorySystem::new_with_vector(
+            vector_config(),
+            None,
+            None,
+            Some(tier.clone() as Arc<dyn MemoryVectorTier>),
+        )
+        .await
+        .unwrap();
+        let source = system
+            .admin_create(
+                "user::superseded-edit".to_owned(),
+                "First entry that will be superseded.".to_owned(),
+                MemoryType::Fact,
+            )
+            .await
+            .unwrap();
+        let survivor = system
+            .admin_create(
+                "user::superseded-edit".to_owned(),
+                "Second entry that supersedes the first.".to_owned(),
+                MemoryType::Fact,
+            )
+            .await
+            .unwrap();
+        let marked = system
+            .store
+            .mark_superseded(&[source.id], survivor.id)
+            .unwrap();
+        assert_eq!(marked, 1);
+
+        let error = system
+            .admin_edit(source.id, "Attempting to edit dead weight.", "fact")
+            .await
+            .unwrap_err();
+    match error {
+        AdminCreateError::Memory(MemoryError::Conflict(message)) => {
+            assert_eq!(message, "memory entry is already superseded");
+        }
+        other => panic!("expected superseded-entry conflict, got {other:?}"),
+    }
+
+        // No write, no re-index: content unchanged and no new tier events
+        // beyond the two create-index calls.
+        let stored = system.store.get_entry_by_id(source.id).unwrap().unwrap();
+        assert_eq!(stored.content, "First entry that will be superseded.");
+        let events = wait_for_events(&tier, 2).await;
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_consolidation_now_rejects_while_a_pass_is_running() {
+        let provider = Arc::new(PausableExtractionProvider::default());
+        let config = MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            consolidation_enabled: true,
+            consolidation_provider: "provider".to_owned(),
+            consolidation_model: "model".to_owned(),
+            ..Default::default()
+        };
+        let system =
+            MemorySystem::new_with_vector(config, None, Some(provider.clone()), None)
+                .await
+                .unwrap();
+        seed_near_duplicates(&system);
+
+        // Park the provider so the background pass holds the gate while the
+        // manual trigger tries to start.
+        let release = provider.hold().await;
+        let background = {
+            let runner = MemoryConsolidationRunner::from_system(
+                &system,
+                Arc::clone(&system.consolidation_pass_gate),
+            );
+            tokio::spawn(async move { runner.run_consolidation_pass().await })
+        };
+        wait_for_calls(&provider, 1).await;
+
+        let error = system.run_consolidation_now().await.unwrap_err();
+        assert!(error.to_string().contains("consolidation already in progress"));
+
+        drop(release);
+        background.await.unwrap();
+
+        // Gate released: a manual pass runs again.
+        system.run_consolidation_now().await.unwrap();
+        assert!(provider.calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn manual_pass_released_gate_lets_background_hook_run() {
+        let provider = Arc::new(PausableExtractionProvider::default());
+        let config = MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            consolidation_enabled: true,
+            consolidation_provider: "provider".to_owned(),
+            consolidation_model: "model".to_owned(),
+            ..Default::default()
+        };
+        let system =
+            MemorySystem::new_with_vector(config, None, Some(provider.clone()), None)
+                .await
+                .unwrap();
+        seed_near_duplicates(&system);
+
+        // Manual pass completes while no background pass holds the gate.
+        system.run_consolidation_now().await.unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        // The background hook then serializes behind the same gate instead
+        // of racing the completed manual pass.
+        let runner = MemoryConsolidationRunner::from_system(
+            &system,
+            Arc::clone(&system.consolidation_pass_gate),
+        );
+        runner.run_consolidation_pass().await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn admin_edit_survives_vector_delete_failure() {
+        let tier = Arc::new(RecordingVectorTier {
+            fail_deletes: true,
+            events: Mutex::new(Vec::new()),
+        });
+        let system = MemorySystem::new_with_vector(
+            vector_config(),
+            None,
+            None,
+            Some(tier.clone() as Arc<dyn MemoryVectorTier>),
+        )
+        .await
+        .unwrap();
+        let entry = system
+            .admin_create(
+                "user::edit".to_owned(),
+                "Vector indexing remains asynchronous.".to_owned(),
+                MemoryType::Fact,
+            )
+            .await
+            .unwrap();
+        wait_for_events(&tier, 1).await;
+
+        let updated = system
+            .admin_edit(entry.id, "Edited content stays safe.", "fact")
+            .await
+            .unwrap()
+            .expect("edit must succeed despite tier delete failure");
+        assert_eq!(updated.content, "Edited content stays safe.");
+        let events = wait_for_events(&tier, 3).await;
+        assert_eq!(events[1], format!("delete:{}", entry.id));
+        assert!(system.store.get_entry_by_id(entry.id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn default_trait_delete_methods_are_noops() {
+        struct BareTier;
+        #[async_trait]
+        impl MemoryVectorTier for BareTier {
+            async fn index(&self, _entry: &MemoryEntry) -> Result<(), MemoryError> {
+                Ok(())
+            }
+            async fn search(
+                &self,
+                _query: &str,
+                _limit: usize,
+            ) -> Result<Vec<VectorMatch>, MemoryError> {
+                Ok(Vec::new())
+            }
+        }
+        let tier = BareTier;
+        tier.delete_entry(Uuid::new_v4()).await.unwrap();
+        tier.delete_namespace("user::bare").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_delete_and_clear_trigger_tier_deletes_best_effort() {
+        let tier = Arc::new(RecordingVectorTier::new());
+        let system = MemorySystem::new_with_vector(
+            vector_config(),
+            None,
+            None,
+            Some(tier.clone() as Arc<dyn MemoryVectorTier>),
+        )
+        .await
+        .unwrap();
+        let first = system
+            .admin_create(
+                "user::purge".to_owned(),
+                "First purge candidate content.".to_owned(),
+                MemoryType::Fact,
+            )
+            .await
+            .unwrap();
+        let second = system
+            .admin_create(
+                "user::purge".to_owned(),
+                "Second purge candidate content.".to_owned(),
+                MemoryType::Fact,
+            )
+            .await
+            .unwrap();
+        wait_for_events(&tier, 2).await;
+
+        assert!(system.admin_delete(first.id).await.unwrap());
+        assert!(!system.admin_delete(first.id).await.unwrap());
+        assert_eq!(system.admin_clear("user::purge").await.unwrap(), 1);
+        assert_eq!(
+            system.store.get_entry_by_id(second.id).unwrap(),
+            None,
+            "second entry must be cleared with the namespace"
+        );
+
+        let events = wait_for_events(&tier, 4).await;
+        assert_eq!(events[2], format!("delete:{}", first.id));
+        assert_eq!(events[3], "delete_namespace:user::purge");
     }
 
     #[test]
@@ -1123,6 +1970,118 @@ mod tests {
         config.database_path = "other-memory.db".to_owned();
         let error = system.reload(config).await.unwrap_err();
         assert!(error.to_string().contains("requires a gateway restart"));
+        assert!(system.store.get_entry_by_id(stored.id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn decay_cycle_triggers_consolidation_when_enabled_and_not_when_disabled() {
+        let provider = Arc::new(TestExtractionProvider {
+            calls: AtomicUsize::new(0),
+        });
+
+        let config = MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            consolidation_enabled: true,
+            consolidation_provider: "provider".to_owned(),
+            consolidation_model: "model".to_owned(),
+            ..MemoryConfig::default()
+        };
+        let system = MemorySystem::new_with_vector(config, None, Some(provider.clone()), None)
+            .await
+            .unwrap();
+        seed_near_duplicates(&system);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        let scheduler = system.decay_scheduler.lock().unwrap();
+        scheduler.run_once().await.unwrap();
+        drop(scheduler);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(system.metrics.last_consolidation_pass().is_some());
+
+        // Disabled (default): no provider call on decay completion.
+        let disabled_provider = Arc::new(TestExtractionProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let config = MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            ..MemoryConfig::default()
+        };
+        let disabled = MemorySystem::new_with_vector(
+            config,
+            None,
+            Some(disabled_provider.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        seed_near_duplicates(&disabled);
+        let scheduler = disabled.decay_scheduler.lock().unwrap();
+        scheduler.run_once().await.unwrap();
+        drop(scheduler);
+        assert_eq!(disabled_provider.calls.load(Ordering::SeqCst), 0);
+        assert!(disabled.metrics.last_consolidation_pass().is_none());
+    }
+
+    fn seed_near_duplicates(system: &MemorySystem) {
+        for content in [
+            "The deploy target is fly.io eu-west",
+            "The deploy target is fly.io eu-west region",
+        ] {
+            system
+                .store
+                .store_entry(
+                    NewMemoryEntry {
+                        namespace: "user::consolidation".to_owned(),
+                        content: content.to_owned(),
+                        memory_type: MemoryType::Fact,
+                        source_request_id: None,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_applies_consolidation_settings_without_dropping_store() {
+        let provider = Arc::new(TestExtractionProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let config = MemoryConfig {
+            enabled: true,
+            database_path: ":memory:".to_owned(),
+            ..MemoryConfig::default()
+        };
+        let system = MemorySystem::new_with_vector(config.clone(), None, Some(provider.clone()), None)
+            .await
+            .unwrap();
+        seed_near_duplicates(&system);
+        let stored = system
+            .store
+            .store_entry(
+                NewMemoryEntry {
+                    namespace: "user::consolidation-reload".to_owned(),
+                    content: "Survives consolidation hot reload.".to_owned(),
+                    memory_type: MemoryType::Fact,
+                    source_request_id: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        let mut enabled = config.clone();
+        enabled.consolidation_enabled = true;
+        enabled.consolidation_provider = "provider".to_owned();
+        enabled.consolidation_model = "model".to_owned();
+        system.reload(enabled).await.unwrap();
+        assert!(system.config.read().await.consolidation_enabled);
+
+        let scheduler = system.decay_scheduler.lock().unwrap();
+        scheduler.run_once().await.unwrap();
+        drop(scheduler);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert!(system.store.get_entry_by_id(stored.id).unwrap().is_some());
     }
 
@@ -1239,6 +2198,8 @@ mod tests {
             last_accessed_at,
             access_count: 3,
             source_request_id: Some(Uuid::from_u128(2)),
+            updated_at: None,
+            superseded_by: None,
         }
     }
 

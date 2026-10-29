@@ -19,9 +19,11 @@ use super::metrics::{MemoryMetrics, NamespaceType};
 use super::namespace::validate_namespace as is_valid_namespace;
 use super::{MemoryEntry, MemoryError, MemoryType, ScoredMemory};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 pub const DEFAULT_MAX_MEMORIES_PER_NAMESPACE: usize = 1_000;
-const MAX_LIST_LIMIT: usize = 200;
+/// Maximum rows one public listing page may return; internal callers that
+/// need complete listings (consolidation) paginate with this page size.
+pub(crate) const MAX_LIST_LIMIT: usize = 200;
 const MAX_RETRIEVAL_CANDIDATES: usize = 50;
 const DEFAULT_MIN_RELEVANCE_THRESHOLD: f64 = 0.25;
 pub(crate) const CONTEXT_SCOPE_BOOST: f64 = 1.5;
@@ -183,6 +185,8 @@ impl MemoryStore {
                     last_accessed_at: now,
                     access_count: 0,
                     source_request_id: input.source_request_id,
+                    updated_at: None,
+                    superseded_by: None,
                 }
             }
         };
@@ -199,8 +203,9 @@ impl MemoryStore {
         transaction.execute(
             "INSERT INTO memories (
                 id, namespace, content, memory_type, relevance_score,
-                created_at, last_accessed_at, access_count, source_request_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                created_at, last_accessed_at, access_count, source_request_id,
+                updated_at, superseded_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 entry.id.to_string(),
                 entry.namespace,
@@ -211,6 +216,8 @@ impl MemoryStore {
                 entry.last_accessed_at.timestamp(),
                 i64::try_from(entry.access_count).map_err(store_external_error)?,
                 entry.source_request_id.map(|id| id.to_string()),
+                entry.updated_at,
+                entry.superseded_by.map(|id| id.to_string()),
             ],
         )?;
         transaction.execute(
@@ -236,8 +243,9 @@ impl MemoryStore {
         let conn = self.connection()?;
         conn.query_row(
             "SELECT id, namespace, content, memory_type, relevance_score,
-                    created_at, last_accessed_at, access_count, source_request_id
-             FROM memories WHERE id = ?1",
+            created_at, last_accessed_at, access_count, source_request_id,
+            updated_at, superseded_by
+            FROM memories WHERE id = ?1",
             [id.to_string()],
             memory_entry_from_row,
         )
@@ -260,11 +268,175 @@ impl MemoryStore {
         u64::try_from(deleted).map_err(store_external_error)
     }
 
+    /// Update an entry's content and memory type in place, stamping `updated_at`.
+    ///
+    /// The FTS index is refreshed by the `memories_au` UPDATE trigger. Returns
+    /// `Ok(None)` when `id` does not match a stored entry.
+    pub fn update_entry(
+        &self,
+        id: Uuid,
+        content: &str,
+        memory_type: &str,
+    ) -> Result<Option<MemoryEntry>, MemoryError> {
+        validate_content(content)?;
+        let memory_type = match memory_type {
+            "preference" => MemoryType::Preference,
+            "fact" => MemoryType::Fact,
+            "context" => MemoryType::Context,
+            "decision" => MemoryType::Decision,
+            _ => {
+                return Err(MemoryError::Config(
+                    "memory_type must be one of preference, fact, context, decision".to_string(),
+                ))
+            }
+        };
+        let conn = self.connection()?;
+        let updated = conn.execute(
+            "UPDATE memories SET content = ?2, memory_type = ?3, updated_at = ?4 WHERE id = ?1",
+            params![
+                id.to_string(),
+                content,
+                memory_type_as_str(memory_type),
+                Utc::now().timestamp()
+            ],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        conn.query_row(
+            "SELECT id, namespace, content, memory_type, relevance_score,
+            created_at, last_accessed_at, access_count, source_request_id,
+            updated_at, superseded_by
+            FROM memories WHERE id = ?1",
+            [id.to_string()],
+            memory_entry_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Mark the given entries as superseded by `superseded_by` in one transaction.
+    ///
+    /// Rows that are already superseded, ids that do not exist, and the
+    /// `superseded_by` id itself (no self-supersede) are skipped; the returned
+    /// count covers only rows newly marked, so re-marking is idempotent.
+    pub fn mark_superseded(&self, ids: &[Uuid], superseded_by: Uuid) -> Result<usize, MemoryError> {
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        let mut marked = 0_usize;
+        {
+            let mut statement = transaction.prepare(
+                "UPDATE memories SET superseded_by = ?2
+                WHERE id = ?1 AND superseded_by IS NULL AND id <> ?2",
+            )?;
+            for id in ids {
+                marked += statement.execute(params![id.to_string(), superseded_by.to_string()])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(marked)
+    }
+
+    /// Create one merged entry and mark its sources superseded by it atomically.
+    ///
+    /// Used only by the consolidation engine: the merged entry is inserted and
+    /// every `source_ids` row is annotated with `superseded_by` inside a single
+    /// transaction, so a crash can never leave a merged entry without its
+    /// supersession links or vice versa. Every source must be distinct, present,
+    /// active, and in the same namespace or the transaction is rolled back.
+    pub fn create_merged_entry_with_supersession(
+        &self,
+        namespace: &str,
+        content: &str,
+        memory_type: MemoryType,
+        source_ids: &[Uuid],
+    ) -> Result<MemoryEntry, MemoryError> {
+        validate_namespace(namespace)?;
+        validate_content(content)?;
+        let now = Utc::now();
+        let entry = MemoryEntry {
+            id: Uuid::new_v4(),
+            namespace: namespace.to_owned(),
+            content: content.to_owned(),
+            memory_type,
+            relevance_score: 1.0,
+            created_at: now,
+            last_accessed_at: now,
+            access_count: 0,
+            source_request_id: None,
+            updated_at: None,
+            superseded_by: None,
+        };
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "INSERT INTO memories (
+                id, namespace, content, memory_type, relevance_score,
+                created_at, last_accessed_at, access_count, source_request_id,
+                updated_at, superseded_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                entry.id.to_string(),
+                entry.namespace,
+                entry.content,
+                memory_type_as_str(entry.memory_type),
+                entry.relevance_score,
+                entry.created_at.timestamp(),
+                entry.last_accessed_at.timestamp(),
+                i64::try_from(entry.access_count).map_err(store_external_error)?,
+                entry.source_request_id.map(|id| id.to_string()),
+                entry.updated_at,
+                entry.superseded_by.map(|id| id.to_string()),
+            ],
+        )?;
+        {
+            let mut statement = transaction.prepare(
+                "UPDATE memories SET superseded_by = ?2
+                 WHERE id = ?1 AND namespace = ?3 AND superseded_by IS NULL AND id <> ?2",
+            )?;
+            if source_ids.is_empty() {
+                return Err(MemoryError::Config("merge requires active source entries".to_owned()));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for id in source_ids {
+                if !seen.insert(id) || statement.execute(params![id.to_string(), entry.id.to_string(), namespace])? != 1 {
+                    return Err(MemoryError::Config("merge source is missing or already superseded".to_owned()));
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(entry)
+    }
+
     pub fn list_entries(
         &self,
         namespace: &str,
         limit: usize,
         offset: usize,
+    ) -> Result<MemoryEntryPage, MemoryError> {
+        self.list_entries_internal(namespace, limit, offset, false)
+    }
+
+    /// List entries in a namespace, optionally including superseded entries.
+    ///
+    /// Superseded entries are annotated with their `superseded_by` reference,
+    /// which `MemoryEntry` already carries.
+    pub fn list_entries_with_superseded(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+        include_superseded: bool,
+    ) -> Result<MemoryEntryPage, MemoryError> {
+        self.list_entries_internal(namespace, limit, offset, include_superseded)
+    }
+
+    fn list_entries_internal(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+        include_superseded: bool,
     ) -> Result<MemoryEntryPage, MemoryError> {
         validate_namespace(namespace)?;
         let limit = limit.min(MAX_LIST_LIMIT);
@@ -273,18 +445,26 @@ impl MemoryStore {
         let conn = self.connection()?;
         let total_count = query_u64(
             &conn,
-            "SELECT count(*) FROM memories WHERE namespace = ?1",
-            [namespace],
+            "SELECT count(*) FROM memories WHERE namespace = ?1
+            AND (?2 = 1 OR superseded_by IS NULL)",
+            params![namespace, if include_superseded { 1 } else { 0 }],
         )?;
         let mut statement = conn.prepare(
             "SELECT id, namespace, content, memory_type, relevance_score,
-                    created_at, last_accessed_at, access_count, source_request_id
-             FROM memories WHERE namespace = ?1
-             ORDER BY created_at DESC, id ASC LIMIT ?2 OFFSET ?3",
+            created_at, last_accessed_at, access_count, source_request_id,
+            updated_at, superseded_by
+            FROM memories WHERE namespace = ?1
+            AND (?2 = 1 OR superseded_by IS NULL)
+            ORDER BY created_at DESC, id ASC LIMIT ?3 OFFSET ?4",
         )?;
         let entries = statement
             .query_map(
-                params![namespace, sql_limit, sql_offset],
+                params![
+                    namespace,
+                    if include_superseded { 1 } else { 0 },
+                    sql_limit,
+                    sql_offset
+                ],
                 memory_entry_from_row,
             )?
             .collect::<Result<Vec<_>, _>>()?;
@@ -296,15 +476,168 @@ impl MemoryStore {
         })
     }
 
-    pub fn namespace_count(&self, namespace: &str) -> Result<u64, MemoryError> {
+/// Search memory content across namespaces through the FTS5 index.
+///
+/// The query is escaped exactly like [`MemoryStore::retrieve`]: each
+/// whitespace-separated token is stripped of non-alphanumeric edge characters,
+/// wrapped in double quotes with internal quotes doubled, and tokens are
+    /// joined with `OR`, so ordinary FTS5 operators cannot produce invalid
+    /// MATCH syntax. If SQLite nevertheless rejects the sanitized MATCH query,
+    /// it becomes [`MemoryError::Config`] (HTTP 400) instead of a silent listing
+    /// fallback. This is a defensive branch: quoted tokens normally parse.
+    /// Results join back to `memories` for full rows and
+    /// are ordered by bm25 relevance ascending (best first), like retrieval.
+/// Namespace, memory type, and supersession filters are applied server-side;
+/// `include_superseded = false` adds `superseded_by IS NULL`. An empty or
+/// whitespace-only query falls back to the default filtered listing
+/// (cross-namespace, newest-first) instead of erroring. `limit` is capped at
+/// `MAX_LIST_LIMIT`.
+pub fn search_entries(
+    &self,
+    query: &str,
+    namespace_filter: Option<&str>,
+    memory_type_filter: Option<&str>,
+    include_superseded: bool,
+    limit: usize,
+    offset: usize,
+) -> Result<MemoryEntryPage, MemoryError> {
+    if let Some(namespace) = namespace_filter {
         validate_namespace(namespace)?;
-        let conn = self.connection()?;
-        query_u64(
-            &conn,
-            "SELECT count(*) FROM memories WHERE namespace = ?1",
-            [namespace],
-        )
     }
+    if let Some(memory_type) = memory_type_filter {
+        if !matches!(memory_type, "preference" | "fact" | "context" | "decision") {
+            return Err(MemoryError::Config(
+                "memory_type_filter must be one of preference, fact, context, decision"
+                    .to_string(),
+            ));
+        }
+    }
+    let limit = limit.min(MAX_LIST_LIMIT);
+    let sql_limit = i64::try_from(limit).map_err(store_external_error)?;
+    let sql_offset = i64::try_from(offset).map_err(store_external_error)?;
+    let superseded_flag: i64 = if include_superseded { 1 } else { 0 };
+    let conn = self.connection()?;
+    let fts_query = fts_query_from_user_text(query);
+    let (total_count, entries) = if let Some(fts_query) = &fts_query {
+        let total_count = query_u64(
+            &conn,
+            "SELECT count(*) FROM memories_fts
+            JOIN memories m ON m.rowid = memories_fts.rowid
+            WHERE memories_fts MATCH ?1
+            AND (?2 IS NULL OR m.namespace = ?2)
+            AND (?3 IS NULL OR m.memory_type = ?3)
+            AND (?4 = 1 OR m.superseded_by IS NULL)",
+        params![
+            fts_query,
+            namespace_filter,
+            memory_type_filter,
+            superseded_flag
+        ],
+        )
+        .map_err(map_fts_match_error)?;
+        let mut statement = conn.prepare(
+            "SELECT m.id, m.namespace, m.content, m.memory_type, m.relevance_score,
+            m.created_at, m.last_accessed_at, m.access_count, m.source_request_id,
+            m.updated_at, m.superseded_by,
+            bm25(memories_fts) AS raw_rank
+            FROM memories_fts
+            JOIN memories m ON m.rowid = memories_fts.rowid
+            WHERE memories_fts MATCH ?1
+            AND (?2 IS NULL OR m.namespace = ?2)
+            AND (?3 IS NULL OR m.memory_type = ?3)
+            AND (?4 = 1 OR m.superseded_by IS NULL)
+            ORDER BY raw_rank ASC, m.rowid ASC
+            LIMIT ?5 OFFSET ?6",
+        ).map_err(map_fts_match_error)?;
+        let entries = statement
+            .query_map(
+                params![
+                    fts_query,
+                    namespace_filter,
+                    memory_type_filter,
+                    superseded_flag,
+                    sql_limit,
+                    sql_offset
+                ],
+                memory_entry_from_row,
+            )
+            .map_err(map_fts_match_error)?
+            .collect::<Result<Vec<_>, _>>()?;
+        (total_count, entries)
+    } else {
+        // Empty or whitespace-only query: fall back to the default filtered
+        // listing (cross-namespace, newest-first) rather than erroring.
+        let total_count = query_u64(
+            &conn,
+            "SELECT count(*) FROM memories m
+            WHERE (?1 IS NULL OR m.namespace = ?1)
+            AND (?2 IS NULL OR m.memory_type = ?2)
+            AND (?3 = 1 OR m.superseded_by IS NULL)",
+            params![namespace_filter, memory_type_filter, superseded_flag],
+        )?;
+        let mut statement = conn.prepare(
+            "SELECT m.id, m.namespace, m.content, m.memory_type, m.relevance_score,
+            m.created_at, m.last_accessed_at, m.access_count, m.source_request_id,
+            m.updated_at, m.superseded_by
+            FROM memories m
+            WHERE (?1 IS NULL OR m.namespace = ?1)
+            AND (?2 IS NULL OR m.memory_type = ?2)
+            AND (?3 = 1 OR m.superseded_by IS NULL)
+            ORDER BY m.created_at DESC, m.id ASC
+            LIMIT ?4 OFFSET ?5",
+        )?;
+        let entries = statement
+            .query_map(
+                params![
+                    namespace_filter,
+                    memory_type_filter,
+                    superseded_flag,
+                    sql_limit,
+                    sql_offset
+                ],
+                memory_entry_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        (total_count, entries)
+    };
+    Ok(MemoryEntryPage {
+        entries,
+        total_count,
+        limit,
+        offset,
+    })
+}
+
+/// Export every stored entry, including superseded ones, for data portability.
+///
+/// Supersession and edit annotations travel on each entry through
+/// `MemoryEntry::superseded_by` and `updated_at`. Ordering is deterministic:
+/// namespace ascending, then creation time, then id.
+pub fn export_all(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
+    let conn = self.connection()?;
+    let mut statement = conn.prepare(
+        "SELECT id, namespace, content, memory_type, relevance_score,
+        created_at, last_accessed_at, access_count, source_request_id,
+        updated_at, superseded_by
+        FROM memories
+        ORDER BY namespace ASC, created_at ASC, id ASC",
+        )
+        .map_err(map_fts_match_error)?;
+        let entries = statement
+        .query_map([], memory_entry_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(entries)
+}
+
+pub fn namespace_count(&self, namespace: &str) -> Result<u64, MemoryError> {
+    validate_namespace(namespace)?;
+    let conn = self.connection()?;
+    query_u64(
+        &conn,
+        "SELECT count(*) FROM memories WHERE namespace = ?1",
+        [namespace],
+    )
+}
 
     pub fn mark_unconfigured_vector_entries_pending(&self) -> Result<u64, MemoryError> {
         let updated = self.connection()?.execute(
@@ -386,13 +719,26 @@ WHERE vector_index_status = 'not_configured'",
     }
 
     pub fn get_entries_by_ids(&self, ids: &[Uuid]) -> Result<Vec<MemoryEntry>, MemoryError> {
-        let mut entries = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(entry) = self.get_entry_by_id(*id)? {
-                entries.push(entry);
-            }
+        if ids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(entries)
+        let conn = self.connection()?;
+        let id_strings = ids.iter().map(Uuid::to_string).collect::<Vec<_>>();
+        let placeholders = std::iter::repeat_n("?", id_strings.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, namespace, content, memory_type, relevance_score,
+             created_at, last_accessed_at, access_count, source_request_id,
+             updated_at, superseded_by FROM memories
+             WHERE superseded_by IS NULL AND id IN ({placeholders})"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let found = statement
+            .query_map(rusqlite::params_from_iter(&id_strings), memory_entry_from_row)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| (entry.id, entry))
+            .collect::<std::collections::HashMap<_, _>>();
+        Ok(ids.iter().filter_map(|id| found.get(id).cloned()).collect())
     }
 
     pub fn retrieve(
@@ -421,21 +767,23 @@ WHERE vector_index_status = 'not_configured'",
             .map_err(store_external_error)?
             .checked_mul(if context_scope.is_some() { 2 } else { 1 })
             .ok_or_else(|| store_external_error(NumericOverflow))?;
-        let mut statement = conn.prepare(
-            "SELECT m.id, m.namespace, m.content, m.memory_type, m.relevance_score,
-                    m.created_at, m.last_accessed_at, m.access_count, m.source_request_id,
-                    bm25(memories_fts) AS raw_rank
-             FROM memories_fts
-             JOIN memories m ON m.rowid = memories_fts.rowid
-             WHERE memories_fts MATCH ?1
-               AND (m.namespace = ?2 OR (?3 IS NOT NULL AND m.namespace = ?3))
-             ORDER BY raw_rank ASC, m.rowid ASC
-             LIMIT ?4",
-        )?;
-        let rows = statement.query_map(
-            params![fts_query, user_scope, context_scope, scope_candidate_limit],
-            |row| Ok((memory_entry_from_row(row)?, row.get::<_, f64>(9)?)),
-        )?;
+    let mut statement = conn.prepare(
+        "SELECT m.id, m.namespace, m.content, m.memory_type, m.relevance_score,
+        m.created_at, m.last_accessed_at, m.access_count, m.source_request_id,
+        m.updated_at, m.superseded_by,
+        bm25(memories_fts) AS raw_rank
+        FROM memories_fts
+        JOIN memories m ON m.rowid = memories_fts.rowid
+        WHERE memories_fts MATCH ?1
+        AND (m.namespace = ?2 OR (?3 IS NOT NULL AND m.namespace = ?3))
+        AND m.superseded_by IS NULL
+        ORDER BY raw_rank ASC, m.rowid ASC
+        LIMIT ?4",
+    )?;
+    let rows = statement.query_map(
+        params![fts_query, user_scope, context_scope, scope_candidate_limit],
+        |row| Ok((memory_entry_from_row(row)?, row.get::<_, f64>(11)?)),
+    )?;
         let mut candidates = Vec::new();
         for row in rows {
             let (entry, raw_rank) = row?;
@@ -500,11 +848,13 @@ WHERE vector_index_status = 'not_configured'",
         validate_namespace(namespace)?;
         let needle = content.trim();
         let conn = self.connection()?;
-        let mut statement = conn.prepare(
-            "SELECT id, namespace, content, memory_type, relevance_score,
-                    created_at, last_accessed_at, access_count, source_request_id
-             FROM memories WHERE namespace = ?1 ORDER BY created_at ASC, id ASC",
-        )?;
+    let mut statement = conn.prepare(
+        "SELECT id, namespace, content, memory_type, relevance_score,
+        created_at, last_accessed_at, access_count, source_request_id,
+        updated_at, superseded_by
+        FROM memories WHERE namespace = ?1 AND superseded_by IS NULL
+        ORDER BY created_at ASC, id ASC",
+    )?;
         let mut rows = statement.query([namespace])?;
         while let Some(row) = rows.next()? {
             let entry = memory_entry_from_row(row)?;
@@ -730,24 +1080,25 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ) -> Result<Vec<VectorRetryCandidate>, MemoryError> {
         let conn = self.connection()?;
         let mut statement = conn.prepare(
-            "SELECT id, namespace, content, memory_type, relevance_score,
-created_at, last_accessed_at, access_count, source_request_id,
-vector_retry_count, vector_last_attempt_at, vector_next_retry_at, vector_last_error
-FROM memories
-WHERE vector_index_status IN ('pending', 'retry')
-AND (vector_next_retry_at IS NULL OR vector_next_retry_at <= ?1)
-ORDER BY coalesce(vector_next_retry_at, 0) ASC, id ASC",
-        )?;
-        let candidates = statement
-            .query_map([as_of.timestamp()], |row| {
-                Ok(VectorRetryCandidate {
-                    entry: memory_entry_from_row(row)?,
-                    retry_count: checked_db_u64(row.get(9)?, 9)?,
-                    last_attempt_at: optional_timestamp_from_db(row.get(10)?, 10)?,
-                    next_retry_at: optional_timestamp_from_db(row.get(11)?, 11)?,
-                    last_error: row.get(12)?,
-                })
-            })?
+        "SELECT id, namespace, content, memory_type, relevance_score,
+        created_at, last_accessed_at, access_count, source_request_id,
+        updated_at, superseded_by,
+        vector_retry_count, vector_last_attempt_at, vector_next_retry_at, vector_last_error
+        FROM memories
+        WHERE vector_index_status IN ('pending', 'retry')
+        AND (vector_next_retry_at IS NULL OR vector_next_retry_at <= ?1)
+        ORDER BY coalesce(vector_next_retry_at, 0) ASC, id ASC",
+    )?;
+    let candidates = statement
+        .query_map([as_of.timestamp()], |row| {
+            Ok(VectorRetryCandidate {
+                entry: memory_entry_from_row(row)?,
+                retry_count: checked_db_u64(row.get(11)?, 11)?,
+                last_attempt_at: optional_timestamp_from_db(row.get(12)?, 12)?,
+                next_retry_at: optional_timestamp_from_db(row.get(13)?, 13)?,
+                last_error: row.get(14)?,
+            })
+        })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(candidates)
     }
@@ -772,25 +1123,27 @@ ORDER BY coalesce(vector_next_retry_at, 0) ASC, id ASC",
     fn initialize_schema(conn: &mut Connection) -> Result<(), MemoryError> {
         let transaction = conn.transaction()?;
         transaction.execute_batch(
-            "CREATE TABLE IF NOT EXISTS memories (
-                id TEXT PRIMARY KEY,
-                namespace TEXT NOT NULL CHECK(length(namespace) BETWEEN 1 AND 256),
-                content TEXT NOT NULL CHECK(length(content) BETWEEN 1 AND 4096),
-                memory_type TEXT NOT NULL
-                    CHECK(memory_type IN ('preference', 'fact', 'context', 'decision')),
-                relevance_score REAL NOT NULL DEFAULT 1.0
-                    CHECK(relevance_score >= 0.0 AND relevance_score <= 1.0),
-                created_at INTEGER NOT NULL,
-                last_accessed_at INTEGER NOT NULL,
-                access_count INTEGER NOT NULL DEFAULT 0 CHECK(access_count >= 0),
-                source_request_id TEXT,
-                vector_index_status TEXT NOT NULL DEFAULT 'not_configured'
-                    CHECK(vector_index_status IN ('not_configured', 'pending', 'indexed', 'retry')),
-                vector_retry_count INTEGER NOT NULL DEFAULT 0 CHECK(vector_retry_count >= 0),
-                vector_last_attempt_at INTEGER,
-                vector_next_retry_at INTEGER,
-                vector_last_error TEXT
-            );
+        "CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY,
+            namespace TEXT NOT NULL CHECK(length(namespace) BETWEEN 1 AND 256),
+            content TEXT NOT NULL CHECK(length(content) BETWEEN 1 AND 4096),
+            memory_type TEXT NOT NULL
+            CHECK(memory_type IN ('preference', 'fact', 'context', 'decision')),
+            relevance_score REAL NOT NULL DEFAULT 1.0
+            CHECK(relevance_score >= 0.0 AND relevance_score <= 1.0),
+            created_at INTEGER NOT NULL,
+            last_accessed_at INTEGER NOT NULL,
+            access_count INTEGER NOT NULL DEFAULT 0 CHECK(access_count >= 0),
+            source_request_id TEXT,
+            updated_at INTEGER,
+            superseded_by TEXT,
+            vector_index_status TEXT NOT NULL DEFAULT 'not_configured'
+            CHECK(vector_index_status IN ('not_configured', 'pending', 'indexed', 'retry')),
+            vector_retry_count INTEGER NOT NULL DEFAULT 0 CHECK(vector_retry_count >= 0),
+            vector_last_attempt_at INTEGER,
+            vector_next_retry_at INTEGER,
+            vector_last_error TEXT
+        );
         CREATE TABLE IF NOT EXISTS memory_metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -807,21 +1160,21 @@ ORDER BY coalesce(vector_next_retry_at, 0) ASC, id ASC",
             "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 content, content='memories', content_rowid='rowid'
             );
-            DROP TRIGGER IF EXISTS memories_ai;
-            DROP TRIGGER IF EXISTS memories_ad;
-            DROP TRIGGER IF EXISTS memories_au;
-            CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
-                INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
-            END;
-            CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, content)
-                VALUES ('delete', old.rowid, old.content);
-            END;
-            CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, content)
-                VALUES ('delete', old.rowid, old.content);
-                INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
-            END;
+        DROP TRIGGER IF EXISTS memories_ai;
+        DROP TRIGGER IF EXISTS memories_ad;
+        DROP TRIGGER IF EXISTS memories_au;
+        CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+            INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+        END;
+        CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, content)
+            VALUES ('delete', old.rowid, old.content);
+        END;
+        CREATE TRIGGER memories_au AFTER UPDATE OF content ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, content)
+            VALUES ('delete', old.rowid, old.content);
+            INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+        END;
             CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
             CREATE INDEX IF NOT EXISTS idx_memories_namespace_score
                 ON memories(namespace, relevance_score DESC, id);
@@ -841,10 +1194,12 @@ ORDER BY coalesce(vector_next_retry_at, 0) ASC, id ASC",
         for (column_name, alter_sql) in [
             ("vector_index_status", "ALTER TABLE memories ADD COLUMN vector_index_status TEXT NOT NULL DEFAULT 'not_configured' CHECK(vector_index_status IN ('not_configured', 'pending', 'indexed', 'retry'))"),
             ("vector_retry_count", "ALTER TABLE memories ADD COLUMN vector_retry_count INTEGER NOT NULL DEFAULT 0 CHECK(vector_retry_count >= 0)"),
-            ("vector_last_attempt_at", "ALTER TABLE memories ADD COLUMN vector_last_attempt_at INTEGER"),
-            ("vector_next_retry_at", "ALTER TABLE memories ADD COLUMN vector_next_retry_at INTEGER"),
-            ("vector_last_error", "ALTER TABLE memories ADD COLUMN vector_last_error TEXT"),
-        ] {
+        ("vector_last_attempt_at", "ALTER TABLE memories ADD COLUMN vector_last_attempt_at INTEGER"),
+        ("vector_next_retry_at", "ALTER TABLE memories ADD COLUMN vector_next_retry_at INTEGER"),
+        ("vector_last_error", "ALTER TABLE memories ADD COLUMN vector_last_error TEXT"),
+        ("updated_at", "ALTER TABLE memories ADD COLUMN updated_at INTEGER"),
+        ("superseded_by", "ALTER TABLE memories ADD COLUMN superseded_by TEXT"),
+    ] {
             Self::add_column_if_missing(conn, column_name, alter_sql)?;
         }
         Ok(())
@@ -873,6 +1228,16 @@ fn sanitize_vector_error(error: &str) -> String {
     first_line.chars().take(512).collect()
 }
 
+fn map_fts_match_error(error: impl Into<MemoryError>) -> MemoryError {
+    let error = error.into();
+    if let MemoryError::Store(rusqlite::Error::SqliteFailure(_, Some(message))) = &error {
+        if message.contains("fts5: syntax error") || message.contains("unterminated string") {
+            return MemoryError::Config("invalid FTS5 search query; use plain words without operators".to_owned());
+        }
+    }
+    error
+}
+
 fn fts_query_from_user_text(query: &str) -> Option<String> {
     let tokens = query
         .split_whitespace()
@@ -895,14 +1260,19 @@ fn normalize_fts_rank(raw_rank: f64) -> f64 {
     positive_rank / (positive_rank + 1.0e-6)
 }
 
-fn validate_entry(entry: &MemoryEntry) -> Result<(), MemoryError> {
-    let length = entry.content.chars().count();
+fn validate_content(content: &str) -> Result<(), MemoryError> {
+    let length = content.chars().count();
     if length < 5 {
         return Err(MemoryError::ContentTooShort { length, min: 5 });
     }
     if length > 4_096 {
         return Err(MemoryError::ContentTooLong { length, max: 4_096 });
     }
+    Ok(())
+}
+
+fn validate_entry(entry: &MemoryEntry) -> Result<(), MemoryError> {
+    validate_content(&entry.content)?;
     validate_namespace(&entry.namespace)?;
     if !entry.relevance_score.is_finite() || !(0.0..=1.0).contains(&entry.relevance_score) {
         return Err(MemoryError::Config(
@@ -933,6 +1303,10 @@ fn memory_entry_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryEntry> {
         .get::<_, Option<String>>(8)?
         .map(|value| uuid_from_db(value, 8))
         .transpose()?;
+    let superseded_by = row
+        .get::<_, Option<String>>(10)?
+        .map(|value| uuid_from_db(value, 10))
+        .transpose()?;
     Ok(MemoryEntry {
         id,
         namespace: row.get(1)?,
@@ -943,6 +1317,8 @@ fn memory_entry_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryEntry> {
         last_accessed_at: timestamp_from_db(row.get(6)?, 6)?,
         access_count: checked_db_u64(row.get(7)?, 7)?,
         source_request_id,
+        updated_at: row.get(9)?,
+        superseded_by,
     })
 }
 
@@ -1092,6 +1468,8 @@ mod tests {
             last_accessed_at: at(1_700_000_100 + id as i64),
             access_count: id as u64,
             source_request_id: Some(Uuid::from_u128(id + 100)),
+            updated_at: None,
+            superseded_by: None,
         }
     }
 
@@ -1569,63 +1947,767 @@ WHERE id = ?1",
         assert!(results[0].final_score > results[1].final_score);
     }
 
-    #[test]
-    fn fts_triggers_follow_crud() {
-        let store = in_memory_store();
-        let saved = store
-            .store_entry(entry(1, "fts", "alpha searchable phrase"), None)
-            .unwrap();
-        let count = |query: &str| {
-            store
-                .connection()
-                .unwrap()
-                .query_row(
-                    "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH ?1",
-                    [query],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap()
-        };
-        assert_eq!(count("searchable"), 1);
-        store.delete_entry(saved.id).unwrap();
-        assert_eq!(count("searchable"), 0);
-    }
+#[test]
+fn fts_triggers_follow_crud() {
+    let store = in_memory_store();
+    let saved = store
+        .store_entry(entry(1, "fts", "alpha searchable phrase"), None)
+        .unwrap();
+    let count = |query: &str| {
+        store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH ?1",
+                [query],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count("searchable"), 1);
+    store.delete_entry(saved.id).unwrap();
+    assert_eq!(count("searchable"), 0);
+}
 
-    #[test]
-    fn migrates_legacy_schema_without_losing_fts_content() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE memories (
-                id TEXT PRIMARY KEY, namespace TEXT NOT NULL, content TEXT NOT NULL,
-                memory_type TEXT NOT NULL, relevance_score REAL NOT NULL,
-                created_at INTEGER NOT NULL, last_accessed_at INTEGER NOT NULL,
-                access_count INTEGER NOT NULL, source_request_id TEXT
-            );
-            INSERT INTO memories VALUES (
-                '00000000-0000-0000-0000-000000000001', 'user::default',
-                'legacy searchable content', 'fact', 1.0, 1700000000, 1700000000, 0, NULL
-            );",
+#[test]
+fn fts_trigger_reindexes_on_content_edit() {
+    let store = in_memory_store();
+    let saved = store
+        .store_entry(entry(1, "fts-edit", "alpha original wording"), None)
+        .unwrap();
+    let count = |query: &str| {
+        store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH ?1",
+                [query],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    store
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE memories SET content = 'beta revised wording' WHERE id = ?1",
+            [saved.id.to_string()],
         )
         .unwrap();
-        MemoryStore::verify_fts5(&conn).unwrap();
-        MemoryStore::initialize_schema(&mut conn).unwrap();
-        let store = MemoryStore {
-            conn: Arc::new(Mutex::new(conn)),
-            db_path: None,
-            metrics: Arc::new(MemoryMetrics::new()),
-        };
-        assert!(schema_objects(&store, "table").contains("memory_metadata"));
-        assert_eq!(
-            store
-                .connection()
-                .unwrap()
-                .query_row(
-                    "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'legacy'",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            1
+    assert_eq!(count("original"), 0);
+    assert_eq!(count("revised"), 1);
+}
+
+#[test]
+fn fresh_database_is_at_schema_v4() {
+    let store = in_memory_store();
+    let conn = store.connection().unwrap();
+    assert_eq!(
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    let mut columns = conn
+        .prepare("PRAGMA table_info(memories)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    columns.sort_unstable();
+    assert!(columns.contains(&"updated_at".to_string()));
+    assert!(columns.contains(&"superseded_by".to_string()));
+    let trigger_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'memories_au'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(trigger_sql.contains("AFTER UPDATE OF content"));
+}
+
+#[test]
+fn migrates_v3_schema_to_v4_preserving_rows() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE memories (
+            id TEXT PRIMARY KEY, namespace TEXT NOT NULL, content TEXT NOT NULL,
+            memory_type TEXT NOT NULL, relevance_score REAL NOT NULL,
+            created_at INTEGER NOT NULL, last_accessed_at INTEGER NOT NULL,
+            access_count INTEGER NOT NULL, source_request_id TEXT,
+            vector_index_status TEXT NOT NULL DEFAULT 'not_configured'
+            CHECK(vector_index_status IN ('not_configured', 'pending', 'indexed', 'retry')),
+            vector_retry_count INTEGER NOT NULL DEFAULT 0 CHECK(vector_retry_count >= 0),
+            vector_last_attempt_at INTEGER, vector_next_retry_at INTEGER, vector_last_error TEXT
         );
+        INSERT INTO memories (
+            id, namespace, content, memory_type, relevance_score,
+            created_at, last_accessed_at, access_count, source_request_id
+        ) VALUES (
+            '00000000-0000-0000-0000-000000000001', 'user::v3',
+            'legacy searchable content', 'fact', 1.0, 1700000000, 1700000000, 0, NULL
+        );
+        PRAGMA user_version = 3;",
+    )
+    .unwrap();
+    MemoryStore::verify_fts5(&conn).unwrap();
+    MemoryStore::initialize_schema(&mut conn).unwrap();
+    let store = MemoryStore {
+        conn: Arc::new(Mutex::new(conn)),
+        db_path: None,
+        metrics: Arc::new(MemoryMetrics::new()),
+    };
+    assert_eq!(
+        store
+            .connection()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    let migrated = store
+        .get_entry_by_id(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap())
+        .unwrap()
+        .expect("v3 row must survive migration");
+    assert_eq!(migrated.content, "legacy searchable content");
+    assert_eq!(migrated.updated_at, None);
+    assert_eq!(migrated.superseded_by, None);
+    assert_eq!(
+        store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'legacy'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn schema_migration_is_idempotent() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("memory.db");
+    let store = MemoryStore::new(&path).unwrap();
+    let saved = store
+        .store_entry(entry(1, "user::idem", "idempotent migration content"), None)
+        .unwrap();
+    drop(store);
+    let reopened = MemoryStore::new(&path).unwrap();
+    assert_eq!(
+        reopened
+            .connection()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    assert_eq!(
+        reopened.get_entry_by_id(saved.id).unwrap(),
+        Some(entry(1, "user::idem", "idempotent migration content"))
+    );
+    let conn = reopened.connection().unwrap();
+    let mut statement = conn
+        .prepare("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'memories_au'")
+        .unwrap();
+    assert_eq!(
+        statement.query_row([], |row| row.get::<_, i64>(0)).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn migrates_legacy_schema_without_losing_fts_content() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE memories (
+        id TEXT PRIMARY KEY, namespace TEXT NOT NULL, content TEXT NOT NULL,
+        memory_type TEXT NOT NULL, relevance_score REAL NOT NULL,
+        created_at INTEGER NOT NULL, last_accessed_at INTEGER NOT NULL,
+        access_count INTEGER NOT NULL, source_request_id TEXT
+    );
+    INSERT INTO memories VALUES (
+        '00000000-0000-0000-0000-000000000001', 'user::default',
+        'legacy searchable content', 'fact', 1.0, 1700000000, 1700000000, 0, NULL
+    );",
+    )
+    .unwrap();
+    MemoryStore::verify_fts5(&conn).unwrap();
+    MemoryStore::initialize_schema(&mut conn).unwrap();
+    let store = MemoryStore {
+        conn: Arc::new(Mutex::new(conn)),
+        db_path: None,
+        metrics: Arc::new(MemoryMetrics::new()),
+    };
+    assert!(schema_objects(&store, "table").contains("memory_metadata"));
+    assert_eq!(
+        store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'legacy'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn superseded_entries_are_excluded_from_retrieval_but_listed_when_included() {
+    let store = in_memory_store();
+    let now = Utc::now();
+    let mut active = entry(1, "user::sup", "active searchable wording");
+    active.relevance_score = 1.0;
+    active.last_accessed_at = now;
+    let mut superseded = entry(2, "user::sup", "superseded searchable wording");
+    superseded.relevance_score = 1.0;
+    superseded.last_accessed_at = now;
+    store.store_entry(active.clone(), None).unwrap();
+    store.store_entry(superseded.clone(), None).unwrap();
+    store
+        .mark_superseded(&[superseded.id], active.id)
+        .unwrap();
+
+    let results = store
+        .retrieve("user::sup", None, "searchable", Some(0.0))
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].entry.id, active.id);
+
+    let default_page = store.list_entries("user::sup", 50, 0).unwrap();
+    assert_eq!(default_page.total_count, 1);
+    assert_eq!(default_page.entries.len(), 1);
+    assert_eq!(default_page.entries[0].id, active.id);
+    assert_eq!(default_page.entries[0].superseded_by, None);
+
+    let including = store
+        .list_entries_with_superseded("user::sup", 50, 0, true)
+        .unwrap();
+    assert_eq!(including.total_count, 2);
+    assert_eq!(including.entries.len(), 2);
+    let superseded_listed = including
+        .entries
+        .iter()
+        .find(|listed| listed.id == superseded.id)
+        .expect("superseded entry must be listed when included");
+    assert_eq!(superseded_listed.superseded_by, Some(active.id));
+}
+
+#[test]
+fn vector_candidate_recheck_excludes_superseded_entries() {
+    let store = in_memory_store();
+    let active = store
+        .store_entry(entry(1, "user::vec", "vector candidate active"), None)
+        .unwrap();
+    let superseded = store
+        .store_entry(entry(2, "user::vec", "vector candidate superseded"), None)
+        .unwrap();
+    store.mark_superseded(&[superseded.id], active.id).unwrap();
+    assert_eq!(
+        store.get_entries_by_ids(&[active.id, superseded.id]).unwrap(),
+        vec![active]
+    );
+}
+
+#[test]
+fn merged_entry_supersession_is_transactional_and_namespace_guarded() {
+    let store = in_memory_store();
+    let first = store
+        .store_entry(entry(1, "user::merge", "alpha one shared"), None)
+        .unwrap();
+    let second = store
+        .store_entry(entry(2, "user::merge", "alpha two shared"), None)
+        .unwrap();
+
+    let merged = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "alpha merged summary",
+            MemoryType::Fact,
+            &[first.id, second.id],
+        )
+        .unwrap();
+    assert_eq!(merged.namespace, "user::merge");
+    for source in [&first, &second] {
+        let row = store.get_entry_by_id(source.id).unwrap().unwrap();
+        assert_eq!(row.superseded_by, Some(merged.id));
     }
+
+    // A source id that exists in a DIFFERENT namespace must be rejected inside
+    // the transaction (namespace guard), with nothing committed.
+    let foreign = store
+        .store_entry(entry(3, "user::other", "alpha three shared"), None)
+        .unwrap();
+    let local = store
+        .store_entry(entry(4, "user::merge", "alpha four shared"), None)
+        .unwrap();
+    let error = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "alpha second summary",
+            MemoryType::Fact,
+            &[local.id, foreign.id],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Config(_)), "got {error:?}");
+    // Rollback verified: no merged row appeared and no source was marked.
+    assert!(store.get_entry_by_id(local.id).unwrap().unwrap().superseded_by.is_none());
+    assert!(store.get_entry_by_id(foreign.id).unwrap().unwrap().superseded_by.is_none());
+    // Active rows are exactly the first merge plus `local`.
+    assert_eq!(store.list_entries("user::merge", 50, 0).unwrap().entries.len(), 2);
+}
+
+#[test]
+fn merged_entry_rejects_unknown_superseded_or_duplicate_sources() {
+    let store = in_memory_store();
+    let first = store
+        .store_entry(entry(1, "user::merge", "beta one shared"), None)
+        .unwrap();
+    let second = store
+        .store_entry(entry(2, "user::merge", "beta two shared"), None)
+        .unwrap();
+    let survivor = store
+        .store_entry(entry(3, "user::merge", "beta three shared"), None)
+        .unwrap();
+    store
+        .mark_superseded(&[first.id], second.id)
+        .unwrap();
+
+    // Unknown id.
+    let error = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "beta merged summary",
+            MemoryType::Fact,
+            &[Uuid::new_v4()],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Config(_)));
+
+    // Already-superseded source: transaction must roll back entirely.
+    let error = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "beta merged summary",
+            MemoryType::Fact,
+            &[survivor.id, first.id],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Config(_)), "got {error:?}");
+    assert!(store.get_entry_by_id(survivor.id).unwrap().unwrap().superseded_by.is_none());
+
+    // Duplicate source ids.
+    let error = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "beta merged summary",
+            MemoryType::Fact,
+            &[second.id, second.id],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Config(_)));
+
+    // Empty source list.
+    let error = store
+        .create_merged_entry_with_supersession(
+            "user::merge",
+            "beta merged summary",
+            MemoryType::Fact,
+            &[],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MemoryError::Config(_)));
+
+    // Nothing above committed any merge; active rows are second + survivor.
+    assert_eq!(store.list_entries("user::merge", 50, 0).unwrap().entries.len(), 2);
+}
+
+#[test]
+fn get_entries_by_ids_returns_input_order_and_skips_missing() {
+    let store = in_memory_store();
+    let first = store
+        .store_entry(entry(1, "user::ids", "id lookup one"), None)
+        .unwrap();
+    let second = store
+        .store_entry(entry(2, "user::ids", "id lookup two"), None)
+        .unwrap();
+    let missing = Uuid::new_v4();
+
+    let results = store.get_entries_by_ids(&[first.id, missing, second.id]).unwrap();
+    assert_eq!(results, vec![first.clone(), second.clone()]);
+    assert!(store.get_entries_by_ids(&[]).unwrap().is_empty());
+}
+
+#[test]
+fn update_entry_round_trips_and_reindexes_fts() {
+    let store = in_memory_store();
+    let saved = store
+        .store_entry(entry(1, "user::edit", "alpha original wording"), None)
+        .unwrap();
+    assert_eq!(saved.updated_at, None);
+
+    let updated = store
+        .update_entry(saved.id, "beta revised wording", "decision")
+        .unwrap()
+        .expect("existing entry should update");
+    assert_eq!(updated.content, "beta revised wording");
+    assert_eq!(updated.memory_type, MemoryType::Decision);
+    assert_eq!(updated.namespace, saved.namespace);
+    assert_eq!(updated.created_at, saved.created_at);
+    let updated_at = updated.updated_at.expect("edit must stamp updated_at");
+    assert!(updated_at >= saved.created_at.timestamp());
+
+    let reloaded = store.get_entry_by_id(saved.id).unwrap().unwrap();
+    assert_eq!(reloaded, updated);
+
+    let count = |query: &str| {
+        store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH ?1",
+                [query],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count("original"), 0);
+    assert_eq!(count("revised"), 1);
+
+    assert_eq!(
+        store
+            .update_entry(Uuid::from_u128(99), "valid missing content", "fact")
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        store.update_entry(saved.id, "tiny", "fact"),
+        Err(MemoryError::ContentTooShort { length: 4, .. })
+    ));
+    assert!(store
+        .update_entry(saved.id, "still valid content", "bogus")
+        .is_err());
+    let unchanged = store.get_entry_by_id(saved.id).unwrap().unwrap();
+    assert_eq!(unchanged.content, "beta revised wording");
+}
+
+#[test]
+fn mark_superseded_is_transactional_counts_and_idempotent() {
+    let store = in_memory_store();
+    let first = store
+        .store_entry(entry(1, "user::mark", "first valid marking content"), None)
+        .unwrap();
+    let second = store
+        .store_entry(entry(2, "user::mark", "second valid marking content"), None)
+        .unwrap();
+    let replacement = store
+        .store_entry(entry(3, "user::mark", "replacement valid content"), None)
+        .unwrap();
+
+    assert_eq!(
+        store
+            .mark_superseded(&[first.id, second.id, Uuid::from_u128(98)], replacement.id)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store.get_entry_by_id(first.id).unwrap().unwrap().superseded_by,
+        Some(replacement.id)
+    );
+    assert_eq!(
+        store.get_entry_by_id(second.id).unwrap().unwrap().superseded_by,
+        Some(replacement.id)
+    );
+    assert_eq!(
+        store.get_entry_by_id(replacement.id).unwrap().unwrap().superseded_by,
+        None
+    );
+
+    // Re-marking is a no-op for already-superseded rows and never self-supersedes.
+    assert_eq!(store.mark_superseded(&[first.id], replacement.id).unwrap(), 0);
+    assert_eq!(
+        store.mark_superseded(&[replacement.id], replacement.id).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn find_duplicate_ignores_superseded_rows() {
+    let store = in_memory_store();
+    let original = store
+        .store_entry(entry(1, "user::dup", "duplicate phrasing target"), None)
+        .unwrap();
+    let replacement = store
+        .store_entry(entry(2, "user::dup", "replacement phrasing target"), None)
+        .unwrap();
+    assert_eq!(
+        store
+            .find_duplicate("user::dup", "duplicate phrasing target")
+            .unwrap(),
+        Some(original.clone())
+    );
+    store.mark_superseded(&[original.id], replacement.id).unwrap();
+    assert_eq!(
+        store.find_duplicate("user::dup", "duplicate phrasing target").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn search_returns_relevant_results_across_namespaces() {
+    let store = in_memory_store();
+    store
+        .store_entry(entry(1, "user::one", "kubernetes deployment preference"), None)
+        .unwrap();
+    store
+        .store_entry(entry(2, "user::two", "kubernetes debugging fact"), None)
+        .unwrap();
+    store
+        .store_entry(entry(3, "user::one", "unrelated cooking note"), None)
+        .unwrap();
+
+    let page = store
+        .search_entries("kubernetes", None, None, false, MAX_LIST_LIMIT, 0)
+        .unwrap();
+    assert_eq!(page.total_count, 2);
+    assert_eq!(page.entries.len(), 2);
+    let namespaces: BTreeSet<&str> = page
+        .entries
+        .iter()
+        .map(|entry| entry.namespace.as_str())
+        .collect();
+    assert!(namespaces.contains("user::one"));
+    assert!(namespaces.contains("user::two"));
+    assert!(page
+        .entries
+        .iter()
+        .all(|entry| entry.content.contains("kubernetes")));
+
+    let miss = store
+        .search_entries("nonexistent-term", None, None, false, MAX_LIST_LIMIT, 0)
+        .unwrap();
+    assert_eq!(miss.total_count, 0);
+    assert!(miss.entries.is_empty());
+}
+
+#[test]
+fn search_applies_namespace_type_and_supersession_filters() {
+    let store = in_memory_store();
+    let mut preference = entry(1, "user::one", "terraform preference content");
+    preference.memory_type = MemoryType::Preference;
+    let fact = entry(2, "user::one", "terraform fact content");
+    let other = entry(3, "user::two", "terraform other content");
+    store.store_entry(preference, None).unwrap();
+    store.store_entry(fact.clone(), None).unwrap();
+    store.store_entry(other, None).unwrap();
+
+    let by_namespace = store
+        .search_entries("terraform", Some("user::one"), None, false, MAX_LIST_LIMIT, 0)
+        .unwrap();
+    assert_eq!(by_namespace.total_count, 2);
+    assert!(by_namespace
+        .entries
+        .iter()
+        .all(|entry| entry.namespace == "user::one"));
+
+    let by_type = store
+        .search_entries("terraform", Some("user::one"), Some("fact"), false, MAX_LIST_LIMIT, 0)
+        .unwrap();
+    assert_eq!(by_type.total_count, 1);
+    assert_eq!(by_type.entries[0].id, fact.id);
+    assert_eq!(by_type.entries[0].memory_type, MemoryType::Fact);
+
+    let replacement = store
+        .store_entry(entry(4, "user::one", "terraform replacement content"), None)
+        .unwrap();
+    store.mark_superseded(&[fact.id], replacement.id).unwrap();
+    let excluding = store
+        .search_entries("terraform", Some("user::one"), None, false, MAX_LIST_LIMIT, 0)
+        .unwrap();
+    assert_eq!(excluding.total_count, 2);
+    assert!(excluding.entries.iter().all(|entry| entry.superseded_by.is_none()));
+    assert!(!excluding.entries.iter().any(|entry| entry.id == fact.id));
+    let including = store
+        .search_entries("terraform", Some("user::one"), None, true, MAX_LIST_LIMIT, 0)
+        .unwrap();
+    assert_eq!(including.total_count, 3);
+    let superseded = including
+        .entries
+        .iter()
+        .find(|entry| entry.id == fact.id)
+        .expect("superseded entry must be included when requested");
+    assert_eq!(superseded.superseded_by, Some(replacement.id));
+
+    assert!(store
+        .search_entries("terraform", Some("user::one"), Some("bogus"), false, MAX_LIST_LIMIT, 0)
+        .is_err());
+}
+
+#[test]
+fn search_empty_query_falls_back_to_filtered_listing() {
+    let store = in_memory_store();
+    for id in 1..=3 {
+        store
+            .store_entry(entry(id, "user::one", &format!("fallback content {id}")), None)
+            .unwrap();
+    }
+    store
+        .store_entry(entry(4, "user::two", "fallback other content"), None)
+        .unwrap();
+
+    for empty in ["", "   ", "\t"] {
+        let page = store
+            .search_entries(empty, None, None, false, MAX_LIST_LIMIT, 0)
+            .unwrap();
+        assert_eq!(page.total_count, 4, "query {empty:?} must not error");
+        assert_eq!(page.entries.len(), 4);
+    }
+
+    // Newest-first ordering like the list defaults.
+    let page = store
+        .search_entries("", None, None, false, MAX_LIST_LIMIT, 0)
+        .unwrap();
+    let created: Vec<i64> = page.entries.iter().map(|entry| entry.created_at.timestamp()).collect();
+    let mut sorted = created.clone();
+    sorted.sort_by(|left, right| right.cmp(left));
+    assert_eq!(created, sorted);
+
+    // Filters still apply on the fallback path.
+    let filtered = store
+        .search_entries("", Some("user::one"), Some("fact"), false, MAX_LIST_LIMIT, 0)
+        .unwrap();
+    assert_eq!(filtered.total_count, 3);
+}
+
+#[test]
+fn search_with_fts5_special_characters_never_panics() {
+    let store = in_memory_store();
+    store
+        .store_entry(entry(1, "user::one", "quoted \"ands\" and asterisks content"), None)
+        .unwrap();
+    let hostile = [
+        "\"", "AND", "OR", "*", "\"unbalanced", "a\"b", "NEAR", "NOT", "^", ":",
+        "AND OR", "\"\"\"\"", "**", "(parenthesis)",
+    ];
+    for query in hostile {
+        let result = store.search_entries(query, None, None, false, MAX_LIST_LIMIT, 0);
+        assert!(result.is_ok(), "query {query:?} must not error");
+    }
+    // A token containing embedded quotes still matches its alphanumeric core.
+    let page = store
+        .search_entries("\"ands\"", None, None, false, MAX_LIST_LIMIT, 0)
+        .unwrap();
+    assert_eq!(page.total_count, 1);
+}
+
+#[test]
+fn fts_syntax_errors_map_to_config_not_silent_fallback() {
+    // All public input is sanitized to quoted literals, so a sanitized MATCH
+    // query cannot normally produce an FTS5 syntax error; this exercises the
+    // defensive branch directly with the raw SQLite failure it guards.
+    let fts_failure = MemoryError::Store(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some("fts5: syntax error near \"OR\"".to_owned()),
+    ));
+    match map_fts_match_error(fts_failure) {
+        MemoryError::Config(message) => assert!(message.contains("FTS5")),
+        other => panic!("expected Config, got {other:?}"),
+    }
+    let unterminated = MemoryError::Store(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some("unterminated string".to_owned()),
+    ));
+    assert!(matches!(map_fts_match_error(unterminated), MemoryError::Config(_)));
+    // Unrelated SQLite failures pass through unchanged.
+    let unrelated = MemoryError::Store(rusqlite::Error::QueryReturnedNoRows);
+    assert!(matches!(
+        map_fts_match_error(unrelated),
+        MemoryError::Store(rusqlite::Error::QueryReturnedNoRows)
+    ));
+    // The sanitizer itself keeps quoting every token.
+    assert_eq!(
+        fts_query_from_user_text("a\"b AND *c*"),
+        Some("\"a\"\"b\" OR \"AND\" OR \"c\"".to_owned())
+    );
+}
+
+#[test]
+fn search_paginates_and_caps_limit() {
+    let store = in_memory_store();
+    for id in 1..=5 {
+        store
+            .store_entry(entry(id, "user::page", &format!("paginated target content {id}")), None)
+            .unwrap();
+    }
+
+    let first = store
+        .search_entries("paginated", None, None, false, 2, 0)
+        .unwrap();
+    assert_eq!(first.limit, 2);
+    assert_eq!(first.offset, 0);
+    assert_eq!(first.entries.len(), 2);
+    assert_eq!(first.total_count, 5);
+
+    let second = store
+        .search_entries("paginated", None, None, false, 2, 2)
+        .unwrap();
+    assert_eq!(second.entries.len(), 2);
+    assert!(second.offset == 2);
+
+    let third = store
+        .search_entries("paginated", None, None, false, 2, 4)
+        .unwrap();
+    assert_eq!(third.entries.len(), 1);
+
+    let ids: BTreeSet<Uuid> = first
+        .entries
+        .iter()
+        .chain(&second.entries)
+        .chain(&third.entries)
+        .map(|entry| entry.id)
+        .collect();
+    assert_eq!(ids.len(), 5);
+
+    let capped = store
+        .search_entries("paginated", None, None, false, MAX_LIST_LIMIT + 100, 0)
+        .unwrap();
+    assert_eq!(capped.limit, MAX_LIST_LIMIT);
+}
+
+#[test]
+fn export_all_returns_every_entry_with_annotations() {
+    let store = in_memory_store();
+    let first = store
+        .store_entry(entry(2, "user::beta", "beta export content"), None)
+        .unwrap();
+    let second = store
+        .store_entry(entry(3, "user::alpha", "alpha export content"), None)
+        .unwrap();
+    store
+        .store_entry(entry(1, "user::beta", "beta superseded content"), None)
+        .unwrap();
+    store.mark_superseded(&[first.id], second.id).unwrap();
+
+    let exported = store.export_all().unwrap();
+    assert_eq!(exported.len(), 3);
+    // Deterministic: namespace ascending, then created_at ascending.
+    assert_eq!(exported[0].namespace, "user::alpha");
+    assert_eq!(exported[1].namespace, "user::beta");
+    assert_eq!(exported[2].namespace, "user::beta");
+    assert!(exported[1].created_at <= exported[2].created_at);
+    let superseded = exported
+        .iter()
+        .find(|entry| entry.id == first.id)
+        .expect("superseded entry must be exported");
+    assert_eq!(superseded.superseded_by, Some(second.id));
+    assert_eq!(superseded.updated_at, None);
+    assert!(exported
+        .iter()
+        .all(|entry| entry.superseded_by.is_none() || entry.id == first.id));
+}
 }

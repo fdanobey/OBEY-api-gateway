@@ -2,12 +2,23 @@
 
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use chrono::{DateTime, Utc};
+
+use super::consolidation::ConsolidationCounts;
 
 const RETRIEVALS_METRIC: &str = "obey_memory_retrievals_total";
 const STORES_METRIC: &str = "obey_memory_stores_total";
 const INJECTION_TOKENS_METRIC: &str = "obey_memory_injection_tokens_total";
 const PROJECT_DETECTIONS_METRIC: &str = "obey_memory_project_detections_total";
 const DECAY_EVICTIONS_METRIC: &str = "obey_memory_decay_evictions_total";
+const CONSOLIDATION_MERGED_METRIC: &str = "obey_memory_consolidation_merged_total";
+const CONSOLIDATION_SUPERSEDED_METRIC: &str = "obey_memory_consolidation_superseded_total";
+const CONSOLIDATION_KEPT_METRIC: &str = "obey_memory_consolidation_kept_total";
+const CONSOLIDATION_SKIPPED_METRIC: &str = "obey_memory_consolidation_skipped_batches_total";
+const CONSOLIDATION_PROVIDER_ERRORS_METRIC: &str =
+    "obey_memory_consolidation_provider_errors_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NamespaceType {
@@ -53,6 +64,13 @@ impl StoreMethod {
     }
 }
 
+/// Counters and completion timestamp for the most recent consolidation pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsolidationLastPass {
+    pub counts: ConsolidationCounts,
+    pub completed_at: DateTime<Utc>,
+}
+
 /// Fixed-cardinality, infallible counters owned by one memory system.
 #[derive(Debug, Default)]
 pub struct MemoryMetrics {
@@ -61,6 +79,12 @@ pub struct MemoryMetrics {
     injection_tokens: AtomicU64,
     project_detections: [AtomicU64; 3],
     decay_evictions: AtomicU64,
+    consolidation_merged: AtomicU64,
+    consolidation_superseded: AtomicU64,
+    consolidation_kept: AtomicU64,
+    consolidation_skipped_batches: AtomicU64,
+    consolidation_provider_errors: AtomicU64,
+    last_consolidation_pass: Mutex<Option<ConsolidationLastPass>>,
 }
 
 impl MemoryMetrics {
@@ -86,6 +110,35 @@ impl MemoryMetrics {
 
     pub(crate) fn record_decay_evictions(&self, count: u64) {
         saturating_add(&self.decay_evictions, count);
+    }
+
+    /// Merge one consolidation pass into the counters and last-pass summary.
+    pub(crate) fn record_consolidation_pass(&self, counts: ConsolidationCounts) {
+        saturating_add(&self.consolidation_merged, u64::from(counts.merged));
+        saturating_add(
+            &self.consolidation_superseded,
+            u64::from(counts.superseded),
+        );
+        saturating_add(&self.consolidation_kept, u64::from(counts.kept));
+        saturating_add(
+            &self.consolidation_skipped_batches,
+            u64::from(counts.skipped_batches),
+        );
+        saturating_add(
+            &self.consolidation_provider_errors,
+            u64::from(counts.provider_errors),
+        );
+        if let Ok(mut last) = self.last_consolidation_pass.lock() {
+            *last = Some(ConsolidationLastPass {
+                counts,
+                completed_at: Utc::now(),
+            });
+        }
+    }
+
+    /// Snapshot of the most recent consolidation pass, if one completed.
+    pub fn last_consolidation_pass(&self) -> Option<ConsolidationLastPass> {
+        self.last_consolidation_pass.lock().ok().and_then(|guard| *guard)
     }
 
     /// Gather this memory system's complete Prometheus text exposition.
@@ -150,6 +203,56 @@ impl MemoryMetrics {
         );
         output.push_str("# TYPE obey_memory_decay_evictions_total counter\n");
         write_counter(output, DECAY_EVICTIONS_METRIC, load(&self.decay_evictions));
+
+        output.push_str(
+            "# HELP obey_memory_consolidation_merged_total Memories merged by consolidation passes\n",
+        );
+        output.push_str("# TYPE obey_memory_consolidation_merged_total counter\n");
+        write_counter(
+            output,
+            CONSOLIDATION_MERGED_METRIC,
+            load(&self.consolidation_merged),
+        );
+
+        output.push_str(
+            "# HELP obey_memory_consolidation_superseded_total Memories superseded by consolidation passes\n",
+        );
+        output.push_str("# TYPE obey_memory_consolidation_superseded_total counter\n");
+        write_counter(
+            output,
+            CONSOLIDATION_SUPERSEDED_METRIC,
+            load(&self.consolidation_superseded),
+        );
+
+        output.push_str(
+            "# HELP obey_memory_consolidation_kept_total Memories left untouched by consolidation passes\n",
+        );
+        output.push_str("# TYPE obey_memory_consolidation_kept_total counter\n");
+        write_counter(
+            output,
+            CONSOLIDATION_KEPT_METRIC,
+            load(&self.consolidation_kept),
+        );
+
+        output.push_str(
+            "# HELP obey_memory_consolidation_skipped_batches_total Batches skipped by consolidation passes\n",
+        );
+        output.push_str("# TYPE obey_memory_consolidation_skipped_batches_total counter\n");
+        write_counter(
+            output,
+            CONSOLIDATION_SKIPPED_METRIC,
+            load(&self.consolidation_skipped_batches),
+        );
+
+        output.push_str(
+            "# HELP obey_memory_consolidation_provider_errors_total Provider failures during consolidation passes\n",
+        );
+        output.push_str("# TYPE obey_memory_consolidation_provider_errors_total counter\n");
+        write_counter(
+            output,
+            CONSOLIDATION_PROVIDER_ERRORS_METRIC,
+            load(&self.consolidation_provider_errors),
+        );
     }
 }
 
@@ -223,27 +326,73 @@ mod tests {
         metrics.record_project_detection(NamespaceType::Project);
         metrics.record_project_detection(NamespaceType::Agent);
         metrics.record_project_detection(NamespaceType::User);
-        metrics.record_decay_evictions(5);
+    metrics.record_decay_evictions(5);
 
-        let output = metrics.gather();
+    let output = metrics.gather();
 
-        assert!(output.contains("obey_memory_retrievals_total{namespace_type=\"project\"} 2\n"));
-        assert!(output.contains("obey_memory_retrievals_total{namespace_type=\"agent\"} 3\n"));
-        assert!(output.contains("obey_memory_retrievals_total{namespace_type=\"user\"} 4\n"));
-        assert!(output.contains("obey_memory_stores_total{extraction_method=\"explicit\"} 1\n"));
-        assert!(output.contains("obey_memory_stores_total{extraction_method=\"async_llm\"} 1\n"));
-        assert!(output.contains("obey_memory_stores_total{extraction_method=\"heuristic\"} 1\n"));
-        assert!(output.contains("obey_memory_injection_tokens_total 17\n"));
-        assert!(
-            output.contains("obey_memory_project_detections_total{context_type=\"project\"} 1\n")
-        );
-        assert!(output.contains("obey_memory_project_detections_total{context_type=\"agent\"} 1\n"));
-        assert!(output.contains("obey_memory_project_detections_total{context_type=\"user\"} 1\n"));
-        assert!(output.contains("obey_memory_decay_evictions_total 5\n"));
-        assert_eq!(output.matches("namespace_type=").count(), 3);
-        assert_eq!(output.matches("extraction_method=").count(), 3);
-        assert_eq!(output.matches("context_type=").count(), 3);
-    }
+    assert!(output.contains("obey_memory_retrievals_total{namespace_type=\"project\"} 2\n"));
+    assert!(output.contains("obey_memory_retrievals_total{namespace_type=\"agent\"} 3\n"));
+    assert!(output.contains("obey_memory_retrievals_total{namespace_type=\"user\"} 4\n"));
+    assert!(output.contains("obey_memory_stores_total{extraction_method=\"explicit\"} 1\n"));
+    assert!(output.contains("obey_memory_stores_total{extraction_method=\"async_llm\"} 1\n"));
+    assert!(output.contains("obey_memory_stores_total{extraction_method=\"heuristic\"} 1\n"));
+    assert!(output.contains("obey_memory_injection_tokens_total 17\n"));
+    assert!(
+        output.contains("obey_memory_project_detections_total{context_type=\"project\"} 1\n")
+    );
+    assert!(output.contains("obey_memory_project_detections_total{context_type=\"agent\"} 1\n"));
+    assert!(output.contains("obey_memory_project_detections_total{context_type=\"user\"} 1\n"));
+    assert!(output.contains("obey_memory_decay_evictions_total 5\n"));
+    assert_eq!(output.matches("namespace_type=").count(), 3);
+    assert_eq!(output.matches("extraction_method=").count(), 3);
+    assert_eq!(output.matches("context_type=").count(), 3);
+}
+
+#[test]
+fn consolidation_passes_accumulate_counters_and_last_pass_summary() {
+    let metrics = MemoryMetrics::new();
+    metrics.record_consolidation_pass(ConsolidationCounts {
+        merged: 2,
+        superseded: 3,
+        kept: 5,
+        skipped_batches: 1,
+        provider_errors: 0,
+    });
+    metrics.record_consolidation_pass(ConsolidationCounts {
+        merged: 1,
+        superseded: 2,
+        kept: 7,
+        skipped_batches: 0,
+        provider_errors: 4,
+    });
+
+    let output = metrics.gather();
+    assert!(output.contains("obey_memory_consolidation_merged_total 3\n"));
+    assert!(output.contains("obey_memory_consolidation_superseded_total 5\n"));
+    assert!(output.contains("obey_memory_consolidation_kept_total 12\n"));
+    assert!(output.contains("obey_memory_consolidation_skipped_batches_total 1\n"));
+    assert!(output.contains("obey_memory_consolidation_provider_errors_total 4\n"));
+
+    let last = metrics.last_consolidation_pass().unwrap();
+    assert_eq!(
+        last.counts,
+        ConsolidationCounts {
+            merged: 1,
+            superseded: 2,
+            kept: 7,
+            skipped_batches: 0,
+            provider_errors: 4,
+        }
+    );
+    assert!(last.completed_at <= Utc::now());
+    assert!(metrics.last_consolidation_pass().is_some());
+}
+
+#[test]
+fn last_consolidation_pass_is_none_before_any_pass() {
+    let metrics = MemoryMetrics::new();
+    assert!(metrics.last_consolidation_pass().is_none());
+}
 
     #[test]
     fn exposition_never_contains_raw_namespaces() {
