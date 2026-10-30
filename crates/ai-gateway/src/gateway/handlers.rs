@@ -2902,6 +2902,12 @@ async fn chat_completions_stream(
         if let Some(tick) = heartbeat_tick.as_mut() {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         }
+        // Placeholder-reasoning-blob, Req 1/3: when enabled, heartbeat
+        // chunks carry a rotating placeholder `delta.reasoning` phase line
+        // until the first real relay frame arrives; then placeholder mode
+        // stops permanently (the real reasoning deltas take over).
+        let placeholder_reasoning = streaming_config_relay.placeholder_reasoning;
+        let mut heartbeat_step: u32 = 0;
         let routing_result = loop {
             let step = tokio::select! {
                 frame = relay_rx.recv(), if relay_open => match frame {
@@ -2937,11 +2943,25 @@ async fn chat_completions_stream(
             };
             match step {
                 RelayStep::Heartbeat => {
-                    // Req 1/2: empty-delta data event resets data-aware
-                    // client chunk timers; idempotent for reassembly.
-                    yield Ok::<_, Infallible>(Event::default().data(
-                        heartbeat_chunk(&response_id, created, &requested_model).to_string(),
-                    ));
+                    // Req 1/2: data event resets data-aware client chunk
+                    // timers; empty delta is idempotent for reassembly.
+                    // With placeholder_reasoning on and no real frame seen
+                    // yet, carry a placeholder reasoning phase line instead
+                    // (placeholder-reasoning-blob Req 1) for clients that
+                    // only count reasoning/content deltas as progress.
+                    let chunk = if placeholder_reasoning && relay_handle.forwarded() == 0 {
+                        let c = heartbeat_chunk_placeholder_reasoning(
+                            &response_id,
+                            created,
+                            &requested_model,
+                            heartbeat_step,
+                        );
+                        heartbeat_step = heartbeat_step.wrapping_add(1);
+                        c
+                    } else {
+                        heartbeat_chunk(&response_id, created, &requested_model)
+                    };
+                    yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
                 }
                 RelayStep::Frame(RelayFrame::Reasoning { text }) => {
         // Extra `data:` event between keep-alives: same
@@ -3657,7 +3677,10 @@ async fn chat_completions_stream(
         if let Some(tick) = heartbeat_tick.as_mut() {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         }
-        let first_step = loop {
+// Placeholder-reasoning-blob, Req 1/3 (see site 1 comment).
+let placeholder_reasoning = streaming_config_relay.placeholder_reasoning;
+let heartbeat_step: u32 = 0;
+let first_step = loop {
             tokio::select! {
                 frame = relay_rx.recv(), if relay_open => match frame {
                     Some(frame) => break RelayStep::Frame(frame),
@@ -3717,6 +3740,7 @@ async fn chat_completions_stream(
         // replayed through the same match arms. The heartbeat ticker is
         // captured from the handler scope so both loops share one cadence.
         let mut heartbeat_tick = heartbeat_tick;
+        let mut heartbeat_step = heartbeat_step;
         let mut first = Some(first_step);
         let routing_result = loop {
             let step = match first.take() {
@@ -3755,17 +3779,29 @@ async fn chat_completions_stream(
             };
             match step {
                 RelayStep::Heartbeat => {
-                    // Req 1/2: empty-delta data event resets data-aware
-                    // client chunk timers; idempotent for reassembly.
-                    yield Ok::<_, Infallible>(Event::default().data(
-                        heartbeat_chunk(&response_id, created, &requested_model).to_string(),
-                    ));
+                    // Req 1/2: data event resets data-aware client chunk
+                    // timers; with placeholder_reasoning on and no real
+                    // frame relayed yet, carry a placeholder reasoning
+                    // phase line (placeholder-reasoning-blob Req 1).
+                    let chunk = if placeholder_reasoning && !relayed_any {
+                        let c = heartbeat_chunk_placeholder_reasoning(
+                            &response_id,
+                            created,
+                            &requested_model,
+                            heartbeat_step,
+                        );
+                        heartbeat_step = heartbeat_step.wrapping_add(1);
+                        c
+                    } else {
+                        heartbeat_chunk(&response_id, created, &requested_model)
+                    };
+                    yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
                 }
                 RelayStep::Frame(RelayFrame::Reasoning { text }) => {
-        // Req 2.5: no early role event was sent, so the
-        // first relayed frame carries the role marker
-        // exactly once; later frames omit it.
-        let chunk = if !relayed_any {
+                    // Req 2.5: no early role event was sent, so the
+                    // first relayed frame carries the role marker
+                    // exactly once; later frames omit it.
+                    let chunk = if !relayed_any {
         relayed_any = true;
         reasoning_relay_chunk_with_role(
         &response_id,
@@ -4924,34 +4960,49 @@ async fn stream_buffered_with_post_call(
                 let mut relay_carry: Vec<u8> = Vec::new();
                 let mut bytes = byte_stream.bytes_stream();
                 let mut too_large = false;
-                // Timestamp of the last data-carrying heartbeat on this loop.
-                let mut last_heartbeat: Option<std::time::Instant> = None;
-                // Data-carrying heartbeat cadence (Req 3): 0 disables; the
-                // comment keep-alive below still fires every keepalive_interval.
-                let heartbeat_every = if streaming_config.heartbeat_interval_seconds > 0 {
-                    Some(std::time::Duration::from_secs(
-                        streaming_config.heartbeat_interval_seconds,
-                    ))
-                } else {
-                    None
-                };
-                loop {
-                    match tokio::time::timeout(keepalive_interval, bytes.next()).await {
-                        // Idle gap while buffering: keep the client alive (Req 10.2)
-                        // with BOTH the comment keep-alive and — when enabled — a
-                        // data-carrying heartbeat chunk so chunk timers that only
-                        // observe `data:` events (e.g. Kilo's) also reset.
-                        Err(_elapsed) => {
-                            yield Ok(Event::default().comment("keepalive"));
-                            if let Some(every) = heartbeat_every {
-                                if last_heartbeat.map(|t: std::time::Instant| t.elapsed() >= every).unwrap_or(true) {
-                                    last_heartbeat = Some(std::time::Instant::now());
-                                    yield Ok(Event::default().data(
-                                        heartbeat_chunk(&response_id, created, &requested_model).to_string(),
-                                    ));
+                    // Timestamp of the last data-carrying heartbeat on this loop.
+                    let mut last_heartbeat: Option<std::time::Instant> = None;
+                    // Data-carrying heartbeat cadence (Req 3): 0 disables; the
+                    // comment keep-alive below still fires every keepalive_interval.
+                    let heartbeat_every = if streaming_config.heartbeat_interval_seconds > 0 {
+                        Some(std::time::Duration::from_secs(
+                            streaming_config.heartbeat_interval_seconds,
+                        ))
+                    } else {
+                        None
+                    };
+                    // Placeholder-reasoning-blob, Req 1/3 (see site 1 comment):
+                    // placeholder reasoning rides heartbeats only until the
+                    // first real relay frame was forwarded on this loop.
+                    let placeholder_reasoning = streaming_config.placeholder_reasoning;
+                    let mut heartbeat_step: u32 = 0;
+                    loop {
+                        match tokio::time::timeout(keepalive_interval, bytes.next()).await {
+                            // Idle gap while buffering: keep the client alive (Req 10.2)
+                            // with BOTH the comment keep-alive and — when enabled — a
+                            // data-carrying heartbeat chunk so chunk timers that only
+                            // observe `data:` events (e.g. Kilo's) also reset.
+                            Err(_elapsed) => {
+                                yield Ok(Event::default().comment("keepalive"));
+                                if let Some(every) = heartbeat_every {
+                                    if last_heartbeat.map(|t: std::time::Instant| t.elapsed() >= every).unwrap_or(true) {
+                                        last_heartbeat = Some(std::time::Instant::now());
+                                        let chunk = if placeholder_reasoning && !relayed_any {
+                                            let c = heartbeat_chunk_placeholder_reasoning(
+                                                &response_id,
+                                                created,
+                                                &requested_model,
+                                                heartbeat_step,
+                                            );
+                                            heartbeat_step = heartbeat_step.wrapping_add(1);
+                                            c
+                                        } else {
+                                            heartbeat_chunk(&response_id, created, &requested_model)
+                                        };
+                                        yield Ok(Event::default().data(chunk.to_string()));
+                                    }
                                 }
                             }
-                        }
                     // Upstream stream ended.
                     Ok(None) => break,
                     Ok(Some(Ok(b))) => {
@@ -5487,6 +5538,52 @@ fn heartbeat_chunk(id: &str, created: i64, model: &str) -> serde_json::Value {
             "finish_reason": null
         }]
     })
+}
+
+/// Placeholder reasoning phase indicator (placeholder-reasoning-blob, Req 1):
+/// shown while the model produces nothing at all — long prefill on
+/// near-context-limit payloads, or providers that only start emitting
+/// reasoning/content after the whole prompt is processed. Rotating through
+/// these gives reasoning-aware clients visible, non-repeating progress text
+/// without inventing model output. The deltas are additive and only ever
+/// appear while NO real reasoning/content has been relayed; the first real
+/// upstream frame permanently stops the placeholder stream, and the final
+/// replay is unchanged.
+fn placeholder_reasoning_text(step: u32) -> &'static str {
+    const PHASES: [&str; 5] = [
+        "Processing the request context",
+        "Reading the provided context",
+        "Analyzing the input",
+        "Considering how to respond",
+        "Preparing the response",
+    ];
+    PHASES[(step as usize) % PHASES.len()]
+}
+
+/// Build a heartbeat variant carrying a placeholder reasoning delta
+/// (placeholder-reasoning-blob, Req 1/2): same envelope as
+/// [`heartbeat_chunk`], but `delta.reasoning` carries one placeholder phase
+/// line. Clients whose progress heuristics only count reasoning/content
+/// deltas (not empty deltas) observe continuous progress during otherwise
+/// silent dispatch. `step` rotates the phase text so consecutive chunks
+/// differ (some clients de-duplicate identical deltas).
+fn heartbeat_chunk_placeholder_reasoning(
+    id: &str,
+    created: i64,
+    model: &str,
+    step: u32,
+) -> serde_json::Value {
+    let mut chunk = heartbeat_chunk(id, created, model);
+    if let Some(delta) = chunk["choices"][0]["delta"].as_object_mut() {
+        delta.insert(
+            "reasoning".to_string(),
+            serde_json::json!(format!(
+                "{}…\n",
+                placeholder_reasoning_text(step)
+            )),
+        );
+    }
+    chunk
 }
 
 /// Build a graceful SSE error termination: an `error` data event followed by
@@ -6058,10 +6155,16 @@ fn relay_passthrough_stream(
         // Stable synthetic envelope for heartbeats on this relay: distinct
         // from the provider's own ids, `chatcmpl-` shaped like every other
         // chunk so generic clients parse it without special-casing.
-        let heartbeat_id = format!("chatcmpl-hb-{}", uuid::Uuid::new_v4());
-        let heartbeat_created = chrono::Utc::now().timestamp();
-        let heartbeat_model = request.model.clone();
-        let mut last_forward_activity = tokio::time::Instant::now();
+    let heartbeat_id = format!("chatcmpl-hb-{}", uuid::Uuid::new_v4());
+    let heartbeat_created = chrono::Utc::now().timestamp();
+    let heartbeat_model = request.model.clone();
+    let mut last_forward_activity = tokio::time::Instant::now();
+    // Placeholder-reasoning-blob, Req 1/3 (see site 1 comment): on this
+    // relay the placeholder rides heartbeats while upstream is silent
+    // pre-content; the wait-loop gate (`content_forwarded || none`)
+    // already stops all heartbeats once real deltas flow.
+    let placeholder_reasoning = streaming_config.placeholder_reasoning;
+    let mut heartbeat_step: u32 = 0;
     let (
     upstream_version,
     upstream_content_encoding,
@@ -6145,10 +6248,19 @@ fn relay_passthrough_stream(
                         // spanned the cadence since the last activity.
                         if last_forward_activity.elapsed() >= cadence {
                             last_forward_activity = tokio::time::Instant::now();
-                            yield Ok(Event::default().data(
+                            let chunk = if placeholder_reasoning {
+                                let c = heartbeat_chunk_placeholder_reasoning(
+                                    &heartbeat_id,
+                                    heartbeat_created,
+                                    &heartbeat_model,
+                                    heartbeat_step,
+                                );
+                                heartbeat_step = heartbeat_step.wrapping_add(1);
+                                c
+                            } else {
                                 heartbeat_chunk(&heartbeat_id, heartbeat_created, &heartbeat_model)
-                                    .to_string(),
-                            ));
+                            };
+                            yield Ok(Event::default().data(chunk.to_string()));
                         }
                     }
                 }
@@ -8170,7 +8282,7 @@ mod tests {
         build_keepalive, cache_allowed_for_validation, chunk_carries_answer, chunk_carries_content,
         classify_relay_line, classify_stream_error, collect_structured_output_failure,
         eager_sse_response, early_event_chunk, emit_sse_error_event, force_eager_structured_stream,
-    heartbeat_chunk, is_tool_call_turn, is_transient_stream_truncation, json_model,
+            heartbeat_chunk, heartbeat_chunk_placeholder_reasoning, is_tool_call_turn, is_transient_stream_truncation, json_model,
     memory_feedback_chunk, memory_mode, multipart_model, openai_json_response,
     prepare_response_for_client,
         provider_pass_through_response, reasoning_relay_chunk, reasoning_relay_chunk_with_role,
@@ -9492,6 +9604,43 @@ fn pass_through_extracts_models_without_mutating_bodies() {
         );
         // Distinguishable from the early event: no role marker inside delta.
         assert!(delta.get("role").is_none());
+    }
+
+    /// Placeholder-reasoning-blob, Req 1/2: the placeholder heartbeat variant
+    /// keeps the chunk envelope, carries exactly one non-empty `reasoning`
+    /// delta (and nothing else in the delta), keeps `finish_reason` null,
+    /// and rotates its phase text so consecutive steps differ (clients that
+    /// de-duplicate identical deltas still see progress).
+    #[test]
+    fn heartbeat_chunk_placeholder_reasoning_carries_rotating_reasoning_delta() {
+        let mut seen_texts = std::collections::HashSet::new();
+        for step in 0..5 {
+            let chunk =
+                heartbeat_chunk_placeholder_reasoning("chatcmpl-hb-id", 1700, "gpt-4o", step);
+            assert_eq!(chunk["id"], "chatcmpl-hb-id");
+            assert_eq!(chunk["object"], "chat.completion.chunk");
+            assert!(chunk["choices"][0]["finish_reason"].is_null());
+            let delta = chunk["choices"][0]["delta"].as_object().unwrap();
+            assert_eq!(delta.len(), 1, "delta must carry only reasoning, got {delta:?}");
+            let text = delta.get("reasoning").and_then(|v| v.as_str()).unwrap();
+            assert!(!text.trim().is_empty(), "placeholder text must be non-empty");
+            assert!(!text.contains("tool"), "placeholder must not invent model output");
+            seen_texts.insert(text.to_string());
+        }
+        assert_eq!(
+            seen_texts.len(),
+            5,
+            "five consecutive steps must yield five distinct phase texts"
+        );
+        // Step 5 wraps back to the first phase (rotation is cyclic).
+        let wrap =
+            heartbeat_chunk_placeholder_reasoning("chatcmpl-hb-id", 1700, "gpt-4o", 5);
+        let first =
+            heartbeat_chunk_placeholder_reasoning("chatcmpl-hb-id", 1700, "gpt-4o", 0);
+        assert_eq!(
+            wrap["choices"][0]["delta"]["reasoning"],
+            first["choices"][0]["delta"]["reasoning"]
+        );
     }
 
     /// Buffered reasoning progress relay (Task 5): a relayed reasoning frame

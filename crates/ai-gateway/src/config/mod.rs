@@ -1451,6 +1451,20 @@ pub struct StreamingConfig {
     /// (comment keep-alives alone, the legacy behavior).
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_seconds: u64,
+
+    /// Carry a placeholder synthetic reasoning delta on heartbeat chunks
+    /// (placeholder-reasoning-blob). Opt-in: some clients only count
+    /// parsed reasoning/content deltas as stream progress — empty-delta
+    /// heartbeats keep the connection alive but those clients still show a
+    /// stall (and may abort) during long silent prefill (e.g. near-context-
+    /// limit payloads). When enabled, heartbeat chunks carry a rotating
+    /// placeholder `delta.reasoning` phase line ("Processing the request
+    /// context…") which those clients render as thinking progress. The
+    /// placeholder stops permanently at the first real reasoning/content
+    /// delta and the final replay is unchanged. Requires
+    /// `heartbeat_interval_seconds > 0`.
+    #[serde(default = "default_false")]
+    pub placeholder_reasoning: bool,
 }
 
 impl Default for StreamingConfig {
@@ -1464,6 +1478,7 @@ impl Default for StreamingConfig {
             retry_on_stream_truncation: true,
             relay_reasoning_progress: true,
             heartbeat_interval_seconds: default_heartbeat_interval(),
+            placeholder_reasoning: false,
         }
     }
 }
@@ -1482,6 +1497,10 @@ fn default_keepalive_interval() -> u64 {
 
 fn default_heartbeat_interval() -> u64 {
     15
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_chunk_timeout() -> u64 {
@@ -1572,6 +1591,7 @@ retry_on_truncation: false
 retry_on_stream_truncation: false
 relay_reasoning_progress: false
 heartbeat_interval_seconds: 0
+placeholder_reasoning: true
 "#;
     let cfg: StreamingConfig = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(
@@ -1585,9 +1605,10 @@ heartbeat_interval_seconds: 0
             retry_on_stream_truncation: false,
             relay_reasoning_progress: false,
             heartbeat_interval_seconds: 0,
+            placeholder_reasoning: true,
         }
     );
-    }
+}
 
     #[test]
     fn test_streaming_config_deserialize_empty_section_applies_defaults() {
@@ -1707,6 +1728,22 @@ fn test_streaming_config_heartbeat_interval_zero_round_trips() {
     assert_eq!(cfg.heartbeat_interval_seconds, 0);
     let serialized = serde_yaml::to_string(&cfg).unwrap();
     assert!(serialized.contains("heartbeat_interval_seconds: 0"));
+}
+
+// Placeholder reasoning blobs: opt-in, off by default so existing configs
+// keep pure empty-delta heartbeats.
+
+#[test]
+fn test_streaming_config_placeholder_reasoning_default_is_false() {
+    assert!(!StreamingConfig::default().placeholder_reasoning);
+}
+
+#[test]
+fn test_streaming_config_placeholder_reasoning_true_round_trips() {
+    let cfg: StreamingConfig = serde_yaml::from_str("placeholder_reasoning: true").unwrap();
+    assert!(cfg.placeholder_reasoning);
+    let serialized = serde_yaml::to_string(&cfg).unwrap();
+    assert!(serialized.contains("placeholder_reasoning: true"));
 }
 
 // Context Overflow Management, Task 1.3: ContextConfig deserialization
