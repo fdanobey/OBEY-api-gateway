@@ -61,12 +61,26 @@ require deep knowledge of the routing internals.
 
 ### Pull Requests
 
-- Fork the repo and create your branch from `master`.
+- Fork the repo and create your branch from `development`.
+- Open your pull request against the `development` branch — **not** `master`.
+  `master` only receives changes through the release process (see
+  [Releases](#releases) below), so PRs targeting it will be retargeted or
+  closed.
 - Follow the [Rust styleguide](#rust-styleguide) below.
 - CI must pass: `cargo check -p ai-gateway --all-targets` with zero warnings,
   and the full test suite green.
 - Fill out [the pull request template](.github/PULL_REQUEST_TEMPLATE.md).
 - Feel free to open a draft PR early if you want feedback on the approach.
+
+## Releases
+
+`development` is the integration branch: everything lands there first, and CI
+runs on every pull request into it and every push to it. `master` tracks
+releases only. When the maintainer is ready to ship, they run the
+**Release** workflow (Actions tab → Release → Run workflow → pick
+patch/minor/major). That workflow bumps the crate version, tags, merges
+`development` into `master`, and publishes the Windows build, installer, and
+release notes automatically. Contributors never need to touch this process.
 
 ## Styleguides
 
