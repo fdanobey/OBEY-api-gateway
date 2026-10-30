@@ -1036,6 +1036,86 @@ async fn test_streaming_heartbeat_zero_disables_heartbeat_chunks() {
     assert_eq!(content, "too late", "replay reconstructs the slow mock's content");
 }
 
+/// Placeholder-reasoning-blob, Req 1 (buffered site A): with
+/// `placeholder_reasoning: true`, heartbeat chunks during silent dispatch
+/// carry a synthetic non-empty `delta.reasoning` phase line (rotating), so
+/// clients that only count reasoning/content deltas as progress stay live.
+/// The mock emits no reasoning, so every heartbeat carries the placeholder.
+#[tokio::test]
+async fn test_streaming_placeholder_reasoning_on_heartbeats_when_enabled() {
+    let mock = start_slow_streaming_mock(3).await;
+    let mut cfg = streaming_test_config(&mock.uri(), true);
+    cfg.streaming = Some(StreamingConfig {
+        heartbeat_interval_seconds: 1,
+        placeholder_reasoning: true,
+        ..cfg.streaming.unwrap()
+    });
+    let app = build_app(cfg).await;
+
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(streaming_request_body())
+        .unwrap();
+    let (status, raw) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let chunks = parse_sse_chunks(&raw);
+    let placeholder_heartbeats: Vec<&serde_json::Value> = chunks
+        .iter()
+        .filter(|c| {
+            let delta = c["choices"][0]["delta"].as_object();
+            delta.is_some_and(|d| d.len() == 1 && d.contains_key("reasoning"))
+                && c["choices"][0]["finish_reason"].is_null()
+        })
+        .collect();
+    assert!(
+        !placeholder_heartbeats.is_empty(),
+        "expected at least one placeholder-reasoning heartbeat, got:\n{}",
+        String::from_utf8_lossy(&raw)
+    );
+    for hb in &placeholder_heartbeats {
+        let text = hb["choices"][0]["delta"]["reasoning"].as_str().unwrap();
+        assert!(!text.trim().is_empty());
+    }
+    // The final replay still reconstructs the provider content unchanged.
+    let content: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(content, "too late", "replay reconstructs the slow mock's content");
+}
+
+/// Placeholder-reasoning-blob, Req 3 (default off): without the flag,
+/// heartbeats keep pure empty deltas — no synthetic reasoning leaks.
+#[tokio::test]
+async fn test_streaming_placeholder_reasoning_default_off_keeps_empty_heartbeats() {
+    let mock = start_slow_streaming_mock(2).await;
+    let mut cfg = streaming_test_config(&mock.uri(), true);
+    cfg.streaming = Some(StreamingConfig {
+        heartbeat_interval_seconds: 1,
+        ..cfg.streaming.unwrap()
+    });
+    assert!(!cfg.streaming.as_ref().unwrap().placeholder_reasoning);
+    let app = build_app(cfg).await;
+
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(streaming_request_body())
+        .unwrap();
+    let (status, raw) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let chunks = parse_sse_chunks(&raw);
+    assert!(
+        chunks.iter().all(|c| {
+            c["choices"][0]["delta"]["reasoning"].is_null()
+                || !c["choices"][0]["finish_reason"].is_null()
+        }),
+        "no placeholder reasoning expected when disabled, got:\n{}",
+        String::from_utf8_lossy(&raw)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 12. True streaming pass-through (streaming-reliability task 5.6)
 //
