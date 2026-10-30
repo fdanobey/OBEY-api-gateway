@@ -31,6 +31,51 @@ pub enum ActivePhase {
     Cascade,
 }
 
+/// One-to-two-word reason the request is momentarily busy on gateway-side work
+/// that produces no client output. Rendered under the phase badge in the
+/// dashboard's Reason column so invisible LLM calls and waits are explainable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallReason {
+    /// Pre-call guardrail scan (PII/secrets/etc.) before routing.
+    GuardrailScan,
+    /// Post-call guardrail scan on a completed provider response.
+    GuardrailReview,
+    /// Memory retrieval/injection before provider dispatch.
+    MemoryRecall,
+    /// Buffered dispatch: streaming upstream and reassembling SSE before the
+    /// first client byte.
+    Buffering,
+    /// Codex search agent loop round (web search + resubmission).
+    CodexSearch,
+    /// Tool-disclosure synthetic call resolved locally, model resubmitted.
+    ToolDisclosure,
+    /// Same-provider continuation nudge after a reasoning-only turn.
+    ReasoningNudge,
+    /// Retry backoff sleep before the next same-provider attempt.
+    RetryBackoff,
+    /// Waiting for a local provider rate-limit token (admission).
+    RateLimitWait,
+}
+
+impl StallReason {
+    /// Short human label for the dashboard.
+    #[allow(dead_code)] // public API; mirrored by STALL_REASON_LABELS in the dashboard frontend
+    pub fn label(&self) -> &'static str {
+        match self {
+            StallReason::GuardrailScan => "guardrail scan",
+            StallReason::GuardrailReview => "guardrail review",
+            StallReason::MemoryRecall => "memory recall",
+            StallReason::Buffering => "buffering",
+            StallReason::CodexSearch => "codex search",
+            StallReason::ToolDisclosure => "tool disclosure",
+            StallReason::ReasoningNudge => "reasoning nudge",
+            StallReason::RetryBackoff => "retry backoff",
+            StallReason::RateLimitWait => "rate-limit wait",
+        }
+    }
+}
+
 impl ActivePhase {
     /// Short human label for the dashboard badge.
     #[allow(dead_code)] // public API; may be used by the dashboard frontend
@@ -70,6 +115,10 @@ pub struct ActiveRequestInfo {
     #[serde(default)]
     pub attempt: usize,
     pub phase: ActivePhase,
+    /// Why the request is currently stalled on invisible gateway work, if it is.
+    /// Cleared when the work finishes so the badge reflects only live stalls.
+    #[serde(default)]
+    pub stall_reason: Option<StallReason>,
     #[serde(default)]
     pub last_error: Option<String>,
     #[serde(default)]
@@ -131,6 +180,49 @@ impl ActiveRequestHandle {
     pub fn set_phase(&self, phase: ActivePhase) {
         if let Ok(mut info) = self.0.lock() {
             info.phase = phase;
+        }
+    }
+
+    /// Mark the request as busy on gateway-side work that produces no client
+    /// output. The dashboard shows `reason.label()` under the phase badge.
+    ///
+    /// Prefer [`Self::begin_stall`], which returns an RAII scope that restores
+    /// the previous marker on exit and is exception-safe across `?`/early
+    /// returns; this raw setter exists for the few sites that intentionally
+    /// hold the marker until request completion.
+    pub fn set_stall_reason(&self, reason: StallReason) {
+        if let Ok(mut info) = self.0.lock() {
+            info.stall_reason = Some(reason);
+        }
+    }
+
+    /// Begin a scoped stall: mark the request busy on invisible gateway work
+    /// and return an RAII guard that restores the previous marker (nesting
+    /// aware) when dropped, including on `?`/early-return paths.
+    pub fn begin_stall(&self, reason: StallReason) -> StallScope {
+        let previous = self
+            .0
+            .lock()
+            .ok()
+            .map(|mut info| std::mem::replace(&mut info.stall_reason, Some(reason)))
+            .flatten();
+        StallScope {
+            handle: Some(self.clone()),
+            previous,
+        }
+    }
+
+    /// Begin a scoped stall on an optional handle (no-op when absent).
+    pub fn begin_stall_opt(
+        handle: Option<&ActiveRequestHandle>,
+        reason: StallReason,
+) -> StallScope {
+        match handle {
+            Some(handle) => handle.begin_stall(reason),
+            None => StallScope {
+                handle: None,
+                previous: None,
+            },
         }
     }
 
@@ -218,12 +310,42 @@ info.reasoning_relay = None;
 }
 }
 
-/// Clone the attached reasoning relay handle, if any.
+    /// Clone the attached reasoning relay handle, if any.
     pub fn reasoning_relay(&self) -> Option<RelayHandle> {
         self.0
             .lock()
             .ok()
             .and_then(|info| info.reasoning_relay.clone())
+    }
+}
+
+/// RAII stall scope created by [`ActiveRequestHandle::begin_stall`].
+///
+/// Dropping the scope restores the stall marker that was active before the
+/// scope began (`None` when the request was not stalled), so nested scopes
+/// (e.g. `buffering` inside a `codex search` round) unwind in LIFO order
+/// without erasing a still-active outer reason, and error paths (`?`,
+/// early returns) unwind the marker the same way as success paths.
+#[derive(Debug)]
+pub struct StallScope {
+    handle: Option<ActiveRequestHandle>,
+    previous: Option<StallReason>,
+}
+
+impl StallScope {
+    /// End this scope early, restoring the previous marker.
+    pub fn end(self) {
+        drop(self)
+    }
+}
+
+impl Drop for StallScope {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            if let Ok(mut info) = handle.0.lock() {
+                info.stall_reason = self.previous;
+            }
+        }
     }
 }
 
@@ -310,9 +432,10 @@ mod tests {
             model_group: None,
             provider: None,
             model: None,
-            attempt: 0,
-            phase: ActivePhase::Pending,
-            last_error: None,
+        attempt: 0,
+        phase: ActivePhase::Pending,
+        stall_reason: None,
+        last_error: None,
             virtual_key_id: None,
             started_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -393,20 +516,96 @@ mod tests {
         assert!(reg.is_empty());
     }
 
-    #[test]
-    fn handle_updates_propagate_to_snapshot() {
-        let reg = ActiveRequestRegistry::new();
-        let handle = reg.register(sample_info("trace-3"));
-        handle.set_group("default");
-        handle.set_target("openai", "gpt-4", ActivePhase::Primary);
-        handle.set_attempt(2);
-        handle.set_last_error("429 rate limited");
-        let snap = reg.snapshot();
-        assert_eq!(snap[0].model_group.as_deref(), Some("default"));
-        assert_eq!(snap[0].provider.as_deref(), Some("openai"));
-        assert_eq!(snap[0].attempt, 2);
-        assert_eq!(snap[0].last_error.as_deref(), Some("429 rate limited"));
+#[test]
+fn handle_updates_propagate_to_snapshot() {
+    let reg = ActiveRequestRegistry::new();
+    let handle = reg.register(sample_info("trace-3"));
+    handle.set_group("default");
+    handle.set_target("openai", "gpt-4", ActivePhase::Primary);
+    handle.set_attempt(2);
+    handle.set_last_error("429 rate limited");
+    let snap = reg.snapshot();
+    assert_eq!(snap[0].model_group.as_deref(), Some("default"));
+    assert_eq!(snap[0].provider.as_deref(), Some("openai"));
+    assert_eq!(snap[0].attempt, 2);
+    assert_eq!(snap[0].last_error.as_deref(), Some("429 rate limited"));
+}
+
+#[test]
+fn stall_reason_round_trips_and_serializes() {
+    let reg = ActiveRequestRegistry::new();
+    let handle = reg.register(sample_info("trace-stall"));
+    assert_eq!(reg.snapshot()[0].stall_reason, None);
+
+    handle.set_stall_reason(StallReason::GuardrailScan);
+    let snap = reg.snapshot();
+    assert_eq!(snap[0].stall_reason, Some(StallReason::GuardrailScan));
+    // Serialized to the dashboard under the snake_case name.
+    let json = serde_json::to_value(&snap[0]).unwrap();
+    assert_eq!(json["stall_reason"], serde_json::json!("guardrail_scan"));
+}
+
+#[test]
+fn stall_scope_restores_previous_reason_on_drop() {
+    let reg = ActiveRequestRegistry::new();
+    let handle = reg.register(sample_info("trace-scope"));
+
+    // Outer scope, held across an inner scope's full lifetime.
+    let outer = handle.begin_stall(StallReason::CodexSearch);
+    assert_eq!(reg.snapshot()[0].stall_reason, Some(StallReason::CodexSearch));
+
+    {
+        // Inner scope overwrites the marker for its duration...
+        let inner = handle.begin_stall(StallReason::Buffering);
+        assert_eq!(reg.snapshot()[0].stall_reason, Some(StallReason::Buffering));
+        // ...and restores the outer reason when it ends.
+        inner.end();
     }
+    assert_eq!(reg.snapshot()[0].stall_reason, Some(StallReason::CodexSearch));
+
+    // Dropping the outer scope clears back to the pre-stall state.
+    drop(outer);
+    assert_eq!(reg.snapshot()[0].stall_reason, None);
+}
+
+#[test]
+fn stall_scope_nests_same_reason_without_losing_outer() {
+    let reg = ActiveRequestRegistry::new();
+    let handle = reg.register(sample_info("trace-nest"));
+
+    let outer = handle.begin_stall(StallReason::GuardrailScan);
+    let inner = handle.begin_stall(StallReason::GuardrailScan);
+    inner.end();
+    // Same-reason nesting still keeps the outer marker set.
+    assert_eq!(reg.snapshot()[0].stall_reason, Some(StallReason::GuardrailScan));
+    drop(outer);
+    assert_eq!(reg.snapshot()[0].stall_reason, None);
+}
+
+#[test]
+fn begin_stall_opt_handles_missing_handle() {
+    let scope = ActiveRequestHandle::begin_stall_opt(None, StallReason::Buffering);
+    // No handle: a no-op scope that drops cleanly.
+    scope.end();
+}
+
+#[test]
+fn stall_reason_labels_are_short() {
+    // The dashboard constraint: one or two words.
+    for reason in [
+        StallReason::GuardrailScan,
+        StallReason::GuardrailReview,
+        StallReason::MemoryRecall,
+        StallReason::Buffering,
+        StallReason::CodexSearch,
+        StallReason::ToolDisclosure,
+        StallReason::ReasoningNudge,
+        StallReason::RetryBackoff,
+        StallReason::RateLimitWait,
+    ] {
+        assert!(reason.label().split_whitespace().count() <= 2);
+    }
+}
 
     #[test]
     fn sweep_stale_removes_only_expired() {
