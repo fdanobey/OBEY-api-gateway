@@ -4513,12 +4513,20 @@ impl Router {
             router: self,
             provider_name: provider_model.provider.as_str(),
             provider_model,
-            active,
+            active: active.clone(),
             base_attempt,
         };
+        // The search loop runs extra upstream rounds the client never sees;
+        // mark the request so the dashboard can say why it is busy. The RAII
+        // scope restores the previous marker on any exit, including `?`.
+        let _search_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+            active.as_ref(),
+            crate::active_requests::StallReason::CodexSearch,
+        );
         let intercepted = interceptor
             .intercept(&resubmitter, request.clone(), response)
             .await?;
+        _search_stall.end();
         let mut final_response = intercepted.response;
 
         // Safety net. The interceptor strips its own tool calls on the way out,
@@ -4846,16 +4854,24 @@ impl Router {
                     codex_search_config.effective_base_url(),
                     codex_search_config.effective_timeout(),
                 ));
-                let interceptor = crate::codex::search::interceptor::ToolInterceptor::new(
-                    executor,
-                    codex_search_config.effective_max_iterations(),
-                    codex_search_config.effective_output_to_chat(),
-                    codex_search_budget,
-                );
-                let intercepted = interceptor
-                    .intercept(&codex_client, codex_request, result.response)
-                    .await?;
-                let mut final_response = intercepted.response;
+            let interceptor = crate::codex::search::interceptor::ToolInterceptor::new(
+                executor,
+                codex_search_config.effective_max_iterations(),
+                codex_search_config.effective_output_to_chat(),
+                codex_search_budget,
+            );
+            // Search rounds are extra upstream calls invisible to the client;
+            // surface the stall reason while the loop runs. RAII: the previous
+            // marker is restored even when `?` propagates an error.
+            let _search_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                active.as_ref(),
+                crate::active_requests::StallReason::CodexSearch,
+            );
+            let intercepted = interceptor
+                .intercept(&codex_client, codex_request, result.response)
+                .await?;
+            _search_stall.end();
+            let mut final_response = intercepted.response;
                 // Stripping the gateway's own tool calls can leave a turn with
                 // neither content nor tool calls, which clients read as a
                 // finished, empty reply and stop on.
@@ -5357,24 +5373,30 @@ impl Router {
                     }
                 }
 
-                let backoff_secs = backoff_sequence
-                    .get((attempt - 1) as usize)
-                    .copied()
-                    .unwrap_or(4);
-                let retry_delay =
-                    Self::calculate_retry_delay(backoff_secs, jitter_enabled, jitter_ratio);
-                self.metrics
-                    .record_provider_retry(provider_name, retry_delay.as_millis() as u64);
-                // Report the retry to the in-flight registry: same provider,
-                // retrying after the previous attempt's error.
-                if let Some(handle) = &active {
-                    handle.set_phase(ActivePhase::Retry);
-                    handle.set_attempt(base_attempt + attempt as usize);
-                    if let Some(err) = &last_error {
-                        handle.set_last_error(&err.to_string());
-                    }
-                }
-                tokio::time::sleep(retry_delay).await;
+        let backoff_secs = backoff_sequence
+            .get((attempt - 1) as usize)
+            .copied()
+            .unwrap_or(4);
+        let retry_delay =
+            Self::calculate_retry_delay(backoff_secs, jitter_enabled, jitter_ratio);
+        self.metrics
+            .record_provider_retry(provider_name, retry_delay.as_millis() as u64);
+        // Report the retry to the in-flight registry: same provider,
+        // retrying after the previous attempt's error. The backoff stall is
+        // RAII so the marker restores correctly on any exit path.
+        if let Some(handle) = &active {
+            handle.set_phase(ActivePhase::Retry);
+            handle.set_attempt(base_attempt + attempt as usize);
+            if let Some(err) = &last_error {
+                handle.set_last_error(&err.to_string());
+            }
+        }
+        let _backoff_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+            active.as_ref(),
+            crate::active_requests::StallReason::RetryBackoff,
+        );
+        tokio::time::sleep(retry_delay).await;
+        _backoff_stall.end();
                 debug!(
                     provider = provider_name,
                     attempt,
@@ -5450,25 +5472,35 @@ impl Router {
                         }
                     }
 
-                    // Streamed success body: read incrementally so the TTFB
-                    // deadline covers the first body chunk and an idle gap is
-                    // detected, while a generation that keeps sending bytes
-                    // runs up to the total timeout.
-                    // Otherwise (stream:false, or an error status whose body is
-                    // a small JSON envelope) read the body with the remaining
-                    // total timeout budget, exactly as before.
-                    let body_result = if stream_upstream && status.is_success() {
-                        let started = tokio::time::Instant::from_std(request_start);
-                        let limits = UpstreamBodyLimits {
-                            first_byte_deadline: started + ttfb_timeout,
-                            ttfb_secs: ttfb_timeout_secs,
-                            idle: Some(Duration::from_secs(chunk_timeout_secs)),
-                            total_deadline: started + total_timeout,
-                            total_secs: total_timeout_secs,
-                        };
-                        match read_upstream_body(response, &limits, provider_name, relay.as_ref())
-                            .await
-                        {
+            // Streamed success body: read incrementally so the TTFB
+            // deadline covers the first body chunk and an idle gap is
+            // detected, while a generation that keeps sending bytes
+            // runs up to the total timeout.
+            // Otherwise (stream:false, or an error status whose body is
+            // a small JSON envelope) read the body with the remaining
+            // total timeout budget, exactly as before.
+            let body_result = if stream_upstream && status.is_success() {
+                let started = tokio::time::Instant::from_std(request_start);
+                let limits = UpstreamBodyLimits {
+                    first_byte_deadline: started + ttfb_timeout,
+                    ttfb_secs: ttfb_timeout_secs,
+                    idle: Some(Duration::from_secs(chunk_timeout_secs)),
+                    total_deadline: started + total_timeout,
+                    total_secs: total_timeout_secs,
+                };
+                // Buffered dispatch: the upstream SSE is reassembled before
+                // any client byte is emitted, which the client experiences as
+                // a silent wait — say so on the dashboard while it runs.
+                let _buffering_stall =
+                    crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                        active.as_ref(),
+                        crate::active_requests::StallReason::Buffering,
+                    );
+                let read =
+                    read_upstream_body(response, &limits, provider_name, relay.as_ref()).await;
+                _buffering_stall.end();
+                match read
+                {
                             Ok(text) => Ok(Ok(text)),
                             Err(e) => {
                                 warn!(
@@ -7044,7 +7076,16 @@ impl Router {
             } else {
                 Duration::ZERO
             };
-            match rate_limiter.acquire_within(max_wait).await {
+            // Admission wait is invisible to the client: surface it on the
+            // in-flight registry while it runs. RAII scope: restores the
+            // previous marker whether the token is acquired or refused.
+            let _rate_limit_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                active.as_ref().filter(|_| !max_wait.is_zero()),
+                crate::active_requests::StallReason::RateLimitWait,
+            );
+            let rate_limit_outcome = rate_limiter.acquire_within(max_wait).await;
+            drop(_rate_limit_stall);
+            match rate_limit_outcome {
                 Ok(waited) if !waited.is_zero() => {
                     info!(
                         provider = %provider_model.provider,
@@ -7184,20 +7225,31 @@ impl Router {
                         let revived = if !reasoning_nudge_done
                             && Self::reasoning_states_intent(&response)
                         {
-                            reasoning_nudge_done = true;
-                            info!(
-                                provider = %provider_model.provider,
-                                model = %provider_model.model,
-                                "Reasoning-only turn announces an action; retrying same provider with a continuation nudge"
-                            );
-                            self.nudge_reasoning_continuation(
-                                &provider_model,
-                                &prepared_request,
-                                &response,
-                                active.clone(),
-                                attempt_counter,
-                            )
-                            .await
+            reasoning_nudge_done = true;
+            info!(
+                provider = %provider_model.provider,
+                model = %provider_model.model,
+                "Reasoning-only turn announces an action; retrying same provider with a continuation nudge"
+            );
+                            // The nudge resubmission is an invisible extra
+                            // LLM call; RAII so `?`-style exits inside the
+                            // nudge restore the previous marker.
+                            let _nudge_stall =
+                                crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                                    active.as_ref(),
+                                    crate::active_requests::StallReason::ReasoningNudge,
+                                );
+                            let nudged = self
+                                .nudge_reasoning_continuation(
+                                    &provider_model,
+                                    &prepared_request,
+                                    &response,
+                                    active.clone(),
+                                    attempt_counter,
+                                )
+                                .await;
+                            drop(_nudge_stall);
+                            nudged
                         } else {
                             None
                         }
@@ -13935,20 +13987,21 @@ mod tests {
                 model_group: None,
                 provider: None,
                 model: None,
-                attempt: 0,
-                phase: ActivePhase::Pending,
-                last_error: None,
-                virtual_key_id: None,
-                started_at_ms: 0,
-                kind: crate::active_requests::RequestKind::Chat,
-                smart_routing_logged: false,
-                failed_attempts: Vec::new(),
-                outcome_logged: false,
-                breaker_skips_recorded: false,
-                reasoning_relay: None,
-            },
-        )
-    }
+            attempt: 0,
+            phase: ActivePhase::Pending,
+            stall_reason: None,
+            last_error: None,
+            virtual_key_id: None,
+            started_at_ms: 0,
+            kind: crate::active_requests::RequestKind::Chat,
+            smart_routing_logged: false,
+            failed_attempts: Vec::new(),
+            outcome_logged: false,
+            breaker_skips_recorded: false,
+            reasoning_relay: None,
+        },
+    )
+}
 
     #[tokio::test]
     async fn ttfb_timeout_attempt_records_duration_and_error_class() {
@@ -15418,18 +15471,19 @@ extra: Default::default(),
             model_group: None,
             provider: None,
             model: None,
-            attempt: 0,
-            phase: ActivePhase::Pending,
-            last_error: None,
-            virtual_key_id: None,
-            started_at_ms: 0,
-            kind: crate::active_requests::RequestKind::Chat,
-            smart_routing_logged: false,
-            failed_attempts: Vec::new(),
-            outcome_logged: false,
-            breaker_skips_recorded: false,
-            reasoning_relay: None,
-        })));
+        attempt: 0,
+        phase: ActivePhase::Pending,
+        stall_reason: None,
+        last_error: None,
+        virtual_key_id: None,
+        started_at_ms: 0,
+        kind: crate::active_requests::RequestKind::Chat,
+        smart_routing_logged: false,
+        failed_attempts: Vec::new(),
+        outcome_logged: false,
+        breaker_skips_recorded: false,
+        reasoning_relay: None,
+    })));
         let result = router
             .route_request(&compression_request(false), Some(handle.clone()))
             .await;
@@ -16053,12 +16107,13 @@ extra: Default::default(),
                 model_group: None,
                 provider: None,
                 model: None,
-                attempt: 0,
-                phase: ActivePhase::Pending,
-                last_error: None,
-                virtual_key_id: None,
-                started_at_ms: 0,
-                kind: crate::active_requests::RequestKind::Stream,
+            attempt: 0,
+            phase: ActivePhase::Pending,
+            stall_reason: None,
+            last_error: None,
+            virtual_key_id: None,
+            started_at_ms: 0,
+            kind: crate::active_requests::RequestKind::Stream,
                 smart_routing_logged: false,
                 failed_attempts: Vec::new(),
                 outcome_logged: false,

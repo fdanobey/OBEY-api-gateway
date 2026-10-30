@@ -1693,6 +1693,7 @@ fn build_active_request_info(
         model: None,
         attempt: 0,
         phase: crate::active_requests::ActivePhase::Pending,
+        stall_reason: None,
         last_error: None,
         virtual_key_id: virtual_key_id.map(|s| s.to_string()),
         started_at_ms,
@@ -1749,16 +1750,26 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     authenticated_key: Option<Extension<AuthenticatedKey>>,
+    disclosure_resubmit: Option<Extension<crate::tool_compression::ToolDisclosureResubmit>>,
     Json(request): Json<OpenAIRequest>,
 ) -> Response {
     tracing::info!(model = %request.model, stream = request.stream, "Received chat completion request");
     let trace_id = trace_id_from_headers(&headers);
     let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
     let mode = memory_mode(&headers);
+    // True when a synthetic drill-down resolution loop re-entered the
+    // handler: the whole re-dispatch is an extra LLM call the client never
+    // sees, so the in-flight entry carries a `tool disclosure` stall reason
+    // until the outer middleware answers.
+    let tool_disclosure = disclosure_resubmit
+        .map(|Extension(flag)| flag.0)
+        .unwrap_or(false);
     if request.stream {
-        chat_completions_stream(state, request, trace_id, virtual_key_id, mode).await
+        chat_completions_stream(state, request, trace_id, virtual_key_id, mode, tool_disclosure)
+            .await
     } else {
-        chat_completions_non_stream(state, request, trace_id, virtual_key_id, mode).await
+        chat_completions_non_stream(state, request, trace_id, virtual_key_id, mode, tool_disclosure)
+            .await
     }
 }
 
@@ -1768,6 +1779,7 @@ async fn chat_completions_non_stream(
     trace_id: String,
     virtual_key_id: Option<String>,
     memory_mode: MemoryMode,
+    tool_disclosure: bool,
 ) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
@@ -1777,6 +1789,15 @@ async fn chat_completions_non_stream(
         virtual_key_id.as_deref(),
         crate::active_requests::RequestKind::Chat,
     ));
+    // Tool-disclosure synthetic resolution resubmission: the entire inner
+    // dispatch produces no client output, so mark it for its lifetime
+    // (nesting-aware scope; inner stalls restore this marker on exit).
+    let _disclosure_stall = tool_disclosure.then(|| {
+        crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+            Some(&active_handle),
+            crate::active_requests::StallReason::ToolDisclosure,
+        )
+    });
     let mut request_guard = RequestCompleteGuard::new(
         state.metrics.clone(),
         start,
@@ -1871,78 +1892,89 @@ async fn chat_completions_non_stream(
         Some("/v1/chat/completions".to_string()),
     );
 
-    if let Some(engine) = guardrail_engine.as_ref() {
-        match engine
-            .run_pre_call(&mut request, &selector, &mut guardrail_ctx, &trace_id)
-            .await
-        {
-            // Forward the (possibly redacted/masked) request to the router.
-            PreCallOutcome::Proceed => {}
-            // `block` fired → HTTP 403, do NOT route (Req 2.2).
-            PreCallOutcome::Block(block) => {
-                let err = GatewayError::GuardrailPolicyViolation {
-                    category: block.entity_label,
-                };
-                return guardrail_error_response(
-                    &state,
-                    &request,
-                    &mut request_guard,
-                    &trace_id,
-                    err,
-                );
-            }
-            // Action invalid for the pre-call phase → HTTP 400 (Req 2.7).
-            PreCallOutcome::InvalidAction => {
-                return guardrail_error_response(
-                    &state,
-                    &request,
-                    &mut request_guard,
-                    &trace_id,
-                    GatewayError::GuardrailInvalidAction,
-                );
-            }
-            // fail_close scan timeout → HTTP 503 (Req 2.9).
-            PreCallOutcome::Timeout => {
-                let err = GatewayError::GuardrailUnavailable("guardrail scan timeout".to_string());
-                return guardrail_error_response(
-                    &state,
-                    &request,
-                    &mut request_guard,
-                    &trace_id,
-                    err,
-                );
-            }
-            // fail_close provider error → HTTP 503 (Req 9.7).
-            PreCallOutcome::ServiceFailure => {
-                let err =
-                    GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
-                return guardrail_error_response(
-                    &state,
-                    &request,
-                    &mut request_guard,
-                    &trace_id,
-                    err,
-                );
-            }
+if let Some(engine) = guardrail_engine.as_ref() {
+    // Scope the scan marker tightly to the pre-call await itself; a
+    // handler-lived guard would mislabel the routing/dispatch that follows.
+    let _pre_call_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+        Some(&active_handle),
+        crate::active_requests::StallReason::GuardrailScan,
+    );
+    match engine
+        .run_pre_call(&mut request, &selector, &mut guardrail_ctx, &trace_id)
+        .await
+    {
+        // Forward the (possibly redacted/masked) request to the router.
+        PreCallOutcome::Proceed => {}
+        // `block` fired → HTTP 403, do NOT route (Req 2.2).
+        PreCallOutcome::Block(block) => {
+            let err = GatewayError::GuardrailPolicyViolation {
+                category: block.entity_label,
+            };
+            return guardrail_error_response(
+                &state,
+                &request,
+                &mut request_guard,
+                &trace_id,
+                err,
+            );
+        }
+        // Action invalid for the pre-call phase → HTTP 400 (Req 2.7).
+        PreCallOutcome::InvalidAction => {
+            return guardrail_error_response(
+                &state,
+                &request,
+                &mut request_guard,
+                &trace_id,
+                GatewayError::GuardrailInvalidAction,
+            );
+        }
+        // fail_close scan timeout → HTTP 503 (Req 2.9).
+        PreCallOutcome::Timeout => {
+            let err = GatewayError::GuardrailUnavailable("guardrail scan timeout".to_string());
+            return guardrail_error_response(
+                &state,
+                &request,
+                &mut request_guard,
+                &trace_id,
+                err,
+            );
+        }
+        // fail_close provider error → HTTP 503 (Req 9.7).
+        PreCallOutcome::ServiceFailure => {
+            let err =
+                GatewayError::GuardrailUnavailable("guardrail service unavailable".to_string());
+            return guardrail_error_response(
+                &state,
+                &request,
+                &mut request_guard,
+                &trace_id,
+                err,
+            );
         }
     }
+}
 
     // Context truncation is centralized here so memory observes the exact
     // post-truncation request. Router compression remains provider-specific and
     // therefore runs only after this handler-side injection boundary.
-    request = state.router.prepare_post_truncation_request(&request);
-    let memory_context = preprocess_memory_request(
-        &state,
-        &mut request,
-        virtual_key_id.as_deref(),
-        memory_mode,
-    )
-    .await;
+request = state.router.prepare_post_truncation_request(&request);
+let memory_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+    Some(&active_handle),
+    crate::active_requests::StallReason::MemoryRecall,
+);
+let memory_context = preprocess_memory_request(
+    &state,
+    &mut request,
+    virtual_key_id.as_deref(),
+    memory_mode,
+)
+.await;
+drop(memory_stall);
 
-    match state
-        .router
-        .route_request(&request, Some(active_handle.clone()))
-        .await
+match state
+    .router
+    .route_request(&request, Some(active_handle.clone()))
+    .await
     {
         Ok(mut response) => {
             // Post-call guardrails run on the freshly routed response BEFORE it
@@ -1974,23 +2006,27 @@ async fn chat_completions_non_stream(
                             .and_then(|v| v.as_array())
                             .map_or(false, |a| !a.is_empty())
                     }),
-                };
-                match engine
-                    .run_post_call(
-                        &mut response,
-                        &selector,
-                        &mut guardrail_ctx,
-                        &trace_id,
-                        &tool_ctx,
-                    )
-                    .await
-                {
-                    // Proceed without refusal: re-injection already ran inside
-                    // run_post_call. Replaced also returns as-is (Req 9.4: a
-                    // halting action skips re-injection and is final regardless
-                    // of refusal detection).
-                    (PostCallOutcome::Proceed, RefusalDecision::NotRefusal)
-                    | (PostCallOutcome::Replaced, _) => {}
+};
+let _post_call_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+    Some(&active_handle),
+    crate::active_requests::StallReason::GuardrailReview,
+);
+match engine
+    .run_post_call(
+        &mut response,
+                    &selector,
+                    &mut guardrail_ctx,
+                    &trace_id,
+                    &tool_ctx,
+                )
+                .await
+            {
+            // Proceed without refusal: re-injection already ran inside
+            // run_post_call. Replaced also returns as-is (Req 9.4: a
+            // halting action skips re-injection and is final regardless
+            // of refusal detection).
+            (PostCallOutcome::Proceed, RefusalDecision::NotRefusal)
+            | (PostCallOutcome::Replaced, _) => {}
                     // Refusal detected with failover enabled (Req 12.5): run the
                     // bounded re-dispatch loop. Re-injection was skipped inside
                     // run_post_call so we do it exactly once on the final response.
@@ -2118,16 +2154,21 @@ async fn chat_completions_non_stream(
                                                     .map_or(false, |a| !a.is_empty())
                                             },
                                         ),
-                                    };
-                                    let (post_outcome, refusal_decision) = engine
-                                        .run_post_call(
-                                            &mut new_response,
-                                            &selector,
-                                            &mut guardrail_ctx,
-                                            &trace_id,
-                                            &new_tool_ctx,
-                                        )
-                                        .await;
+        };
+        let _post_call_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+            Some(&active_handle),
+            crate::active_requests::StallReason::GuardrailReview,
+        );
+        let (post_outcome, refusal_decision) = engine
+            .run_post_call(
+                &mut new_response,
+                &selector,
+                &mut guardrail_ctx,
+                &trace_id,
+                &new_tool_ctx,
+            )
+            .await;
+        drop(_post_call_stall);
 
                                     match post_outcome {
                                         // Block/ServiceFailure from post-call on failover target:
@@ -2341,19 +2382,24 @@ async fn chat_completions_non_stream(
                                                 successful_retry_count += 1;
                                                 remaining_attempts -= 1;
 
-                                                if let Some(guardrail) = guardrail_engine.as_ref() {
-                                                    let retry_tool_context =
-                                                        tool_context(&request, &retry_response);
-                                                    let guardrail_started = Instant::now();
-                                                    let guardrail_result = guardrail
-                                                        .run_post_call(
-                                                            &mut retry_response,
-                                                            &selector,
-                                                            &mut guardrail_ctx,
-                                                            &trace_id,
-                                                            &retry_tool_context,
-                                                        )
-                                                        .await;
+        if let Some(guardrail) = guardrail_engine.as_ref() {
+            let retry_tool_context =
+                tool_context(&request, &retry_response);
+            let guardrail_started = Instant::now();
+            let _review_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                Some(&active_handle),
+                crate::active_requests::StallReason::GuardrailReview,
+            );
+            let guardrail_result = guardrail
+                .run_post_call(
+                    &mut retry_response,
+                    &selector,
+                    &mut guardrail_ctx,
+                    &trace_id,
+                    &retry_tool_context,
+                )
+                .await;
+            drop(_review_stall);
                                                     gateway_processing_ms +=
                                                         guardrail_started.elapsed().as_secs_f64()
                                                             * 1_000.0;
@@ -2602,6 +2648,7 @@ async fn chat_completions_stream(
     trace_id: String,
     virtual_key_id: Option<String>,
     memory_mode: MemoryMode,
+    tool_disclosure: bool,
 ) -> Response {
     state.metrics.start_request();
     let start = Instant::now();
@@ -2611,6 +2658,15 @@ async fn chat_completions_stream(
         virtual_key_id.as_deref(),
         crate::active_requests::RequestKind::Stream,
     ));
+    // Tool-disclosure synthetic resolution resubmission (see the non-stream
+    // handler): the entire inner dispatch — including its lazy SSE body —
+    // produces no client output. The marker is deliberately NOT scoped: it
+    // lives until the inner request completes and its registry entry is
+    // removed, which outlives this handler frame (the body is consumed by
+    // the compression middleware after this function returns).
+    if tool_disclosure {
+        active_handle.set_stall_reason(crate::active_requests::StallReason::ToolDisclosure);
+    }
     let mut request_guard = RequestCompleteGuard::new(
         state.metrics.clone(),
         start,
@@ -2623,17 +2679,22 @@ async fn chat_completions_stream(
         "Client requested streaming response; gateway currently buffers the full upstream response before synthesizing SSE"
     );
 
-    request = state.router.prepare_post_truncation_request(&request);
-    let memory_context = preprocess_memory_request(
-        &state,
-        &mut request,
-        virtual_key_id.as_deref(),
-        memory_mode,
-    )
-    .await;
+request = state.router.prepare_post_truncation_request(&request);
+let memory_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+    Some(&active_handle),
+    crate::active_requests::StallReason::MemoryRecall,
+);
+let memory_context = preprocess_memory_request(
+    &state,
+    &mut request,
+    virtual_key_id.as_deref(),
+    memory_mode,
+)
+.await;
+drop(memory_stall);
 
-    // Memory extraction is deliberately kept OFF the pre-routing critical path.
-    // The previous implementation awaited `extract_explicit_response` here,
+// Memory extraction is deliberately kept OFF the pre-routing critical path.
+// The previous implementation awaited `extract_explicit_response` here,
     // before the request was even routed, so a slow memory store stalled the
     // request while the dashboard showed it as `pending`. Extraction (explicit
     // + automatic) is now spawned after the response is assembled, via
@@ -2708,18 +2769,22 @@ async fn chat_completions_stream(
         .as_ref()
         .map(|e| e.new_context())
         .unwrap_or_default();
-    let selector = BindingSelector::new(
-        virtual_key_id,
-        Some(request.model.clone()),
-        Some("/v1/chat/completions".to_string()),
-    );
-    if let Some(engine) = guardrail_engine.as_ref() {
-        // Request-scoped context carrying the PII Re_Injection_Map from pre-call
-        // redaction into post-call re-injection (Req 9.5).
+let selector = BindingSelector::new(
+    virtual_key_id,
+    Some(request.model.clone()),
+    Some("/v1/chat/completions".to_string()),
+);
+if let Some(engine) = guardrail_engine.as_ref() {
+    // Request-scoped context carrying the PII Re_Injection_Map from pre-call
+    // redaction into post-call re-injection (Req 9.5).
 
-        // Pre-call runs before routing. Nothing has streamed yet, so on a
-        // terminal pre-call outcome we return a plain JSON error response
-        // identical to the non-stream handler.
+    // Pre-call runs before routing. Nothing has streamed yet, so on a
+    // terminal pre-call outcome we return a plain JSON error response
+    // identical to the non-stream handler.
+    let _pre_call_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+        Some(&active_handle),
+        crate::active_requests::StallReason::GuardrailScan,
+    );
         match engine
             .run_pre_call(&mut request, &selector, &mut guardrail_ctx, &trace_id)
             .await
@@ -4039,11 +4104,17 @@ async fn finalize_single_eager_post_call(
     selector: &BindingSelector,
     guardrail_ctx: &mut GuardrailContext,
     trace_id: &str,
+    active: Option<&crate::active_requests::ActiveRequestHandle>,
 ) -> EagerSinglePostCall {
     let tool_ctx = tool_context(request, &response);
+    let _review_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+        active,
+        crate::active_requests::StallReason::GuardrailReview,
+    );
     let (post_outcome, refusal) = engine
         .run_post_call(&mut response, selector, guardrail_ctx, trace_id, &tool_ctx)
         .await;
+    drop(_review_stall);
     match post_outcome {
         PostCallOutcome::Proceed => EagerSinglePostCall::Response {
             response,
@@ -4086,12 +4157,17 @@ async fn finalize_eager_post_call(
     selector: &BindingSelector,
     guardrail_ctx: &mut GuardrailContext,
     trace_id: &str,
+    active: Option<&crate::active_requests::ActiveRequestHandle>,
 ) -> EagerPostCallResult {
     let Some(engine) = guardrail_engine else {
         return EagerPostCallResult::Response(response);
     };
 
     let tool_ctx = tool_context(request, &response);
+    let _review_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+        active,
+        crate::active_requests::StallReason::GuardrailReview,
+    );
     match engine
         .run_post_call(&mut response, selector, guardrail_ctx, trace_id, &tool_ctx)
         .await
@@ -4160,22 +4236,23 @@ async fn finalize_eager_post_call(
                     continue;
                 };
 
-                match finalize_single_eager_post_call(
-                    engine,
-                    request,
-                    candidate,
-                    selector,
-                    guardrail_ctx,
-                    trace_id,
-                )
-                .await
-                {
-                    EagerSinglePostCall::Response {
-                        response: candidate,
-                        refusal,
-                        replaced,
-                    } => {
-                        last_response = candidate;
+            match finalize_single_eager_post_call(
+                engine,
+                request,
+                candidate,
+                selector,
+                guardrail_ctx,
+                trace_id,
+                active,
+            )
+            .await
+            {
+                EagerSinglePostCall::Response {
+                    response: candidate,
+                    refusal,
+                    replaced,
+                } => {
+                    last_response = candidate;
                         if replaced {
                             skip_reinjection = true;
                             break;
@@ -4206,6 +4283,7 @@ async fn validate_eager_structured_response(
     selector: &BindingSelector,
     guardrail_ctx: &mut GuardrailContext,
     trace_id: &str,
+    active: Option<&crate::active_requests::ActiveRequestHandle>,
 ) -> Result<(OpenAIResponse, ValidationResponseStatus), EagerPostCallResult> {
     let Some(engine) = engine else {
         tracing::warn!(
@@ -4330,15 +4408,16 @@ async fn validate_eager_structured_response(
                                 remaining_attempts -= 1;
                                 let retry_response = if let Some(guardrail) = guardrail_engine {
                                     let guardrail_started = Instant::now();
-                                    let post_call = finalize_single_eager_post_call(
-                                        guardrail,
-                                        request,
-                                        retry_response,
-                                        selector,
-                                        guardrail_ctx,
-                                        trace_id,
-                                    )
-                                    .await;
+                let post_call = finalize_single_eager_post_call(
+                    guardrail,
+                    request,
+                    retry_response,
+                    selector,
+                    guardrail_ctx,
+                    trace_id,
+                    active,
+                )
+                .await;
                                     gateway_processing_ms +=
                                         guardrail_started.elapsed().as_secs_f64() * 1_000.0;
                                     match post_call {
@@ -4495,12 +4574,19 @@ async fn stream_eager_structured_output(
             concurrency_permit,
             smart_routing,
         }) => {
-            let _concurrency_permit = concurrency_permit;
-            let mut buffer = guardrail_stream::SseBuffer::with_default_cap();
-            let mut bytes = byte_stream.bytes_stream();
-            while let Some(chunk) = bytes.next().await {
-                match chunk {
-                    Ok(chunk) if buffer.push_bytes(&chunk).is_ok() => {}
+        let _concurrency_permit = concurrency_permit;
+        let mut buffer = guardrail_stream::SseBuffer::with_default_cap();
+        let mut bytes = byte_stream.bytes_stream();
+        // Handler-side reassembly of the upstream SSE: the client sees
+        // nothing until the full body is buffered (same silent wait as the
+        // router's buffered dispatch, so the same stall reason).
+        let _buffering_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+            active.as_ref(),
+            crate::active_requests::StallReason::Buffering,
+        );
+        while let Some(chunk) = bytes.next().await {
+            match chunk {
+                Ok(chunk) if buffer.push_bytes(&chunk).is_ok() => {}
                     Ok(_) => {
                         let message = format!(
                             "Buffered streaming response exceeded the {} byte structured output buffer limit",
@@ -4545,22 +4631,23 @@ async fn stream_eager_structured_output(
                             &log_context,
                             request_guard.active_handle(),
                         );
-                        return eager_sse_response(
-                            emit_sse_error_event(
-                                "stream_error",
-                                &gateway_error.to_string(),
-                                &trace_id,
-                            ),
-                            &streaming_config,
-                            &trace_id,
-                            None,
-                            None,
-                        );
-                    }
-                }
-            }
+            return eager_sse_response(
+                emit_sse_error_event(
+                    "stream_error",
+                    &gateway_error.to_string(),
+                    &trace_id,
+                ),
+                &streaming_config,
+                &trace_id,
+                None,
+                None,
+            );
+        }
+    }
+    }
+    drop(_buffering_stall);
 
-            let assembled = match buffer.assemble() {
+    let assembled = match buffer.assemble() {
                 Ok(assembled) => assembled,
                 Err(message) => {
                     let gateway_error = GatewayError::GuardrailUnavailable(message);
@@ -4664,6 +4751,7 @@ async fn stream_eager_structured_output(
         &selector,
         &mut guardrail_ctx,
         &trace_id,
+        request_guard.active_handle(),
     )
     .await
     {
@@ -4682,18 +4770,19 @@ async fn stream_eager_structured_output(
         }
     };
 
-    let (response, validation_status) = match validate_eager_structured_response(
-        &state,
-        &request,
-        response,
-        structured_output_engine.as_ref(),
-        guardrail_engine.as_ref(),
-        &selector,
-        &mut guardrail_ctx,
-        &trace_id,
-    )
-    .await
-    {
+let (response, validation_status) = match validate_eager_structured_response(
+    &state,
+    &request,
+    response,
+    structured_output_engine.as_ref(),
+    guardrail_engine.as_ref(),
+    &selector,
+    &mut guardrail_ctx,
+    &trace_id,
+    request_guard.active_handle(),
+)
+.await
+{
         Ok(result) => result,
         Err(EagerPostCallResult::Terminal { events, error }) => {
             let duration_ms = request_guard.complete();
@@ -5157,15 +5246,19 @@ async fn stream_buffered_with_post_call(
                 has_tool_calls: response.choices.first().map_or(false, |c| {
                     c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
                 }),
-            };
-            match engine
-                .run_post_call(&mut response, &selector, &mut guardrail_ctx, &stream_trace_id, &tool_ctx)
-                .await
-            {
-    // Proceed without refusal, or replaced (halting action skips
-    // re-injection, Req 9.4) → re-chunk normally.
-    (PostCallOutcome::Proceed, RefusalDecision::NotRefusal)
-    | (PostCallOutcome::Replaced, _) => {
+        };
+        let _review_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+            _guard.active_handle(),
+            crate::active_requests::StallReason::GuardrailReview,
+        );
+        match engine
+            .run_post_call(&mut response, &selector, &mut guardrail_ctx, &stream_trace_id, &tool_ctx)
+            .await
+        {
+            // Proceed without refusal, or replaced (halting action skips
+            // re-injection, Req 9.4) → re-chunk normally.
+            (PostCallOutcome::Proceed, RefusalDecision::NotRefusal)
+            | (PostCallOutcome::Replaced, _) => {
 // Task 8 (Req 4.4): when reasoning was relayed live, the final
 // replay suppresses the reasoning delta (no double-emit); the
 // suppress variant keeps the shared id/created and role
@@ -5290,10 +5383,15 @@ async fn stream_buffered_with_post_call(
                                     has_tool_calls: new_response.choices.first().map_or(false, |c| {
                                         c.message.extra.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty())
                                     }),
-                                };
-                                let (post_outcome, refusal_decision) = engine
-                                    .run_post_call(&mut new_response, &selector, &mut guardrail_ctx, &stream_trace_id, &new_tool_ctx)
-                                    .await;
+            };
+            let _review_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                _guard.active_handle(),
+                crate::active_requests::StallReason::GuardrailReview,
+            );
+            let (post_outcome, refusal_decision) = engine
+                .run_post_call(&mut new_response, &selector, &mut guardrail_ctx, &stream_trace_id, &new_tool_ctx)
+                .await;
+            drop(_review_stall);
 
                                 match post_outcome {
                                     PostCallOutcome::Block(block) => {
@@ -7343,18 +7441,22 @@ async fn anthropic_create_buffered(
         .as_ref()
         .map(|e| e.new_context())
         .unwrap_or_default();
-    let selector = BindingSelector::new(
-        virtual_key_id.clone(),
-        Some(chat_request.model.clone()),
-        Some("/v1/messages".to_string()),
+let selector = BindingSelector::new(
+    virtual_key_id.clone(),
+    Some(chat_request.model.clone()),
+    Some("/v1/messages".to_string()),
+);
+if let Some(engine) = guardrail_engine.as_ref() {
+    let _pre_call_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+        Some(&active_handle),
+        crate::active_requests::StallReason::GuardrailScan,
     );
-    if let Some(engine) = guardrail_engine.as_ref() {
-        match engine
-            .run_pre_call(&mut chat_request, &selector, &mut guardrail_ctx, &trace_id)
-            .await
-        {
-            PreCallOutcome::Proceed => {}
-            PreCallOutcome::Block(block) => {
+    match engine
+        .run_pre_call(&mut chat_request, &selector, &mut guardrail_ctx, &trace_id)
+        .await
+    {
+        PreCallOutcome::Proceed => {}
+        PreCallOutcome::Block(block) => {
                 let err = GatewayError::GuardrailPolicyViolation {
                     category: block.entity_label,
                 };
@@ -7407,46 +7509,55 @@ async fn anthropic_create_buffered(
         }
     }
 
-	// Memory injection + context-overflow compression (Req 6.1 best-effort
-	// parity with the chat path): the centralized post-truncation boundary
-	// and memory preprocessing both mutate the translated chat request
-	// exactly as in `chat_completions_non_stream` before dispatch.
-	chat_request = state.router.prepare_post_truncation_request(&chat_request);
-	let memory_context = preprocess_memory_request(
-		&state,
-		&mut chat_request,
-		virtual_key_id.as_deref(),
-		memory_mode,
-	)
-	.await;
+// Memory injection + context-overflow compression (Req 6.1 best-effort
+// parity with the chat path): the centralized post-truncation boundary
+// and memory preprocessing both mutate the translated chat request
+// exactly as in `chat_completions_non_stream` before dispatch.
+chat_request = state.router.prepare_post_truncation_request(&chat_request);
+let memory_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+    Some(&active_handle),
+    crate::active_requests::StallReason::MemoryRecall,
+);
+let memory_context = preprocess_memory_request(
+    &state,
+    &mut chat_request,
+    virtual_key_id.as_deref(),
+    memory_mode,
+)
+.await;
+drop(memory_stall);
 
-	let passthrough_scope = anthropic_passthrough_scope(&raw_body, &headers);
-	let result = passthrough_scope
-		.scope(async {
-			state
-				.router
-				.route_request(&chat_request, Some(active_handle.clone()))
-				.await
-		})
-		.await;
+let passthrough_scope = anthropic_passthrough_scope(&raw_body, &headers);
+let result = passthrough_scope
+    .scope(async {
+        state
+            .router
+            .route_request(&chat_request, Some(active_handle.clone()))
+            .await
+    })
+    .await;
 
-    match result {
+match result {
         Ok(mut chat_response) => {
             // Post-call guardrails run on the routed chat response BEFORE
             // verbatim relay, synthesis, or cache write, using the SAME ctx
             // so PII re-injection works (Req 6.1/9.5 parity with the chat
             // path).
-            if let Some(engine) = guardrail_engine.as_ref() {
-                let tool_ctx = tool_context(&chat_request, &chat_response);
-                let (post_outcome, refusal_decision) = engine
-                    .run_post_call(
-                        &mut chat_response,
-                        &selector,
-                        &mut guardrail_ctx,
-                        &trace_id,
-                        &tool_ctx,
-                    )
-                    .await;
+        if let Some(engine) = guardrail_engine.as_ref() {
+            let tool_ctx = tool_context(&chat_request, &chat_response);
+            let _post_call_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                Some(&active_handle),
+                crate::active_requests::StallReason::GuardrailReview,
+            );
+            let (post_outcome, refusal_decision) = engine
+                .run_post_call(
+                    &mut chat_response,
+                    &selector,
+                    &mut guardrail_ctx,
+                    &trace_id,
+                    &tool_ctx,
+                )
+                .await;
                 match post_outcome {
                     // Proceed/Replaced without refusal-failover: the chat
                     // handler's bounded refusal re-dispatch loop (Req 12.5)
@@ -7635,14 +7746,18 @@ async fn anthropic_create_stream(
         Some(chat_request.model.clone()),
         Some("/v1/messages".to_string()),
     );
-    let mut post_call_forces_buffered = false;
-    if let Some(engine) = guardrail_engine.as_ref() {
-        match engine
-            .run_pre_call(&mut chat_request, &selector, &mut guardrail_ctx, &trace_id)
-            .await
-        {
-            PreCallOutcome::Proceed => {}
-            PreCallOutcome::Block(block) => {
+let mut post_call_forces_buffered = false;
+if let Some(engine) = guardrail_engine.as_ref() {
+    let _pre_call_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+        Some(&active_handle),
+        crate::active_requests::StallReason::GuardrailScan,
+    );
+    match engine
+        .run_pre_call(&mut chat_request, &selector, &mut guardrail_ctx, &trace_id)
+        .await
+    {
+        PreCallOutcome::Proceed => {}
+        PreCallOutcome::Block(block) => {
                 let err = GatewayError::GuardrailPolicyViolation {
                     category: block.entity_label,
                 };
@@ -7707,18 +7822,23 @@ async fn anthropic_create_stream(
         post_call_forces_buffered = post_call_bound || !guardrail_ctx.is_empty();
     }
 
-	// Memory injection + context-overflow compression (Req 6.1 best-effort
-	// parity with the chat streaming handler).
-	chat_request = state.router.prepare_post_truncation_request(&chat_request);
-	let memory_context = preprocess_memory_request(
-		&state,
-		&mut chat_request,
-		virtual_key_id.as_deref(),
-		memory_mode,
-	)
-	.await;
+// Memory injection + context-overflow compression (Req 6.1 best-effort
+// parity with the chat streaming handler).
+chat_request = state.router.prepare_post_truncation_request(&chat_request);
+let memory_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+    Some(&active_handle),
+    crate::active_requests::StallReason::MemoryRecall,
+);
+let memory_context = preprocess_memory_request(
+    &state,
+    &mut chat_request,
+    virtual_key_id.as_deref(),
+    memory_mode,
+)
+.await;
+drop(memory_stall);
 
-    // Input-side usage estimate (Req 2.1): tokenizer estimate on the
+// Input-side usage estimate (Req 2.1): tokenizer estimate on the
     // translated request, the same counting helper `/v1/messages/count_tokens`
     // uses, so `message_start.usage.input_tokens` is populated even before
     // the provider reports usage.
@@ -7756,18 +7876,24 @@ Ok(StreamingResponse::Buffered(mut chat_response)) => {
 // caller. The verbatim stash below is relayed byte-faithfully per
 // decision D2 regardless — post-call cannot rewrite a native
 // Anthropic body — but a `block` outcome still discards it.
-if let Some(engine) = guardrail_engine.as_ref() {
-if post_call_forces_buffered {
-let tool_ctx = tool_context(&chat_request, &chat_response);
-let (post_outcome, refusal_decision) = engine
-.run_post_call(
-&mut chat_response,
-&selector,
-&mut guardrail_ctx,
-&trace_id,
-&tool_ctx,
-)
-.await;
+            if let Some(engine) = guardrail_engine.as_ref() {
+                if post_call_forces_buffered {
+                    let tool_ctx = tool_context(&chat_request, &chat_response);
+                    let _review_stall =
+                        crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                            Some(&active_handle),
+                            crate::active_requests::StallReason::GuardrailReview,
+                        );
+                    let (post_outcome, refusal_decision) = engine
+                        .run_post_call(
+                            &mut chat_response,
+                            &selector,
+                            &mut guardrail_ctx,
+                            &trace_id,
+                            &tool_ctx,
+                        )
+                        .await;
+                    drop(_review_stall);
 match post_outcome {
 PostCallOutcome::Proceed | PostCallOutcome::Replaced => {
 if !matches!(post_outcome, PostCallOutcome::Replaced)
@@ -10944,12 +11070,12 @@ pub async fn completions(
     authenticated_key: Option<Extension<AuthenticatedKey>>,
     Json(request): Json<OpenAIRequest>,
 ) -> Response {
-	// Reuse chat completions routing; the OpenAI completions format is close enough
-	// for provider pass-through. Full translation can be refined later.
-	let trace_id = trace_id_from_headers(&headers);
-	let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
-	let memory_mode = memory_mode(&headers);
-	chat_completions_non_stream(state, request, trace_id, virtual_key_id, memory_mode).await
+    // Reuse chat completions routing; the OpenAI completions format is close enough
+    // for provider pass-through. Full translation can be refined later.
+    let trace_id = trace_id_from_headers(&headers);
+    let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
+    let memory_mode = memory_mode(&headers);
+    chat_completions_non_stream(state, request, trace_id, virtual_key_id, memory_mode, false).await
 }
 // ---------------------------------------------------------------------------
 // Provider pass-through endpoints (Req 2.3-2.5)

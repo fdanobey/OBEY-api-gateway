@@ -23,6 +23,7 @@ mod integration_tests;
 pub use config::ToolCompressionConfig;
 pub use middleware::{
     OriginalToolsExtension, ToolCompressionApplied, ToolCompressionLayer, ToolCompressionService,
+    ToolDisclosureResubmit,
 };
 pub use stage::CompressionStage;
 pub use state::ToolCompressionState;

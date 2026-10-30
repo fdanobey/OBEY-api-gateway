@@ -687,14 +687,20 @@ where
                 next_parts
                     .headers
                     .insert(axum::http::header::CONTENT_LENGTH, len_value);
-                let mut next_req = Request::from_parts(next_parts, Body::from(next_body));
-                next_req
-                    .extensions_mut()
-                    .insert(OriginalToolsExtension(Arc::new(original_tools.clone())));
-                next_req
-                    .extensions_mut()
-                    .insert(ToolCompressionApplied(true));
-                match inner.call(next_req).await {
+let mut next_req = Request::from_parts(next_parts, Body::from(next_body));
+next_req
+    .extensions_mut()
+    .insert(OriginalToolsExtension(Arc::new(original_tools.clone())));
+next_req
+    .extensions_mut()
+    .insert(ToolCompressionApplied(true));
+// The resubmit is an invisible extra LLM call: let the handler park a
+// `tool disclosure` stall reason on the in-flight request for the
+// dashboard while this round runs.
+next_req
+    .extensions_mut()
+    .insert(ToolDisclosureResubmit(true));
+match inner.call(next_req).await {
                     Ok(r) => final_response = r,
                     Err(e) => return Err(e),
                 }
@@ -763,6 +769,13 @@ pub struct OriginalToolsExtension(pub Arc<Vec<ToolDefinition>>);
 /// description compression to avoid redundant double-compression.
 #[derive(Clone, Debug)]
 pub struct ToolCompressionApplied(pub bool);
+
+/// Extension set while a synthetic drill-down resolution loop is resubmitting
+/// the conversation to the model — extra LLM calls that produce no client
+/// output. The handler reads it to park a `tool disclosure` stall reason on the
+/// in-flight request so the dashboard can explain the wait.
+#[derive(Clone, Debug)]
+pub struct ToolDisclosureResubmit(pub bool);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
