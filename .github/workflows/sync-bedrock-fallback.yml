@@ -24,7 +24,7 @@ jobs:
         run: |
           "STATE_DIR=${{ runner.temp }}\bedrock-sync-state" >> $env:GITHUB_ENV
           "SUMMARY_FILE=${{ runner.temp }}\bedrock-sync-summary.json" >> $env:GITHUB_ENV
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
