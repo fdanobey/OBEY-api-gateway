@@ -75,7 +75,7 @@ jobs:
 
           # Installer version lives in the Inno Setup script; keep it in sync.
           (Get-Content "scripts/installer.iss" -Raw) -replace
-            '(?m)^#define MyAppVersion "[^"]+"', "#define MyAppVersion `"$next`"" |
+            '(?m)^(#define MyAppVersion\s+)"[^"]+"', "`${1}`"$next`"" |
             Set-Content "scripts/installer.iss" -NoNewline
 
           # Re-sync workspace member versions into Cargo.lock (only touches
