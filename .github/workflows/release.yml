@@ -82,8 +82,8 @@ jobs:
 
           git add $manifest Cargo.lock
           git commit -m "chore: bump version to $next"
-          # release/* branches are unprotected; clear any stale branch from a
-          # previous failed attempt before pushing the fresh one.
+          # release/* branches are unprotected; clear any stale branch/tag from
+          # a previous failed attempt before pushing the fresh ones.
           git push origin --delete "refs/heads/release/v$next" 2>$null
           git push origin "HEAD:refs/heads/release/v$next"
 
@@ -110,9 +110,15 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ steps.version.outputs.tag }}"
+          # Stale local tags from a previous attempt must never win: delete
+          # locally AND remotely, then create fresh on the verified tip.
+          git tag -d $tag 2>$null
+          git push origin ":refs/tags/$tag" 2>$null
+          git fetch origin development --prune-tags --force 2>$null
           $sha = git rev-parse refs/remotes/origin/development
           git tag -a $tag -m "Release $tag" $sha
           git push origin $tag
+          if ((git rev-parse "$tag^{}") -ne $sha) { throw "Tag target verification failed" }
 
   build-windows:
     name: Build & publish release artifacts
