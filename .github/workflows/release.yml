@@ -203,8 +203,10 @@ jobs:
             $range = "$prevTag..$tag"
           }
 
+          # Suppress pipeline-machinery noise: version bump commits and the
+          # iterative release-pipeline fixes from the bootstrap window.
           $commits = @(git log $range --pretty=format:"- %s" --no-merges |
-            Where-Object { $_ -notmatch "^- chore: bump version" })
+            Where-Object { $_ -notmatch "^- chore: bump version" -and $_ -notmatch "^- (chore|fix)\(release\)" })
 
           $features = @($commits | Where-Object { $_ -match "^- feat" })
           $fixes    = @($commits | Where-Object { $_ -match "^- fix" })
