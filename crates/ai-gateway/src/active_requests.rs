@@ -56,6 +56,10 @@ pub enum StallReason {
     RetryBackoff,
     /// Waiting for a local provider rate-limit token (admission).
     RateLimitWait,
+    /// Semantic-cache (embedding) lookup before the first provider attempt.
+    CacheLookup,
+    /// Smart-routing planning: classification, internal cache, budget, tiers.
+    SmartRouting,
 }
 
 impl StallReason {
@@ -72,6 +76,8 @@ impl StallReason {
             StallReason::ReasoningNudge => "reasoning nudge",
             StallReason::RetryBackoff => "retry backoff",
             StallReason::RateLimitWait => "rate-limit wait",
+            StallReason::CacheLookup => "cache lookup",
+            StallReason::SmartRouting => "smart routing",
         }
     }
 }
@@ -602,6 +608,8 @@ fn stall_reason_labels_are_short() {
         StallReason::ReasoningNudge,
         StallReason::RetryBackoff,
         StallReason::RateLimitWait,
+        StallReason::CacheLookup,
+        StallReason::SmartRouting,
     ] {
         assert!(reason.label().split_whitespace().count() <= 2);
     }

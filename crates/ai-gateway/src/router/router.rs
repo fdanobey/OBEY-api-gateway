@@ -1,4 +1,4 @@
-use crate::active_requests::{ActivePhase, ActiveRequestHandle};
+use crate::active_requests::{ActivePhase, ActiveRequestHandle, StallReason};
 use crate::compression::{
     caveman::apply_caveman_output,
     config::CompressionConfig,
@@ -1862,36 +1862,45 @@ impl Router {
     /// promotion applies only within the tier list so an overflow model is
     /// never promoted ahead of tier candidates. Entries are de-duplicated by
     /// `provider:model`.
-    async fn resolve_routed_providers(
-        &self,
-        request: &OpenAIRequest,
-        model_group: ModelGroup,
-    ) -> Result<RoutedProviders, GatewayError> {
-        let (tier_group, overflow, decision, bypassed, diagnostics) =
-            match self.smart_routing_plan(request, &model_group).await? {
-                Some(plan) => {
-                    let mut tier_group = model_group.clone();
-                    tier_group.models = plan.candidates;
-                    let overflow = if plan.bypassed {
-                        Vec::new()
-                    } else {
-                        plan.overflow
-                    };
-                    (
-                        tier_group,
-                        overflow,
-                        Some(plan.decision),
-                        plan.bypassed,
-                        plan.diagnostics,
-                    )
-                }
-                None => (
-                    model_group.clone(),
-                    Vec::new(),
-                    None,
-                    true,
-                    RoutingDiagnostics::default(),
-                ),
+async fn resolve_routed_providers(
+    &self,
+    request: &OpenAIRequest,
+    model_group: ModelGroup,
+    active: Option<&ActiveRequestHandle>,
+) -> Result<RoutedProviders, GatewayError> {
+    // Smart-routing planning (classification, internal semantic cache,
+    // budget, tier selection) runs BEFORE the first attempt and can include
+    // embedding/LLM-backed classification calls: surface the wait while it
+    // runs so the attempt-0 delay is explainable.
+    let _routing_stall =
+        ActiveRequestHandle::begin_stall_opt(active, StallReason::SmartRouting);
+    let (tier_group, overflow, decision, bypassed, diagnostics) = match self
+        .smart_routing_plan(request, &model_group)
+        .await?
+    {
+        Some(plan) => {
+            let mut tier_group = model_group.clone();
+            tier_group.models = plan.candidates;
+            let overflow = if plan.bypassed {
+                Vec::new()
+            } else {
+                plan.overflow
+            };
+            (
+                tier_group,
+                overflow,
+                Some(plan.decision),
+                plan.bypassed,
+                plan.diagnostics,
+            )
+        }
+        None => (
+            model_group.clone(),
+            Vec::new(),
+            None,
+            true,
+            RoutingDiagnostics::default(),
+        ),
             };
 
         let mut providers = self.select_provider_order(&tier_group).await;
@@ -9995,11 +10004,11 @@ visible content. Do not restate your plan and do not end your turn without doing
             decision: mut routing_decision,
             bypassed: routing_bypassed,
             diagnostics: routing_diagnostics,
-        } = self
-            .resolve_routed_providers(&prepared_request, model_group)
-            .await?;
-        // Drop explicitly excluded provider:model entries (streaming 429
-        // fallback — see `route_request_streaming_excluding`).
+} = self
+.resolve_routed_providers(&prepared_request, model_group, active.as_ref())
+.await?;
+// Drop explicitly excluded provider:model entries (streaming 429
+// fallback — see `route_request_streaming_excluding`).
         let providers = if exclude.is_empty() {
             providers
         } else {
@@ -10225,14 +10234,14 @@ visible content. Do not restate your plan and do not end your turn without doing
             decision: routing_decision,
             bypassed: routing_bypassed,
             diagnostics: routing_diagnostics,
-        } = self
-            .resolve_routed_providers(&prepared_request, model_group)
-            .await?;
-        if providers.is_empty() {
-            return Err(GatewayError::InvalidRequest(
-                "No available providers for model".to_string(),
-            ));
-        }
+} = self
+.resolve_routed_providers(&prepared_request, model_group, active.as_ref())
+.await?;
+if providers.is_empty() {
+return Err(GatewayError::InvalidRequest(
+"No available providers for model".to_string(),
+));
+}
 
         // Pass-through disabled globally, or Smart Routing applied without
         // Streaming Reliability → buffer the whole request.
@@ -15931,7 +15940,7 @@ extra: Default::default(),
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
         let routed = router
-            .resolve_routed_providers(&smart_routing_request(false), group)
+            .resolve_routed_providers(&smart_routing_request(false), group, None)
             .await
             .unwrap();
         let order: Vec<&str> = routed
@@ -16014,7 +16023,7 @@ extra: Default::default(),
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
         let routed = router
-            .resolve_routed_providers(&smart_routing_request(false), group)
+            .resolve_routed_providers(&smart_routing_request(false), group, None)
             .await
             .unwrap();
         let order: Vec<&str> = routed
