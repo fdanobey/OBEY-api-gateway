@@ -81,9 +81,11 @@ tbody tr:hover{background:rgba(59,130,246,.06)}
 .inflight-failover{background:rgba(249,115,22,.18);color:#f97316}
 .inflight-cascade{background:rgba(59,130,246,.18);color:#3b82f6}
 
-/* Stall reason shown under the in-flight phase badge: why the request is
-   busy on gateway-side work that produces no client output. */
-.inflight-stall{display:block;margin-top:.2rem;color:var(--warning);font-size:.72rem;line-height:1.2;white-space:normal}
+/* Stall reason pill shown under the in-flight phase badge: why the request is
+   busy on gateway-side work that produces no client output. Same pill shape
+   as the phase badges, smaller and violet to distinguish internal work. */
+.inflight-pillwrap{display:block;margin-top:.25rem;line-height:1.1}
+.inflight-stall{display:inline-block;padding:.1rem .45rem;border-radius:999px;background:rgba(139,92,246,.16);color:#a78bfa;font-size:.62rem;font-weight:600;text-transform:uppercase;letter-spacing:.02em}
 
 /* Last failure reason cell */
 .failure-reason{display:inline-block;max-width:32rem;color:var(--text-muted);font-size:.85rem;line-height:1.3;white-space:normal;word-break:break-word}
@@ -755,7 +757,8 @@ var stallHtml = stallText
 : '';
 var reasonHtml = '<span class="badge '+ (phaseClass[phase]||'inflight-pending') +'"'
 + (reasonTitle ? ' title="'+reasonTitle+'"' : '') +'>'
-+ esc(phase) + (r.last_error ? ' ⚠' : '') + '</span>' + stallHtml;
++ esc(phase) + (r.last_error ? ' ⚠' : '') + '</span>'
++ (stallHtml ? '<span class="inflight-pillwrap">'+stallHtml+'</span>' : '');
       var vk = r.virtual_key_id || '—';
       var elapsedMs = r.started_at_ms ? (Date.now() - r.started_at_ms) : 0;
       var elapsed = elapsedMs>=1000
