@@ -12,9 +12,6 @@ on:
           - minor
           - major
         default: patch
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: write
@@ -76,6 +73,11 @@ jobs:
           (Get-Content $manifest -Raw) -replace '(?m)^version\s*=\s*"[^"]+"', "version = `"$next`"" |
             Set-Content $manifest -NoNewline
 
+          # Installer version lives in the Inno Setup script; keep it in sync.
+          (Get-Content "scripts/installer.iss" -Raw) -replace
+            '(?m)^#define MyAppVersion "[^"]+"', "#define MyAppVersion `"$next`"" |
+            Set-Content "scripts/installer.iss" -NoNewline
+
           # Re-sync workspace member versions into Cargo.lock (only touches
           # workspace members; fails loudly if the lock is inconsistent).
           cargo update --workspace
@@ -123,19 +125,12 @@ jobs:
   build-windows:
     name: Build & publish release artifacts
     needs: cut-release
-    if: >-
-      always() && (
-        needs.cut-release.result == 'success' ||
-        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
-      )
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
         with:
           fetch-depth: 0
-          # On dispatch: check out the tag just created by cut-release.
-          # On tag push: cut-release is skipped, so this falls back to the pushed tag.
-          ref: ${{ needs.cut-release.outputs.tag || github.ref }}
+          ref: ${{ needs.cut-release.outputs.tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -196,7 +191,7 @@ jobs:
           # Source of truth is git history, NOT the tag annotation.
           # actions/checkout replaces annotated tags with lightweight tags,
           # so the annotation is not reliable in CI. We rebuild notes here.
-          $tag  = "${{ needs.cut-release.outputs.tag || github.ref_name }}"
+          $tag  = "${{ needs.cut-release.outputs.tag }}"
           $repo = $env:GITHUB_REPOSITORY
 
           # Previous tag reachable from this tag's parent (linear history).
@@ -232,7 +227,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ needs.cut-release.outputs.tag || github.ref_name }}
+          tag_name: ${{ needs.cut-release.outputs.tag }}
           body_path: release-notes.md
           files: |
             ai-gateway-windows-x86_64.zip
