@@ -82,7 +82,7 @@ jobs:
           # workspace members; fails loudly if the lock is inconsistent).
           cargo update --workspace
 
-          git add $manifest Cargo.lock
+          git add $manifest Cargo.lock "scripts/installer.iss"
           git commit -m "chore: bump version to $next"
           # release/* branches are unprotected; clear any stale branch/tag from
           # a previous failed attempt before pushing the fresh ones.
