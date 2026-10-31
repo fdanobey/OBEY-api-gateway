@@ -1862,46 +1862,46 @@ impl Router {
     /// promotion applies only within the tier list so an overflow model is
     /// never promoted ahead of tier candidates. Entries are de-duplicated by
     /// `provider:model`.
-async fn resolve_routed_providers(
-    &self,
-    request: &OpenAIRequest,
-    model_group: ModelGroup,
-    active: Option<&ActiveRequestHandle>,
-) -> Result<RoutedProviders, GatewayError> {
-    // Smart-routing planning (classification, internal semantic cache,
-    // budget, tier selection) runs BEFORE the first attempt and can include
-    // embedding/LLM-backed classification calls: surface the wait while it
-    // runs so the attempt-0 delay is explainable.
-    let _routing_stall =
-        ActiveRequestHandle::begin_stall_opt(active, StallReason::SmartRouting);
-    let (tier_group, overflow, decision, bypassed, diagnostics) = match self
-        .smart_routing_plan(request, &model_group)
-        .await?
-    {
-        Some(plan) => {
-            let mut tier_group = model_group.clone();
-            tier_group.models = plan.candidates;
-            let overflow = if plan.bypassed {
-                Vec::new()
-            } else {
-                plan.overflow
-            };
-            (
-                tier_group,
-                overflow,
-                Some(plan.decision),
-                plan.bypassed,
-                plan.diagnostics,
-            )
-        }
-        None => (
-            model_group.clone(),
-            Vec::new(),
-            None,
-            true,
-            RoutingDiagnostics::default(),
-        ),
-            };
+    async fn resolve_routed_providers(
+        &self,
+        request: &OpenAIRequest,
+        model_group: ModelGroup,
+        active: Option<&ActiveRequestHandle>,
+    ) -> Result<RoutedProviders, GatewayError> {
+        // Smart-routing planning (classification, internal semantic cache,
+        // budget, tier selection) runs BEFORE the first attempt and can include
+        // embedding/LLM-backed classification calls: surface the wait while it
+        // runs so the attempt-0 delay is explainable.
+        let _routing_stall =
+            ActiveRequestHandle::begin_stall_opt(active, StallReason::SmartRouting);
+        let (tier_group, overflow, decision, bypassed, diagnostics) = match self
+            .smart_routing_plan(request, &model_group)
+            .await?
+        {
+            Some(plan) => {
+                let mut tier_group = model_group.clone();
+                tier_group.models = plan.candidates;
+                let overflow = if plan.bypassed {
+                    Vec::new()
+                } else {
+                    plan.overflow
+                };
+                (
+                    tier_group,
+                    overflow,
+                    Some(plan.decision),
+                    plan.bypassed,
+                    plan.diagnostics,
+                )
+            }
+            None => (
+                model_group.clone(),
+                Vec::new(),
+                None,
+                true,
+                RoutingDiagnostics::default(),
+            ),
+        };
 
         let mut providers = self.select_provider_order(&tier_group).await;
         // Cache-aware sticky routing (Req 1.2): promote the provider that
