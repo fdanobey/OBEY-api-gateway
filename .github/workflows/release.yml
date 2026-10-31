@@ -81,8 +81,9 @@ jobs:
 
           git add $manifest Cargo.lock
           git commit -m "chore: bump version to $next"
-          # release/* branches are unprotected; development can't take a direct
-          # push because required checks can't exist on an unpushed SHA.
+          # release/* branches are unprotected; clear any stale branch from a
+          # previous failed attempt before pushing the fresh one.
+          git push origin --delete "refs/heads/release/v$next" 2>$null
           git push origin "HEAD:refs/heads/release/v$next"
 
       - name: Open release PR and enable auto-merge
