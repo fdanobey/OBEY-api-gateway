@@ -30,13 +30,14 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: Guard branch
-        if: github.ref != 'refs/heads/development'
+        if: github.ref != 'refs/heads/master'
         run: |
-          echo "::error::Release can only be cut from the development branch"
+          echo "::error::Release can only be cut from the master branch (Actions → Release → Run workflow on master)"
           exit 1
 
       - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
         with:
+          ref: development
           fetch-depth: 0
           persist-credentials: true
 

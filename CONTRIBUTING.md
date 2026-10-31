@@ -77,9 +77,10 @@ require deep knowledge of the routing internals.
 `development` is the integration branch: everything lands there first, and CI
 runs on every pull request into it and every push to it. `master` tracks
 releases only. When the maintainer is ready to ship, they run the
-**Release** workflow (Actions tab → Release → Run workflow → pick
-patch/minor/major). That workflow bumps the crate version, tags, merges
-`development` into `master`, and publishes the Windows build, installer, and
+**Release** workflow (Actions tab → Release → Run workflow → branch `master` →
+pick patch/minor/major). That button press promotes `development` into
+`master`: it bumps the crate version, merges the bump into `development`,
+fast-forwards `master`, tags, and publishes the Windows build, installer, and
 release notes automatically. Contributors never need to touch this process.
 
 ## Styleguides
