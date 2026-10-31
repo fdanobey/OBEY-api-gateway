@@ -1829,20 +1829,20 @@ async fn chat_completions_non_stream(
         state.metrics.record_cache_miss();
     }
 
-    // Tier-2: semantic cache (paraphrase match).  Skipped for tool-using
+    // Tier-2: semantic cache (paraphrase match). Skipped for tool-using
     // requests — semantic similarity across different tool surfaces is too
     // risky for code agents.
     let skip_semantic =
         request.extra.contains_key("tools") || request.extra.contains_key("tool_choice");
-if !skip_semantic {
-    if let Some(ref cache) = state.cache {
-        // Embedding-backed lookup before the first attempt: mark it so the
-        // attempt-0 wait is explained on the dashboard.
-        let _cache_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
-            Some(&active_handle),
-            crate::active_requests::StallReason::CacheLookup,
-        );
-        match cache.get(&request).await {
+    if !skip_semantic {
+        if let Some(ref cache) = state.cache {
+            // Embedding-backed lookup before the first attempt: mark it so the
+            // attempt-0 wait is explained on the dashboard.
+            let _cache_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                Some(&active_handle),
+                crate::active_requests::StallReason::CacheLookup,
+            );
+            match cache.get(&request).await {
                 Ok(Some(cached_response)) => {
                     state.metrics.record_cache_hit();
                     match serde_json::from_str::<crate::models::openai::OpenAIResponse>(
