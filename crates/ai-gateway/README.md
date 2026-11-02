@@ -259,6 +259,7 @@ The dashboard supports:
 - Real-time metrics over WebSocket
 - Provider and per-model circuit-breaker visibility
 - Per-provider budget columns (spent, remaining, window badge with reset countdown, exhausted state) driven by `budget_status_by_provider` in the metrics snapshot
+- Recent Budget Alerts panel (newest warning / exhausted / reset events from the webhook alert subsystem, served with each metrics snapshot)
 - Request-rate chart seeded from `GET /dashboard/rate-history` on load and WebSocket reconnect, then advanced live by rolling 60s metrics snapshots
 - Recent error retrieval from logged failed requests
 - Log viewer filtering by timestamp, provider, model, status code, and trace id
@@ -281,6 +282,20 @@ providers:
 - `reset_policy` controls when spend resets to zero: `daily` at UTC midnight, `weekly` at Monday 00:00 UTC, `monthly` on the 1st at 00:00 UTC — the same boundary math as virtual-key budget windows. `manual` (the default) never resets automatically.
 - Window rollover is lazy: it happens on the next dispatch after expiry, with no background timers.
 - Spend persists across restarts in `budgets.db` beside `logs.db` and is restored at startup.
+- Optional `alert_threshold_percent` (1-100, default 80) sets the warning threshold for webhook alerts; the exhausted line is fixed at 100.
+
+### Budget-Alert Webhooks
+
+With at least one endpoint configured under `webhooks:`, budgets emit threshold events (`budget.warning`, `budget.exhausted`, `budget.reset`) as Standard Webhooks-signed JSON, with bounded retries and a durable delivery ledger (`webhooks.db`). See `config.example.yaml` for the block:
+
+```yaml
+webhooks:
+endpoints:
+- url: "https://hooks.example.com/budget-alerts"
+secret: "whsec_<placeholder>" # omit for unsigned
+events: ["budget.warning", "budget.exhausted", "budget.reset"] # omit = all
+allowed_private_hosts: [] # exact-match hosts permitting http + private/LAN addresses
+```
 
 Administrative endpoints:
 

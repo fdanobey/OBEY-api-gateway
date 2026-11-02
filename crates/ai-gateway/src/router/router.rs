@@ -685,10 +685,16 @@ pub struct Router {
     /// time the shortfall is detectable, so there is nothing left to retry.
     /// In-memory only — resets on process restart.
     degenerate_stream_combos: Arc<std::sync::RwLock<HashSet<String>>>,
-    /// Prompt-cache sticky routing affinity (prefix hash → last successful
-    /// provider/model, TTL-bounded). Zero-TTL when cache-aware routing is
-    /// disabled, so lookups always miss (Req 1.4, prompt-cache-routing spec).
-    sticky_cache: StickyCache,
+/// Prompt-cache sticky routing affinity (prefix hash → last successful
+/// provider/model, TTL-bounded). Zero-TTL when cache-aware routing is
+/// disabled, so lookups always miss (Req 1.4, prompt-cache-routing spec).
+sticky_cache: StickyCache,
+/// Provider-budget alert hook (budget-alerts-unified-webhooks, Task 5):
+/// threshold evaluation + `budget.reset` events for provider scopes.
+/// `None` until gateway startup wires it (built-once notifier); every
+/// call rides an existing off-path spawn (Req 1.10 — zero synchronous
+/// work on the request/response path).
+provider_budget_alerts: Option<Arc<crate::webhooks::ProviderBudgetAlerts>>,
 }
 
 /// Result of [`Router::route_request_streaming`].
@@ -1091,12 +1097,13 @@ impl Router {
             oauth_usage_tracker: None,
             search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
-        }
+        degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+        sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
+        provider_budget_alerts: None,
     }
+}
 
-    /// Create a new Router with explicit context configuration
+/// Create a new Router with explicit context configuration
     #[allow(dead_code)]
     pub fn with_context_config(
         config: Arc<RwLock<Config>>,
@@ -1140,6 +1147,7 @@ impl Router {
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
+            provider_budget_alerts: None,
         }
     }
 
@@ -1160,6 +1168,17 @@ impl Router {
     /// Codex providers. Called once during gateway startup.
     pub fn set_instructions_store(&mut self, store: Arc<crate::codex::InstructionsStore>) {
         self.instructions_store = Some(store);
+    }
+
+    /// Attach the provider-budget alert hook
+    /// (budget-alerts-unified-webhooks, Task 5). Called once during
+    /// gateway startup with the built-once notifier wrapper; `None`
+    /// leaves the hook dormant (no evaluation, no ledger writes).
+    pub fn set_provider_budget_alerts(
+        &mut self,
+        alerts: Arc<crate::webhooks::ProviderBudgetAlerts>,
+    ) {
+        self.provider_budget_alerts = Some(alerts);
     }
 
     /// Get the Codex Search metrics handle for Prometheus exposition.
@@ -2665,24 +2684,59 @@ impl Router {
         if !crate::virtual_keys::budget::window_expired(&window, window_start, chrono::Utc::now()) {
             return false;
         }
-        // Roll the durable window first (CAS on the window_start we read:
-        // zero spend + new window_start only when no other writer advanced
-        // it); a store failure downgrades to metrics-only rollover, never
-        // fails the request.
-        match store.reset_window(provider, window_start_epoch) {
-            Ok(_previous) => {
-                self.metrics.reset_provider_spend(provider);
-            }
-            Err(error) => {
-                warn!(
-                    provider = %provider,
-                    error = %error,
-                    "Failed to persist provider budget window rollover; keeping in-memory spend (durable/in-memory stay consistent)"
-                );
-            }
-        }
-        true
-    }
+// Roll the durable window first (CAS on the window_start we read:
+// zero spend + new window_start only when no other writer advanced
+// it); a store failure downgrades to metrics-only rollover, never
+// fails the request.
+match store.reset_window(provider, window_start_epoch) {
+Ok(Some(outcome)) => {
+self.metrics.reset_provider_spend(provider);
+// Budget-reset webhook (budget-alerts-unified-webhooks,
+// Req 2.1): a prior window at/over the limit (the
+// provider had been budget-skipped) emits
+// `budget.reset(window_rollover)` with the NEW anchor.
+// Rides a spawned task — this method is on the request
+// path, so nothing synchronous is added (Req 1.10).
+// Only the CAS WINNER emits: `reset_window` returns
+// did_reset atomically with the anchor it stamped, so a
+// racing request whose CAS missed stays silent and the
+// winner uses exactly the anchor its own reset landed
+// (no post-hoc read-back that may belong to a later
+// reset).
+if outcome.did_reset && outcome.previous_spend >= budget_config.limit_usd {
+if let Some(alerts) = self.provider_budget_alerts.clone() {
+let provider = provider.to_string();
+let config = self.config.clone();
+let new_anchor = outcome.new_anchor;
+tokio::spawn(async move {
+alerts
+.note_provider_reset(
+&config,
+&provider,
+crate::webhooks::events::ResetSource::WindowRollover,
+new_anchor,
+)
+.await;
+});
+}
+}
+}
+Ok(None) => {
+// No durable row: nothing was rolled durably, but the
+// in-memory window check above passed — roll the metrics
+// atomics so the hot path still sees a fresh window.
+self.metrics.reset_provider_spend(provider);
+}
+Err(error) => {
+warn!(
+provider = %provider,
+error = %error,
+"Failed to persist provider budget window rollover; keeping in-memory spend (durable/in-memory stay consistent)"
+);
+}
+}
+true
+}
 
     /// Detect and strip image content parts from messages when the target
     /// model does not support vision inputs.
@@ -12900,6 +12954,7 @@ mod tests {
             codex_search: None,
             cache_aware_routing: Default::default(),
             reasoning_compat: Default::default(),
+        webhooks: Default::default(),
         }
     }
 
@@ -16402,6 +16457,7 @@ extra: Default::default(),
             budget: Some(crate::config::ProviderBudgetConfig {
                 limit_usd: 1.0,
                 reset_policy: Some(crate::config::BudgetResetPolicy::Manual),
+        alert_threshold_percent: None,
             }),
             manual_models: vec![],
             global_inference_profile: false,

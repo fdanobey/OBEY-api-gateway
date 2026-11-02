@@ -75,6 +75,7 @@ fn base_config() -> Config {
         codex_search: None,
         structured_output: None,
         reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     }
 }
 
@@ -305,6 +306,7 @@ async fn provider_budget_window_resets_lazily() {
             // Two $3.00 requests exhaust a $5.00 budget within a window.
             limit_usd: 5.0,
             reset_policy: Some(BudgetResetPolicy::Daily),
+            alert_threshold_percent: None,
         }),
     )];
     config.model_groups = vec![ModelGroup {
@@ -396,6 +398,7 @@ async fn manual_policy_never_rolls_over() {
         Some(ProviderBudgetConfig {
             limit_usd: 5.0,
             reset_policy: Some(BudgetResetPolicy::Manual),
+            alert_threshold_percent: None,
         }),
     )];
     config.model_groups = vec![ModelGroup {

@@ -155,6 +155,7 @@ fn base_config(base_url: &str) -> Config {
         structured_output: None,
         memory: None,
         reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     }
 }
 

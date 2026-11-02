@@ -39,6 +39,11 @@ pub fn isolate_databases(config: &mut Config) {
         .keep();
     config.logging.database_path = dir.join("logs.db").to_string_lossy().into_owned();
     config.virtual_keys.database_path = dir.join("keys.db").to_string_lossy().into_owned();
+    // `budgets.db` and `webhooks.db` are placed as siblings of the logs
+    // database (gateway placement rule), so the logs redirect above
+    // isolates them into the same temp dir — no separate handling needed
+    // (budget-alerts-unified-webhooks, Task 5 dormancy test relies on
+    // this: it can find `webhooks.db` next to the redirected logs.db).
 }
 
 /// Minimal valid single-provider `Config` shared by the budget test binaries
@@ -153,6 +158,7 @@ pub fn budget_test_config(
         structured_output: None,
         memory: None,
         reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     };
     if let Some(dir) = db_dir {
         config.logging.database_path = dir.join("logs.db").to_string_lossy().into_owned();

@@ -163,6 +163,27 @@ fn cors_wildcard_credentials_reason(cors: &CorsConfig) -> Option<String> {
     }
 }
 
+/// Whether a literal-IP webhook host falls into a forbidden private
+/// address class (loopback, link-local incl. cloud metadata, CGNAT,
+/// unique-local, multicast, broadcast, unspecified, RFC1918, and the
+/// v6 mapped/NAT64 forms). Reuses the delivery-time classifier from
+/// the outbound-fetch SSRF guard (black-october-security-hardening,
+/// Component 3) so save-time and delivery-time rules can never drift;
+/// hostname (non-literal) hosts return `false` here — they are
+/// resolved and re-checked per delivery attempt instead (validation
+/// never performs DNS).
+fn webhook_host_is_private_address(host: &str) -> bool {
+    let trimmed = host
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    match trimmed.parse::<std::net::IpAddr>() {
+        Ok(ip) => {
+            crate::security::outbound_fetch::forbidden_ip_reason(ip).is_some()
+        }
+        Err(_) => false,
+    }
+}
+
 /// Resolve configuration file path using priority order:
 /// 1. --config CLI flag
 /// 2. CONFIG_PATH environment variable
@@ -247,6 +268,58 @@ impl Config {
         // (allowed_headers) or credentialed access.
         if let Some(reason) = cors_wildcard_credentials_reason(&self.cors) {
             errors.push(ValidationError::CorsWildcardWithCredentials { reason });
+        }
+
+        // Validate webhook endpoints (budget-alerts-unified-webhooks,
+        // Req 3.1-3.3): URLs must parse, https-only unless the host is an
+        // exact-match entry in allowed_private_hosts, event filters
+        // restricted to the known budget event types (enforced at
+        // deserialization; the enum admits no other values).
+        for (index, endpoint) in self.webhooks.endpoints.iter().enumerate() {
+            let field_path = format!("webhooks.endpoints[{index}].url");
+            match reqwest::Url::parse(&endpoint.url) {
+                Ok(url) => {
+                    let host = url.host_str().unwrap_or_default();
+                    let scheme = url.scheme();
+                    // Case-insensitive to match delivery-time semantics
+                    // (outbound_fetch::host_in_private_allowlist).
+                    let allowlisted = self
+                        .webhooks
+                        .allowed_private_hosts
+                        .iter()
+                        .any(|allowed| allowed.eq_ignore_ascii_case(host));
+                    if scheme != "https" && !(scheme == "http" && allowlisted) {
+                        errors.push(ValidationError::InvalidValue {
+                            field: field_path.clone(),
+                            value: endpoint.url.clone(),
+                            expected: "an https URL (http is allowed only for hosts listed in webhooks.allowed_private_hosts)"
+                                .to_string(),
+                        });
+                    }
+                    // Private-address defense at save time: literal-IP hosts
+                    // (v4 and bracketed v6) are checked against the same
+                    // forbidden classes the delivery-time SSRF guard uses —
+                    // https://127.0.0.1/... or https://[::1]/... must not
+                    // pass config validation unless the host is allowlisted.
+                    // Hostnames that need DNS are NOT resolved here (no
+                    // network I/O in validation); delivery-time validation
+                    // re-resolves them with fresh DNS per attempt.
+                    if !allowlisted && webhook_host_is_private_address(host) {
+                        errors.push(ValidationError::InvalidValue {
+                            field: field_path,
+                            value: endpoint.url.clone(),
+                            expected: "a webhook URL whose host is not a loopback, link-local, CGNAT, unique-local, multicast, broadcast, unspecified, or RFC1918 private address (allowlist it in webhooks.allowed_private_hosts to override)".to_string(),
+                        });
+                    }
+                }
+                Err(_) => {
+                    errors.push(ValidationError::InvalidValue {
+                        field: field_path,
+                        value: endpoint.url.clone(),
+                        expected: "a valid URL".to_string(),
+                    });
+                }
+            }
         }
 
         let configured_provider_names: std::collections::HashSet<&str> = self
@@ -394,6 +467,21 @@ impl Config {
                         value: budget.limit_usd.to_string(),
                         expected: "a positive finite dollar amount".to_string(),
                     });
+                }
+
+                // Warning-threshold bounds (budget-alerts-unified-webhooks,
+                // Req 1.8): 1..=100; None = default 80.
+                if let Some(alert_threshold_percent) = budget.alert_threshold_percent {
+                    if !(1..=100).contains(&alert_threshold_percent) {
+                        errors.push(ValidationError::InvalidValue {
+                            field: format!(
+                                "providers.{}.budget.alert_threshold_percent",
+                                provider.name
+                            ),
+                            value: alert_threshold_percent.to_string(),
+                            expected: "a percentage between 1 and 100".to_string(),
+                        });
+                    }
                 }
             }
 
@@ -1295,6 +1383,7 @@ mod property_tests {
             codex_search: None,
             cache_aware_routing: Default::default(),
             reasoning_compat: Default::default(),
+            webhooks: Default::default(),
         }
     }
 
@@ -1529,19 +1618,352 @@ mod property_tests {
         assert!(config.validate().is_ok());
     }
 
-    #[test]
-    fn cors_disabled_wildcard_auth_combo_is_not_flagged() {
-        // Validation only guards enabled CORS; a disabled section is inert.
+#[test]
+fn cors_disabled_wildcard_auth_combo_is_not_flagged() {
+    // Validation only guards enabled CORS; a disabled section is inert.
+    let mut config = minimal_valid_config();
+    config.cors = CorsConfig {
+        enabled: false,
+        allowed_origins: vec!["*".to_string()],
+        allowed_methods: vec!["GET".to_string()],
+        allowed_headers: vec!["Authorization".to_string()],
+        allow_credentials: true,
+    };
+    assert!(config.validate().is_ok());
+}
+
+// --- Webhook config validation (budget-alerts-unified-webhooks,
+// Req 3.1-3.3, 1.8) ---
+
+#[test]
+fn webhooks_absent_section_defaults_to_empty_and_validates() {
+    let config = minimal_valid_config();
+    assert!(config.webhooks.endpoints.is_empty());
+    assert!(config.webhooks.allowed_private_hosts.is_empty());
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn webhooks_section_serde_round_trips() {
+    let yaml = r#"
+endpoints:
+  - url: "https://hooks.example.com/alerts"
+    secret: "whsec_example"
+    events: ["budget.warning", "budget.exhausted", "budget.reset"]
+  - url: "https://hooks.example.com/all"
+allowed_private_hosts: ["hooks.internal"]
+"#;
+    let webhooks: WebhooksConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(
+        webhooks,
+        WebhooksConfig {
+            endpoints: vec![
+                WebhookEndpoint {
+                    url: "https://hooks.example.com/alerts".to_string(),
+                    secret: Some("whsec_example".to_string()),
+                    events: Some(vec![
+                        BudgetEventType::BudgetWarning,
+                        BudgetEventType::BudgetExhausted,
+                        BudgetEventType::BudgetReset,
+                    ]),
+                },
+                WebhookEndpoint {
+                    url: "https://hooks.example.com/all".to_string(),
+                    secret: None,
+                    events: None,
+                },
+            ],
+            allowed_private_hosts: vec!["hooks.internal".to_string()],
+        }
+    );
+
+    // Round-trip: serialize → deserialize is identity, and event names
+    // serialize as the exact wire strings receivers match on.
+    let serialized = serde_yaml::to_string(&webhooks).unwrap();
+    assert!(serialized.contains("budget.warning"));
+    assert!(serialized.contains("budget.exhausted"));
+    assert!(serialized.contains("budget.reset"));
+    let reparsed: WebhooksConfig = serde_yaml::from_str(&serialized).unwrap();
+    assert_eq!(reparsed, webhooks);
+}
+
+#[test]
+fn webhooks_unknown_event_name_rejected() {
+    let yaml = r#"
+endpoints:
+  - url: "https://hooks.example.com/alerts"
+    events: ["budget.exploded"]
+"#;
+    assert!(serde_yaml::from_str::<WebhooksConfig>(yaml).is_err());
+}
+
+#[test]
+fn webhooks_invalid_url_rejected() {
+    let mut config = minimal_valid_config();
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "not a url".to_string(),
+        secret: None,
+        events: None,
+    });
+    let errors = config.validate().unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, .. }
+        if field == "webhooks.endpoints[0].url"
+    )));
+}
+
+#[test]
+fn webhooks_http_url_rejected_unless_exact_host_allowlisted() {
+    // Plain http, no allowlist.
+    let mut config = minimal_valid_config();
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "http://hooks.internal:8080/alerts".to_string(),
+        secret: None,
+        events: None,
+    });
+    let errors = config.validate().unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, .. }
+        if field == "webhooks.endpoints[0].url"
+    )));
+
+    // Substring/suffix host entries are NOT exact matches.
+    let mut config = minimal_valid_config();
+    config
+        .webhooks
+        .allowed_private_hosts
+        .push("hooks.internal.example.com".to_string());
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "http://hooks.internal:8080/alerts".to_string(),
+        secret: None,
+        events: None,
+    });
+    let errors = config.validate().unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, .. }
+        if field == "webhooks.endpoints[0].url"
+    )));
+}
+
+#[test]
+fn webhooks_http_url_accepted_when_exact_host_allowlisted() {
+    let mut config = minimal_valid_config();
+    config
+        .webhooks
+        .allowed_private_hosts
+        .push("hooks.internal".to_string());
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "http://hooks.internal:8080/alerts".to_string(),
+        secret: None,
+        events: None,
+    });
+    assert!(config.validate().is_ok());
+
+    // https URLs remain valid with or without an allowlist entry.
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "https://hooks.example.com/alerts".to_string(),
+        secret: None,
+        events: None,
+    });
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn webhooks_allowlist_matching_is_case_insensitive() {
+    // Uppercase YAML allowlist entry + matching-case (lowercase) URL
+    // host is accepted — parity with delivery-time eq_ignore_ascii_case.
+    let mut config = minimal_valid_config();
+    config
+        .webhooks
+        .allowed_private_hosts
+        .push("HOOKS.INTERNAL".to_string());
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "http://hooks.internal:8080/alerts".to_string(),
+        secret: None,
+        events: None,
+    });
+    assert!(config.validate().is_ok());
+
+    // Mixed-case host NOT in the (case-differing) list is rejected.
+    let mut config = minimal_valid_config();
+    config
+        .webhooks
+        .allowed_private_hosts
+        .push("hooks.internal".to_string());
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "http://Hooks.Other:8080/alerts".to_string(),
+        secret: None,
+        events: None,
+    });
+    let errors = config.validate().unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, .. }
+        if field == "webhooks.endpoints[0].url"
+    )));
+}
+
+#[test]
+fn webhooks_private_literal_ip_https_url_rejected_unless_allowlisted() {
+    // https + private literal v4: rejected without an allowlist entry.
+    for url in [
+        "https://127.0.0.1/hook",
+        "https://10.0.0.5/x",
+        "https://192.168.1.20/x",
+        "https://169.254.169.254/latest/meta-data",
+        "https://100.64.0.1/x",
+        "https://0.0.0.0/x",
+        "https://255.255.255.255/x",
+        "https://224.0.0.1/x",
+    ] {
         let mut config = minimal_valid_config();
-        config.cors = CorsConfig {
-            enabled: false,
-            allowed_origins: vec!["*".to_string()],
-            allowed_methods: vec!["GET".to_string()],
-            allowed_headers: vec!["Authorization".to_string()],
-            allow_credentials: true,
-        };
-        assert!(config.validate().is_ok());
+        config.webhooks.endpoints.push(WebhookEndpoint {
+            url: url.to_string(),
+            secret: None,
+            events: None,
+        });
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidValue { field, .. }
+                if field == "webhooks.endpoints[0].url"
+            )),
+            "private literal host must be rejected: {url}"
+        );
     }
+
+    // IPv6 literal private (the URL lib keeps brackets in host_str):
+    // rejected unless the bracketed form is allowlisted — fail-closed.
+    let mut config = minimal_valid_config();
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "https://[::1]/x".to_string(),
+        secret: None,
+        events: None,
+    });
+    let errors = config.validate().unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, .. }
+        if field == "webhooks.endpoints[0].url"
+    )));
+
+    // Allowlisted bracketed v6 form is accepted.
+    let mut config = minimal_valid_config();
+    config
+        .webhooks
+        .allowed_private_hosts
+        .push("[::1]".to_string());
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "https://[::1]/x".to_string(),
+        secret: None,
+        events: None,
+    });
+    assert!(config.validate().is_ok());
+
+    // Public literal IP stays valid.
+    let mut config = minimal_valid_config();
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "https://8.8.8.8/hook".to_string(),
+        secret: None,
+        events: None,
+    });
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn webhooks_trailing_dot_host_requires_exact_allowlist_entry() {
+    // `hooks.internal.` (trailing dot) is a distinct hostname from
+    // `hooks.internal`; only an exact allowlist entry permits it.
+    let mut config = minimal_valid_config();
+    config
+        .webhooks
+        .allowed_private_hosts
+        .push("hooks.internal".to_string());
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "http://hooks.internal.:8080/alerts".to_string(),
+        secret: None,
+        events: None,
+    });
+    let errors = config.validate().unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, .. }
+        if field == "webhooks.endpoints[0].url"
+    )));
+
+    // The exact trailing-dot entry itself does permit it.
+    let mut config = minimal_valid_config();
+    config
+        .webhooks
+        .allowed_private_hosts
+        .push("hooks.internal.".to_string());
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "http://hooks.internal.:8080/alerts".to_string(),
+        secret: None,
+        events: None,
+    });
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn webhooks_userinfo_url_rejected() {
+    // http://allowed@evil/ — userinfo is not the host; the effective
+    // host is `evil`, which is not allowlisted, so plain http fails.
+    let mut config = minimal_valid_config();
+    config
+        .webhooks
+        .allowed_private_hosts
+        .push("allowed".to_string());
+    config.webhooks.endpoints.push(WebhookEndpoint {
+        url: "http://allowed@evil/hook".to_string(),
+        secret: None,
+        events: None,
+    });
+    let errors = config.validate().unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, .. }
+        if field == "webhooks.endpoints[0].url"
+    )));
+}
+
+#[test]
+fn budget_alert_threshold_percent_bounds_are_validated() {
+    for threshold in [0u8, 101] {
+        let mut config = minimal_valid_config();
+        config.providers[0].budget = Some(ProviderBudgetConfig {
+            limit_usd: 50.0,
+            reset_policy: None,
+            alert_threshold_percent: Some(threshold),
+        });
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidValue { field, .. }
+                if field == "providers.test-provider.budget.alert_threshold_percent"
+            )),
+            "threshold {threshold} should be rejected"
+        );
+    }
+
+    for threshold in [1u8, 100] {
+        let mut config = minimal_valid_config();
+        config.providers[0].budget = Some(ProviderBudgetConfig {
+            limit_usd: 50.0,
+            reset_policy: None,
+            alert_threshold_percent: Some(threshold),
+        });
+        assert!(
+            config.validate().is_ok(),
+            "threshold {threshold} should be valid"
+        );
+    }
+}
 
     // Context Overflow Management, Task 1.3: validation of the new
     // ContextConfig overflow fields. **Validates: Requirements US-2, US-3**

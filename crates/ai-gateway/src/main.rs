@@ -54,6 +54,8 @@ mod tool_compression;
 #[cfg(feature = "tray")]
 mod tray;
 mod virtual_keys;
+#[allow(dead_code, unused_imports)]
+mod webhooks;
 
 #[derive(Parser, Debug)]
 #[command(name = "ai-gateway")]

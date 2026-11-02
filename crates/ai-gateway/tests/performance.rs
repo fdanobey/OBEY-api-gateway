@@ -283,6 +283,7 @@ fn build_router_from_fixture(fixture: &ProviderSelectionFixture) -> Router {
         codex_search: None,
         structured_output: None,
         reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     };
     common::isolate_databases(&mut config);
     Router::new(Arc::new(RwLock::new(config)), test_metrics())
@@ -752,6 +753,7 @@ fn test_config() -> Config {
         codex_search: None,
         structured_output: None,
         reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     }
 }
 
@@ -1463,6 +1465,7 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
             budget: (i % 2 == 0).then(|| ProviderBudgetConfig {
                 limit_usd: 10.0,
                 reset_policy: Some(BudgetResetPolicy::Manual),
+                alert_threshold_percent: None,
             }),
             manual_models: vec![],
             global_inference_profile: false,
@@ -1553,6 +1556,7 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
         codex_search: None,
         structured_output: None,
         reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     };
     common::isolate_databases(&mut config);
     let shared = Arc::new(RwLock::new(config));

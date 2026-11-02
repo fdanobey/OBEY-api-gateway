@@ -170,6 +170,7 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
         reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     }
 }
 

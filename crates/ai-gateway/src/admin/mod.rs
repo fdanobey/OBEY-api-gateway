@@ -53,9 +53,16 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
 
     // Virtual key admin API (Req 10.1-10.6). Self-contained router owning an
     // `Arc<VirtualKeyManager>`; nested here so the admin auth `route_layer`
-    // below protects every `/keys` endpoint (Req 10.2).
+    // below protects every `/keys` endpoint (Req 10.2). Wrapped by
+    // `vk_reset_webhook_layer` so a successful spend reset also emits the
+    // `budget.reset(admin)` webhook (budget-alerts-unified-webhooks,
+    // Task 6, Req 2.2).
     let virtual_keys_api =
-        crate::virtual_keys::admin::routes(std::sync::Arc::clone(&state.virtual_key_manager));
+    crate::virtual_keys::admin::routes(std::sync::Arc::clone(&state.virtual_key_manager))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            vk_reset_webhook_layer,
+        ));
 
     let loop_detection_api = crate::loop_detection::admin::routes();
     let memory_api = crate::memory::admin::routes(state.memory_system.clone());
@@ -94,6 +101,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .nest("/memory", memory_api)
         .nest("/tool-compression", tool_compression::routes())
         .nest("/smart-routing", smart_routing_api)
+        .nest("/webhooks", crate::webhooks::admin::routes())
         .nest_service("/keys", virtual_keys_api)
         .route("/providers/models", post(proxy_provider_models))
         .route("/providers/{name}/budget", get(get_provider_budget))
@@ -421,6 +429,26 @@ fn redact_config_for_response(config: &Config) -> serde_json::Value {
         redact_laya_credentials(smart_routing, config.smart_routing.laya.as_ref());
     }
 
+    // Webhook endpoint secrets are masked with the same sentinel the
+    // dedicated /admin/webhooks GET uses (Req 3.6): the full-config
+    // GET must never echo a raw `whsec_` value. The PUT path
+    // preserves stored secrets for URLs whose secret comes back as
+    // the sentinel (see `preserve_webhook_masked_secrets`).
+    if let Some(webhooks) = body.get_mut("webhooks").and_then(|v| v.as_object_mut()) {
+        if let Some(endpoints) = webhooks.get_mut("endpoints").and_then(|v| v.as_array_mut()) {
+            for endpoint in endpoints.iter_mut() {
+                if let Some(obj) = endpoint.as_object_mut() {
+                    if let Some(secret) = obj.get_mut("secret") {
+                        if secret.as_str().is_some_and(|s| !s.is_empty()) {
+                            *secret =
+                                serde_json::Value::String(crate::webhooks::admin::SECRET_MASK.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     body
 }
 
@@ -664,6 +692,21 @@ fn normalize_config_for_storage(
         }
     }
 
+    // Webhook secrets (Req 3.6 round-trip rule, mirrors the dedicated
+    // /admin/webhooks PUT): a secret returned unchanged as the
+    // `[configured]` sentinel preserves the stored secret for the
+    // same URL. A sentinel for a URL with no stored endpoint
+    // preserves nothing and must not persist the mask itself — it
+    // becomes an unsigned endpoint.
+    for endpoint in &mut config.webhooks.endpoints {
+        if endpoint.secret.as_deref() == Some(crate::webhooks::admin::SECRET_MASK) {
+            endpoint.secret = existing_config
+                .and_then(|existing| existing.webhooks.endpoints.iter().find(|stored| stored.url == endpoint.url))
+                .and_then(|stored| stored.secret.clone())
+                .filter(|secret| !secret.is_empty());
+        }
+    }
+
     normalize_smart_routing_credentials(
         &mut config.smart_routing,
         existing_config.map(|config| &config.smart_routing),
@@ -861,10 +904,10 @@ async fn update_smart_routing_config(
     }
     if let Err(errors) = candidate.validate() {
         return (
- StatusCode::BAD_REQUEST,
- Json(json!({"error":{"type":"validation_error","details":errors.iter().map(ToString::to_string).collect::<Vec<_>>()}})),
- )
- .into_response();
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"type":"validation_error","details":errors.iter().map(ToString::to_string).collect::<Vec<_>>()}})),
+        )
+        .into_response();
     }
     // Stamp the resolved security mode (Req 1.10): every save path persists
     // the migrated marker so the on-disk YAML no longer reads as legacy.
@@ -1492,11 +1535,19 @@ async fn reset_circuit_breakers(
 /// GET /admin/config/export — download current config as YAML (Req 32.1, 32.2, 32.7)
 ///
 /// Returns the current configuration serialized as YAML with a
-/// Content-Disposition header to trigger a browser download.
+/// Content-Disposition header to trigger a browser download. Webhook
+/// endpoint secrets are stripped to null in the export payload (the
+/// mask sentinel would survive a round-trip as a literal — null is
+/// clean for re-import: URLs export, secrets never do).
 async fn export_config(State(state): State<AppState>) -> Response {
     let config = state.config.read().await;
 
-    let yaml = match serde_yaml::to_string(&*config) {
+    let mut export_config = config.clone();
+    for endpoint in &mut export_config.webhooks.endpoints {
+        endpoint.secret = None;
+    }
+
+    let yaml = match serde_yaml::to_string(&export_config) {
         Ok(y) => y,
         Err(_) => {
             return (
@@ -1672,50 +1723,80 @@ async fn reset_provider_budget(
         }
     }
 
-    // Durable reset first (CAS on the durable window_start: zeroes the
-    // row only when it is still anchored where we read it), on the
-    // blocking pool — same discipline as the virtual-key reset. A store
-    // error for a provider that HAS a row is fail-closed: durable spend
-    // survives and the request errors instead of reporting success.
-    let store_reset: Result<Option<f64>, String> = match state.metrics.provider_budget_store() {
-        Some(store) => {
-            let store_name = name.clone();
-            tokio::task::spawn_blocking(move || {
-                // Read the durable anchor the CAS reset expects. An error
-                // here is treated like a reset error (the row's existence
-                // is unknowable — do not claim success).
-                let expected = store.get_window_start(&store_name)?;
-                match expected {
-                    Some(expected) => store.reset_window(&store_name, expected),
-                    // No row yet: nothing durable to zero.
-                    None => Ok(None),
-                }
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|inner| inner.map_err(|e| e.to_string()))
-        }
-        // No durable store attached (e.g. degraded startup path): nothing
-        // durable to zero; reset the in-memory view only.
-        None => Ok(None),
-    };
-    let previous_spend_usd = match store_reset {
-        Ok(previous) => previous.unwrap_or(0.0),
-        Err(error) => {
-            tracing::error!(
-                provider = %name,
-                error = %error,
-                "Failed to reset provider budget window in store; refusing to zero in-memory spend"
-            );
-            return Err(crate::error::GatewayError::Database(format!(
-                "Failed to reset budget window for provider '{name}': {error}"
-            )));
-        }
-    };
-    // Metrics atomics + exhaustion marker (budget_skip visibility) only
-    // after the durable reset succeeded.
-    state.metrics.reset_provider_spend(&name);
-    state.metrics.clear_provider_budget_exhausted(&name);
+// Durable reset first (CAS on the durable window_start: zeroes the
+// row only when it is still anchored where we read it), on the
+// blocking pool — same discipline as the virtual-key reset. A store
+// error for a provider that HAS a row is fail-closed: durable spend
+// survives and the request errors instead of reporting success.
+let store_reset: Result<
+Option<crate::metrics::provider_budget_store::ResetWindowOutcome>,
+String,
+> = match state.metrics.provider_budget_store() {
+Some(store) => {
+let store_name = name.clone();
+tokio::task::spawn_blocking(move || {
+// Read the durable anchor the CAS reset expects. An error
+// here is treated like a reset error (the row's existence
+// is unknowable — do not claim success).
+let expected = store.get_window_start(&store_name)?;
+match expected {
+Some(expected) => store.reset_window(&store_name, expected),
+// No row yet: nothing durable to zero.
+None => Ok(None),
+}
+})
+.await
+.map_err(|e| e.to_string())
+.and_then(|inner| inner.map_err(|e| e.to_string()))
+}
+// No durable store attached (e.g. degraded startup path): nothing
+// durable to zero; reset the in-memory view only.
+None => Ok(None),
+};
+let (previous_spend_usd, reset_anchor) = match store_reset {
+// Admin resets re-arm unconditionally (Req 2.2) — even a CAS
+// miss (another admin/window reset raced) reports success; the
+// anchor the outcome carries is the freshest durable anchor.
+Ok(Some(outcome)) => (outcome.previous_spend, Some(outcome.new_anchor)),
+Ok(None) => (0.0, None),
+Err(error) => {
+tracing::error!(
+provider = %name,
+error = %error,
+"Failed to reset provider budget window in store; refusing to zero in-memory spend"
+);
+return Err(crate::error::GatewayError::Database(format!(
+"Failed to reset budget window for provider '{name}': {error}"
+)));
+}
+};
+// Metrics atomics + exhaustion marker (budget_skip visibility) only
+// after the durable reset succeeded.
+state.metrics.reset_provider_spend(&name);
+state.metrics.clear_provider_budget_exhausted(&name);
+
+// Budget-reset webhook (budget-alerts-unified-webhooks, Req 2.2):
+// re-arm the scope's fired state and emit `budget.reset(admin)`
+// with the anchor the store reset just returned (atomic with the
+// zeroing — no read-back that could observe a later rollover).
+// Admin path — not on the request/response hot path; the emit
+// spawns delivery.
+{
+let alerts = state.provider_budget_alerts.clone();
+let config = state.config.clone();
+let provider = name.clone();
+tokio::spawn(async move {
+let new_anchor = reset_anchor.unwrap_or_else(|| chrono::Utc::now().timestamp());
+alerts
+.note_provider_reset(
+&config,
+&provider,
+crate::webhooks::events::ResetSource::Admin,
+new_anchor,
+)
+.await;
+});
+}
 
     tracing::info!(provider = %name, "Admin endpoint reset provider budget window");
     Ok(Json(json!({
@@ -1733,6 +1814,68 @@ fn unknown_provider(name: &str) -> crate::error::GatewayError {
         message: format!("Provider '{name}' not found"),
         status_code: Some(404),
     }
+}
+
+/// VK admin-router middleware emitting `budget.reset(admin)` after a
+/// successful `POST /keys/{id}/reset` (budget-alerts-unified-webhooks,
+/// Task 6, Req 2.2): the handler has already zeroed the counters and
+/// advanced the durable window anchor, so the event carries the NEW
+/// anchor. The emit is spawned — the admin path is never the
+/// request/response hot path (design D4). Dormancy gating happens
+/// inside `note_virtual_key_reset` (Req 3.3). The key id/name are the
+/// only identity fields; the `vk_` secret never appears (Req 1.2).
+async fn vk_reset_webhook_layer(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let is_reset = request.uri().path().ends_with("/reset")
+        && matches!(*request.method(), axum::http::Method::POST);
+    // Extract the key id from the path segment before `/reset`
+    // (`/{id}/reset`): everything between the last two segments.
+    let key_id = if is_reset {
+        let path = request.uri().path().trim_end_matches('/');
+        path.rsplit_once('/')
+            .and_then(|(head, _)| head.rsplit_once('/'))
+            .map(|(_, id)| id.to_string())
+            .filter(|id| !id.is_empty())
+    } else {
+        None
+    };
+
+    let response = next.run(request).await;
+    if response.status().is_success() {
+        if let Some(key_id) = key_id {
+            let alerts = state.provider_budget_alerts.clone();
+            let config = state.config.clone();
+            let manager = state.virtual_key_manager.clone();
+            tokio::spawn(async move {
+                // Resolve the fresh durable anchor + key name after the
+                // reset landed (best-effort: a missing row emits with
+                // the current time, matching the provider reset path).
+                let (name, new_anchor) = match manager.key_budget_state(&key_id).await {
+                    Ok(Some(state)) => (
+                        state.name.unwrap_or_default(),
+                        state
+                            .window_start
+                            .map(|ws| ws.timestamp())
+                            .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                    ),
+                    _ => (String::new(), chrono::Utc::now().timestamp()),
+                };
+                alerts
+                    .note_virtual_key_reset(
+                        &config,
+                        &key_id,
+                        &name,
+                        crate::webhooks::events::ResetSource::Admin,
+                        new_anchor,
+                    )
+                    .await;
+            });
+        }
+    }
+    response
 }
 
 /// POST /admin/test-connection
@@ -2645,6 +2788,7 @@ mod tests {
                     reasoning_models_allowlist: Default::default(),
                     codex_search: None,
                     reasoning_compat: Default::default(),
+            webhooks: Default::default(),
                 })
             })
         })
@@ -3388,6 +3532,7 @@ retry:
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
             codex_search: None,
+    webhooks: Default::default(),
             reasoning_compat: Default::default(),
         };
         config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
@@ -4948,35 +5093,110 @@ retry:
         );
     }
 
-    /// S7 (R2): credential-bearing custom header values are redacted in the
-    /// config GET response; the header name survives so the pair is visible.
-    #[test]
-    fn test_redact_config_for_response_redacts_credential_custom_headers() {
-        let mut config = arb_config()
-            .new_tree(&mut proptest::test_runner::TestRunner::default())
-            .unwrap()
-            .current();
-        config.providers[0].custom_headers.insert(
-            "Authorization".to_string(),
-            "Bearer sk-custom-header-secret-abcdef".to_string(),
-        );
-        config.providers[0]
-            .custom_headers
-            .insert("X-Team".to_string(), "obey-core".to_string());
+/// S7 (R2): credential-bearing custom header values are redacted in the
+/// config GET response; the header name survives so the pair is visible.
+#[test]
+fn test_redact_config_for_response_redacts_credential_custom_headers() {
+    let mut config = arb_config()
+        .new_tree(&mut proptest::test_runner::TestRunner::default())
+        .unwrap()
+        .current();
+    config.providers[0].custom_headers.insert(
+        "Authorization".to_string(),
+        "Bearer sk-custom-header-secret-abcdef".to_string(),
+    );
+    config.providers[0]
+        .custom_headers
+        .insert("X-Team".to_string(), "obey-core".to_string());
 
-        let redacted = redact_config_for_response(&config);
-        let headers = &redacted["providers"][0]["custom_headers"];
-        assert_eq!(
-            headers["Authorization"], "[configured]",
-            "credential-bearing value must be redacted"
-        );
-        assert_eq!(headers["X-Team"], "obey-core", "non-secret value must stay");
-        let serialized = serde_json::to_string(&redacted).unwrap();
-        assert!(
-            !serialized.contains("sk-custom-header-secret-abcdef"),
-            "GET response leaked custom header secret: {serialized}"
-        );
-    }
+    let redacted = redact_config_for_response(&config);
+    let headers = &redacted["providers"][0]["custom_headers"];
+    assert_eq!(
+        headers["Authorization"], "[configured]",
+        "credential-bearing value must be redacted"
+    );
+    assert_eq!(headers["X-Team"], "obey-core", "non-secret value must stay");
+    let serialized = serde_json::to_string(&redacted).unwrap();
+    assert!(
+        !serialized.contains("sk-custom-header-secret-abcdef"),
+        "GET response leaked custom header secret: {serialized}"
+    );
+}
+
+/// Webhook endpoint secrets are masked in the full-config GET with
+/// the same `[configured]` sentinel the dedicated /admin/webhooks GET
+/// uses (Req 3.6 parity: every GET surface).
+#[test]
+fn test_redact_config_for_response_masks_webhook_secrets() {
+    let mut config = arb_config()
+        .new_tree(&mut proptest::test_runner::TestRunner::default())
+        .unwrap()
+        .current();
+    config.webhooks.endpoints = vec![crate::config::WebhookEndpoint {
+        url: "https://hooks.example.com/alerts".to_string(),
+        secret: Some("whsec_full_config_get_secret".to_string()),
+        events: None,
+    }];
+
+    let redacted = redact_config_for_response(&config);
+    assert_eq!(
+        redacted["webhooks"]["endpoints"][0]["secret"], "[configured]",
+        "webhook secret must be masked in the full-config GET"
+    );
+    assert_eq!(
+        redacted["webhooks"]["endpoints"][0]["url"],
+        "https://hooks.example.com/alerts",
+        "URL survives masking (endpoint identity)"
+    );
+    let serialized = serde_json::to_string(&redacted).unwrap();
+    assert!(
+        !serialized.contains("whsec_full_config_get_secret"),
+        "GET response leaked webhook secret: {serialized}"
+    );
+}
+
+/// Full-config PUT round-trip (Req 3.6): a secret returned unchanged
+/// as the `[configured]` sentinel preserves the stored secret for the
+/// same URL; a sentinel for an unknown URL clears to unsigned (never
+/// persists the mask itself).
+#[test]
+fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
+    let mut config = arb_config()
+        .new_tree(&mut proptest::test_runner::TestRunner::default())
+        .unwrap()
+        .current();
+    config.webhooks.endpoints = vec![crate::config::WebhookEndpoint {
+        url: "https://hooks.example.com/alerts".to_string(),
+        secret: Some("whsec_stored_secret".to_string()),
+        events: None,
+    }];
+
+    // Round-trip body: same URL, sentinel secret.
+    let mut incoming = config.clone();
+    incoming.webhooks.endpoints[0].secret =
+        Some(crate::webhooks::admin::SECRET_MASK.to_string());
+    let stored =
+        normalize_config_for_storage(incoming, Some(&config)).expect("normalize must succeed");
+    assert_eq!(
+        stored.webhooks.endpoints[0].secret.as_deref(),
+        Some("whsec_stored_secret"),
+        "sentinel must preserve the stored secret for the same URL"
+    );
+
+    // Sentinel for a URL with no stored endpoint: nothing to
+    // preserve — becomes unsigned, never persists the mask literal.
+    let mut unknown = config.clone();
+    unknown.webhooks.endpoints = vec![crate::config::WebhookEndpoint {
+        url: "https://hooks.example.com/other".to_string(),
+        secret: Some(crate::webhooks::admin::SECRET_MASK.to_string()),
+        events: None,
+    }];
+    let stored = normalize_config_for_storage(unknown, Some(&config)).expect("normalize");
+    assert_eq!(
+        stored.webhooks.endpoints[0].secret, None,
+        "sentinel for unknown URL must not persist the mask"
+    );
+}
 
     /// C7 (R8): scheme-default ports normalize away in origin comparison, so
     /// `https://host` and `https://host:443` are the same origin (and ditto

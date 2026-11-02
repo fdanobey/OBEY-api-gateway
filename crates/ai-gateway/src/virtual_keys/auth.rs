@@ -449,24 +449,24 @@ async fn enforce_authenticated(
 
         // Req 6.4: model access is checked BEFORE budget / rate limit so denied
         // requests consume no budget or rate-limit capacity.
- if let Some(model) = &model {
- if let Err(err) = manager.check_model_access(&key, model) {
- return access_denied_response(&err, messages_path);
- }
- }
+        if let Some(model) = &model {
+            if let Err(err) = manager.check_model_access(&key, model) {
+                return access_denied_response(&err, messages_path);
+            }
+        }
 
- (Request::from_parts(parts, Body::from(bytes)), model)
- } else {
- (request, None)
- };
+        (Request::from_parts(parts, Body::from(bytes)), model)
+    } else {
+        (request, None)
+    };
 
- // Budget (Req 3.2 / 4.2) then per-key rate limit (Req 5.1-5.5).
- if let Err(err) = manager.check_budget(&key) {
- return budget_exhausted_response(&err, messages_path);
- }
- if let Err(err) = manager.check_rate_limit(&key) {
- return rate_limited_response(&err, messages_path);
- }
+    // Budget (Req 3.2 / 4.2) then per-key rate limit (Req 5.1-5.5).
+    if let Err(err) = manager.check_budget(&key) {
+        return budget_exhausted_response(&err, messages_path);
+    }
+    if let Err(err) = manager.check_rate_limit(&key) {
+        return rate_limited_response(&err, messages_path);
+    }
 
     // Carry the authenticated key downstream (Req 2.1) and forward.
     let key_id = key.id.clone();
@@ -581,10 +581,29 @@ async fn record_usage_from_response(
         // TPM rolling window reflects real consumption (Req 5.3).
         manager.record_tpm_usage(&record.key_id, tpm_tokens);
         // Persist spend/token/request counters off the response path (Req 3.5).
+        // Budget-alert evaluation (Task 6, Reqs 1.2-1.4) rides this same
+        // spawned task — never the response path (design D4): after the
+        // durable write, resolve the key's durable limit/window facts and
+        // hand them to the shared alert registry.
+        let alerts = state.provider_budget_alerts.clone();
+        let config = state.config.clone();
+        let key_id_for_alerts = key_id.to_string();
         tokio::spawn(async move {
             if let Err(e) = manager.record_usage(record).await {
                 tracing::warn!(error = %e, "failed to record virtual key usage");
+                return;
             }
+            // Alert evaluation (Req 1.2) rides the same off-path spawn
+            // (design D4): shared helper resolves the key's durable limit /
+            // window facts and evaluates. The read-back is a second store
+            // operation after the write, so a reset landing in between can
+            // erase a crossing — accepted residual race, design D11
+            // tolerance style (the next accrual in the fresh window
+            // evaluates correctly); read failures warn (never silently
+            // discarded).
+            manager
+                .evaluate_budget_alerts_after_usage(&alerts, &config, &key_id_for_alerts)
+                .await;
         });
     }
 
@@ -674,10 +693,10 @@ fn usage_tokens(
     if primary.is_some_and(|tokens| tokens > 0) {
         return primary;
     }
-    usage
-        .and_then(|u| u.get(fallback))
-        .and_then(serde_json::Value::as_u64)
-        .filter(|tokens| *tokens > 0)
+usage
+.and_then(|u| u.get(fallback))
+.and_then(serde_json::Value::as_u64)
+.filter(|tokens| *tokens > 0)
 }
 
 /// Resolve `(input_rate, output_rate)` per-million-token cost rates for the

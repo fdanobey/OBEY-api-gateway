@@ -53,6 +53,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Guardrail pipelines** — configurable pre-call and post-call policy enforcement with PII redaction/re-injection, regex scanning, Presidio NLP, OpenAI Moderation, Lakera, semantic prompt guard, and custom HTTP providers; includes refusal detection with automatic failover (see [Guardrail Pipelines](#guardrail-pipelines))
 - **Agent loop detection** — multi-signal confidence scorer detects repetitive agent behavior (tool-call repetition, content similarity, error cycling, response stagnation, token/cost velocity, context growth) and escalates through Warn → Throttle → Inject → Hard-Stop enforcement levels; per-virtual-key overrides, session admin API, and Prometheus histograms (see [Agent Loop Detection](#agent-loop-detection))
 - **Virtual key management** — issue per-caller API keys (`vk_…`) with independent USD/token budgets, rate limits, model-access restrictions, and expiry; authenticate callers without sharing real provider keys (see [Virtual Key Management](#virtual-key-management))
+- **Budget alerts & webhooks** — warn/exhausted threshold events for provider and virtual-key budgets (defaults 80%/100%, per-provider warn override), `budget.reset` recovery events, and a unified webhook system delivering Standard Webhooks-signed JSON with bounded retries, a delivery ledger, and a test-send control (see [Budget Alerts](#budget-alerts))
 - **Encrypted API key storage** — provider keys encrypted at rest with a machine-local master key
 - **Assistants API** — full local OpenAI-compatible Assistants implementation (assistants, threads, messages, runs, run steps, files) backed by SQLite; multi-tenant with per-virtual-key isolation, resource quotas, and run execution through gateway routing (see [Assistants API](#assistants-api))
 - **Active request tracking** — live in-flight request registry surfaces per-request phase (primary / retry / failover / cascade), target provider, elapsed time, and virtual key to the dashboard in real time
@@ -821,6 +822,23 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 The admin panel's **Virtual Keys** section provides a searchable/sortable key table (with budget and expiry warnings), create/edit forms, one-time key reveal, revoke/delete confirmations, and a 30-day per-key usage chart.
+
+## Budget Alerts
+
+Provider budgets and virtual-key budgets can notify you before and when they hit their limits. With at least one webhook endpoint configured, the gateway emits `budget.warning` (default 80% of the limit, per-provider `alert_threshold_percent` override), `budget.exhausted` (fixed 100% — the enforcement line), and `budget.reset` (window rollover or admin reset) events as Standard Webhooks-signed JSON, with bounded retries (4 attempts: immediate, 30 s, 2 m, 10 m), a durable delivery ledger, and an admin-panel test send.
+
+Providers are budget-skipped at 100% (routing fails over); virtual-key callers get a `429`. Full enforcement semantics, event payloads, and the signature verification recipe: see the [Budgets & Alerts](https://github.com/fdanobey/OBEY-api-gateway/wiki) wiki page.
+
+```yaml
+webhooks:
+endpoints:
+- url: "https://hooks.example.com/budget-alerts" # https-only unless allowlisted
+secret: "whsec_<placeholder>" # Standard Webhooks HMAC key; omit for unsigned
+events: ["budget.warning", "budget.exhausted", "budget.reset"] # omit = all
+allowed_private_hosts: [] # exact-match hosts permitting http + private/LAN addresses
+```
+
+No endpoints configured (the default) means the subsystem is fully dormant.
 
 ## Guardrail Pipelines
 

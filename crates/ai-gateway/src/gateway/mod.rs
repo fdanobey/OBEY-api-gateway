@@ -28,6 +28,9 @@ use crate::responses::ResponsesStore;
 use crate::router::router::Router as RequestRouter;
 use crate::structured_output::StructuredOutputEngine;
 use crate::virtual_keys::VirtualKeyManager;
+use crate::webhooks::alerts::ScopeRef;
+use crate::webhooks::ledger::WebhookLedgerStore;
+use crate::webhooks::{ProviderBudgetAlerts, WebhookNotifier};
 
 /// Shared application state accessible by all route handlers.
 #[derive(Clone)]
@@ -88,11 +91,27 @@ pub struct AppState {
     /// Local SQLite store for Responses API (`/v1/responses`) stateful
     /// persistence: `store`, `previous_response_id`, retrieval endpoints.
     pub responses_store: Arc<ResponsesStore>,
-    /// Lock-free snapshot of the per-request limits (body size, global
-    /// deadline). Read on every request instead of taking `config.read()`, so a
-    /// queued config writer cannot stall the whole gateway.
-    pub runtime_limits: Arc<crate::runtime_limits::RuntimeLimits>,
-}
+/// Lock-free snapshot of the per-request limits (body size, global
+/// deadline). Read on every request instead of taking `config.read()`, so a
+/// queued config writer cannot stall the whole gateway.
+pub runtime_limits: Arc<crate::runtime_limits::RuntimeLimits>,
+/// Budget-alert webhook subsystem (budget-alerts-unified-webhooks,
+/// Task 5): durable event/delivery ledger at `webhooks.db` (sibling of
+/// `budgets.db`) plus the built-once notifier + provider evaluation
+/// hook. The ledger's idempotent schema init runs at startup even when
+/// dormant; the DORMANCY CONTRACT (Req 3.3) — no evaluation, no ledger
+/// writes with zero endpoints — is enforced inside the hook/notifier,
+        /// not by omitting the store.
+        pub webhook_ledger: Arc<WebhookLedgerStore>,
+        /// `None`-free handle to the provider alert hook; methods internally
+        /// no-op while `config.webhooks.endpoints` is empty (Req 3.3).
+        pub provider_budget_alerts: Arc<ProviderBudgetAlerts>,
+        /// The shared notifier behind `provider_budget_alerts` (same
+        /// construction, same Arc) — held separately so the admin
+        /// test-send route reuses the built-once client instead of
+        /// constructing a new notifier per request.
+        pub webhook_notifier: Arc<WebhookNotifier>,
+    }
 
 /// Core HTTP server wrapping Axum with middleware and integrated components.
 pub struct GatewayServer {
@@ -137,10 +156,51 @@ impl GatewayServer {
             // wins over the fresh atomics). Providers without a configured limit
             // still have their persisted spend restored here; their future spend
             // accrual is Task 4.
-            metrics.set_provider_budget_store(store.clone());
-            metrics.seed_provider_budget_limits(&config);
-            restore_provider_budgets(&metrics, store.as_ref(), &budgets_path)?;
-        }
+        metrics.set_provider_budget_store(store.clone());
+        metrics.seed_provider_budget_limits(&config);
+        restore_provider_budgets(&metrics, store.as_ref(), &budgets_path)?;
+    }
+
+    // --- Budget-alert webhooks (budget-alerts-unified-webhooks, Task 5) ---
+    // `webhooks.db` follows the sibling placement rule of `budgets.db`
+    // (same parent as the logs database). The ledger's idempotent schema
+    // init runs here regardless of dormancy (allowed by the contract);
+    // a store open failure is non-fatal — the ledger is observability,
+    // not a safety control (design, Error Handling 3) — so the gateway
+        // starts with alerting degraded instead of refusing to boot.
+        let webhooks_path = webhooks_db_path(&config.logging.database_path);
+        let (webhook_ledger, webhook_notifier, provider_budget_alerts) =
+            match WebhookLedgerStore::new(&webhooks_path) {
+                Ok(ledger) => {
+                    let ledger = Arc::new(ledger);
+                    match WebhookNotifier::new(config_arc.clone(), ledger.clone()).await {
+                        Ok(notifier) => {
+                            let notifier = Arc::new(notifier);
+                            let alerts = Arc::new(ProviderBudgetAlerts::new(notifier.clone()));
+                            (ledger, notifier, alerts)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                path = %webhooks_path.display(),
+                                error = %error,
+                                "Failed to build webhook delivery client; budget-alert delivery starts degraded"
+                            );
+                            degraded_webhooks(config_arc.clone()).await
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %webhooks_path.display(),
+                        error = %error,
+                        "Failed to open webhooks ledger; budget-alert delivery starts degraded"
+                    );
+                    // Degraded sentinel: an in-memory ledger that never lands on
+                    // disk. Evaluation still runs (Req 1.1) but event history
+                    // degrades to the warn log only.
+                    degraded_webhooks(config_arc.clone()).await
+                }
+            };
         let compression_events = Arc::new(crate::dashboard::CompressionEventHub::new());
         let memory_events = Arc::new(crate::dashboard::MemoryEventHub::new());
         let memory_system = Arc::new(RwLock::new(
@@ -232,9 +292,87 @@ impl GatewayServer {
             }
         }
 
-        // --- OAuth UsageTracker wiring ---
-        let oauth_usage_tracker = Arc::new(crate::oauth::UsageTracker::new());
-        router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
+// --- OAuth UsageTracker wiring ---
+let oauth_usage_tracker = Arc::new(crate::oauth::UsageTracker::new());
+router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
+
+        // --- Budget-alert webhooks activation (budget-alerts-unified-webhooks,
+        // Task 5) ---
+        // Attach the provider hook to the router (reset events come from the
+        // rollover/admin paths; evaluation rides the persist spawn via the
+        // metrics hook below), park restart-interrupted retry chains, and seed
+        // restart re-derivation state. All startup work is skipped when the
+        // subsystem is dormant (zero endpoints, Req 3.3) except the ledger
+        // schema init above — the dormancy contract's one allowed artifact.
+        router.set_provider_budget_alerts(provider_budget_alerts.clone());
+        {
+            let webhooks_active = !config.webhooks.endpoints.is_empty();
+            if webhooks_active {
+                // NOTE: restart parking runs after AppState assembly (it reads
+                // `state.webhook_ledger`); restart re-derivation seeding and the
+                // evaluation funnel are wired here.
+                // Restart re-derivation (design "Component 1", D11): seed
+                // fired-state from the durable budget store so an
+                // already-exhausted/warned budget never re-announces after a
+                // restart. Rows without a configured limit are skipped by
+                // `seed_from_recovered` itself (Req 1.9).
+                if let Some(store) = metrics.provider_budget_store() {
+                    let alerts_for_seed = provider_budget_alerts.alert_state().clone();
+                    for provider in &config.providers {
+                        let Some(budget) = &provider.budget else {
+                            continue;
+                        };
+                        if let Ok(Some(row)) = store
+                            .get_spend_and_window(&provider.name)
+                        {
+                            let warn_pct = budget.alert_threshold_percent.unwrap_or(80);
+                            alerts_for_seed.seed_from_recovered(
+                                ScopeRef::Provider {
+                                    name: provider.name.clone(),
+                                },
+                                row.0,
+                                budget.limit_usd,
+                                warn_pct,
+                                row.1,
+                            );
+                        }
+                    }
+                }
+                // Post-persist evaluation funnel: the closure spawns the async
+                // evaluation (Req 1.10 — nothing synchronous on the response
+                // path; the spawn_blocking tail is already off-path).
+                {
+                    let alerts = provider_budget_alerts.clone();
+                    let hook_config = config_arc.clone();
+                    metrics.set_provider_spend_hook(Arc::new(move |provider, spent, anchor| {
+                        let alerts = alerts.clone();
+                        let config = hook_config.clone();
+                        let provider = provider.to_string();
+                        match tokio::runtime::Handle::try_current() {
+                            Ok(handle) => {
+                                handle.spawn(async move {
+                                    alerts
+                                        .evaluate_provider(&config, &provider, spent, anchor)
+                                        .await;
+                                });
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    provider = %provider,
+                                    "no tokio runtime; provider budget alert evaluation skipped"
+                                );
+                            }
+                        }
+                    }));
+                }
+            } else {
+                // Dormancy (Req 3.3): evaluation funnel stays unset — no
+                // evaluation, no ledger writes, beyond the schema init above.
+                tracing::info!(
+                    "budget-alert webhooks dormant: no endpoints configured"
+                );
+            }
+        }
 
         // --- Virtual key manager construction (Req 2.1, 11.1-11.5) ---
         // Backed by the SQLite key store at `virtual_keys.database_path`. Built
@@ -246,6 +384,56 @@ impl GatewayServer {
                 .map_err(|e| GatewayError::Database(e.to_string()))?;
             Arc::new(manager)
         };
+
+// --- VK alert restart seeding (budget-alerts-unified-webhooks, Task 6) ---
+// Mirrors the provider seeding above (design "Component 1", D11; Reqs
+// 1.2, 4.6): when the webhook subsystem is active, seed each VK
+// scope's fired-state from the keys.db durable spend vs limit under
+// the key's current window anchor, so an already-warned/exhausted key
+// never re-announces after a restart. Fixed warn 80 (design D9).
+// Spawned off the critical startup path; a read failure is logged and
+// skipped (non-fatal — seeding is best-effort re-derivation).
+//
+// The spawn is detached, so a first accrual may evaluate before the
+// seed lands — safe by the seed's MONOTONIC merge (AlertState::
+// seed_from_recovered ORs into a live same-anchor entry and never
+// clears flags, and spend within one window anchor never decreases,
+// so a live entry's flags are always at least as advanced as the
+// seed's). Chosen over blocking-startup seeding per the minimal-fix
+// rule.
+if !config.webhooks.endpoints.is_empty() {
+            let alerts_for_seed = provider_budget_alerts.alert_state().clone();
+            let manager_for_seed = virtual_key_manager.clone();
+            tokio::spawn(async move {
+                match manager_for_seed.all_key_budget_states().await {
+                    Ok(states) => {
+                        for state in states {
+                            let Some(limit) = state.budget_limit_usd else {
+                                continue;
+                            };
+                            let anchor =
+                                state.window_start.map(|ws| ws.timestamp()).unwrap_or(0);
+                            alerts_for_seed.seed_from_recovered(
+                                ScopeRef::VirtualKey {
+                                    key_id: state.key_id.clone(),
+                                    name: state.name.clone().unwrap_or_default(),
+                                },
+                                state.current_spend_usd,
+                                limit,
+                                80,
+                                anchor,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "virtual-key alert restart seeding skipped: key store read failed"
+                        );
+                    }
+                }
+            });
+        }
 
         // --- Guardrail engine construction (Req 1.8, 8.5) ---
         // Built only when a `guardrails` section is present. Provider
@@ -319,8 +507,11 @@ impl GatewayServer {
             tool_compression_state: Arc::new(crate::tool_compression::ToolCompressionState::new(
                 &config.tool_compression,
             )),
-            responses_store: Arc::new(responses_store),
-            runtime_limits: Arc::new(crate::runtime_limits::RuntimeLimits::from_config(&config)),
+        responses_store: Arc::new(responses_store),
+        runtime_limits: Arc::new(crate::runtime_limits::RuntimeLimits::from_config(&config)),
+            webhook_ledger,
+            provider_budget_alerts,
+            webhook_notifier,
         };
 
         tracing::info!(
@@ -330,6 +521,23 @@ impl GatewayServer {
             "Per-request limits published; the effective deadline is the larger of \
              server.request_timeout_seconds and the longest provider total_timeout_seconds plus grace"
         );
+
+        // Restart parking (budget-alerts-unified-webhooks, design Error
+        // Handling 5): mark restart-interrupted retry chains parked so
+        // the panel shows them as failed deliveries — never silently
+        // resumed, never silently dropped. Runs only when the
+        // subsystem is active; non-fatal on error (a warn is logged
+        // and the rows stay as they are until the next restart).
+        if !state.config.read().await.webhooks.endpoints.is_empty() {
+            let ledger = state.webhook_ledger.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = ledger.park_unfinished_chains() {
+                    tracing::warn!(error = %error, "webhooks ledger: startup park failed");
+                }
+            })
+            .await
+            .ok();
+        }
 
         Ok(Self { state })
     }
@@ -968,6 +1176,53 @@ fn budgets_db_path(logging_database_path: &str) -> std::path::PathBuf {
         .join("budgets.db")
 }
 
+/// Resolve the `webhooks.db` path as a sibling of the logs database —
+/// the same placement rule as `budgets.db` (budget-alerts-unified-
+/// webhooks, Task 5).
+fn webhooks_db_path(logging_database_path: &str) -> std::path::PathBuf {
+    let logging_path = std::path::Path::new(logging_database_path);
+    logging_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("webhooks.db")
+}
+
+/// Degraded webhooks sentinel (budget-alerts-unified-webhooks,
+/// design Error Handling 3): an in-memory ledger plus a notifier
+/// built over it. Used when the on-disk ledger or the delivery
+/// client cannot be constructed — alerting continues with delivery
+/// degraded (warn logged by the caller), instead of refusing boot.
+/// A notifier construction failure here falls back to an in-memory
+/// notifier over the in-memory ledger (construction over a plain
+/// in-memory path cannot realistically fail; if it ever does the
+/// second failure is logged and swallowed to keep startup alive).
+async fn degraded_webhooks(
+    config: Arc<RwLock<Config>>,
+) -> (
+    Arc<WebhookLedgerStore>,
+    Arc<WebhookNotifier>,
+    Arc<ProviderBudgetAlerts>,
+) {
+    let ledger = Arc::new(WebhookLedgerStore::new_in_memory());
+    match WebhookNotifier::new(Arc::clone(&config), ledger.clone()).await {
+        Ok(notifier) => {
+            let notifier = Arc::new(notifier);
+            let alerts = Arc::new(ProviderBudgetAlerts::new(notifier.clone()));
+            (ledger, notifier, alerts)
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "webhooks: degraded-mode notifier construction failed; deliveries disabled"
+            );
+            let notifier = Arc::new(WebhookNotifier::degraded(config));
+            let alerts = Arc::new(ProviderBudgetAlerts::new(notifier.clone()));
+            (ledger, notifier, alerts)
+        }
+    }
+}
+
 /// Restore persisted per-provider budget-window spend from the store into
 /// the in-memory metrics atomics. Startup-only: the store value is the
 /// durable truth and wins over the freshly zeroed atomics. Restored spend
@@ -1082,6 +1337,23 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
         // deliberately untouched — reload re-seeds, it never resets
         // persisted spend.
         state.metrics.seed_provider_budget_limits(&cfg);
+        // Budget-alert webhooks (budget-alerts-unified-webhooks, Task 10,
+        // design "Config reload"): the endpoint set needs NO explicit
+        // re-seed — the notifier snapshots `webhooks.endpoints` under the
+        // read lock per emit (delivery.rs `fan_out`), so publishing the
+        // config above re-seeds it atomically. The fired-state registry is
+        // deliberately KEPT (windows never reset on reload), and in-flight
+        // retry chains hold their endpoint by value so they finish
+        // unaffected (design, Error Handling 6).
+        //
+        // One startup-derived piece is NOT live-read: the post-persist
+        // provider evaluation funnel, installed at startup only when the
+        // initial config had endpoints. A dormant→active reload must
+        // install it (idempotently — re-installing over the live hook is
+        // safe, same closure over shared Arcs); an active→dormant reload
+        // keeps it and the dormancy check inside the hook (Req 3.3) makes
+        // evaluation no-op while zero endpoints are configured.
+        ensure_provider_spend_hook(&state);
         tracing::info!(
             configured_request_timeout_seconds = cfg.server.request_timeout_seconds,
             effective_request_timeout_seconds = state.runtime_limits.request_timeout_seconds(),
@@ -1193,9 +1465,45 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
         }
     };
 
-    if let Some(new_engine) = rebuilt {
-        *state.guardrail_engine.write().await = new_engine;
-    }
+if let Some(new_engine) = rebuilt {
+    *state.guardrail_engine.write().await = new_engine;
+}
+}
+
+/// Install the post-persist provider evaluation funnel on the metrics
+/// sink (budget-alerts-unified-webhooks, Task 10). Startup installs it
+/// only when the initial config has endpoints; this helper is the
+/// reload-side counterpart that activates provider evaluation on a
+/// dormant→active reload. Idempotent: the closure only captures shared
+/// `Arc` handles (alerts registry, config), so re-installing over a
+/// live hook is safe. Never uninstalls — the hook's internal dormancy
+/// check (Req 3.3) no-ops evaluation while zero endpoints are
+/// configured, which is cheaper and safer than racing a removal.
+fn ensure_provider_spend_hook(state: &AppState) {
+let alerts = state.provider_budget_alerts.clone();
+let hook_config = state.config.clone();
+state.metrics.set_provider_spend_hook(Arc::new(
+move |provider, spent, anchor| {
+let alerts = alerts.clone();
+let config = hook_config.clone();
+let provider = provider.to_string();
+match tokio::runtime::Handle::try_current() {
+Ok(handle) => {
+handle.spawn(async move {
+alerts
+    .evaluate_provider(&config, &provider, spent, anchor)
+    .await;
+});
+}
+Err(_) => {
+tracing::warn!(
+    provider = %provider,
+    "no tokio runtime; provider budget alert evaluation skipped"
+);
+}
+}
+},
+));
 }
 
 /// Wait for SIGTERM / SIGINT (Req 18.1-18.5).
@@ -1491,6 +1799,7 @@ mod tests {
             reasoning_models_allowlist: Default::default(),
             codex_search: None,
             reasoning_compat: Default::default(),
+        webhooks: Default::default(),
         }
     }
 
@@ -2491,8 +2800,9 @@ mod tests {
             smart_routing: Default::default(),
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
-    codex_search: None,
-    reasoning_compat: Default::default(),
+        codex_search: None,
+        reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     };
 
     let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -3094,8 +3404,9 @@ mod tests {
             smart_routing: Default::default(),
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
-    codex_search: None,
-    reasoning_compat: Default::default(),
+        codex_search: None,
+        reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     };
 
     // Write new config to disk
