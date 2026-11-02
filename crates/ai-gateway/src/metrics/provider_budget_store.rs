@@ -68,6 +68,29 @@ impl std::fmt::Debug for ProviderBudgetStore {
     }
 }
 
+/// Result of a [`ProviderBudgetStore::reset_window`] call: which
+/// reset won and the facts the callers need to act on it exactly once.
+///
+/// `did_reset` is true only for the call whose CAS hit — the single
+/// winner that performed the zeroing. `previous_spend` is the spend
+/// that was zeroed (winner) or the fresh post-rollover spend the
+/// re-read observed (CAS-miss loser). `new_anchor` is the window
+/// anchor the reset stamped (winner) or the anchor the concurrent
+/// winning reset already stamped (loser) — callers emit follow-up
+/// events (budget.reset) with THIS anchor, never with a post-hoc
+/// read-back that may already belong to an even later reset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResetWindowOutcome {
+/// True when THIS call performed the reset (CAS hit).
+pub did_reset: bool,
+/// Spend before the reset (winner) / current spend after the
+/// other writer's reset (loser).
+pub previous_spend: f64,
+/// The window anchor now in force (the one this reset stamped, or
+/// the concurrent reset's stamp).
+pub new_anchor: i64,
+}
+
 impl ProviderBudgetStore {
     /// Open (or create) the database at `db_path`, run the idempotent schema
     /// migration, and apply the same WAL/busy-timeout discipline as the
@@ -205,6 +228,29 @@ impl ProviderBudgetStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// The durable `(current_spend_usd, window_start)` for `provider`,
+    /// or `None` when the provider has no row. Read by the post-persist
+    /// alert hook (budget-alerts-unified-webhooks, Task 5) inside the
+    /// off-path spend-write task, so the evaluation sees the exact
+    /// durable total the write produced (including when the conditional
+    /// upsert dropped the write after a concurrent window reset).
+    pub fn get_spend_and_window(
+        &self,
+        provider: &str,
+    ) -> Result<Option<(f64, i64)>, ProviderBudgetStoreError> {
+        let conn = self.conn.lock().expect("budgets.db mutex poisoned");
+        let row = conn.query_row(
+            "SELECT current_spend_usd, window_start FROM provider_budgets WHERE provider = ?1",
+            params![provider],
+            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+        );
+        match row {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The durable `window_start` (UTC epoch seconds) for `provider`, or
     /// `None` when the provider has no row. Read by the router's lazy
     /// window-rollover check (persistent budgets, Task 4): the store owns
@@ -226,70 +272,81 @@ impl ProviderBudgetStore {
         }
     }
 
-    /// Reset one provider's budget window via compare-and-swap on the
-    /// durable `window_start`, zeroing the spend only when the row is
-    /// still anchored at `expected_window_start_epoch`. Returns the
-    /// previous spend when THIS call performed the reset; when another
-    /// thread already advanced the window (CAS miss), re-reads the row
-    /// once and returns its fresh (post-rollover, typically 0) spend —
-    /// the window is treated as already reset. `None` when the provider
-    /// has no row.
-    ///
-    /// Consumed by the router's lazy window-rollover check and the admin
-    /// manual reset (persistent-budgets Task 4/8). The single
-    /// `Arc<Mutex<Connection>>` serializes store accesses in-process; the
-    /// CAS clause additionally makes the UPDATE safe against any external
-    /// writer (WAL allows a second connection, e.g. tests) and keeps the
-    /// reset idempotent under concurrent callers.
-    pub fn reset_window(
-        &self,
-        provider: &str,
-        expected_window_start_epoch: i64,
-    ) -> Result<Option<f64>, ProviderBudgetStoreError> {
-        let mut conn = self.conn.lock().expect("budgets.db mutex poisoned");
-        let tx = conn.transaction()?;
-        let current = tx.query_row(
-            "SELECT current_spend_usd FROM provider_budgets WHERE provider = ?1",
-            params![provider],
-            |row| row.get::<_, f64>(0),
-        );
-        let previous = match current {
-            Ok(spend) => spend,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                tx.commit()?;
-                return Ok(None);
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let now = now_epoch();
-        let updated = tx.execute(
-            "UPDATE provider_budgets
-             SET current_spend_usd = 0.0, window_start = ?3, updated_at = ?3
-             WHERE provider = ?1 AND window_start = ?2",
-            params![provider, expected_window_start_epoch, now],
-        )?;
-        if updated > 0 {
-            // CAS hit: this call performed the reset; report the spend
-            // that was just zeroed.
-            tx.commit()?;
-            Ok(Some(previous))
-        } else {
-            // CAS miss: another writer already advanced the window. The
-            // UPDATE changed nothing; commit the no-op transaction and
-            // report the fresh row state (~0 after the other reset).
-            tx.commit()?;
-            let fresh = conn.query_row(
-                "SELECT current_spend_usd FROM provider_budgets WHERE provider = ?1",
-                params![provider],
-                |row| row.get::<_, f64>(0),
-            );
-            match fresh {
-                Ok(spend) => Ok(Some(spend)),
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => Err(e.into()),
-            }
-        }
-    }
+/// Reset one provider's budget window via compare-and-swap on the
+/// durable `window_start`, zeroing the spend only when the row is
+/// still anchored at `expected_window_start_epoch`. On a CAS hit,
+/// [`ResetWindowOutcome::did_reset`] is true and `new_anchor` is the
+/// instant this reset stamped; on a CAS miss (another writer already
+/// advanced the window) the row is re-read once and the outcome
+/// reports the concurrent reset's fresh spend and anchor — the window
+/// is treated as already reset, and only the CAS winner should emit
+/// the follow-up reset event. `previous_spend` is `None` when the
+/// provider has no row.
+///
+/// Consumed by the router's lazy window-rollover check and the admin
+/// manual reset (persistent-budgets Task 4/8). The single
+/// `Arc<Mutex<Connection>>` serializes store accesses in-process; the
+/// CAS clause additionally makes the UPDATE safe against any external
+/// writer (WAL allows a second connection, e.g. tests) and keeps the
+/// reset idempotent under concurrent callers.
+pub fn reset_window(
+&self,
+provider: &str,
+expected_window_start_epoch: i64,
+) -> Result<Option<ResetWindowOutcome>, ProviderBudgetStoreError> {
+let mut conn = self.conn.lock().expect("budgets.db mutex poisoned");
+let tx = conn.transaction()?;
+let current = tx.query_row(
+"SELECT current_spend_usd FROM provider_budgets WHERE provider = ?1",
+params![provider],
+|row| row.get::<_, f64>(0),
+);
+let previous = match current {
+Ok(spend) => spend,
+Err(rusqlite::Error::QueryReturnedNoRows) => {
+tx.commit()?;
+return Ok(None);
+}
+Err(e) => return Err(e.into()),
+};
+let now = now_epoch();
+let updated = tx.execute(
+"UPDATE provider_budgets
+SET current_spend_usd = 0.0, window_start = ?3, updated_at = ?3
+WHERE provider = ?1 AND window_start = ?2",
+params![provider, expected_window_start_epoch, now],
+)?;
+if updated > 0 {
+// CAS hit: this call performed the reset; report the spend
+// that was just zeroed and the anchor this reset stamped.
+tx.commit()?;
+Ok(Some(ResetWindowOutcome {
+did_reset: true,
+previous_spend: previous,
+new_anchor: now,
+}))
+} else {
+// CAS miss: another writer already advanced the window. The
+// UPDATE changed nothing; commit the no-op transaction and
+// report the fresh row state (the other reset's anchor and
+// the ~0 spend it left behind) so the loser can stay silent.
+tx.commit()?;
+let fresh = conn.query_row(
+"SELECT current_spend_usd, window_start FROM provider_budgets WHERE provider = ?1",
+params![provider],
+|row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+);
+match fresh {
+Ok((spend, anchor)) => Ok(Some(ResetWindowOutcome {
+did_reset: false,
+previous_spend: spend,
+new_anchor: anchor,
+})),
+Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+Err(e) => Err(e.into()),
+}
+}
+}
 }
 
 fn row_to_budget_row(row: &Row) -> Result<ProviderBudgetRow, rusqlite::Error> {
@@ -450,38 +507,55 @@ mod tests {
         assert_eq!(rows[0].current_spend_usd, 0.0);
     }
 
-    #[test]
-    fn reset_window_returns_previous_spend_and_zeroes() {
-        let (store, _tmp) = temp_store();
-        let anchor = now_epoch();
-        store.add_spend("openai", 3.5, anchor).unwrap();
-        let stored_anchor = store.get_window_start("openai").unwrap().unwrap();
+#[test]
+fn reset_window_returns_previous_spend_and_zeroes() {
+let (store, _tmp) = temp_store();
+let anchor = now_epoch();
+store.add_spend("openai", 3.5, anchor).unwrap();
+let stored_anchor = store.get_window_start("openai").unwrap().unwrap();
 
-        let previous = store.reset_window("openai", stored_anchor).unwrap();
-        assert_eq!(previous, Some(3.5));
+let outcome = store.reset_window("openai", stored_anchor).unwrap().unwrap();
+assert!(outcome.did_reset);
+assert_eq!(outcome.previous_spend, 3.5);
+// The reset stamps "now" as the new anchor — same-second resets
+// legitimately tie, so the assertion is monotonic (>=), not strict.
+assert!(outcome.new_anchor >= stored_anchor);
 
-        let rows = store.get_all().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].current_spend_usd, 0.0);
-        assert!(rows[0].window_start > 0);
+let rows = store.get_all().unwrap();
+assert_eq!(rows.len(), 1);
+assert_eq!(rows[0].current_spend_usd, 0.0);
+assert_eq!(rows[0].window_start, outcome.new_anchor);
 
-        // A second CAS with the ORIGINAL anchor misses (window already
-        // advanced): treated as already-reset, returns the fresh spend.
-        assert_eq!(
-            store.reset_window("openai", stored_anchor).unwrap(),
-            Some(0.0)
-        );
-        // A second CAS with the CURRENT anchor hits and reports the
-        // (now zero) spend.
-        let new_anchor = store.get_window_start("openai").unwrap().unwrap();
-        assert_eq!(store.reset_window("openai", new_anchor).unwrap(), Some(0.0));
-    }
+// CAS miss is only observable when the winner stamped a DIFFERENT
+// anchor; same-second ties make the stale CAS hit again. Pin the
+// row's anchor forward (simulating a later winning reset) and re-CAS
+// with the original: did_reset is false and the outcome reports the
+// concurrent winner's anchor and the ~0 spend it left.
+{
+let conn = store.conn.lock().unwrap();
+conn.execute(
+"UPDATE provider_budgets SET window_start = ?1 WHERE provider = 'openai'",
+params![stored_anchor + 12345],
+)
+.unwrap();
+}
+let missed = store.reset_window("openai", stored_anchor).unwrap().unwrap();
+assert!(!missed.did_reset);
+assert_eq!(missed.previous_spend, 0.0);
+assert_eq!(missed.new_anchor, stored_anchor + 12345);
+// A second CAS with the CURRENT anchor hits and reports the
+// (now zero) spend.
+let new_anchor = store.get_window_start("openai").unwrap().unwrap();
+let again = store.reset_window("openai", new_anchor).unwrap().unwrap();
+assert!(again.did_reset);
+assert_eq!(again.previous_spend, 0.0);
+}
 
-    #[test]
-    fn reset_window_unknown_provider_returns_none() {
-        let (store, _tmp) = temp_store();
-        assert_eq!(store.reset_window("missing", now_epoch()).unwrap(), None);
-    }
+#[test]
+fn reset_window_unknown_provider_returns_none() {
+let (store, _tmp) = temp_store();
+assert_eq!(store.reset_window("missing", now_epoch()).unwrap(), None);
+}
 
     #[test]
     fn get_all_returns_rows_for_metrics_seeding() {

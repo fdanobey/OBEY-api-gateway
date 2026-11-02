@@ -112,6 +112,7 @@ fn test_config() -> Config {
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
         reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     }
 }
 
@@ -221,6 +222,88 @@ async fn test_admin_config_export() {
     assert!(text.contains("test-provider"));
     // Should be valid YAML that deserializes back
     let _parsed: Config = serde_yaml::from_str(text).unwrap();
+}
+
+/// Config export carries no webhook secrets: URLs survive, secrets
+/// are stripped to null (clean for re-import).
+#[tokio::test]
+async fn test_admin_config_export_strips_webhook_secrets() {
+    let mut cfg = test_config();
+    cfg.webhooks.endpoints = vec![WebhookEndpoint {
+        url: "https://hooks.example.com/alerts".to_string(),
+        secret: Some("whsec_export_must_not_leak".to_string()),
+        events: None,
+    }];
+    let app = build_app(cfg).await;
+
+    let req = Request::get("/admin/config/export")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        !text.contains("whsec_export_must_not_leak"),
+        "export leaked webhook secret: {text}"
+    );
+    assert!(
+        text.contains("https://hooks.example.com/alerts"),
+        "endpoint URL must survive secret stripping"
+    );
+    // The stripped YAML re-imports as an unsigned endpoint.
+    let parsed: Config = serde_yaml::from_str(text).unwrap();
+    assert_eq!(parsed.webhooks.endpoints[0].secret, None);
+}
+
+/// Full-config GET masks webhook secrets with the `[configured]`
+/// sentinel (parity with the dedicated /admin/webhooks GET), and the
+/// sentinel round-trips through PUT preserving the stored secret.
+#[tokio::test]
+async fn test_admin_config_get_masks_webhook_secret_and_put_preserves() {
+    let mut cfg = test_config();
+    cfg.server.port = 8080;
+    cfg.webhooks.endpoints = vec![WebhookEndpoint {
+        url: "https://hooks.example.com/alerts".to_string(),
+        secret: Some("whsec_roundtrip_secret".to_string()),
+        events: None,
+    }];
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let config_path = config_dir.path().join("config.yaml");
+    common::isolate_databases(&mut cfg);
+    let server = GatewayServer::new(cfg, Some(config_path))
+        .await
+        .unwrap();
+    let app = server.build_router();
+
+    // GET: masked secret, no raw value anywhere in the body.
+    let req = Request::get("/admin/config").body(Body::empty()).unwrap();
+    let (status, body) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(
+        !text.contains("whsec_roundtrip_secret"),
+        "config GET leaked webhook secret: {text}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["webhooks"]["endpoints"][0]["secret"], "[configured]");
+
+    // PUT the GET body back unchanged: the sentinel preserves the
+    // stored secret for the same URL.
+    let req = Request::put("/admin/config")
+        .header("content-type", "application/json")
+        .body(Body::from(text))
+        .unwrap();
+    let (status, body) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK, "round-trip PUT: {body:?}");
+    let stored_secret = {
+        let live = server.state.config.read().await;
+        live.webhooks.endpoints[0].secret.clone()
+    };
+    assert_eq!(
+        stored_secret.as_deref(),
+        Some("whsec_roundtrip_secret"),
+        "sentinel round-trip must preserve the stored webhook secret"
+    );
 }
 
 #[tokio::test]
@@ -531,6 +614,7 @@ async fn test_admin_config_validate_accepts_reliability_fields() {
     validatable.providers[0].budget = Some(ProviderBudgetConfig {
         limit_usd: 25.0,
         reset_policy: Some(BudgetResetPolicy::Manual),
+        alert_threshold_percent: None,
     });
 
     let req = Request::post("/admin/config/validate")

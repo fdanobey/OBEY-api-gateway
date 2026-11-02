@@ -11887,10 +11887,22 @@ async fn extract_run_usage_and_record(
     manager.record_tpm_usage(&record.key_id, tpm_tokens);
     let record_clone = record.clone();
     let manager_clone = Arc::clone(&manager);
+    // Alert evaluation (Req 1.2 gap: assistants-run accruals must emit
+    // like the chat front door): same off-path spawn discipline as the
+    // auth.rs record_usage site — the shared VirtualKeyManager helper
+    // resolves the key's durable budget facts and evaluates after the
+    // usage write, with the same dormancy gating inside the hook.
+    let alerts = Arc::clone(&state.provider_budget_alerts);
+    let config = Arc::clone(&state.config);
+    let key_id_for_alerts = record.key_id.clone();
     tokio::spawn(async move {
         if let Err(e) = manager_clone.record_usage(record_clone).await {
             tracing::warn!(error = %e, "failed to record virtual key run usage");
+            return;
         }
+        manager_clone
+            .evaluate_budget_alerts_after_usage(&alerts, &config, &key_id_for_alerts)
+            .await;
     });
 
     Some(record.key_id)

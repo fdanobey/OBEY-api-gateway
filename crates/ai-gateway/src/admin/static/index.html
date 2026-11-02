@@ -267,6 +267,41 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 .prov-http-headers{margin-top:1rem;background:var(--bg)}
 .prov-http-headers>summary{cursor:pointer;font-weight:600;color:var(--primary);padding:.35rem 0;font-size:.9rem}
 .prov-header-row .form-group{margin:0}
+/* Webhooks (budget-alerts-unified-webhooks, Req 5.1, 5.2, 5.5) */
+.wh-table-wrap{overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
+table.wh-table{width:100%;border-collapse:collapse;font-size:.8rem}
+table.wh-table th,table.wh-table td{padding:.5rem .6rem;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+table.wh-table th{white-space:nowrap;background:var(--bg);font-weight:600}
+table.wh-table td{white-space:normal}
+table.wh-table tbody tr:hover{background:rgba(13,110,253,.04)}
+.wh-url-cell{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
+.wh-actions-cell{white-space:nowrap}
+.wh-actions-cell .btn{margin-right:.25rem}
+.wh-chip{display:inline-block;font-size:.7rem;padding:.1rem .5rem;border-radius:999px;font-weight:600;background:rgba(13,110,253,.08);color:var(--primary);border:1px solid rgba(13,110,253,.2);margin:0 .15rem .15rem 0;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.wh-chip.wh-chip-muted{background:rgba(108,117,125,.08);color:var(--text-muted);border-color:rgba(108,117,125,.25)}
+.wh-badge{display:inline-block;font-size:.7rem;padding:.15rem .5rem;border-radius:999px;font-weight:600;margin-right:.25rem}
+.wh-badge-signed{background:rgba(25,135,84,.1);color:var(--success);border:1px solid rgba(25,135,84,.25)}
+.wh-badge-unsigned{background:rgba(108,117,125,.08);color:var(--text-muted);border:1px solid rgba(108,117,125,.25)}
+.wh-badge-failing{background:rgba(220,53,69,.1);color:var(--danger);border:1px solid rgba(220,53,69,.25)}
+.wh-badge-ok{background:rgba(25,135,84,.1);color:var(--success);border:1px solid rgba(25,135,84,.25)}
+.wh-badge-outcome-{background:rgba(108,117,125,.08);color:var(--text-muted);border:1px solid rgba(108,117,125,.25)}
+.wh-badge-outcome-success{background:rgba(25,135,84,.1);color:var(--success);border:1px solid rgba(25,135,84,.25)}
+.wh-badge-outcome-failed{background:rgba(220,53,69,.1);color:var(--danger);border:1px solid rgba(220,53,69,.25)}
+.wh-badge-outcome-parked{background:rgba(255,193,7,.12);color:#8a6d0b;border:1px solid rgba(255,193,7,.4)}
+.wh-badge-outcome-skipped_no_endpoints{background:rgba(108,117,125,.08);color:var(--text-muted);border:1px solid rgba(108,117,125,.25)}
+.wh-empty{padding:1rem;text-align:center;color:var(--text-muted);font-size:.85rem}
+.wh-endpoints-controls{margin-bottom:.75rem}
+.wh-form{border:1px solid var(--border);border-radius:var(--radius);padding:1rem;margin-top:1rem;background:var(--surface)}
+.wh-form h3{font-size:1rem;margin-bottom:1rem;padding-bottom:.5rem;border-bottom:2px solid var(--primary)}
+.wh-event-checks{display:flex;gap:1.5rem;flex-wrap:wrap;margin-top:.35rem}
+.wh-allow-row{display:flex;align-items:center;gap:.5rem;padding:.35rem 0}
+.wh-allow-row code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.8rem;overflow-wrap:anywhere}
+.wh-allow-hosts{display:inline;margin-left:.25rem}
+.wh-deliveries-header{display:flex;gap:1rem;align-items:flex-end;flex-wrap:wrap;margin-bottom:.75rem}
+.wh-delivery-filter{min-width:220px}
+.wh-test-result{margin-top:.5rem;font-size:.75rem}
+.wh-form .error{font-size:.75rem;color:var(--danger);margin-top:.15rem;display:none}
+.wh-form .error.visible{display:block}
 @media(max-width:700px){.compression-rule-grid,.compression-pre-row,.compression-pipeline-row{grid-template-columns:1fr}}
 /* Security exposure banner (Req 1.8) */
 .sec-banner{position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;color:#fff;padding:.6rem 1rem;display:flex;align-items:center;gap:1rem;font-size:.9rem;box-shadow:var(--shadow)}
@@ -296,8 +331,9 @@ body.sec-banner-active{padding-top:3.2rem}
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="virtual-keys" id="tab-virtual-keys" aria-controls="page-virtual-keys">Virtual Keys</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="guardrails" id="tab-guardrails" aria-controls="page-guardrails">Guardrails</button></li>
     <li role="presentation"><button class="nav-btn" role="tab" type="button" data-page="structured-output" id="tab-structured-output" aria-controls="page-structured-output">Structured Output</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="memory" id="tab-memory" aria-controls="page-memory">Persistent Memory</button></li>
-  </ul>
+<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="memory" id="tab-memory" aria-controls="page-memory">Persistent Memory</button></li>
+<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="webhooks" id="tab-webhooks" aria-controls="page-webhooks">Webhooks</button></li>
+</ul>
   <div class="nav-footer">
     <a href="/dashboard" id="dashboard-link">Open Dashboard &rarr;</a>
   </div>
@@ -541,13 +577,13 @@ body.sec-banner-active{padding-top:3.2rem}
             <div class="hint">Idle pooled connection lifetime</div>
           </div>
         </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label>Budget Limit (USD, blank = none)</label>
-            <input type="number" class="prov-budget-limit" min="0" step="0.01" placeholder="100.00">
-          </div>
-          <div class="form-group">
-            <label>Budget Reset Policy</label>
+<div class="form-row">
+<div class="form-group">
+<label>Budget Limit (USD, blank = none)</label>
+<input type="number" class="prov-budget-limit" min="0" step="0.01" placeholder="100.00">
+</div>
+<div class="form-group">
+<label>Budget Reset Policy</label>
 <select class="prov-budget-reset">
 <option value="manual">Manual</option>
 <option value="daily">Daily</option>
@@ -555,6 +591,15 @@ body.sec-banner-active{padding-top:3.2rem}
 <option value="monthly">Monthly</option>
 </select>
 </div>
+</div>
+<div class="form-row">
+<div class="form-group">
+<label>Alert Threshold (%)</label>
+<input type="number" class="prov-budget-threshold" min="1" max="100" step="1" placeholder="80">
+<div class="hint">Warn at this percent of the budget limit. Blank = default 80. Applies when webhook endpoints are configured.</div>
+<div class="error" role="alert"></div>
+</div>
+<div class="form-group"></div>
 </div>
 <div class="prov-budget-live" hidden>
 <span class="prov-budget-live-text" aria-live="polite">—</span>
@@ -2320,11 +2365,127 @@ body.sec-banner-active{padding-top:3.2rem}
       <button class="btn btn-secondary btn-sm" id="mem-refresh-projects" style="margin-top:.75rem">Refresh</button>
     </fieldset>
 
-    <div class="actions">
-      <button class="btn btn-primary" id="mem-save-btn">Save Memory Config</button>
-      <button class="btn btn-secondary" id="mem-reset-btn">Reset</button>
-    </div>
-  </section>
+<div class="actions">
+<button class="btn btn-primary" id="mem-save-btn">Save Memory Config</button>
+<button class="btn btn-secondary" id="mem-reset-btn">Reset</button>
+</div>
+</section>
+
+<!-- Webhooks (budget-alerts-unified-webhooks, Req 5.1, 5.2) -->
+<section class="page" id="page-webhooks" role="tabpanel" aria-labelledby="tab-webhooks">
+<h2>Webhooks</h2>
+<p class="hint" style="margin-bottom:1.5rem">Budget alert webhooks. Configure an endpoint and budget warning, exhaustion, and reset events are delivered as signed JSON. No endpoints = fully dormant.</p>
+
+<fieldset><legend>Endpoints</legend>
+<div class="wh-endpoints-controls">
+<button type="button" class="btn btn-primary btn-sm" id="wh-add-endpoint">+ Add Endpoint</button>
+</div>
+<table class="wh-table" id="wh-endpoints-table">
+<caption class="sr-only">Configured webhook endpoints</caption>
+<thead>
+<tr>
+<th scope="col">URL</th>
+<th scope="col">Events</th>
+<th scope="col">Status</th>
+<th scope="col">Actions</th>
+</tr>
+</thead>
+<tbody id="wh-endpoints-tbody"></tbody>
+</table>
+<div class="wh-empty" id="wh-endpoints-empty" hidden>No webhook endpoints configured. The subsystem is dormant until at least one endpoint exists.</div>
+
+<div class="wh-form" id="wh-endpoint-form" hidden>
+<h3 id="wh-form-title">Add Endpoint</h3>
+<div class="form-group">
+<label for="wh-f-url">URL</label>
+<input type="url" id="wh-f-url" placeholder="https://example.com/webhook" autocomplete="off" aria-describedby="wh-f-url-error">
+<div class="hint">https-only, unless the host is exact-match allowlisted below. The URL identifies the endpoint.</div>
+<div class="error" id="wh-f-url-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="wh-f-secret">Secret</label>
+<input type="password" id="wh-f-secret" class="wh-f-secret" autocomplete="new-password" aria-describedby="wh-f-secret-error">
+<div class="hint" id="wh-f-secret-hint">Standard Webhooks HMAC key. Blank = unsigned delivery.</div>
+<div class="error" id="wh-f-secret-error" role="alert"></div>
+</div>
+<div class="form-check wh-secret-remove" hidden>
+<input type="checkbox" id="wh-f-secret-remove">
+<label for="wh-f-secret-remove">Remove stored secret (deliver unsigned)</label>
+</div>
+<div class="form-group">
+<label id="wh-f-events-label">Events</label>
+<div class="wh-f-events" role="group" aria-labelledby="wh-f-events-label">
+<div class="form-check wh-event-all" style="margin:0">
+<input type="checkbox" id="wh-f-events-all" checked>
+<label for="wh-f-events-all">All (default)</label>
+</div>
+<div class="wh-event-checks">
+<div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-warning" value="budget.warning" disabled><label for="wh-f-event-warning">budget.warning</label></div>
+<div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-exhausted" value="budget.exhausted" disabled><label for="wh-f-event-exhausted">budget.exhausted</label></div>
+<div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-reset" value="budget.reset" disabled><label for="wh-f-event-reset">budget.reset</label></div>
+</div>
+</div>
+<div class="hint">Unchecking "All" enables per-event filtering. At least one event must be selected.</div>
+<div class="error" id="wh-f-events-error" role="alert"></div>
+</div>
+<div class="actions" style="margin-top:1rem">
+<button type="button" class="btn btn-primary btn-sm" id="wh-form-save">Add Endpoint</button>
+<button type="button" class="btn btn-secondary btn-sm" id="wh-form-cancel">Cancel</button>
+</div>
+</div>
+</fieldset>
+
+<fieldset><legend>Private Host Allowlist</legend>
+<p class="hint" style="margin-bottom:.75rem">Exact-match hostnames where private addresses and plain http are permitted for webhook URLs (LAN receivers).</p>
+<div class="wh-allowlist" id="wh-allowlist"></div>
+<div class="form-row" style="align-items:flex-end">
+<div class="form-group">
+<label for="wh-allow-host">Host</label>
+<input type="text" id="wh-allow-host" placeholder="receiver.lan" autocomplete="off" aria-describedby="wh-allow-host-error">
+<div class="hint">Exact hostname match. List applies only to webhooks.</div>
+<div class="error" id="wh-allow-host-error" role="alert"></div>
+</div>
+<div class="form-group">
+<button type="button" class="btn btn-secondary btn-sm" id="wh-allow-add">+ Add Host</button>
+</div>
+</div>
+</fieldset>
+
+<fieldset><legend>Recent Deliveries</legend>
+<div class="wh-deliveries-header">
+<div class="form-group wh-delivery-filter">
+<label for="wh-delivery-endpoint">Endpoint</label>
+<select id="wh-delivery-endpoint" aria-describedby="wh-delivery-endpoint-hint">
+<option value="">All endpoints</option>
+</select>
+<div class="hint" id="wh-delivery-endpoint-hint">Newest 50 delivery attempts for the chosen endpoint.</div>
+</div>
+<button type="button" class="btn btn-secondary btn-sm" id="wh-delivery-refresh">Refresh</button>
+</div>
+<div class="wh-table-wrap">
+<table class="wh-table" id="wh-deliveries-table">
+<caption class="sr-only">Recent webhook delivery attempts</caption>
+<thead>
+<tr>
+<th scope="col">Time</th>
+<th scope="col">Event</th>
+<th scope="col">Attempt</th>
+<th scope="col">Outcome</th>
+<th scope="col">Status</th>
+<th scope="col">Error</th>
+</tr>
+</thead>
+<tbody id="wh-deliveries-tbody"></tbody>
+</table>
+</div>
+<div class="wh-empty" id="wh-deliveries-empty">No deliveries recorded.</div>
+</fieldset>
+
+<div class="actions">
+<button class="btn btn-primary" id="wh-save">Save Webhooks</button>
+<button class="btn btn-secondary" id="wh-reset">Reset</button>
+</div>
+</section>
 </main>
 
 <div class="status-bar" role="status" aria-live="polite">
@@ -2421,6 +2582,7 @@ if (pageId === 'loop-detection') { populateLoopDetection((config && config.loop_
 if (pageId === 'smart-routing') { populateSmartRouting((config && config.smart_routing) || {}); }
 if (pageId === 'virtual-keys') { vkOnOpen(); }
     if (pageId === 'guardrails') { loadGuardrailVirtualKeys(); }
+ if (pageId === 'webhooks') { whOnOpen(); }
  if (pageId === 'circuit-breaker') { loadCircuitBreakerStates(); }
  if (pageId === 'providers') { refreshProvBudgetsBulk(); }
 }
@@ -2742,8 +2904,14 @@ function refreshModelGroupModels() {
       if (!validatePositiveInt(maxConnIn, 'Max connections')) ok = false;
       if (!validatePositiveInt(poolMaxIdleIn, 'Pool max idle')) ok = false;
       if (!validatePositiveInt(poolIdleTimeoutIn, 'Pool idle timeout')) ok = false;
-        if (budgetLimitIn.value.trim() && !validatePositiveNum(budgetLimitIn, 'Budget limit')) ok = false;
-        if (!validateCompressionOverride(card, 'prov')) ok = false;
+ if (budgetLimitIn.value.trim() && !validatePositiveNum(budgetLimitIn, 'Budget limit')) ok = false;
+ var budgetThresholdIn = card.querySelector('.prov-budget-threshold');
+ if (budgetThresholdIn.value.trim()) {
+ var tv = parseInt(budgetThresholdIn.value, 10);
+ if (isNaN(tv) || tv < 1 || tv > 100) { showError(budgetThresholdIn, 'Alert threshold must be between 1 and 100'); ok = false; }
+ else clearError(budgetThresholdIn);
+ }
+ if (!validateCompressionOverride(card, 'prov')) ok = false;
 
         // Custom header rows need a name when a value is present
         card.querySelectorAll('.prov-header-row').forEach(function(row) {
@@ -3299,6 +3467,7 @@ function addProviderCard(data) {
       card.querySelector('.prov-pool-idle-timeout').value = (data.connection_pool && data.connection_pool.idle_timeout_seconds) || 90;
       card.querySelector('.prov-budget-limit').value = (data.budget && data.budget.limit_usd != null) ? data.budget.limit_usd : '';
       card.querySelector('.prov-budget-reset').value = (data.budget && data.budget.reset_policy) || 'manual';
+      card.querySelector('.prov-budget-threshold').value = (data.budget && data.budget.alert_threshold_percent != null) ? data.budget.alert_threshold_percent : '';
         card.querySelector('.prov-manual-models').value = (data.manual_models || []).join('\n');
         card.querySelector('.prov-user-agent').value = data.user_agent || '';
         var headerList = card.querySelector('.prov-headers-list');
@@ -4412,7 +4581,7 @@ var csIter=parseInt(document.getElementById('codex-search-iterations').value,10)
 cfg.codex_search=csSearch;
     cfg.exact_cache={enabled:document.getElementById('ecache-enabled').checked,max_entries:parseInt(document.getElementById('ecache-max-entries').value,10)||5000,ttl_seconds:parseInt(document.getElementById('ecache-ttl').value,10)||3600,temperature_threshold:parseFloat(document.getElementById('ecache-temp-threshold').value)||0.15};
     var originalProviders = (config && config.providers) || [];
-    cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,buffered_upstream_streaming:card.querySelector('.prov-buffered-upstream-streaming').checked,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),rate_limit_max_wait_ms:(function(v){return v?parseInt(v,10):null;})(card.querySelector('.prov-rate-max-wait').value.trim()),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}var uaVal=card.querySelector('.prov-user-agent').value.trim();if(uaVal)p.user_agent=uaVal;else delete p.user_agent;var hdrMap={};card.querySelectorAll('.prov-header-row').forEach(function(row){var hk=row.querySelector('.prov-header-name').value.trim();var hv=row.querySelector('.prov-header-value').value;if(hk)hdrMap[hk]=hv;});if(Object.keys(hdrMap).length)p.custom_headers=hdrMap;else delete p.custom_headers;p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
+    cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,buffered_upstream_streaming:card.querySelector('.prov-buffered-upstream-streaming').checked,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),rate_limit_max_wait_ms:(function(v){return v?parseInt(v,10):null;})(card.querySelector('.prov-rate-max-wait').value.trim()),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};var budgetThreshold=card.querySelector('.prov-budget-threshold').value.trim();if(budgetThreshold)p.budget.alert_threshold_percent=parseInt(budgetThreshold,10);}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}var uaVal=card.querySelector('.prov-user-agent').value.trim();if(uaVal)p.user_agent=uaVal;else delete p.user_agent;var hdrMap={};card.querySelectorAll('.prov-header-row').forEach(function(row){var hk=row.querySelector('.prov-header-name').value.trim();var hv=row.querySelector('.prov-header-value').value;if(hk)hdrMap[hk]=hv;});if(Object.keys(hdrMap).length)p.custom_headers=hdrMap;else delete p.custom_headers;p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
     var originalGroups = (config && config.model_groups) || [];
     cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container > .form-row').forEach(function(row,modelIndex){var originalModel=(originalGroup&&originalGroup.models&&originalGroup.models[modelIndex])||{};var m=JSON.parse(JSON.stringify(originalModel));Object.assign(m,{provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});var mdlCacheReadVal=(row.querySelector('.mdl-cache-read')||{}).value;var mdlCacheWriteVal=(row.querySelector('.mdl-cache-write')||{}).value;var mdlCacheMinVal=(row.querySelector('.mdl-cache-min-tokens')||{}).value;var mdlCacheSupportVal=(row.querySelector('.mdl-cache-support')||{}).value||'none';m.cost_per_million_cache_read_input_tokens=mdlCacheReadVal!==''?parseFloat(mdlCacheReadVal):null;m.cost_per_million_cache_creation_input_tokens=mdlCacheWriteVal!==''?parseFloat(mdlCacheWriteVal):null;m.cache_min_tokens=mdlCacheMinVal!==''?parseInt(mdlCacheMinVal,10):null;m.cache_support=mdlCacheSupportVal==='explicit'?{type:'explicit',max_breakpoints:parseInt((row.querySelector('.mdl-cache-max-bp')||{}).value||'4',10)}:(mdlCacheSupportVal==='automatic'?{type:'automatic'}:null);var mdlReasoningFamilyVal=(row.querySelector('.mdl-reasoning-family')||{}).value||'';var mdlReasoningParamVal=(row.querySelector('.mdl-reasoning-param')||{}).value||'';var mdlReasoningCostVal=(row.querySelector('.mdl-reasoning-cost')||{}).value;m.reasoning_family=mdlReasoningFamilyVal!==''?mdlReasoningFamilyVal:null;m.reasoning_parameter=mdlReasoningParamVal!==''?mdlReasoningParamVal:null;m.cost_per_million_reasoning_tokens=mdlReasoningCostVal!==''?parseFloat(mdlReasoningCostVal):null;var mdlTierVal=(row.querySelector('.mdl-tier')||{}).value||'';m.tier=mdlTierVal!==''?mdlTierVal:null;var mdlContextVal=(row.querySelector('.mdl-context-window')||{}).value;m.context_window=mdlContextVal!==''&&mdlContextVal!=null?parseInt(mdlContextVal,10):0;m.specializations=Array.prototype.map.call(row.querySelectorAll('.mdl-spec:checked'),function(cb){return cb.value;});g.models.push(m);});cfg.model_groups.push(g);});
     var retryMax=parseInt(document.getElementById('retry-max').value,10);
@@ -7348,7 +7517,422 @@ document.getElementById('mem-qdrant-recreate').addEventListener('click', functio
     if (config) populateMemory(config.memory);
   });
 
-  // --- Security exposure banner (Req 1.8) ---
+  // --- Webhooks UI Logic (budget-alerts-unified-webhooks, Req 5.1, 5.2, 5.5) ---
+var WH_EVENTS = ['budget.warning', 'budget.exhausted', 'budget.reset'];
+// whState.endpoints holds editor state; secret keeps the masked sentinel
+// verbatim so an untouched field preserves the stored secret on save, and a
+// cleared field removes it. Stored secrets are never displayed.
+var whState = { endpoints: [], allowlist: [], editingIndex: -1 };
+
+function whReq(path, options) {
+ return fetch(apiUrl('webhooks' + path), options || {})
+ .then(function(response) {
+ return response.text().then(function(text) {
+ var body = null;
+ try { body = text ? JSON.parse(text) : null; } catch (_) { /* non-JSON error body */ }
+ if (!response.ok) throw new Error((body && body.error && body.error.message) || text || ('HTTP ' + response.status));
+ return body;
+ });
+ });
+}
+
+function whTd(text, cls) {
+ var td = document.createElement('td');
+ if (cls) td.className = cls;
+ td.textContent = text;
+ return td;
+}
+
+function whEventChips(events) {
+ var span = document.createElement('span');
+ if (!events || !events.length) {
+ var all = document.createElement('span');
+ all.className = 'wh-chip wh-chip-muted';
+ all.textContent = 'all';
+ span.appendChild(all);
+ return span;
+ }
+ events.forEach(function(ev) {
+ var chip = document.createElement('span');
+ chip.className = 'wh-chip';
+ chip.textContent = ev;
+ span.appendChild(chip);
+ });
+ return span;
+}
+
+function whStatusCell(ep) {
+ var td = document.createElement('td');
+ var signed = document.createElement('span');
+ signed.className = 'wh-badge ' + (ep.secret ? 'wh-badge-signed' : 'wh-badge-unsigned');
+ signed.textContent = ep.secret ? 'signed' : 'unsigned';
+ td.appendChild(signed);
+ if (ep.failing) {
+ var fail = document.createElement('span');
+ fail.className = 'wh-badge wh-badge-failing';
+ fail.title = 'Last 3 delivery attempts failed or were parked';
+ fail.textContent = 'failing';
+ td.appendChild(fail);
+ }
+ return td;
+}
+
+function whRenderEndpoints() {
+ var tbody = document.getElementById('wh-endpoints-tbody');
+ var empty = document.getElementById('wh-endpoints-empty');
+ tbody.innerHTML = ''; /* xss-audit: static */
+ empty.hidden = whState.endpoints.length > 0;
+ whState.endpoints.forEach(function(ep, i) {
+ var tr = document.createElement('tr');
+ tr.appendChild(whTd(ep.url || '', 'wh-url-cell'));
+ var evTd = document.createElement('td');
+ evTd.appendChild(whEventChips(ep.events));
+ tr.appendChild(evTd);
+ tr.appendChild(whStatusCell(ep));
+ var act = document.createElement('td');
+ act.className = 'wh-actions-cell';
+ var editBtn = document.createElement('button');
+ editBtn.type = 'button';
+ editBtn.className = 'btn btn-secondary btn-sm';
+ editBtn.textContent = 'Edit';
+ editBtn.addEventListener('click', function() { whOpenForm(i); });
+ var testBtn = document.createElement('button');
+ testBtn.type = 'button';
+ testBtn.className = 'btn btn-secondary btn-sm wh-test-btn';
+ testBtn.textContent = 'Test';
+ testBtn.addEventListener('click', function() { whTestEndpoint(i, tr); });
+ var delBtn = document.createElement('button');
+ delBtn.type = 'button';
+ delBtn.className = 'btn btn-danger btn-sm';
+ delBtn.textContent = 'Delete';
+ delBtn.addEventListener('click', function() { whDeleteEndpoint(i); });
+ act.appendChild(editBtn);
+ act.appendChild(testBtn);
+ act.appendChild(delBtn);
+ tr.appendChild(act);
+ tbody.appendChild(tr);
+ });
+ whRenderDeliveryFilter();
+}
+
+function whOpenForm(index) {
+ whState.editingIndex = (typeof index === 'number') ? index : -1;
+ var form = document.getElementById('wh-endpoint-form');
+ var urlIn = document.getElementById('wh-f-url');
+ var secretIn = document.getElementById('wh-f-secret');
+ var hint = document.getElementById('wh-f-secret-hint');
+ clearError(urlIn);
+ clearError(secretIn);
+ document.getElementById('wh-f-events-error').classList.remove('visible');
+ var all = document.getElementById('wh-f-events-all');
+ var checks = document.querySelectorAll('.wh-f-event');
+ if (whState.editingIndex >= 0) {
+ var ep = whState.endpoints[whState.editingIndex];
+ document.getElementById('wh-form-title').textContent = 'Edit Endpoint';
+ document.getElementById('wh-form-save').textContent = 'Save Endpoint';
+ urlIn.value = ep.url || '';
+ var removeCheck = document.getElementById('wh-f-secret-remove');
+ removeCheck.checked = false;
+ if (ep.secret) {
+ // Masked sentinel shown as placeholder; field left blank preserves it.
+ secretIn.value = '';
+ secretIn.dataset.preserve = ep.secret;
+ secretIn.placeholder = ep.secret;
+ hint.textContent = 'A secret is configured. Leave blank to keep it; check "Remove stored secret" to deliver unsigned.';
+ removeCheck.hidden = false;
+ } else {
+ secretIn.value = '';
+ delete secretIn.dataset.preserve;
+ secretIn.placeholder = '';
+ hint.textContent = 'Standard Webhooks HMAC key. Blank = unsigned delivery.';
+ removeCheck.hidden = true;
+ }
+ var selected = (ep.events && ep.events.length) ? ep.events : null;
+ all.checked = !selected;
+ checks.forEach(function(c) {
+ c.disabled = all.checked;
+ c.checked = !!(selected && selected.indexOf(c.value) !== -1);
+ });
+ } else {
+ document.getElementById('wh-form-title').textContent = 'Add Endpoint';
+ document.getElementById('wh-form-save').textContent = 'Add Endpoint';
+ urlIn.value = '';
+ secretIn.value = '';
+ delete secretIn.dataset.preserve;
+ secretIn.placeholder = '';
+ hint.textContent = 'Standard Webhooks HMAC key. Blank = unsigned delivery.';
+ document.getElementById('wh-f-secret-remove').hidden = true;
+ document.getElementById('wh-f-secret-remove').checked = false;
+ all.checked = true;
+ checks.forEach(function(c) { c.disabled = true; c.checked = false; });
+ }
+ form.hidden = false;
+ urlIn.focus();
+}
+
+function whCloseForm() {
+ var form = document.getElementById('wh-endpoint-form');
+ form.hidden = true;
+ whState.editingIndex = -1;
+}
+
+function whValidateForm() {
+ var ok = true;
+ var urlIn = document.getElementById('wh-f-url');
+ var secretIn = document.getElementById('wh-f-secret');
+ var eventsErr = document.getElementById('wh-f-events-error');
+ if (!validateRequired(urlIn, 'URL')) { ok = false; }
+ else if (!validateUrl(urlIn, 'URL')) { ok = false; }
+ var secretVal = secretIn.value.trim();
+ if (secretVal && whState.editingIndex >= 0 && whState.endpoints[whState.editingIndex].secret === secretVal) {
+ showError(secretIn, 'Enter a new secret, or leave blank to keep the stored one');
+ ok = false;
+ } else {
+ clearError(secretIn);
+ }
+ var all = document.getElementById('wh-f-events-all');
+ if (!all.checked) {
+ var any = Array.prototype.some.call(document.querySelectorAll('.wh-f-event'), function(c) { return c.checked; });
+ if (!any) {
+ eventsErr.textContent = 'Select at least one event type, or check "All"';
+ eventsErr.classList.add('visible');
+ ok = false;
+ } else {
+ eventsErr.classList.remove('visible');
+ }
+ } else {
+ eventsErr.classList.remove('visible');
+ }
+ return ok;
+}
+
+function whSaveForm() {
+ if (!whValidateForm()) return;
+ var urlIn = document.getElementById('wh-f-url');
+ var secretIn = document.getElementById('wh-f-secret');
+ var all = document.getElementById('wh-f-events-all');
+ var events = null;
+ if (!all.checked) {
+ events = [];
+ document.querySelectorAll('.wh-f-event').forEach(function(c) { if (c.checked) events.push(c.value); });
+ }
+ var entry = { url: urlIn.value.trim(), secret: null, events: events };
+ var secretVal = secretIn.value.trim();
+ var removeSecret = document.getElementById('wh-f-secret-remove');
+ if (secretVal) {
+ entry.secret = secretVal;
+ } else if (whState.editingIndex >= 0 && secretIn.dataset.preserve && !(removeSecret && removeSecret.checked)) {
+ entry.secret = secretIn.dataset.preserve; // sentinel round-trip = preserve
+ }
+ if (whState.editingIndex >= 0) {
+ whState.endpoints[whState.editingIndex] = entry;
+ } else {
+ whState.endpoints.push(entry);
+ }
+ whCloseForm();
+ whRenderEndpoints();
+ setStatus('Webhook endpoint saved locally — use "Save Webhooks" to apply');
+}
+
+function whDeleteEndpoint(i) {
+ var ep = whState.endpoints[i];
+ vkConfirm({
+ title: 'Delete webhook endpoint',
+ message: 'Delete endpoint "' + (ep.url || '') + '"? Budget alert deliveries to it stop after the next save.',
+ confirmLabel: 'Delete', danger: true,
+ onConfirm: function() {
+ whState.endpoints.splice(i, 1);
+ if (whState.editingIndex === i) whCloseForm();
+ whRenderEndpoints();
+ setStatus('Webhook endpoint removed locally — use "Save Webhooks" to apply');
+ }
+ });
+}
+
+function whTestEndpoint(i, tr) {
+ var ep = whState.endpoints[i];
+ var btn = tr.querySelector('.wh-test-btn');
+ if (btn) { btn.disabled = true; btn.textContent = 'Testing…'; }
+ var old = tr.querySelector('.wh-test-result');
+ if (old) old.remove();
+ whReq('/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: ep.url }) })
+ .then(function(result) {
+ result = result || {};
+ var el = document.createElement('div');
+ el.className = 'wh-test-result';
+ var statusPart = (result.status_code != null) ? ('HTTP ' + result.status_code) : 'no response';
+ el.textContent = result.success ? ('Test delivered — ' + statusPart) : ('Test failed — ' + statusPart + (result.error ? (': ' + result.error) : ''));
+ tr.querySelector('.wh-actions-cell').appendChild(el);
+ setStatus(result.success ? 'Webhook test delivered' : 'Webhook test failed');
+ })
+ .catch(function(err) {
+ var el = document.createElement('div');
+ el.className = 'wh-test-result';
+ el.textContent = 'Test failed: ' + err.message;
+ tr.querySelector('.wh-actions-cell').appendChild(el);
+ setStatus('Webhook test failed: ' + err.message);
+ })
+ .finally(function() { if (btn) { btn.disabled = false; btn.textContent = 'Test'; } });
+}
+
+function whRenderAllowlist() {
+ var wrap = document.getElementById('wh-allowlist');
+ wrap.innerHTML = ''; /* xss-audit: static */
+ if (!whState.allowlist.length) {
+ var none = document.createElement('span');
+ none.className = 'hint';
+ none.textContent = 'No private hosts allowlisted.';
+ wrap.appendChild(none);
+ return;
+ }
+ var row = document.createElement('div');
+ row.className = 'wh-allow-row';
+ whState.allowlist.forEach(function(host, idx) {
+ var code = document.createElement('code');
+ code.textContent = host;
+ row.appendChild(code);
+ var rm = document.createElement('button');
+ rm.type = 'button';
+ rm.className = 'btn btn-danger btn-sm';
+ rm.textContent = 'Remove';
+ rm.setAttribute('aria-label', 'Remove host ' + host);
+ rm.addEventListener('click', function() {
+ whState.allowlist.splice(idx, 1);
+ whRenderAllowlist();
+ });
+ row.appendChild(rm);
+ });
+ wrap.appendChild(row);
+}
+
+function whAddAllowHost() {
+ var input = document.getElementById('wh-allow-host');
+ var v = input.value.trim().toLowerCase();
+ if (!v) { showError(input, 'Enter a hostname'); return; }
+ if (whState.allowlist.indexOf(v) !== -1) { showError(input, 'Host already allowlisted'); return; }
+ clearError(input);
+ whState.allowlist.push(v);
+ input.value = '';
+ whRenderAllowlist();
+}
+
+function whRenderDeliveryFilter() {
+ var sel = document.getElementById('wh-delivery-endpoint');
+ var current = sel.value;
+ sel.innerHTML = '<option value="">All endpoints</option>'; /* xss-audit: static */
+ whState.endpoints.forEach(function(ep) {
+ var o = document.createElement('option');
+ o.value = ep.url;
+ o.textContent = ep.url;
+ sel.appendChild(o);
+ });
+ sel.value = current;
+}
+
+function whOutcomeBadge(outcome) {
+ var b = document.createElement('span');
+ var cls = String(outcome || '').replace(/[^a-z_]/g, '');
+ b.className = 'wh-badge wh-badge-outcome-' + cls;
+ b.textContent = outcome || '—';
+ return b;
+}
+
+function whLoadDeliveries() {
+ var sel = document.getElementById('wh-delivery-endpoint');
+ var tbody = document.getElementById('wh-deliveries-tbody');
+ var empty = document.getElementById('wh-deliveries-empty');
+ var ep = sel.value;
+ var qs = '?limit=50' + (ep ? ('&endpoint=' + encodeURIComponent(ep)) : '');
+ whReq('/deliveries' + qs)
+ .then(function(body) {
+ var deliveries = (body && body.deliveries) || [];
+ tbody.innerHTML = ''; /* xss-audit: static */
+ empty.hidden = deliveries.length > 0;
+ empty.textContent = deliveries.length ? '' : 'No deliveries recorded.';
+ deliveries.forEach(function(d) {
+ var tr = document.createElement('tr');
+ var when = '—';
+ if (d.attempted_at != null) {
+ var ts = typeof d.attempted_at === 'number' ? d.attempted_at * 1000 : d.attempted_at;
+ when = new Date(ts).toLocaleString();
+ }
+ tr.appendChild(whTd(when));
+ tr.appendChild(whTd(d.event_id || '—', 'wh-url-cell'));
+ tr.appendChild(whTd(d.attempt != null ? String(d.attempt) : '—'));
+ var outTd = document.createElement('td');
+ outTd.appendChild(whOutcomeBadge(d.outcome));
+ tr.appendChild(outTd);
+ tr.appendChild(whTd(d.status_code != null ? String(d.status_code) : '—'));
+ tr.appendChild(whTd(d.error || '—'));
+ tbody.appendChild(tr);
+ });
+ })
+ .catch(function(err) {
+ tbody.innerHTML = ''; /* xss-audit: static */
+ empty.hidden = false;
+ empty.textContent = 'Failed to load deliveries: ' + err.message;
+ });
+}
+
+function whOnOpen() { whLoad(); }
+
+function whLoad() {
+ setStatus('Loading webhooks…');
+ whReq('')
+ .then(function(body) {
+ body = body || {};
+ whState.endpoints = (body.endpoints || []).map(function(ep) {
+ return { url: ep.url || '', secret: ep.secret || null, events: ep.events || null, failing: !!ep.failing };
+ });
+ whState.allowlist = (body.allowed_private_hosts || []).slice();
+ whRenderEndpoints();
+ whRenderAllowlist();
+ whLoadDeliveries();
+ setStatus('Webhooks loaded');
+ })
+ .catch(function(err) {
+ setStatus('Failed to load webhooks: ' + err.message);
+ });
+}
+
+function whCollect() {
+ var endpoints = whState.endpoints.map(function(ep) {
+ return { url: ep.url, secret: ep.secret || null, events: ep.events || null };
+ });
+ return { endpoints: endpoints, allowed_private_hosts: whState.allowlist.slice() };
+}
+
+function whSave() {
+ setStatus('Saving webhooks…');
+ whReq('', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(whCollect()) })
+ .then(function() {
+ setStatus('Webhooks saved and applied');
+ showToast('Webhooks saved and applied');
+ whLoad();
+ })
+ .catch(function(err) {
+ setStatus('Webhooks save failed: ' + err.message);
+ showToast('Webhooks save failed: ' + err.message, true);
+ });
+}
+
+(function whWire() {
+ document.getElementById('wh-add-endpoint').addEventListener('click', function() { whOpenForm(); });
+ document.getElementById('wh-form-save').addEventListener('click', whSaveForm);
+ document.getElementById('wh-form-cancel').addEventListener('click', whCloseForm);
+ document.getElementById('wh-f-events-all').addEventListener('change', function() {
+ var disabled = this.checked;
+ document.querySelectorAll('.wh-f-event').forEach(function(c) { c.disabled = disabled; });
+ });
+ document.getElementById('wh-allow-add').addEventListener('click', whAddAllowHost);
+ document.getElementById('wh-allow-host').addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); whAddAllowHost(); } });
+ document.getElementById('wh-delivery-endpoint').addEventListener('change', whLoadDeliveries);
+ document.getElementById('wh-delivery-refresh').addEventListener('click', whLoadDeliveries);
+ document.getElementById('wh-save').addEventListener('click', whSave);
+ document.getElementById('wh-reset').addEventListener('click', whLoad);
+})();
+
+// --- Security exposure banner (Req 1.8) ---
   var SEC_BANNER_KEY = 'sec-banner-dismissed';
   function renderSecurityBanner(mode) {
     var banner = document.createElement('div');

@@ -147,6 +147,12 @@ pub struct Config {
     /// tier). See [`crate::security`].
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Budget-alert webhook delivery. Absent section applies
+    /// [`WebhooksConfig::default`] (empty endpoints = fully dormant —
+    /// there is no enabled flag). See the `budget-alerts-unified-webhooks`
+    /// spec.
+    #[serde(default)]
+    pub webhooks: WebhooksConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +178,57 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             outbound_fetch: OutboundFetchConfig::default(),
+        }
+    }
+}
+
+/// Budget-alert event types deliverable to webhook endpoints
+/// (budget-alerts-unified-webhooks, Req 3.2). Serialized exactly as the
+/// event `type` strings receivers match on. The `webhook.test` type used
+/// for admin test sends is synthesized by the webhooks module and is not
+/// a configurable event filter value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BudgetEventType {
+    #[serde(rename = "budget.warning")]
+    BudgetWarning,
+    #[serde(rename = "budget.exhausted")]
+    BudgetExhausted,
+    #[serde(rename = "budget.reset")]
+    BudgetReset,
+}
+
+/// A single webhook receiver (budget-alerts-unified-webhooks, Req 3.1).
+/// The URL is the endpoint identity; `events` of `None` subscribes the
+/// endpoint to every budget event type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookEndpoint {
+    pub url: String,
+    /// Standard Webhooks HMAC secret; `None` = unsigned delivery.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Event filter; `None` = all event types.
+    #[serde(default)]
+    pub events: Option<Vec<BudgetEventType>>,
+}
+
+/// `webhooks:` configuration section root (budget-alerts-unified-webhooks,
+/// Req 3.1, 3.3). Absent or empty section = fully dormant; there is no
+/// enabled flag — an empty `endpoints` list is the off state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebhooksConfig {
+    /// Receiver endpoints; the URL is the endpoint identity.
+    pub endpoints: Vec<WebhookEndpoint>,
+    /// Exact-match hostname allowlist: permits private addresses AND
+    /// plain `http` for the listed hosts only.
+    pub allowed_private_hosts: Vec<String>,
+}
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            allowed_private_hosts: Vec::new(),
         }
     }
 }
@@ -869,6 +926,11 @@ pub struct ProviderBudgetConfig {
     /// (zero-config compatibility with configs that only set `limit_usd`).
     #[serde(default)]
     pub reset_policy: Option<BudgetResetPolicy>,
+    /// Warning-threshold override for this provider
+    /// (budget-alerts-unified-webhooks, Req 1.8). `None` = default 80;
+    /// valid range 1..=100 (the exhausted line is fixed at 100).
+    #[serde(default)]
+    pub alert_threshold_percent: Option<u8>,
 }
 
 /// Model group configuration

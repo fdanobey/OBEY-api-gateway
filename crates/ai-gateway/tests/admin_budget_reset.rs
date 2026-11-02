@@ -30,6 +30,7 @@ fn budget_test_config() -> Config {
         Some(ProviderBudgetConfig {
             limit_usd: 50.0,
             reset_policy: Some(BudgetResetPolicy::Manual),
+        alert_threshold_percent: None,
         }),
     )
 }

@@ -196,6 +196,7 @@ fn base_config(provider_uri: &str) -> Config {
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
         reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     }
 }
 

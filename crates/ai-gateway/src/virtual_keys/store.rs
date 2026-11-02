@@ -66,6 +66,20 @@ pub struct StoredVirtualKey {
     pub request_count: u64,
 }
 
+/// Durable budget facts for one key, read without mutation for
+/// budget-alert evaluation (budget-alerts-unified-webhooks, Task 6).
+/// Carries key id/name ONLY — never the hashed or encrypted key value
+/// (Req 1.2: events and logs must never contain the `vk_` secret).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyBudgetState {
+    pub key_id: String,
+    pub name: Option<String>,
+    pub budget_limit_usd: Option<f64>,
+    pub budget_window: Option<BudgetWindow>,
+    pub current_spend_usd: f64,
+    pub window_start: Option<DateTime<Utc>>,
+}
+
 /// Partial update descriptor for [`KeyStore::update_key`].
 ///
 /// Each field uses `Option` to indicate "leave unchanged" (`None`). Nullable
@@ -469,7 +483,78 @@ impl KeyStore {
         Ok(previous.unwrap_or((0.0, 0)))
     }
 
-    /// Insert a single usage row into `virtual_key_usage`.
+/// Pure getter: the durable budget facts for one key, without mutation
+/// (budget-alerts-unified-webhooks, Task 6 / Req 1.2). Returns `None`
+/// when the id is unknown. Reads only alert-safe columns — never the
+/// hashed or encrypted key value.
+pub fn get_key_budget_state(
+    &self,
+    id: &str,
+) -> Result<Option<KeyBudgetState>, KeyStoreError> {
+    let conn = self.conn.lock().expect("keys.db mutex poisoned");
+    let row = conn.query_row(
+        "SELECT id, name, budget_limit_usd, budget_window, current_spend_usd, \
+         window_start_timestamp FROM virtual_keys WHERE id = ?1",
+        params![id],
+        |row| {
+            let budget_window_str: Option<String> = row.get(3)?;
+            let budget_window = match budget_window_str {
+                Some(s) => Some(budget_window_from_str(&s).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(3, SqlType::Text, Box::new(e))
+                })?),
+                None => None,
+            };
+            let window_start_ts: Option<i64> = row.get(5)?;
+            Ok(KeyBudgetState {
+                key_id: row.get(0)?,
+                name: row.get(1)?,
+                budget_limit_usd: row.get(2)?,
+                budget_window,
+                current_spend_usd: row.get(4)?,
+                window_start: window_start_ts.and_then(|ts| DateTime::from_timestamp(ts, 0)),
+            })
+        },
+    );
+    match row {
+        Ok(state) => Ok(Some(state)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Pure getter: the durable budget facts for every key, ordered by id
+/// (startup VK alert seeding, Task 6 / Reqs 1.2, 4.6). Reads only
+/// alert-safe columns — never the hashed or encrypted key value.
+pub fn list_key_budget_states(&self) -> Result<Vec<KeyBudgetState>, KeyStoreError> {
+    let conn = self.conn.lock().expect("keys.db mutex poisoned");
+    let mut stmt = conn.prepare(
+        "SELECT id, name, budget_limit_usd, budget_window, current_spend_usd, \
+         window_start_timestamp FROM virtual_keys ORDER BY id",
+    )?;
+    let states = stmt
+        .query_map([], |row| {
+            let budget_window_str: Option<String> = row.get(3)?;
+            let budget_window = match budget_window_str {
+                Some(s) => Some(budget_window_from_str(&s).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(3, SqlType::Text, Box::new(e))
+                })?),
+                None => None,
+            };
+            let window_start_ts: Option<i64> = row.get(5)?;
+            Ok(KeyBudgetState {
+                key_id: row.get(0)?,
+                name: row.get(1)?,
+                budget_limit_usd: row.get(2)?,
+                budget_window,
+                current_spend_usd: row.get(4)?,
+                window_start: window_start_ts.and_then(|ts| DateTime::from_timestamp(ts, 0)),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(states)
+}
+
+/// Insert a single usage row into `virtual_key_usage`.
     ///
     /// Records the per-request breakdown (model group/model, token counts,
     /// computed cost, UTC timestamp) used for later aggregation. The caller is

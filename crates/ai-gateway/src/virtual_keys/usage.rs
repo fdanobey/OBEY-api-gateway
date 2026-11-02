@@ -40,8 +40,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
-use super::models::{UsageAggregate, UsageRecord};
-use super::store::{KeyStore, KeyStoreError};
+use super::errors::KeyError;
+use super::models::{BudgetWindow, UsageAggregate, UsageRecord};
+use super::store::{KeyBudgetState, KeyStore, KeyStoreError};
+use super::VirtualKeyManager;
 
 /// Records completed-request usage and answers aggregation queries.
 ///
@@ -114,6 +116,92 @@ pub fn compute_cost(
     let input_cost = input_tokens as f64 * input_rate_per_million / COST_DECIMALS;
     let output_cost = output_tokens as f64 * output_rate_per_million / COST_DECIMALS;
     ((input_cost + output_cost) * COST_DECIMALS).round() / COST_DECIMALS
+}
+
+impl VirtualKeyManager {
+/// Read one key's durable budget facts (limit, window, spend, anchor)
+/// without mutation — the enriched input the record_usage call site
+/// resolves for VK alert evaluation (design D4; Reqs 1.2, 1.3).
+/// Store access follows the `spawn_store_task` blocking-pool
+/// discipline; evaluation itself stays off the request path.
+pub async fn key_budget_state(&self, key_id: &str) -> Result<Option<KeyBudgetState>, KeyError> {
+let store = Arc::clone(&self.store);
+let key_id = key_id.to_string();
+super::spawn_store_task(move || Ok(store.get_key_budget_state(&key_id)?)).await
+}
+
+/// Read every key's durable budget facts (startup VK alert seeding;
+/// Reqs 1.2, 4.6). Blocking-pool discipline as above.
+pub async fn all_key_budget_states(&self) -> Result<Vec<KeyBudgetState>, KeyError> {
+let store = Arc::clone(&self.store);
+super::spawn_store_task(move || Ok(store.list_key_budget_states()?)).await
+}
+
+/// Shared VK threshold-crossing evaluation for off-path
+/// `record_usage` spawn sites (budget-alerts-unified-webhooks,
+/// Reqs 1.2-1.4): after the durable usage write, resolve the key's
+/// budget facts and hand them to the alert hook. Dormancy gating and
+/// the no-limit filter (Req 1.9/3.3) happen inside the hook. Used by
+/// the chat-front-door site (`virtual_keys::auth`) and the
+/// assistants-runs site (`gateway::handlers`) so every VK accrual
+/// path evaluates identically — extracting it here avoids a
+/// `gateway → virtual_keys → gateway` module cycle.
+///
+/// Read-back race note (design D11 tolerance style): the usage write
+/// and this budget read are two store operations, so an admin/window
+/// reset landing between them can erase a crossing before
+/// evaluation. Accepted residual race — the durable truth moves on
+/// and the next accrual in the fresh window evaluates correctly; a
+/// fully transactional read-back would couple the usage tracker to
+/// the alert path for marginal benefit.
+pub async fn evaluate_budget_alerts_after_usage(
+&self,
+alerts: &std::sync::Arc<crate::webhooks::ProviderBudgetAlerts>,
+config: &std::sync::Arc<tokio::sync::RwLock<crate::config::Config>>,
+key_id: &str,
+) {
+match self.key_budget_state(key_id).await {
+Ok(Some(budget)) => {
+if budget.budget_limit_usd.is_some_and(|limit| limit > 0.0) {
+alerts
+.evaluate_virtual_key(
+config,
+&budget.key_id,
+budget.name.as_deref().unwrap_or_default(),
+budget.budget_limit_usd.unwrap_or_default(),
+budget.current_spend_usd,
+budget
+.window_start
+.map(|ws| ws.timestamp())
+.unwrap_or(0),
+vk_window_label(budget.budget_window.as_ref()),
+)
+.await;
+}
+}
+Ok(None) => {}
+Err(error) => {
+tracing::warn!(
+key_id = %key_id,
+error = %error,
+"virtual key budget state read failed after usage recording; alert evaluation skipped"
+);
+}
+}
+}
+}
+
+/// Envelope `data.window` label for a virtual-key budget window.
+/// Keys without a periodic window accumulate for the key's lifetime
+/// (`lifetime`); the auth-front-door copy lives in `auth.rs` — this
+/// one serves the shared post-usage evaluation helper.
+fn vk_window_label(window: Option<&BudgetWindow>) -> &'static str {
+match window {
+Some(BudgetWindow::Daily) => "daily",
+Some(BudgetWindow::Weekly) => "weekly",
+Some(BudgetWindow::Monthly) => "monthly",
+None => "lifetime",
+}
 }
 
 #[cfg(test)]

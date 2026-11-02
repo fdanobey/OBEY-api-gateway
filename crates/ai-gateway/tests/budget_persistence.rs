@@ -30,6 +30,7 @@ async fn gateway_creates_budgets_db_sibling_of_logs_db_and_seeds_limit() {
         Some(ProviderBudgetConfig {
             limit_usd: 50.0,
             reset_policy: None,
+            alert_threshold_percent: None,
         }),
     );
     let server = GatewayServer::new(config, None)
@@ -111,6 +112,7 @@ async fn config_reload_reseeds_limits_without_clearing_store_spend() {
         Some(ProviderBudgetConfig {
             limit_usd: 50.0,
             reset_policy: None,
+            alert_threshold_percent: None,
         }),
     );
     let server = GatewayServer::new(config, None)
@@ -134,6 +136,7 @@ async fn config_reload_reseeds_limits_without_clearing_store_spend() {
         Some(ProviderBudgetConfig {
             limit_usd: 75.0,
             reset_policy: None,
+            alert_threshold_percent: None,
         }),
     );
     server
@@ -182,6 +185,7 @@ async fn budget_store_open_failure_aborts_startup_with_actionable_error() {
         Some(ProviderBudgetConfig {
             limit_usd: 50.0,
             reset_policy: None,
+            alert_threshold_percent: None,
         }),
     );
     let err = match GatewayServer::new(config, None).await {
@@ -216,6 +220,7 @@ async fn snapshot_carries_budget_status_by_provider() {
         Some(ProviderBudgetConfig {
             limit_usd: 50.0,
             reset_policy: Some(BudgetResetPolicy::Daily),
+            alert_threshold_percent: None,
         }),
     );
     let daily_server = GatewayServer::new(daily_config, None)

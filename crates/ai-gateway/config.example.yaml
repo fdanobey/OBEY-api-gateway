@@ -45,6 +45,7 @@ providers:
     budget:
       limit_usd: 50.0
       reset_policy: manual # daily | weekly | monthly | manual
+      # alert_threshold_percent: 90 # warning-webhook threshold override (1-100; default 80)
     # custom_headers:
     # X-Custom: "${MY_ENV_VAR}"
 
@@ -313,5 +314,18 @@ tray:
 # domain_load: 0.1666666667
 # ambiguity: 0.1666666667
 # cascade:
-# enabled: true
-# max_escalations: 2
+#   enabled: true
+#   max_escalations: 2
+
+# Budget-alert webhooks (optional). Absent section or empty endpoints =
+# fully dormant (no enabled flag). Endpoints receive signed webhook
+# deliveries when provider budgets cross the warning threshold, hit
+# their limit, or reset. URLs must be https; plain http is allowed only
+# for hosts listed in allowed_private_hosts (exact match — also permits
+# private/LAN addresses for those hosts).
+# webhooks:
+#   endpoints:
+#     - url: "https://hooks.example.com/budget-alerts"
+#       secret: "whsec_example" # Standard Webhooks HMAC key; omit for unsigned
+#       events: ["budget.warning", "budget.exhausted", "budget.reset"] # omit = all
+#   allowed_private_hosts: [] # e.g. ["hooks.lan.local"]

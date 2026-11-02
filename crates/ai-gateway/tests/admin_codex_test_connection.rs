@@ -113,6 +113,7 @@ fn codex_test_config() -> Config {
         structured_output: None,
         memory: None,
         reasoning_compat: Default::default(),
+        webhooks: Default::default(),
     }
 }
 

@@ -85,7 +85,8 @@ impl RequestRateRing {
 }
 
 /// Thread-safe metrics tracking for the gateway
-#[derive(Debug)]
+// Manual Debug impl below: the provider-spend hook is a `dyn Fn`
+// closure with no Debug representation.
 pub struct Metrics {
     /// Total request count since startup
     request_count: AtomicU64,
@@ -191,18 +192,40 @@ pub struct Metrics {
             HashMap<String, crate::metrics::provider_budget_store::ProviderBudgetRow>,
         )>,
     >,
-    /// In-memory next-boundary cache for the lazy budget-window rollover
-    /// (hot-path remediation, finding B1): provider -> (policy at seed
-    /// time, durable `window_start`, next boundary epoch). Seeded from the
-    /// store + policy once per provider per window; every later rollover
-    /// check is a pure `now >= next_boundary_epoch` comparison with no
-    /// SQL. A policy change (config hot-reload) re-seeds via the cached
-    /// policy mismatch check.
-    budget_window_boundaries: Mutex<HashMap<String, (crate::config::BudgetResetPolicy, i64, i64)>>,
+/// In-memory next-boundary cache for the lazy budget-window rollover
+/// (hot-path remediation, finding B1): provider -> (policy at seed
+/// time, durable `window_start`, next boundary epoch). Seeded from the
+/// store + policy once per provider per window; every later rollover
+/// check is a pure `now >= next_boundary_epoch` comparison with no
+/// SQL. A policy change (config hot-reload) re-seeds via the cached
+/// policy mismatch check.
+budget_window_boundaries: Mutex<HashMap<String, (crate::config::BudgetResetPolicy, i64, i64)>>,
+/// Post-persist alert hook (budget-alerts-unified-webhooks, Task 5):
+/// invoked INSIDE the off-path spend-write task after a successful
+/// `add_spend`, with (provider, durable total USD, window anchor).
+/// Set once during gateway startup; the closure itself spawns the
+/// async alert evaluation. Metrics never imports the webhooks module
+/// (no module cycle) — the closure is injected by the gateway wiring.
+provider_spend_hook: Mutex<Option<ProviderSpendHook>>,
+}
+
+/// The post-persist alert hook signature (budget-alerts-unified-
+/// webhooks, Task 5): `(provider, durable_total_usd, window_anchor)`.
+pub type ProviderSpendHook = std::sync::Arc<dyn Fn(&str, f64, i64) + Send + Sync>;
+
+impl std::fmt::Debug for Metrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Metrics").finish_non_exhaustive()
+    }
 }
 
 /// TTL of the cached budget-store rows served to budget status snapshots.
 const BUDGET_STORE_ROWS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many recent budget-alert events the dashboard snapshot carries
+/// (budget-alerts-unified-webhooks, Task 9; design Component 5:
+/// "newest 20"). The ledger's TTL-cached read is bounded to this.
+pub const RECENT_BUDGET_ALERTS_LIMIT: u32 = 20;
 
 /// Bounded label set for compression metrics: (level, provider).
 type CompressionMetricKey = (String, String);
@@ -602,6 +625,14 @@ pub struct MetricsSnapshot {
     /// via WS snapshots and `GET /dashboard/metrics`.
     #[serde(default)]
     pub budget_status_by_provider: HashMap<String, ProviderBudgetStatus>,
+    /// Newest budget-alert events (budget-alerts-unified-webhooks,
+    /// Task 9, Req 5.4): newest first, capped at 20 server-side.
+    /// Populated from the webhook ledger's 1-second-TTL-cached read
+    /// during dashboard snapshot assembly (same discipline as
+    /// `cached_budget_store_rows`, design D8); empty while the alert
+    /// subsystem is dormant (no endpoints ⇒ no events).
+    #[serde(default)]
+    pub recent_budget_alerts: Vec<AlertSummary>,
 }
 
 impl MetricsSnapshot {
@@ -656,6 +687,27 @@ pub struct ProviderBudgetStatus {
     pub next_reset_epoch: Option<i64>,
     /// Whether the provider is currently budget-exhausted (spent >= limit).
     pub exhausted: bool,
+}
+
+/// One recent budget-alert event for the dashboard feed
+/// (budget-alerts-unified-webhooks, Task 9, Req 5.4). Server-derived
+/// summary of a ledger `alert_events` row; the JS renders only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertSummary {
+    /// Event name verbatim: `budget.warning` | `budget.exhausted` |
+    /// `budget.reset`.
+    pub event_type: String,
+    /// `provider` | `virtual_key` (ledger scope column).
+    pub scope: String,
+    /// Provider name or `key:<id>:<name>` (ledger scope_label column).
+    pub scope_label: String,
+    /// UTC epoch seconds the event fired at.
+    pub fired_at: i64,
+    /// Warn threshold crossed (warning events only, design Component 5:
+    /// "threshold kind"); extracted from the ledger payload. Absent
+    /// for exhausted/reset rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_percent: Option<u8>,
 }
 
 /// Next UTC reset boundary for a windowed policy, anchored on the row's
@@ -965,6 +1017,7 @@ impl Metrics {
             provider_budget_store: Mutex::new(None),
             budget_store_rows_cache: Mutex::new(None),
             budget_window_boundaries: Mutex::new(HashMap::new()),
+            provider_spend_hook: Mutex::new(None),
         }
     }
 
@@ -1082,6 +1135,14 @@ impl Metrics {
                 return;
             }
         };
+        // Post-persist alert hook (budget-alerts-unified-webhooks,
+        // Task 5): cloned into the write task so the read-back and the
+        // evaluation never touch the request/response path.
+        let spend_hook = self
+            .provider_spend_hook
+            .lock()
+            .expect("provider spend hook slot poisoned")
+            .clone();
         let write = move || {
             if let Err(error) = store.add_spend(&provider, usd, window_start_epoch) {
                 tracing::warn!(
@@ -1089,6 +1150,24 @@ impl Metrics {
                     error = %error,
                     "Failed to persist provider budget spend; in-memory metrics remain authoritative"
                 );
+                return;
+            }
+            // Alert evaluation (Req 1.1, 1.10): only after a successful
+            // durable write, with the store's own read-back of the new
+            // total + anchor so the emitted events agree with the
+            // durable truth. Hook failures degrade to a warn.
+            if let Some(hook) = spend_hook {
+                match store.get_spend_and_window(&provider) {
+                    Ok(Some((total_usd, anchor))) => hook(&provider, total_usd, anchor),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            provider = %provider,
+                            error = %error,
+                            "Failed to read back provider budget spend for alert evaluation"
+                        );
+                    }
+                }
             }
         };
         // Inside the async gateway, keep the sync SQLite write off the
@@ -1101,6 +1180,18 @@ impl Metrics {
             }
             Err(_) => write(),
         }
+    }
+
+    /// Set the post-persist alert hook (budget-alerts-unified-webhooks,
+    /// Task 5). Called once during gateway startup; the closure spawns
+    /// the async threshold evaluation. Metrics stays free of any
+    /// webhooks import (no module cycle) — the gateway injects the
+    /// closure.
+    pub fn set_provider_spend_hook(&self, hook: ProviderSpendHook) {
+        *self
+            .provider_spend_hook
+            .lock()
+            .expect("provider spend hook slot poisoned") = Some(hook);
     }
 
     /// The current budget-window start (UTC epoch seconds) for `provider`
@@ -2814,6 +2905,7 @@ Total unicode_stego provider detections by category and phase\n",
             circuit_breaker_states: Vec::new(),
             active_requests_list: Vec::new(),
             budget_status_by_provider: self.budget_status_by_provider(),
+            recent_budget_alerts: Vec::new(),
         }
     }
 

@@ -648,6 +648,57 @@ async fn build_dashboard_snapshot(state: &AppState) -> crate::metrics::MetricsSn
     snapshot.circuit_breaker_states = cb_states.clone();
     snapshot.enrich_circuit_breaker_states(&cb_states);
     snapshot.active_requests_list = state.active_requests.snapshot();
+    let ledger = std::sync::Arc::clone(&state.webhook_ledger);
+    // Recent budget alerts (budget-alerts-unified-webhooks, Task 9,
+    // Req 5.4): served from the ledger's 1-second-TTL-cached read so
+    // the snapshot cadence never hits SQLite more than once per
+    // second (design D8 — same discipline as the budget rows cache).
+    // The cached read is sync SQLite, so it runs on the blocking pool
+    // bounded by a 250 ms timeout — a slow ledger write can never
+    // stall the snapshot. Empty list while dormant or on a
+    // read/timeout failure: the ledger read degrades silently, never
+    // logs per-snapshot.
+    snapshot.recent_budget_alerts = match tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        tokio::task::spawn_blocking(move || {
+            ledger.recent_events_cached(crate::metrics::RECENT_BUDGET_ALERTS_LIMIT)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(rows)) => rows
+            .into_iter()
+            // Budget event types only (design Component 5): the feed
+            // excludes `webhook.test` rows BEFORE the limit so admin
+            // test sends can never crowd out real alert history.
+            .filter(|row| row.event_type != "webhook.test")
+            .map(|row| crate::metrics::AlertSummary {
+                threshold_percent: serde_json::from_str::<serde_json::Value>(
+                    &row.payload_json,
+                )
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("data")
+                        .and_then(|data| data.get("percent"))
+                        .and_then(|percent| percent.as_u64())
+                        .and_then(|percent| u8::try_from(percent).ok())
+                }),
+                event_type: row.event_type,
+                scope: row.scope,
+                scope_label: row.scope_label,
+                fired_at: row.created_at,
+            })
+            .collect(),
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "dashboard: recent-alerts read task failed");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("dashboard: recent-alerts read timed out; degrading to empty");
+            Vec::new()
+        }
+    };
     snapshot
 }
 
@@ -1123,6 +1174,7 @@ mod tests {
             virtual_keys: Default::default(),
             loop_detection: Default::default(),
             guardrails: None,
+        webhooks: Default::default(),
             tool_compression: Default::default(),
             smart_routing: Default::default(),
             memory: None,
