@@ -143,6 +143,16 @@ struct RequestLogContext {
     claude_session_id: Option<String>,
     /// Log row `path` (front door that served the request).
     log_path: &'static str,
+    /// Input (prompt) tokens reported by the provider (cost-reporting
+    /// spec, Req 1.1/2.1); `None` when no usage was reported.
+    input_tokens: Option<i64>,
+    /// Output (completion) tokens reported by the provider
+    /// (cost-reporting spec, Req 1.1/2.1); `None` when no usage was
+    /// reported.
+    output_tokens: Option<i64>,
+    /// Virtual key id that authenticated the request (cost-reporting
+    /// spec, Req 2.1/2.2); `None` for anonymous traffic.
+    virtual_key_id: Option<String>,
 }
 
 impl RequestLogContext {
@@ -169,6 +179,41 @@ fn with_memory(
         if let Some(extraction) = extraction {
             self.memories_stored = extraction.stored;
         }
+        self
+    }
+
+    /// Builder-style setter for the cost-reporting usage columns
+    /// (cost-reporting spec, Req 1.1/2.1): streaming success paths
+    /// that hold the reassembled usage call
+    /// `context.with_usage(prompt, completion)`; zero values stay
+    /// `None` so "no usage reported" persists as NULL, not zero.
+    fn with_usage(mut self, prompt_tokens: u32, completion_tokens: u32) -> Self {
+        if prompt_tokens > 0 {
+            self.input_tokens = Some(i64::from(prompt_tokens));
+        }
+        if completion_tokens > 0 {
+            self.output_tokens = Some(i64::from(completion_tokens));
+        }
+        self
+    }
+
+    /// Builder-style setter for the key-attribution column
+    /// (cost-reporting spec, Req 2.1/2.2): applied at `log_outcome`
+    /// from the active-request registry entry so every outcome site
+    /// (including streaming generators with no key in scope)
+    /// persists the authenticating virtual key id.
+    fn with_virtual_key(mut self, virtual_key_id: Option<&str>) -> Self {
+        self.virtual_key_id = virtual_key_id.map(str::to_string);
+        self
+    }
+
+    /// Builder-style setter for the cost-reporting cost column
+    /// (cost-reporting spec, Req 1.1/2.1): the pass-through success
+    /// path threads the cost accrued by `record_streaming_success`
+    /// (0.0 when usage was unknown) into the ledger row instead of
+    /// logging a fake zero.
+    fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
         self
     }
 
@@ -290,8 +335,16 @@ fn with_memory(
         client_protocol: None,
         claude_session_id: None,
         log_path: "/v1/chat/completions",
+        // Cost-reporting usage telemetry (Req 1.1/2.1): read straight
+        // off the response usage object; zero stays None (NULL = no
+        // usage reported, not zero).
+        input_tokens: (response.usage.prompt_tokens > 0)
+            .then(|| i64::from(response.usage.prompt_tokens)),
+        output_tokens: (response.usage.completion_tokens > 0)
+            .then(|| i64::from(response.usage.completion_tokens)),
+        virtual_key_id: None,
     }
-}
+    }
 
     fn from_streaming_success(
         request: &OpenAIRequest,
@@ -321,7 +374,10 @@ fn with_memory(
             prefix_hash: None,
         // Pass-through streams have no response extras to read; the
         // reasoning usage itself is attributed to metrics inside
-        // `record_streaming_success`.
+        // `record_streaming_success`. Token usage and the accrued
+        // cost (cost-reporting Req 1.1/2.1) are attached by the
+        // caller via `with_usage`/`with_cost` where the reassembled
+        // usage and accrued cost are in scope.
         reasoning_tokens: None,
         reasoning_compat_actions: None,
         reasoning_relayed_frames: None,
@@ -330,6 +386,9 @@ fn with_memory(
         client_protocol: None,
         claude_session_id: None,
         log_path: "/v1/chat/completions",
+        input_tokens: None,
+        output_tokens: None,
+        virtual_key_id: None,
     }
 }
 
@@ -384,6 +443,11 @@ fn with_memory(
         // gate-skipped attempts surface as context_window_exceeded
         // `#attempt` rows instead.
         context_reduction: None,
+        // Failed requests never reported usage; the key id is still
+        // attached centrally by `log_outcome` for attribution.
+        input_tokens: None,
+        output_tokens: None,
+        virtual_key_id: None,
         error_class: Some(crate::error::error_class_for(error)),
         client_protocol: None,
         claude_session_id: None,
@@ -418,7 +482,18 @@ fn log_outcome(
         log_failed_attempts(&state.logger, &state.metrics, &context.trace_id, &attempts);
     }
     let relay = handle.and_then(|handle| handle.reasoning_relay());
-    let context = context.clone().with_reasoning_relay(relay.as_ref());
+    let key = handle.and_then(|handle| {
+        handle
+            .0
+            .lock()
+            .ok()
+            .and_then(|info| info.virtual_key_id.clone())
+            .filter(|key| key != ANONYMOUS_KEY_ID)
+    });
+    let context = context
+        .clone()
+        .with_reasoning_relay(relay.as_ref())
+        .with_virtual_key(key.as_deref());
     log_request(state, request, &context);
     if let Some(handle) = handle {
         handle.mark_outcome_logged();
@@ -472,6 +547,9 @@ fn write_request_log(
         context_reduction: context.context_reduction.clone(),
         client_protocol: context.client_protocol.map(str::to_string),
         claude_session_id: context.claude_session_id.clone(),
+        input_tokens: context.input_tokens,
+        output_tokens: context.output_tokens,
+        virtual_key_id: context.virtual_key_id.clone(),
     };
     logger.log_with_reasoning_relay(entry, context.reasoning_relayed_frames)
 }
@@ -487,6 +565,12 @@ pub(crate) const ATTEMPT_LOG_PATH: &str = "/v1/chat/completions#attempt";
 /// (e.g. a connection error or circuit-breaker skip with no HTTP status).
 /// Mirrors the gateway's `AllProvidersFailed` → HTTP 502 mapping.
 const ATTEMPT_FALLBACK_STATUS: u16 = 502;
+
+/// Sentinel owner id registered on the in-flight handle for anonymous
+/// traffic (no virtual key authenticated). Filtered everywhere a real
+/// key id is read back off the handle so cost reports keep anonymous
+/// rows unattributed instead of minting an "anonymous" key.
+const ANONYMOUS_KEY_ID: &str = "anonymous";
 
 /// Write one content-free failure log row per failed provider attempt, and
 /// bump the model-labeled attempt-failure counter.
@@ -521,10 +605,10 @@ fn log_failed_attempts(
             status_code,
             duration_ms: attempt.duration_ms.unwrap_or(0),
             cost: 0.0,
-            request_body: None,
-            response_body: Some(attempt.error.clone()),
             requested_model: None,
             responded_model: None,
+            response_body: Some(attempt.error.clone()),
+            request_body: None,
             compression: None,
             memories_injected: 0,
             memories_stored: 0,
@@ -534,12 +618,17 @@ fn log_failed_attempts(
             cache_creation_tokens: None,
             cache_savings_cents: None,
             prefix_hash: None,
-        reasoning_tokens: None,
-        reasoning_compat_actions: None,
-        context_reduction: None,
-        client_protocol: None,
-        claude_session_id: None,
-        error_class: Some(
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
+            context_reduction: None,
+            client_protocol: None,
+            claude_session_id: None,
+            // Attempt rows never carry usage; they are excluded from cost
+            // reports by the `#attempt` path filter.
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
+            error_class: Some(
             attempt
                 .error_class
                 .clone()
@@ -1529,13 +1618,14 @@ impl AbandonLogger {
         }
         self.handle.mark_outcome_logged();
         let snapshot = self.handle.0.lock().ok().map(|info| info.clone());
-        let (trace_id, provider, model, attempt, phase) = match snapshot.as_ref() {
+        let (trace_id, provider, model, attempt, phase, virtual_key_id) = match snapshot.as_ref() {
             Some(info) => (
                 info.trace_id.clone(),
                 info.provider.clone().unwrap_or_default(),
                 info.model.clone(),
                 info.attempt,
                 info.phase,
+                info.virtual_key_id.clone().filter(|key| key != ANONYMOUS_KEY_ID),
             ),
             None => (
                 String::new(),
@@ -1543,6 +1633,7 @@ impl AbandonLogger {
                 None,
                 0,
                 crate::active_requests::ActivePhase::Pending,
+                None,
             ),
         };
         let (status_code, error_class) = abandon_outcome(elapsed, self.deadline_secs);
@@ -1582,13 +1673,21 @@ impl AbandonLogger {
             cache_creation_tokens: None,
             cache_savings_cents: None,
             prefix_hash: None,
-        reasoning_tokens: None,
-        reasoning_compat_actions: None,
-        context_reduction: None,
-        client_protocol: None,
-        claude_session_id: None,
-        error_class: Some(error_class.to_string()),
-    };
+            reasoning_tokens: None,
+            reasoning_compat_actions: None,
+            context_reduction: None,
+            client_protocol: None,
+            claude_session_id: None,
+            // Abandoned requests never reported usage; the key id
+            // comes from the handle snapshot with the same
+            // `!= ANONYMOUS_KEY_ID` normalization `log_outcome`
+            // applies, so cost reports attribute abandoned rows
+            // to the authenticating key (None for anonymous).
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id,
+            error_class: Some(error_class.to_string()),
+        };
         tracing::info!(
             trace_id = %trace_id,
             status_code,
@@ -3325,16 +3424,16 @@ if let Some(engine) = guardrail_engine.as_ref() {
                                 // the latency tracker, accrue cost from the relay's
                                 // reassembled usage, and clear any upstream-driven cooldown
                                 // so a recovered provider is reselected immediately.
-                    state
-                        .router
-                        .record_streaming_success(
-                            &request,
-                            &current_provider,
-                            &current_model,
-                            duration,
-                            &usage,
-                        )
-                        .await;
+                                let cost = state
+                                    .router
+                                    .record_streaming_success(
+                                        &request,
+                                        &current_provider,
+                                        &current_model,
+                                        duration,
+                                        &usage,
+                                    )
+                                    .await;
                                 let duration_ms = duration.as_millis() as u64;
                                 let log_context = RequestLogContext::from_streaming_success(
                                     &request,
@@ -3343,7 +3442,9 @@ if let Some(engine) = guardrail_engine.as_ref() {
                                     current_provider.clone(),
                                     current_model.clone(),
                                     current_compression.clone(),
-                                );
+                                )
+                                .with_cost(cost)
+                                .with_usage(usage.prompt_tokens, usage.completion_tokens);
                                 // Streaming attempts that failed before this success are
                                 // in the ledger; log_outcome writes them as #attempt rows.
                                 log_outcome(&state, &request, &log_context, _guard.active_handle());
@@ -7377,7 +7478,7 @@ async fn anthropic_create_buffered(
 ) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
-    let owner_id = virtual_key_id.clone().unwrap_or_else(|| "anonymous".to_string());
+    let owner_id = virtual_key_id.clone().unwrap_or_else(|| ANONYMOUS_KEY_ID.to_string());
     let active_handle = state.active_requests.register(build_active_request_info(
         &trace_id,
         &request.model,
@@ -7720,7 +7821,7 @@ async fn anthropic_create_stream(
 
     state.metrics.start_request();
     let start = std::time::Instant::now();
-    let owner_id = virtual_key_id.clone().unwrap_or_else(|| "anonymous".to_string());
+    let owner_id = virtual_key_id.clone().unwrap_or_else(|| ANONYMOUS_KEY_ID.to_string());
     let active_handle = state.active_requests.register(build_active_request_info(
         &trace_id,
         &request.model,
@@ -8255,24 +8356,31 @@ crate::compression::token_counter::TokenCounter::estimate_heuristic(
 ),
 );
 }
-        if cumulative.input_tokens == 0 {
-            cumulative.input_tokens = input_token_estimate;
-        }
-        for event in assembler.finish(stop_reason, stop_sequence, cumulative) {
-if let Some((name, data)) = sse_event_parts(&event) {
-yield Ok(Event::default().event(name).data(data));
+if cumulative.input_tokens == 0 {
+cumulative.input_tokens = input_token_estimate;
 }
+// Capture the final usage counts before `finish` consumes the
+// usage object (cost-reporting Req 1.1/2.1).
+let (input_tokens, output_tokens) = (
+u32::try_from(cumulative.input_tokens).unwrap_or(u32::MAX),
+u32::try_from(cumulative.output_tokens).unwrap_or(u32::MAX),
+);
+for event in assembler.finish(stop_reason, stop_sequence, cumulative) {
+    if let Some((name, data)) = sse_event_parts(&event) {
+        yield Ok(Event::default().event(name).data(data));
+    }
 }
 let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 let log_context = RequestLogContext::from_streaming_success(
-&chat_request,
-stream_trace_id.clone(),
-duration_ms,
-provider.clone(),
-model.clone(),
-compression.clone(),
+    &chat_request,
+    stream_trace_id.clone(),
+    duration_ms,
+    provider.clone(),
+    model.clone(),
+    compression.clone(),
 )
-.with_anthropic_protocol(claude_session_id.clone());
+.with_anthropic_protocol(claude_session_id.clone())
+.with_usage(input_tokens, output_tokens);
 log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
 }
 };
@@ -9685,14 +9793,67 @@ fn pass_through_extracts_models_without_mutating_bodies() {
             .unwrap()
             .contains("gateway_reasoning_relayed_frames"));
 
-        // Nothing relayed → no extra → log context stays None.
-        let plain = base_response(Message {
+    // Nothing relayed → no extra → log context stays None.
+    let plain = base_response(Message {
+        role: "assistant".to_owned(),
+        content: serde_json::json!("ok"),
+        extra: Default::default(),
+    });
+    let context = RequestLogContext::from_response(&request, "trace".to_owned(), 10, &plain);
+    assert_eq!(context.reasoning_relayed_frames, None);
+}
+
+    /// Cost-reporting usage enrichment (Req 1.1/2.1/2.2): the buffered
+    /// success constructor captures token usage off the response usage
+    /// object (non-zero → Some), `with_usage` attaches reassembled
+    /// streaming usage (zero stays None), and `with_virtual_key` threads
+    /// the authenticating key id into the context.
+    #[test]
+    fn log_context_captures_usage_and_virtual_key() {
+        let request = OpenAIRequest {
+            model: "test-model".to_owned(),
+            messages: Vec::new(),
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+
+        // Reported usage lands in the context as Some per side.
+        let response = base_response(Message {
             role: "assistant".to_owned(),
             content: serde_json::json!("ok"),
             extra: Default::default(),
         });
-        let context = RequestLogContext::from_response(&request, "trace".to_owned(), 10, &plain);
-        assert_eq!(context.reasoning_relayed_frames, None);
+        let context =
+            RequestLogContext::from_response(&request, "trace".to_owned(), 10, &response);
+        assert_eq!(context.input_tokens, Some(1));
+        assert_eq!(context.output_tokens, Some(2));
+
+        // with_usage maps reassembled streaming usage; zero stays None.
+        let streamed = RequestLogContext::from_streaming_success(
+            &request,
+            "trace-stream".to_owned(),
+            10,
+            "provider".to_owned(),
+            "model".to_owned(),
+            test_compression_stats(),
+        )
+        .with_usage(1_500, 0);
+        assert_eq!(streamed.input_tokens, Some(1_500));
+        assert_eq!(streamed.output_tokens, None);
+
+        // with_cost threads the cost accrued by record_streaming_success
+        // into the ledger row (remediation finding 1: no fake zero).
+        assert_eq!(streamed.cost, 0.0);
+        let priced = streamed.clone().with_cost(0.06);
+        assert!((priced.cost - 0.06).abs() < 1e-12);
+
+        // with_virtual_key threads the key id (None for anonymous).
+        let keyed = context.clone().with_virtual_key(Some("vk-team-42"));
+        assert_eq!(keyed.virtual_key_id.as_deref(), Some("vk-team-42"));
+        let anonymous = context.with_virtual_key(None);
+        assert!(anonymous.virtual_key_id.is_none());
     }
 
     // -- Early synthetic SSE event (task 2.3) --------------------------------
@@ -11064,6 +11225,19 @@ data: [DONE]\n\n";
         }
     }
 }
+
+    /// Anthropic usage capture clamps u64 token counts into u32 (finding 6):
+    /// a value above u32::MAX saturates instead of panicking, and normal
+    /// counts pass through unchanged.
+    #[test]
+    fn anthropic_usage_capture_clamps_u32_saturation() {
+        let normal: u64 = 12_345;
+        assert_eq!(u32::try_from(normal).unwrap_or(u32::MAX), 12_345_u32);
+        let overflow: u64 = u32::MAX as u64 + 1;
+        assert_eq!(u32::try_from(overflow).unwrap_or(u32::MAX), u32::MAX);
+        let huge: u64 = u64::MAX;
+        assert_eq!(u32::try_from(huge).unwrap_or(u32::MAX), u32::MAX);
+    }
 
 // ---------------------------------------------------------------------------
 // POST /v1/completions  (Req 2.2)
@@ -12933,7 +13107,7 @@ pub async fn responses_create(
     let owner_id = authenticated_key
         .as_ref()
         .map(|Extension(key)| key.id.clone())
-        .unwrap_or_else(|| "anonymous".to_string());
+        .unwrap_or_else(|| ANONYMOUS_KEY_ID.to_string());
 
     state.metrics.start_request();
     let start = std::time::Instant::now();
@@ -13990,9 +14164,9 @@ pub async fn responses_input_items(
             )
         }
     }
+
 }
 
-/// Extract input items from a ResponsesRequest for store persistence.
 fn extract_input_items(request: &ResponsesRequest) -> Vec<InputItem> {
     match &request.input {
         ResponsesInput::Text(text) => vec![InputItem::Easy(EasyInputMessage {
@@ -14046,4 +14220,4 @@ fn map_chat_usage(usage: &serde_json::Value) -> Option<ResponsesUsage> {
         }),
         ..Default::default()
     })
-}
+    }

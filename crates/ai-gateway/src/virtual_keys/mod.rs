@@ -85,6 +85,9 @@ pub struct VirtualKeyManager {
     /// `Mutex` since each limiter mutates on every request (token bucket /
     /// rolling window).
     rate_limiters: Arc<DashMap<String, Arc<Mutex<PerKeyRateLimiter>>>>,
+    /// Startup-resolved `keys.db` path, retained for read-side callers
+    /// (cost-reporting reconcile) — mirrors `RequestLogger::database_path`.
+    database_path: std::path::PathBuf,
 }
 
 impl VirtualKeyManager {
@@ -101,7 +104,15 @@ impl VirtualKeyManager {
             cache: Arc::new(DashMap::new()),
             usage_tracker,
             rate_limiters: Arc::new(DashMap::new()),
+            database_path: db_path.to_path_buf(),
         })
+    }
+
+    /// Startup-resolved `keys.db` path for read-side callers (cost-reporting
+    /// reconcile). Hot reload never rebuilds the manager, so this — not the
+    /// current config value — is the database receiving usage writes.
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
     }
 
     /// Generate, encrypt, and persist a new virtual key.

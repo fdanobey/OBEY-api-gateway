@@ -279,6 +279,22 @@ pub struct LogEntry {
     /// never parsed out of prompt content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session_id: Option<String>,
+    /// Input (prompt) tokens reported by the provider for this request
+    /// (cost-reporting spec, Req 1.1/2.1). NULL when no usage was
+    /// reported — unknown, not zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    /// Output (completion) tokens reported by the provider for this
+    /// request (cost-reporting spec, Req 1.1/2.1). NULL when no usage
+    /// was reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    /// Virtual key id that authenticated the request (cost-reporting
+    /// spec, Req 2.1/2.2); persisted as the `key_id` column so the
+    /// cost-reporting PRAGMA probe picks it up. NULL for anonymous
+    /// traffic (reported as `unattributed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_key_id: Option<String>,
 }
 
 impl LogEntry {
@@ -437,6 +453,12 @@ pub struct RequestLogger {
     /// `JoinHandle` is `Send` but not `Sync`; the `Mutex` keeps the logger
     /// shareable via `Arc<AppState>` across axum handlers.
     writer: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Database path retained for read-side callers (cost-reporting
+    /// aggregate queries): the writer thread owns the only write
+    /// `Connection`, so read workloads open their own connection against
+    /// this path (WAL mode allows concurrent readers without blocking the
+    /// writer). Not used by the logger itself after construction.
+    database_path: String,
 }
 
 impl RequestLogger {
@@ -450,6 +472,7 @@ impl RequestLogger {
         }
 
         let conn = Connection::open(db_path)?;
+        let database_path = db_path.to_string_lossy().into_owned();
 
         // Create schema
         Self::create_schema(&conn)?;
@@ -463,7 +486,16 @@ impl RequestLogger {
         Ok(Self {
             sender: Some(sender),
             writer: Mutex::new(Some(writer)),
+            database_path,
         })
+    }
+
+    /// Database file path for read-side callers (cost-reporting aggregate
+    /// queries). The writer thread owns the only write connection; readers
+    /// open their own `rusqlite::Connection` against this path (WAL mode
+    /// permits concurrent readers). See `cost_reporting::query`.
+    pub fn database_path(&self) -> &str {
+        &self.database_path
     }
 
     /// Enqueue a command without ever blocking the caller.
@@ -530,9 +562,12 @@ impl RequestLogger {
             reasoning_compat_actions TEXT,
             error_class TEXT,
             reasoning_relayed_frames INTEGER,
-            context_reduction TEXT,
-            client_protocol TEXT,
-            claude_session_id TEXT
+        context_reduction TEXT,
+        client_protocol TEXT,
+        claude_session_id TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        key_id TEXT
         )",
             [],
         )?;
@@ -554,6 +589,9 @@ impl RequestLogger {
         Self::ensure_column(conn, "context_reduction", "TEXT")?;
         Self::ensure_column(conn, "client_protocol", "TEXT")?;
         Self::ensure_column(conn, "claude_session_id", "TEXT")?;
+        Self::ensure_column(conn, "input_tokens", "INTEGER")?;
+        Self::ensure_column(conn, "output_tokens", "INTEGER")?;
+        Self::ensure_column(conn, "key_id", "TEXT")?;
 
         // Create indexes for common query patterns
         conn.execute(
@@ -583,6 +621,16 @@ impl RequestLogger {
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_requests_compression_level ON requests(compression_level)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_requests_timestamp_provider ON requests(timestamp, provider)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_requests_timestamp_model ON requests(timestamp, model)",
             [],
         )?;
 
@@ -934,17 +982,18 @@ fn insert_entry(
 
     conn.execute(
         "INSERT INTO requests (
-            trace_id, timestamp, method, path, model, provider,
-            status_code, duration_ms, cost, request_body, response_body,
-            requested_model, responded_model, compression_metadata, compression_level,
-            memories_injected, memories_stored, injection_tokens, detected_project,
-            cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
-            reasoning_tokens, reasoning_compat_actions, error_class, reasoning_relayed_frames,
-            context_reduction, client_protocol, claude_session_id
+        trace_id, timestamp, method, path, model, provider,
+        status_code, duration_ms, cost, request_body, response_body,
+        requested_model, responded_model, compression_metadata, compression_level,
+        memories_injected, memories_stored, injection_tokens, detected_project,
+        cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
+        reasoning_tokens, reasoning_compat_actions, error_class, reasoning_relayed_frames,
+        context_reduction, client_protocol, claude_session_id,
+        input_tokens, output_tokens, key_id
         ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-            ?29, ?30
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+        ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+        ?29, ?30, ?31, ?32, ?33
         )",
         params![
             entry.trace_id,
@@ -953,9 +1002,9 @@ fn insert_entry(
             entry.path,
             entry.model,
             entry.provider,
- entry.status_code,
- i64::try_from(entry.duration_ms).unwrap_or(i64::MAX),
- entry.cost,
+            entry.status_code,
+            i64::try_from(entry.duration_ms).unwrap_or(i64::MAX),
+            entry.cost,
             request_body,
             response_body,
             entry.requested_model,
@@ -977,6 +1026,9 @@ fn insert_entry(
             context_reduction,
             entry.client_protocol,
             entry.claude_session_id,
+            entry.input_tokens,
+            entry.output_tokens,
+            entry.virtual_key_id,
         ],
     )?;
 
@@ -985,7 +1037,7 @@ fn insert_entry(
 
 /// Query log entries with optional filtering. Runs on the writer thread.
 fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
-    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class, context_reduction, client_protocol, claude_session_id FROM requests WHERE 1=1");
+    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class, context_reduction, client_protocol, claude_session_id, input_tokens, output_tokens, key_id FROM requests WHERE 1=1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     if let Some(ref trace_id) = filter.trace_id {
@@ -1087,9 +1139,12 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
                 reasoning_compat_actions: row.get(23)?,
                 error_class: row.get(24)?,
                 context_reduction,
-                client_protocol: row.get(26)?,
-                claude_session_id: row.get(27)?,
-            })
+        client_protocol: row.get(26)?,
+        claude_session_id: row.get(27)?,
+        input_tokens: row.get(28)?,
+        output_tokens: row.get(29)?,
+        virtual_key_id: row.get(30)?,
+    })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -1196,6 +1251,9 @@ mod tests {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
         }
     }
 
@@ -1353,22 +1411,180 @@ mod tests {
         assert!(columns.contains(&"context_reduction".to_owned()));
     }
 
-    #[test]
-    fn fresh_schema_has_cache_columns() {
-        let (_logger, temp) = create_test_logger();
-        let conn = Connection::open(temp.path()).unwrap();
-        let columns = conn
-            .prepare("PRAGMA table_info(requests)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(columns.contains(&"cache_read_tokens".to_owned()));
-        assert!(columns.contains(&"cache_creation_tokens".to_owned()));
-        assert!(columns.contains(&"cache_savings_cents".to_owned()));
-        assert!(columns.contains(&"prefix_hash".to_owned()));
-    }
+#[test]
+fn fresh_schema_has_cache_columns() {
+    let (_logger, temp) = create_test_logger();
+    let conn = Connection::open(temp.path()).unwrap();
+    let columns = conn
+        .prepare("PRAGMA table_info(requests)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.contains(&"cache_read_tokens".to_owned()));
+    assert!(columns.contains(&"cache_creation_tokens".to_owned()));
+    assert!(columns.contains(&"cache_savings_cents".to_owned()));
+    assert!(columns.contains(&"prefix_hash".to_owned()));
+}
+
+/// Cost-reporting usage enrichment: fresh schemas carry the
+/// input/output token columns and the `key_id` attribution column; a
+/// seeded entry round-trips its values, an entry without usage keeps
+/// NULL defaults across a reopen, and the API payload omits the keys
+/// entirely (unknown, not zero).
+#[test]
+fn usage_and_key_columns_round_trip_and_default_null() {
+    let (logger, temp) = create_test_logger();
+
+    let mut enriched = sample_entry("usage-keyed", None);
+    enriched.input_tokens = Some(1_200);
+    enriched.output_tokens = Some(340);
+    enriched.virtual_key_id = Some("vk-team-42".to_owned());
+    logger.log(enriched).unwrap();
+
+    let plain = sample_entry("usage-unknown", None);
+    logger.log(plain).unwrap();
+    logger.flush();
+    drop(logger);
+
+    // NULL defaults survive a reopen (fresh connection, same file).
+    let logger = RequestLogger::new(LoggingConfig {
+        database_path: temp.path().to_string_lossy().into_owned(),
+        ..Default::default()
+    })
+    .unwrap();
+    let keyed = logger
+        .query(LogFilter {
+            trace_id: Some("usage-keyed".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(keyed.len(), 1);
+    assert_eq!(keyed[0].input_tokens, Some(1_200));
+    assert_eq!(keyed[0].output_tokens, Some(340));
+    assert_eq!(keyed[0].virtual_key_id.as_deref(), Some("vk-team-42"));
+
+    let unknown = logger
+        .query(LogFilter {
+            trace_id: Some("usage-unknown".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(unknown.len(), 1);
+    assert!(unknown[0].input_tokens.is_none());
+    assert!(unknown[0].output_tokens.is_none());
+    assert!(unknown[0].virtual_key_id.is_none());
+
+    let json = serde_json::to_value(&unknown[0]).unwrap();
+    assert!(json.get("input_tokens").is_none());
+    assert!(json.get("output_tokens").is_none());
+    assert!(json.get("virtual_key_id").is_none());
+
+    let conn = Connection::open(temp.path()).unwrap();
+    let columns = conn
+        .prepare("PRAGMA table_info(requests)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.contains(&"input_tokens".to_owned()));
+    assert!(columns.contains(&"output_tokens".to_owned()));
+    assert!(columns.contains(&"key_id".to_owned()));
+}
+
+/// Cost-reporting usage enrichment: a pre-enrichment database gains the
+/// three columns via `ensure_column` on open, and rows written before
+/// the migration survive with NULL usage/key attribution.
+#[test]
+fn migrates_pre_usage_schema_and_preserves_rows() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let conn = Connection::open(temp_file.path()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE requests (
+        id INTEGER PRIMARY KEY,
+        trace_id TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        method TEXT NOT NULL,
+        path TEXT NOT NULL,
+        model TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        status_code INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        cost REAL NOT NULL,
+        request_body TEXT,
+        response_body TEXT,
+        requested_model TEXT,
+        responded_model TEXT,
+        compression_metadata TEXT,
+        compression_level TEXT,
+        memories_injected INTEGER NOT NULL DEFAULT 0,
+        memories_stored INTEGER NOT NULL DEFAULT 0,
+        injection_tokens INTEGER NOT NULL DEFAULT 0,
+        detected_project TEXT,
+        cache_read_tokens INTEGER,
+        cache_creation_tokens INTEGER,
+        cache_savings_cents INTEGER,
+        prefix_hash TEXT,
+        reasoning_tokens INTEGER,
+        reasoning_compat_actions TEXT,
+        error_class TEXT,
+        reasoning_relayed_frames INTEGER,
+        context_reduction TEXT,
+        client_protocol TEXT,
+        claude_session_id TEXT
+        );
+        INSERT INTO requests (
+        trace_id, timestamp, method, path, model, provider, status_code,
+        duration_ms, cost, request_body, response_body, requested_model, responded_model
+        ) VALUES (
+        'pre-usage', 1700000000, 'POST', '/v1/chat/completions', 'gpt-4',
+        'openai', 200, 10, 0.0, NULL, NULL, NULL, NULL
+        );",
+    )
+    .unwrap();
+    drop(conn);
+
+    let config = LoggingConfig {
+        database_path: temp_file.path().to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let logger = RequestLogger::new(config).unwrap();
+    let legacy = logger
+        .query(LogFilter {
+            trace_id: Some("pre-usage".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(legacy.len(), 1);
+    assert!(legacy[0].input_tokens.is_none());
+    assert!(legacy[0].output_tokens.is_none());
+    assert!(legacy[0].virtual_key_id.is_none());
+    drop(logger);
+
+    let conn = Connection::open(temp_file.path()).unwrap();
+    let columns = conn
+        .prepare("PRAGMA table_info(requests)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.contains(&"input_tokens".to_owned()));
+    assert!(columns.contains(&"output_tokens".to_owned()));
+    assert!(columns.contains(&"key_id".to_owned()));
+    let (input, output, key): (Option<i64>, Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT input_tokens, output_tokens, key_id FROM requests WHERE trace_id = 'pre-usage'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(input.is_none());
+    assert!(output.is_none());
+    assert!(key.is_none());
+}
 
     #[test]
     fn migrates_pre_cache_schema_and_preserves_rows() {
@@ -2149,6 +2365,9 @@ mod tests {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
         };
 
         logger.log(entry.clone()).unwrap();
@@ -2327,6 +2546,9 @@ mod tests {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
         };
 
         logger.log(old_entry).unwrap();
@@ -2361,6 +2583,9 @@ mod tests {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
         };
 
         logger.log(recent_entry).unwrap();
@@ -2445,6 +2670,9 @@ mod property_tests {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
             }
                 },
             )
@@ -2542,6 +2770,9 @@ mod property_tests {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
         };
 
             logger.log(entry.clone()).unwrap();
@@ -2619,6 +2850,9 @@ mod property_tests {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
         };
 
             logger.log(entry).unwrap();
@@ -2693,6 +2927,9 @@ mod property_tests {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
         };
 
             logger.log(entry).unwrap();
@@ -2765,6 +3002,9 @@ mod property_tests {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
         };
 
             logger.log(entry).unwrap();
@@ -2848,6 +3088,9 @@ mod property_tests {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
         };
 
             logger.log(entry).unwrap();

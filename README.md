@@ -54,6 +54,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Agent loop detection** — multi-signal confidence scorer detects repetitive agent behavior (tool-call repetition, content similarity, error cycling, response stagnation, token/cost velocity, context growth) and escalates through Warn → Throttle → Inject → Hard-Stop enforcement levels; per-virtual-key overrides, session admin API, and Prometheus histograms (see [Agent Loop Detection](#agent-loop-detection))
 - **Virtual key management** — issue per-caller API keys (`vk_…`) with independent USD/token budgets, rate limits, model-access restrictions, and expiry; authenticate callers without sharing real provider keys (see [Virtual Key Management](#virtual-key-management))
 - **Budget alerts & webhooks** — warn/exhausted threshold events for provider and virtual-key budgets (defaults 80%/100%, per-provider warn override), `budget.reset` recovery events, and a unified webhook system delivering Standard Webhooks-signed JSON with bounded retries, a delivery ledger, and a test-send control (see [Budget Alerts](#budget-alerts))
+- **Cost reports** — billing-grade cost aggregation by day, provider, model, or virtual key, with JSON/CSV export, explicit unpriced-usage counts, and a reconciliation endpoint that compares the request log ledger against provider and virtual-key spend stores; reports read durable SQLite state only, so numbers survive restarts (see [Cost Reports](#cost-reports))
 - **Encrypted API key storage** — provider keys encrypted at rest with a machine-local master key
 - **Assistants API** — full local OpenAI-compatible Assistants implementation (assistants, threads, messages, runs, run steps, files) backed by SQLite; multi-tenant with per-virtual-key isolation, resource quotas, and run execution through gateway routing (see [Assistants API](#assistants-api))
 - **Active request tracking** — live in-flight request registry surfaces per-request phase (primary / retry / failover / cascade), target provider, elapsed time, and virtual key to the dashboard in real time
@@ -839,6 +840,40 @@ allowed_private_hosts: [] # exact-match hosts permitting http + private/LAN addr
 ```
 
 No endpoints configured (the default) means the subsystem is fully dormant.
+
+## Cost Reports
+
+The gateway aggregates its durable request log into billing-grade cost reports. Reports are restart-proof: they read SQLite only, never in-memory gauges, so the same closed-window query returns identical rows before and after a restart.
+
+### `GET /admin/cost-reports`
+
+```bash
+curl -u admin:admin \
+  "http://localhost:8080/admin/cost-reports?start=2026-01-01T00:00:00Z&end=2026-01-08T00:00:00Z&group_by=day&format=json"
+```
+
+Parameters: `start` and `end` (RFC 3339, required); `group_by` (`day`, `provider`, `model`, `virtual_key`, default `day`); `provider` and `key_id` (optional conjunctive filters); `format` (`csv` or `json`, default `json`).
+
+Validation returns HTTP 400 naming the offending parameter: missing/invalid `start`, missing/invalid `end` or `end <= start`, range over 366 days, or invalid `group_by`/`format`.
+
+Rows include `dimension`, `requests`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `cost_usd` (6 decimal places), `cost_unpriced_requests`, and `window_start`/`window_end`. Day grouping fills empty days with zero rows; other groupings order by cost descending. Virtual-key grouping attributes no-key traffic to `"unattributed"`.
+
+Unpriced requests (missing model pricing) are counted in `requests` and `cost_unpriced_requests` but excluded from `cost_usd`.
+
+CSV export (`format=csv`) returns UTF-8 with CRLF line endings, a header row, and `cost_usd` exactly 6 decimals. Empty reports return the header only.
+
+### `GET /admin/cost-reports/reconcile`
+
+```bash
+curl -u admin:admin \
+  "http://localhost:8080/admin/cost-reports/reconcile?start=2026-01-01T00:00:00Z&end=2026-01-08T00:00:00Z"
+```
+
+Returns the request-log ledger total, provider-budget-store spend, and virtual-key usage-store spend for the window, plus `difference_usd = ledger - provider_spend` and `unpriced_requests`.
+
+Provider spend carries a caveat: the budget store keeps only the current window's accrued spend, so for windows not aligned to the current budget window the returned provider total reflects that current window and `caveat` is `true`. Empty stores return zero totals.
+
+The admin panel has a **Cost Reports** view with 7/30/90-day presets, custom ranges, group-by, provider/key filters, and CSV/JSON export.
 
 ## Guardrail Pipelines
 

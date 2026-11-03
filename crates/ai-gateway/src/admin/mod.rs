@@ -13,6 +13,11 @@ use serde_json::json;
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 
 use crate::config::{load_and_validate_config, save_config, AdminSecurityMode, Config};
+use crate::cost_reporting::csv::render_report_csv;
+use crate::cost_reporting::query::{fetch_reconciliation_async, fetch_report_async};
+use crate::cost_reporting::{
+    CostReport, CostReportParams, CostReportValidationError, ReconcileParams, ReportFormat,
+};
 use crate::gateway::apply_runtime_config_update;
 use crate::gateway::AppState;
 use crate::models::openai::{Message, OpenAIRequest};
@@ -118,6 +123,8 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/metrics/reset-active", post(reset_active_requests))
         .route("/circuit-breaker/states", get(get_circuit_breaker_states))
         .route("/circuit-breaker/reset", post(reset_circuit_breakers))
+        .route("/cost-reports", get(get_cost_report))
+        .route("/cost-reports/reconcile", get(get_cost_reconciliation))
         .route("/security-status", get(security_status_handler))
         .route("/", get(index_handler))
         .route("/{*path}", get(static_handler))
@@ -1476,7 +1483,141 @@ async fn security_status_handler(State(state): State<AppState>) -> Response {
             "unauthenticated_non_loopback": unauthenticated_non_loopback,
         })),
     )
-        .into_response()
+    .into_response()
+}
+
+/// Map a cost-report/reconcile validation error to the admin 400 JSON
+/// envelope, naming the offending parameter (Requirements 1.6, 1.7, 3.4,
+/// 4.4). The `message` carries the allowed values for enum parameters;
+/// `parameter` names the query parameter for inline UI errors.
+fn cost_report_validation_error(error: &CostReportValidationError) -> Response {
+(
+StatusCode::BAD_REQUEST,
+Json(json!({
+"error": {
+"type": "validation_error",
+"message": error.to_string(),
+"parameter": error.parameter(),
+}
+})),
+)
+.into_response()
+}
+
+/// Map a cost-report/reconcile query failure to the 500 JSON envelope
+/// (spec: billing-grade-cost-reporting). The client-facing `message` is a
+/// static per-route string: the underlying error is rusqlite internals and
+/// file paths, which must not leak into a response body (OWASP A09). The
+/// full detail is already recorded server-side via `tracing::error!` by
+/// the caller; this helper only shapes the envelope, mirroring
+/// [`cost_report_validation_error`].
+fn cost_report_query_error(message: &'static str) -> Response {
+(
+StatusCode::INTERNAL_SERVER_ERROR,
+Json(json!({
+"error": {
+"type": "cost_report_query_error",
+"message": message,
+}
+})),
+)
+.into_response()
+}
+
+/// Resolve a sibling SQLite database path next to the logs database
+/// (`budgets.db`/`webhooks.db` placement rule, shared with
+/// `gateway::budgets_db_path`): same parent directory as `logs_path`,
+/// or the working directory when the logs path has no parent component.
+fn sibling_db_path(logs_path: &std::path::Path, name: &str) -> std::path::PathBuf {
+logs_path
+.parent()
+.filter(|parent| !parent.as_os_str().is_empty())
+.unwrap_or_else(|| std::path::Path::new("."))
+.join(name)
+}
+
+/// GET /admin/cost-reports — aggregated cost report (spec:
+/// billing-grade-cost-reporting, Task 6; Requirements 1, 4).
+///
+/// Thin HTTP surface: parse + validate query params (defaults
+/// `group_by=day`, `format=json`), aggregate the logs.db ledger through
+/// `fetch_report_async` (spawn_blocking inside — SQLite I/O never parks
+/// an async worker), then negotiate the response format: JSON
+/// `CostReport` or CSV via `render_report_csv` (text/csv, CRLF,
+/// 6-decimal `cost_usd`).
+async fn get_cost_report(
+    State(state): State<AppState>,
+    Query(params): Query<CostReportParams>,
+) -> Response {
+    let validated = match params.validate() {
+        Ok(validated) => validated,
+        Err(error) => return cost_report_validation_error(&error),
+    };
+
+let database_path = state.logger.database_path().to_string();
+let rows = match fetch_report_async(database_path, validated.clone()).await {
+Ok(rows) => rows,
+Err(error) => {
+tracing::error!(%error, "cost report query failed");
+return cost_report_query_error("cost report query failed");
+}
+};
+
+    let report = CostReport::new(
+        validated.group_by,
+        rows,
+        validated.range.start_secs,
+        validated.range.end_secs,
+    );
+    match validated.format {
+        ReportFormat::Json => (StatusCode::OK, Json(report)).into_response(),
+        ReportFormat::Csv => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+            render_report_csv(&report),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /admin/cost-reports/reconcile — per-source reconciliation (spec:
+/// billing-grade-cost-reporting, Task 6; Requirement 3).
+///
+/// Compares the request-log ledger total for the window against the
+/// provider budget store's current-window spend and the virtual-key
+/// usage store, with an explicit caveat flag when the requested window
+/// is not aligned to the provider budget window. Zero-activity stores
+/// report zero totals, never an error (Req 3.2).
+async fn get_cost_reconciliation(
+    State(state): State<AppState>,
+    Query(params): Query<ReconcileParams>,
+) -> Response {
+    let range = match params.validate() {
+        Ok(range) => range,
+        Err(error) => return cost_report_validation_error(&error),
+    };
+
+// Store paths follow the server's placement rules: budgets.db is a
+// sibling of logs.db (see `sibling_db_path`); keys.db is the path the
+// running VirtualKeyManager was built with at startup — hot reload does
+// not rebuild the manager, so re-reading the config here could point at
+// a different database than the one actually receiving usage writes.
+let logs_db_path = state.logger.database_path().to_string();
+let keys_db_path = state
+.virtual_key_manager
+.database_path()
+.to_string_lossy()
+.into_owned();
+let budgets_db_path = sibling_db_path(std::path::Path::new(&logs_db_path), "budgets.db")
+.to_string_lossy()
+.into_owned();
+match fetch_reconciliation_async(logs_db_path, budgets_db_path, keys_db_path, range).await {
+Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+Err(error) => {
+tracing::error!(%error, "cost reconciliation query failed");
+cost_report_query_error("reconciliation query failed")
+}
+}
 }
 
 /// POST /admin/circuit-breaker/reset — reset circuit breaker(s).

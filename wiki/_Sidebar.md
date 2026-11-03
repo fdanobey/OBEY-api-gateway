@@ -15,6 +15,8 @@
 - [Persistent Memory](Persistent-Memory)
 ### Access Control
 - [Virtual Keys](Virtual-Keys)
+- [Budgets & Alerts](Budgets-and-Alerts)
+- [Cost Reports](Cost-Reports)
 - [Guardrail Pipelines](Guardrail-Pipelines)
 - [Agent Loop Detection](Agent-Loop-Detection)
 - [OAuth & Codex](OAuth-and-Codex)

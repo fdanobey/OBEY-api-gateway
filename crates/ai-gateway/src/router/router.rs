@@ -2519,6 +2519,12 @@ impl Router {
     /// per-model rates only when token usage is actually known, mirroring the
     /// buffered path's `usage_known` handling.
     ///
+    /// Returns the cost accrued from the reassembled usage at the
+    /// configured per-model rates — 0.0 when usage was unknown or the
+    /// provider:model has no rate entry — so the handler can thread the
+    /// real figure into the request ledger row via `with_cost` instead
+    /// of logging a fake zero.
+    ///
     /// `request` is the original client request; it is used to upsert the
     /// cache-aware sticky-routing affinity entry (Req 1.1) so the next turn
     /// of the same conversation prefix prefers this provider.
@@ -2529,7 +2535,7 @@ impl Router {
         model: &str,
         duration: std::time::Duration,
         usage: &Usage,
-    ) {
+) -> f64 {
         let cb_key = format!("{}:{}", provider, model);
         let cb = self.get_circuit_breaker(&cb_key).await;
         cb.record_success().await;
@@ -2549,13 +2555,16 @@ impl Router {
             usage.total_tokens > 0 || usage.prompt_tokens > 0 || usage.completion_tokens > 0;
         if !usage_known {
             self.metrics.record_provider_unknown_cost(provider);
-            return;
+            return 0.0;
         }
         // Cache-aware actual cost (Req 3.5): price the reassembled usage
         // split (uncached / cache-read / cache-creation) at the model's
         // configured per-million rates. Falls back to base-price math,
         // bit-identical to the previous formula, when the usage carries
-        // no cache fields.
+        // no cache fields. Returns the accrued cost so the handler can
+        // thread it into the ledger row (0.0 when the provider:model has
+        // no rate entry).
+        let mut accrued_cost = 0.0;
         {
             let config = self.config.read().await;
             let model_entry = config.model_groups.iter().find_map(|group| {
@@ -2567,6 +2576,7 @@ impl Router {
             match model_entry {
                 Some(model_entry) => {
                     let cost = compute_actual_cost(model_entry, usage);
+                    accrued_cost = cost;
                     self.metrics.add_cost(provider, cost);
                     // Durable budget accrual (persistent budgets, Task 4):
                     // off-path store write, never blocks the relay.
@@ -2606,6 +2616,7 @@ impl Router {
         // this conversation prefers this provider.
         self.record_sticky_success(request, provider, model, usage)
             .await;
+        accrued_cost
     }
 
     /// Lazily roll `provider`'s budget window when its policy is
@@ -17519,15 +17530,84 @@ extra: Default::default(),
             .get_model_affinity(prefix_hash)
             .is_none());
     }
-}
+
+    /// Cost-reporting Phase 3 (remediation finding 1): the pass-through
+    /// success hook returns the cost it accrued from the reassembled usage
+    /// at the configured per-model rates, so the handler can thread the
+    /// real figure into the ledger row. Unknown usage and missing rate
+    /// entries return 0.0.
+    #[tokio::test]
+    async fn record_streaming_success_returns_accrued_cost_for_known_usage() {
+        let mut config = create_test_config();
+        let mut model = test_model_named("priced", "upstream-model", 1);
+        model.cost_per_million_input_tokens = 30.0;
+        model.cost_per_million_output_tokens = 60.0;
+        config.providers = vec![test_provider("priced", "http://localhost".to_owned())];
+        config.model_groups = vec![test_group(vec![model])];
+        let router = Router::new(
+            std::sync::Arc::new(tokio::sync::RwLock::new(config)),
+            test_metrics(),
+        );
+        let request = OpenAIRequest {
+            model: "test-group".to_string(),
+            messages: vec![],
+            stream: true,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+        let usage = Usage {
+            prompt_tokens: 1_000,
+            completion_tokens: 500,
+            total_tokens: 1_500,
+            extra: serde_json::Map::new(),
+        };
+
+        let cost = router
+            .record_streaming_success(
+                &request,
+                "priced",
+                "upstream-model",
+                std::time::Duration::from_millis(10),
+                &usage,
+            )
+            .await;
+        // 1k input @ $30/M + 500 output @ $60/M = $0.03 + $0.03 = $0.06.
+        assert!((cost - 0.06).abs() < 1e-12, "accrued cost {cost}");
+
+        // Unknown usage (all-zero) accrues nothing and returns 0.0.
+        let unknown = router
+            .record_streaming_success(
+                &request,
+                "priced",
+                "upstream-model",
+                std::time::Duration::from_millis(10),
+                &Usage::default(),
+            )
+            .await;
+        assert_eq!(unknown, 0.0);
+
+        // A provider:model without a rate entry returns 0.0 too.
+        let unpriced = router
+            .record_streaming_success(
+                &request,
+                "priced",
+                "other-model",
+                std::time::Duration::from_millis(10),
+                &usage,
+            )
+            .await;
+        assert_eq!(unpriced, 0.0);
+    }
+    }
 
 #[cfg(test)]
 mod property_tests {
     use super::tests::{create_test_config, test_metrics};
     use super::*;
-    use proptest::prelude::*;
 
     // Generator for ProviderModel
+    use proptest::prelude::*;
     fn provider_model_strategy() -> impl Strategy<Value = ProviderModel> {
         (
             "[a-z]{3,8}",
