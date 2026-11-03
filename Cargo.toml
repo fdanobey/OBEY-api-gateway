@@ -41,7 +41,7 @@ tar = "0.4"
 flate2 = "1.0"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 wiremock = "0.6"
-rcgen = "0.13"
+rcgen = "0.14"
 
 [profile.release]
 opt-level = 3
