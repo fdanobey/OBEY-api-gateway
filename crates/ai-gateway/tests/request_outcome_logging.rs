@@ -6,8 +6,9 @@ mod common;
 
 use std::time::Duration;
 
-use ai_gateway::config::{Config, StreamingConfig};
+use ai_gateway::config::{Config, EnforcementMode, StreamingConfig};
 use ai_gateway::gateway::GatewayServer;
+use ai_gateway::virtual_keys::models::CreateKeyParams;
 use ai_gateway::logger::LogEntry;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -157,7 +158,90 @@ async fn abandoned_stream_writes_client_disconnect_outcome_row() {
     assert_eq!(row.status_code, 499);
     assert_eq!(row.error_class.as_deref(), Some("client_disconnect"));
     assert_eq!(row.provider, "slow-provider");
+    // Anonymous traffic: no virtual key authenticated, so the abandoned row
+    // stays unattributed (key id NULL), not the "anonymous" sentinel.
+    assert!(row.virtual_key_id.is_none());
     assert!(row.request_body.is_none());
+}
+
+/// Attribution fix (cost-reporting Phase 3): an abandoned request that
+/// authenticated with a virtual key carries the key id on its 499 row
+/// (from the in-flight handle snapshot), while anonymous rows stay NULL.
+#[tokio::test]
+async fn abandoned_stream_outcome_row_carries_virtual_key_attribution() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(completion_body())
+                .set_delay(Duration::from_secs(20)),
+        )
+        .mount(&upstream)
+        .await;
+    let mut config = outcome_config(&[("slow-provider", upstream.uri())], 0);
+    config.virtual_keys.enforcement = EnforcementMode::Optional;
+    let server = GatewayServer::new(config, None).await.unwrap();
+    let created = server
+        .state
+        .virtual_key_manager
+        .create_key(CreateKeyParams {
+            name: None,
+            budget_limit_usd: None,
+            token_budget: None,
+            budget_window: None,
+            requests_per_minute: None,
+            tokens_per_minute: None,
+            model_access: None,
+            expires_in: None,
+            loop_detection: None,
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .build_router()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", created.key))
+                .body(Body::from(
+                    json!({
+                        "model": "outcome-group",
+                        "messages": [{ "role": "user", "content": "hello" }],
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("early SSE frame should arrive")
+        .expect("body should yield a frame")
+        .expect("frame should be readable");
+    assert!(String::from_utf8_lossy(&first).contains("data:"));
+    let reader = tokio::spawn(async move { while body.next().await.is_some() {} });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    reader.abort();
+    let _ = reader.await;
+
+    let rows = poll_logs(&server, Duration::from_secs(5), |rows| {
+        rows.iter().any(|row| row.status_code == 499)
+    })
+    .await;
+    let abandoned: Vec<&LogEntry> = rows.iter().filter(|row| row.path == OUTCOME_PATH).collect();
+    assert_eq!(abandoned.len(), 1, "exactly one outcome row: {rows:?}");
+    assert_eq!(abandoned[0].status_code, 499);
+    assert_eq!(
+        abandoned[0].virtual_key_id.as_deref(),
+        Some(created.id.as_str()),
+        "abandoned row is attributed to the authenticating key, not NULL"
+    );
 }
 
 #[tokio::test]

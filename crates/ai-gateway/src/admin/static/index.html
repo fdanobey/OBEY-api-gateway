@@ -302,6 +302,24 @@ table.wh-table tbody tr:hover{background:rgba(13,110,253,.04)}
 .wh-test-result{margin-top:.5rem;font-size:.75rem}
 .wh-form .error{font-size:.75rem;color:var(--danger);margin-top:.15rem;display:none}
 .wh-form .error.visible{display:block}
+/* Cost Reports (billing-grade-cost-reporting, Req 5) */
+.cr-controls{margin-bottom:.75rem}
+.cr-presets{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.75rem}
+.cr-toolbar{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-top:.75rem}
+.cr-table-wrap{overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
+table.cr-table{width:100%;border-collapse:collapse;font-size:.8rem}
+table.cr-table th,table.cr-table td{padding:.5rem .6rem;text-align:right;border-bottom:1px solid var(--border);white-space:nowrap}
+table.cr-table th:first-child,table.cr-table td:first-child{text-align:left}
+table.cr-table th{background:var(--bg);font-weight:600}
+table.cr-table tbody tr:hover{background:rgba(13,110,253,.04)}
+table.cr-table tfoot td{font-weight:700;border-top:2px solid var(--border)}
+.cr-dim-cell{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;text-align:left}
+.cr-cost-cell{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.cr-badge-unpriced{display:inline-block;font-size:.7rem;padding:.15rem .5rem;border-radius:999px;font-weight:600;background:rgba(255,193,7,.12);color:#8a6d0b;border:1px solid rgba(255,193,7,.4)}
+.cr-badge-unpriced[hidden]{display:none}
+.cr-empty{padding:1rem;text-align:center;color:var(--text-muted);font-size:.85rem}
+.cr-loading{padding:1rem;text-align:center;color:var(--text-muted);font-size:.85rem}
+.cr-error{border:1px solid rgba(220,53,69,.35);background:rgba(220,53,69,.06);color:var(--danger);border-radius:var(--radius);padding:.6rem .75rem;font-size:.8rem;margin-bottom:.75rem}
 @media(max-width:700px){.compression-rule-grid,.compression-pre-row,.compression-pipeline-row{grid-template-columns:1fr}}
 /* Security exposure banner (Req 1.8) */
 .sec-banner{position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;color:#fff;padding:.6rem 1rem;display:flex;align-items:center;gap:1rem;font-size:.9rem;box-shadow:var(--shadow)}
@@ -333,6 +351,7 @@ body.sec-banner-active{padding-top:3.2rem}
     <li role="presentation"><button class="nav-btn" role="tab" type="button" data-page="structured-output" id="tab-structured-output" aria-controls="page-structured-output">Structured Output</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="memory" id="tab-memory" aria-controls="page-memory">Persistent Memory</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="webhooks" id="tab-webhooks" aria-controls="page-webhooks">Webhooks</button></li>
+<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="cost-reports" id="tab-cost-reports" aria-controls="page-cost-reports">Cost Reports</button></li>
 </ul>
   <div class="nav-footer">
     <a href="/dashboard" id="dashboard-link">Open Dashboard &rarr;</a>
@@ -2486,6 +2505,99 @@ body.sec-banner-active{padding-top:3.2rem}
 <button class="btn btn-secondary" id="wh-reset">Reset</button>
 </div>
 </section>
+
+<!-- Cost Reports (billing-grade-cost-reporting, Req 5) -->
+<section class="page" id="page-cost-reports" role="tabpanel" aria-labelledby="tab-cost-reports">
+<h2>Cost Reports</h2>
+<p class="hint" style="margin-bottom:1.5rem">Aggregated request-ledger costs per day, provider, model, or virtual key. Read-only over durable ledgers; restarts never change historical numbers.</p>
+
+<fieldset><legend>Report</legend>
+<div class="cr-presets" role="group" aria-label="Date range presets">
+<button type="button" class="btn btn-secondary btn-sm cr-preset" data-days="7">Last 7 days</button>
+<button type="button" class="btn btn-secondary btn-sm cr-preset" data-days="30">Last 30 days</button>
+<button type="button" class="btn btn-secondary btn-sm cr-preset" data-days="90">Last 90 days</button>
+</div>
+<div class="cr-controls">
+<div class="form-row">
+<div class="form-group">
+<label for="cr-start">Start (UTC)</label>
+<input type="date" id="cr-start" aria-describedby="cr-start-error">
+<div class="error" id="cr-start-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="cr-end">End (UTC, inclusive)</label>
+<input type="date" id="cr-end" aria-describedby="cr-end-error">
+<div class="hint">The report covers up to and including this day.</div>
+<div class="error" id="cr-end-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="cr-group-by">Group By</label>
+<select id="cr-group-by">
+<option value="day">Day</option>
+<option value="provider">Provider</option>
+<option value="model">Model</option>
+<option value="virtual_key">Virtual Key</option>
+</select>
+</div>
+</div>
+<div class="form-row">
+<div class="form-group">
+<label for="cr-provider">Provider Filter</label>
+<input type="text" id="cr-provider" placeholder="e.g. openai" autocomplete="off">
+<div class="hint">Optional exact provider name.</div>
+</div>
+<div class="form-group">
+<label for="cr-key-id">Virtual Key Filter</label>
+<input type="text" id="cr-key-id" placeholder="key_id" autocomplete="off">
+<div class="hint">Optional virtual key id.</div>
+</div>
+</div>
+<div class="cr-toolbar">
+<button type="button" class="btn btn-primary btn-sm" id="cr-run">Run Report</button>
+<button type="button" class="btn btn-secondary btn-sm" id="cr-export-csv">Export CSV</button>
+<button type="button" class="btn btn-secondary btn-sm" id="cr-export-json">Export JSON</button>
+</div>
+</div>
+<div class="cr-error" id="cr-error" role="alert" hidden></div>
+<div class="cr-loading" id="cr-loading" hidden>Loading report…</div>
+<div class="cr-empty" id="cr-empty" hidden>No requests in the selected range. Widen the date range or clear the filters.</div>
+<div class="cr-table-wrap" id="cr-table-wrap" hidden>
+<table class="cr-table" id="cr-table">
+<caption class="sr-only">Aggregated cost report rows</caption>
+<thead>
+<tr>
+<th scope="col">Dimension</th>
+<th scope="col">Requests</th>
+<th scope="col">Input Tokens</th>
+<th scope="col">Output Tokens</th>
+<th scope="col">Cache Read</th>
+<th scope="col">Cache Creation</th>
+<th scope="col">Reasoning</th>
+<th scope="col">Cost (USD)</th>
+<th scope="col">Unpriced</th>
+<th scope="col">Window (UTC)</th>
+</tr>
+</thead>
+<tbody id="cr-tbody"></tbody>
+<tfoot>
+<tr id="cr-totals-row">
+<td>Total</td>
+<td id="cr-total-requests"></td>
+<td id="cr-total-input"></td>
+<td id="cr-total-output"></td>
+<td id="cr-total-cache-read"></td>
+<td id="cr-total-cache-creation"></td>
+<td id="cr-total-reasoning"></td>
+<td id="cr-total-cost" class="cr-cost-cell"></td>
+<td id="cr-total-unpriced"></td>
+<td id="cr-total-window"></td>
+</tr>
+</tfoot>
+</table>
+</div>
+<p class="hint" id="cr-unpriced-note"><span class="cr-badge-unpriced" id="cr-unpriced-badge" hidden></span> <span id="cr-unpriced-text" hidden></span></p>
+</fieldset>
+</section>
 </main>
 
 <div class="status-bar" role="status" aria-live="polite">
@@ -2583,6 +2695,7 @@ if (pageId === 'smart-routing') { populateSmartRouting((config && config.smart_r
 if (pageId === 'virtual-keys') { vkOnOpen(); }
     if (pageId === 'guardrails') { loadGuardrailVirtualKeys(); }
  if (pageId === 'webhooks') { whOnOpen(); }
+if (pageId === 'cost-reports') { crOnOpen(); }
  if (pageId === 'circuit-breaker') { loadCircuitBreakerStates(); }
  if (pageId === 'providers') { refreshProvBudgetsBulk(); }
 }
@@ -7406,12 +7519,7 @@ setStatus('Exporting memories…');
 fetch(memApiUrl('export'))
 .then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
 .then(function(data) {
-var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-var a = document.createElement('a');
-a.href = URL.createObjectURL(blob);
-a.download = 'memory-export.json';
-a.click();
-URL.revokeObjectURL(a.href);
+downloadBlob(JSON.stringify(data, null, 2), 'application/json', 'memory-export.json');
 setStatus('Memory export downloaded (' + (data.total != null ? data.total : (data.entries ? data.entries.length : 0)) + ' entries)');
 })
 .catch(function(err) { setStatus('Memory export failed: ' + err.message); showToast('Export failed: ' + err.message, true); });
@@ -7917,20 +8025,263 @@ function whSave() {
 }
 
 (function whWire() {
- document.getElementById('wh-add-endpoint').addEventListener('click', function() { whOpenForm(); });
- document.getElementById('wh-form-save').addEventListener('click', whSaveForm);
- document.getElementById('wh-form-cancel').addEventListener('click', whCloseForm);
- document.getElementById('wh-f-events-all').addEventListener('change', function() {
- var disabled = this.checked;
- document.querySelectorAll('.wh-f-event').forEach(function(c) { c.disabled = disabled; });
- });
- document.getElementById('wh-allow-add').addEventListener('click', whAddAllowHost);
- document.getElementById('wh-allow-host').addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); whAddAllowHost(); } });
- document.getElementById('wh-delivery-endpoint').addEventListener('change', whLoadDeliveries);
- document.getElementById('wh-delivery-refresh').addEventListener('click', whLoadDeliveries);
- document.getElementById('wh-save').addEventListener('click', whSave);
- document.getElementById('wh-reset').addEventListener('click', whLoad);
+document.getElementById('wh-add-endpoint').addEventListener('click', function() { whOpenForm(); });
+document.getElementById('wh-form-save').addEventListener('click', whSaveForm);
+document.getElementById('wh-form-cancel').addEventListener('click', whCloseForm);
+document.getElementById('wh-f-events-all').addEventListener('change', function() {
+var disabled = this.checked;
+document.querySelectorAll('.wh-f-event').forEach(function(c) { c.disabled = disabled; });
+});
+document.getElementById('wh-allow-add').addEventListener('click', whAddAllowHost);
+document.getElementById('wh-allow-host').addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); whAddAllowHost(); } });
+document.getElementById('wh-delivery-endpoint').addEventListener('change', whLoadDeliveries);
+document.getElementById('wh-delivery-refresh').addEventListener('click', whLoadDeliveries);
+document.getElementById('wh-save').addEventListener('click', whSave);
+document.getElementById('wh-reset').addEventListener('click', whLoad);
 })();
+
+// --- Cost Reports (billing-grade-cost-reporting, Req 5) ---
+var crLoaded = false;
+
+function crFmtInt(n) { return Number(n).toLocaleString(); }
+
+/* Report cost_usd arrives exact to 6 decimal places (Req 6.2); keep all six. */
+function crFmtCost(n) { return '$' + Number(n).toFixed(6); }
+
+/* YYYY-MM-DD date-input value -> RFC 3339 UTC instant. */
+function crRfc3339(dateStr) { return dateStr + 'T00:00:00Z'; }
+
+/* The end input is the inclusive selected end date; the API takes an
+* exclusive bound, so send the day after it at 00:00:00Z (docs
+* wiki-local/Cost-Reports.md) — the chosen end day is fully covered. */
+function crExclusiveEndDate(dateStr) {
+var ms = Date.UTC(
+parseInt(dateStr.slice(0, 4), 10),
+parseInt(dateStr.slice(5, 7), 10) - 1,
+parseInt(dateStr.slice(8, 10), 10)
+) + 86400000;
+var d = new Date(ms);
+return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
+}
+
+function crTodayUtc(offsetDays) {
+var d = new Date(Date.now() + offsetDays * 86400000);
+return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
+}
+
+/* Collect the current control state into query params; returns null and
+ * flags the offending field client-side when a required date is missing.
+ * Inputs are never cleared, so a 400 keeps the operator's selections (Req 5.4). */
+function crQuery(format) {
+var start = document.getElementById('cr-start').value;
+var end = document.getElementById('cr-end').value;
+var ok = true;
+if (!start) { showError(document.getElementById('cr-start'), 'Start date is required'); ok = false; } else { clearError(document.getElementById('cr-start')); }
+if (!end) { showError(document.getElementById('cr-end'), 'End date is required'); ok = false; } else { clearError(document.getElementById('cr-end')); }
+if (!ok) return null;
+var params = new URLSearchParams();
+params.set('start', crRfc3339(start));
+params.set('end', crRfc3339(crExclusiveEndDate(end)));
+params.set('group_by', document.getElementById('cr-group-by').value);
+var provider = document.getElementById('cr-provider').value.trim();
+if (provider) params.set('provider', provider);
+var keyId = document.getElementById('cr-key-id').value.trim();
+if (keyId) params.set('key_id', keyId);
+if (format) params.set('format', format);
+return params;
+}
+
+/* Extract the message from an error body: cost-reports errors serialize as
+* a nested {"error": {message, ...}} envelope; older admin endpoints use a
+* bare {"error": "<message>"}. Both shapes are accepted. */
+function crErrorMessage(data) {
+if (!data) return null;
+if (typeof data.error === 'string') return data.error;
+if (data.error && typeof data.error.message === 'string') return data.error.message;
+return null;
+}
+
+function crFetchReport(params) {
+return fetch(apiUrl('cost-reports?' + params.toString()))
+.then(function(r) {
+return r.json().then(function(body) {
+if (!r.ok) {
+var err = new Error(crErrorMessage(body) || 'HTTP ' + r.status);
+err.status = r.status;
+throw err;
+}
+return body;
+});
+});
+}
+
+function crTd(text, cls) {
+var td = document.createElement('td');
+td.textContent = text;
+if (cls) td.className = cls;
+return td;
+}
+
+function crSetVisible(id, visible) { document.getElementById(id).hidden = !visible; }
+
+/* Window column text: the row's epoch-second pair (inclusive start,
+* exclusive end) rendered compactly (Req 5.2 — all Req 1 columns). */
+function crWindow(row) {
+var start = Number(row.window_start);
+var end = Number(row.window_end);
+if (!isFinite(start) || !isFinite(end)) return '';
+return String(start) + '–' + String(end);
+}
+
+function crRenderRow(row) {
+var tr = document.createElement('tr');
+tr.appendChild(crTd(row.dimension || '', 'cr-dim-cell'));
+tr.appendChild(crTd(crFmtInt(row.requests)));
+tr.appendChild(crTd(crFmtInt(row.input_tokens)));
+tr.appendChild(crTd(crFmtInt(row.output_tokens)));
+tr.appendChild(crTd(crFmtInt(row.cache_read_tokens)));
+tr.appendChild(crTd(crFmtInt(row.cache_creation_tokens)));
+tr.appendChild(crTd(crFmtInt(row.reasoning_tokens)));
+tr.appendChild(crTd(crFmtCost(row.cost_usd), 'cr-cost-cell'));
+tr.appendChild(crTd(crFmtInt(row.cost_unpriced_requests)));
+tr.appendChild(crTd(crWindow(row), 'cr-cost-cell'));
+return tr;
+}
+
+function crRenderReport(report) {
+var rows = report.rows || [];
+var totals = report.totals || {};
+var tbody = document.getElementById('cr-tbody');
+tbody.innerHTML = ''; /* xss-audit: static */
+rows.forEach(function(row) { tbody.appendChild(crRenderRow(row)); });
+document.getElementById('cr-total-requests').textContent = crFmtInt(totals.requests);
+document.getElementById('cr-total-input').textContent = crFmtInt(totals.input_tokens);
+document.getElementById('cr-total-output').textContent = crFmtInt(totals.output_tokens);
+document.getElementById('cr-total-cache-read').textContent = crFmtInt(totals.cache_read_tokens);
+document.getElementById('cr-total-cache-creation').textContent = crFmtInt(totals.cache_creation_tokens);
+document.getElementById('cr-total-reasoning').textContent = crFmtInt(totals.reasoning_tokens);
+document.getElementById('cr-total-cost').textContent = crFmtCost(totals.cost_usd);
+document.getElementById('cr-total-unpriced').textContent = crFmtInt(totals.cost_unpriced_requests);
+/* Totals row spans the full requested range: render its own window pair. */
+document.getElementById('cr-total-window').textContent = crWindow(totals);
+var unpriced = Number(totals.cost_unpriced_requests) || 0;
+var badge = document.getElementById('cr-unpriced-badge');
+var text = document.getElementById('cr-unpriced-text');
+badge.hidden = unpriced === 0;
+badge.textContent = crFmtInt(unpriced) + ' unpriced';
+text.hidden = unpriced === 0;
+text.textContent = 'request' + (unpriced === 1 ? '' : 's') + ' in this range had no model pricing; they are counted in Requests but excluded from Cost.';
+crSetVisible('cr-table-wrap', rows.length > 0);
+crSetVisible('cr-empty', rows.length === 0);
+}
+
+function crHideResultStates() {
+crSetVisible('cr-loading', false);
+crSetVisible('cr-error', false);
+crSetVisible('cr-empty', false);
+crSetVisible('cr-table-wrap', false);
+}
+
+function crRunReport() {
+var params = crQuery(null);
+if (!params) return;
+document.getElementById('cr-error').textContent = '';
+crHideResultStates();
+crSetVisible('cr-loading', true);
+setStatus('Running cost report…');
+crFetchReport(params)
+.then(function(report) {
+crSetVisible('cr-loading', false);
+crRenderReport(report);
+setStatus('Cost report loaded (' + (report.rows ? report.rows.length : 0) + ' rows)');
+})
+.catch(function(err) {
+crSetVisible('cr-loading', false);
+/* 400 keeps the table untouched and all control values intact (Req 5.4). */
+var errEl = document.getElementById('cr-error');
+errEl.textContent = err.message;
+crSetVisible('cr-error', true);
+setStatus('Cost report failed: ' + err.message);
+});
+}
+
+function crExport(format) {
+var params = crQuery(format);
+if (!params) return;
+document.getElementById('cr-error').textContent = '';
+crSetVisible('cr-error', false);
+setStatus('Exporting cost report (' + format + ')…');
+fetch(apiUrl('cost-reports?' + params.toString()))
+.then(function(r) {
+if (!r.ok) {
+return r.json().then(function(body) {
+throw new Error(crErrorMessage(body) || 'HTTP ' + r.status);
+});
+}
+return format === 'csv' ? r.text() : r.json();
+})
+.then(function(data) {
+var content = format === 'csv' ? data : JSON.stringify(data, null, 2);
+var type = format === 'csv' ? 'text/csv' : 'application/json';
+var filename = 'cost-report-' + document.getElementById('cr-start').value + '-' + crExclusiveEndDate(document.getElementById('cr-end').value) + '.' + format;
+downloadBlob(content, type, filename);
+setStatus('Cost report exported (' + format + ')');
+})
+.catch(function(err) {
+var errEl = document.getElementById('cr-error');
+errEl.textContent = err.message;
+crSetVisible('cr-error', true);
+setStatus('Cost report export failed: ' + err.message);
+});
+}
+
+/* Shared blob download (memory export + cost-report exports). The object
+* URL is revoked on a timer, not synchronously after click(): some browsers
+* cancel deferred downloads when the URL vanishes before the download
+* starts. */
+function downloadBlob(content, type, filename) {
+var blob = new Blob([content], { type: type });
+var a = document.createElement('a');
+var url = URL.createObjectURL(blob);
+a.href = url;
+a.download = filename;
+a.click();
+setTimeout(function() { URL.revokeObjectURL(url); }, 5000);
+}
+
+/* Presets set start = today-(days-1) and end = today (inclusive selected
+* date; crQuery adds the +1 day for the API's exclusive bound), so
+* "Last N days" is exactly N calendar days. */
+function crApplyPreset(days) {
+document.getElementById('cr-start').value = crTodayUtc(-(days - 1));
+document.getElementById('cr-end').value = crTodayUtc(0);
+clearError(document.getElementById('cr-start'));
+clearError(document.getElementById('cr-end'));
+crRunReport();
+}
+
+/* Called whenever the Cost Reports section is opened; the first open loads
+* the default view (last 30 days, grouped by day — Req NFR Usability):
+* start = today-29, end = today (inclusive) = 30 calendar days. */
+function crOnOpen() {
+if (crLoaded) return;
+crLoaded = true;
+document.getElementById('cr-start').value = crTodayUtc(-29);
+document.getElementById('cr-end').value = crTodayUtc(0);
+crRunReport();
+}
+
+(function crWire() {
+document.querySelectorAll('.cr-preset').forEach(function(btn) {
+btn.addEventListener('click', function() { crApplyPreset(parseInt(this.dataset.days, 10)); });
+});
+document.getElementById('cr-run').addEventListener('click', crRunReport);
+document.getElementById('cr-export-csv').addEventListener('click', function() { crExport('csv'); });
+document.getElementById('cr-export-json').addEventListener('click', function() { crExport('json'); });
+document.getElementById('cr-start').addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); crRunReport(); } });
+document.getElementById('cr-end').addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); crRunReport(); } });
+})();
+
 
 // --- Security exposure banner (Req 1.8) ---
   var SEC_BANNER_KEY = 'sec-banner-dismissed';

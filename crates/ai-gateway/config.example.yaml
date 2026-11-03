@@ -323,6 +323,8 @@ tray:
 # their limit, or reset. URLs must be https; plain http is allowed only
 # for hosts listed in allowed_private_hosts (exact match — also permits
 # private/LAN addresses for those hosts).
+# Cost reports are read-only, zero-config, and documented at
+# https://github.com/fdanobey/OBEY-api-gateway/wiki/Cost-Reports.
 # webhooks:
 #   endpoints:
 #     - url: "https://hooks.example.com/budget-alerts"

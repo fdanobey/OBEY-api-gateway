@@ -6,6 +6,7 @@ pub mod cache;
 pub mod codex;
 pub mod compression;
 pub mod config;
+pub mod cost_reporting;
 pub mod context;
 pub mod dashboard;
 pub mod description_utils;

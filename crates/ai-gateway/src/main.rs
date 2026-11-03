@@ -21,6 +21,8 @@ mod codex;
 #[allow(dead_code, unused_imports)]
 mod compression;
 mod config;
+#[allow(dead_code, unused_imports)]
+mod cost_reporting;
 mod context;
 mod dashboard;
 mod description_utils;
