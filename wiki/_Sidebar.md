@@ -20,6 +20,7 @@
 - [Guardrail Pipelines](Guardrail-Pipelines)
 - [Agent Loop Detection](Agent-Loop-Detection)
 - [OAuth & Codex](OAuth-and-Codex)
+- [GitHub Copilot Provider](GitHub-Copilot-Provider)
 ### Operations
 - [Admin Panel & Dashboard](Admin-Panel-and-Dashboard)
 - [Security](Security)

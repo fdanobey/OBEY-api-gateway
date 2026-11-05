@@ -24,6 +24,7 @@ use crate::memory::{
     ExtractionPolicy, MemorySystem, ResolvedNamespace,
 };
 use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
+use crate::oauth::github_copilot::manager::CopilotSessionState;
 use crate::providers::bedrock::{
     apply_global_inference_prefix, apply_global_inference_profile,
     is_duplicate_compaction_trigger_error, model_supports_reasoning,
@@ -689,12 +690,23 @@ pub struct Router {
 /// provider/model, TTL-bounded). Zero-TTL when cache-aware routing is
 /// disabled, so lookups always miss (Req 1.4, prompt-cache-routing spec).
 sticky_cache: StickyCache,
-/// Provider-budget alert hook (budget-alerts-unified-webhooks, Task 5):
-/// threshold evaluation + `budget.reset` events for provider scopes.
-/// `None` until gateway startup wires it (built-once notifier); every
-/// call rides an existing off-path spawn (Req 1.10 — zero synchronous
-/// work on the request/response path).
-provider_budget_alerts: Option<Arc<crate::webhooks::ProviderBudgetAlerts>>,
+    /// Provider-budget alert hook (budget-alerts-unified-webhooks, Task 5):
+    /// threshold evaluation + `budget.reset` events for provider scopes.
+    /// `None` until gateway startup wires it (built-once notifier); every
+    /// call rides an existing off-path spawn (Req 1.10 — zero synchronous
+    /// work on the request/response path).
+    provider_budget_alerts: Option<Arc<crate::webhooks::ProviderBudgetAlerts>>,
+    /// GitHub Copilot token manager (github-copilot-oauth-provider spec,
+    /// task 9). Attached once at gateway startup, master-key gated; config
+    /// hot-reload never reconstructs or clears it (NFR Reliability) — same
+    /// lifetime discipline as `oauth_manager` above.
+    copilot_manager: Option<Arc<crate::oauth::github_copilot::manager::CopilotTokenManager>>,
+    /// Copilot model catalog sync (task 8/9): `enabled_models()` feeds the
+    /// `/v1/models` aggregation when a `github-copilot` provider exists.
+    copilot_catalog: Option<Arc<crate::oauth::github_copilot::catalog::CopilotCatalogSync>>,
+    /// Usage tracker for Copilot `x-ratelimit-*` / premium-request headers
+    /// (Req 7.1/7.2). Shared with the adapter dispatch path.
+    copilot_usage_tracker: Option<Arc<crate::oauth::usage_tracker::UsageTracker>>,
 }
 
 /// Result of [`Router::route_request_streaming`].
@@ -1098,12 +1110,15 @@ impl Router {
             search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
         degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-        sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
-        provider_budget_alerts: None,
+            sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
+            provider_budget_alerts: None,
+            copilot_manager: None,
+            copilot_catalog: None,
+            copilot_usage_tracker: None,
+        }
     }
-}
 
-/// Create a new Router with explicit context configuration
+    /// Create a new Router with explicit context configuration
     #[allow(dead_code)]
     pub fn with_context_config(
         config: Arc<RwLock<Config>>,
@@ -1148,6 +1163,9 @@ impl Router {
             degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
             provider_budget_alerts: None,
+            copilot_manager: None,
+            copilot_catalog: None,
+            copilot_usage_tracker: None,
         }
     }
 
@@ -1162,6 +1180,36 @@ impl Router {
     /// OpenAI rate-limit headers from OAuth provider responses.
     pub fn set_oauth_usage_tracker(&mut self, tracker: Arc<crate::oauth::UsageTracker>) {
         self.oauth_usage_tracker = Some(tracker);
+    }
+
+    /// Attach the [`CopilotTokenManager`](crate::oauth::github_copilot::manager::CopilotTokenManager)
+    /// so `github-copilot` providers can resolve a Copilot bearer per
+    /// dispatch (github-copilot-oauth-provider spec, task 9). Called once
+    /// during gateway startup, master-key gated; hot-reload preserves it.
+    pub fn set_copilot_manager(
+        &mut self,
+        manager: Arc<crate::oauth::github_copilot::manager::CopilotTokenManager>,
+    ) {
+        self.copilot_manager = Some(manager);
+    }
+
+    /// Attach the Copilot usage tracker (Req 7.1/7.2) shared with the
+    /// adapter dispatch path.
+    pub fn set_copilot_usage_tracker(
+        &mut self,
+        tracker: Arc<crate::oauth::usage_tracker::UsageTracker>,
+    ) {
+        self.copilot_usage_tracker = Some(tracker);
+    }
+
+    /// Attach the [`CopilotCatalogSync`](crate::oauth::github_copilot::catalog::CopilotCatalogSync)
+    /// so `/v1/models` can aggregate Copilot entitlement-filtered models
+    /// when a `github-copilot` provider exists (task 8/9 wiring).
+    pub fn set_copilot_catalog(
+        &mut self,
+        catalog: Arc<crate::oauth::github_copilot::catalog::CopilotCatalogSync>,
+    ) {
+        self.copilot_catalog = Some(catalog);
     }
 
     /// Attach an [`InstructionsStore`](crate::codex::InstructionsStore) for
@@ -5000,17 +5048,133 @@ true
                 provider_cfg.effective_custom_headers(),
             )
             .await?;
-            let bedrock_client =
-                MeteredClient::new(&bedrock_client, rate_limiter.clone(), first_send);
-            let mut response = self
-                .dispatch_buffered_with_context_retry(&bedrock_client, bedrock_request)
-                .await?
-                .response;
-            Self::attach_context_reduction(&mut response, context_reduction.as_ref());
-            return Ok(response);
-        }
+        let bedrock_client =
+            MeteredClient::new(&bedrock_client, rate_limiter.clone(), first_send);
+        let mut response = self
+            .dispatch_buffered_with_context_retry(&bedrock_client, bedrock_request)
+            .await?
+            .response;
+        Self::attach_context_reduction(&mut response, context_reduction.as_ref());
+        return Ok(response);
+    }
 
-        // OAuth bearer override (Req 6.2): when the provider declares
+        // ─── GitHub Copilot dispatch (github-copilot-oauth-provider,
+        // task 9 / Req 4.3, 9.1) ───────────────────────────────────────────
+        // Delegates end-to-end to the GitHubCopilotProvider adapter (task 7),
+        // mirroring the Codex arm: MeteredClient wraps the adapter so ADR
+        // 0002 (one token per real upstream request) holds, and
+        // dispatch_buffered_with_context_retry reuses the standard buffered
+        // retry machinery (image-strip, context-truncation, reassembly).
+        if provider_cfg.provider_type == "github-copilot" {
+            // Drop config lock before making HTTP calls (same discipline
+            // as the Codex/Bedrock/generic arms): this dispatch awaits
+            // inline token refresh + full upstream round-trips, and the
+            // arm only needs the already-cloned `provider_cfg` and the
+            // `context_config` captured above the arms.
+            drop(config);
+
+            let http =
+                self.get_or_create_http_client(provider_name, &provider_cfg.connection_pool)?;
+            let copilot_client = crate::providers::github_copilot::GitHubCopilotProvider::new(
+                provider_name.to_string(),
+                provider_cfg.auth_method.as_deref(),
+                // PAT already resolved for api-key mode; None for
+                // device-oauth so resolve_dispatch never falls back (Req 8.3).
+                if provider_cfg.auth_method.as_deref() == Some("api-key") {
+                    Some(provider_cfg.resolve_api_key().unwrap_or_default())
+                } else {
+                    None
+                },
+                self.copilot_manager.clone(),
+                self.copilot_usage_tracker
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(crate::oauth::UsageTracker::new())),
+                provider_cfg.effective_base_url().map(str::to_string),
+                http,
+                provider_cfg.effective_custom_headers(),
+            )?;
+
+            // Model rewrite + context gate on the dispatch copy, same as
+            // the Codex/Bedrock arms.
+            let mut copilot_request = request.clone();
+            copilot_request.model = provider_model.model.clone();
+            // Copilot rides stream:false buffered dispatch (Bedrock arm
+            // precedent): this arm delegates to the adapter, which has no
+            // upstream-streaming SSE reassembly, so a client stream:true
+            // must never reach the upstream request body — an SSE body
+            // would hit the adapter's JSON parser and fail guaranteed.
+            // Copilot hereby joins ADR 0001's enumerated stream:false
+            // exceptions (arms without upstream-streaming reassembly),
+            // like Bedrock.
+            copilot_request.stream = false;
+            let context_reduction = match self
+                .enforce_context_budget(
+                    &copilot_request,
+                    provider_model,
+                    &context_config,
+                    force_context_reduce,
+                )
+                .await?
+            {
+                Some((reduced, outcome)) => {
+                    copilot_request = reduced;
+                    Some(outcome)
+                }
+                None => None,
+            };
+
+            let metered =
+                MeteredClient::new(&copilot_client, rate_limiter.clone(), first_send);
+            // Req 4.3 (router side): on an upstream 401/403 auth-class
+            // failure, force ONE token refresh + ONE re-dispatch before
+            // giving up on this provider. force_refresh() invalidates the
+            // cached bearer and exchanges a fresh one single-flight — even
+            // when the cache still holds a live-but-revoked token (unlike
+            // get_copilot_token, which would serve that token again); a
+            // 401/403 exchange rejection flips the session to Expired so
+            // the re-dispatch surfaces the auth-class error for standard
+            // failover. PAT (`api-key`) mode is gated out — there is no
+            // OAuth token to refresh, so the rescue would waste an
+            // exchange + re-dispatch.
+            let result = match self
+                .dispatch_buffered_with_context_retry(&metered, copilot_request.clone())
+                .await
+            {
+                Ok(response) => response,
+                Err(err) if crate::providers::github_copilot::is_copilot_auth_error(&err)
+                    && provider_cfg.auth_method.as_deref() != Some("api-key") =>
+                {
+                    if let Some(handle) = &active {
+                        handle.set_last_error(&err.to_string());
+                    }
+                    tracing::warn!(
+                        provider = provider_name,
+                        "Copilot auth-class failure (401/403): forcing one token refresh + re-dispatch (Req 4.3)"
+                    );
+                    // Force the refresh; the rescue is capped at exactly
+                    // one re-dispatch regardless of the exchange outcome.
+                    if let Some(manager) = &self.copilot_manager {
+                        if let Err(refresh_err) = manager.force_refresh().await {
+                            tracing::warn!(
+                                provider = provider_name,
+                                error = %refresh_err,
+                                "Copilot forced token refresh failed; re-dispatching once anyway"
+                            );
+                        }
+                    }
+                    self.dispatch_buffered_with_context_retry(&metered, copilot_request)
+                        .await?
+                }
+                Err(err) => return Err(err),
+            };
+
+        let mut response = result.response;
+        Self::attach_context_reduction(&mut response, context_reduction.as_ref());
+        return Ok(response);
+    }
+    // ─── End GitHub Copilot dispatch ───────────────────────────────────
+
+    // OAuth bearer override (Req 6.2): when the provider declares
         // `auth_method: oauth` and the OAuth manager has a live,
         // non-expired access token, use it as the outgoing Bearer in place
         // of any configured api_key.
@@ -7099,43 +7263,108 @@ true
                 continue;
             }
 
-            // Defense-in-depth: re-check the durable upstream-driven
-            // cooldown that backs the dashboard. `select_provider_order`
-            // already filters on this, but a config hot-reload between
-            // selection and failover (or any direct call to
-            // `route_with_failover`) could leave a stale provider in the
-            // candidate list. The metrics store survives
-            // `clear_rate_limiters()`, so it is the authoritative gate
-            // for "this provider returned 429 / Retry-After recently".
-            if let Some(remaining) = self
-                .metrics
-                .provider_cooldown_remaining_secs(&provider_model.provider)
-            {
-                debug!(
-                    provider = %provider_model.provider,
-                    model = %provider_model.model,
-                    cooldown_remaining_secs = remaining,
-                    "Upstream rate-limit cooldown active, skipping provider"
-                );
-                Self::push_attempt(
-                    &mut attempts,
-                    active.as_ref(),
-                    ProviderAttempt::new(
-                        provider_model.provider.clone(),
-                        provider_model.model.clone(),
-                        format!(
-                            "Provider in upstream rate-limit cooldown ({}s remaining)",
-                            remaining
-                        ),
-                        Some(429),
-                    )
-                    .with_duration(start.elapsed())
-                    .with_error_class("cooldown_skip"),
-                );
-                continue;
-            }
+        // Defense-in-depth: re-check the durable upstream-driven
+        // cooldown that backs the dashboard. `select_provider_order`
+        // already filters on this, but a config hot-reload between
+        // selection and failover (or any direct call to
+        // `route_with_failover`) could leave a stale provider in the
+        // candidate list. The metrics store survives
+        // `clear_rate_limiters()`, so it is the authoritative gate
+        // for "this provider returned 429 / Retry-After recently".
+        if let Some(remaining) = self
+            .metrics
+            .provider_cooldown_remaining_secs(&provider_model.provider)
+        {
+            debug!(
+                provider = %provider_model.provider,
+                model = %provider_model.model,
+                cooldown_remaining_secs = remaining,
+                "Upstream rate-limit cooldown active, skipping provider"
+            );
+            Self::push_attempt(
+                &mut attempts,
+                active.as_ref(),
+                ProviderAttempt::new(
+                    provider_model.provider.clone(),
+                    provider_model.model.clone(),
+                    format!(
+                        "Provider in upstream rate-limit cooldown ({}s remaining)",
+                        remaining
+                    ),
+                    Some(429),
+                )
+                .with_duration(start.elapsed())
+                .with_error_class("cooldown_skip"),
+            );
+            continue;
+        }
 
-            // Admission gate (ADR 0002): take the token for this candidate's
+        // GitHub Copilot eligibility gate (Req 9.2): a device-oauth
+        // candidate whose session is Unauthenticated/Expired is
+        // ineligible — SKIP, not error — so the request fails over to
+        // the next provider without a spurious upstream attempt. Same
+        // observability shape as the rate-limit/budget skips above (one
+        // ledger row via push_attempt, error_class `copilot_auth_skip`).
+        // `api-key` (PAT) candidates have no session state and stay
+        // eligible; a missing manager (no master key at startup) also
+        // skips — there is no credential to dispatch with.
+        {
+            let device_oauth = {
+                let config = self.config.read().await;
+                config
+                    .providers
+                    .iter()
+                    .find(|p| p.name == provider_model.provider)
+                    .map(|p| {
+                        p.provider_type == "github-copilot"
+                            && p.auth_method.as_deref() != Some("api-key")
+                    })
+                    .unwrap_or(false)
+            };
+            if device_oauth {
+                let eligible = match &self.copilot_manager {
+                    None => Err("no Copilot token manager attached (gateway started without a master key)"),
+                    Some(manager) => match manager.session_state().await {
+                        CopilotSessionState::Authenticated { .. } => Ok(()),
+                        CopilotSessionState::Unauthenticated => Err(
+                            "Copilot session not authenticated (no login)",
+                        ),
+                        CopilotSessionState::Expired => {
+                            Err("Copilot session expired (re-login required)")
+                        }
+                        CopilotSessionState::Pending => Err("Copilot login in progress"),
+                        CopilotSessionState::Error => Err(
+                            "Copilot token refresh exhausted (Error state)",
+                        ),
+                    },
+                };
+                if let Err(reason) = eligible {
+                    debug!(
+                        provider = %provider_model.provider,
+                        model = %provider_model.model,
+                        reason,
+                        "Copilot session ineligible, skipping provider"
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        active.as_ref(),
+                        ProviderAttempt::new(
+                            provider_model.provider.clone(),
+                            provider_model.model.clone(),
+                            format!(
+                                "{reason}; skipping per Req 9.2 (no fallback credential)"
+                            ),
+                            Some(401),
+                        )
+                        .with_duration(start.elapsed())
+                        .with_error_class("copilot_auth_skip"),
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // Admission gate (ADR 0002): take the token for this candidate's
             // first upstream send. The primary candidate may wait briefly for
             // its next token (at most one refill, capped by
             // `rate_limit_max_wait_ms`) instead of failing over to a slower
@@ -7577,37 +7806,51 @@ true
                     self.metrics
                         .clear_provider_cooldown(&provider_model.provider);
 
-                    // Cache-aware actual cost (Req 3.5): price the response's usage
-                    // split (uncached / cache-read / cache-creation) at the model's
-                    // per-million rates. Bit-identical to the previous base-price
-                    // formula when the usage carries no cache fields, so providers
-                    // that never report cache telemetry are unaffected.
-                    let usage_known = response.usage.total_tokens > 0
-                        || response.usage.prompt_tokens > 0
-                        || response.usage.completion_tokens > 0;
-                    let total_cost = if usage_known {
-                        let cost = compute_actual_cost(&provider_model, &response.usage);
-                        if cost > 0.0 {
-                            self.metrics.add_cost(&provider_model.provider, cost);
-                            // Durable budget accrual (persistent budgets, Task 4):
-                            // persist for every provider — limits are metadata in
-                            // the store; off-path write, never blocks the response.
-                            self.metrics
-                                .persist_provider_spend(&provider_model.provider, cost);
-                        }
-                        record_cache_usage(
-                            &self.metrics,
-                            &provider_model.provider,
-                            &provider_model,
-                            &response.usage,
-                            cost,
-                        );
-                        cost
-                    } else {
-                        self.metrics
-                            .record_provider_unknown_cost(&provider_model.provider);
-                        0.0
-                    };
+        // Cache-aware actual cost (Req 3.5): price the response's usage
+        // split (uncached / cache-read / cache-creation) at the model's
+        // per-million rates. Bit-identical to the previous base-price
+        // formula when the usage carries no cache fields, so providers
+        // that never report cache telemetry are unaffected.
+        let usage_known = response.usage.total_tokens > 0
+            || response.usage.prompt_tokens > 0
+            || response.usage.completion_tokens > 0;
+        // Req 9.3 (github-copilot-oauth-provider): Copilot models are
+        // subscription-included — token usage IS recorded (usage rows
+        // below carry the model name + provider attribution), but the
+        // computed cost is forced to zero so per-token rates never
+        // bill a subscription-included model, even when the operator
+        // configured rates in the group entry.
+        let is_copilot_provider = {
+            let config = self.config.read().await;
+            config.providers.iter().any(|p| {
+                p.name == provider_model.provider && p.provider_type == "github-copilot"
+            })
+        };
+        let total_cost = if is_copilot_provider {
+            0.0
+        } else if usage_known {
+            let cost = compute_actual_cost(&provider_model, &response.usage);
+            if cost > 0.0 {
+                self.metrics.add_cost(&provider_model.provider, cost);
+                // Durable budget accrual (persistent budgets, Task 4):
+                // persist for every provider — limits are metadata in
+                // the store; off-path write, never blocks the response.
+                self.metrics
+                    .persist_provider_spend(&provider_model.provider, cost);
+            }
+            record_cache_usage(
+                &self.metrics,
+                &provider_model.provider,
+                &provider_model,
+                &response.usage,
+                cost,
+            );
+            cost
+        } else {
+            self.metrics
+                .record_provider_unknown_cost(&provider_model.provider);
+            0.0
+        };
 
                     // Reasoning-token attribution (Req 4.7): extract the reasoning /
                     // thinking token count (any carrier shape, never double-counted) and
@@ -10459,6 +10702,12 @@ return Err(GatewayError::InvalidRequest(
         // (Bedrock / XML-tool rewrite / Kimi-Nano) likewise must buffer.
         let is_codex = provider_cfg.auth_method.as_deref() == Some("oauth")
             && provider_cfg.provider_type == "openai";
+        // GitHub Copilot is dispatched end-to-end by the
+        // GitHubCopilotProvider adapter (mandatory Copilot headers +
+        // bearer resolution per auth_method), so streaming requests
+        // take the buffered route where that arm lives — same
+        // discipline as Bedrock below.
+        let is_copilot = provider_cfg.provider_type == "github-copilot";
         // INVARIANT: a Bedrock request must never be dispatched from the
         // pass-through path. That path posts to `{base_url}/chat/completions`
         // unconditionally and would send a `MantleApi::Responses` model to the
@@ -10484,6 +10733,7 @@ return Err(GatewayError::InvalidRequest(
         let known_degenerate_combo = tools_present
             && self.is_degenerate_stream_combo(&provider_model.provider, &provider_model.model);
         if is_codex
+            || is_copilot
             || is_bedrock
             || self.provider_needs_transformation(&provider_cfg, &prepared_request)
             || known_xml_combo
@@ -12969,7 +13219,7 @@ mod tests {
         }
     }
 
-    fn test_provider(name: &str, base_url: String) -> crate::config::Provider {
+    pub(super) fn test_provider(name: &str, base_url: String) -> crate::config::Provider {
         crate::config::Provider {
             name: name.to_string(),
             provider_type: "openai".to_string(),
@@ -13012,7 +13262,7 @@ mod tests {
         test_model_named(provider, "upstream-model", priority)
     }
 
-    fn test_model_named(provider: &str, model: &str, priority: u32) -> ProviderModel {
+    pub(super) fn test_model_named(provider: &str, model: &str, priority: u32) -> ProviderModel {
         ProviderModel {
             provider: provider.to_string(),
             model: model.to_string(),
@@ -13033,7 +13283,7 @@ mod tests {
         }
     }
 
-    fn test_group(models: Vec<ProviderModel>) -> ModelGroup {
+    pub(super) fn test_group(models: Vec<ProviderModel>) -> ModelGroup {
         ModelGroup {
             name: "test-group".to_string(),
             version_fallback_enabled: false,
@@ -13044,7 +13294,7 @@ mod tests {
         }
     }
 
-    fn compression_request(stream: bool) -> OpenAIRequest {
+    pub(super) fn compression_request(stream: bool) -> OpenAIRequest {
         OpenAIRequest {
             model: "test-group".to_string(),
             messages: vec![Message {
@@ -13070,7 +13320,7 @@ mod tests {
         }
     }
 
-    fn completion_response() -> serde_json::Value {
+    pub(super) fn completion_response() -> serde_json::Value {
         serde_json::json!({
             "id": "chatcmpl-test",
             "object": "chat.completion",
@@ -14054,7 +14304,7 @@ mod tests {
         );
     }
 
-    fn ledger_handle() -> ActiveRequestHandle {
+    pub(super) fn ledger_handle() -> ActiveRequestHandle {
         crate::active_requests::ActiveRequestRegistry::new().register(
             crate::active_requests::ActiveRequestInfo {
                 trace_id: "ledger-trace".to_string(),
@@ -18700,10 +18950,464 @@ mod property_tests {
             ref other => panic!("hint content must be a string, got: {other:?}"),
         });
 
-        // No system message at all: the hint becomes the first message.
-        let mut messages = vec![msg("user"), msg("assistant")];
-        Router::insert_tool_calling_hint(&mut messages);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].role, "user");
+    // No system message at all: the hint becomes the first message.
+    let mut messages = vec![msg("user"), msg("assistant")];
+    Router::insert_tool_calling_hint(&mut messages);
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[1].role, "user");
+    }
+
+    // ---- github-copilot-oauth-provider, task 9 wiring ------------------
+
+    mod copilot_wiring {
+        use super::super::tests::{
+            completion_response, compression_request, create_test_config, ledger_handle,
+            test_metrics, test_group, test_model_named, test_provider,
+        };
+        use super::*;
+        use crate::oauth::github_copilot::manager::{
+            CopilotEndpoints, CopilotSessionState, CopilotTokenManager,
+        };
+        use crate::oauth::github_copilot::store::{CopilotStoredCredentials, CopilotTokenStore};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn secure_dir() -> &'static std::path::Path {
+            use std::sync::OnceLock;
+            static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+            DIR.get_or_init(|| {
+                let dir = tempfile::tempdir().expect("temp secure dir");
+                let leaked = Box::leak(Box::new(dir.keep()));
+                std::env::set_var("AI_GATEWAY_DATA_DIR", &*leaked);
+                let _ = crate::secrets::load_or_create_master_key();
+                leaked.to_path_buf()
+            })
+        }
+
+        fn unique_store(tag: &str) -> CopilotTokenStore {
+            static COUNTER: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            CopilotTokenStore::new(secure_dir().join(format!("wire_{tag}_{n}.enc")))
+        }
+
+        fn now_plus(secs: u64) -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + secs
+        }
+
+        fn copilot_provider(name: &str, base_url: String) -> crate::config::Provider {
+            let mut p = test_provider(name, base_url);
+            p.provider_type = "github-copilot".to_string();
+            p.auth_method = None; // default device-oauth
+            p
+        }
+
+        fn copilot_config(
+            copilot_base: &str,
+            fallback_base: &str,
+        ) -> Config {
+            let mut config = create_test_config();
+            config.retry.max_retries_per_provider = 0;
+            config.providers = vec![
+                copilot_provider("copilot", copilot_base.to_string()),
+                test_provider("fallback", fallback_base.to_string()),
+            ];
+            config.model_groups = vec![test_group(vec![
+                test_model_named("copilot", "gpt-5-copilot", 1),
+                test_model_named("fallback", "upstream-model", 2),
+            ])];
+            config
+        }
+
+        /// Req 9.2: an Unauthenticated device-oauth Copilot candidate is
+        /// SKIPPED (ledger row `copilot_auth_skip`), the request fails
+        /// over to the next provider, and no copilot HTTP attempt is
+        /// recorded as an upstream error.
+        #[tokio::test]
+        async fn copilot_unauthenticated_session_skips_and_fails_over() {
+            let copilot = MockServer::start().await;
+            let fallback = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+                .expect(1)
+                .mount(&fallback)
+                .await;
+
+            let manager = CopilotTokenManager::with_endpoints(
+                unique_store("unauth"),
+                reqwest::Client::new(),
+                CopilotEndpoints::production(),
+            );
+            // Session stays Unauthenticated (empty store).
+
+            let mut router = Router::new(
+                Arc::new(RwLock::new(copilot_config(&copilot.uri(), &fallback.uri()))),
+                test_metrics(),
+            );
+            router.set_copilot_manager(Arc::new(manager));
+
+            let handle = ledger_handle();
+            let response = router
+                .route_request(&compression_request(false), Some(handle.clone()))
+                .await
+                .expect("fails over to the fallback provider");
+            assert_eq!(
+                response.extra.get("gateway_provider"),
+                Some(&serde_json::json!("fallback"))
+            );
+
+            let ledger = handle.take_failed_attempts();
+            let skip = ledger
+                .iter()
+                .find(|a| a.error_class.as_deref() == Some("copilot_auth_skip"))
+                .expect("copilot_auth_skip ledger row");
+            assert_eq!(skip.provider, "copilot");
+            assert_eq!(skip.status_code, Some(401));
+            // SKIP, not error: no upstream attempt row for copilot.
+            assert!(
+                !ledger.iter().any(|a| a.provider == "copilot"
+                    && a.error_class.as_deref() != Some("copilot_auth_skip")),
+                "ledger: {ledger:?}"
+            );
+            // Nothing was sent to the copilot upstream.
+            assert_eq!(copilot.received_requests().await.unwrap().len(), 0);
+        }
+
+        /// Req 9.2: an Expired session is skipped the same way.
+        #[tokio::test]
+        async fn copilot_expired_session_skips() {
+            let copilot = MockServer::start().await;
+            let fallback = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+                .mount(&fallback)
+                .await;
+
+            // Expired copilot token on disk → Expired session state.
+            let store = unique_store("expired");
+            store
+                .save(&CopilotStoredCredentials {
+                    github_access_token: "gho-test".into(),
+                    copilot_token: Some("tid=dead".into()),
+                    copilot_expires_at: Some(now_plus(0) - 1),
+                    api_base: String::new(),
+                    machine_id: "m".into(),
+                    sku: None,
+                    scopes: "read:user".into(),
+                    updated_at: now_plus(0),
+                })
+                .unwrap();
+            let manager = CopilotTokenManager::with_endpoints(
+                store,
+                reqwest::Client::new(),
+                CopilotEndpoints::production(),
+            );
+            manager.load_existing_session().await.unwrap();
+            assert_eq!(manager.session_state().await, CopilotSessionState::Expired);
+
+            let mut router = Router::new(
+                Arc::new(RwLock::new(copilot_config(&copilot.uri(), &fallback.uri()))),
+                test_metrics(),
+            );
+            router.set_copilot_manager(Arc::new(manager));
+
+            let handle = ledger_handle();
+            let response = router
+                .route_request(&compression_request(false), Some(handle.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.extra.get("gateway_provider"),
+                Some(&serde_json::json!("fallback"))
+            );
+            assert!(handle
+                .take_failed_attempts()
+                .iter()
+                .any(|a| a.error_class.as_deref() == Some("copilot_auth_skip")));
+        }
+
+        /// Req 9.1 + 9.3: an Authenticated session dispatches through the
+        /// GitHubCopilotProvider adapter (headers + no /v1 URL), succeeds,
+        /// records usage, and reports ZERO cost even with rates configured.
+        #[tokio::test]
+        async fn copilot_authenticated_dispatch_zero_cost_usage_attribution() {
+            let copilot = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "id": "chatcmpl-copilot",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "gpt-5-copilot",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 5,
+                            "total_tokens": 15,
+                        },
+                    }),
+                ))
+                .expect(1)
+                .mount(&copilot)
+                .await;
+
+            let store = unique_store("ok");
+            store
+                .save(&CopilotStoredCredentials {
+                    github_access_token: "gho-test".into(),
+                    copilot_token: Some("tid=live".into()),
+                    copilot_expires_at: Some(now_plus(3600)),
+                    // Wire the dispatch base at the mock directly.
+                    api_base: copilot.uri(),
+                    machine_id: "6f9619ff".into(),
+                    sku: Some("copilot_pro".into()),
+                    scopes: "read:user".into(),
+                    updated_at: now_plus(0),
+                })
+                .unwrap();
+            let manager = CopilotTokenManager::with_endpoints(
+                store,
+                reqwest::Client::new(),
+                CopilotEndpoints::production(),
+            );
+            manager.load_existing_session().await.unwrap();
+
+            let mut config = copilot_config(&copilot.uri(), "http://fallback.invalid");
+            // Rates configured on the copilot model — must still bill 0.
+            config.model_groups[0].models[0].cost_per_million_input_tokens = 10.0;
+            config.model_groups[0].models[0].cost_per_million_output_tokens = 30.0;
+
+            let mut router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+            router.set_copilot_manager(Arc::new(manager));
+
+            let handle = ledger_handle();
+            let response = router
+                .route_request(&compression_request(false), Some(handle.clone()))
+                .await
+                .expect("copilot dispatch succeeds");
+            assert_eq!(
+                response.extra.get("gateway_provider"),
+                Some(&serde_json::json!("copilot"))
+            );
+            assert_eq!(
+                response.extra.get("gateway_responded_model"),
+                Some(&serde_json::json!("gpt-5-copilot"))
+            );
+            // Usage preserved (Req 9.3)…
+            assert_eq!(response.usage.prompt_tokens, 10);
+            assert_eq!(response.usage.total_tokens, 15);
+            // …with zero cost reported to the client (Req 9.3).
+            assert_eq!(
+                response.extra.get("gateway_cost"),
+                Some(&serde_json::json!(0.0))
+            );
+            // No failed attempts for a clean dispatch.
+            assert!(handle.take_failed_attempts().is_empty());
+        }
+
+/// Req 4.3 (router side): upstream 401 on a Copilot attempt → ONE
+/// forced token refresh + ONE re-dispatch, then failover when the
+/// retry also auth-fails. The forced exchange is itself rejected 401
+/// (entitlement missing → session Expired), so the re-dispatch fails
+/// in bearer resolution without a second upstream POST.
+#[tokio::test]
+async fn copilot_upstream_401_refreshes_once_then_fails_over() {
+    let copilot = MockServer::start().await;
+    let exchange = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("token revoked"))
+        // First dispatch only: the forced exchange rejects 401 → the
+        // session flips Expired → the single re-dispatch short-circuits
+        // in bearer resolution (no second upstream POST).
+        .expect(1)
+        .mount(&copilot)
+        .await;
+    // Forced-refresh exchange rejects with 401 — no real network: the
+    // rescue's force_refresh() must hit this wiremock endpoint.
+    Mock::given(method("GET"))
+        .and(path("/copilot_internal/v2/token"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("no copilot seat"))
+        .expect(1)
+        .mount(&exchange)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let store = unique_store("401");
+    store
+        .save(&CopilotStoredCredentials {
+            github_access_token: "gho-test".into(),
+            copilot_token: Some("tid=revoked".into()),
+            copilot_expires_at: Some(now_plus(3600)),
+            api_base: copilot.uri(),
+            machine_id: "6f9619ff".into(),
+            sku: Some("copilot_pro".into()),
+            scopes: "read:user".into(),
+            updated_at: now_plus(0),
+        })
+        .unwrap();
+    let manager = CopilotTokenManager::with_endpoints(
+        store,
+        reqwest::Client::new(),
+        CopilotEndpoints {
+            device_flow: crate::oauth::github_copilot::device_flow::DeviceFlowEndpoints::production(),
+            copilot_token_url: format!("{}/copilot_internal/v2/token", exchange.uri()),
+        },
+    );
+    manager.load_existing_session().await.unwrap();
+
+    let mut router = Router::new(
+        Arc::new(RwLock::new(copilot_config(&copilot.uri(), &fallback.uri()))),
+        test_metrics(),
+    );
+    router.set_copilot_manager(Arc::new(manager));
+
+    let handle = ledger_handle();
+    let response = router
+        .route_request(&compression_request(false), Some(handle.clone()))
+        .await
+        .expect("fails over after the single auth rescue");
+    assert_eq!(
+        response.extra.get("gateway_provider"),
+        Some(&serde_json::json!("fallback"))
+    );
+    // Exactly 1 copilot dispatch + 1 forced exchange, then failover.
+    copilot.verify().await;
+    exchange.verify().await;
+}
+
+/// NFR Reliability: reload never clears Copilot auth state. Drives the
+/// same router-surface calls the gateway's real hot-reload entry
+/// (`apply_runtime_config_update`) makes — smart-router reload, breaker
+/// / rate-limiter / sticky-cache / http-client / model-capability
+/// clears, compression-runtime reload — with a config whose copilot
+/// provider is RENAMED ("copilot-2"), then asserts from the router
+/// side: the SAME manager Arc stays attached, the session state
+/// survives, and a post-reload dispatch still authenticates and serves
+/// through it.
+#[tokio::test]
+async fn copilot_reload_preserves_manager_and_auth_state() {
+    let copilot = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-copilot-reload",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-5-copilot",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })))
+        .expect(1)
+        .mount(&copilot)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+        .mount(&fallback)
+        .await;
+
+    let store = unique_store("reload");
+    store
+        .save(&CopilotStoredCredentials {
+            github_access_token: "gho-test".into(),
+            copilot_token: Some("tid=live".into()),
+            copilot_expires_at: Some(now_plus(3600)),
+            api_base: copilot.uri(),
+            machine_id: "6f9619ff".into(),
+            sku: None,
+            scopes: "read:user".into(),
+            updated_at: now_plus(0),
+        })
+        .unwrap();
+    let manager = Arc::new(CopilotTokenManager::with_endpoints(
+        store,
+        reqwest::Client::new(),
+        CopilotEndpoints::production(),
+    ));
+    manager.load_existing_session().await.unwrap();
+
+    // Pre-reload config: provider named "copilot".
+    let config = copilot_config(&copilot.uri(), &fallback.uri());
+    let config_lock = Arc::new(RwLock::new(config));
+    let mut router = Router::new(config_lock.clone(), test_metrics());
+    router.set_copilot_manager(manager.clone());
+    let attached_before = router.copilot_manager.clone().expect("manager attached");
+    assert!(Arc::ptr_eq(&attached_before, &manager));
+
+    // Publish the reloaded config: same shape but the copilot provider
+    // is RENAMED ("copilot-2") — a reload that drops/reconstructs auth
+    // state would lose the manager here.
+    let mut reloaded = copilot_config(&copilot.uri(), &fallback.uri());
+    reloaded.providers[0].name = "copilot-2".to_string();
+    reloaded.model_groups[0].models[0].provider = "copilot-2".to_string();
+    *config_lock.write().await = reloaded;
+
+    // Drive the same router-surface calls apply_runtime_config_update
+    // makes on hot-reload (gateway/mod.rs): nothing here may touch the
+    // copilot manager/catalog fields.
+    {
+        let cfg = config_lock.read().await;
+        router
+            .reload_smart_router(cfg.smart_routing.clone())
+            .expect("smart router reload");
+        router.reload_compression_runtime(
+            cfg.compression.clone(),
+            None,
+        );
+    }
+    router.clear_circuit_breakers();
+    router.clear_rate_limiters();
+    router.clear_sticky_cache();
+    router.clear_http_clients();
+    router.clear_model_capabilities();
+
+    // Router side: the same manager Arc survived the reload untouched.
+    let attached_after = router.copilot_manager.clone().expect("manager survives reload");
+    assert!(
+        Arc::ptr_eq(&attached_after, &manager),
+        "reload must keep the SAME CopilotTokenManager Arc"
+    );
+    // Auth state untouched by the config swap + router reload surface.
+    assert!(matches!(
+        manager.session_state().await,
+        CopilotSessionState::Authenticated { .. }
+    ));
+
+    // Behavioral proof: a post-reload dispatch through the renamed
+    // provider still authenticates with the seeded session and serves.
+    let response = router
+        .route_request(&compression_request(false), Some(ledger_handle()))
+        .await
+        .expect("post-reload dispatch succeeds");
+    assert_eq!(
+        response.extra.get("gateway_provider"),
+        Some(&serde_json::json!("copilot-2"))
+    );
+    copilot.verify().await;
+}
     }
 }

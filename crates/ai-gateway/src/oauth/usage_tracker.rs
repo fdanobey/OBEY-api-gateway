@@ -5,14 +5,17 @@
 //! the ChatGPT Codex backend used by browser login exposes percentage-based
 //! `x-codex-{primary,secondary}-*` headers. Both formats are normalized into
 //! the same short/weekly snapshot consumed by the admin provider card.
+//! GitHub Copilot responses additionally carry `x-copilot-premium-requests-*`
+//! percentage headers, recorded as a separate premium window in the snapshot.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 /// A single rate-limit window (e.g., "requests per 5h" or "tokens per week").
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RateLimitWindow {
     /// Maximum allowed in this window (from `x-ratelimit-limit-*`).
     pub limit: Option<u64>,
@@ -61,7 +64,7 @@ impl RateLimitWindow {
 
 /// A pair of request/token windows that belong to the same time horizon
 /// (either the short ~5h window or the weekly ~7d window).
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WindowPair {
     pub requests: RateLimitWindow,
     pub tokens: RateLimitWindow,
@@ -72,10 +75,16 @@ pub struct WindowPair {
 /// OpenAI browser-login accounts expose two sliding windows:
 ///   - `short`  — the ~5 hour window (requests + tokens).
 ///   - `weekly` — the 7-day weekly window (requests + tokens).
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UsageSnapshot {
     pub short: WindowPair,
     pub weekly: WindowPair,
+    /// Premium-request allowance (GitHub Copilot `x-copilot-premium-requests-*`
+    /// headers). Percentage-based: `used`/`limit` are percentages of the
+    /// subscription's premium-request allowance, independent of the count-based
+    /// short/weekly windows.
+    #[serde(default)]
+    pub premium: Option<RateLimitWindow>,
     /// Unix timestamp when this snapshot was last updated.
     pub updated_at: u64,
 }
@@ -84,12 +93,18 @@ pub struct UsageSnapshot {
 #[derive(Debug, Clone)]
 pub struct UsageTracker {
     state: Arc<RwLock<UsageSnapshot>>,
+    /// Generation counter (G6): `clear()` bumps it; `update_from_headers`
+    /// captures it before parsing and publishes only when unchanged, so a
+    /// response that lands after logout never repopulates the previous
+    /// account's windows.
+    epoch: Arc<AtomicU64>,
 }
 
 impl UsageTracker {
     pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(UsageSnapshot::default())),
+            epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -99,14 +114,27 @@ impl UsageTracker {
     /// backend used by OAuth browser login instead reports percentage-based
     /// primary (short) and secondary (weekly) windows through `x-codex-*`.
     pub async fn update_from_headers(&self, headers: &reqwest::header::HeaderMap) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        self.update_if_current(epoch, headers).await;
+    }
+
+    /// Publish a header-derived update only when `epoch` is still the
+    /// current generation (G6): an update that straddled a `clear()` is
+    /// dropped instead of repopulating the logged-out account's windows.
+    async fn update_if_current(&self, epoch: u64, headers: &reqwest::header::HeaderMap) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
         let mut state = self.state.write().await;
+        if epoch != self.epoch.load(Ordering::Acquire) {
+            // A clear() (logout) raced this update: drop the stale payload.
+            return;
+        }
         let mut updated = update_from_codex_headers(&mut state, headers, now);
         updated |= update_from_standard_headers(&mut state, headers, now);
+        updated |= update_from_premium_headers(&mut state, headers, now);
 
         if updated {
             state.updated_at = now;
@@ -115,7 +143,23 @@ impl UsageTracker {
 
     /// Get the current usage snapshot.
     pub async fn snapshot(&self) -> UsageSnapshot {
-        self.state.read().await.clone()
+    self.state.read().await.clone()
+    }
+
+    /// Clear all cached windows (short, weekly, premium) and reset
+    /// `updated_at` — the logout path (Copilot admin Req 6.2 "clear cached
+    /// usage") calls this so a stale pre-logout snapshot never lingers for
+    /// the next account session. Bumps the epoch so in-flight updates that
+    /// captured the pre-clear generation are discarded (G6).
+    pub async fn clear(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        *self.state.write().await = UsageSnapshot::default();
+    }
+
+    /// Test-only seam for G6: current generation counter.
+    #[cfg(test)]
+    fn current_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
     }
 
     /// Compute a fallback cooldown duration from the tracked headers when
@@ -258,6 +302,44 @@ fn update_from_standard_headers(
     if let Some(seconds) = tok_reset_secs {
         target.tokens.resets_at = Some(now + seconds);
     }
+
+    true
+}
+
+/// Parse GitHub Copilot premium-request headers (`x-copilot-premium-requests-*`)
+/// into a percentage window recorded alongside the count-based windows.
+///
+/// `used` and `limit` are percentages (e.g. used=37, limit=100 means 37% of
+/// the premium-request allowance consumed), so the window is marked
+/// `is_percentage = true`. The reset header follows the same duration
+/// convention as the count-based `x-ratelimit-reset-*` headers (e.g. "1h").
+/// Returns `false` when no premium headers are present, leaving the snapshot
+/// untouched (old serialized payloads without the field keep parsing via
+/// `serde(default)`).
+fn update_from_premium_headers(
+    state: &mut UsageSnapshot,
+    headers: &reqwest::header::HeaderMap,
+    now: u64,
+) -> bool {
+    let used = header_u64(headers, "x-copilot-premium-requests-used");
+    let limit = header_u64(headers, "x-copilot-premium-requests-limit");
+    let reset_secs = header_str(headers, "x-copilot-premium-requests-reset")
+        .and_then(parse_reset_duration);
+
+    if used.is_none() && limit.is_none() && reset_secs.is_none() {
+        return false;
+    }
+
+    let used_pct = used.unwrap_or(0).min(100);
+    let limit_pct = limit.unwrap_or(100).min(100).max(1);
+    let remaining_pct = limit_pct.saturating_sub(used_pct);
+
+    state.premium = Some(RateLimitWindow {
+        limit: Some(limit_pct),
+        remaining: Some(remaining_pct),
+        resets_at: reset_secs.map(|secs| now + secs),
+        is_percentage: true,
+    });
 
     true
 }
@@ -417,19 +499,98 @@ mod tests {
 
     #[tokio::test]
     async fn test_short_window_classification() {
-        let tracker = UsageTracker::new();
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
-        headers.insert("x-ratelimit-remaining-requests", "40".parse().unwrap());
-        headers.insert("x-ratelimit-reset-requests", "3h30m0s".parse().unwrap());
-        tracker.update_from_headers(&headers).await;
-        let snap = tracker.snapshot().await;
-        assert_eq!(snap.short.requests.limit, Some(100));
-        assert_eq!(snap.short.requests.remaining, Some(40));
-        assert!(snap.short.requests.resets_at.is_some());
-        // Weekly window should not have been populated
-        assert_eq!(snap.weekly.requests.limit, None);
+    let tracker = UsageTracker::new();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
+    headers.insert("x-ratelimit-remaining-requests", "40".parse().unwrap());
+    headers.insert("x-ratelimit-reset-requests", "3h30m0s".parse().unwrap());
+    tracker.update_from_headers(&headers).await;
+    let snap = tracker.snapshot().await;
+    assert_eq!(snap.short.requests.limit, Some(100));
+    assert_eq!(snap.short.requests.remaining, Some(40));
+    assert!(snap.short.requests.resets_at.is_some());
+    // Weekly window should not have been populated
+    assert_eq!(snap.weekly.requests.limit, None);
     }
+
+    #[tokio::test]
+    async fn test_clear_resets_all_windows() {
+    let tracker = UsageTracker::new();
+    // Weekly window first (5d reset >= weekly threshold)...
+    let mut weekly = reqwest::header::HeaderMap::new();
+    weekly.insert("x-ratelimit-limit-tokens", "500".parse().unwrap());
+    weekly.insert("x-ratelimit-remaining-tokens", "100".parse().unwrap());
+    weekly.insert("x-ratelimit-reset-tokens", "5d12h0m0s".parse().unwrap());
+    tracker.update_from_headers(&weekly).await;
+    // ...then short (3h reset) + premium in a second update.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
+    headers.insert("x-ratelimit-remaining-requests", "40".parse().unwrap());
+    headers.insert("x-ratelimit-reset-requests", "3h0m0s".parse().unwrap());
+    headers.insert("x-copilot-premium-requests-used", "37".parse().unwrap());
+    headers.insert("x-copilot-premium-requests-limit", "100".parse().unwrap());
+    headers.insert("x-copilot-premium-requests-reset", "27d0h0m0s".parse().unwrap());
+    tracker.update_from_headers(&headers).await;
+    let snap = tracker.snapshot().await;
+    assert!(snap.short.requests.limit.is_some());
+    assert!(snap.weekly.tokens.limit.is_some());
+    assert!(snap.premium.is_some());
+    assert!(snap.updated_at > 0);
+
+    tracker.clear().await;
+    let cleared = tracker.snapshot().await;
+    assert_eq!(cleared.short.requests.limit, None);
+    assert_eq!(cleared.short.requests.remaining, None);
+    assert_eq!(cleared.weekly.tokens.limit, None);
+    assert_eq!(cleared.weekly.tokens.remaining, None);
+    assert!(cleared.premium.is_none());
+    assert_eq!(cleared.updated_at, 0);
+}
+
+/// G6: a stale in-flight update that captured the pre-clear epoch must
+/// not repopulate windows after `clear()` (logout). Deterministic
+/// interleaving: capture the epoch exactly like `update_from_headers`
+/// does, clear() in between, then publish through the same guarded path.
+#[tokio::test]
+async fn test_stale_update_after_clear_does_not_repopulate() {
+    let tracker = UsageTracker::new();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
+    headers.insert("x-ratelimit-remaining-requests", "40".parse().unwrap());
+    headers.insert("x-ratelimit-reset-requests", "3h0m0s".parse().unwrap());
+    tracker.update_from_headers(&headers).await;
+    assert!(tracker.snapshot().await.short.requests.limit.is_some());
+
+    // In-flight response: epoch captured before logout's clear()...
+    let stale_epoch = tracker.current_epoch();
+    tracker.clear().await;
+    // ...and lands after it. The guarded publish must drop it.
+    tracker.update_if_current(stale_epoch, &headers).await;
+
+    let snap = tracker.snapshot().await;
+    assert_eq!(
+        snap.short.requests.limit, None,
+        "stale pre-clear update must not repopulate windows after logout clear"
+    );
+    assert_eq!(snap.updated_at, 0);
+}
+
+/// G6 companion: a FRESH update after clear() (new epoch) still applies.
+#[tokio::test]
+async fn test_fresh_update_after_clear_applies() {
+    let tracker = UsageTracker::new();
+    tracker.clear().await;
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
+    headers.insert("x-ratelimit-remaining-requests", "40".parse().unwrap());
+    headers.insert("x-ratelimit-reset-requests", "3h0m0s".parse().unwrap());
+    tracker.update_from_headers(&headers).await;
+
+    let snap = tracker.snapshot().await;
+    assert_eq!(snap.short.requests.limit, Some(100));
+    assert!(snap.updated_at > 0);
+}
 
     #[tokio::test]
     async fn test_weekly_window_classification() {
@@ -612,5 +773,105 @@ mod tests {
             cooldown <= 3_600,
             "expected the ~1h short-window reset, got {cooldown}s"
         );
+    }
+
+    #[tokio::test]
+    async fn test_premium_requests_headers_populate_percentage_window() {
+        let tracker = UsageTracker::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-copilot-premium-requests-used", "37".parse().unwrap());
+        headers.insert("x-copilot-premium-requests-limit", "100".parse().unwrap());
+        headers.insert("x-copilot-premium-requests-reset", "1d12h".parse().unwrap());
+
+        tracker.update_from_headers(&headers).await;
+        let snap = tracker.snapshot().await;
+
+        let premium = snap.premium.expect("premium window should be set");
+        assert!(premium.is_percentage);
+        assert_eq!(premium.limit, Some(100));
+        assert_eq!(premium.remaining, Some(63));
+        let resets_at = premium.resets_at.expect("premium reset should be set");
+        assert!(resets_at > now && resets_at <= now + 36 * 3_600);
+        // Percentage semantics: usage_percent derives from used/limit.
+        assert_eq!(premium.usage_percent(), Some(37.0));
+        assert!(snap.updated_at > 0);
+    }
+
+    #[tokio::test]
+    async fn test_premium_requests_absent_headers_leave_window_unset() {
+        let tracker = UsageTracker::new();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
+        headers.insert("x-ratelimit-remaining-requests", "40".parse().unwrap());
+        headers.insert("x-ratelimit-reset-requests", "3h30m0s".parse().unwrap());
+
+        tracker.update_from_headers(&headers).await;
+        let snap = tracker.snapshot().await;
+
+        assert!(snap.premium.is_none());
+        // Count-based windows still populated exactly as before.
+        assert_eq!(snap.short.requests.limit, Some(100));
+        assert_eq!(snap.short.requests.remaining, Some(40));
+        assert!(snap.short.requests.resets_at.is_some());
+        assert!(!snap.short.requests.is_percentage);
+    }
+
+    #[tokio::test]
+    async fn test_premium_requests_recorded_alongside_count_windows() {
+        let tracker = UsageTracker::new();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
+        headers.insert("x-ratelimit-remaining-requests", "40".parse().unwrap());
+        headers.insert("x-ratelimit-reset-requests", "3h30m0s".parse().unwrap());
+        headers.insert("x-copilot-premium-requests-used", "82".parse().unwrap());
+        headers.insert("x-copilot-premium-requests-limit", "100".parse().unwrap());
+        headers.insert("x-copilot-premium-requests-reset", "5d".parse().unwrap());
+
+        tracker.update_from_headers(&headers).await;
+        let snap = tracker.snapshot().await;
+
+        // Count window semantics unchanged (Req 7.1).
+        assert_eq!(snap.short.requests.limit, Some(100));
+        assert_eq!(snap.short.requests.remaining, Some(40));
+        assert!(!snap.short.requests.is_percentage);
+        // Premium window recorded alongside (Req 7.2).
+        let premium = snap.premium.expect("premium window should be set");
+        assert!(premium.is_percentage);
+        assert_eq!(premium.remaining, Some(18));
+    }
+
+    #[tokio::test]
+    async fn test_premium_requests_partial_headers_use_defaults() {
+        let tracker = UsageTracker::new();
+        let mut headers = reqwest::header::HeaderMap::new();
+        // Only the used percentage is present.
+        headers.insert("x-copilot-premium-requests-used", "25".parse().unwrap());
+
+        tracker.update_from_headers(&headers).await;
+        let snap = tracker.snapshot().await;
+
+        let premium = snap.premium.expect("premium window should be set");
+        assert!(premium.is_percentage);
+        assert_eq!(premium.limit, Some(100));
+        assert_eq!(premium.remaining, Some(75));
+        assert_eq!(premium.resets_at, None);
+    }
+
+    #[tokio::test]
+    async fn test_premium_requests_snapshot_json_round_trip_without_field() {
+        // Additive JSON shape: an old serialized payload (no `premium` field)
+        // must still deserialize into the snapshot shape via serde(default).
+        let json = serde_json::json!({
+            "short": {"requests": {}, "tokens": {}},
+            "weekly": {"requests": {}, "tokens": {}},
+            "updated_at": 42
+        });
+        let snap: UsageSnapshot = serde_json::from_value(json).expect("old payload parses");
+        assert!(snap.premium.is_none());
+        assert_eq!(snap.updated_at, 42);
     }
 }

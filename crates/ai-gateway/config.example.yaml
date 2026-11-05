@@ -25,7 +25,7 @@ server:
 #   key_path: "./key.pem"
 
 # Providers — at least one required
-# Types: openai | ollama | bedrock | groq | together | vllm | lmstudio | nvidia_nim
+# Types: openai | ollama | bedrock | groq | together | vllm | lmstudio | nvidia_nim | github-copilot
 providers:
   - name: "openai"
     type: "openai"
@@ -53,6 +53,25 @@ providers:
     type: "ollama"
     base_url: "http://localhost:11434"
     timeout_seconds: 120
+
+  # GitHub Copilot (subscription-included models through your Copilot seat).
+  # NOTE: the endpoint set this provider uses is UNOFFICIAL — it is not part
+  # of GitHub's public, documented API surface, may change or break without
+  # notice, and is used by major third-party clients (opencode, with
+  # GitHub's announced partnership support; LiteLLM; copilot-api).
+  # auth_method: device-oauth (default; sign in via the admin panel) or
+  # api-key (GitHub PAT resolved through the standard api_key_env field).
+  # base_url is optional and defaults to https://api.githubcopilot.com.
+  # - name: "github-copilot"
+  #   type: "github-copilot"
+  #   auth_method: device-oauth
+  #   timeout_seconds: 60
+  #
+  # - name: "github-copilot-pat"
+  #   type: "github-copilot"
+  #   auth_method: api-key
+  #   api_key_env: "GITHUB_COPILOT_PAT"
+  #   timeout_seconds: 60
 
   # NVIDIA's hosted NIM API uses a maintained built-in model fallback when
   # live /v1/models discovery is unavailable. Optional manual_models entries

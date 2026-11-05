@@ -11591,6 +11591,21 @@ pub async fn list_models(
         }
     }
 
+    // GitHub Copilot catalog models (github-copilot-oauth-provider,
+    // Req 5.2 / task 9 wiring): when a `github-copilot` provider
+    // exists and the catalog sync is attached, aggregate the
+    // entitlement-filtered enabled models. Empty until the first
+    // successful fetch (never blocks, never errors).
+    if config.providers.iter().any(|p| p.provider_type == "github-copilot") {
+        if let Some(catalog) = &state.copilot_catalog {
+            for model in catalog.enabled_models().await {
+                if seen_ids.insert(model.id.clone()) {
+                    all_models.push(model);
+                }
+            }
+        }
+    }
+
     // When the caller authenticated with a virtual key that has a model_access
     // restriction, filter the list to only models/groups in the allowed set.
     // A permitted model group name also grants visibility to all individual

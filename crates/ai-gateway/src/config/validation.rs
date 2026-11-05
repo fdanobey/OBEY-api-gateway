@@ -135,6 +135,27 @@ pub enum ValidationError {
 
 pub type ValidationResult<T> = Result<T, Vec<ValidationError>>;
 
+/// Save-time validation warning hook for `github-copilot` providers
+/// (Req 5.3, github-copilot-oauth-provider spec): warn — never block —
+/// when an explicit `models` list contains identifiers absent from the
+/// fetched Copilot model catalog. Full catalog wiring lands in a later
+/// task; the catalog component calls this helper with the fetched
+/// catalog identifiers. Returns the unknown identifiers (those not in
+/// `catalog_models`), preserving the provider's order.
+#[allow(dead_code)]
+pub fn unknown_copilot_models<'a>(
+    provider_models: &[String],
+    catalog_models: &[&'a str],
+) -> Vec<String> {
+    let catalog: std::collections::HashSet<&str> =
+        catalog_models.iter().copied().collect();
+    provider_models
+        .iter()
+        .filter(|model| !catalog.contains(model.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Returns the offending credential channel when wildcard CORS origins are
 /// combined with Authorization-header exposure (black-october-security-
 /// hardening, Req 4.2). `None` when the combination is safe.
@@ -519,6 +540,32 @@ impl Config {
                     expected: "auth_method 'oauth' is only supported for provider_type 'openai'"
                         .to_string(),
                 });
+            }
+
+            // Feature: github-copilot-oauth-provider, Task 1
+            // **Validates: Requirements 1.1, 1.2, 8.1**
+            // type × auth_method matrix: device-oauth (default) or api-key
+            // (PAT resolved through the existing api_key/api_key_env
+            // mechanism — never a silent fallback, Req 8.3). base_url is
+            // optional and defaults to GITHUB_COPILOT_DEFAULT_BASE_URL.
+            if provider.provider_type == "github-copilot" {
+                let auth_method = provider.auth_method.as_deref().unwrap_or("device-oauth");
+
+                if auth_method == "api-key" {
+                    if !provider.has_api_key_configured() {
+                        errors.push(ValidationError::InvalidValue {
+                            field: format!("providers.{}.auth_method", provider.name),
+                            value: "api-key".to_string(),
+                            expected: "auth_method 'api-key' requires api_key or api_key_env to be set for github-copilot providers (no credential source — configure a PAT before enabling api-key auth)".to_string(),
+                        });
+                    }
+                } else if auth_method != "device-oauth" {
+                    errors.push(ValidationError::InvalidValue {
+                        field: format!("providers.{}.auth_method", provider.name),
+                        value: auth_method.to_string(),
+                        expected: "auth_method 'device-oauth' (default) or 'api-key' for provider_type 'github-copilot'".to_string(),
+                    });
+                }
             }
 
             // Codex-specific field validation (Req 10.6)
@@ -2664,6 +2711,257 @@ model_groups:
             "No auth_method should be accepted for any provider: {:?}",
             result
         );
+    }
+
+    // Feature: github-copilot-oauth-provider, Task 1: config schema and
+    // validation for the github-copilot provider type.
+    // **Validates: Requirements 1.1, 1.2, 8.1, 5.3 (warning hook)**
+
+    /// minimal `github-copilot` provider on a valid config (Req 1.1): no
+    /// base_url required, no other provider-specific fields.
+    fn copilot_config(auth_method: Option<&str>) -> Config {
+        let mut config = minimal_valid_config();
+        config.providers[0].provider_type = "github-copilot".to_string();
+        config.providers[0].base_url = None;
+        config.providers[0].api_key_env = None;
+        config.providers[0].auth_method = auth_method.map(str::to_string);
+        config
+    }
+
+    #[test]
+    fn test_github_copilot_device_oauth_accepted_without_base_url() {
+        let config = copilot_config(Some("device-oauth"));
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "device-oauth github-copilot provider should be accepted: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_github_copilot_default_auth_method_is_device_oauth() {
+        let config = copilot_config(None);
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "github-copilot provider without auth_method should default to device-oauth and be accepted: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_github_copilot_api_key_accepted_with_resolvable_key() {
+        let mut config = copilot_config(Some("api-key"));
+        // Existing mechanism (Req 8.1): api_key_env naming a set env var.
+        env::set_var("TEST_COPILOT_PAT", "ghp_testtoken123");
+        config.providers[0].api_key_env = Some("TEST_COPILOT_PAT".to_string());
+        let result = config.validate();
+        env::remove_var("TEST_COPILOT_PAT");
+        assert!(
+            result.is_ok(),
+            "api-key github-copilot provider with resolvable PAT should be accepted: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_github_copilot_api_key_accepted_with_encrypted_key() {
+        let mut config = copilot_config(Some("api-key"));
+        config.providers[0].api_key_encrypted = Some("enc-v1:not-a-real-cipher".to_string());
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "api-key github-copilot provider with encrypted key stored should be accepted: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_github_copilot_api_key_rejected_without_key() {
+        let config = copilot_config(Some("api-key"));
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, value, .. }
+                    if field == "providers.test-provider.auth_method" && value == "api-key"
+            )),
+            "api-key without resolvable key should be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_github_copilot_api_key_rejected_when_env_var_unset() {
+        // Existing api_key mechanism (Req 8.1): a syntactically valid
+        // env-var NAME counts as configured (the variable may be set at
+        // runtime; an unset var is warn-only for every provider type,
+        // never a hard error). Only a truly missing credential source is
+        // rejected — see test_github_copilot_api_key_rejected_without_key.
+        let mut config = copilot_config(Some("api-key"));
+        config.providers[0].api_key_env =
+            Some("DEFINITELY_UNSET_COPILOT_PAT_ENV".to_string());
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "api-key with env var name configured should follow the existing warn-not-block env resolution: {:?}",
+            result
+        );
+
+        // A value that is neither an env var name (uppercase convention)
+        // nor a recognizable plaintext PAT nor an encrypted secret is NOT
+        // a resolvable credential through the existing mechanism.
+        config.providers[0].api_key_env = Some("not-a-key".to_string());
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, value, .. }
+                    if field == "providers.test-provider.auth_method" && value == "api-key"
+            )),
+            "api-key with an unresolvable api_key_env value should be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_github_copilot_unknown_auth_method_rejected() {
+        for bad in ["oauth", "pat", "device", ""] {
+            let config = copilot_config(Some(bad));
+            let errors = config.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::InvalidValue { field, value, .. }
+                        if field == "providers.test-provider.auth_method" && value == bad
+                )),
+                "unknown auth_method {bad:?} should be rejected: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_github_copilot_load_and_hot_reload_validation_matrix() {
+        // Req 1.2: the same validation path backs config load and hot
+        // reload (load_and_validate_config / Config::validate), so the
+        // accept/reject matrix must hold through file round-trips too.
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("config.yaml");
+
+        let base_yaml = r#"server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers:
+  - name: "copilot"
+    type: "github-copilot"
+    {auth_line}
+model_groups:
+  - name: "default"
+    version_fallback_enabled: false
+    models:
+      - provider: "copilot"
+        model: "gpt-4o"
+        priority: 100
+"#;
+
+        // device-oauth (explicit) loads.
+        std::fs::write(
+            &path,
+            base_yaml.replace("{auth_line}", "auth_method: device-oauth"),
+        )
+        .unwrap();
+        let config = load_and_validate_config(&path).unwrap();
+        assert_eq!(
+            config.providers[0].auth_method.as_deref(),
+            Some("device-oauth")
+        );
+
+        // api-key without a key fails both load and re-validate (hot-reload
+        // path re-runs Config::validate).
+        std::fs::write(
+            &path,
+            base_yaml.replace("{auth_line}", "auth_method: api-key"),
+        )
+        .unwrap();
+        assert!(load_and_validate_config(&path).is_err());
+        let reloaded: Config = serde_yaml::from_str(
+            &std::fs::read_to_string(&path).unwrap(),
+        )
+        .unwrap();
+        assert!(reloaded.validate().is_err());
+
+        // unknown auth_method fails load.
+        std::fs::write(
+            &path,
+            base_yaml.replace("{auth_line}", "auth_method: oauth"),
+        )
+        .unwrap();
+        assert!(load_and_validate_config(&path).is_err());
+
+        // api-key with a plaintext literal PAT (existing api_key mechanism,
+        // Req 8.1) loads and resolves at runtime only.
+        std::fs::write(
+            &path,
+            base_yaml.replace(
+                "{auth_line}",
+                "auth_method: api-key\n    api_key_env: \"ghp_testtoken123456789012345\"",
+            ),
+        )
+        .unwrap();
+        let config = load_and_validate_config(&path).unwrap();
+        assert_eq!(
+            config.providers[0].resolved_api_key.as_deref(),
+            Some("ghp_testtoken123456789012345")
+        );
+    }
+
+    #[test]
+    fn test_github_copilot_explicit_base_url_still_accepted() {
+        let mut config = copilot_config(Some("device-oauth"));
+        config.providers[0].base_url =
+            Some("https://api.githubcopilot.com".to_string());
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "explicit base_url on github-copilot should be accepted: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_github_copilot_default_base_url_applied() {
+        let config = copilot_config(None);
+        assert_eq!(
+            config.providers[0].effective_base_url(),
+            Some(GITHUB_COPILOT_DEFAULT_BASE_URL),
+            "github-copilot without base_url must resolve the default API base"
+        );
+        assert_eq!(
+            GITHUB_COPILOT_DEFAULT_BASE_URL, "https://api.githubcopilot.com",
+            "default Copilot API base constant must match the spec"
+        );
+    }
+
+    #[test]
+    fn test_unknown_copilot_models_warning_hook() {
+        // Req 5.3 hook: warn (not block) on models absent from the fetched
+        // catalog. Full wiring arrives with the catalog task.
+        let provider_models = vec![
+            "gpt-5-codex".to_string(),
+            "claude-sonnet-4.5".to_string(),
+            "not-in-catalog".to_string(),
+        ];
+        let catalog = ["gpt-5-codex", "claude-sonnet-4.5", "gpt-4.1"];
+        let unknown = unknown_copilot_models(&provider_models, &catalog);
+        assert_eq!(unknown, vec!["not-in-catalog".to_string()]);
+
+        // All-known list warns about nothing.
+        let all_known = vec!["gpt-4.1".to_string()];
+        assert!(unknown_copilot_models(&all_known, &catalog).is_empty());
+
+        // Empty provider list is trivially clean.
+        assert!(unknown_copilot_models(&[], &catalog).is_empty());
     }
 
     // Feature: bedrock-ui-integration, Bedrock validation rules

@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 pub mod bedrock;
 #[allow(dead_code)]
+pub mod github_copilot;
+#[allow(dead_code)]
 pub mod groq;
 #[allow(dead_code)]
 pub mod lmstudio;

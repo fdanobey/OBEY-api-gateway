@@ -1,5 +1,6 @@
 #![allow(dead_code)]
-//! OAuth error type covering every failure mode of the OpenAI OAuth + PKCE flow.
+//! OAuth error type covering every failure mode of the OpenAI OAuth + PKCE
+//! flow and the GitHub Copilot device flow.
 //!
 //! # Security invariant
 //!
@@ -16,6 +17,26 @@ use crate::secrets::SecretError;
 
 /// Placeholder string used anywhere a secret value would otherwise be rendered.
 pub const REDACTED: &str = "<redacted>";
+
+/// Maximum number of bytes of an upstream error response body retained in
+/// `OAuthError` variants (256 bytes, UTF-8-boundary-safe).
+pub const ERROR_BODY_MAX_BYTES: usize = 256;
+
+/// Truncate a response body to at most [`ERROR_BODY_MAX_BYTES`] bytes on a
+/// UTF-8 character boundary. Shared by the device flow and the Copilot
+/// token exchange (mirrors the policy of `oauth/token.rs`).
+pub(crate) fn truncate_error_body(body: String) -> String {
+    if body.len() <= ERROR_BODY_MAX_BYTES {
+        return body;
+    }
+    let mut end = ERROR_BODY_MAX_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = body;
+    truncated.truncate(end);
+    truncated
+}
 
 /// All failure modes of the OAuth login, token exchange, refresh, storage, and
 /// callback subsystems.
@@ -133,4 +154,72 @@ pub enum OAuthError {
     /// claim is absent, non-string, or empty.
     #[error("JWT payload does not contain chatgpt_account_id claim")]
     JwtMissingAccountId,
+
+    /// The user denied the authorization request during the GitHub device
+    /// flow (terminal `access_denied` per RFC 8628 §3.5).
+    ///
+    /// Actionable guidance: re-run the login and approve the request at the
+    /// verification URL; no further polling will happen for this grant.
+    #[error("GitHub login was denied; re-run the login and approve the request at the verification URL")]
+    DeviceFlowDenied,
+
+    /// The device code expired before the user completed authorization
+    /// (terminal `expired_token` per RFC 8628 §3.5, or local expiry guard).
+    ///
+    /// Actionable guidance: start a new login; the previous device code is
+    /// no longer accepted by GitHub regardless of remaining poll budget.
+    #[error("device code expired after {expires_in_secs} seconds; start a new login")]
+    DeviceFlowExpired { expires_in_secs: u64 },
+
+    /// The login was cancelled (watch channel signalled) before reaching a
+    /// terminal state. Not an error condition on its own — surfaced so
+    /// callers can distinguish deliberate cancellation from failures.
+    #[error("device flow cancelled by user")]
+    DeviceFlowCancelled,
+
+    /// Transport-level failure (DNS, TLS, connection reset, etc.) during a
+    /// GitHub device-flow request. Polling treats these as transient.
+    #[error("GitHub device flow network error")]
+    DeviceFlowNetwork(#[source] reqwest::Error),
+
+    /// A GitHub device-flow endpoint returned a non-success HTTP status, or
+    /// a success response whose payload was not the expected JSON shape
+    /// (including unrecognized terminal error codes).
+    ///
+    /// `body` is a best-effort truncated snippet of the response body (or a
+    /// parse-failure description), mirroring the token-exchange truncation
+    /// rules; it must never contain token material.
+    #[error("GitHub device flow HTTP {status}: {body}")]
+    DeviceFlowHttp { status: u16, body: String },
+
+    /// The Copilot token exchange returned 401/403: the GitHub credential
+    /// is not entitled to Copilot (Req 3.3 terminal, Req 8.2 actionable).
+    ///
+    /// Carries only the HTTP status — the response body is deliberately
+    /// dropped so no upstream content can leak token material (Req 10.2).
+    /// Actionable guidance: the account needs an active Copilot
+    /// subscription (Free, Pro, Pro+, Business, or Enterprise) with a
+    /// Copilot Chat seat; PAT users must grant the `copilot` scope.
+    #[error(
+        "Copilot access missing — the account needs an active Copilot \
+         subscription with a Copilot Chat seat (HTTP {status}); re-login \
+         after enabling Copilot, or for a PAT add the copilot scope"
+    )]
+    CopilotEntitlementMissing { status: u16 },
+
+    /// Transport-level failure (DNS, TLS, connection reset, etc.) during
+    /// the Copilot token exchange. Treated as transient by the caller's
+    /// single-retry policy and the background manager's backoff.
+    #[error("Copilot token exchange network error")]
+    CopilotTokenNetwork(#[source] reqwest::Error),
+
+    /// The Copilot token exchange returned a non-success HTTP status
+    /// (other than 401/403), or a success payload that was not the
+    /// expected JSON shape.
+    ///
+    /// `body` is a best-effort truncated snippet of the response body (or a
+    /// parse-failure description), mirroring the token-exchange truncation
+    /// rules; it must never contain token material.
+    #[error("Copilot token exchange failed with HTTP {status}: {body}")]
+    CopilotTokenHttp { status: u16, body: String },
 }

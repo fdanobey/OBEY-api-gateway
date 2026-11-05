@@ -224,6 +224,64 @@ providers:
 
 The admin UI shows whether a provider key is missing, environment-backed, encrypted, or plaintext pending encryption. Custom headers also support `${ENV_VAR}` substitution.
 
+## GitHub Copilot Provider
+
+A `github-copilot` provider routes requests through an existing GitHub Copilot subscription (Free, Pro, Pro+, Business, or Enterprise with a Copilot Chat seat). Models are subscription-included, so usage is recorded at zero cost, and the provider participates in model groups, failover, budgets, and the attempt ledger like any other provider.
+
+These endpoints are unofficial. They are not part of GitHub's documented public API, they may change or break without notice, and they are used by major third-party clients: opencode (with GitHub's announced partnership support), LiteLLM, and copilot-api. If GitHub changes the surface, requests fail over to your other providers rather than erroring out.
+
+### Setup via the admin UI
+
+1. Add a provider with type `github-copilot` (auth method `device-oauth`, the default) and save.
+2. On the provider card, click Sign in with GitHub. The gateway displays a verification URL and a device code, and copies the code to the clipboard.
+3. Open `https://github.com/login/device`, paste the code, and authorize.
+4. The card switches to authenticated, with token expiry and a usage snapshot. Logout deletes the persisted tokens.
+
+### Setup via YAML
+
+Device flow (complete the sign-in from the admin panel afterwards):
+
+```yaml
+providers:
+- name: "github-copilot"
+type: "github-copilot"
+auth_method: "device-oauth" # default
+timeout_seconds: 60
+```
+
+PAT variant for headless deployments, resolved through the standard `api_key_env` field:
+
+```yaml
+providers:
+- name: "github-copilot-pat"
+type: "github-copilot"
+auth_method: "api-key"
+api_key_env: "GITHUB_COPILOT_PAT" # a PAT from an account with a Copilot Chat seat
+timeout_seconds: 60
+```
+
+`base_url` is optional and defaults to `https://api.githubcopilot.com`. `auth_method` selects the credential source and is authoritative: if that method's credential is missing or invalid, the gateway fails with an actionable error instead of silently falling back to the other method.
+
+### Admin endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/admin/oauth/github-copilot/login` | Start device-flow login; returns the verification URL and user code |
+| `POST` | `/admin/oauth/github-copilot/cancel` | Cancel a pending device-flow login |
+| `POST` | `/admin/oauth/github-copilot/logout` | Delete persisted tokens, stop refresh, clear cached usage |
+| `GET` | `/admin/oauth/github-copilot/status` | Session state (pending / authenticated / expired / error) and token expiry |
+| `GET` | `/admin/oauth/github-copilot/usage` | Usage snapshot parsed from rate-limit response headers |
+
+### Usage display
+
+Copilot responses carry `x-ratelimit-*` headers, which the gateway parses into two count-based windows (short and weekly). When `x-copilot-premium-requests-*` headers are present, the usage card also shows the premium-request percentage and its reset time. Until a Copilot response has been observed, the card reads "no usage data yet" rather than showing zeros.
+
+### Troubleshooting
+
+- Entitlement missing / Copilot Chat seat required: the token exchange failed because the account has no Copilot Chat access. Sign in with an account holding an active Copilot subscription with Chat, or use a PAT from such an account.
+- Token expired: the session shows expired when the Copilot token can no longer be refreshed. The GitHub token is kept, so signing in again from the provider card restores the session.
+- Model not supported / absent from catalog: the live catalog only lists models enabled for your account. Model IDs are configured per group, not per provider — when a model-group entry pointing at this provider names a model the catalog does not contain, saving produces a warning; pick model IDs that appear in `/v1/models` while the Copilot session is authenticated.
+
 ## API Endpoints
 
 | Method | Path | Description |
