@@ -10,6 +10,8 @@ use crate::structured_output::config::StructuredOutputConfigError;
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../config.example.yaml");
 
+const DEFAULT_TEMPLATE_HOST_LINE: &str = "  host: \"0.0.0.0\"";
+
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
 pub enum ValidationError {
@@ -1278,6 +1280,52 @@ pub fn load_and_validate_config(path: &Path) -> Result<Config, String> {
     Ok(config)
 }
 
+pub(crate) fn default_bind_host() -> &'static str {
+    #[cfg(feature = "tray")]
+    {
+        "127.0.0.1"
+    }
+    #[cfg(not(feature = "tray"))]
+    {
+        "0.0.0.0"
+    }
+}
+
+fn rendered_config_template() -> String {
+    let host = default_bind_host();
+    if host == "0.0.0.0" {
+        return DEFAULT_CONFIG_TEMPLATE.to_string();
+    }
+
+    let replacement = format!(
+        "  host: \"{}\" # tray default: local-only bind so admin is credential-free; set 0.0.0.0 plus admin auth deliberately for LAN exposure",
+        host
+    );
+    // Byte-exact replacement: preserve every other byte of the template,
+    // including CRLF terminators and any missing final newline.
+    let mut rendered = String::with_capacity(DEFAULT_CONFIG_TEMPLATE.len() + replacement.len());
+    let mut replaced = false;
+    for segment in DEFAULT_CONFIG_TEMPLATE.split_inclusive('\n') {
+        let body = segment.trim_end_matches(['\r', '\n']);
+        if body == DEFAULT_TEMPLATE_HOST_LINE {
+            rendered.push_str(&replacement);
+            rendered.push_str(&segment[body.len()..]);
+            replaced = true;
+        } else {
+            rendered.push_str(segment);
+        }
+    }
+    if replaced {
+        rendered
+    } else {
+        tracing::warn!(
+            "Default config template no longer contains the expected host line {:?} — writing unmodified template",
+            DEFAULT_TEMPLATE_HOST_LINE
+        );
+        DEFAULT_CONFIG_TEMPLATE.to_string()
+    }
+}
+
 pub fn bootstrap_config_if_missing(path: &Path) -> Result<bool, String> {
     if path.exists() {
         return Ok(false);
@@ -1290,7 +1338,7 @@ pub fn bootstrap_config_if_missing(path: &Path) -> Result<bool, String> {
         }
     }
 
-    std::fs::write(path, DEFAULT_CONFIG_TEMPLATE)
+    std::fs::write(path, rendered_config_template())
         .map_err(|e| format!("Failed to create default configuration file: {}", e))?;
 
     Ok(true)
@@ -4166,5 +4214,111 @@ model_groups:
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_default_config_template_contains_expected_host_line() {
+        // Template-stability guard: the bootstrap host replace targets the
+        // exact `  host: "0.0.0.0"` line; if the template drifts, the tray
+        // replace would silently miss.
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE
+                .lines()
+                .any(|line| line == DEFAULT_TEMPLATE_HOST_LINE),
+            "DEFAULT_CONFIG_TEMPLATE must contain the exact line {:?} for the tray host replace",
+            DEFAULT_TEMPLATE_HOST_LINE
+        );
+    }
+
+    #[cfg(not(feature = "tray"))]
+    #[test]
+    fn test_bootstrap_headless_writes_template_byte_identical() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("config.yaml");
+
+        let created = bootstrap_config_if_missing(&path).unwrap();
+        assert!(created);
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, DEFAULT_CONFIG_TEMPLATE);
+        assert!(written.lines().any(|line| line == DEFAULT_TEMPLATE_HOST_LINE));
+    }
+
+    #[cfg(feature = "tray")]
+    #[test]
+    fn test_bootstrap_tray_writes_loopback_host_with_comment() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("config.yaml");
+
+        let created = bootstrap_config_if_missing(&path).unwrap();
+        assert!(created);
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(default_bind_host(), "127.0.0.1");
+        assert!(written.contains(
+            "  host: \"127.0.0.1\" # tray default: local-only bind so admin is credential-free; set 0.0.0.0 plus admin auth deliberately for LAN exposure"
+        ));
+        assert!(!written.contains("  host: \"0.0.0.0\""));
+        assert_ne!(written, DEFAULT_CONFIG_TEMPLATE);
+
+        // Strict one-line diff: exactly one element (the host line + its
+        // original terminator) differs; every other byte is preserved.
+        let expected_tray_line = "  host: \"127.0.0.1\" # tray default: local-only bind so admin is credential-free; set 0.0.0.0 plus admin auth deliberately for LAN exposure";
+        let written_segments: Vec<&str> = written.split_inclusive('\n').collect();
+        let template_segments: Vec<&str> = DEFAULT_CONFIG_TEMPLATE.split_inclusive('\n').collect();
+        assert_eq!(
+            written_segments.len(),
+            template_segments.len(),
+            "tray bootstrap must not change the template's line count"
+        );
+        let diffs: Vec<usize> = (0..written_segments.len())
+            .filter(|&i| written_segments[i] != template_segments[i])
+            .collect();
+        assert_eq!(
+            diffs.len(),
+            1,
+            "exactly one line must differ; differing indices: {:?}",
+            diffs
+        );
+        let diff = diffs[0];
+        assert_eq!(
+            written_segments[diff].trim_end_matches(['\r', '\n']),
+            expected_tray_line
+        );
+        assert_eq!(
+            template_segments[diff].trim_end_matches(['\r', '\n']),
+            DEFAULT_TEMPLATE_HOST_LINE
+        );
+        // The replacement keeps the original line's trailing terminator bytes.
+        assert_eq!(
+            &written_segments[diff][expected_tray_line.len()..],
+            &template_segments[diff][DEFAULT_TEMPLATE_HOST_LINE.len()..]
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_is_noop_when_config_exists() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("config.yaml");
+
+        let original = "server:\n  host: \"192.168.1.10\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        let created = bootstrap_config_if_missing(&path).unwrap();
+        assert!(!created);
+
+        let unchanged = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(unchanged, original);
+    }
+
+    #[test]
+    fn test_bootstrapped_config_loads_with_default_bind_host() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("config.yaml");
+
+        assert!(bootstrap_config_if_missing(&path).unwrap());
+
+        let config = load_and_validate_config(&path).unwrap();
+        assert_eq!(config.server.host, default_bind_host());
     }
 }

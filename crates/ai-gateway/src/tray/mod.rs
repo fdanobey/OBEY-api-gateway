@@ -92,6 +92,15 @@ pub fn client_host_for_bind_host(host: &str) -> &str {
     }
 }
 
+/// Decide whether the tray should post the admin lockout notification for
+/// this config (spec: tray-frictionless-auth, Component 2). True only when
+/// the resolved admin security mode fails closed to `Authenticated`; every
+/// open mode (`LoopbackOpen`, `OpenWarnedLegacy`, `OpenOptIn`) stays silent.
+pub fn should_notify_admin_locked_out(config: &Config) -> bool {
+    crate::admin::auth_policy::resolve_admin_security_mode(config)
+        == crate::config::AdminSecurityMode::Authenticated
+}
+
 fn select_available_port(host: &str, preferred_port: u16) -> Result<u16, TrayError> {
     if port_is_available(host, preferred_port) {
         return Ok(preferred_port);
@@ -324,11 +333,12 @@ mod tests {
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
  codex_search: None,
- cache_aware_routing: Default::default(),
- reasoning_compat: Default::default(),
- security: Default::default(),
- }
-}
+            cache_aware_routing: Default::default(),
+            reasoning_compat: Default::default(),
+            webhooks: Default::default(),
+            security: Default::default(),
+        }
+    }
 
     #[test]
     fn test_server_status_uses_loopback_host_for_wildcard_bind_address() {
@@ -355,5 +365,55 @@ mod tests {
         assert_ne!(updated.server.port, occupied_port);
         assert_eq!(reloaded.server.port, updated.server.port);
         assert!(port_is_available("127.0.0.1", updated.server.port));
+    }
+
+    fn auth_policy_test_config(yaml: &str) -> Config {
+        serde_yaml::from_str(yaml).expect("test config must parse")
+    }
+
+    #[test]
+    fn should_notify_admin_locked_out_is_true_for_authenticated_config() {
+        let mut config = auth_policy_test_config(
+            "server:\n  host: 0.0.0.0\n  port: 0\nproviders: []\nmodel_groups: []\n",
+        );
+        config.admin.auth.enabled = true;
+        assert!(should_notify_admin_locked_out(&config));
+    }
+
+    #[test]
+    fn should_notify_admin_locked_out_is_true_for_non_loopback_explicit_auth_section() {
+        let mut config = auth_policy_test_config(
+            "server:\n  host: 0.0.0.0\n  port: 0\nproviders: []\nmodel_groups: []\n",
+        );
+        config.admin.auth_section_present = true;
+        assert!(should_notify_admin_locked_out(&config));
+    }
+
+    #[test]
+    fn should_notify_admin_locked_out_is_false_for_loopback_open_config() {
+        let mut config = auth_policy_test_config(
+            "server:\n  host: 127.0.0.1\n  port: 0\nproviders: []\nmodel_groups: []\n",
+        );
+        config.admin.auth_section_present = true;
+        assert!(!should_notify_admin_locked_out(&config));
+    }
+
+    #[test]
+    fn should_notify_admin_locked_out_is_false_for_open_warned_legacy_config() {
+        let mut config = auth_policy_test_config(
+            "server:\n  host: 192.168.1.110\n  port: 0\nproviders: []\nmodel_groups: []\n",
+        );
+        config.admin.auth_section_present = false;
+        assert!(!should_notify_admin_locked_out(&config));
+    }
+
+    #[test]
+    fn should_notify_admin_locked_out_is_false_for_open_opt_in_config() {
+        let mut config = auth_policy_test_config(
+            "server:\n  host: 192.168.1.110\n  port: 0\nproviders: []\nmodel_groups: []\n",
+        );
+        config.admin.auth.allow_unauthenticated_non_loopback = true;
+        config.admin.auth_section_present = false;
+        assert!(!should_notify_admin_locked_out(&config));
     }
 }

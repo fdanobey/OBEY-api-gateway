@@ -1608,6 +1608,10 @@ When built with `--features tray` on Windows, the binary runs as a desktop appli
 - Single-instance guard prevents duplicate processes
 - Optional Windows login startup entry
 
+On first run, a fresh tray build writes a default `config.yaml` with `server.host: "127.0.0.1"` — a local-only bind. With a loopback bind and admin auth not explicitly enabled, the admin panel and dashboard resolve to loopback-open mode: they are reachable only from the local machine and require no login. Existing config files are never modified by bootstrap; headless (non-tray) builds still default to `0.0.0.0`.
+
+To expose the gateway on the LAN, deliberately set `server.host: "0.0.0.0"` and either enable admin auth (`ADMIN_USERNAME`/`ADMIN_PASSWORD` env vars) or set the `allow_unauthenticated_non_loopback` acknowledgment in the admin auth section. Non-loopback binds without credentials fail closed to login-required — except legacy configs with no admin auth section at all, which stay open with startup warnings (the `allow_unauthenticated_non_loopback` acknowledgment keeps such binds open deliberately). If the tray detects an existing `0.0.0.0` config that locks the admin panel out, it shows a one-time-per-start toast explaining how to fix it.
+
 ## Project Structure
 
 ```

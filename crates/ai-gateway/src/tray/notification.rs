@@ -44,6 +44,20 @@ impl NotificationManager {
         tracing::info!("Tray notification: application is already running");
         Ok(())
     }
+
+    pub fn notify_admin_locked_out() -> Result<(), TrayError> {
+        #[cfg(target_os = "windows")]
+        show_windows_toast(
+            "OBEY API Gateway",
+            "Admin panel requires login",
+            "Set ADMIN_USERNAME/ADMIN_PASSWORD env vars, or set server.host to 127.0.0.1 in config.yaml",
+        )?;
+
+        tracing::warn!(
+            "Tray notification: admin panel requires login (set ADMIN_USERNAME/ADMIN_PASSWORD env vars, or set server.host to 127.0.0.1 in config.yaml)"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "windows")]

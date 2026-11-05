@@ -570,6 +570,15 @@ async fn run_tray_mode(config: config::Config, config_path: PathBuf) -> anyhow::
     let config = tray::prepare_startup_config(config, &config_path)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
+    // Spec tray-frictionless-auth, Component 2: warn 401-locked-out tray
+    // users exactly once per process start. Any notification failure is
+    // logged and ignored — startup continues normally.
+    if tray::should_notify_admin_locked_out(&config) {
+        if let Err(error) = tray::NotificationManager::notify_admin_locked_out() {
+            tracing::warn!(%error, "Failed to post admin lockout notification");
+        }
+    }
+
     tracing::info!(
         "Server will listen on {}:{}",
         config.server.host,
