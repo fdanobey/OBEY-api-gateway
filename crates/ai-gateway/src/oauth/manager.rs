@@ -34,27 +34,19 @@ use tokio::task::JoinHandle;
 
 use super::error::OAuthError;
 use super::flow::{OAuthFlow, OAuthSessionState};
+use super::lifecycle::{
+    BACKOFF_MAX_ATTEMPTS, REFRESH_TICK_INTERVAL, REFRESH_WINDOW_SECS,
+};
 use super::store::{OAuthTokenStore, StoredTokens};
 use super::token::{refresh_access_token, TokenResponse};
 
-/// Background-refresh tick cadence (Req 5.2: "check at a regular interval").
-const REFRESH_TICK_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Pre-expiry refresh window (Req 5.2: "within 5 minutes of expiry").
-const REFRESH_WINDOW_SECS: u64 = 300;
-
-/// Number of refresh attempts before marking the session as expired
-/// (Req 5.5: "up to 3 attempts").
-const BACKOFF_MAX_ATTEMPTS: u32 = 3;
-
-/// Exponential-backoff delay before refresh attempt `attempt`
-/// (Req 5.5 / Property 8: `2^(attempt + 1)` seconds).
-///
-/// `attempt = 0 → 2 s`, `1 → 4 s`, `2 → 8 s`. Exposed `pub(crate)` so the
-/// property test in task 5.9 can pin the formula without re-deriving it.
-pub(crate) fn backoff_delay_secs(attempt: u32) -> u64 {
-    2u64.pow(attempt + 1)
-}
+// Refresh cadence policy (tick interval, pre-expiry window, backoff
+// schedule, attempt budget) now lives in [`super::lifecycle`] so the
+// OpenAI manager and the GitHub Copilot manager share one source of
+// truth. The re-export below keeps `backoff_delay_secs` reachable at the
+// old `oauth::backoff_delay_secs` path for the Property 8 test in this
+// module.
+pub(crate) use super::lifecycle::backoff_delay_secs;
 
 /// Top-level OAuth session manager.
 ///

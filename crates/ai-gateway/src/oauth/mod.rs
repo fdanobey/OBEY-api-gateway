@@ -14,6 +14,8 @@
 pub mod callback;
 pub mod error;
 pub mod flow;
+pub mod github_copilot;
+pub mod lifecycle;
 pub mod manager;
 pub mod pkce;
 pub mod store;
@@ -29,9 +31,11 @@ pub use flow::{FlowState, InitiationOutcome, OAuthFlow, OAuthSessionState};
 #[allow(unused_imports)]
 pub(crate) use flow::{build_authorization_url, AUTHORIZATION_ENDPOINT};
 pub use manager::OAuthManager;
-// Re-exported for the Property 8 test in task 5.9.
+// Shared refresh-lifecycle policy (tick / window / backoff), consumed by
+// both OAuthManager and the GitHub Copilot CopilotTokenManager; also
+// re-exported for the Property 8 backoff-schedule test in manager.rs.
 #[allow(unused_imports)]
-pub(crate) use manager::backoff_delay_secs;
+pub(crate) use lifecycle::backoff_delay_secs;
 #[allow(unused_imports)]
 pub use pkce::{generate_pkce, generate_state, PkceChallenge};
 pub use store::OAuthTokenStore;

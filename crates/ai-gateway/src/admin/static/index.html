@@ -146,6 +146,21 @@ padding:.4rem 1rem;font-size:.75rem;color:var(--text-muted);display:flex;justify
 .oauth-state-badge.state-expired{background:rgba(220,53,69,.08);color:var(--danger);border:1px solid rgba(220,53,69,.25)}
 .oauth-state-badge.state-unauthenticated{background:rgba(108,117,125,.08);color:var(--text-muted);border:1px solid rgba(108,117,125,.18)}
 .oauth-state-badge.state-refreshing{background:rgba(13,110,253,.08);color:var(--primary);border:1px solid rgba(13,110,253,.2)}
+.oauth-state-badge.state-pending{background:rgba(13,110,253,.08);color:var(--primary);border:1px solid rgba(13,110,253,.2)}
+.oauth-state-badge.state-error{background:rgba(220,53,69,.08);color:var(--danger);border:1px solid rgba(220,53,69,.25)}
+/* GitHub Copilot provider card + device-code modal (spec github-copilot-oauth-provider, task 11) */
+.copilot-tos-note{font-size:.75rem;color:#856404;background:#fff3cd;border:1px solid #ffeeba;border-radius:var(--radius);padding:.4rem .55rem;margin:.5rem 0 .75rem}
+.copilot-sku{font-size:.75rem;color:var(--text-muted);margin-left:.5rem}
+.copilot-token-expiry{font-size:.75rem;color:var(--text-muted);margin-left:.5rem}
+.copilot-error-msg{display:none;font-size:.75rem;padding:.4rem .6rem;border-radius:var(--radius);border:1px solid rgba(220,53,69,.2);background:rgba(220,53,69,.05);color:var(--danger);margin:.5rem 0}
+.copilot-catalog{display:none;font-size:.75rem;padding:.4rem .6rem;border-radius:var(--radius);border:1px solid #ffeeba;background:#fff3cd;color:#856404;margin:.5rem 0}
+.copilot-usage-bar{height:6px;background:var(--surface);border:1px solid var(--border);border-radius:999px;overflow:hidden;margin-top:.25rem}
+.copilot-usage-bar-fill{height:100%;width:0;background:var(--primary)}
+.copilot-device-intro{font-size:.9rem;margin-bottom:1rem}
+.copilot-device-code-wrap{display:flex;align-items:center;gap:.5rem;margin:.75rem 0}
+.copilot-device-code{font-family:monospace;font-size:1.4rem;font-weight:700;letter-spacing:.15em;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:.5rem .8rem}
+.copilot-device-countdown{font-size:.85rem;color:var(--text-muted);margin-bottom:.6rem}
+.copilot-device-status{margin-bottom:.75rem}
 .oauth-fields-actions{display:flex;gap:.5rem;align-items:center}
 .oauth-fields-msg{margin-top:.6rem;font-size:.75rem;padding:.4rem .6rem;border-radius:var(--radius);border:1px solid var(--border)}
 .oauth-fields-msg.msg-info{background:rgba(13,110,253,.05);border-color:rgba(13,110,253,.2);color:var(--primary)}
@@ -528,6 +543,7 @@ body.sec-banner-active{padding-top:3.2rem}
               <option value="vllm">vLLM</option>
               <option value="lmstudio">LM Studio</option>
               <option value="nvidia_nim">NVIDIA NIM</option>
+<option value="github-copilot">GitHub Copilot (Device Login)</option>
             </select>
           </div>
         </div>
@@ -746,6 +762,76 @@ body.sec-banner-active{padding-top:3.2rem}
           </div>
           <div class="oauth-fields-msg prov-oauth-msg" style="display:none"></div>
         </div>
+        <div class="copilot-fields">
+          <div class="oauth-fields-title">GitHub Copilot Login</div>
+          <div class="oauth-fields-desc">Sign in with your GitHub Copilot subscription (Free, Pro, Pro+, Business, or Enterprise with Copilot Chat access).</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Auth Method</label>
+              <select class="prov-copilot-auth-method" aria-label="Authentication method">
+              <option value="device-oauth">Device OAuth (sign in via GitHub)</option>
+              <option value="api-key">API Key (GitHub PAT)</option>
+              </select>
+              <div class="hint">device-oauth: sign in from this panel. api-key: resolve a GitHub PAT through the standard key field below.</div>
+            </div>
+          </div>
+          <div class="copilot-tos-note">Unofficial API: the endpoint set this provider uses is not part of GitHub's public, documented API surface, may change or break without notice, and is used by major third-party clients (opencode, with GitHub's announced partnership support; LiteLLM; copilot-api).</div>
+          <div class="copilot-auth-status">
+            <div class="oauth-fields-status">
+              <span class="oauth-state-label">Status:</span>
+              <span class="oauth-state-badge state-unauthenticated prov-copilot-badge">Checking…</span>
+              <span class="copilot-sku"></span>
+              <span class="copilot-token-expiry"></span>
+            </div>
+            <div class="copilot-error-msg"></div>
+            <div class="copilot-catalog"></div>
+            <div class="copilot-usage" style="display:none;margin:.75rem 0;padding:.6rem .75rem;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);font-size:.8rem">
+              <div style="font-weight:600;margin-bottom:.4rem;font-size:.8rem">Usage Limits</div>
+              <div class="oauth-usage-window copilot-usage-short" style="margin-bottom:.5rem">
+                <div class="oauth-usage-window-label" style="font-weight:600;font-size:.75rem;color:var(--text-muted);margin-bottom:.2rem">Short Window</div>
+                <div class="copilot-usage-short-requests" style="margin-bottom:.2rem">
+                  <span class="oauth-usage-req-label">Requests:</span>
+                  <span class="oauth-usage-req-value" style="font-weight:500">—</span>
+                  <span class="oauth-usage-req-reset" style="color:var(--text-muted);margin-left:.4rem"></span>
+                </div>
+                <div class="copilot-usage-short-tokens">
+                  <span class="oauth-usage-tok-label">Tokens:</span>
+                  <span class="oauth-usage-tok-value" style="font-weight:500">—</span>
+                  <span class="oauth-usage-tok-reset" style="color:var(--text-muted);margin-left:.4rem"></span>
+                </div>
+                <div class="copilot-usage-bar"><div class="copilot-usage-bar-fill copilot-usage-short-bar"></div></div>
+              </div>
+              <div class="oauth-usage-window copilot-usage-weekly">
+                <div class="oauth-usage-window-label" style="font-weight:600;font-size:.75rem;color:var(--text-muted);margin-bottom:.2rem">Weekly Window</div>
+                <div class="copilot-usage-weekly-requests" style="margin-bottom:.2rem">
+                  <span class="oauth-usage-req-label">Requests:</span>
+                  <span class="oauth-usage-req-value" style="font-weight:500">—</span>
+                  <span class="oauth-usage-req-reset" style="color:var(--text-muted);margin-left:.4rem"></span>
+                </div>
+                <div class="copilot-usage-weekly-tokens">
+                  <span class="oauth-usage-tok-label">Tokens:</span>
+                  <span class="oauth-usage-tok-value" style="font-weight:500">—</span>
+                  <span class="oauth-usage-tok-reset" style="color:var(--text-muted);margin-left:.4rem"></span>
+                </div>
+                <div class="copilot-usage-bar"><div class="copilot-usage-bar-fill copilot-usage-weekly-bar"></div></div>
+              </div>
+              <div class="oauth-usage-window copilot-usage-premium" style="display:none">
+                <div class="oauth-usage-window-label" style="font-weight:600;font-size:.75rem;color:var(--text-muted);margin-bottom:.2rem">Premium Requests</div>
+                <div class="copilot-usage-premium-requests" style="margin-bottom:.2rem">
+                  <span class="oauth-usage-req-label">Used:</span>
+                  <span class="oauth-usage-req-value" style="font-weight:500">—</span>
+                  <span class="oauth-usage-req-reset" style="color:var(--text-muted);margin-left:.4rem"></span>
+                </div>
+                <div class="copilot-usage-bar"><div class="copilot-usage-bar-fill copilot-usage-premium-bar" style="background:#856404"></div></div>
+              </div>
+            </div>
+            <div class="oauth-fields-actions">
+              <button type="button" class="btn btn-primary btn-sm prov-copilot-login">Sign in with GitHub</button>
+              <button type="button" class="btn btn-danger btn-sm prov-copilot-logout" style="display:none">Logout</button>
+            </div>
+            <div class="oauth-fields-msg copilot-msg" style="display:none"></div>
+          </div>
+        </div>
         <details class="compression-override" id="prov-compression-override">
           <summary>Token Compression Override</summary>
           <div class="hint">Optional provider settings. Unset fields inherit the global compression configuration.</div>
@@ -770,6 +856,30 @@ body.sec-banner-active{padding-top:3.2rem}
         </div>
       </div>
     </template>
+    <!-- GitHub Copilot device-code login modal (spec github-copilot-oauth-provider, task 11) -->
+      <div class="vk-modal-backdrop" id="copilot-device-backdrop">
+        <div class="vk-modal" role="dialog" aria-modal="true" aria-labelledby="copilot-device-title" id="copilot-device-modal">
+          <h3 id="copilot-device-title">Sign in with GitHub</h3>
+          <p class="copilot-device-intro">Open the verification URL, enter the code below (copied to your clipboard), and authorize this device with your GitHub account.</p>
+          <div class="form-group">
+            <label for="copilot-device-uri">Verification URL</label>
+            <input type="text" id="copilot-device-uri" readonly style="font-size:.8rem;font-family:monospace">
+          </div>
+          <div class="form-group">
+            <label for="copilot-device-code-input">User Code</label>
+            <div class="copilot-device-code-wrap">
+              <input type="text" id="copilot-device-code-input" class="copilot-device-code" readonly>
+              <button type="button" class="btn btn-secondary btn-sm" id="copilot-device-copy">Copy Code</button>
+            </div>
+          </div>
+          <div class="copilot-device-countdown" id="copilot-device-countdown"></div>
+          <div class="oauth-fields-msg copilot-device-status" id="copilot-device-status" style="display:none"></div>
+          <div class="actions">
+            <button type="button" class="btn btn-secondary" id="copilot-device-cancel">Cancel Login</button>
+            <button type="button" class="btn btn-primary" id="copilot-device-close">Close</button>
+          </div>
+        </div>
+      </div>
     <div class="actions">
       <button class="btn btn-primary" data-action="save">Save</button>
       <button class="btn btn-secondary" data-action="reset">Reset</button>
@@ -2697,7 +2807,7 @@ if (pageId === 'virtual-keys') { vkOnOpen(); }
  if (pageId === 'webhooks') { whOnOpen(); }
 if (pageId === 'cost-reports') { crOnOpen(); }
  if (pageId === 'circuit-breaker') { loadCircuitBreakerStates(); }
- if (pageId === 'providers') { refreshProvBudgetsBulk(); }
+ if (pageId === 'providers') { refreshProvBudgetsBulk(); refreshCopilotStatuses(); }
 }
 
   /**
@@ -3590,14 +3700,19 @@ function addProviderCard(data) {
             });
         }
         populateCompressionOverride(card, data.compression, 'prov');
-      // Restore Bedrock-specific checkbox values (Req 8.2, 8.4)
-      if (data.type === 'bedrock') {
-        card.querySelector('.prov-global-inference').checked = !!data.global_inference_profile;
-        card.querySelector('.prov-cross-region').checked = !!data.cross_region_inference;
-        card.querySelector('.prov-prompt-caching').checked = !!data.prompt_caching;
-        card.querySelector('.prov-custom-vpc').checked = !!data.custom_vpc_endpoint;
-        card.querySelector('.prov-reasoning').checked = data.reasoning !== false;
-      }
+ // Restore Bedrock-specific checkbox values (Req 8.2, 8.4)
+ if (data.type === 'bedrock') {
+ card.querySelector('.prov-global-inference').checked = !!data.global_inference_profile;
+ card.querySelector('.prov-cross-region').checked = !!data.cross_region_inference;
+ card.querySelector('.prov-prompt-caching').checked = !!data.prompt_caching;
+ card.querySelector('.prov-custom-vpc').checked = !!data.custom_vpc_endpoint;
+ card.querySelector('.prov-reasoning').checked = data.reasoning !== false;
+ }
+ // GitHub Copilot (spec github-copilot-oauth-provider, Req 1.3): restore
+ // auth_method (device-oauth default) so the card round-trips YAML parity.
+ if (data.type === 'github-copilot') {
+ card.querySelector('.prov-copilot-auth-method').value = data.auth_method || 'device-oauth';
+ }
     }
     if (!data) populateCompressionOverride(card, null, 'prov');
     wireCompressionOverride(card, 'prov');
@@ -3621,37 +3736,63 @@ function addProviderCard(data) {
       return 'https://bedrock-mantle.' + region + '.api.aws/v1';
     }
 
-    function syncBedrockVisibility() {
-      var isBedrock = typeSelect.value === 'bedrock';
-      var isOAuth = typeSelect.value === 'openai_oauth';
-      bedrockFields.style.display = isBedrock ? 'block' : 'none';
-      oauthFields.style.display = isOAuth ? 'block' : 'none';
-      if (isBedrock) {
-        if (!regionSelect.value) {
-          regionSelect.value = 'us-east-1';
-        }
-        var region = regionSelect.value || 'us-east-1';
-        var mantleUrl = buildMantleUrl(region);
-        bedrockUrlInput.value = mantleUrl;
-        urlInput.value = mantleUrl;
-        urlInput.readOnly = true;
-        urlInput.closest('.form-group').style.display = 'none';
-        keyGroup.style.display = '';
-      } else if (isOAuth) {
-        urlInput.value = 'https://api.openai.com/v1';
-        urlInput.readOnly = true;
-        urlInput.closest('.form-group').style.display = 'none';
-        keyGroup.style.display = 'none';
-        // Fetch OAuth status for this card
-        fetchOAuthStatusForCard(card);
-      } else {
-        urlInput.readOnly = false;
-        urlInput.closest('.form-group').style.display = '';
-        keyGroup.style.display = '';
-      }
-    }
+function syncBedrockVisibility() {
+ var isBedrock = typeSelect.value === 'bedrock';
+ var isOAuth = typeSelect.value === 'openai_oauth';
+ var isCopilot = typeSelect.value === 'github-copilot';
+ bedrockFields.style.display = isBedrock ? 'block' : 'none';
+ oauthFields.style.display = isOAuth ? 'block' : 'none';
+ var copilotFields = card.querySelector('.copilot-fields');
+ if (copilotFields) copilotFields.style.display = isCopilot ? 'block' : 'none';
+ if (isBedrock) {
+ if (!regionSelect.value) {
+ regionSelect.value = 'us-east-1';
+ }
+ var region = regionSelect.value || 'us-east-1';
+ var mantleUrl = buildMantleUrl(region);
+ bedrockUrlInput.value = mantleUrl;
+ urlInput.value = mantleUrl;
+ urlInput.readOnly = true;
+ urlInput.closest('.form-group').style.display = 'none';
+ keyGroup.style.display = '';
+ } else if (isOAuth) {
+ urlInput.value = 'https://api.openai.com/v1';
+ urlInput.readOnly = true;
+ urlInput.closest('.form-group').style.display = 'none';
+ keyGroup.style.display = 'none';
+ // Fetch OAuth status for this card
+ fetchOAuthStatusForCard(card);
+ } else if (isCopilot) {
+ // GitHub Copilot (Req 1.1): no base_url required — default endpoint.
+ urlInput.value = 'https://api.githubcopilot.com';
+ urlInput.readOnly = true;
+ urlInput.closest('.form-group').style.display = 'none';
+ keyGroup.style.display = '';
+ // api-key auth (PAT) reuses the standard key field; device-oauth hides it.
+ var copilotAuth = card.querySelector('.prov-copilot-auth-method');
+ if (copilotAuth) {
+ keyGroup.style.display = (copilotAuth.value === 'api-key') ? '' : 'none';
+ }
+ // Fetch Copilot status + usage for this card (Req 6.1, 7.3)
+ fetchCopilotStatusForCard(card);
+ } else {
+ urlInput.readOnly = false;
+ urlInput.closest('.form-group').style.display = '';
+ keyGroup.style.display = '';
+ }
+}
 
     typeSelect.addEventListener('change', syncBedrockVisibility);
+
+// GitHub Copilot: switching auth method toggles the PAT key field (Req 8.1).
+var copilotAuthSelect = card.querySelector('.prov-copilot-auth-method');
+if (copilotAuthSelect) {
+ copilotAuthSelect.addEventListener('change', function() {
+ if (typeSelect.value === 'github-copilot') {
+ keyGroup.style.display = (copilotAuthSelect.value === 'api-key') ? '' : 'none';
+ }
+ });
+}
 
     regionSelect.addEventListener('change', function() {
       if (typeSelect.value === 'bedrock') {
@@ -3734,8 +3875,9 @@ function addProviderCard(data) {
           .finally(function() { testBtn.disabled = false; });
       }
     });
-renderProviderKeyStatus(card);
-wireOAuthButtons(card);
+ renderProviderKeyStatus(card);
+ wireOAuthButtons(card);
+ wireCopilotButtons(card);
 var provBudgetResetBtn = card.querySelector('.prov-budget-reset-btn');
  if (provBudgetResetBtn) provBudgetResetBtn.addEventListener('click', function() { provResetBudget(card); });
  provList.appendChild(clone);
@@ -4694,7 +4836,7 @@ var csIter=parseInt(document.getElementById('codex-search-iterations').value,10)
 cfg.codex_search=csSearch;
     cfg.exact_cache={enabled:document.getElementById('ecache-enabled').checked,max_entries:parseInt(document.getElementById('ecache-max-entries').value,10)||5000,ttl_seconds:parseInt(document.getElementById('ecache-ttl').value,10)||3600,temperature_threshold:parseFloat(document.getElementById('ecache-temp-threshold').value)||0.15};
     var originalProviders = (config && config.providers) || [];
-    cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,buffered_upstream_streaming:card.querySelector('.prov-buffered-upstream-streaming').checked,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),rate_limit_max_wait_ms:(function(v){return v?parseInt(v,10):null;})(card.querySelector('.prov-rate-max-wait').value.trim()),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};var budgetThreshold=card.querySelector('.prov-budget-threshold').value.trim();if(budgetThreshold)p.budget.alert_threshold_percent=parseInt(budgetThreshold,10);}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}var uaVal=card.querySelector('.prov-user-agent').value.trim();if(uaVal)p.user_agent=uaVal;else delete p.user_agent;var hdrMap={};card.querySelectorAll('.prov-header-row').forEach(function(row){var hk=row.querySelector('.prov-header-name').value.trim();var hv=row.querySelector('.prov-header-value').value;if(hk)hdrMap[hk]=hv;});if(Object.keys(hdrMap).length)p.custom_headers=hdrMap;else delete p.custom_headers;p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
+    cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,buffered_upstream_streaming:card.querySelector('.prov-buffered-upstream-streaming').checked,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),rate_limit_max_wait_ms:(function(v){return v?parseInt(v,10):null;})(card.querySelector('.prov-rate-max-wait').value.trim()),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};var budgetThreshold=card.querySelector('.prov-budget-threshold').value.trim();if(budgetThreshold)p.budget.alert_threshold_percent=parseInt(budgetThreshold,10);}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}if(p.type==='github-copilot'){p.auth_method=card.querySelector('.prov-copilot-auth-method')?card.querySelector('.prov-copilot-auth-method').value:'device-oauth';if(p.auth_method==='device-oauth'){p.api_key_env=null;}if(!p.base_url)p.base_url=null;}var uaVal=card.querySelector('.prov-user-agent').value.trim();if(uaVal)p.user_agent=uaVal;else delete p.user_agent;var hdrMap={};card.querySelectorAll('.prov-header-row').forEach(function(row){var hk=row.querySelector('.prov-header-name').value.trim();var hv=row.querySelector('.prov-header-value').value;if(hk)hdrMap[hk]=hv;});if(Object.keys(hdrMap).length)p.custom_headers=hdrMap;else delete p.custom_headers;p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
     var originalGroups = (config && config.model_groups) || [];
     cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container > .form-row').forEach(function(row,modelIndex){var originalModel=(originalGroup&&originalGroup.models&&originalGroup.models[modelIndex])||{};var m=JSON.parse(JSON.stringify(originalModel));Object.assign(m,{provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});var mdlCacheReadVal=(row.querySelector('.mdl-cache-read')||{}).value;var mdlCacheWriteVal=(row.querySelector('.mdl-cache-write')||{}).value;var mdlCacheMinVal=(row.querySelector('.mdl-cache-min-tokens')||{}).value;var mdlCacheSupportVal=(row.querySelector('.mdl-cache-support')||{}).value||'none';m.cost_per_million_cache_read_input_tokens=mdlCacheReadVal!==''?parseFloat(mdlCacheReadVal):null;m.cost_per_million_cache_creation_input_tokens=mdlCacheWriteVal!==''?parseFloat(mdlCacheWriteVal):null;m.cache_min_tokens=mdlCacheMinVal!==''?parseInt(mdlCacheMinVal,10):null;m.cache_support=mdlCacheSupportVal==='explicit'?{type:'explicit',max_breakpoints:parseInt((row.querySelector('.mdl-cache-max-bp')||{}).value||'4',10)}:(mdlCacheSupportVal==='automatic'?{type:'automatic'}:null);var mdlReasoningFamilyVal=(row.querySelector('.mdl-reasoning-family')||{}).value||'';var mdlReasoningParamVal=(row.querySelector('.mdl-reasoning-param')||{}).value||'';var mdlReasoningCostVal=(row.querySelector('.mdl-reasoning-cost')||{}).value;m.reasoning_family=mdlReasoningFamilyVal!==''?mdlReasoningFamilyVal:null;m.reasoning_parameter=mdlReasoningParamVal!==''?mdlReasoningParamVal:null;m.cost_per_million_reasoning_tokens=mdlReasoningCostVal!==''?parseFloat(mdlReasoningCostVal):null;var mdlTierVal=(row.querySelector('.mdl-tier')||{}).value||'';m.tier=mdlTierVal!==''?mdlTierVal:null;var mdlContextVal=(row.querySelector('.mdl-context-window')||{}).value;m.context_window=mdlContextVal!==''&&mdlContextVal!=null?parseInt(mdlContextVal,10):0;m.specializations=Array.prototype.map.call(row.querySelectorAll('.mdl-spec:checked'),function(cb){return cb.value;});g.models.push(m);});cfg.model_groups.push(g);});
     var retryMax=parseInt(document.getElementById('retry-max').value,10);
@@ -5170,9 +5312,376 @@ function formatUsageWindow(window) {
         })
         .finally(function() { logoutBtn.disabled = false; });
     });
-  }
+}
 
-  // ===== Virtual Keys section (Req 12.1, 12.2, 12.8, 12.9, 12.10) =====
+// ===== GitHub Copilot OAuth helpers (spec github-copilot-oauth-provider, task 11) =====
+// Mirrors the OpenAI OAuth card helpers above: status fetch, usage fill, and
+// button wiring, plus the device-code modal flow (login → modal with code +
+// countdown → status polling) and logout.
+
+function fetchCopilotStatusForCard(card) {
+ var badge = card.querySelector('.prov-copilot-badge');
+ if (!badge) return;
+ var loginBtn = card.querySelector('.prov-copilot-login');
+ var logoutBtn = card.querySelector('.prov-copilot-logout');
+ fetch(apiUrl('oauth/github-copilot/status'))
+ .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+ .then(function(data) {
+ renderCopilotStatus(card, data);
+ })
+ .catch(function() {
+ badge.textContent = 'Unavailable';
+ badge.className = 'oauth-state-badge prov-copilot-badge state-unauthenticated';
+ });
+}
+
+/** Compact duration: 59s / 15m / 2h 5m / 3d 4h (for token expiry + device-code countdown). */
+function copilotFmtDur(secs) {
+ if (secs <= 0) return 'expired';
+ if (secs < 60) return secs + 's';
+ if (secs < 3600) return Math.ceil(secs / 60) + 'm';
+ if (secs < 86400) { var h = Math.floor(secs / 3600); var m = Math.ceil((secs % 3600) / 60); return h + 'h' + (m > 0 ? ' ' + m + 'm' : ''); }
+ var d = Math.floor(secs / 86400);
+ var hh = Math.ceil((secs % 86400) / 3600);
+ return d + 'd' + (hh > 0 ? ' ' + hh + 'h' : '');
+}
+
+/** Render a status payload onto a provider card (Req 6.1). */
+function renderCopilotStatus(card, data) {
+ var badge = card.querySelector('.prov-copilot-badge');
+ var loginBtn = card.querySelector('.prov-copilot-login');
+ var logoutBtn = card.querySelector('.prov-copilot-logout');
+ var skuEl = card.querySelector('.copilot-sku');
+ var expiryEl = card.querySelector('.copilot-token-expiry');
+ var errEl = card.querySelector('.copilot-error-msg');
+ var catEl = card.querySelector('.copilot-catalog');
+ var usageEl = card.querySelector('.copilot-usage');
+ var state = data.state || 'unauthenticated';
+ badge.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+ badge.className = 'oauth-state-badge prov-copilot-badge state-' + state;
+ var active = (state === 'authenticated');
+ if (loginBtn) loginBtn.style.display = active ? 'none' : '';
+ if (logoutBtn) logoutBtn.style.display = active ? '' : 'none';
+ if (skuEl) skuEl.textContent = data.sku ? ('SKU: ' + data.sku) : '';
+ if (expiryEl) {
+ if (active && data.expires_at) {
+ var now = Math.floor(Date.now() / 1000);
+ var secs = data.expires_at - now;
+ expiryEl.textContent = secs > 0 ? ('Token expires in ' + copilotFmtDur(secs)) : 'Token expiring…';
+ } else {
+ expiryEl.textContent = '';
+ }
+ }
+ if (errEl) {
+ if (data.error) { errEl.textContent = data.error; errEl.style.display = 'block'; }
+ else { errEl.textContent = ''; errEl.style.display = 'none'; }
+ }
+ if (catEl) {
+ var cat = data.catalog;
+ var warns = [];
+ if (cat && cat.fetch_failed) {
+ warns.push('Model catalog fetch failed' + (cat.last_error ? (': ' + cat.last_error) : '') + (cat.last_success_at ? ' (last success ' + new Date(cat.last_success_at * 1000).toLocaleString() + ')' : ''));
+ }
+ if (cat && cat.unknown_configured_models && cat.unknown_configured_models.length) {
+ warns.push('Configured models missing from catalog: ' + cat.unknown_configured_models.join(', '));
+ }
+ if (cat && cat.model_count != null && !cat.fetch_failed) {
+ catEl.textContent = 'Catalog: ' + cat.model_count + ' models' + (cat.last_success_at ? (' · updated ' + new Date(cat.last_success_at * 1000).toLocaleTimeString()) : '');
+ catEl.style.display = 'block';
+ } else if (warns.length) {
+ catEl.textContent = warns.join(' · ');
+ catEl.style.display = 'block';
+ } else {
+ catEl.textContent = '';
+ catEl.style.display = 'none';
+ }
+ }
+ if (active) {
+ fetchCopilotUsageForCard(card);
+ } else if (usageEl) {
+ usageEl.style.display = 'none';
+ }
+}
+
+/** Refresh every github-copilot card's status (tab switch / state change). */
+function refreshCopilotStatuses() {
+ document.querySelectorAll('#providers-list .item-card').forEach(function(card) {
+ var sel = card.querySelector('.prov-type');
+ if (sel && sel.value === 'github-copilot') fetchCopilotStatusForCard(card);
+ });
+}
+
+function fetchCopilotUsageForCard(card) {
+ var usageEl = card.querySelector('.copilot-usage');
+ if (!usageEl) return;
+ fetch(apiUrl('oauth/github-copilot/usage'))
+ .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+ .then(function(data) {
+ // Req 7.3: "no usage data yet" rather than zero-values.
+ var empty = !data || !data.updated_at || ((!data.short || !hasCopilotWindowData(data.short)) && (!data.weekly || !hasCopilotWindowData(data.weekly)) && !data.premium);
+ if (empty) {
+ usageEl.style.display = 'block';
+ var wins = usageEl.querySelectorAll('.oauth-usage-window');
+ wins.forEach(function(w) { w.style.display = 'none'; });
+ var noneEl = usageEl.querySelector('.copilot-usage-none');
+ if (!noneEl) {
+ noneEl = document.createElement('div');
+ noneEl.className = 'copilot-usage-none';
+ noneEl.style.color = 'var(--text-muted)';
+ usageEl.insertBefore(noneEl, usageEl.firstChild.nextSibling);
+ }
+ noneEl.textContent = 'No usage data yet';
+ return;
+ }
+ usageEl.style.display = 'block';
+ var noneEl = usageEl.querySelector('.copilot-usage-none');
+ if (noneEl) noneEl.remove();
+ fillCopilotWindow(card, '.copilot-usage-short', data.short);
+ fillCopilotWindow(card, '.copilot-usage-weekly', data.weekly);
+ fillCopilotPremiumWindow(card, data.premium);
+ })
+ .catch(function() { usageEl.style.display = 'none'; });
+}
+
+function hasCopilotWindowData(pair) {
+ return pair && ((pair.requests && (pair.requests.limit != null || pair.requests.remaining != null)) || (pair.tokens && (pair.tokens.limit != null || pair.tokens.remaining != null)));
+}
+
+function fillCopilotWindow(card, containerSelector, pair) {
+ var container = card.querySelector(containerSelector);
+ if (!container) return;
+ if (!pair || !hasCopilotWindowData(pair)) {
+ container.style.display = 'none';
+ return;
+ }
+ container.style.display = '';
+ var reqVal = container.querySelector('.oauth-usage-req-value');
+ var reqReset = container.querySelector('.oauth-usage-req-reset');
+ var reqLabel = container.querySelector('.oauth-usage-req-label');
+ var tokVal = container.querySelector('.oauth-usage-tok-value');
+ var tokReset = container.querySelector('.oauth-usage-tok-reset');
+ var tokRow = tokVal ? tokVal.parentElement : null;
+ var barFill = container.querySelector('.copilot-usage-bar-fill');
+
+ var isPercentage = pair.requests && pair.requests.is_percentage;
+ if (reqLabel) reqLabel.textContent = isPercentage ? 'Usage:' : 'Requests:';
+ if (tokRow) tokRow.style.display = isPercentage ? 'none' : '';
+ reqVal.textContent = formatUsageWindow(pair.requests);
+ reqVal.style.color = '';
+ reqReset.textContent = formatResetTime(pair.requests && pair.requests.resets_at);
+ if (!isPercentage) {
+ tokVal.textContent = formatUsageWindow(pair.tokens);
+ tokReset.textContent = formatResetTime(pair.tokens && pair.tokens.resets_at);
+ }
+ if (barFill) {
+ var pct = copilotWindowPercent(pair.requests);
+ barFill.style.width = pct + '%';
+ barFill.style.background = pct >= 90 ? 'var(--danger)' : (pct >= 70 ? '#856404' : 'var(--primary)');
+ }
+ var reqPct = copilotWindowPercent(pair.requests);
+ reqVal.style.color = reqPct >= 90 ? 'var(--danger)' : (reqPct >= 70 ? '#856404' : 'var(--text)');
+}
+
+function fillCopilotPremiumWindow(card, premium) {
+ var container = card.querySelector('.copilot-usage-premium');
+ if (!container) return;
+ if (!premium || premium.limit == null) {
+ container.style.display = 'none';
+ return;
+ }
+ container.style.display = '';
+ var val = container.querySelector('.oauth-usage-req-value');
+ var reset = container.querySelector('.oauth-usage-req-reset');
+ var barFill = container.querySelector('.copilot-usage-bar-fill');
+ var pct = copilotWindowPercent(premium);
+ if (val) {
+ val.textContent = formatUsageWindow(premium);
+ val.style.color = pct >= 90 ? 'var(--danger)' : (pct >= 70 ? '#856404' : 'var(--text)');
+ }
+ if (reset) reset.textContent = formatResetTime(premium.resets_at);
+ if (barFill) {
+ barFill.style.width = pct + '%';
+ barFill.style.background = pct >= 90 ? 'var(--danger)' : '#856404';
+ }
+}
+
+/** Used percent of a window (0-100), or 0 when limits are unknown. */
+function copilotWindowPercent(window) {
+ if (!window || window.limit == null || window.remaining == null || !window.limit) return 0;
+ var pct = ((window.limit - window.remaining) / window.limit) * 100;
+ return Math.max(0, Math.min(100, Math.round(pct)));
+}
+
+// --- Device-code modal state ---
+var copilotDevice = { timer: null, poll: null, card: null, lastState: 'pending' };
+
+function copilotDeviceShow(loginData) {
+ var bd = document.getElementById('copilot-device-backdrop');
+ document.getElementById('copilot-device-uri').value = loginData.verification_uri || '';
+ var codeInput = document.getElementById('copilot-device-code-input');
+ codeInput.value = loginData.user_code || '';
+ copilotDeviceSetStatus('Waiting for authorization…', 'msg-info');
+ copilotDeviceStartCountdown(loginData.expires_at || (Math.floor(Date.now() / 1000) + (loginData.expires_in || 900)));
+ bd.classList.add('open');
+ // Auto-copy the user code to the clipboard (usability goal: 3 actions).
+ copilotCopyCode();
+ codeInput.focus();
+ codeInput.select();
+}
+
+function copilotDeviceHide() {
+ var bd = document.getElementById('copilot-device-backdrop');
+ bd.classList.remove('open');
+ if (copilotDevice.timer) { clearInterval(copilotDevice.timer); copilotDevice.timer = null; }
+ if (copilotDevice.poll) { clearInterval(copilotDevice.poll); copilotDevice.poll = null; }
+ copilotDevice.card = null;
+ copilotDevice.lastState = 'pending';
+}
+
+function copilotDeviceSetStatus(text, cls) {
+ var el = document.getElementById('copilot-device-status');
+ el.textContent = text;
+ el.className = 'oauth-fields-msg copilot-device-status ' + (cls || 'msg-info');
+ el.style.display = 'block';
+}
+
+function copilotDeviceStartCountdown(expiresAt) {
+ var el = document.getElementById('copilot-device-countdown');
+ if (copilotDevice.timer) { clearInterval(copilotDevice.timer); copilotDevice.timer = null; }
+ function tick() {
+ var secs = expiresAt - Math.floor(Date.now() / 1000);
+ if (secs <= 0) {
+ el.textContent = 'Code expired — close this dialog and sign in again.';
+ if (copilotDevice.timer) { clearInterval(copilotDevice.timer); copilotDevice.timer = null; }
+ copilotDeviceSetStatus('The device code expired. Start the sign-in again.', 'msg-error');
+ return;
+ }
+ el.textContent = 'Code expires in ' + copilotFmtDur(secs);
+ }
+ tick();
+ copilotDevice.timer = setInterval(tick, 1000);
+}
+
+function copilotCopyCode() {
+ var input = document.getElementById('copilot-device-code-input');
+ input.focus();
+ input.select();
+ var done = function () { showToast('Code copied to clipboard'); };
+ var fallback = function () {
+ try { document.execCommand('copy'); done(); }
+ catch (_) { showToast('Copy failed \u2014 select and copy manually', true); }
+ };
+ if (navigator.clipboard && navigator.clipboard.writeText) {
+ navigator.clipboard.writeText(input.value).then(done).catch(fallback);
+ } else { fallback(); }
+}
+
+function wireCopilotButtons(card) {
+ var loginBtn = card.querySelector('.prov-copilot-login');
+ var logoutBtn = card.querySelector('.prov-copilot-logout');
+ var msgEl = card.querySelector('.copilot-msg');
+ if (!loginBtn || !logoutBtn) return;
+
+ loginBtn.addEventListener('click', function() {
+ loginBtn.disabled = true;
+ if (msgEl) msgEl.style.display = 'none';
+ setStatus('Initiating GitHub Copilot login…');
+ fetch(apiUrl('oauth/github-copilot/login'), { method: 'POST' })
+ .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+ .then(function(res) {
+ if (!res.ok) {
+ if (msgEl) {
+ msgEl.textContent = res.data.error ? res.data.error.message : 'Login failed';
+ msgEl.className = 'oauth-fields-msg copilot-msg msg-error';
+ msgEl.style.display = 'block';
+ }
+ setStatus('Copilot login failed');
+ return;
+ }
+ copilotDevice.card = card;
+ copilotDeviceShow(res.data);
+ setStatus(res.data.status === 'in_flight' ? 'Copilot login already in flight' : 'Copilot login initiated');
+ // Poll status while the modal is open: state flips to authenticated
+ // once GitHub authorizes and the Copilot token exchange completes.
+ if (copilotDevice.poll) { clearInterval(copilotDevice.poll); copilotDevice.poll = null; }
+ var pollCount = 0;
+ copilotDevice.poll = setInterval(function() {
+ pollCount++;
+ fetch(apiUrl('oauth/github-copilot/status'))
+ .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+ .then(function(data) {
+ renderCopilotStatus(copilotDevice.card, data);
+ copilotDevice.lastState = data.state || 'pending';
+ if (data.state === 'authenticated') {
+ if (copilotDevice.poll) { clearInterval(copilotDevice.poll); copilotDevice.poll = null; }
+ copilotDeviceSetStatus('Signed in successfully.', 'msg-success');
+ setTimeout(copilotDeviceHide, 1200);
+ } else if (data.state === 'error' || data.state === 'expired') {
+ if (copilotDevice.poll) { clearInterval(copilotDevice.poll); copilotDevice.poll = null; }
+ copilotDeviceSetStatus(data.error || ('Sign-in ' + data.state + '.'), 'msg-error');
+ }
+ })
+ .catch(function() { /* transient status errors: keep polling */ });
+ if (pollCount > 120) { clearInterval(copilotDevice.poll); copilotDevice.poll = null; }
+ }, 2000);
+ })
+ .catch(function(err) {
+ if (msgEl) {
+ msgEl.textContent = 'Request failed: ' + err.message;
+ msgEl.className = 'oauth-fields-msg copilot-msg msg-error';
+ msgEl.style.display = 'block';
+ }
+ })
+ .finally(function() { loginBtn.disabled = false; });
+ });
+
+ logoutBtn.addEventListener('click', function() {
+ logoutBtn.disabled = true;
+ if (msgEl) msgEl.style.display = 'none';
+ fetch(apiUrl('oauth/github-copilot/logout'), { method: 'POST' })
+ .then(function() {
+ if (msgEl) {
+ msgEl.textContent = 'Signed out.';
+ msgEl.className = 'oauth-fields-msg copilot-msg msg-info';
+ msgEl.style.display = 'block';
+ }
+ setStatus('Copilot: signed out');
+ fetchCopilotStatusForCard(card);
+ })
+ .catch(function(err) {
+ if (msgEl) {
+ msgEl.textContent = 'Logout failed: ' + err.message;
+ msgEl.className = 'oauth-fields-msg copilot-msg msg-error';
+ msgEl.style.display = 'block';
+ }
+ })
+ .finally(function() { logoutBtn.disabled = false; });
+ });
+}
+
+// --- Device-code modal wiring (single instance, bound once) ---
+(function copilotDeviceWire() {
+ document.getElementById('copilot-device-copy').addEventListener('click', copilotCopyCode);
+ document.getElementById('copilot-device-close').addEventListener('click', function() {
+ // Closing the modal keeps the login in flight; user can re-open via Sign in.
+ copilotDeviceHide();
+ });
+ document.getElementById('copilot-device-cancel').addEventListener('click', function() {
+ // Cancel the in-flight login on the backend (Req 2.2), then close.
+ fetch(apiUrl('oauth/github-copilot/cancel'), { method: 'POST' })
+ .then(function() {
+ copilotDeviceSetStatus('Login cancelled.', 'msg-info');
+ setStatus('Copilot login cancelled');
+ if (copilotDevice.card) fetchCopilotStatusForCard(copilotDevice.card);
+ setTimeout(copilotDeviceHide, 600);
+ })
+ .catch(function(err) {
+ copilotDeviceSetStatus('Cancel failed: ' + err.message, 'msg-error');
+ });
+ });
+})();
+
+// ===== Virtual Keys section (Req 12.1, 12.2, 12.8, 12.9, 12.10) =====
   // Task 14.1 renders the list + enforcement control. Tasks 14.2 (create/edit
   // forms) and 14.3 (row actions + usage charts) extend the seams below:
   //   #vk-toolbar        -> Create Key button/form (14.2)

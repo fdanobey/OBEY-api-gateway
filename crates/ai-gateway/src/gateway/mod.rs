@@ -48,6 +48,22 @@ pub struct AppState {
     pub shutting_down: Arc<AtomicBool>,
     pub oauth_manager: Option<Arc<OAuthManager>>,
     pub oauth_usage_tracker: Arc<crate::oauth::UsageTracker>,
+    /// Copilot credential-lifecycle manager (github-copilot-oauth-provider,
+    /// task 9); the SAME `Arc` the router dispatches through, surfaced here
+    /// for the admin `/admin/oauth/github-copilot/*` family. `None` without
+    /// a master-key path (the same gate that constructs the router's
+    /// manager).
+    pub copilot_manager:
+    Option<Arc<crate::oauth::github_copilot::manager::CopilotTokenManager>>,
+    /// Copilot usage tracker (short/weekly/premium windows fed by the
+    /// task-7 adapter); same `Arc` as the router's. `None` under the same
+    /// master-key gate as `copilot_manager`.
+    pub copilot_usage_tracker: Option<Arc<crate::oauth::UsageTracker>>,
+    /// Copilot model catalog sync (task 8); feeds `/v1/models` when a
+    /// `github-copilot` provider exists. `None` under the same
+    /// master-key gate as the router's Copilot token manager.
+    pub copilot_catalog:
+    Option<Arc<crate::oauth::github_copilot::catalog::CopilotCatalogSync>>,
     pub codex_models_discovery: Arc<crate::codex::models_discovery::ModelsDiscovery>,
     /// Virtual key manager: caller authentication and usage governance.
     /// Always present; enforcement is gated by `config.virtual_keys.enforcement`
@@ -116,6 +132,24 @@ pub runtime_limits: Arc<crate::runtime_limits::RuntimeLimits>,
 /// Core HTTP server wrapping Axum with middleware and integrated components.
 pub struct GatewayServer {
     pub state: AppState,
+}
+
+/// Connect timeout for the Copilot OAuth clients (manager + catalog),
+/// mirroring `get_or_create_http_client`'s 10 s connect discipline.
+const COPILOT_HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Total-request timeout for the Copilot OAuth clients: a stalled
+/// api.github.com exchange during the dispatch-path inline refresh must
+/// fail over instead of hanging the request indefinitely.
+const COPILOT_HTTP_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// HTTP client for Copilot OAuth legs (device flow, token exchange,
+/// catalog fetch) with explicit connect + total timeouts.
+fn copilot_oauth_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(COPILOT_HTTP_CONNECT_TIMEOUT)
+        .timeout(COPILOT_HTTP_TOTAL_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 impl GatewayServer {
@@ -295,6 +329,89 @@ impl GatewayServer {
 // --- OAuth UsageTracker wiring ---
 let oauth_usage_tracker = Arc::new(crate::oauth::UsageTracker::new());
 router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
+
+        // --- GitHub Copilot manager + catalog wiring
+        // (github-copilot-oauth-provider, task 9) ---
+        // Mirrors the oauth_manager construction block above: master-key
+        // gated, session loaded from disk, background refresh loop started.
+        // Without a master-key path the gateway still starts — Copilot
+        // device-oauth is simply unavailable (Req 9.2's skip gate keeps
+        // requests failing over). The manager/tracker live on the router
+        // and (as the same Arcs) on AppState for the admin endpoints;
+        // only the catalog (needed by /v1/models via AppState) is also
+        // surfaced here.
+        let (copilot_manager, copilot_usage_tracker) = match crate::secrets::master_key_path() {
+            Ok(key_path) => {
+                let storage_dir = key_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+                let store = crate::oauth::github_copilot::store::CopilotTokenStore::new(
+                crate::oauth::github_copilot::store::CopilotTokenStore::default_path(
+                storage_dir,
+                ),
+                );
+                let manager = Arc::new(
+                    crate::oauth::github_copilot::manager::CopilotTokenManager::new(
+                        store,
+                        copilot_oauth_http_client(),
+                    ),
+                );
+
+                // Restore any persisted session (enc-v1 store, Req 3.2).
+                if let Err(e) = manager.load_existing_session().await {
+                tracing::warn!(error = %e, "Failed to load persisted Copilot session; starting unauthenticated");
+                }
+
+                // Background lifecycle (refresh tick + backoff, Req 3.3).
+                manager.clone().start_refresh_loop();
+
+                router.set_copilot_manager(manager.clone());
+                let copilot_usage_tracker = Arc::new(crate::oauth::UsageTracker::new());
+                router.set_copilot_usage_tracker(copilot_usage_tracker.clone());
+
+                (Some(manager), Some(copilot_usage_tracker))
+                }
+            Err(e) => {
+            tracing::warn!(error = %e, "Could not determine Copilot OAuth storage path; Copilot OAuth disabled");
+                (None, None)
+                }
+            };
+        let copilot_catalog = match (&copilot_manager, &copilot_usage_tracker) {
+            (Some(manager), Some(_)) => {
+                // Catalog sync (task 8): owner-tagged with the first
+                // configured github-copilot provider's name; background
+                // sync fetches post-auth on the shared cadence. Only
+                // constructed when a github-copilot provider exists.
+        if config
+            .providers
+            .iter()
+            .any(|p| p.provider_type == "github-copilot")
+        {
+            let owner = copilot_catalog_owner(&config);
+                    let catalog = Arc::new(
+                        crate::oauth::github_copilot::catalog::CopilotCatalogSync::with_owner(
+                            manager.clone(),
+                            copilot_oauth_http_client(),
+                            owner.clone(),
+                        ),
+                    );
+                        // Seed the configured explicit models list (Req 5.3
+                        // input) from the initial config; the reload path
+                        // re-seeds below without touching auth state.
+                        // Explicit Copilot models live in model-group entries
+                        // pointing at the provider (Provider has no `models`
+                        // list in this config schema).
+                        let configured_models = copilot_configured_models(&config, &owner);
+                        catalog.set_configured_models(configured_models).await;
+                        catalog.clone().spawn_background_sync();
+                        router.set_copilot_catalog(catalog.clone());
+                        Some(catalog)
+                    } else {
+                        None
+                    }
+                }
+            (None, _) | (_, None) => None,
+            };
 
         // --- Budget-alert webhooks activation (budget-alerts-unified-webhooks,
         // Task 5) ---
@@ -482,8 +599,11 @@ if !config.webhooks.endpoints.is_empty() {
             exact_cache: Arc::new(ExactCache::new(&config.exact_cache)),
             metrics,
             shutting_down: Arc::new(AtomicBool::new(false)),
-            oauth_manager,
-            oauth_usage_tracker,
+oauth_manager,
+oauth_usage_tracker,
+copilot_manager,
+copilot_usage_tracker,
+copilot_catalog,
             codex_models_discovery: Arc::new(crate::codex::models_discovery::ModelsDiscovery::new()),
             virtual_key_manager,
             active_runs: Arc::new(DashMap::new()),
@@ -1286,6 +1406,33 @@ fn build_precompressed_manager(
     }
 }
 
+/// Explicit Copilot model IDs configured anywhere for the named
+/// `github-copilot` provider (any model-group entry whose
+/// `pm.provider` names it). Used to seed the catalog's
+/// configured-models list (Req 5.3 input) at startup and on reload.
+fn copilot_configured_models(config: &Config, provider_name: &str) -> Vec<String> {
+    config
+        .model_groups
+        .iter()
+        .flat_map(|group| group.models.iter())
+        .filter(|pm| pm.provider == provider_name)
+        .map(|pm| pm.model.clone())
+        .collect()
+}
+
+/// Owner tag for the Copilot catalog: the first configured
+/// `github-copilot` provider's REAL name (startup and hot-reload must
+/// derive it the same way, or a reload would wipe the configured-models
+/// list for differently-named providers).
+fn copilot_catalog_owner(config: &Config) -> String {
+    config
+        .providers
+        .iter()
+        .find(|p| p.provider_type == "github-copilot")
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "github-copilot".to_string())
+}
+
 pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     let loop_detection = new_config.loop_detection.clone();
     let compression = new_config.compression.clone();
@@ -1332,6 +1479,21 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     {
         let cfg = state.config.read().await;
         state.runtime_limits.apply(&cfg);
+        // GitHub Copilot (github-copilot-oauth-provider, NFR
+        // Reliability): hot-reload re-seeds ONLY the catalog's
+        // configured-models list. The token manager, its session
+        // state, and the background sync task are startup-attached
+        // and deliberately untouched here — reload never
+        // reconstructs or drops Copilot auth state (same discipline
+        // as oauth_manager, which is also never rebuilt on reload).
+        if let Some(catalog) = &state.copilot_catalog {
+            // Derive the owner from the RELOADED config exactly like
+            // startup does, so a differently-named copilot provider
+            // keeps its configured-models list across reload.
+            let owner = copilot_catalog_owner(&cfg);
+            let configured_models = copilot_configured_models(&cfg, &owner);
+            catalog.set_configured_models(configured_models).await;
+        }
         // Persistent budgets: re-seed configured limits from the reloaded
         // config (config is the authority for limits). The durable store is
         // deliberately untouched — reload re-seeds, it never resets
@@ -3582,8 +3744,8 @@ mod tests {
         assert!(text.contains("obey_memory_decay_evictions_total 0"));
     }
 
-    #[tokio::test]
-    async fn test_prometheus_disabled_returns_404() {
+        #[tokio::test]
+        async fn test_prometheus_disabled_returns_404() {
         // Prometheus disabled (default)
         let server = GatewayServer::new(minimal_config(), None).await.unwrap();
         let app = server.build_router();
@@ -3596,5 +3758,295 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+// ---- github-copilot-oauth-provider, task 9 gateway wiring ---------
+
+/// Serializes the copilot wiring tests: `AI_GATEWAY_DATA_DIR` is
+/// process-global and sibling admin tests run in parallel, so each
+/// test holds this lock for its whole body (same pattern as the
+/// admin oauth tests' `ENV_LOCK`).
+static COPILOT_WIRING_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Point `AI_GATEWAY_DATA_DIR` at a leaked (kept) temp dir, create the
+/// master key, and return the dir path. `keep()` ensures the env var
+/// never dangles at a deleted directory mid-suite.
+fn copilot_wiring_secure_dir(guard: &std::sync::MutexGuard<'static, ()>) -> std::path::PathBuf {
+    let _ = guard;
+    let dir = tempfile::tempdir().expect("temp data dir").keep();
+    std::env::set_var("AI_GATEWAY_DATA_DIR", &dir);
+    let _ = crate::secrets::load_or_create_master_key();
+    dir
+}
+
+/// Copilot catalog construction: attached when a github-copilot
+/// provider exists + master key available; absent otherwise.
+#[tokio::test]
+async fn copilot_catalog_attached_when_provider_configured() {
+    let _guard = COPILOT_WIRING_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Isolate storage (master key + copilot store) like the router
+    // copilot tests.
+    let _dir = copilot_wiring_secure_dir(&_guard);
+
+        let mut config = minimal_config();
+        config.providers.push(Provider {
+            name: "copilot-test".to_string(),
+            provider_type: "github-copilot".to_string(),
+            base_url: None,
+            api_key_env: None,
+            api_key_encrypted: None,
+            api_secret_env: None,
+            api_secret_encrypted: None,
+            auth_method: None,
+            resolved_api_key: None,
+            resolved_api_secret: None,
+            region: None,
+            timeout_seconds: 30,
+            ttfb_timeout_seconds: None,
+            total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
+            max_connections: 10,
+            rate_limit_per_minute: 0,
+            custom_headers: Default::default(),
+            user_agent: None,
+            connection_pool: ProviderConnectionPoolConfig::default(),
+            memory: None,
+            budget: None,
+            manual_models: vec![],
+            global_inference_profile: false,
+            cross_region_inference: false,
+            custom_vpc_endpoint: false,
+            prompt_caching: false,
+            compression: None,
+            reasoning: true,
+            codex_base_url_override: None,
+            codex_model_override: None,
+            instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
+        });
+        let storage_dir = std::env::temp_dir().join(format!(
+            "obey-gw-copilot-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        config.logging.database_path =
+            storage_dir.join("logs.db").to_string_lossy().into_owned();
+        config.virtual_keys.database_path =
+            storage_dir.join("keys.db").to_string_lossy().into_owned();
+
+        let server = GatewayServer::new(config, None).await.unwrap();
+        assert!(
+            server.state.copilot_catalog.is_some(),
+            "catalog attached when a github-copilot provider exists"
+        );
+
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+/// No github-copilot provider → no catalog (nothing to sync).
+#[tokio::test]
+async fn copilot_catalog_absent_without_copilot_provider() {
+    let _guard = COPILOT_WIRING_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _dir = copilot_wiring_secure_dir(&_guard);
+
+        let mut config = minimal_config();
+        let storage_dir = std::env::temp_dir().join(format!(
+            "obey-gw-copilot-none-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        config.logging.database_path =
+            storage_dir.join("logs.db").to_string_lossy().into_owned();
+        config.virtual_keys.database_path =
+            storage_dir.join("keys.db").to_string_lossy().into_owned();
+
+        let server = GatewayServer::new(config, None).await.unwrap();
+        assert!(server.state.copilot_catalog.is_none());
+
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// /v1/models includes enabled Copilot catalog models when a
+    /// github-copilot provider exists (Req 5.2 / task 9 wiring).
+    /// Drives a real catalog sync over wiremock, then asserts the
+    /// aggregated response carries the enabled (entitlement-filtered)
+    /// models with the provider as `owned_by`.
+#[tokio::test]
+async fn models_list_includes_enabled_copilot_catalog_models() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = COPILOT_WIRING_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = copilot_wiring_secure_dir(&_guard);
+
+        // Catalog upstream: one enabled + one disabled entry.
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "gpt-5-copilot",
+                        "model_picker_enabled": true,
+                        "policy": {
+                            "state": "enabled",
+                            "soles": ["copilot_pro"],
+                        },
+                    },
+                    {
+                        "id": "gpt-4o-copilot-disabled",
+                        "model_picker_enabled": false,
+                        "policy": { "state": "enabled" },
+                    },
+                ],
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let mut config = minimal_config();
+        config.providers.push(Provider {
+            name: "copilot-models".to_string(),
+            provider_type: "github-copilot".to_string(),
+            base_url: None,
+            api_key_env: None,
+            api_key_encrypted: None,
+            api_secret_env: None,
+            api_secret_encrypted: None,
+            auth_method: None,
+            resolved_api_key: None,
+            resolved_api_secret: None,
+            region: None,
+            timeout_seconds: 30,
+            ttfb_timeout_seconds: None,
+            total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
+            max_connections: 10,
+            rate_limit_per_minute: 0,
+            custom_headers: Default::default(),
+            user_agent: None,
+            connection_pool: ProviderConnectionPoolConfig::default(),
+            memory: None,
+            budget: None,
+            manual_models: vec![],
+            global_inference_profile: false,
+            cross_region_inference: false,
+            custom_vpc_endpoint: false,
+            prompt_caching: false,
+            compression: None,
+            reasoning: true,
+            codex_base_url_override: None,
+            codex_model_override: None,
+            instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
+        });
+        let storage_dir = std::env::temp_dir().join(format!(
+            "obey-gw-copilot-models-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        config.logging.database_path =
+            storage_dir.join("logs.db").to_string_lossy().into_owned();
+        config.virtual_keys.database_path =
+            storage_dir.join("keys.db").to_string_lossy().into_owned();
+
+        let server = GatewayServer::new(config, None).await.unwrap();
+
+        // Replace the production catalog with a wiremock-backed one:
+        // authenticated manager pointing at the mock exchange + api.
+        let manager = Arc::new(
+            crate::oauth::github_copilot::manager::CopilotTokenManager::with_endpoints(
+                crate::oauth::github_copilot::store::CopilotTokenStore::new(
+                    dir.join("models_tokens.enc"),
+                ),
+                reqwest::Client::new(),
+                crate::oauth::github_copilot::manager::CopilotEndpoints {
+                    device_flow: crate::oauth::github_copilot::device_flow::DeviceFlowEndpoints {
+                        device_code_url: format!("{}/login/device/code", upstream.uri()),
+                        token_url: format!("{}/login/oauth/access_token", upstream.uri()),
+                    },
+                    copilot_token_url: format!("{}/copilot_internal/v2/token", upstream.uri()),
+                },
+            ),
+        );
+        // Authenticated session with the mock as api base so the
+        // catalog fetch hits wiremock (public API: save + load).
+        let store = crate::oauth::github_copilot::store::CopilotTokenStore::new(
+            dir.join("models_tokens.enc"),
+        );
+        store
+            .save(&crate::oauth::github_copilot::store::CopilotStoredCredentials {
+                github_access_token: "gho-test".into(),
+                copilot_token: Some("tid=live".into()),
+                copilot_expires_at: Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        + 3600,
+                ),
+                api_base: upstream.uri(),
+                machine_id: "6f9619ff".into(),
+                sku: Some("copilot_pro".into()),
+                scopes: "read:user".into(),
+                updated_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            })
+            .unwrap();
+        manager.load_existing_session().await.unwrap();
+        assert!(matches!(
+            manager.session_state().await,
+            crate::oauth::github_copilot::manager::CopilotSessionState::Authenticated { .. }
+        ));
+        let catalog = Arc::new(
+            crate::oauth::github_copilot::catalog::CopilotCatalogSync::with_owner(
+                manager.clone(),
+                reqwest::Client::new(),
+                "copilot-models".to_string(),
+            ),
+        );
+        catalog.refresh_now().await;
+        assert_eq!(catalog.enabled_models().await.len(), 1);
+        let mut server = server;
+        server.state.copilot_catalog = Some(catalog);
+
+        let app = server.build_router();
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"gpt-5-copilot"),
+            "enabled copilot model present: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"gpt-4o-copilot-disabled"),
+            "disabled copilot model filtered: {ids:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 }

@@ -731,6 +731,19 @@ impl Provider {
         )
     }
 
+    /// Effective base URL (Req 1.1): `github-copilot` providers default
+    /// to [`GITHUB_COPILOT_DEFAULT_BASE_URL`] when no `base_url` is set;
+    /// other providers pass their configured `base_url` through.
+    /// Consumed by the router dispatch task of the
+    /// github-copilot-oauth-provider spec.
+    #[allow(dead_code)]
+    pub fn effective_base_url(&self) -> Option<&str> {
+        self.base_url.as_deref().or(match self.provider_type.as_str() {
+            "github-copilot" => Some(GITHUB_COPILOT_DEFAULT_BASE_URL),
+            _ => None,
+        })
+    }
+
     /// Resolve the effective total (round-trip) timeout for a given model.
     /// Priority: explicit `total_timeout_seconds` > legacy `timeout_seconds`
     /// (when non-default) > model-aware default.
@@ -868,6 +881,16 @@ impl Provider {
 
 /// Default `rate_limit_max_wait_ms`: one token at 8/min refills in 7.5 s.
 pub const DEFAULT_RATE_LIMIT_MAX_WAIT_MS: u64 = 10_000;
+
+/// Default API base for `github-copilot` providers (Req 1.1,
+/// github-copilot-oauth-provider spec). The endpoint set is unofficial,
+/// may change or break, and is shared by major third-party clients
+/// (opencode with GitHub's announced partnership support, LiteLLM,
+/// copilot-api) — see `config.example.yaml` for the support-status note.
+/// Consumed by `Provider::effective_base_url` and the router dispatch
+/// task of the spec.
+#[allow(dead_code)]
+pub const GITHUB_COPILOT_DEFAULT_BASE_URL: &str = "https://api.githubcopilot.com";
 
 /// Upper bound accepted for `rate_limit_max_wait_ms`.
 pub const MAX_RATE_LIMIT_MAX_WAIT_MS: u64 = 60_000;
@@ -2198,6 +2221,155 @@ model_groups:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.streaming.is_none());
+    }
+}
+
+// Feature: github-copilot-oauth-provider, Task 1: config schema
+// **Validates: Requirements 1.1, 1.2, 8.1**
+#[cfg(test)]
+mod github_copilot_config_tests {
+    use super::*;
+
+    #[test]
+    fn github_copilot_provider_parses_with_defaults() {
+        // Req 1.1: type github-copilot parses with auth_method defaulting to
+        // device-oauth; no base_url required, no other provider-specific
+        // fields.
+        let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers:
+  - name: "copilot"
+    type: "github-copilot"
+model_groups:
+  - name: "default"
+    version_fallback_enabled: false
+    models:
+      - provider: "copilot"
+        model: "gpt-4o"
+        priority: 100
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let provider = &config.providers[0];
+        assert_eq!(provider.provider_type, "github-copilot");
+        assert_eq!(provider.auth_method, None);
+        assert_eq!(provider.base_url, None);
+        // Default API base applies at resolution time (Req 1.1).
+        assert_eq!(
+            provider.effective_base_url(),
+            Some("https://api.githubcopilot.com")
+        );
+    }
+
+    #[test]
+    fn github_copilot_auth_method_api_key_parses() {
+        // Req 8.1: PAT through the existing api_key_env mechanism.
+        let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers:
+  - name: "copilot-pat"
+    type: "github-copilot"
+    auth_method: "api-key"
+    api_key_env: "COPILOT_PAT"
+model_groups:
+  - name: "default"
+    version_fallback_enabled: false
+    models:
+      - provider: "copilot-pat"
+        model: "gpt-4o"
+        priority: 100
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.providers[0].auth_method.as_deref(),
+            Some("api-key")
+        );
+        assert_eq!(
+            config.providers[0].api_key_env.as_deref(),
+            Some("COPILOT_PAT")
+        );
+    }
+
+    #[test]
+    fn github_copilot_snake_case_auth_method_round_trips() {
+        let provider = Provider {
+            name: "copilot".to_string(),
+            provider_type: "github-copilot".to_string(),
+            auth_method: Some("device-oauth".to_string()),
+            ..test_copilot_provider()
+        };
+        let yaml = serde_yaml::to_string(&provider).unwrap();
+        assert!(yaml.contains("auth_method: device-oauth"));
+        let back: Provider = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.auth_method.as_deref(), Some("device-oauth"));
+        assert_eq!(back.provider_type, "github-copilot");
+    }
+
+    #[test]
+    fn github_copilot_effective_base_url_explicit_wins() {
+        let provider = Provider {
+            base_url: Some("https://proxy.example.com".to_string()),
+            ..test_copilot_provider()
+        };
+        assert_eq!(
+            provider.effective_base_url(),
+            Some("https://proxy.example.com")
+        );
+    }
+
+    #[test]
+    fn other_provider_types_keep_base_url_none_default() {
+        let provider = Provider {
+            provider_type: "openai".to_string(),
+            ..test_copilot_provider()
+        };
+        assert_eq!(provider.effective_base_url(), None);
+    }
+
+    fn test_copilot_provider() -> Provider {
+        Provider {
+            name: "copilot".to_string(),
+            provider_type: "github-copilot".to_string(),
+            base_url: None,
+            api_key_env: None,
+            api_key_encrypted: None,
+            api_secret_env: None,
+            api_secret_encrypted: None,
+            auth_method: None,
+            resolved_api_key: None,
+            resolved_api_secret: None,
+            region: None,
+            timeout_seconds: 30,
+            ttfb_timeout_seconds: None,
+            total_timeout_seconds: None,
+            buffered_upstream_streaming: None,
+            rate_limit_max_wait_ms: None,
+            max_connections: 100,
+            rate_limit_per_minute: 0,
+            custom_headers: HashMap::new(),
+            user_agent: None,
+            connection_pool: ProviderConnectionPoolConfig::default(),
+            budget: None,
+            manual_models: vec![],
+            global_inference_profile: false,
+            cross_region_inference: false,
+            custom_vpc_endpoint: false,
+            prompt_caching: false,
+            compression: None,
+            memory: None,
+            reasoning: true,
+            codex_base_url_override: None,
+            codex_model_override: None,
+            instructions_override: None,
+            max_rate_limit_cooldown_seconds: None,
+        }
     }
 }
 
