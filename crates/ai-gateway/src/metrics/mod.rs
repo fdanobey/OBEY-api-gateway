@@ -9,6 +9,8 @@ use crate::structured_output::metrics::StructuredOutputMetrics;
 mod provider_attempt;
 use provider_attempt::ProviderAttemptFailureMetrics;
 pub mod provider_budget_store;
+pub mod telemetry;
+pub use telemetry::TelemetryMetrics;
 use dashmap::DashMap;
 pub use provider_budget_store::{ProviderBudgetStore, ProviderBudgetStoreError};
 use serde::{Deserialize, Serialize};
@@ -148,9 +150,12 @@ pub struct Metrics {
     guardrail_stego_detections: Arc<DashMap<(String, String), AtomicU64>>,
     /// Structured output validation, retry, and latency metrics.
     structured_output: Arc<StructuredOutputMetrics>,
-    /// Failed provider attempts keyed by (provider, model, status_code),
-    /// including attempts masked by a successful retry/fallback.
-    provider_attempt_failures: Arc<ProviderAttemptFailureMetrics>,
+ /// Failed provider attempts keyed by (provider, model, status_code),
+ /// including attempts masked by a successful retry/fallback.
+ provider_attempt_failures: Arc<ProviderAttemptFailureMetrics>,
+ /// OTLP trace-export counters shared with the telemetry exporter
+ /// (opentelemetry-trace-export spec, Req 7.1/7.2).
+ otlp_telemetry: Arc<TelemetryMetrics>,
     /// Compression tokens saved counter, keyed by bounded (level, provider).
     compression_tokens_saved: Arc<DashMap<CompressionMetricKey, AtomicU64>>,
     /// Compression ratio histogram, keyed by bounded (level, provider).
@@ -1002,6 +1007,7 @@ impl Metrics {
             guardrail_stego_detections: Arc::new(DashMap::new()),
             structured_output: Arc::new(StructuredOutputMetrics::new()),
             provider_attempt_failures: Arc::new(ProviderAttemptFailureMetrics::new()),
+ otlp_telemetry: Arc::new(TelemetryMetrics::new()),
             compression_tokens_saved: Arc::new(DashMap::new()),
             compression_ratio: Arc::new(DashMap::new()),
             compression_duration_seconds: Arc::new(DashMap::new()),
@@ -2194,6 +2200,16 @@ Total unicode_stego provider detections by category and phase\n",
     /// Append provider attempt-failure metrics in Prometheus text format.
     pub fn write_provider_attempt_failures_prometheus(&self, out: &mut String) {
         self.provider_attempt_failures.write_prometheus(out);
+        // OTLP export counters render alongside the other always-on
+        // counter families (opentelemetry-trace-export Req 7.2).
+        self.otlp_telemetry_metrics().write_prometheus(out);
+    }
+
+    /// Shared OTLP export counters (the telemetry exporter increments
+    /// these; Prometheus rendering reads them). Returns the same handle
+    /// `write_provider_attempt_failures_prometheus` renders.
+    pub fn otlp_telemetry_metrics(&self) -> Arc<TelemetryMetrics> {
+        self.otlp_telemetry.clone()
     }
 
     /// Record content-free compression metrics for one pipeline operation.

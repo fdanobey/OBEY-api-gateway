@@ -207,6 +207,7 @@ mod tests {
             codex_search: None,
             reasoning_compat: Default::default(),
             webhooks: Default::default(),
+            opentelemetry: Default::default(),
         }
     }
 

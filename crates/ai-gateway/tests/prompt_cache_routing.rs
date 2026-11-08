@@ -63,6 +63,7 @@ fn cache_config(cache: CacheAwareRouting) -> Config {
         codex_search: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     }
 }
 

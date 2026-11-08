@@ -116,6 +116,7 @@ fn test_config() -> Config {
         structured_output: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
         loop_detection: Default::default(),
         cache_aware_routing: Default::default(),
         security: Default::default(),

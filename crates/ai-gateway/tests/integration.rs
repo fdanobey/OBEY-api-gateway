@@ -113,6 +113,7 @@ fn test_config() -> Config {
         codex_search: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     }
 }
 

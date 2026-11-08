@@ -159,6 +159,7 @@ pub fn budget_test_config(
         memory: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     };
     if let Some(dir) = db_dir {
         config.logging.database_path = dir.join("logs.db").to_string_lossy().into_owned();

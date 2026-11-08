@@ -1175,6 +1175,7 @@ mod tests {
             loop_detection: Default::default(),
             guardrails: None,
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
             tool_compression: Default::default(),
             smart_routing: Default::default(),
             memory: None,

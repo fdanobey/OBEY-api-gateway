@@ -52,6 +52,8 @@ mod smart_routing;
 #[allow(dead_code, unused_imports)]
 mod structured_output;
 #[allow(dead_code, unused_imports)]
+mod telemetry;
+#[allow(dead_code, unused_imports)]
 mod tool_compression;
 #[cfg(feature = "tray")]
 mod tray;

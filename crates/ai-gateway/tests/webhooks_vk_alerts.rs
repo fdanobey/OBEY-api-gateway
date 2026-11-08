@@ -77,6 +77,7 @@ fn base_config() -> Config {
         structured_output: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     }
 }
 

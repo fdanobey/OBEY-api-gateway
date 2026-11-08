@@ -336,6 +336,7 @@ mod tests {
             cache_aware_routing: Default::default(),
             reasoning_compat: Default::default(),
             webhooks: Default::default(),
+            opentelemetry: Default::default(),
             security: Default::default(),
         }
     }

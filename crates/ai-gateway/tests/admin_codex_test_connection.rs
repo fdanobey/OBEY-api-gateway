@@ -114,6 +114,7 @@ fn codex_test_config() -> Config {
         memory: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     }
 }
 

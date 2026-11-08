@@ -255,9 +255,22 @@ exact_cache:
 #   ttl_seconds: 3600
 #   max_cache_size: 10000
 
+# OpenTelemetry trace export (disabled by default).
+# When enabled, emits W3C-compatible traces to an OTLP/HTTP collector.
+# See: https://github.com/fdanobey/OBEY-api-gateway/wiki/OpenTelemetry-Trace-Export
+ #
+ # opentelemetry:
+ #   enabled: true
+ #   endpoint: "http://localhost:4318/v1/traces"
+ #   headers: # Optional auth headers; values support ${ENV} substitution
+ #     Authorization: "Bearer ${OTEL_AUTH_TOKEN}"
+ #   sampling_ratio: 1.0 # 0.0–1.0; inbound traceparent sampled flag takes precedence
+ #   capture_content: false # Privacy: when true, bounded request/response bodies are captured
+ #   service_name: "ai-gateway" # Resource service.name attribute
+
 # prometheus:
-#   enabled: true
-#   path: "/metrics"
+# enabled: true
+# path: "/metrics"
 
 first_launch_completed: false
 
