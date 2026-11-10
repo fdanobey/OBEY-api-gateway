@@ -19,16 +19,8 @@ pub struct NimFallbackModel {
 }
 
 // BEGIN NVIDIA NIM FALLBACK MODELS
-/// Probe provenance: catalog=https://integrate.api.nvidia.com/v1/models; probed=2026-10-05T17:47:55.3495924Z; git_rev=b496311
+/// Probe provenance: catalog=https://integrate.api.nvidia.com/v1/models; probed=2026-11-09T16:33:33.2638940Z; git_rev=5c4838d
 pub const NVIDIA_NIM_FALLBACK_MODELS: &[NimFallbackModel] = &[
-    NimFallbackModel {
-        id: "moonshotai/kimi-k3",
-        owned_by: "moonshotai",
-        supports_vision: true,
-        context_window: Some(1000000),
-        max_completion_tokens: None,
-        source_url: "https://build.nvidia.com/moonshotai/kimi-k3",
-    },
     NimFallbackModel {
         id: "meta/muse-glimmer-30b",
         owned_by: "meta",
@@ -44,6 +36,14 @@ pub const NVIDIA_NIM_FALLBACK_MODELS: &[NimFallbackModel] = &[
         context_window: None,
         max_completion_tokens: None,
         source_url: "https://build.nvidia.com/google/diffusiongemma-26b-a4b-it",
+    },
+    NimFallbackModel {
+        id: "stepfun-ai/step-5-preview",
+        owned_by: "stepfun-ai",
+        supports_vision: true,
+        context_window: None,
+        max_completion_tokens: None,
+        source_url: "https://build.nvidia.com/stepfun-ai/step-5-preview",
     },
 ];
 // END NVIDIA NIM FALLBACK MODELS
