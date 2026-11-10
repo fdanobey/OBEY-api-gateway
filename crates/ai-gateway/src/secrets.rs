@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use std::fs;
 use std::path::PathBuf;
@@ -48,7 +49,7 @@ pub fn load_or_create_master_key() -> Result<[u8; KEY_SIZE], SecretError> {
     }
 
     let mut key = [0u8; KEY_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    SysRng.try_fill_bytes(&mut key).expect("OS RNG failed while generating master key");
 
     fs::write(&key_path, STANDARD.encode(key))
         .map_err(|e| SecretError::WriteMasterKey(e.to_string()))?;
@@ -74,7 +75,7 @@ pub fn encrypt_provider_secret_with_key(
     plaintext: &str,
 ) -> Result<String, SecretError> {
     let mut nonce_bytes = [0u8; NONCE_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    SysRng.try_fill_bytes(&mut nonce_bytes).expect("OS RNG failed while generating encryption nonce");
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
     let unbound = UnboundKey::new(&AES_256_GCM, key).map_err(|_| SecretError::EncryptFailed)?;
     let cipher = LessSafeKey::new(unbound);

@@ -26,8 +26,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::Utc;
 use dashmap::DashMap;
-use rand::rngs::OsRng;
-use rand::RngCore as _;
+use rand::rngs::SysRng;
+use rand::TryRng as _;
 use uuid::Uuid;
 
 use crate::secrets;
@@ -331,7 +331,7 @@ where
 /// characters derived from 32 cryptographically secure random bytes.
 fn generate_key_value() -> String {
     let mut bytes = [0u8; KEY_RANDOM_BYTES];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng.try_fill_bytes(&mut bytes).expect("OS RNG failed while generating virtual key value");
     let encoded = URL_SAFE_NO_PAD.encode(bytes);
     format!("{KEY_PREFIX}{encoded}")
 }
@@ -578,7 +578,7 @@ mod property_tests {
 
         /// `generate_key_value()` takes no input; the `_seed` argument only
         /// drives proptest to invoke generation across many independent cases,
-        /// exercising the underlying `OsRng` randomness. The invariant must hold
+        /// exercising the underlying `SysRng` randomness. The invariant must hold
         /// every case.
         #[test]
         fn prop_key_generation_produces_valid_keys(_seed in any::<u32>()) {

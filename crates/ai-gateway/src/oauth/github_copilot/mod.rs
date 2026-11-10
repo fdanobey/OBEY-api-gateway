@@ -25,7 +25,8 @@ pub mod device_flow;
 pub mod manager;
 pub mod store;
 
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 
 /// Generate a fresh, random, UUID-v4-shaped machine identifier.
 ///
@@ -39,7 +40,7 @@ use rand::RngCore;
 /// to surface in non-secret diagnostics, unlike the token fields.
 pub fn generate_machine_id() -> String {
     let mut bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    SysRng.try_fill_bytes(&mut bytes).expect("OS RNG failed while generating machine id");
     // Force UUID version 4 (random) and RFC 4122 variant bits so the id is
     // shape-compatible with the machine ids emitted by first-party clients.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

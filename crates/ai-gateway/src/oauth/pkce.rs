@@ -5,7 +5,8 @@
 //! [`design.md` §1 "PKCE Module"](../../../../.kiro/specs/openai-oauth-login/design.md).
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rand::{rngs::OsRng, RngCore};
+use rand::rngs::SysRng;
+use rand::TryRng;
 use ring::digest::{digest, SHA256};
 
 /// A PKCE verifier/challenge pair produced by [`generate_pkce`].
@@ -26,7 +27,7 @@ pub struct PkceChallenge {
 /// - SHA-256 of the verifier ASCII bytes → base64url-no-pad challenge (43 chars)
 pub fn generate_pkce() -> PkceChallenge {
     let mut verifier_bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut verifier_bytes);
+    SysRng.try_fill_bytes(&mut verifier_bytes).expect("OS RNG failed while generating PKCE verifier");
     let code_verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
 
     let hash = digest(&SHA256, code_verifier.as_bytes());
@@ -42,7 +43,7 @@ pub fn generate_pkce() -> PkceChallenge {
 /// base64url-no-pad (22 characters).
 pub fn generate_state() -> String {
     let mut state_bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut state_bytes);
+    SysRng.try_fill_bytes(&mut state_bytes).expect("OS RNG failed while generating OAuth state");
     URL_SAFE_NO_PAD.encode(state_bytes)
 }
 
@@ -57,7 +58,7 @@ mod tests {
     // For all generated PKCE pairs, the `code_verifier` is exactly 43 characters
     // long and contains only base64url characters `[A-Za-z0-9_-]`.
     //
-    // `generate_pkce()` draws entropy from `OsRng`, so we drive many iterations
+    // `generate_pkce()` draws entropy from `SysRng`, so we drive many iterations
     // by threading a throwaway proptest-generated seed through the test body;
     // each invocation samples a fresh verifier from the RNG.
     proptest! {
@@ -101,7 +102,7 @@ mod tests {
     // encoded verifier string) is detected.
     //
     // The `_seed` input only drives proptest iteration count; entropy for
-    // the PKCE pair comes from `OsRng` inside `generate_pkce()`.
+    // the PKCE pair comes from `SysRng` inside `generate_pkce()`.
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 64,
@@ -148,7 +149,7 @@ mod tests {
     // specific encoded string length.
     //
     // The `_seed` input only drives proptest iteration count; entropy for the
-    // state value comes from `OsRng` inside `generate_state()`.
+    // state value comes from `SysRng` inside `generate_state()`.
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 64,
