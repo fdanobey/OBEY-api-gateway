@@ -12440,7 +12440,7 @@ Ok(StreamingResponse::PassThrough {
 		jitter_enabled: bool,
 		jitter_ratio: f64,
 	) -> Duration {
-		let mut rng = rand::thread_rng();
+		let mut rng = rand::rng();
 		Self::calculate_retry_delay_with_rng(
 			&mut rng,
 			base_delay_secs,
@@ -12458,13 +12458,15 @@ Ok(StreamingResponse::PassThrough {
 		jitter_enabled: bool,
 		jitter_ratio: f64,
 	) -> Duration {
+		use rand::RngExt;
+
 		if !jitter_enabled || jitter_ratio <= 0.0 {
 			return Duration::from_secs(base_delay_secs);
 		}
 
 		let lower_bound = (1.0 - jitter_ratio).max(0.0);
 		let upper_bound = 1.0 + jitter_ratio;
-		let multiplier = rng.gen_range(lower_bound..=upper_bound);
+		let multiplier = rng.random_range(lower_bound..=upper_bound);
 		Duration::from_secs_f64((base_delay_secs as f64) * multiplier)
 	}
 }
