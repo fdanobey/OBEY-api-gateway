@@ -128,6 +128,10 @@ pub struct Metrics {
     /// Cache statistics
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    /// Sticky-routing affinity re-pins (retry-failover-core-overhaul,
+    /// Req 6.4): a failed-over request succeeded on a different provider
+    /// than its sticky pin. Plain global counter — no ledger rows.
+    sticky_repins_total: AtomicU64,
     /// Guardrail stage execution counter, keyed by
     /// (pipeline, stage, provider_type, action). `action` is one of
     /// `pass`, `block`, `redact`, `mask`, `replace_with_policy_message`, `error`
@@ -617,6 +621,11 @@ pub struct MetricsSnapshot {
     #[serde(default)]
     pub rate_limit_exhaustions_by_provider: Vec<(String, u64)>,
     pub cache_hit_rate: Option<f64>,
+    /// Sticky-routing affinity re-pins since startup
+    /// (retry-failover-core-overhaul, Req 6.4): failed-over requests
+    /// that succeeded on a different provider than their sticky pin.
+    #[serde(default)]
+    pub sticky_repins_total: u64,
     /// Per-model circuit breaker states: Vec of (key, state) where key is "provider:model"
     /// and state is "closed", "open", or "half_open".
     #[serde(default)]
@@ -1000,6 +1009,7 @@ impl Metrics {
             rate_limit_exhaustions_by_provider: Arc::new(DashMap::new()),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            sticky_repins_total: AtomicU64::new(0),
             guardrail_stage_executions: Arc::new(DashMap::new()),
             guardrail_stage_latency: Arc::new(DashMap::new()),
             guardrail_refusal_detected: Arc::new(DashMap::new()),
@@ -2733,6 +2743,15 @@ Total unicode_stego provider detections by category and phase\n",
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a sticky-routing affinity re-pin: a request whose sticky
+    /// entry pointed at provider A succeeded on provider B after failover
+    /// (retry-failover-core-overhaul, Req 6.4). Counter only — the
+    /// failover attempt ledger rows already tell the per-attempt story.
+    #[inline]
+    pub fn record_sticky_repin(&self) {
+        self.sticky_repins_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Get current metrics snapshot
     pub fn snapshot(&self) -> MetricsSnapshot {
         let completed = self.completed_requests.load(Ordering::Relaxed);
@@ -2915,9 +2934,10 @@ Total unicode_stego provider detections by category and phase\n",
             retry_delay_ms_by_provider,
             budget_limit_by_provider,
             budget_exhaustions_by_provider,
-            unknown_cost_by_provider,
-            rate_limit_exhaustions_by_provider,
-            cache_hit_rate,
+        unknown_cost_by_provider,
+        rate_limit_exhaustions_by_provider,
+        cache_hit_rate,
+        sticky_repins_total: self.sticky_repins_total.load(Ordering::Relaxed),
             circuit_breaker_states: Vec::new(),
             active_requests_list: Vec::new(),
             budget_status_by_provider: self.budget_status_by_provider(),

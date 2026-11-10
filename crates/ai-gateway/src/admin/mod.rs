@@ -5694,6 +5694,77 @@ std::env::remove_var(pass_env);
         let _ = std::fs::remove_dir_all(&config_dir);
     }
 
+    /// Admin-panel parity (retry-failover-core-overhaul, Req 3.7):
+    /// `retry.upstream_retry_after_max_wait_ms` saved through PUT
+    /// /admin/config persists to YAML and comes back from GET; values above
+    /// the 60000 ms cap are rejected by validation on save.
+    #[tokio::test]
+    async fn admin_config_round_trips_upstream_retry_after_max_wait_ms() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "obey-admin-retry-after-wait-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.yaml");
+        let mut initial = test_config_with_auth(false);
+        initial.server.port = 8080;
+        let server = crate::gateway::GatewayServer::new(initial, Some(config_path.clone()))
+            .await
+            .unwrap();
+
+        let get = || {
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/admin/config")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let response = tower::ServiceExt::oneshot(server.build_router(), get())
+            .await
+            .unwrap();
+        let mut config = smart_routing_response_json(response).await;
+        assert_eq!(config["retry"]["upstream_retry_after_max_wait_ms"], json!(0));
+
+        config["retry"]["upstream_retry_after_max_wait_ms"] = json!(60001);
+        let response = tower::ServiceExt::oneshot(
+            server.build_router(),
+            smart_routing_json_request("PUT", "/admin/config", config.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "out-of-range Retry-After wait must be rejected, got {}",
+            response.status()
+        );
+
+        config["retry"]["upstream_retry_after_max_wait_ms"] = json!(15000);
+        let response = tower::ServiceExt::oneshot(
+            server.build_router(),
+            smart_routing_json_request("PUT", "/admin/config", config),
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        let body = smart_routing_response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "PUT /admin/config failed: {body}");
+
+        let saved: Config =
+            serde_yaml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(saved.retry.upstream_retry_after_max_wait_ms, 15000);
+
+        let response = tower::ServiceExt::oneshot(server.build_router(), get())
+            .await
+            .unwrap();
+        let config = smart_routing_response_json(response).await;
+        assert_eq!(
+            config["retry"]["upstream_retry_after_max_wait_ms"],
+            json!(15000)
+        );
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
     fn smart_routing_json_request(
         method: &str,
         uri: &str,

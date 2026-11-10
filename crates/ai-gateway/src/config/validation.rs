@@ -662,6 +662,15 @@ impl Config {
             });
         }
 
+        // retry-failover-core-overhaul, Req 3.7: Retry-After wait bound.
+        if self.retry.upstream_retry_after_max_wait_ms > 60_000 {
+            errors.push(ValidationError::InvalidValue {
+                field: "retry.upstream_retry_after_max_wait_ms".to_string(),
+                value: self.retry.upstream_retry_after_max_wait_ms.to_string(),
+                expected: "a value between 0 and 60000 milliseconds (0 disables the Retry-After wait)".to_string(),
+            });
+        }
+
         if self.tray.splash_duration_ms == 0 {
             errors.push(ValidationError::InvalidValue {
                 field: "tray.splash_duration_ms".to_string(),
@@ -1571,6 +1580,34 @@ mod property_tests {
         config.cache_aware_routing.enabled = true;
         config.cache_aware_routing.stickiness_ttl_seconds = 0;
         assert!(config.validate().is_ok());
+    }
+
+    // retry-failover-core-overhaul, Task 6: Retry-After wait bound.
+    // **Validates: Requirements 3.7, 3.8**
+
+    #[test]
+    fn upstream_retry_after_max_wait_ms_boundaries_are_valid() {
+        // 0 (disabled, default) and 60000 (cap) both pass validation.
+        for wait_ms in [0u64, 60_000] {
+            let mut config = minimal_valid_config();
+            config.retry.upstream_retry_after_max_wait_ms = wait_ms;
+            assert!(
+                config.validate().is_ok(),
+                "wait_ms {wait_ms} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_retry_after_max_wait_ms_above_cap_is_rejected() {
+        let mut config = minimal_valid_config();
+        config.retry.upstream_retry_after_max_wait_ms = 60_001;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, .. }
+                if field == "retry.upstream_retry_after_max_wait_ms"
+        )));
     }
 
     #[test]

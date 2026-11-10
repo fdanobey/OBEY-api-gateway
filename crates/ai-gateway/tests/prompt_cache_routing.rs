@@ -629,3 +629,292 @@ async fn sqlite_request_log_persists_cache_fields() {
         "prefix hash must be hex: {prefix_hash}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Req 6 (retry-failover-core-overhaul): sticky re-pin on failover
+// ---------------------------------------------------------------------------
+
+/// A request whose sticky entry points at provider A fails over (A 500s)
+/// and succeeds on provider B: the entry re-pins to B, the
+/// `sticky_repins_total` counter increments once, and the success is
+/// observed through the router's sticky/metrics state. Mirrors the
+/// failover setup of `same_prefix_requests_stick_to_serving_provider`.
+#[tokio::test]
+async fn successful_failover_repins_sticky_entry_and_increments_counter() {
+    let primary = MockServer::start().await; // provider A (priority 1)
+    let backup = MockServer::start().await; // provider B (priority 2)
+
+    let mut config = cache_config(cache_aware(true));
+    config.providers = vec![
+        provider("primary", &primary.uri()),
+        provider("backup", &backup.uri()),
+    ];
+    config.model_groups = vec![ModelGroup {
+        name: "cache-group".to_string(),
+        version_fallback_enabled: false,
+        compression: None,
+        memory: None,
+        structured_output: None,
+        models: vec![
+            model("primary", "m-primary", 1, 1.0, 1.0, None, None, None),
+            model("backup", "m-backup", 2, 1.0, 1.0, None, None, None),
+        ],
+    }];
+    config.retry.max_retries_per_provider = 0;
+    common::isolate_databases(&mut config);
+    let server = GatewayServer::new(config, None).await.unwrap();
+    let app = server.build_router();
+
+    // Turn 1: `primary` (A) succeeds and pins the sticky entry. The OK
+    // mock is capped at one hit (wiremock `expect` only asserts counts;
+    // it does not stop matching), so turn 2 falls through to the 500.
+    let ok_body = serde_json::json!({
+        "id": "chatcmpl-cache-test",
+        "object": "chat.completion",
+        "created": 1700000000_i64,
+        "model": "gpt-4",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    });
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body))
+        .up_to_n_times(1)
+        .named("primary ok once")
+        .mount(&primary)
+        .await;
+    // Turn 2: `primary` 500s; the gateway fails over to `backup` (B) and
+    // the success path re-pins the entry.
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream boom"))
+        .expect(1)
+        .mount(&primary)
+        .await;
+    mount_completion_mock(&backup, plain_usage(), 1).await;
+
+    let (status, _) = post_chat(app.clone(), "cache-group", "turn one question").await;
+    assert_eq!(status, StatusCode::OK);
+    // Same conversation prefix: the pre-failover turn must pin A first.
+    let pinned = server
+        .state
+        .router
+        .sticky_entry_for_request(&prefix_probe_request("turn two question"));
+    let pinned = pinned.as_ref().map(|entry| entry.provider_id.as_str());
+    assert_eq!(
+        pinned,
+        Some("primary"),
+        "turn one must pin the sticky entry to `primary`"
+    );
+    assert_eq!(
+        server.state.metrics.snapshot().sticky_repins_total,
+        0,
+        "no re-pin before any failover"
+    );
+
+    let (status, _) = post_chat(app, "cache-group", "turn two question").await;
+    assert_eq!(status, StatusCode::OK, "failover must succeed");
+
+    let repinned = server
+        .state
+        .router
+        .sticky_entry_for_request(&prefix_probe_request("turn two question"));
+    let repinned = repinned.as_ref().map(|entry| {
+        (
+            entry.provider_id.as_str(),
+            entry.model_id.as_str(),
+        )
+    });
+    assert_eq!(
+        repinned,
+        Some(("backup", "m-backup")),
+        "failover success must re-pin the sticky entry to `backup`"
+    );
+    assert_eq!(
+        server.state.metrics.snapshot().sticky_repins_total,
+        1,
+        "exactly one re-pin for the failed-over request"
+    );
+
+    primary.verify().await;
+    backup.verify().await;
+}
+
+/// No-provider-failover success on the SAME provider as the pin is a
+/// refresh (sticky_recorded), never a re-pin: the counter stays flat.
+#[tokio::test]
+async fn same_provider_success_does_not_increment_repin_counter() {
+    let upstream = MockServer::start().await;
+
+    let mut config = cache_config(cache_aware(true));
+    config.providers = vec![provider("solo", &upstream.uri())];
+    config.model_groups = vec![ModelGroup {
+        name: "cache-group".to_string(),
+        version_fallback_enabled: false,
+        compression: None,
+        memory: None,
+        structured_output: None,
+        models: vec![model("solo", "m-solo", 1, 1.0, 1.0, None, None, None)],
+    }];
+    common::isolate_databases(&mut config);
+    let server = GatewayServer::new(config, None).await.unwrap();
+    let app = server.build_router();
+
+    mount_completion_mock(&upstream, plain_usage(), 2).await;
+    let (status, _) = post_chat(app.clone(), "cache-group", "turn one question").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_chat(app.clone(), "cache-group", "turn two question").await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        server.state.metrics.snapshot().sticky_repins_total,
+        0,
+        "same-provider successes never count as re-pins"
+    );
+    let pinned = server
+        .state
+        .router
+        .sticky_entry_for_request(&prefix_probe_request("turn two question"));
+    let pinned = pinned.as_ref().map(|entry| entry.provider_id.as_str());
+    assert_eq!(pinned, Some("solo"));
+}
+
+/// Re-pinning adds no ledger rows: the requests log for the failover
+/// test flow contains only the ordinary request/outcome + #attempt rows
+/// (already covered elsewhere); specifically no extra row is written for
+/// the re-pin event itself. Row count for the conversation is asserted
+/// against the no-failover baseline (1 row per request).
+#[tokio::test]
+async fn sticky_repin_writes_no_extra_ledger_rows() {
+    async fn run(failover: bool) -> (u64, GatewayServer) {
+        let primary = MockServer::start().await;
+        let backup = MockServer::start().await;
+        let mut config = cache_config(cache_aware(true));
+        config.providers = vec![
+            provider("primary", &primary.uri()),
+            provider("backup", &backup.uri()),
+        ];
+        config.model_groups = vec![ModelGroup {
+            name: "cache-group".to_string(),
+            version_fallback_enabled: false,
+            compression: None,
+            memory: None,
+            structured_output: None,
+            models: vec![
+                model("primary", "m-primary", 1, 1.0, 1.0, None, None, None),
+                model("backup", "m-backup", 2, 1.0, 1.0, None, None, None),
+            ],
+        }];
+        config.retry.max_retries_per_provider = 0;
+        common::isolate_databases(&mut config);
+        let server = GatewayServer::new(config, None).await.unwrap();
+        let app = server.build_router();
+
+        // Turn 1 pin: OK once (capped — `expect` does not stop matching),
+        // then either the 500 (failover run) or another OK (baseline run).
+        let ok_body = serde_json::json!({
+            "id": "chatcmpl-cache-test",
+            "object": "chat.completion",
+            "created": 1700000000_i64,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body.clone()))
+            .up_to_n_times(1)
+            .named("primary ok once")
+            .mount(&primary)
+            .await;
+        if failover {
+            Mock::given(wm_method("POST"))
+                .and(wm_path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("upstream boom"))
+                .expect(1)
+                .mount(&primary)
+                .await;
+            mount_completion_mock(&backup, plain_usage(), 1).await;
+        } else {
+            Mock::given(wm_method("POST"))
+                .and(wm_path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body))
+                .expect(1)
+                .named("primary ok twice")
+                .mount(&primary)
+                .await;
+            mount_completion_mock(&backup, plain_usage(), 0).await;
+        }
+
+        let (status, _) = post_chat(app.clone(), "cache-group", "turn one question").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_chat(app, "cache-group", "turn two question").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The logger drains an async writer queue — poll until the rows
+        // land, then count ALL rows for the conversation.
+        let mut rows = Vec::new();
+        for _ in 0..50 {
+            rows = server
+                .state
+                .logger
+                .query(ai_gateway::logger::LogFilter {
+                    limit: Some(50),
+                    ..Default::default()
+                })
+                .unwrap();
+            if rows.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let total = rows
+            .iter()
+            .filter(|row| row.path == "/v1/chat/completions")
+            .count() as u64;
+        (total, server)
+    }
+
+    // Baseline: two requests, no failover → 2 outcome rows.
+    let (baseline_rows, baseline_server) = run(false).await;
+    assert_eq!(baseline_rows, 2);
+    assert_eq!(baseline_server.state.metrics.snapshot().sticky_repins_total, 0);
+
+    // Failover: re-pin happens (counter proves it) yet the row count is
+    // identical — no ledger rows are written for the re-pin.
+    let (failover_rows, failover_server) = run(true).await;
+    assert_eq!(
+        failover_server.state.metrics.snapshot().sticky_repins_total,
+        1,
+        "failover run must have re-pinned"
+    );
+    assert_eq!(
+        failover_rows, baseline_rows,
+        "re-pin must not add ledger rows (failover attempt rows are the same #attempt rows either way)"
+    );
+}
+
+/// The original `chat_request` body as a parsed request, with `turn` as
+/// the conversation tail — used to compute the same prefix hash the
+/// routing path saw (prefix excludes the newest user turn).
+fn prefix_probe_request(turn: &str) -> ai_gateway::models::openai::OpenAIRequest {
+    let body = serde_json::to_string(&serde_json::json!({
+        "model": "cache-group",
+        "messages": [
+            {"role": "system", "content": "You are terse but thorough."},
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": turn}
+        ]
+    }))
+    .unwrap();
+    serde_json::from_str(&body).expect("probe request must deserialize")
+}

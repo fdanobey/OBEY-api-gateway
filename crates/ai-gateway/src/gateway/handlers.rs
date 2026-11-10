@@ -1020,6 +1020,31 @@ fn attach_trace_id_header(response: &mut Response, trace_id: &str) {
     }
 }
 
+/// Header name for the attempt-count response header
+/// (retry-failover-core-overhaul Req 5.1-5.4).
+const ATTEMPT_COUNT_HEADER: &str = "x-obey-attempt-count";
+
+/// `x-obey-attempt-count` header value from the handle's monotonic ledger
+/// row total (failed upstream sends plus recorded skips — it survives the
+/// outcome-log drain, unlike the live slice) plus `success_send`: the
+/// terminal successful send never occupies a ledger row, so a no-failover
+/// success counts 1 (Req 5.2) and a failover success counts rows + 1.
+/// Error responses pass `success_send = false`: every failed send is
+/// already a ledger row.
+fn attempt_count_header_value_from_total(total: usize, success_send: bool) -> u16 {
+    let count = total + usize::from(success_send);
+    u16::try_from(count).unwrap_or(u16::MAX)
+}
+
+/// Raw header insertion from an already-computed count.
+fn insert_attempt_count_header(response: &mut Response, count: u16) {
+    if let Ok(header_value) = HeaderValue::from_str(&count.to_string()) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(ATTEMPT_COUNT_HEADER), header_value);
+    }
+}
+
 const VALIDATION_STATUS_HEADER: &str = "x-obey-validation-status";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1133,6 +1158,7 @@ fn eager_sse_response(
     trace_id: &str,
     validation_status: Option<ValidationResponseStatus>,
     routing_headers: Option<HeaderMap>,
+    attempt_count: Option<u16>,
 ) -> Response {
     let stream = futures::stream::iter(events.into_iter().map(Ok::<_, Infallible>));
     let mut response = Sse::new(stream)
@@ -1143,6 +1169,9 @@ fn eager_sse_response(
     }
     if let Some(status) = validation_status {
         attach_validation_status_header(&mut response, status, true);
+    }
+    if let Some(count) = attempt_count {
+        insert_attempt_count_header(&mut response, count);
     }
     attach_trace_id_header(&mut response, trace_id);
     response
@@ -1644,6 +1673,17 @@ fn guardrail_error_response(
     );
     let mut response = error.into_response();
     attach_trace_id_header(&mut response, trace_id);
+    // Guardrail rejections: any pre-routing ledger rows (e.g. skips
+    // recorded before the policy verdict) make up the count; the
+    // request never completed a successful send, so no +1 (Req 5.3).
+    let attempt_rows = request_guard
+        .active_handle()
+        .map(|handle| handle.attempt_rows_total())
+        .unwrap_or(0);
+    insert_attempt_count_header(
+        &mut response,
+        attempt_count_header_value_from_total(attempt_rows, false),
+    );
     response
 }
 
@@ -2405,6 +2445,8 @@ fn build_active_request_info(
         kind,
         smart_routing_logged: false,
         failed_attempts: Vec::new(),
+        attempt_rows_total: 0,
+        rate_limit_wait_done: false,
         outcome_logged: false,
         breaker_skips_recorded: false,
         reasoning_relay: None,
@@ -2550,11 +2592,15 @@ async fn chat_completions_non_stream(
         if let Ok(resp) =
             serde_json::from_str::<crate::models::openai::OpenAIResponse>(&cached_json)
         {
-            state.metrics.record_cache_hit();
-            request_guard.complete();
-            let mut http = openai_json_response(&resp);
-            attach_trace_id_header(&mut http, &trace_id);
-            return http;
+        state.metrics.record_cache_hit();
+        request_guard.complete();
+        let mut http = openai_json_response(&resp);
+        attach_trace_id_header(&mut http, &trace_id);
+        // Exact-cache hit: no upstream attempt was made, so the request's
+        // ledger count at finalization is 0 (Req 5.1 — every response
+        // carries the header; no-try cache hits document "0").
+        insert_attempt_count_header(&mut http, 0);
+        return http;
         }
     } else if state.exact_cache.is_eligible(&request) {
         state.metrics.record_cache_miss();
@@ -2579,12 +2625,14 @@ async fn chat_completions_non_stream(
                     match serde_json::from_str::<crate::models::openai::OpenAIResponse>(
                         &cached_response,
                     ) {
-                        Ok(resp) => {
-                            request_guard.complete();
-                            let mut response = openai_json_response(&resp);
-                            attach_trace_id_header(&mut response, &trace_id);
-                            return response;
-                        }
+            Ok(resp) => {
+                request_guard.complete();
+                let mut response = openai_json_response(&resp);
+                attach_trace_id_header(&mut response, &trace_id);
+                // Semantic-cache hit: no upstream attempt (see exact-cache).
+                insert_attempt_count_header(&mut response, 0);
+                return response;
+            }
                         Err(_) => {
                             tracing::warn!(
                                 "Failed to parse cached response, falling through to provider"
@@ -3357,28 +3405,48 @@ match engine
                     .map(|memory| (&memory.context, &memory.injection)),
                 Some(memory_extraction),
             );
-            // Log any failed provider attempts masked by this success BEFORE
-            // the response's gateway extras are stripped for the client.
-            log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry());
-            let mut http_response = openai_json_response(&response);
-            attach_validation_status_header(
-                &mut http_response,
-                validation_status,
-                requests_json_schema(&request),
-            );
-            attach_trace_id_header(&mut http_response, &trace_id);
-            http_response
-        }
-        Err(e) => {
-            let duration_ms = request_guard.complete();
-            let log_context =
-                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
-            log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry());
-            let mut response = e.into_response();
-            attach_trace_id_header(&mut response, &trace_id);
-            response
-        }
-    }
+    // Log any failed provider attempts masked by this success BEFORE
+    // the response's gateway extras are stripped for the client.
+    log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry());
+    let mut http_response = openai_json_response(&response);
+    attach_validation_status_header(
+        &mut http_response,
+        validation_status,
+        requests_json_schema(&request),
+    );
+    attach_trace_id_header(&mut http_response, &trace_id);
+    // Buffered success: attempt count = ledger rows + 1 (the terminal
+    // successful send never occupies a ledger row; no-failover = 1,
+    // Req 5.2). log_outcome above drained the live slice, so the
+    // monotonic total on the handle is the only surviving source.
+    insert_attempt_count_header(
+        &mut http_response,
+        attempt_count_header_value_from_total(
+            active_handle.attempt_rows_total(),
+            true,
+        ),
+    );
+    http_response
+}
+Err(e) => {
+    let duration_ms = request_guard.complete();
+    let log_context =
+        RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
+    log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry());
+    let mut response = e.into_response();
+    attach_trace_id_header(&mut response, &trace_id);
+    // Error path: every failed upstream send is already a ledger row,
+    // so the count is the row total as-is (Req 5.3).
+    insert_attempt_count_header(
+        &mut response,
+        attempt_count_header_value_from_total(
+            active_handle.attempt_rows_total(),
+            false,
+        ),
+    );
+    response
+}
+}
 }
 
 async fn chat_completions_stream(
@@ -3499,6 +3567,8 @@ drop(memory_stall);
                 .keep_alive(build_keepalive(&streaming_config))
                 .into_response();
             attach_trace_id_header(&mut sse, &trace_id);
+            // Exact-cache hit on the stream path: no upstream attempt (0).
+            insert_attempt_count_header(&mut sse, 0);
             return sse;
         }
     } else if state.exact_cache.is_eligible(&request) {
@@ -3648,12 +3718,15 @@ if let Some(engine) = guardrail_engine.as_ref() {
         // Pre-generate a stable id + timestamp so the early event and every
         // subsequent chunk can share them (Req 1.3; threaded into downstream
         // chunks by task 2.2).
-        let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-        let created = chrono::Utc::now().timestamp();
-        let requested_model = request.model.clone();
-        let early_chunk = early_event_chunk(&response_id, created, &requested_model);
-        let stream_trace_id = trace_id.clone();
-        let active_handle_stream = active_handle.clone();
+let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+let created = chrono::Utc::now().timestamp();
+let requested_model = request.model.clone();
+let early_chunk = early_event_chunk(&response_id, created, &requested_model);
+let stream_trace_id = trace_id.clone();
+let active_handle_stream = active_handle.clone();
+// Header-time attempt-count snapshot: taken before the handle moves
+// into the stream generator (headers commit before routing runs).
+let early_attempt_rows = active_handle.attempt_rows_total();
 
         let streaming_config_relay = streaming_config.clone();
         let stream = async_stream::stream! {
@@ -4388,14 +4461,23 @@ if let Some(engine) = guardrail_engine.as_ref() {
                             _guard.complete();
                         };
 
-        let mut sse = Sse::new(stream)
-            .keep_alive(build_keepalive(&streaming_config))
-            .into_response();
-        attach_trace_id_header(&mut sse, &trace_id);
-        return sse;
-    }
+    let mut sse = Sse::new(stream)
+        .keep_alive(build_keepalive(&streaming_config))
+        .into_response();
+attach_trace_id_header(&mut sse, &trace_id);
+// Early-event SSE: headers commit before routing runs inside the
+// stream body, so the best-known count at emission time is the ledger
+// total snapshot taken before the handle moved into the stream
+// (typically 0 — routing failures surface as SSE error events, not
+// header changes; documented timing choice).
+insert_attempt_count_header(
+    &mut sse,
+    attempt_count_header_value_from_total(early_attempt_rows, false),
+);
+return sse;
+}
 
-    // Early event disabled (Req 1.6): preserve the original buffer-and-replay
+// Early event disabled (Req 1.6): preserve the original buffer-and-replay
     // flow where route_request() runs first and pre-stream errors return a
     // proper HTTP status code.
     //
@@ -4444,13 +4526,19 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     request_guard.active_handle(),
                     request_guard.inbound_telemetry(),
                 );
-                let mut response = e.into_response();
-                attach_trace_id_header(&mut response, &trace_id);
-                return response;
-            }
-        }
-    } else {
-        // Pre-generate the shared envelope (same convention as the final
+    let mut response = e.into_response();
+    attach_trace_id_header(&mut response, &trace_id);
+    // Pre-stream routing error (relay disabled): headers emit after
+    // routing resolved, so the count is the full ledger total.
+    insert_attempt_count_header(
+        &mut response,
+        attempt_count_header_value_from_total(active_handle.attempt_rows_total(), false),
+    );
+    return response;
+}
+}
+} else {
+// Pre-generate the shared envelope (same convention as the final
         // re-chunk's provider id/created override in the early-event path):
         // every relayed frame and the final replay line up on one id/created.
         let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -4539,11 +4627,17 @@ let first_step = loop {
                     request_guard.active_handle(),
                     request_guard.inbound_telemetry(),
                 );
-                let mut response = e.into_response();
-                attach_trace_id_header(&mut response, &trace_id);
-                return response;
-            }
-            step => step,
+            let mut response = e.into_response();
+            attach_trace_id_header(&mut response, &trace_id);
+            // First-step routing error (relay enabled): headers emit after
+            // routing resolved, so the count is the full ledger total.
+            insert_attempt_count_header(
+                &mut response,
+                attempt_count_header_value_from_total(active_handle.attempt_rows_total(), false),
+            );
+            return response;
+        }
+        step => step,
         };
 
         let mut relayed_any = false;
@@ -4757,12 +4851,20 @@ log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbou
                 _guard.complete();
             };
 
-        let mut sse = Sse::new(stream)
-            .keep_alive(build_keepalive(&streaming_config_relay))
-            .into_response();
-        attach_trace_id_header(&mut sse, &trace_id);
-        return sse;
-    };
+    let mut sse = Sse::new(stream)
+        .keep_alive(build_keepalive(&streaming_config_relay))
+        .into_response();
+    attach_trace_id_header(&mut sse, &trace_id);
+    // Relay-enabled fallback SSE: like the early-event path, headers
+    // commit before routing resolves inside the stream; emit the
+    // best-known count at header time (pre-stream routing errors were
+    // returned as HTTP errors above, so this is typically 0).
+    insert_attempt_count_header(
+        &mut sse,
+        attempt_count_header_value_from_total(active_handle.attempt_rows_total(), false),
+    );
+    return sse;
+};
 
     // Buffer-and-replay: store the assembled response in the exact cache so
     // a subsequent identical request (streaming or not) replays without
@@ -4829,9 +4931,18 @@ request_guard.inbound_telemetry(),
 
     request_guard.complete();
 
-    Sse::new(stream)
+    // Buffered (relay-disabled) SSE: routing resolved before headers,
+    // and log_outcome above drained the ledger — the monotonic total
+    // plus the terminal successful send gives the accurate count.
+    let mut sse = Sse::new(stream)
         .keep_alive(build_keepalive(&streaming_config))
-        .into_response()
+        .into_response();
+    attach_trace_id_header(&mut sse, &trace_id);
+    insert_attempt_count_header(
+        &mut sse,
+        attempt_count_header_value_from_total(active_handle.attempt_rows_total(), true),
+    );
+    sse
 }
 
 #[derive(Debug)]
@@ -5362,13 +5473,17 @@ async fn stream_eager_structured_output(
                             request_guard.active_handle(),
                             request_guard.inbound_telemetry(),
                         );
-                        return eager_sse_response(
-                            structured_stream_overflow_events(&trace_id),
-                            &streaming_config,
-                            &trace_id,
-                            None,
-                            None,
-                        );
+        return eager_sse_response(
+            structured_stream_overflow_events(&trace_id),
+            &streaming_config,
+            &trace_id,
+            None,
+            None,
+            Some(attempt_count_header_value_from_total(
+                active.as_ref().map_or(0, |h| h.attempt_rows_total()),
+                false,
+            )),
+        );
                     }
                     Err(error) => {
                         let gateway_error = GatewayError::GuardrailUnavailable(format!(
@@ -5388,17 +5503,21 @@ async fn stream_eager_structured_output(
                             request_guard.active_handle(),
                             request_guard.inbound_telemetry(),
                         );
-            return eager_sse_response(
-                emit_sse_error_event(
-                    "stream_error",
-                    &gateway_error.to_string(),
-                    &trace_id,
-                ),
-                &streaming_config,
+        return eager_sse_response(
+            emit_sse_error_event(
+                "stream_error",
+                &gateway_error.to_string(),
                 &trace_id,
-                None,
-                None,
-            );
+            ),
+            &streaming_config,
+            &trace_id,
+            None,
+            None,
+            Some(attempt_count_header_value_from_total(
+                active.as_ref().map_or(0, |h| h.attempt_rows_total()),
+                false,
+            )),
+        );
         }
     }
     }
@@ -5422,16 +5541,20 @@ async fn stream_eager_structured_output(
                         request_guard.active_handle(),
                         request_guard.inbound_telemetry(),
                     );
-                    return eager_sse_response(
-                        emit_sse_error_event("stream_error", &gateway_error.to_string(), &trace_id),
-                        &streaming_config,
-                        &trace_id,
-                        None,
-                        None,
-                    );
-                }
-            };
-            if !assembled.complete {
+        return eager_sse_response(
+            emit_sse_error_event("stream_error", &gateway_error.to_string(), &trace_id),
+            &streaming_config,
+            &trace_id,
+            None,
+            None,
+            Some(attempt_count_header_value_from_total(
+                active.as_ref().map_or(0, |h| h.attempt_rows_total()),
+                false,
+            )),
+        );
+    }
+};
+if !assembled.complete {
                 let message = "Upstream stream ended before a complete structured output response";
                 let gateway_error = GatewayError::GuardrailUnavailable(message.to_owned());
                 let duration_ms = request_guard.complete();
@@ -5448,16 +5571,20 @@ async fn stream_eager_structured_output(
                     request_guard.active_handle(),
                     request_guard.inbound_telemetry(),
                 );
-                return eager_sse_response(
-                    emit_sse_error_event("stream_error", message, &trace_id),
-                    &streaming_config,
-                    &trace_id,
-                    None,
-                    None,
-                );
-            }
+        return eager_sse_response(
+            emit_sse_error_event("stream_error", message, &trace_id),
+            &streaming_config,
+            &trace_id,
+            None,
+            None,
+            Some(attempt_count_header_value_from_total(
+                active.as_ref().map_or(0, |h| h.attempt_rows_total()),
+                false,
+            )),
+        );
+    }
 
-            let mut response = assembled.response;
+    let mut response = assembled.response;
             response.extra.insert(
                 "gateway_provider".to_owned(),
                 serde_json::Value::String(provider),
@@ -5492,18 +5619,22 @@ async fn stream_eager_structured_output(
                 request_guard.active_handle(),
                 request_guard.inbound_telemetry(),
             );
-            let (error_type, message) = classify_stream_error(&error);
-            return eager_sse_response(
-                emit_sse_error_event(error_type, &message, &trace_id),
-                &streaming_config,
-                &trace_id,
-                None,
-                None,
-            );
-        }
-    };
+    let (error_type, message) = classify_stream_error(&error);
+    return eager_sse_response(
+        emit_sse_error_event(error_type, &message, &trace_id),
+        &streaming_config,
+        &trace_id,
+        None,
+        None,
+        Some(attempt_count_header_value_from_total(
+            active.as_ref().map_or(0, |h| h.attempt_rows_total()),
+            false,
+        )),
+    );
+}
+};
 
-    response = match finalize_eager_post_call(
+response = match finalize_eager_post_call(
         &state,
         &request,
         response,
@@ -5525,11 +5656,21 @@ async fn stream_eager_structured_output(
                 &request,
                 &log_context,
                 request_guard.active_handle(),
-                request_guard.inbound_telemetry(),
-            );
-            return eager_sse_response(events, &streaming_config, &trace_id, None, None);
-        }
-    };
+    request_guard.inbound_telemetry(),
+    );
+    return eager_sse_response(
+        events,
+        &streaming_config,
+        &trace_id,
+        None,
+        None,
+        Some(attempt_count_header_value_from_total(
+            active.as_ref().map_or(0, |h| h.attempt_rows_total()),
+            false,
+        )),
+    );
+}
+};
 
 let (response, validation_status) = match validate_eager_structured_response(
     &state,
@@ -5554,12 +5695,22 @@ let (response, validation_status) = match validate_eager_structured_response(
                 &request,
                 &log_context,
                 request_guard.active_handle(),
-                request_guard.inbound_telemetry(),
-            );
-            return eager_sse_response(events, &streaming_config, &trace_id, None, None);
-        }
-        Err(EagerPostCallResult::Response(_)) => unreachable!(),
-    };
+        request_guard.inbound_telemetry(),
+    );
+    return eager_sse_response(
+        events,
+        &streaming_config,
+        &trace_id,
+        None,
+        None,
+        Some(attempt_count_header_value_from_total(
+            active.as_ref().map_or(0, |h| h.attempt_rows_total()),
+            false,
+        )),
+    );
+}
+Err(EagerPostCallResult::Response(_)) => unreachable!(),
+};
 
     if should_cache_eager_structured(&request, Some(&response), Some(validation_status)) {
         if let Ok(json) = serde_json::to_string(&response) {
@@ -5586,19 +5737,23 @@ let (response, validation_status) = match validate_eager_structured_response(
     let log_context =
 RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response)
 .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
-log_outcome(
-&state,
-&request,
-&log_context,
-request_guard.active_handle(),
-request_guard.inbound_telemetry(),
-);
-eager_sse_response(
+    log_outcome(
+        &state,
+        &request,
+        &log_context,
+        request_guard.active_handle(),
+        request_guard.inbound_telemetry(),
+    );
+    eager_sse_response(
         events,
         &streaming_config,
         &trace_id,
         Some(validation_status),
         Some(routing_headers),
+        Some(attempt_count_header_value_from_total(
+            active.as_ref().map_or(0, |h| h.attempt_rows_total()),
+            true,
+        )),
     )
 }
 
@@ -6277,6 +6432,16 @@ assembled = Some(a.response);
         .keep_alive(build_keepalive(&streaming_config))
         .into_response();
     attach_trace_id_header(&mut sse, &trace_id);
+    // Post-call buffered SSE: headers commit before routing resolves
+    // inside the stream (buffering under the guardrail pipeline), so
+    // emit the best-known count at header time (documented timing).
+    insert_attempt_count_header(
+        &mut sse,
+        attempt_count_header_value_from_total(
+            active.as_ref().map_or(0, |handle| handle.attempt_rows_total()),
+            false,
+        ),
+    );
     sse
 }
 
@@ -7878,7 +8043,14 @@ fn anthropic_guardrail_error_response(
         error = %err,
         "Anthropic request rejected by guardrail policy"
     );
-    anthropic_gateway_error_response(&err)
+    let mut response = anthropic_gateway_error_response(&err);
+    // Guardrail rejection: no successful send, count is the ledger row
+    // total as-is (Req 5.3).
+    insert_attempt_count_header(
+        &mut response,
+        attempt_count_header_value_from_total(active_handle.attempt_rows_total(), false),
+    );
+    response
 }
 
 /// Extract ChatDeltas from a chat-completions SSE chunk (delta shape only;
@@ -8197,10 +8369,12 @@ duration_ms,
  &cached_chat,
  &synthesis_ctx,
  );
- let mut http = Json(&response).into_response();
- attach_trace_id_header(&mut http, &trace_id);
- return http;
- }
+            let mut http = Json(&response).into_response();
+            attach_trace_id_header(&mut http, &trace_id);
+            // Exact-cache hit on /v1/messages: no upstream attempt (0).
+            insert_attempt_count_header(&mut http, 0);
+            return http;
+        }
     } else if state.exact_cache.is_eligible(&chat_request) {
         state.metrics.record_cache_miss();
     }
@@ -8409,10 +8583,16 @@ match result {
                 .extra
                 .get(crate::anthropic::passthrough::VERBATIM_RESPONSE_KEY)
             {
-                let mut http = Json(&raw).into_response();
-                attach_trace_id_header(&mut http, &trace_id);
-                return http;
-            }
+        let mut http = Json(&raw).into_response();
+        attach_trace_id_header(&mut http, &trace_id);
+        // Anthropic verbatim relay: routing resolved before headers —
+        // rows + 1 for the terminal successful send.
+        insert_attempt_count_header(
+            &mut http,
+            attempt_count_header_value_from_total(active_handle.attempt_rows_total(), true),
+        );
+        return http;
+    }
 
  let synthesis_ctx = AnthropicSynthesisContext {
  request_model: &request.model,
@@ -8434,24 +8614,37 @@ match result {
  state.exact_cache.set(&chat_request, response_json);
  }
  }
- let mut http = Json(&response).into_response();
- attach_trace_id_header(&mut http, &trace_id);
- http
- }
- Err(err) => {
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let log_context = RequestLogContext::from_error(
-                &chat_request,
-                trace_id.clone(),
-                duration_ms,
-                &err,
-            )
-            .with_anthropic_protocol(claude_session_id);
-            log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
-            request_guard.complete();
-            anthropic_gateway_error_response(&err)
-        }
+        let mut http = Json(&response).into_response();
+        attach_trace_id_header(&mut http, &trace_id);
+        // Anthropic synthesized success: routing resolved before
+        // headers — rows + 1 (Req 5.2).
+        insert_attempt_count_header(
+            &mut http,
+            attempt_count_header_value_from_total(active_handle.attempt_rows_total(), true),
+        );
+        http
     }
+    Err(err) => {
+        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let log_context = RequestLogContext::from_error(
+            &chat_request,
+            trace_id.clone(),
+            duration_ms,
+            &err,
+        )
+        .with_anthropic_protocol(claude_session_id);
+        log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
+        request_guard.complete();
+        let mut response = anthropic_gateway_error_response(&err);
+        // Routing error: every failed send is already a ledger row
+        // (Req 5.3).
+        insert_attempt_count_header(
+            &mut response,
+            attempt_count_header_value_from_total(active_handle.attempt_rows_total(), false),
+        );
+        response
+    }
+}
 }
 
 /// Streaming /v1/messages path (Req 2.1, 2.5, 2.6): buffered dispatch
@@ -8763,12 +8956,18 @@ frame = frame.event(event);
 yield Ok::<_, Infallible>(frame);
 }
 };
-let mut sse = Sse::new(stream)
-.keep_alive(build_keepalive(&streaming_config))
-.into_response();
-attach_trace_id_header(&mut sse, &trace_id);
-return sse;
-}
+            let mut sse = Sse::new(stream)
+                .keep_alive(build_keepalive(&streaming_config))
+                .into_response();
+            attach_trace_id_header(&mut sse, &trace_id);
+            // Verbatim SSE relay: routing resolved (buffered dispatch)
+            // before headers — rows + 1 (Req 5.2).
+            insert_attempt_count_header(
+                &mut sse,
+                attempt_count_header_value_from_total(active_handle.attempt_rows_total(), true),
+            );
+            return sse;
+        }
 
 // Reuse the buffered synthesizer's chunk replay: convert the
 // response into chat streaming chunks, then feed the assembler.
@@ -8797,21 +8996,27 @@ None,
 log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
 request_guard.complete();
 
-let stream = anthropic_replay_stream(
-&request.model,
-chunks,
-finish_reason,
-response_usage,
-input_usage,
-request_stop_sequences.clone(),
-);
-            let mut sse = Sse::new(stream)
-                .keep_alive(build_keepalive(&streaming_config))
-                .into_response();
-            attach_trace_id_header(&mut sse, &trace_id);
-            sse
-        }
-Ok(StreamingResponse::PassThrough {
+        let stream = anthropic_replay_stream(
+            &request.model,
+            chunks,
+            finish_reason,
+            response_usage,
+            input_usage,
+            request_stop_sequences.clone(),
+        );
+        let mut sse = Sse::new(stream)
+            .keep_alive(build_keepalive(&streaming_config))
+            .into_response();
+        attach_trace_id_header(&mut sse, &trace_id);
+        // Buffered-arm SSE: routing resolved before headers — rows + 1
+        // (Req 5.2).
+        insert_attempt_count_header(
+            &mut sse,
+            attempt_count_header_value_from_total(active_handle.attempt_rows_total(), true),
+        );
+        sse
+    }
+    Ok(StreamingResponse::PassThrough {
 byte_stream,
 provider,
 model,
@@ -8819,12 +9024,16 @@ compression,
 concurrency_permit: _,
 smart_routing: _,
 }) => {
-let stream_trace_id = trace_id.clone();
-    let (stream_inbound_telemetry, _stream_emission) = {
-        let (inbound, emission) = request_guard.inbound_and_emission();
-        (inbound.cloned(), emission)
-    };
-let ping_interval = keep_alive_ping_interval(&streaming_config);
+        let stream_trace_id = trace_id.clone();
+        let (stream_inbound_telemetry, _stream_emission) = {
+            let (inbound, emission) = request_guard.inbound_and_emission();
+            (inbound.cloned(), emission)
+        };
+        // Header-time attempt-count snapshot: taken before the handle
+        // moves into the stream generator (headers commit before the
+        // upstream stream resolves).
+        let passthrough_attempt_rows = active_handle.attempt_rows_total();
+        let ping_interval = keep_alive_ping_interval(&streaming_config);
 let stop_sequences = request_stop_sequences.clone();
 let input_token_estimate = input_usage.input_tokens;
 let stream = async_stream::stream! {
@@ -9067,26 +9276,40 @@ let log_context = RequestLogContext::from_streaming_success(
 log_outcome(&state, &chat_request, &log_context, Some(&active_handle), stream_inbound_telemetry.as_ref());
 }
 };
-let mut sse = Sse::new(stream)
-.keep_alive(build_keepalive(&streaming_config))
-.into_response();
-attach_trace_id_header(&mut sse, &trace_id);
-sse
+    let mut sse = Sse::new(stream)
+        .keep_alive(build_keepalive(&streaming_config))
+        .into_response();
+    attach_trace_id_header(&mut sse, &trace_id);
+    // Pass-through SSE: headers commit before routing resolves inside
+    // the stream; emit the best-known count at header time (routing
+    // succeeded enough to yield a byte stream, but later failovers
+    // are not reflected — documented timing choice).
+    insert_attempt_count_header(
+        &mut sse,
+        attempt_count_header_value_from_total(passthrough_attempt_rows, false),
+    );
+    sse
 }
-        Err(err) => {
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let log_context = RequestLogContext::from_error(
-                &chat_request,
-                trace_id.clone(),
-                duration_ms,
-                &err,
-            )
-            .with_anthropic_protocol(claude_session_id);
-            log_outcome(&state, &chat_request, &log_context, Some(&active_handle), inbound_telemetry.as_ref());
-            request_guard.complete();
-            anthropic_gateway_error_response(&err)
-        }
-    }
+Err(err) => {
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let log_context = RequestLogContext::from_error(
+        &chat_request,
+        trace_id.clone(),
+        duration_ms,
+        &err,
+    )
+    .with_anthropic_protocol(claude_session_id);
+    log_outcome(&state, &chat_request, &log_context, Some(&active_handle), inbound_telemetry.as_ref());
+    request_guard.complete();
+    let mut response = anthropic_gateway_error_response(&err);
+    // Streaming routing error: ledger rows as-is (Req 5.3).
+    insert_attempt_count_header(
+        &mut response,
+        attempt_count_header_value_from_total(active_handle.attempt_rows_total(), false),
+    );
+    response
+}
+}
 }
 
 /// Replay a buffered response as Anthropic SSE events (used by the Buffered
@@ -9195,6 +9418,8 @@ pub async fn anthropic_count_tokens(
     );
     let mut response = Json(serde_json::json!({ "input_tokens": input_tokens })).into_response();
     attach_trace_id_header(&mut response, &trace_id);
+    // count_tokens never dispatches to a provider: zero attempts.
+    insert_attempt_count_header(&mut response, 0);
     response
 }
 
@@ -9704,13 +9929,14 @@ async fn responses_guard_complete_then_drop_does_not_double_emit() {
             extra: Default::default(),
         });
         let events = rechunk_structured_response(&response);
-        let response = eager_sse_response(
-            events,
-            &StreamingConfig::default(),
-            "trace-eager",
-            Some(ValidationResponseStatus::Passed),
-            None,
-        );
+    let response = eager_sse_response(
+        events,
+        &StreamingConfig::default(),
+        "trace-eager",
+        Some(ValidationResponseStatus::Passed),
+        None,
+        None,
+    );
         assert_eq!(
             response
                 .headers()
@@ -9739,13 +9965,14 @@ async fn responses_guard_complete_then_drop_does_not_double_emit() {
             None,
             Some(ValidationResponseStatus::Passed)
         ));
-        let response = eager_sse_response(
-            structured_stream_overflow_events("trace-overflow"),
-            &StreamingConfig::default(),
-            "trace-overflow",
-            None,
-            None,
-        );
+    let response = eager_sse_response(
+        structured_stream_overflow_events("trace-overflow"),
+        &StreamingConfig::default(),
+        "trace-overflow",
+        None,
+        None,
+        None,
+    );
         assert!(response.headers().get("x-obey-validation-status").is_none());
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -13408,6 +13635,14 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
         metric!(gauge "obey_api_cache_hit_rate", "Cache hit rate (0.0 to 1.0)", rate);
     }
 
+    // Sticky re-pins (retry-failover-core-overhaul, Req 6.4): one counter
+    // for failed-over requests whose sticky pin moved to a new provider.
+    metric!(
+        counter "obey_api_sticky_repins_total",
+        "Total sticky-routing affinity re-pins after successful failover",
+        snap.sticky_repins_total
+    );
+
     // Cost by provider
     if !snap.cost_by_provider.is_empty() {
         out.push_str(
@@ -14277,17 +14512,17 @@ async fn responses_create_buffered(
     active_handle: crate::active_requests::ActiveRequestHandle,
     mut request_guard: RequestCompleteGuard,
 ) -> Response {
-    let result = state
-        .router
-        .route_request(&chat_request, Some(active_handle))
-        .await;
+let result = state
+    .router
+    .route_request(&chat_request, Some(active_handle.clone()))
+    .await;
 
-    match result {
-        Ok(chat_response) => {
-            let synthesis_ctx = ResponsesSynthesisContext {
-                request_model: &request.model,
-                request_instructions: request.instructions.as_deref(),
-                request_temperature: request.temperature,
+match result {
+    Ok(chat_response) => {
+        let synthesis_ctx = ResponsesSynthesisContext {
+            request_model: &request.model,
+            request_instructions: request.instructions.as_deref(),
+            request_temperature: request.temperature,
                 request_top_p: request.top_p,
                 request_tools: &request.tools,
                 request_tool_choice: request.tool_choice.as_ref(),
@@ -14347,6 +14582,12 @@ async fn responses_create_buffered(
 
         let mut http = Json(&response_object).into_response();
         attach_trace_id_header(&mut http, &trace_id);
+        // Responses buffered success: routing resolved before headers —
+        // rows + 1 (Req 5.2).
+        insert_attempt_count_header(
+            &mut http,
+            attempt_count_header_value_from_total(active_handle.attempt_rows_total(), true),
+        );
         http
     }
     Err(err) => {
@@ -14357,7 +14598,13 @@ async fn responses_create_buffered(
             None,
             None,
         );
-        err.into_response()
+        let mut response = err.into_response();
+        // Responses buffered error: ledger rows as-is (Req 5.3).
+        insert_attempt_count_header(
+            &mut response,
+            attempt_count_header_value_from_total(active_handle.attempt_rows_total(), false),
+        );
+        response
     }
 }
 }
@@ -14371,7 +14618,7 @@ async fn responses_create_codex_buffered(
     provider_cfg: crate::config::Provider,
     trace_id: String,
     owner_id: String,
-    _active_handle: crate::active_requests::ActiveRequestHandle,
+    active_handle: crate::active_requests::ActiveRequestHandle,
     mut request_guard: RequestCompleteGuard,
 ) -> Response {
     let access_token = match codex_client.oauth().get_access_token().await {
@@ -14656,10 +14903,17 @@ async fn responses_create_codex_buffered(
  Some(completed.model.clone()),
  );
 
-    let mut http = Json(&response_object).into_response();
-    attach_trace_id_header(&mut http, &trace_id);
-    http
-}
+        let mut http = Json(&response_object).into_response();
+        attach_trace_id_header(&mut http, &trace_id);
+        // Codex buffered success: single native dispatch, no ledger rows
+        // — 0 + 1 = 1 (Req 5.2). (Native Codex dispatch bypasses the
+        // router ledger; the handle stays live for parity.)
+        insert_attempt_count_header(
+            &mut http,
+            attempt_count_header_value_from_total(active_handle.attempt_rows_total(), true),
+        );
+        http
+    }
 
 /// Streaming create path using native Codex API dispatch.
 async fn responses_create_codex_stream(
@@ -14670,7 +14924,7 @@ async fn responses_create_codex_stream(
     provider_cfg: crate::config::Provider,
     trace_id: String,
     owner_id: String,
-    _active_handle: crate::active_requests::ActiveRequestHandle,
+    active_handle: crate::active_requests::ActiveRequestHandle,
     mut request_guard: RequestCompleteGuard,
 ) -> Response {
     let streaming_config = state
@@ -14878,11 +15132,19 @@ async fn responses_create_codex_stream(
     yield Ok(Event::default().data("[DONE]"));
     };
 
-    let mut sse = Sse::new(stream)
-        .keep_alive(build_keepalive(&streaming_config))
-        .into_response();
-    attach_trace_id_header(&mut sse, &trace_id);
-    sse
+let mut sse = Sse::new(stream)
+    .keep_alive(build_keepalive(&streaming_config))
+    .into_response();
+attach_trace_id_header(&mut sse, &trace_id);
+// Codex native stream: headers commit before the upstream send
+// resolves; the ledger is empty at this point, so emit 0 (native
+// Codex dispatch bypasses the router ledger entirely — documented
+// timing choice).
+insert_attempt_count_header(
+    &mut sse,
+    attempt_count_header_value_from_total(active_handle.attempt_rows_total(), false),
+);
+sse
 }
 
 /// Streaming create path: route_request_streaming → parse chat SSE → synthesize
@@ -14906,7 +15168,7 @@ async fn responses_create_stream(
 
     let result = state
         .router
-        .route_request_streaming(&chat_request, Some(active_handle))
+        .route_request_streaming(&chat_request, Some(active_handle.clone()))
         .await;
 
     match result {
@@ -14986,12 +15248,18 @@ async fn responses_create_stream(
                 yield Ok(Event::default().data("[DONE]"));
             };
 
-            let mut sse = Sse::new(stream)
-                .keep_alive(build_keepalive(&streaming_config))
-                .into_response();
-            attach_trace_id_header(&mut sse, &trace_id);
-            sse
-        }
+        let mut sse = Sse::new(stream)
+            .keep_alive(build_keepalive(&streaming_config))
+            .into_response();
+        attach_trace_id_header(&mut sse, &trace_id);
+        // Buffered-under-streaming success: routing resolved before
+        // headers — rows + 1 (Req 5.2).
+        insert_attempt_count_header(
+            &mut sse,
+            attempt_count_header_value_from_total(active_handle.attempt_rows_total(), true),
+        );
+        sse
+    }
     Ok(StreamingResponse::PassThrough {
         byte_stream,
         provider,
@@ -15108,11 +15376,18 @@ async fn responses_create_stream(
     yield Ok(Event::default().data("[DONE]"));
     };
 
-    let mut sse = Sse::new(stream)
-        .keep_alive(build_keepalive(&streaming_config))
-        .into_response();
-    attach_trace_id_header(&mut sse, &trace_id);
-    sse
+        let mut sse = Sse::new(stream)
+            .keep_alive(build_keepalive(&streaming_config))
+            .into_response();
+        attach_trace_id_header(&mut sse, &trace_id);
+        // Pass-through SSE: headers commit before the upstream stream
+        // resolves; emit the best-known count at header time
+        // (documented timing choice).
+        insert_attempt_count_header(
+            &mut sse,
+            attempt_count_header_value_from_total(active_handle.attempt_rows_total(), false),
+        );
+        sse
     }
     Err(err) => {
         request_guard.complete_responses_outcome(
@@ -15122,7 +15397,13 @@ async fn responses_create_stream(
             None,
             None,
         );
-        err.into_response()
+        let mut response = err.into_response();
+        // Routing error: ledger rows as-is (Req 5.3).
+        insert_attempt_count_header(
+            &mut response,
+            attempt_count_header_value_from_total(active_handle.attempt_rows_total(), false),
+        );
+        response
     }
     }
 }
@@ -15368,3 +15649,4 @@ fn map_chat_usage(usage: &serde_json::Value) -> Option<ResponsesUsage> {    let 
         ..Default::default()
     })
     }
+

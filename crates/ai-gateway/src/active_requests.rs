@@ -138,6 +138,19 @@ pub struct ActiveRequestInfo {
     /// Ledger of failed upstream tries and skips, drained into `#attempt` log rows.
     #[serde(skip)]
     pub failed_attempts: Vec<ProviderAttempt>,
+    /// Monotonic total of ledger rows ever recorded for this request
+    /// (failed upstream sends plus recorded skips). Unlike
+    /// [`Self::failed_attempts`], it survives the outcome-log drain and is
+    /// the source for the `x-obey-attempt-count` response header
+    /// (retry-failover-core-overhaul Req 5.1-5.3).
+    #[serde(skip)]
+    pub attempt_rows_total: usize,
+    /// A `rate_limit_wait` ledger row was recorded at some point in this
+    /// request's lifetime. Monotonic one-shot marker: unlike
+    /// [`Self::has_error_class`], it survives `take_failed_attempts`, so
+    /// the streaming→buffered re-entry can never re-wait after a drain.
+    #[serde(skip)]
+    pub rate_limit_wait_done: bool,
     /// A terminal outcome row was written for this request.
     #[serde(skip)]
     pub outcome_logged: bool,
@@ -264,13 +277,55 @@ impl ActiveRequestHandle {
     /// Append a failed upstream try (or skip) to the request's attempt ledger.
     pub fn record_failed_attempt(&self, attempt: ProviderAttempt) {
         if let Ok(mut info) = self.0.lock() {
+            if attempt.error_class.as_deref() == Some("rate_limit_wait") {
+                info.rate_limit_wait_done = true;
+            }
             info.failed_attempts.push(attempt);
+            info.attempt_rows_total += 1;
         }
     }
 
-    /// Number of attempts currently held in the ledger.
-    pub fn failed_attempt_count(&self) -> usize {
-        self.0.lock().map(|info| info.failed_attempts.len()).unwrap_or(0)
+    /// Total ledger rows recorded over the request's lifetime (upstream
+    /// failed sends plus recorded skips), surviving the outcome-log drain.
+    /// The `x-obey-attempt-count` response header is derived from this
+    /// (plus 1 on success for the terminal send), NOT from the live slice,
+    /// because `log_outcome` drains the ledger before response headers
+    /// are attached.
+    pub fn attempt_rows_total(&self) -> usize {
+        self.0.lock().map(|info| info.attempt_rows_total).unwrap_or(0)
+    }
+
+/// Number of attempts currently held in the ledger.
+pub fn failed_attempt_count(&self) -> usize {
+    self.0.lock().map(|info| info.failed_attempts.len()).unwrap_or(0)
+}
+
+    /// Whether any ledger row carries `class` as its error class. Read-only
+    /// marker probe so callers can make decisions "once per request" across
+    /// re-entry. NOTE: scans the live (drainable) slice — for the
+    /// `rate_limit_wait` class use [`Self::has_recorded_rate_limit_wait`],
+    /// which is monotonic and survives `take_failed_attempts`.
+    #[allow(dead_code)] // public API; superseded for rate_limit_wait by the monotonic probe
+    pub fn has_error_class(&self, class: &str) -> bool {
+        self.0
+            .lock()
+            .map(|info| {
+                info.failed_attempts
+                    .iter()
+                    .any(|attempt| attempt.error_class.as_deref() == Some(class))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether a `rate_limit_wait` ledger row was ever recorded for this
+    /// request. Monotonic (set in `record_failed_attempt` under the same
+    /// lock that stamps the row), so a `take_failed_attempts` drain between
+    /// the streaming wait and a buffered re-entry cannot erase the marker.
+    pub fn has_recorded_rate_limit_wait(&self) -> bool {
+        self.0
+            .lock()
+            .map(|info| info.rate_limit_wait_done)
+            .unwrap_or(false)
     }
 
     /// Drain the ledger, leaving it empty so a second drain writes nothing.
@@ -447,14 +502,16 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as i64,
-            kind: RequestKind::Chat,
-            smart_routing_logged: false,
-            failed_attempts: Vec::new(),
-            outcome_logged: false,
-            breaker_skips_recorded: false,
-            reasoning_relay: None,
-        }
+        kind: RequestKind::Chat,
+        smart_routing_logged: false,
+        failed_attempts: Vec::new(),
+        attempt_rows_total: 0,
+        rate_limit_wait_done: false,
+        outcome_logged: false,
+        breaker_skips_recorded: false,
+        reasoning_relay: None,
     }
+}
 
     #[test]
     fn failed_attempt_ledger_records_and_drains() {
@@ -496,13 +553,39 @@ mod tests {
         assert!(json.get("outcome_logged").is_none());
     }
 
-    #[test]
-    fn smart_routing_log_is_claimed_once_per_request() {
-        let handle = ActiveRequestRegistry::new().register(sample_info("trace-4"));
-        assert_eq!(handle.claim_smart_routing_log().as_deref(), Some("trace-4"));
-        assert_eq!(handle.claim_smart_routing_log(), None);
-        assert_eq!(handle.clone().claim_smart_routing_log(), None);
-    }
+#[test]
+fn smart_routing_log_is_claimed_once_per_request() {
+    let handle = ActiveRequestRegistry::new().register(sample_info("trace-4"));
+    assert_eq!(handle.claim_smart_routing_log().as_deref(), Some("trace-4"));
+    assert_eq!(handle.claim_smart_routing_log(), None);
+    assert_eq!(handle.clone().claim_smart_routing_log(), None);
+}
+
+/// R10: the `rate_limit_wait` one-shot marker is monotonic — set under
+/// the same lock that records the ledger row and still readable after
+/// `take_failed_attempts` drains the live slice, so the streaming→buffered
+/// re-entry can never re-wait.
+#[test]
+fn rate_limit_wait_marker_survives_ledger_drain() {
+    let handle = ActiveRequestRegistry::new().register(sample_info("trace-wait"));
+
+    assert!(!handle.has_recorded_rate_limit_wait());
+    assert!(!handle.has_error_class("rate_limit_wait"));
+
+    handle.record_failed_attempt(
+        ProviderAttempt::new("p".into(), "m".into(), "waited".into(), Some(429))
+            .with_error_class("rate_limit_wait"),
+    );
+    assert!(handle.has_recorded_rate_limit_wait());
+    assert!(handle.has_error_class("rate_limit_wait"));
+
+    // Drain the live ledger: the slice probe goes false, the monotonic
+    // marker stays true (this is the race the router guards against).
+    let drained = handle.take_failed_attempts();
+    assert_eq!(drained.len(), 1);
+    assert!(!handle.has_error_class("rate_limit_wait"));
+    assert!(handle.has_recorded_rate_limit_wait());
+}
 
     #[test]
     fn register_then_snapshot_contains_entry() {
@@ -677,3 +760,4 @@ assert!(handle.reasoning_relay().is_none());
         assert!(!json.contains("reasoning_relay"));
     }
 }
+

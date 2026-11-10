@@ -107,6 +107,39 @@ impl StickyCache {
         );
     }
 
+    /// Re-pins an existing affinity entry to a new provider
+    /// (retry-failover-core-overhaul spec, Req 6.1/6.2): moves provider,
+    /// model, and usage as if freshly pinned by [`StickyCache::insert`]
+    /// (TTL refreshed), preserving the prefix-hash key and the entry
+    /// shape — no new state machine.
+    ///
+    /// Returns the previous provider id when a *fresh* entry existed and
+    /// pointed at a different provider (the re-pin case). Returns `None`
+    /// — leaving the entry untouched — when there is no entry, the entry
+    /// is expired (a stale pin is not a re-pin; callers fall back to a
+    /// plain [`StickyCache::insert`]), or the entry already points at
+    /// `provider_id` (same-provider success is a refresh, not a re-pin).
+    pub fn repin(
+        &self,
+        hash: u64,
+        provider_id: String,
+        model_id: String,
+        usage: Option<CacheUsage>,
+    ) -> Option<String> {
+        let now = Instant::now();
+        let mut repinned_from = None;
+        self.map.entry(hash).and_modify(|entry| {
+            if entry.expires_at > now && entry.provider_id != provider_id {
+                repinned_from = Some(entry.provider_id.clone());
+                entry.provider_id = provider_id.clone();
+                entry.model_id = model_id.clone();
+                entry.last_success_usage = usage;
+                entry.expires_at = Instant::now() + self.ttl;
+            }
+        });
+        repinned_from
+    }
+
     /// Sweeps the whole map, removing every entry whose TTL has elapsed.
     pub fn evict_expired(&self) {
         let now = Instant::now();
@@ -467,7 +500,85 @@ assert!(cache.get_model_affinity(7).is_none());
 
 #[test]
 fn get_model_affinity_misses_when_never_inserted() {
-let cache = StickyCache::new(Duration::from_secs(30));
-assert!(cache.get_model_affinity(42).is_none());
+    let cache = StickyCache::new(Duration::from_secs(30));
+    assert!(cache.get_model_affinity(42).is_none());
+}
+
+#[test]
+fn repin_moves_fresh_entry_to_new_provider_and_returns_previous() {
+    let cache = StickyCache::new(Duration::from_secs(30));
+    cache.insert(
+        7,
+        "prov-a".to_string(),
+        "model-a".to_string(),
+        Some(CacheUsage {
+            cache_read_input_tokens: 10,
+            cache_creation_input_tokens: 0,
+            uncached_input_tokens: 0,
+        }),
+    );
+    let previous = cache.repin(
+        7,
+        "prov-b".to_string(),
+        "model-b".to_string(),
+        Some(CacheUsage {
+            cache_read_input_tokens: 4,
+            cache_creation_input_tokens: 2,
+            uncached_input_tokens: 0,
+        }),
+    );
+    assert_eq!(previous.as_deref(), Some("prov-a"));
+    let entry = cache.get(7).expect("re-pinned entry survives");
+    assert_eq!(entry.provider_id, "prov-b");
+    assert_eq!(entry.model_id, "model-b");
+    assert_eq!(
+        entry.last_success_usage,
+        Some(CacheUsage {
+            cache_read_input_tokens: 4,
+            cache_creation_input_tokens: 2,
+            uncached_input_tokens: 0,
+        }),
+    );
+}
+
+#[test]
+fn repin_refreshes_ttl_like_a_fresh_insert() {
+    let cache = StickyCache::new(Duration::from_millis(120));
+    cache.insert(7, "prov-a".to_string(), "model-a".to_string(), None);
+    std::thread::sleep(Duration::from_millis(80));
+    let previous = cache.repin(7, "prov-b".to_string(), "model-b".to_string(), None);
+    assert_eq!(previous.as_deref(), Some("prov-a"));
+    std::thread::sleep(Duration::from_millis(80));
+    let entry = cache.get(7).expect("re-pin refreshes the TTL deadline");
+    assert_eq!(entry.provider_id, "prov-b");
+}
+
+#[test]
+fn repin_noops_on_missing_expired_or_same_provider_entries() {
+    // Missing entry: no re-pin (caller falls back to insert).
+    let cache = StickyCache::new(Duration::from_secs(30));
+    assert!(cache
+        .repin(9, "prov-b".to_string(), "model-b".to_string(), None)
+        .is_none());
+    assert!(cache.get(9).is_none());
+
+    // Same provider: a refresh, not a re-pin; the entry keeps its model
+    // and usage as `insert` would have written them.
+    cache.insert(1, "prov-a".to_string(), "model-a".to_string(), None);
+    assert!(cache
+        .repin(1, "prov-a".to_string(), "model-a2".to_string(), None)
+        .is_none());
+    let entry = cache.get(1).expect("entry untouched by same-provider repin");
+    assert_eq!(entry.provider_id, "prov-a");
+    assert_eq!(entry.model_id, "model-a");
+
+    // Expired entry: a stale pin is not re-pinned; it is left to lazy
+    // eviction (the caller's insert path replaces it).
+    let stale = StickyCache::new(Duration::from_millis(50));
+    stale.insert(1, "prov-a".to_string(), "model-a".to_string(), None);
+    std::thread::sleep(Duration::from_millis(80));
+    assert!(stale
+        .repin(1, "prov-b".to_string(), "model-b".to_string(), None)
+        .is_none());
 }
 }

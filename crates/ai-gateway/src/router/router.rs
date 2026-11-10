@@ -33,6 +33,8 @@ use crate::providers::bedrock::{
 };
 use crate::providers::{ProviderClient, ProviderResponse};
 use crate::reasoning_compat::{self, AttemptReport};
+use crate::router::retry_budget::RetryBudgetMap;
+use crate::router::retry_policy::{self, RetryDecision};
 use crate::smart_routing::budget_controller::BudgetController;
 use crate::smart_routing::{
     PinnedRoutingContext, RoutingDiagnostics, RoutingPlanOutcome, RoutingPlanningError,
@@ -80,6 +82,7 @@ impl ProviderClient for SearchResubmitter<'_> {
                 self.active.clone(),
                 self.base_attempt,
                 FirstSendToken::Debit,
+                false,
             )
             .await?;
         Ok(ProviderResponse {
@@ -242,6 +245,14 @@ impl ProviderConcurrencyLimiter {
         Some(ProviderConcurrencyPermit {
             limiter: Arc::clone(self),
         })
+    }
+
+    /// Currently held in-flight slots (retry-budget active-count source).
+    fn in_flight(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .in_flight
     }
 
     async fn acquire(self: &Arc<Self>) -> ProviderConcurrencyPermit {
@@ -634,6 +645,12 @@ pub struct Router {
     latency_tracker: Arc<LatencyTracker>,
     rate_limiters: Arc<DashMap<String, Arc<RateLimiter>>>,
     provider_concurrency_limiters: Arc<DashMap<String, Arc<ProviderConcurrencyLimiter>>>,
+    /// Concurrent same-provider retry budget (spec
+    /// retry-failover-core-overhaul, Req 4.1-4.5): caps in-flight retries
+    /// per provider at `max(3, active/5)` with live active counts. First
+    /// attempts never consult it; exhausted budgets fail over with a
+    /// `retry_budget_exhausted` ledger row.
+    retry_budgets: RetryBudgetMap,
     http_clients: Arc<DashMap<String, reqwest::Client>>,
     /// Context manager for automatic context window handling
     context_manager: Arc<ContextManager>,
@@ -1093,6 +1110,7 @@ impl Router {
             latency_tracker: Arc::new(LatencyTracker::new()),
             rate_limiters: Arc::new(DashMap::new()),
             provider_concurrency_limiters: Arc::new(DashMap::new()),
+            retry_budgets: RetryBudgetMap::new(),
             http_clients: Arc::new(DashMap::new()),
             context_manager: Arc::new(ContextManager::with_config(context_config)),
             context_summarizer: GatewaySummarizer::new(config.clone()),
@@ -1109,7 +1127,7 @@ impl Router {
             oauth_usage_tracker: None,
             search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-        degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
             provider_budget_alerts: None,
             copilot_manager: None,
@@ -1144,6 +1162,7 @@ impl Router {
             latency_tracker: Arc::new(LatencyTracker::new()),
             rate_limiters: Arc::new(DashMap::new()),
             provider_concurrency_limiters: Arc::new(DashMap::new()),
+            retry_budgets: RetryBudgetMap::new(),
             http_clients: Arc::new(DashMap::new()),
             context_manager: Arc::new(ContextManager::with_config(context_config)),
             context_summarizer: GatewaySummarizer::new(config.clone()),
@@ -2287,6 +2306,15 @@ impl Router {
     /// response (Req 1.1). The prefix hash is computed from the ORIGINAL
     /// client request (pre-transform), so affinity stays stable across the
     /// provider-specific mutations applied to the outgoing copy.
+    ///
+    /// Re-pin on failover (retry-failover-core-overhaul spec, Req 6.1):
+    /// when a fresh entry for this prefix points at a DIFFERENT provider
+    /// than the one that just succeeded, the entry moves to the new
+    /// provider (TTL refreshed exactly like a fresh pin — no new state
+    /// machine), emits a `sticky_repin` debug log (old —— new provider +
+    /// prefix hash, hash only) and increments the `sticky_repins_total`
+    /// counter. No ledger rows. If the original provider later recovers,
+    /// existing sticky/TTL rules apply on subsequent successes.
     async fn record_sticky_success(
         &self,
         request: &OpenAIRequest,
@@ -2298,11 +2326,28 @@ impl Router {
             return;
         }
         let prefix_hash = StickyCache::compute_prefix_hash(request);
+        let usage = Some(extract_cache_usage(usage));
+        if let Some(previous_provider) = self.sticky_cache.repin(
+            prefix_hash,
+            provider.to_string(),
+            model.to_string(),
+            usage,
+        ) {
+            debug!(
+                from_provider = %previous_provider,
+                to_provider = %provider,
+                model = %model,
+                prefix_hash,
+                "sticky_repin"
+            );
+            self.metrics.record_sticky_repin();
+            return;
+        }
         self.sticky_cache.insert(
             prefix_hash,
             provider.to_string(),
             model.to_string(),
-            Some(extract_cache_usage(usage)),
+            usage,
         );
         debug!(provider = %provider, model = %model, prefix_hash, "sticky_recorded");
     }
@@ -3498,6 +3543,13 @@ true
         self.rate_limiters.clear();
     }
 
+    /// Clear all per-provider retry budget entries (used during config
+    /// reload, mirroring the circuit-breaker / rate-limiter / sticky-cache
+    /// resets — renamed/removed providers must not leak budget entries).
+    pub fn clear_retry_budgets(&self) {
+        self.retry_budgets.clear();
+    }
+
     /// Clear all sticky-routing affinity entries (used during config
     /// reload, mirroring the circuit-breaker / rate-limiter resets).
     pub fn clear_sticky_cache(&self) {
@@ -3508,9 +3560,21 @@ true
     /// the lazy TTL eviction in `StickyCache::get`; called periodically
     /// by the gateway background task so dead conversations don't
     /// accumulate).
-    pub fn evict_expired_sticky_entries(&self) {
-        self.sticky_cache.evict_expired();
-    }
+pub fn evict_expired_sticky_entries(&self) {
+    self.sticky_cache.evict_expired();
+}
+
+/// Test/observability probe: the fresh sticky-affinity entry for a
+/// conversation prefix, if any. Computes the prefix hash the same way
+/// the routing path does (original client request).
+#[allow(dead_code)] // public accessor / test-only; unused in the binary build
+pub fn sticky_entry_for_request(
+    &self,
+    request: &OpenAIRequest,
+) -> Option<crate::router::sticky_cache::ProviderStickyEntry> {
+    self.sticky_cache
+        .get(StickyCache::compute_prefix_hash(request))
+}
 
     fn provider_concurrency_limiter(
         &self,
@@ -3530,9 +3594,25 @@ true
                 limiter
             }
         };
-        limiter.update_limit(limit);
-        limiter
-    }
+    limiter.update_limit(limit);
+    limiter
+}
+
+/// Live active in-flight count for a provider, read from the provider
+/// concurrency registry (retry-failover-core-overhaul Req 4.5: the retry
+/// budget follows live active counts, not accumulated state).
+///
+/// Source: `ProviderConcurrencyLimiter::in_flight` — requests currently
+/// holding a provider slot (active). The limiter does not track queue
+/// depth (pending waiters) separately, so the active count is the live
+/// approximation used for budget admission. Sync std mutex lock, taken
+/// without any await point.
+fn provider_active_count(&self, provider_name: &str) -> u64 {
+    self.provider_concurrency_limiters
+        .get(provider_name)
+        .map(|limiter| limiter.in_flight() as u64)
+        .unwrap_or(0)
+}
 
     /// Acquire one provider-wide in-flight request slot, giving up after `wait`.
     ///
@@ -3835,26 +3915,164 @@ true
         }
     }
 
-    /// Trim provider-supplied error text to a single short line so the
-    /// dashboard cell stays readable.
-    fn truncate_for_display(text: &str) -> String {
-        const MAX: usize = 140;
-        let one_line: String = text
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .chars()
-            .take(MAX)
-            .collect();
-        if one_line.chars().count() == MAX {
-            format!("{}…", one_line)
-        } else {
-            one_line
+/// Trim provider-supplied error text to a single short line so the
+/// dashboard cell stays readable.
+fn truncate_for_display(text: &str) -> String {
+    const MAX: usize = 140;
+    let one_line: String = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(MAX)
+        .collect();
+    if one_line.chars().count() == MAX {
+        format!("{}—…", one_line)
+    } else {
+        one_line
+    }
+}
+
+/// Bounded Retry-After wait for the primary candidate (retry-failover-
+/// core-overhaul, Req 3.1-3.9). Pure eligibility check: returns the
+/// duration to wait when this 429 qualifies for the one-shot wait,
+/// `None` when today's behavior (cooldown + failover) must run.
+///
+/// Eligibility (Req 3.1-3.5): primary candidate, parseable Retry-After
+/// (`cooldown`, already parsed by the caller — never parsed twice),
+/// `upstream_retry_after_max_wait_ms > 0`, Retry-After within the cap,
+/// and the request has not waited before (caller-tracked flag). The
+/// cooldown must also be a real upstream signal (R4: the fabricated
+/// `default_rate_limit_cooldown_seconds` fallback is not a hint) and
+/// non-zero (R3: an explicit `Retry-After: 0` maps to cooldown +
+/// failover per the documented behavior, not a zero-second sleep).
+///
+/// Request-scoped gates (review findings R1/R2):
+/// - `has_prior_attempts`: primary-ness belongs to the REQUEST, not
+///   the dispatch. A failover re-entry (streaming → buffered
+///   `route_request_with_exclusions`) starts a fresh candidate list
+///   whose index 0 is a fallback; any attempt-ledger row (upstream
+///   sends + skips) proves the request already left its primary, so a
+///   non-primary 429 must fail over immediately (Req 3.2).
+/// - `max_retries_per_provider == 0`: the waited retry IS a
+///   same-provider retry; with none allowed the sleep would be dead
+///   time, so today's cooldown + failover runs instead.
+fn retry_after_wait_duration(
+    is_primary_candidate: bool,
+    waited_before: bool,
+    has_prior_attempts: bool,
+    max_retries_per_provider: u32,
+    max_wait_ms: u64,
+    cooldown: Duration,
+    cooldown_from_upstream: bool,
+) -> Option<Duration> {
+    if !is_primary_candidate
+        || waited_before
+        || has_prior_attempts
+        || max_retries_per_provider == 0
+        || max_wait_ms == 0
+        // R4: Req 3.1 requires a parseable Retry-After hint; the
+        // default-cooldown fallback the parser fabricates for
+        // hint-less 429s is not a waitable upstream signal.
+        || !cooldown_from_upstream
+        // R3: an explicit `Retry-After: 0` / `retry-after-ms: 0` is a
+        // zero-second wait — sleep-free immediate retry is not what
+        // the knob promises. Run today's cooldown + failover instead.
+        || cooldown.is_zero()
+    {
+        return None;
+    }
+    let max_wait = Duration::from_millis(max_wait_ms);
+    (cooldown <= max_wait).then(|| cooldown.min(max_wait))
+}
+
+/// Wait out a qualifying Retry-After (Req 3.1) and record the
+/// `rate_limit_wait` ledger row (Req 3.6).
+///
+/// Wait discipline (Req 3.9): the caller must have dropped the provider
+/// concurrency permit before calling; no config lock is taken here. The
+/// sleep is raced against the gateway request deadline
+/// (`request_deadline_ms`, resolved from
+/// `effective_request_timeout_seconds`); the clock is the
+/// `ActiveRequestHandle::elapsed_ms` arrival stamp, the same source the
+/// Req 1.6 backoff cap reads. On deadline expiry the wait abandons the
+/// retry: `false` is returned so the caller runs today's
+/// cooldown + failover path with no retry sent and no rate token
+/// consumed. A client-disconnect signal is not observable mid-dispatch
+/// in either stack (the `RequestCompleteGuard` abandon path lives in
+/// the handlers), so the deadline race is the enforcement seam.
+async fn maybe_wait_retry_after(
+    active: Option<&ActiveRequestHandle>,
+    provider: &str,
+    model: &str,
+    retry_after: Duration,
+    request_deadline_ms: Option<i64>,
+) -> bool {
+    let started = std::time::Instant::now();
+    // Pre-flight (Req 1.6 pattern): never even start a sleep that would
+    // wake past the deadline.
+    if let (Some(handle), Some(deadline_ms)) = (active, request_deadline_ms) {
+        if handle.elapsed_ms() + retry_after.as_millis() as i64 >= deadline_ms {
+            warn!(
+                provider,
+                retry_after_ms = retry_after.as_millis() as u64,
+                deadline_ms,
+                "Retry-After wait would pass the gateway request deadline — failing over instead"
+            );
+            return false;
         }
     }
+    // Surface the invisible wait on the in-flight registry (RAII, same
+    // pattern as the backoff stall).
+    let _stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+        active,
+        crate::active_requests::StallReason::RateLimitWait,
+    );
+    tokio::time::sleep(retry_after).await;
+    _stall.end();
+    let waited = started.elapsed();
+    // Req 3.6: operators see why time was spent. Content-free class,
+    // actual waited duration, status 429 to align with the rate-limit
+    // family rows.
+    if let Some(handle) = active {
+        handle.record_failed_attempt(
+            ProviderAttempt::new(
+                provider.to_string(),
+                model.to_string(),
+                format!(
+                    "waited for upstream Retry-After ({} ms) before retrying the primary provider",
+                    waited.as_millis()
+                ),
+                Some(429),
+            )
+            .with_duration(waited)
+            .with_error_class("rate_limit_wait"),
+        );
+    }
+    // Deadline fired mid-sleep (the pre-flight passed but the deadline
+    // landed inside the window): abandon the retry, exactly as if the
+    // pre-flight had refused.
+    if let (Some(handle), Some(deadline_ms)) = (active, request_deadline_ms) {
+        if handle.elapsed_ms() >= deadline_ms {
+            warn!(
+                provider,
+                waited_ms = waited.as_millis() as u64,
+                deadline_ms,
+                "Gateway request deadline fired during the Retry-After wait — abandoning the retry"
+            );
+            return false;
+        }
+    }
+    info!(
+        provider,
+        waited_ms = waited.as_millis() as u64,
+        "Waited out upstream Retry-After; retrying the primary provider"
+    );
+    true
+}
 
-    /// Compute the cooldown duration to apply for a rate-limit response.
+/// Compute the cooldown duration to apply for a rate-limit response.
     ///
     /// Looks at, in order of preference:
     /// 1. `Retry-After` HTTP header (seconds, or HTTP-date)
@@ -3896,14 +4114,32 @@ true
             .and_then(|p| p.max_rate_limit_cooldown_seconds);
         drop(config);
 
-        Self::compute_rate_limit_cooldown(
-            headers,
-            body,
-            default_cooldown,
-            provider_cap_secs,
-            global_cap_secs,
-        )
-    }
+ Self::compute_rate_limit_cooldown(
+ headers,
+ body,
+ default_cooldown,
+ provider_cap_secs,
+ global_cap_secs,
+ )
+ }
+
+ /// Whether the last [`Self::parse_rate_limit_cooldown`] call found a
+ /// real upstream Retry-After signal, as opposed to falling back to
+ /// the configured default cooldown (R4, retry-failover-core-overhaul:
+ /// Req 3.1 lets only a parseable hint drive the bounded wait).
+ ///
+ /// Mirrors the header → body → period-marker preference of
+ /// [`Self::compute_rate_limit_cooldown`] without re-parsing text:
+ /// each stage's parser is already pure and cheap.
+ async fn upstream_rate_limit_cooldown_hint(
+ &self,
+ headers: Option<&reqwest::header::HeaderMap>,
+ body: &str,
+ ) -> bool {
+ headers.is_some_and(|h| Self::cooldown_from_headers(h).is_some())
+ || Self::cooldown_from_body(body).is_some()
+ || Self::cooldown_from_period_marker(body).is_some()
+ }
 
     /// Pure cooldown computation — no I/O. Exposed for unit testing the
     /// header / body / period-marker parsing without spinning up a router.
@@ -4395,99 +4631,106 @@ true
     ///
     /// `first_send` says who pays the rate-limit token for the first upstream
     /// send; every further send is charged inside (ADR 0002).
-    pub async fn attempt_with_retry(
-        &self,
-        provider_name: &str,
-        request: &OpenAIRequest,
-        provider_model: &ProviderModel,
-        active: Option<ActiveRequestHandle>,
-        base_attempt: usize,
-        first_send: FirstSendToken,
-    ) -> Result<OpenAIResponse, GatewayError> {
-        self.attempt_with_retry_with_permit(
-            provider_name,
-            request,
-            provider_model,
-            active,
-            base_attempt,
-            None,
-            first_send,
-            false,
-        )
-        .await
-    }
+pub async fn attempt_with_retry(
+    &self,
+    provider_name: &str,
+    request: &OpenAIRequest,
+    provider_model: &ProviderModel,
+    active: Option<ActiveRequestHandle>,
+    base_attempt: usize,
+    first_send: FirstSendToken,
+    is_primary_candidate: bool,
+) -> Result<OpenAIResponse, GatewayError> {
+    self.attempt_with_retry_with_permit(
+        provider_name,
+        request,
+        provider_model,
+        active,
+        base_attempt,
+        None,
+        first_send,
+        false,
+        is_primary_candidate,
+    )
+    .await
+}
 
     /// Dispatch variant that skips the routing phase of the proactive context
     /// gate and reduces the request copy unconditionally (`route_then_reduce`
     /// exhaustion: the first candidate is retried with reduction once no
     /// fitting candidate remains). A reduction that still cannot fit returns
     /// the same 413 [`GatewayError::ContextCapacityExceeded`] as the gate.
-    async fn attempt_with_retry_forced_reduce(
-        &self,
-        provider_name: &str,
-        request: &OpenAIRequest,
-        provider_model: &ProviderModel,
-        active: Option<ActiveRequestHandle>,
-        base_attempt: usize,
-        first_send: FirstSendToken,
-    ) -> Result<OpenAIResponse, GatewayError> {
-        self.attempt_with_retry_with_permit(
-            provider_name,
-            request,
-            provider_model,
-            active,
-            base_attempt,
-            None,
-            first_send,
-            true,
-        )
-        .await
-    }
+async fn attempt_with_retry_forced_reduce(
+    &self,
+    provider_name: &str,
+    request: &OpenAIRequest,
+    provider_model: &ProviderModel,
+    active: Option<ActiveRequestHandle>,
+    base_attempt: usize,
+    first_send: FirstSendToken,
+    is_primary_candidate: bool,
+) -> Result<OpenAIResponse, GatewayError> {
+    self.attempt_with_retry_with_permit(
+        provider_name,
+        request,
+        provider_model,
+        active,
+        base_attempt,
+        None,
+        first_send,
+        true,
+        is_primary_candidate,
+    )
+    .await
+}
 
-    async fn attempt_with_retry_with_permit(
-        &self,
-        provider_name: &str,
-        request: &OpenAIRequest,
-        provider_model: &ProviderModel,
-        active: Option<ActiveRequestHandle>,
-        base_attempt: usize,
-        concurrency_permit: Option<ProviderConcurrencyPermit>,
-        first_send: FirstSendToken,
-        force_context_reduce: bool,
-    ) -> Result<OpenAIResponse, GatewayError> {
-        let provider_cfg = {
-            let config = self.config.read().await;
-            config
-                .providers
-                .iter()
-                .find(|p| p.name == provider_name)
-                .cloned()
-                .ok_or_else(|| {
-                    GatewayError::Configuration(format!(
-                        "Provider '{}' not found in config",
-                        provider_name
-                    ))
-                })?
-        };
-        let _concurrency_permit = match concurrency_permit {
-            Some(permit) => permit,
-            None => {
-                self.acquire_provider_slot_or_reject(&provider_cfg, &provider_model.model)
-                    .await?
-            }
-        };
-        self.dispatch_attempts_under_permit(
-            provider_name,
-            request,
-            provider_model,
-            active,
-            base_attempt,
-            provider_cfg,
-            first_send,
-            force_context_reduce,
-        )
-        .await
-    }
+async fn attempt_with_retry_with_permit(
+    &self,
+    provider_name: &str,
+    request: &OpenAIRequest,
+    provider_model: &ProviderModel,
+    active: Option<ActiveRequestHandle>,
+    base_attempt: usize,
+    concurrency_permit: Option<ProviderConcurrencyPermit>,
+    first_send: FirstSendToken,
+    force_context_reduce: bool,
+    is_primary_candidate: bool,
+) -> Result<OpenAIResponse, GatewayError> {
+    let provider_cfg = {
+        let config = self.config.read().await;
+        config
+            .providers
+            .iter()
+            .find(|p| p.name == provider_name)
+            .cloned()
+            .ok_or_else(|| {
+                GatewayError::Configuration(format!(
+                    "Provider '{}' not found in config",
+                    provider_name
+                ))
+            })?
+    };
+    let _concurrency_permit = match concurrency_permit {
+        Some(permit) => permit,
+        None => {
+            self.acquire_provider_slot_or_reject(&provider_cfg, &provider_model.model)
+                .await?
+        }
+    };
+    self.dispatch_attempts_under_permit(
+        provider_name,
+        request,
+        provider_model,
+        active,
+        base_attempt,
+        provider_cfg,
+        first_send,
+        force_context_reduce,
+        is_primary_candidate,
+        _concurrency_permit,
+    )
+    .await
+}
 
     /// Returns the effective Codex Search configuration when the feature is
     /// enabled and a valid OpenAI OAuth token exists, `None` otherwise.
@@ -4846,27 +5089,38 @@ true
         }
     }
 
-    async fn dispatch_attempts_under_permit(
-        &self,
-        provider_name: &str,
-        request: &OpenAIRequest,
-        provider_model: &ProviderModel,
-        active: Option<ActiveRequestHandle>,
-        base_attempt: usize,
-        provider_cfg: Provider,
-        first_send: FirstSendToken,
-        force_context_reduce: bool,
-    ) -> Result<OpenAIResponse, GatewayError> {
-        // Fetched before the config guard below: `get_rate_limiter` may read
-        // the config itself. Sends after the first one are debited here; the
-        // provider permit is held, so nothing in this function waits for a
-        // token (ADR 0002).
-        let rate_limiter = self.get_rate_limiter(provider_name).await;
-        let mut send_prepaid = first_send == FirstSendToken::Prepaid;
-        let config = self.config.read().await;
-        let max_retries = config.retry.max_retries_per_provider;
-        let backoff_sequence = config.retry.backoff_sequence_seconds.clone();
-        let context_config = config.context.clone();
+async fn dispatch_attempts_under_permit(
+    &self,
+    provider_name: &str,
+    request: &OpenAIRequest,
+    provider_model: &ProviderModel,
+    active: Option<ActiveRequestHandle>,
+    base_attempt: usize,
+    provider_cfg: Provider,
+    first_send: FirstSendToken,
+    force_context_reduce: bool,
+    is_primary_candidate: bool,
+    mut concurrency_permit: ProviderConcurrencyPermit,
+) -> Result<OpenAIResponse, GatewayError> {
+    // Fetched before the config guard below: `get_rate_limiter` may read
+    // the config itself. Sends after the first one are debited here; the
+    // provider permit is held, so nothing in this function waits for a
+    // token (ADR 0002).
+    let rate_limiter = self.get_rate_limiter(provider_name).await;
+    let mut send_prepaid = first_send == FirstSendToken::Prepaid;
+    let config = self.config.read().await;
+    let max_retries = config.retry.max_retries_per_provider;
+    let backoff_sequence = config.retry.backoff_sequence_seconds.clone();
+    let context_config = config.context.clone();
+    // Bounded Retry-After wait (retry-failover-core-overhaul, Req 3.1-3.9),
+    // snapshotted here so the wait never runs under the config guard.
+    let retry_after_max_wait_ms = config.retry.upstream_retry_after_max_wait_ms;
+    // Gateway request deadline for the wait race (same Req 1.6 source the
+    // backoff cap below reads).
+    let wait_deadline_ms = {
+        let secs = crate::runtime_limits::effective_request_timeout_seconds(&config);
+        (secs > 0).then(|| secs as i64 * 1000)
+    };
 
         // ─── Codex dispatch (Req 10.1, 10.2) ────────────────────────────────
         let is_codex = provider_cfg.auth_method.as_deref() == Some("oauth")
@@ -5243,9 +5497,15 @@ true
         let reasoning = provider_cfg.reasoning;
         let reasoning_compat_cfg = config.reasoning_compat.clone();
         let provider_region = provider_cfg.region.clone();
-        let is_oauth_provider = provider_cfg.auth_method.as_deref() == Some("oauth");
-        let jitter_enabled = config.retry.jitter_enabled;
-        let jitter_ratio = config.retry.jitter_ratio;
+let is_oauth_provider = provider_cfg.auth_method.as_deref() == Some("oauth");
+let jitter_enabled = config.retry.jitter_enabled;
+let jitter_ratio = config.retry.jitter_ratio;
+// Gateway request deadline for the retry-loop cap (Req 1.6): resolved
+// from the same source the deadline middleware enforces; 0 disables.
+let request_deadline_ms = {
+	let secs = crate::runtime_limits::effective_request_timeout_seconds(&config);
+	(secs > 0).then(|| secs as i64 * 1000)
+};
         let cache_aware_routing_cfg = config.cache_aware_routing.clone();
         let configured_base_url = provider_cfg.base_url.clone();
         // Proactive context-overflow enforcement snapshot (context-overflow
@@ -5567,8 +5827,23 @@ true
         let mut reasoning_strip_retry_done = false;
         // One-shot `stream:false` fallback: a 400 that rejects `stream` /
         // `stream_options` retries the same provider once without them.
-        let mut stream_fallback_done = false;
-        let mut skip_next_backoff = false;
+let mut stream_fallback_done = false;
+let mut skip_next_backoff = false;
+// One-shot bounded Retry-After wait (retry-failover-core-overhaul,
+// Req 3.1-3.9): the primary candidate's first qualifying 429 may wait
+// out the provider's own Retry-Before signal and retry the same
+// provider. Cross-stack marker: if the streaming pass-through already
+// waited (its fallback re-enters this buffered loop), the ledger
+// carries `rate_limit_wait` and this loop must not wait again.
+        let mut retry_after_waited = active
+            .as_ref()
+            .is_some_and(|h| h.has_recorded_rate_limit_wait());
+	// R1: request-scoped primary-ness — snapshot the ledger row count at
+	// dispatch entry. Rows recorded BEFORE this dispatch (a failed try or
+	// skip on an earlier candidate, e.g. the streaming→buffered failover
+	// hop) prove the request already left its primary; rows this loop
+	// records for its own same-provider retries do not.
+	let attempt_rows_at_dispatch = active.as_ref().map_or(0, |h| h.attempt_rows_total());
         // Every failed HTTP try goes into the request's attempt ledger
         // (DD7), so retries rescued later are still visible in the log.
         let record_try = |err: &GatewayError,
@@ -5589,6 +5864,48 @@ true
         for attempt in 0..=max_retries {
             let skip_backoff_this_attempt = skip_next_backoff;
             skip_next_backoff = false;
+            // Concurrent-retry budget (retry-failover-core-overhaul, Req
+            // 4.1-4.5): every retry iteration (≥11, including mechanism
+            // one-shots with skipped backoff) must be admitted before it
+            // is scheduled; first attempts (attempt 0) never consult the
+            // budget and are never delayed (Req 4.3). The slot is held
+            // for the whole iteration — covering the retry send — and
+            // released on drop at the end of the iteration (Req 4.4),
+            // on any exit path (success, failover, break, panic).
+            // Exhaustion fails over immediately with a
+            // `retry_budget_exhausted` ledger row (Req 4.2).
+            let _retry_budget_slot = if attempt > 0 {
+                let active = self.provider_active_count(provider_name);
+                match self
+                    .retry_budgets
+                    .try_acquire_retry(provider_name, active)
+                {
+                    Some(slot) => Some(slot),
+                    None => {
+                        warn!(
+                            provider = provider_name,
+                            attempt,
+                            active,
+                            in_flight = self.retry_budgets.in_flight(provider_name),
+                            "Retry budget exhausted — failing over instead of scheduling same-provider retry"
+                        );
+                        let budget_err = GatewayError::Provider {
+                            provider: provider_name.to_string(),
+                            message: "retry budget exhausted".to_string(),
+                            status_code: None,
+                        };
+                        record_try(
+                            &budget_err,
+                            Some("retry_budget_exhausted"),
+                            None,
+                            std::time::Instant::now(),
+                        );
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
             if attempt > 0 && !skip_backoff_this_attempt {
                 // Defense-in-depth: never burn backoff time on a
                 // rate-limit-class error from the previous attempt. The
@@ -5611,13 +5928,34 @@ true
                     }
                 }
 
-        let backoff_secs = backoff_sequence
-            .get((attempt - 1) as usize)
-            .copied()
-            .unwrap_or(4);
-        let retry_delay =
-            Self::calculate_retry_delay(backoff_secs, jitter_enabled, jitter_ratio);
-        self.metrics
+		let backoff_secs = backoff_sequence
+			.get((attempt - 1) as usize)
+			.copied()
+			.unwrap_or(4);
+		let retry_delay =
+			Self::calculate_retry_delay(backoff_secs, jitter_enabled, jitter_ratio);
+		// Req 1.6 (retry-failover-core-overhaul): the gateway request
+		// deadline caps the whole retry loop. Reuse the existing
+		// deadline source (effective_request_timeout_seconds, the same
+		// value the deadline middleware enforces) and the
+		// ActiveRequestInfo clock (elapsed_ms, the same source
+		// pre_dispatch_ms reads): if waiting out this backoff would wake
+		// past the deadline, do not schedule — advance to the next
+		// candidate / return now.
+		if let (Some(handle), Some(deadline_ms)) = (&active, request_deadline_ms) {
+			let wake_at_ms = handle.elapsed_ms() + retry_delay.as_millis() as i64;
+			if wake_at_ms >= deadline_ms {
+				warn!(
+					provider = provider_name,
+					attempt,
+					delay_ms = retry_delay.as_millis() as u64,
+					deadline_ms,
+					"Retry backoff would pass the gateway request deadline — failing over instead of scheduling"
+				);
+				break;
+			}
+		}
+		self.metrics
             .record_provider_retry(provider_name, retry_delay.as_millis() as u64);
         // Report the retry to the in-flight registry: same provider,
         // retrying after the previous attempt's error. The backoff stall is
@@ -6348,41 +6686,114 @@ true
                             }
                         }
 
-                        // For rate-limit signals, parse Retry-After /
-                        // retry_after_ms and put the provider in a
-                        // bounded cooldown window so subsequent requests
-                        // skip it via select_provider_order without
-                        // re-issuing.
-                        if Self::is_rate_limited(status_code, &body_text) {
-                            let cooldown = self
-                                .parse_rate_limit_cooldown(
-                                    provider_name,
-                                    Some(&response_headers),
-                                    &body_text,
-                                )
-                                .await;
-                            let rate_limiter = self.get_rate_limiter(provider_name).await;
-                            rate_limiter.apply_cooldown(cooldown).await;
-                            self.metrics
-                                .record_provider_rate_limit_exhausted(provider_name);
-                            let now_secs = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            let deadline = now_secs.saturating_add(cooldown.as_secs());
-                            self.metrics.set_provider_cooldown(
-                                provider_name,
-                                Self::friendly_failure_reason(Some(status_code), &body_text),
-                                deadline,
-                            );
+// For rate-limit signals, parse Retry-After /
+// retry_after_ms and put the provider in a
+// bounded cooldown window so subsequent requests
+// skip it via select_provider_order without
+// re-issuing.
+if Self::is_rate_limited(status_code, &body_text) {
+ let cooldown = self
+ .parse_rate_limit_cooldown(
+ provider_name,
+ Some(&response_headers),
+ &body_text,
+ )
+ .await;
+ // R4: only a real upstream Retry-After signal may drive the
+ // bounded wait; a hint-less 429 (parser fell back to the
+ // configured default cooldown) fails over per Req 3.1.
+ let cooldown_from_upstream = self
+ .upstream_rate_limit_cooldown_hint(
+ Some(&response_headers),
+ &body_text,
+ )
+ .await;
+ // Bounded Retry-After wait (retry-failover-core-overhaul,
+// Req 3.1-3.9): the primary candidate's first
+// qualifying 429 may wait out the provider's own
+// Retry-After and retry the same provider through
+// normal admission (the retry send below re-enters
+// the debit gate — exactly one token per send, ADR
+// 0002). The parsed cooldown IS the Retry-After;
+// it is reused, never parsed twice. The provider
+// permit is dropped before the wait (Req 3.9 wait
+// discipline) and re-acquired after; a saturated
+// provider surfaces its usual 503 rather than
+// blocking the wait.
+ if let Some(wait) = Self::retry_after_wait_duration(
+ is_primary_candidate,
+ retry_after_waited,
+ // R1: rows from a previous dispatch mean this request
+ // already failed over, so the current dispatch's index 0
+ // is a fallback, not the primary.
+ attempt_rows_at_dispatch > 0,
+ max_retries,
+ retry_after_max_wait_ms,
+ cooldown,
+ cooldown_from_upstream,
+ ) {
+                retry_after_waited = true;
+                // The cooldown still applies: a second request
+                // hitting this provider while this one waits must
+                // not re-send into the same rate limit.
+                self.get_rate_limiter(provider_name)
+                    .await
+                    .apply_cooldown(cooldown)
+                    .await;
+                drop(concurrency_permit);
+let waited = Self::maybe_wait_retry_after(
+active.as_ref(),
+provider_name,
+&provider_model.model,
+wait,
+wait_deadline_ms,
+)
+.await;
+ if waited {
+ // R5: record the 429 try row BEFORE re-acquiring the
+ // provider slot (mirrors the streaming arm's ordering):
+ // a saturation reject below must not drop the ledger row
+ // for the 429 the upstream really returned.
+ record_try(&err, None, None, request_start);
+ // Re-acquire the provider slot; a reject fails
+ // the request with the usual saturated-provider
+ // 503 instead of the original 429.
+ concurrency_permit = self
+ .acquire_provider_slot_or_reject(
+ &provider_cfg,
+ &provider_model.model,
+ )
+ .await?;
+ skip_next_backoff = true;
+ last_error = Some(err);
+ continue;
+ }
+// Deadline fired (or loomed) during the wait: run
+// today's cooldown + failover path below — no
+// retry was sent, no rate token consumed.
+}
+let rate_limiter = self.get_rate_limiter(provider_name).await;
+rate_limiter.apply_cooldown(cooldown).await;
+self.metrics
+.record_provider_rate_limit_exhausted(provider_name);
+let now_secs = SystemTime::now()
+.duration_since(UNIX_EPOCH)
+.map(|d| d.as_secs())
+.unwrap_or(0);
+let deadline = now_secs.saturating_add(cooldown.as_secs());
+self.metrics.set_provider_cooldown(
+provider_name,
+Self::friendly_failure_reason(Some(status_code), &body_text),
+deadline,
+);
 
-                            warn!(
-                                provider = provider_name,
-                                status = status_code,
-                                cooldown_ms = cooldown.as_millis() as u64,
-                                "Rate limited, failing over and cooling down provider"
-                            );
-                        } else {
+warn!(
+provider = provider_name,
+status = status_code,
+cooldown_ms = cooldown.as_millis() as u64,
+"Rate limited, failing over and cooling down provider"
+);
+} else {
                             warn!(
                                 provider = provider_name,
                                 status = status_code,
@@ -6409,63 +6820,83 @@ true
                         record_try(&err, None, None, request_start);
                         return Err(err);
                     }
-                    if status_code == 503 {
-                        warn!(
-                            provider = provider_name,
-                            status = status_code,
-                            "Service unavailable, failing over immediately"
-                        );
-                        record_try(&err, None, None, request_start);
-                        return Err(err);
-                    }
+		// Single policy table (retry-failover-core-overhaul, Component 1):
+		// every non-4xx attempt decision flows through
+		// retry_policy::classify. RetrySameProvider keeps the
+		// max_retries_per_provider loop; FailOver returns the error so
+		// the failover layer advances to the next candidate. Mechanism
+		// one-shots (image strip, reasoning strip, context truncation,
+		// OAuth refresh) stay caller-owned above.
+		if retry_policy::classify(&err) == RetryDecision::FailOver {
+			// The 503 / timeout-class labels below are only for log
+			// fidelity; both previously failed over, matching the table.
+			if status_code == 503 {
+				warn!(
+					provider = provider_name,
+					status = status_code,
+					"Service unavailable, failing over immediately"
+				);
+				record_try(&err, None, None, request_start);
+				return Err(err);
+			}
+			if is_timeout_class(&err) {
+				// DD10: an upstream gateway timeout (504/524) on a
+				// long generation repeats on retry and duplicates the
+				// provider-side work, so fail over immediately.
+				warn!(
+					provider = provider_name,
+					status = status_code,
+					"Upstream gateway timeout, failing over without same-provider retry"
+				);
+				record_try(&err, None, None, request_start);
+				return Err(err);
+			}
+			warn!(
+				provider = provider_name,
+				status = status_code,
+				"Non-retryable per policy table, failing over"
+			);
+			record_try(&err, None, None, request_start);
+			return Err(err);
+		}
 
-                    if is_timeout_class(&err) {
-                        // DD10: an upstream gateway timeout (504/524) on a
-                        // long generation repeats on retry and duplicates the
-                        // provider-side work, so fail over immediately.
-                        warn!(
-                            provider = provider_name,
-                            status = status_code,
-                            "Upstream gateway timeout, failing over without same-provider retry"
-                        );
-                        record_try(&err, None, None, request_start);
-                        return Err(err);
-                    }
-
-                    warn!(
-                        provider = provider_name,
-                        status = status_code,
-                        attempt,
-                        "Retryable error"
-                    );
-                    record_try(&err, None, None, request_start);
-                    last_error = Some(err);
-                }
-                Err(e) => {
-                    let err = GatewayError::Provider {
-                        provider: provider_name.to_string(),
-                        message: format!("Request failed: {}", e),
-                        status_code: None,
-                    };
-                    // Log full error chain for network diagnostics
-                    let mut cause_chain = String::new();
-                    let mut source: Option<&dyn StdError> = std::error::Error::source(&e);
-                    while let Some(cause) = source {
-                        cause_chain.push_str(&format!(" -> {}", cause));
-                        source = std::error::Error::source(cause);
-                    }
-                    warn!(
-                        provider = provider_name,
-                        attempt,
-                        error = %e,
-                        causes = %cause_chain,
-                        is_timeout = e.is_timeout(),
-                        is_connect = e.is_connect(),
-                        "Network error"
-                    );
-                    record_try(&err, Some("network_error"), Some(502), request_start);
-                    last_error = Some(err);
-                }
+		warn!(
+			provider = provider_name,
+			status = status_code,
+			attempt,
+			"Retryable error"
+		);
+		record_try(&err, None, None, request_start);
+		last_error = Some(err);
+	}
+	Err(e) => {
+		let err = GatewayError::Provider {
+			provider: provider_name.to_string(),
+			message: format!("Request failed: {}", e),
+			status_code: None,
+		};
+		// Log full error chain for network diagnostics
+		let mut cause_chain = String::new();
+		let mut source: Option<&dyn StdError> = std::error::Error::source(&e);
+		while let Some(cause) = source {
+			cause_chain.push_str(&format!(" -> {}", cause));
+			source = std::error::Error::source(cause);
+		}
+		warn!(
+			provider = provider_name,
+			attempt,
+			error = %e,
+			causes = %cause_chain,
+			is_timeout = e.is_timeout(),
+			is_connect = e.is_connect(),
+			"Network error"
+		);
+		// Network errors stay in the retry budget (classify ->
+		// RetrySameProvider; Provider{status_code: None} is transport
+		// failure, not an HTTP status).
+		record_try(&err, Some("network_error"), Some(502), request_start);
+		last_error = Some(err);
+	}
             }
         }
 
@@ -7455,28 +7886,36 @@ true
                 handle.set_target(&provider_model.provider, &provider_model.model, phase);
                 handle.set_attempt(attempt_counter);
             }
-            let ledger_before = active.as_ref().map_or(0, |h| h.failed_attempt_count());
-            let dispatch_result = if force_context_reduce {
-                self.attempt_with_retry_forced_reduce(
-                    &provider_model.provider,
-                    &prepared_request,
-                    &provider_model,
-                    active.clone(),
-                    attempt_counter,
-                    FirstSendToken::Prepaid,
-                )
-                .await
-            } else {
-                self.attempt_with_retry(
-                    &provider_model.provider,
-                    &prepared_request,
-                    &provider_model,
-                    active.clone(),
-                    attempt_counter,
-                    FirstSendToken::Prepaid,
-                )
-                .await
-            };
+        let ledger_before = active.as_ref().map_or(0, |h| h.failed_attempt_count());
+        // Primary-candidate flag for the bounded Retry-After wait (Req
+        // 3.1-3.3): only the first candidate this request dispatches to
+        // may wait. The forced-reduce fallback (candidate_index =
+        // usize::MAX) re-dispatches an already-tried candidate, never a
+        // fresh primary, so it never qualifies either.
+        let is_primary_candidate = candidate_index == 0;
+        let dispatch_result = if force_context_reduce {
+            self.attempt_with_retry_forced_reduce(
+                &provider_model.provider,
+                &prepared_request,
+                &provider_model,
+                active.clone(),
+                attempt_counter,
+                FirstSendToken::Prepaid,
+                is_primary_candidate,
+            )
+            .await
+        } else {
+            self.attempt_with_retry(
+                &provider_model.provider,
+                &prepared_request,
+                &provider_model,
+                active.clone(),
+                attempt_counter,
+                FirstSendToken::Prepaid,
+                is_primary_candidate,
+            )
+            .await
+        };
             match dispatch_result {
                 Ok(mut response) => {
                     // ---- Repair the turn before judging it ----------------
@@ -8557,6 +8996,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 attempt_counter,
                 // The nudge is a second upstream request: debit its token.
                 FirstSendToken::Debit,
+                false,
             )
             .await
         {
@@ -10616,25 +11056,30 @@ return Err(GatewayError::InvalidRequest(
             break;
         }
 
-        // No pass-through slot is immediately available. Preserve provider
-        // order by waiting for the first saturated candidate, then use the
-        // normal buffered route so cross-provider failover remains intact.
-        let (provider_model, concurrency_permit) = match chosen {
-            Some(chosen) => chosen,
-            None => {
-                let Some((provider_model, provider_cfg)) = chosen_without_capacity else {
-                    debug!("No eligible pass-through provider, using buffered path");
-                    return Ok(StreamingResponse::Buffered(
-                        self.route_request(request, active.clone()).await?,
-                    ));
-                };
-                debug!(provider = %provider_model.provider, model = %provider_model.model, "Waiting for provider concurrency before buffered dispatch");
-                drop(provider_cfg);
-                return Ok(StreamingResponse::Buffered(
-                    self.route_request(request, active.clone()).await?,
-                ));
-            }
+// No pass-through slot is immediately available. Preserve provider
+// order by waiting for the first saturated candidate, then use the
+// normal buffered route so cross-provider failover remains intact.
+// `Option` so the Retry-After wait can drop the permit before sleeping
+// and re-acquire it after (Req 3.9 wait discipline).
+let (provider_model, mut concurrency_permit) = match chosen {
+    Some(chosen) => {
+        let (provider_model, permit) = chosen;
+        (provider_model, Some(permit))
+    }
+    None => {
+        let Some((provider_model, provider_cfg)) = chosen_without_capacity else {
+            debug!("No eligible pass-through provider, using buffered path");
+            return Ok(StreamingResponse::Buffered(
+                self.route_request(request, active.clone()).await?,
+            ));
         };
+        debug!(provider = %provider_model.provider, model = %provider_model.model, "Waiting for provider concurrency before buffered dispatch");
+        drop(provider_cfg);
+        return Ok(StreamingResponse::Buffered(
+            self.route_request(request, active.clone()).await?,
+        ));
+    }
+};
 
         // Report the streaming pass-through target to the in-flight registry.
         // If providers were excluded it means an earlier pass-through failed and
@@ -10661,7 +11106,7 @@ return Err(GatewayError::InvalidRequest(
                 provider = %provider_model.provider,
                 "Codex search active — routing streaming request through buffered path for tool-call interception"
             );
-            drop(concurrency_permit);
+            drop(concurrency_permit.take());
             return Ok(StreamingResponse::Buffered(
                 self.route_request(request, active.clone()).await?,
             ));
@@ -10740,7 +11185,7 @@ return Err(GatewayError::InvalidRequest(
             || known_degenerate_combo
         {
             debug!(provider = %provider_model.provider, "Provider needs transformation or is Codex, using buffered path with full failover");
-            drop(concurrency_permit);
+            drop(concurrency_permit.take());
             return Ok(StreamingResponse::Buffered(
                 self.route_request(request, active.clone()).await?,
             ));
@@ -10769,7 +11214,7 @@ return Err(GatewayError::InvalidRequest(
         // path so the auth failure surfaces consistently via failover.
         if is_oauth_provider && oauth_bearer.is_none() {
             debug!(provider = %provider_model.provider, "OAuth session unusable, using buffered path");
-            drop(concurrency_permit);
+            drop(concurrency_permit.take());
             return Ok(StreamingResponse::Buffered(
                 self.route_request(request, active.clone()).await?,
             ));
@@ -10898,7 +11343,7 @@ return Err(GatewayError::InvalidRequest(
                         > u64::from(check.budget)
                             * u64::from(context_config.summarize_trigger_percent);
                 if !check.fits || summarize {
-                    drop(concurrency_permit);
+                    drop(concurrency_permit.take());
                     return Ok(StreamingResponse::Buffered(
                         self.route_request_with_exclusions(request, active, exclude)
                             .await?,
@@ -10911,7 +11356,7 @@ return Err(GatewayError::InvalidRequest(
             warn!(provider = %provider_model.provider, "Rate limit exhausted before streaming dispatch, using buffered path");
             self.metrics
                 .record_provider_rate_limit_exhausted(&provider_model.provider);
-            drop(concurrency_permit);
+            drop(concurrency_permit.take());
             return Ok(StreamingResponse::Buffered(
                 self.route_request_with_exclusions(request, active, exclude)
                     .await?,
@@ -10919,253 +11364,522 @@ return Err(GatewayError::InvalidRequest(
         }
         let http_client = self.get_or_create_http_client(&provider_model.provider, &pool_config)?;
 
-        let mut req_builder = http_client
-            .post(&url)
-            .header("Content-Type", "application/json");
-        if let Some(ref bearer) = oauth_bearer {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", bearer));
-        } else if !api_key.is_empty() {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+// Retry policy inputs (retry-failover-core-overhaul, Task 4): same
+// sources as the buffered dispatch loop (max_retries_per_provider,
+// backoff sequence + jitter, and the Req 1.6 gateway deadline cap),
+// plus the bounded Retry-After wait knob (Req 3.1-3.9).
+let (
+    max_retries,
+    backoff_sequence,
+    jitter_enabled,
+    jitter_ratio,
+    request_deadline_ms,
+    retry_after_max_wait_ms,
+    provider_cfg_max_connections,
+) = {
+    let config = self.config.read().await;
+    let deadline_ms = {
+        let secs = crate::runtime_limits::effective_request_timeout_seconds(&config);
+        (secs > 0).then(|| secs as i64 * 1000)
+    };
+    let max_connections = config
+        .providers
+        .iter()
+        .find(|p| p.name == provider_model.provider)
+        .map(|p| p.max_connections)
+        .unwrap_or(10);
+    (
+        config.retry.max_retries_per_provider,
+        config.retry.backoff_sequence_seconds.clone(),
+        config.retry.jitter_enabled,
+        config.retry.jitter_ratio,
+        deadline_ms,
+        config.retry.upstream_retry_after_max_wait_ms,
+        max_connections,
+    )
+};
+let mut last_error: Option<GatewayError> = None;
+// One-shot backoff skip for the Retry-After waited retry: the wait
+// itself IS the delay, so the loop's own backoff must not stack on top.
+let mut skip_next_backoff = false;
+
+	let pre_dispatch_ms = active.as_ref().map_or(0, ActiveRequestHandle::elapsed_ms);
+	// R1: request-scoped primary-ness — rows recorded before this
+	// dispatch (e.g. a buffered failover re-entry after an earlier
+	// candidate failed) prove the request already left its primary;
+	// this loop's own rows must not count.
+	let attempt_rows_at_dispatch = active.as_ref().map_or(0, |h| h.attempt_rows_total());
+	tracing::info!(provider = %provider_model.provider, %url, model = %provider_model.model, ttfb_timeout_secs, pre_dispatch_ms, "Calling provider (streaming pass-through)");
+
+        let mut response = None;
+        for attempt in 0..=max_retries {
+            // Concurrent-retry budget (retry-failover-core-overhaul, Req
+            // 4.1-4.5), mirroring the buffered loop: retry iterations
+            // (≥11) are admitted before scheduling — before the backoff
+            // sleep and the rate-limit re-entry — while first attempts
+            // never consult the budget (Req 4.3). The slot covers the
+            // retry send and is released at iteration end (Req 4.4).
+            // Exhaustion breaks to the pass-through fallback sink
+            // (`passthrough_fallback_excluding`) with a
+            // `retry_budget_exhausted` ledger row (Req 4.2).
+            let _retry_budget_slot = if attempt > 0 {
+                let active_count = self.provider_active_count(&provider_model.provider);
+                match self
+                    .retry_budgets
+                    .try_acquire_retry(&provider_model.provider, active_count)
+                {
+                    Some(slot) => Some(slot),
+                    None => {
+                        warn!(
+                            provider = %provider_model.provider,
+                            attempt,
+                            active = active_count,
+                            in_flight = self.retry_budgets.in_flight(&provider_model.provider),
+                            "Retry budget exhausted (streaming) — failing over instead of scheduling same-provider retry"
+                        );
+                        let budget_err = GatewayError::Provider {
+                            provider: provider_model.provider.clone(),
+                            message: "retry budget exhausted".to_string(),
+                            status_code: None,
+                        };
+                        Self::record_try_failure(
+                            active.as_ref(),
+                            &provider_model.provider,
+                            &provider_model.model,
+                            &budget_err,
+                            Some("retry_budget_exhausted"),
+                            None,
+                            std::time::Instant::now(),
+                        );
+                        last_error = Some(budget_err);
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+        if attempt > 0 && !skip_next_backoff {
+            skip_next_backoff = false;
+            let retry_delay = Self::calculate_retry_delay(
+                backoff_sequence.get((attempt - 1) as usize).copied().unwrap_or(4),
+                jitter_enabled,
+                jitter_ratio,
+            );
+                // Req 1.6 (retry-failover-core-overhaul): same cap as the
+                // buffered loop — waking past the gateway request deadline
+                // means failing over now instead of scheduling the sleep.
+                if let (Some(handle), Some(deadline_ms)) = (&active, request_deadline_ms) {
+                    let wake_at_ms = handle.elapsed_ms() + retry_delay.as_millis() as i64;
+                    if wake_at_ms >= deadline_ms {
+                        warn!(
+                            provider = %provider_model.provider,
+                            attempt,
+                            delay_ms = retry_delay.as_millis() as u64,
+                            deadline_ms,
+                            "Streaming retry backoff would pass the gateway request deadline — failing over instead of scheduling"
+                        );
+                        break;
+                    }
+                }
+                self.metrics
+                    .record_provider_retry(&provider_model.provider, retry_delay.as_millis() as u64);
+                if let Some(handle) = &active {
+                    handle.set_phase(ActivePhase::Retry);
+                    handle.set_attempt(attempt as usize);
+                    if let Some(err) = &last_error {
+                        handle.set_last_error(&err.to_string());
+                    }
+                }
+                let _backoff_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                    active.as_ref(),
+                    crate::active_requests::StallReason::RetryBackoff,
+                );
+        tokio::time::sleep(retry_delay).await;
+        _backoff_stall.end();
+        // ADR 0002: one token per real upstream request — every
+        // re-send re-enters the admission gate.
+        let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
+        if !rate_limiter.consume().await {
+            warn!(provider = %provider_model.provider, "Rate limit exhausted before streaming retry, failing over");
+            self.metrics
+                .record_provider_rate_limit_exhausted(&provider_model.provider);
+            break;
         }
-        for (k, v) in &custom_headers {
-            if k.eq_ignore_ascii_case(reqwest::header::ACCEPT_ENCODING.as_str()) {
-                continue;
+        } else if attempt > 0 {
+            // Backoff skipped (Retry-After waited retry): the wait was
+            // the delay, but the admission gate is NOT skipped — one
+            // token per real upstream send (ADR 0002).
+            skip_next_backoff = false;
+            let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
+            if !rate_limiter.consume().await {
+                warn!(provider = %provider_model.provider, "Rate limit exhausted before streaming retry, failing over");
+                self.metrics
+                    .record_provider_rate_limit_exhausted(&provider_model.provider);
+                break;
             }
-            req_builder = req_builder.header(k.as_str(), v.as_str());
         }
-        // RequestBuilder::header appends rather than replaces existing values, so
-        // filter any provider-level Accept-Encoding above and add identity exactly
-        // once. Compressed SSE is vulnerable to truncated decoder frames.
-        req_builder = req_builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
 
-        let pre_dispatch_ms = active.as_ref().map_or(0, ActiveRequestHandle::elapsed_ms);
-        tracing::info!(provider = %provider_model.provider, %url, model = %provider_model.model, ttfb_timeout_secs, pre_dispatch_ms, "Calling provider (streaming pass-through)");
+            let mut req_builder = http_client
+                .post(&url)
+                .header("Content-Type", "application/json");
+            if let Some(ref bearer) = oauth_bearer {
+                req_builder = req_builder.header("Authorization", format!("Bearer {}", bearer));
+            } else if !api_key.is_empty() {
+                req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+            }
+            for (k, v) in &custom_headers {
+                if k.eq_ignore_ascii_case(reqwest::header::ACCEPT_ENCODING.as_str()) {
+                    continue;
+                }
+                req_builder = req_builder.header(k.as_str(), v.as_str());
+            }
+            // RequestBuilder::header appends rather than replaces existing values, so
+            // filter any provider-level Accept-Encoding above and add identity exactly
+            // once. Compressed SSE is vulnerable to truncated decoder frames.
+            req_builder = req_builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
 
-        // Apply the TTFB timeout to the initial response headers only. The
-        // inter-chunk timeout is applied to the body by the relay loop (5.3).
-        // The permit acquired during candidate selection moves with the live
-        // response so it remains held until the downstream relay finishes.
-        let request_start = std::time::Instant::now();
-        let send_result =
-            tokio::time::timeout(ttfb_timeout, req_builder.json(&outgoing).send()).await;
-        let response = match send_result {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                warn!(provider = %provider_model.provider, error = %e, "Streaming pass-through send failed, falling back to buffered path without this provider");
-                drop(concurrency_permit);
+            // Apply the TTFB timeout to the initial response headers only. The
+            // inter-chunk timeout is applied to the body by the relay loop (5.3).
+            // The permit acquired during candidate selection moves with the live
+            // response so it remains held until the downstream relay finishes.
+            let request_start = std::time::Instant::now();
+            let send_result =
+                tokio::time::timeout(ttfb_timeout, req_builder.json(&outgoing).send()).await;
+            let resp = match send_result {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    warn!(provider = %provider_model.provider, error = %e, "Streaming pass-through send failed");
+                    let err = GatewayError::Provider {
+                        provider: provider_model.provider.clone(),
+                        message: format!("Request failed: {}", e),
+                        status_code: None,
+                    };
+                    Self::record_try_failure(
+                        active.as_ref(),
+                        &provider_model.provider,
+                        &provider_model.model,
+                        &err,
+                        Some("network_error"),
+                        Some(502),
+                        request_start,
+                    );
+                    last_error = Some(err);
+                    continue;
+                }
+                Err(_) => {
+                    warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — falling back to buffered path without this provider");
+                    drop(concurrency_permit.take());
+                    let err = GatewayError::TtfbTimeout(ttfb_timeout_secs);
+                    Self::record_try_failure(
+                        active.as_ref(),
+                        &provider_model.provider,
+                        &provider_model.model,
+                        &err,
+                        None,
+                        None,
+                        request_start,
+                    );
+                    return self
+                        .passthrough_fallback_excluding(request, exclude, active, &provider_model, err)
+                        .await;
+                }
+            };
+
+            let status = resp.status();
+            if !status.is_success() {
+                let status_code = status.as_u16();
+                // Capture headers before draining so Retry-After style signals
+                // can feed the cooldown parser.
+                let response_headers = resp.headers().clone();
+                let body_text = resp.text().await.unwrap_or_default();
+                // Every non-success pass-through try is a failed try: record it
+                // once here before any fallback, so 429, context-length,
+                // image and other 4xx retries are visible too. Context-length
+                // bodies take the normalized overflow class (US-5); everything
+                // else keeps `upstream_http_<code>`.
                 let err = GatewayError::Provider {
                     provider: provider_model.provider.clone(),
-                    message: format!("Request failed: {}", e),
-                    status_code: None,
+                    message: format!("HTTP {}: {}", status_code, body_text),
+                    status_code: Some(status_code),
+                };
+                let try_class = if self.is_context_length_error(status_code, &body_text) {
+                    Some(CONTEXT_WINDOW_EXCEEDED_CLASS)
+                } else {
+                    None
                 };
                 Self::record_try_failure(
                     active.as_ref(),
                     &provider_model.provider,
                     &provider_model.model,
                     &err,
-                    Some("network_error"),
-                    Some(502),
+                    try_class,
+                    None,
                     request_start,
                 );
-                return self
-                    .passthrough_fallback_excluding(request, exclude, active, &provider_model, err)
+        if Self::is_rate_limited(status_code, &body_text) {
+            // Rate-limit response on the streaming pass-through: apply
+            // the dedicated upstream cooldown (RateLimiter + durable
+            // metrics store, both consulted by the routing gates) and
+            // exclude this provider:model from the buffered fallback so
+            // it is not immediately retried while the cooldown is
+            // active. No circuit-breaker failure is recorded — a
+            // rate-limited provider is paused, not unhealthy.
+ let cooldown = self
+ .parse_rate_limit_cooldown(
+ &provider_model.provider,
+ Some(&response_headers),
+ &body_text,
+ )
+ .await;
+ // R4: only a real upstream Retry-After signal may drive the
+ // bounded wait (Req 3.1); hint-less 429s fail over with the
+ // default cooldown applied.
+ let cooldown_from_upstream = self
+ .upstream_rate_limit_cooldown_hint(
+ Some(&response_headers),
+ &body_text,
+ )
+ .await;
+ // Bounded Retry-After wait (retry-failover-core-overhaul,
+ // Req 3.1-3.9), streaming arm: the primary candidate's
+            // first qualifying 429 may wait out the provider's own
+            // Retry-After and retry the same provider in pass-through.
+            // The parsed cooldown IS the Retry-After (never parsed
+            // twice); the permit is dropped before the wait and
+            // re-acquired after; the retry re-enters `consume()` at the
+            // top of the loop — one token per real send (ADR 0002).
+            // `exclude.is_empty()` marks this dispatch as the
+            // request's primary candidate; the monotonic wait-done
+            // marker makes the one-shot wait cross-stack (a buffered
+            // fallback that already waited never waits again).
+        let is_primary = exclude.is_empty()
+            && !active
+                .as_ref()
+                .is_some_and(|h| h.has_recorded_rate_limit_wait());
+        if let Some(wait) = Self::retry_after_wait_duration(
+            is_primary,
+            false,
+            // R1: rows from a previous dispatch prove the request
+            // already failed over, even when this fresh dispatch's
+            // exclude list is empty. The monotonic wait marker
+            // above stays as the cross-stack one-shot-wait guard.
+            attempt_rows_at_dispatch > 0,
+            max_retries,
+            retry_after_max_wait_ms,
+            cooldown,
+            cooldown_from_upstream,
+        ) {
+                // Cooldown still applies while this request waits.
+                self.get_rate_limiter(&provider_model.provider)
+                    .await
+                    .apply_cooldown(cooldown)
                     .await;
-            }
-            Err(_) => {
-                warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — falling back to buffered path without this provider");
-                drop(concurrency_permit);
-                let err = GatewayError::TtfbTimeout(ttfb_timeout_secs);
-                Self::record_try_failure(
+                let permit_taken = concurrency_permit.take();
+                drop(permit_taken);
+                let waited = Self::maybe_wait_retry_after(
                     active.as_ref(),
                     &provider_model.provider,
                     &provider_model.model,
-                    &err,
-                    None,
-                    None,
-                    request_start,
+                    wait,
+                    request_deadline_ms,
+                )
+                .await;
+                if waited {
+                    // Re-acquire the provider slot; saturation rejects
+                    // with the usual 503 through the fallback sink.
+                    concurrency_permit = match self.try_acquire_provider_concurrency(
+                        &provider_model.provider,
+                        provider_cfg_max_connections,
+                    ) {
+                        Some(permit) => Some(permit),
+                        None => {
+                            warn!(
+                                provider = %provider_model.provider,
+                                "Provider saturated after Retry-After wait — falling back to buffered path"
+                            );
+                            last_error = Some(err);
+                            break;
+                        }
+                    };
+                    last_error = Some(err);
+                    skip_next_backoff = true;
+                    continue;
+                }
+                // Deadline fired during the wait: fall through to the
+                // cooldown + failover below — no retry sent, no token
+                // consumed for it.
+            }
+            let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
+            rate_limiter.apply_cooldown(cooldown).await;
+                    self.metrics
+                        .record_provider_rate_limit_exhausted(&provider_model.provider);
+                    let now_secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let deadline = now_secs.saturating_add(cooldown.as_secs());
+                    self.metrics.set_provider_cooldown(
+                        &provider_model.provider,
+                        Self::friendly_failure_reason(Some(status_code), &body_text),
+                        deadline,
+                    );
+                    warn!(
+                        provider = %provider_model.provider,
+                        status = status_code,
+                        cooldown_ms = cooldown.as_millis() as u64,
+                        "Rate-limit response on streaming pass-through; cooldown applied, failing over via buffered path"
+                    );
+                    drop(concurrency_permit.take());
+                    let mut excluded = exclude.to_vec();
+                    let failed_key = format!("{}:{}", provider_model.provider, provider_model.model);
+                    if !excluded.contains(&failed_key) {
+                        excluded.push(failed_key);
+                    }
+                    return Ok(StreamingResponse::Buffered(
+                        self.route_request_with_exclusions(request, active.clone(), &excluded)
+                            .await?,
+                    ));
+                }
+                // Non-rate-limit failure: the body was drained above so the
+                // connection can be reused; fall back to the buffered path
+                // which has full multi-provider failover.
+                // Context-length errors: attempt truncation before falling back.
+                if self.is_context_length_error(status_code, &body_text) {
+                    let mut truncated_request = request.clone();
+                    match self.context_manager.handle_context_error(
+                        &mut truncated_request,
+                        0,
+                        Some(&body_text),
+                    ) {
+                        Ok(result) => {
+                            info!(
+                                provider = %provider_model.provider,
+                                model = %provider_model.model,
+                                original_tokens = result.original_tokens,
+                                final_tokens = result.final_tokens,
+                                messages_removed = result.messages_removed,
+                                "Context-length error on streaming pass-through, truncated request and retrying via buffered path"
+                            );
+                            drop(concurrency_permit.take());
+                            return Ok(StreamingResponse::Buffered(
+                                self.route_request(&truncated_request, active.clone())
+                                    .await?,
+                            ));
+                        }
+                        Err(e) => {
+                            warn!(
+                                provider = %provider_model.provider,
+                                model = %provider_model.model,
+                                error = %e,
+                                "Context-length error on streaming pass-through but truncation cannot continue"
+                            );
+                        }
+                    }
+                }
+                // Image-input rejection on the streaming pass-through: the
+                // provider refused image content the proactive strip didn't
+                // remove (unrecognized shape or stale capability belief). Strip
+                // images from a cloned request and retry via the buffered path so
+                // the fallback does not re-send the images and burn another 4xx.
+                // Mirrors the buffered path's reactive strip; bounded to the one
+                // shot the buffered retry loop enforces per provider.
+                if Self::is_unsupported_image_error(status_code, &body_text) {
+                    let mut stripped_request = request.clone();
+                    let mut removed = Self::strip_image_content_if_unsupported(
+                        &mut stripped_request,
+                        false,
+                        &provider_model.provider,
+                        &provider_model.model,
+                    );
+                    // No strippable image content in messages: the marker is
+                    // likely in the tool schemas that some aggregators scan as
+                    // part of the whole body. Scrub those before the buffered
+                    // retry so the fallback isn't re-sending the same trigger.
+                    if removed == 0 {
+                        let tools_removed = Self::strip_image_fields_from_tools(&mut stripped_request);
+                        if tools_removed > 0 {
+                            warn!(
+                                provider = %provider_model.provider,
+                                model = %provider_model.model,
+                                status = status_code,
+                                tool_schema_fields_removed = tools_removed,
+                                "Provider rejected image inputs (streaming) with no image content in messages — scrubbed image references from tool schemas and retrying via buffered path"
+                            );
+                        }
+                        removed += tools_removed;
+                    }
+                    if removed > 0 {
+                        info!(
+                            provider = %provider_model.provider,
+                            model = %provider_model.model,
+                            status = status_code,
+                            images_removed = removed,
+                            "Provider rejected image inputs (streaming) — stripped images and retrying via buffered path"
+                        );
+                        drop(concurrency_permit.take());
+                        return Ok(StreamingResponse::Buffered(
+                            self.route_request(&stripped_request, active.clone())
+                                .await?,
+                        ));
+                    }
+                }
+                // Single policy table (retry-failover-core-overhaul, Task 4):
+                // this pass-through site consumes retry_policy::classify exactly
+                // like the buffered loop. The mechanism one-shots above (429
+                // cooldown, context truncation, image strip) already returned.
+                // RetrySameProvider (network send error, 408, 500/501/502)
+                // retries this provider while the retry budget allows;
+                // FailOver (timeout class, 429, 503, other 4xx) keeps today's
+                // fallback semantics below.
+                if retry_policy::classify(&err) == RetryDecision::RetrySameProvider {
+                    last_error = Some(err);
+                    warn!(
+                        provider = %provider_model.provider,
+                        status = status_code,
+                        attempt,
+                        "Streaming pass-through error classified RetrySameProvider — retrying same provider"
+                    );
+                    continue;
+                }
+                if status.is_server_error() {
+                    warn!(provider = %provider_model.provider, status = status_code, "Provider returned server error (streaming), falling back to buffered path without this provider");
+                    drop(concurrency_permit.take());
+                    return self
+                        .passthrough_fallback_excluding(request, exclude, active, &provider_model, err)
+                        .await;
+                }
+                warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
+                drop(concurrency_permit.take());
+                return Ok(StreamingResponse::Buffered(
+                    self.route_request(request, active.clone()).await?,
+                ));
+            }
+
+            response = Some(resp);
+            break;
+        }
+
+        // Retry budget exhausted on a RetrySameProvider class (or the deadline
+        // cap / rate-limit admission gate stopped the loop): fail over through
+        // the same sink the terminal arms use, with the last recorded error.
+        let response = match response {
+            Some(response) => response,
+            None => {
+                let err = last_error.unwrap_or_else(|| GatewayError::Provider {
+                    provider: provider_model.provider.clone(),
+                    message: "Streaming pass-through retries exhausted".to_string(),
+                    status_code: None,
+                });
+                warn!(
+                    provider = %provider_model.provider,
+                    "Streaming pass-through retry budget exhausted, falling back to buffered path without this provider"
                 );
+                drop(concurrency_permit.take());
                 return self
                     .passthrough_fallback_excluding(request, exclude, active, &provider_model, err)
                     .await;
             }
         };
-
-        let status = response.status();
-        if !status.is_success() {
-            let status_code = status.as_u16();
-            // Capture headers before draining so Retry-After style signals
-            // can feed the cooldown parser.
-            let response_headers = response.headers().clone();
-            let body_text = response.text().await.unwrap_or_default();
-            // Every non-success pass-through try is a failed try: record it
-            // once here (upstream_http_<code>) before any fallback, so 429,
-            // context-length, image and other 4xx retries are visible too.
-            let err = GatewayError::Provider {
-                provider: provider_model.provider.clone(),
-                message: format!("HTTP {}: {}", status_code, body_text),
-                status_code: Some(status_code),
-            };
-            // Every non-success pass-through try is a failed try: record it
-            // once here before any fallback, so 429, context-length, image and
-            // other 4xx retries are visible too. Context-length bodies take
-            // the normalized overflow class (US-5); everything else keeps
-            // `upstream_http_<code>`.
-            let try_class = if self.is_context_length_error(status_code, &body_text) {
-                Some(CONTEXT_WINDOW_EXCEEDED_CLASS)
-            } else {
-                None
-            };
-            Self::record_try_failure(
-                active.as_ref(),
-                &provider_model.provider,
-                &provider_model.model,
-                &err,
-                try_class,
-                None,
-                request_start,
-            );
-            if Self::is_rate_limited(status_code, &body_text) {
-                // Rate-limit response on the streaming pass-through: apply
-                // the dedicated upstream cooldown (RateLimiter + durable
-                // metrics store, both consulted by the routing gates) and
-                // exclude this provider:model from the buffered fallback so
-                // it is not immediately retried while the cooldown is
-                // active. No circuit-breaker failure is recorded — a
-                // rate-limited provider is paused, not unhealthy.
-                let cooldown = self
-                    .parse_rate_limit_cooldown(
-                        &provider_model.provider,
-                        Some(&response_headers),
-                        &body_text,
-                    )
-                    .await;
-                let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
-                rate_limiter.apply_cooldown(cooldown).await;
-                self.metrics
-                    .record_provider_rate_limit_exhausted(&provider_model.provider);
-                let now_secs = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let deadline = now_secs.saturating_add(cooldown.as_secs());
-                self.metrics.set_provider_cooldown(
-                    &provider_model.provider,
-                    Self::friendly_failure_reason(Some(status_code), &body_text),
-                    deadline,
-                );
-                warn!(
-                    provider = %provider_model.provider,
-                    status = status_code,
-                    cooldown_ms = cooldown.as_millis() as u64,
-                    "Rate-limit response on streaming pass-through; cooldown applied, failing over via buffered path"
-                );
-                drop(concurrency_permit);
-                let mut excluded = exclude.to_vec();
-                let failed_key = format!("{}:{}", provider_model.provider, provider_model.model);
-                if !excluded.contains(&failed_key) {
-                    excluded.push(failed_key);
-                }
-                return Ok(StreamingResponse::Buffered(
-                    self.route_request_with_exclusions(request, active.clone(), &excluded)
-                        .await?,
-                ));
-            }
-            // Non-rate-limit failure: the body was drained above so the
-            // connection can be reused; fall back to the buffered path
-            // which has full multi-provider failover.
-            // Context-length errors: attempt truncation before falling back.
-            if self.is_context_length_error(status_code, &body_text) {
-                let mut truncated_request = request.clone();
-                match self.context_manager.handle_context_error(
-                    &mut truncated_request,
-                    0,
-                    Some(&body_text),
-                ) {
-                    Ok(result) => {
-                        info!(
-                            provider = %provider_model.provider,
-                            model = %provider_model.model,
-                            original_tokens = result.original_tokens,
-                            final_tokens = result.final_tokens,
-                            messages_removed = result.messages_removed,
-                            "Context-length error on streaming pass-through, truncated request and retrying via buffered path"
-                        );
-                        drop(concurrency_permit);
-                        return Ok(StreamingResponse::Buffered(
-                            self.route_request(&truncated_request, active.clone())
-                                .await?,
-                        ));
-                    }
-                    Err(e) => {
-                        warn!(
-                            provider = %provider_model.provider,
-                            model = %provider_model.model,
-                            error = %e,
-                            "Context-length error on streaming pass-through but truncation cannot continue"
-                        );
-                    }
-                }
-            }
-            // Image-input rejection on the streaming pass-through: the
-            // provider refused image content the proactive strip didn't
-            // remove (unrecognized shape or stale capability belief). Strip
-            // images from a cloned request and retry via the buffered path so
-            // the fallback does not re-send the images and burn another 4xx.
-            // Mirrors the buffered path's reactive strip; bounded to the one
-            // shot the buffered retry loop enforces per provider.
-            if Self::is_unsupported_image_error(status_code, &body_text) {
-                let mut stripped_request = request.clone();
-                let mut removed = Self::strip_image_content_if_unsupported(
-                    &mut stripped_request,
-                    false,
-                    &provider_model.provider,
-                    &provider_model.model,
-                );
-                // No strippable image content in messages: the marker is
-                // likely in the tool schemas that some aggregators scan as
-                // part of the whole body. Scrub those before the buffered
-                // retry so the fallback isn't re-sending the same trigger.
-                if removed == 0 {
-                    let tools_removed = Self::strip_image_fields_from_tools(&mut stripped_request);
-                    if tools_removed > 0 {
-                        warn!(
-                            provider = %provider_model.provider,
-                            model = %provider_model.model,
-                            status = status_code,
-                            tool_schema_fields_removed = tools_removed,
-                            "Provider rejected image inputs (streaming) with no image content in messages — scrubbed image references from tool schemas and retrying via buffered path"
-                        );
-                    }
-                    removed += tools_removed;
-                }
-                if removed > 0 {
-                    info!(
-                        provider = %provider_model.provider,
-                        model = %provider_model.model,
-                        status = status_code,
-                        images_removed = removed,
-                        "Provider rejected image inputs (streaming) — stripped images and retrying via buffered path"
-                    );
-                    drop(concurrency_permit);
-                    return Ok(StreamingResponse::Buffered(
-                        self.route_request(&stripped_request, active.clone())
-                            .await?,
-                    ));
-                }
-            }
-            if status.is_server_error() {
-                warn!(provider = %provider_model.provider, status = status_code, "Provider returned server error (streaming), falling back to buffered path without this provider");
-                drop(concurrency_permit);
-                return self
-                    .passthrough_fallback_excluding(request, exclude, active, &provider_model, err)
-                    .await;
-            }
-            warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
-            drop(concurrency_permit);
-            return Ok(StreamingResponse::Buffered(
-                self.route_request(request, active.clone()).await?,
-            ));
-        }
 
         // Success — hand the live streaming body and permit to the caller.
         // The handler keeps both alive until the relay finishes or is dropped.
@@ -11179,15 +11893,17 @@ return Err(GatewayError::InvalidRequest(
                     .emit(&model_group.name, active.as_ref());
             }
         }
-        Ok(StreamingResponse::PassThrough {
-            byte_stream: response,
-            provider: provider_model.provider.clone(),
-            model: provider_model.model.clone(),
-            compression,
-            concurrency_permit,
-            smart_routing,
-        })
-    }
+Ok(StreamingResponse::PassThrough {
+    byte_stream: response,
+    provider: provider_model.provider.clone(),
+    model: provider_model.model.clone(),
+    compression,
+    concurrency_permit: concurrency_permit.expect(
+        "a successful pass-through holds its provider permit (re-acquired after any Retry-After wait)",
+    ),
+    smart_routing,
+})
+}
 
     pub async fn route_provider_pass_through(
         &self,
@@ -11719,25 +12435,38 @@ return Err(GatewayError::InvalidRequest(
         Ok(http_client)
     }
 
-    fn calculate_retry_delay(
-        base_delay_secs: u64,
-        jitter_enabled: bool,
-        jitter_ratio: f64,
-    ) -> Duration {
-        if !jitter_enabled || jitter_ratio <= 0.0 {
-            return Duration::from_secs(base_delay_secs);
-        }
+	fn calculate_retry_delay(
+		base_delay_secs: u64,
+		jitter_enabled: bool,
+		jitter_ratio: f64,
+	) -> Duration {
+		let mut rng = rand::thread_rng();
+		Self::calculate_retry_delay_with_rng(
+			&mut rng,
+			base_delay_secs,
+			jitter_enabled,
+			jitter_ratio,
+		)
+	}
 
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.subsec_nanos() as f64)
-            .unwrap_or(0.0);
-        let random_unit = (nanos % 1000.0) / 1000.0;
-        let lower_bound = (1.0 - jitter_ratio).max(0.0);
-        let upper_bound = 1.0 + jitter_ratio;
-        let multiplier = lower_bound + ((upper_bound - lower_bound) * random_unit);
-        Duration::from_secs_f64((base_delay_secs as f64) * multiplier)
-    }
+	/// Seedable core of [`Self::calculate_retry_delay`] (Req 2.3): identical
+	/// semantics, but the RNG is injected so tests can sample the
+	/// distribution deterministically via `StdRng::seed_from_u64`.
+	fn calculate_retry_delay_with_rng<R: rand::Rng>(
+		rng: &mut R,
+		base_delay_secs: u64,
+		jitter_enabled: bool,
+		jitter_ratio: f64,
+	) -> Duration {
+		if !jitter_enabled || jitter_ratio <= 0.0 {
+			return Duration::from_secs(base_delay_secs);
+		}
+
+		let lower_bound = (1.0 - jitter_ratio).max(0.0);
+		let upper_bound = 1.0 + jitter_ratio;
+		let multiplier = rng.gen_range(lower_bound..=upper_bound);
+		Duration::from_secs_f64((base_delay_secs as f64) * multiplier)
+	}
 }
 
 #[cfg(test)]
@@ -14317,11 +15046,19 @@ mod tests {
             phase: ActivePhase::Pending,
             stall_reason: None,
             last_error: None,
-            virtual_key_id: None,
-            started_at_ms: 0,
+		virtual_key_id: None,
+		// Real arrival stamp: the retry-loop deadline cap (Req 1.6)
+		// reads elapsed time from this field, and a synthetic 0
+		// would read as "already past every deadline".
+		started_at_ms: SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map(|d| d.as_millis() as i64)
+			.unwrap_or(0),
             kind: crate::active_requests::RequestKind::Chat,
             smart_routing_logged: false,
             failed_attempts: Vec::new(),
+            attempt_rows_total: 0,
+            rate_limit_wait_done: false,
             outcome_logged: false,
             breaker_skips_recorded: false,
             reasoning_relay: None,
@@ -14538,14 +15275,116 @@ mod tests {
             .await
             .expect("provider b answers after a's retries");
 
-        let ledger = handle.take_failed_attempts();
-        assert_eq!(ledger.len(), 2, "ledger: {ledger:?}");
-        assert!(ledger
-            .iter()
-            .all(|attempt| attempt.status_code == Some(500)));
-        a.verify().await;
-        b.verify().await;
+    let ledger = handle.take_failed_attempts();
+    assert_eq!(ledger.len(), 2, "ledger: {ledger:?}");
+    assert!(ledger
+        .iter()
+        .all(|attempt| attempt.status_code == Some(500)));
+    a.verify().await;
+    b.verify().await;
+}
+
+/// Concurrent-outage guard for the retry budget (spec
+/// retry-failover-core-overhaul, Req 4.1-4.5): 16 concurrent requests
+/// against a primary that always 500s (retryable class) with one
+/// same-provider retry allowed each. With live active ~= 16 the budget
+/// admits at most max(3, 16/5) = 3 concurrent retries, so:
+/// (a) every request still succeeds via the healthy fallback,
+/// (b) primary wire hits == first attempts + admitted retries
+///     (16 + 3, not 16 + 16),
+/// (c) the requests refused a slot carry a `retry_budget_exhausted`
+///     ledger row.
+///
+/// Determinism: the primary mock delays every response 500 ms, so all
+/// first attempts complete in one wave and the winners hold their retry
+/// slots (through the retry send) far longer than the losers' checks
+/// take; the refused requests therefore observe in_flight == threshold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_outage_retry_budget_caps_same_provider_retries() {
+    use wiremock::matchers::{method, path};
+
+    const N: usize = 16;
+    const CAP: usize = 3; // max(3, N/5) (floor) with N = 16
+
+    let a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string("boom")
+                .set_delay(Duration::from_millis(500)),
+        )
+        .mount(&a)
+        .await;
+    let b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(STREAMED_TURN_SSE),
+        )
+        .expect(N as u64)
+        .mount(&b)
+        .await;
+
+    let mut config = create_test_config();
+    config.retry.max_retries_per_provider = 1;
+    config.retry.backoff_sequence_seconds = vec![0];
+    let mut provider_a = test_provider("a", a.uri());
+    provider_a.max_connections = 32;
+    let mut provider_b = test_provider("b", b.uri());
+    provider_b.max_connections = 32;
+    config.providers = vec![provider_a, provider_b];
+    config.model_groups = vec![test_group(vec![test_model("a", 1), test_model("b", 2)])];
+    let router = Arc::new(Router::new(Arc::new(RwLock::new(config)), test_metrics()));
+
+    let handles: Vec<_> = (0..N).map(|_| ledger_handle()).collect();
+    let mut tasks = Vec::new();
+    for handle in &handles {
+        let router = Arc::clone(&router);
+        let handle = handle.clone();
+        tasks.push(tokio::spawn(async move {
+            router
+                .route_request(&compression_request(false), Some(handle))
+                .await
+                .expect("fallback provider must answer")
+        }));
     }
+    for task in tasks {
+        task.await.expect("request task must not panic");
+    }
+
+    // (b) wire hits on the failing primary: every request sent its first
+    // attempt; only CAP retries were admitted.
+    let a_hits = chat_requests(&a).await;
+    assert_eq!(
+        a_hits,
+        N + CAP,
+        "expected {N} first attempts + {CAP} budgeted retries on primary, got {a_hits}"
+    );
+
+    // (c) every refused request carries a retry_budget_exhausted row;
+    // the CAP winners carry their two upstream_http_500 rows instead.
+    let mut exhausted = 0;
+    for handle in &handles {
+        let ledger = handle.take_failed_attempts();
+        if ledger
+            .iter()
+            .any(|attempt| attempt.error_class.as_deref() == Some("retry_budget_exhausted"))
+        {
+            exhausted += 1;
+        }
+    }
+    assert_eq!(
+        exhausted,
+        N - CAP,
+        "expected {} requests refused by the retry budget, got {exhausted}",
+        N - CAP
+    );
+    a.verify().await;
+    b.verify().await;
+}
 
     // ────────────────────────────────────────────────────────────────────
     // ADR 0002: provider rate-limit accounting
@@ -15234,13 +16073,581 @@ extra: Default::default(),
         assert_eq!(chat_requests(&primary).await, 0);
     }
 
-    #[test]
-    fn is_timeout_class_covers_router_timeouts_and_gateway_statuses() {
-        let provider = |status| GatewayError::Provider {
-            provider: "p".to_string(),
-            message: "HTTP".to_string(),
-            status_code: status,
-        };
+// ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+// Bounded Retry-After wait for the primary provider (Req 3.1-3.9,
+// retry-failover-core-overhaul)
+// ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+/// Config like [`rate_limited_config`] plus the Retry-After wait knob.
+fn retry_after_wait_config(
+    primary: &MockServer,
+    backup: &MockServer,
+    retry_after_max_wait_ms: u64,
+) -> Config {
+    let mut config = rate_limited_config(primary, backup, 0, Some(0));
+    config.retry.upstream_retry_after_max_wait_ms = retry_after_max_wait_ms;
+    config
+}
+
+/// A 429 response carrying a millisecond-precision `retry-after-ms`
+/// header (parsed first by `cooldown_from_headers`).
+fn rate_limited_response(retry_after_ms: u64) -> ResponseTemplate {
+    ResponseTemplate::new(429)
+        .insert_header("retry-after-ms", retry_after_ms.to_string())
+        .set_body_json(serde_json::json!({
+            "error": {"message": "Rate limit exceeded"}
+        }))
+}
+
+fn has_rate_limit_wait(ledger: &[ProviderAttempt]) -> bool {
+    ledger
+        .iter()
+        .any(|a| a.error_class.as_deref() == Some("rate_limit_wait"))
+}
+
+/// Req 3.1/3.6: primary 429 + small Retry-After —— the gateway waits,
+/// retries the SAME provider, succeeds; a `rate_limit_wait` ledger row
+/// records the wait; the fallback is never hit.
+#[tokio::test]
+async fn primary_429_waits_retry_after_and_retries_same_provider() {
+    use wiremock::matchers::{method, path};
+
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(rate_limited_response(60))
+        .up_to_n_times(1)
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+        .mount(&primary)
+        .await;
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+        .mount(&backup)
+        .await;
+    let router = Router::new(
+        Arc::new(RwLock::new(retry_after_wait_config(
+            &primary,
+            &backup,
+            5_000,
+        ))),
+        test_metrics(),
+    );
+    let handle = ledger_handle();
+
+    let started = std::time::Instant::now();
+    let response = router
+        .route_request(&compression_request(false), Some(handle.clone()))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        response.extra.get("gateway_provider"),
+        Some(&serde_json::json!("primary"))
+    );
+    assert!(
+        elapsed >= Duration::from_millis(50),
+        "must have waited out the Retry-After, took {elapsed:?}"
+    );
+    let ledger = handle.take_failed_attempts();
+    assert!(has_rate_limit_wait(&ledger), "ledger: {ledger:?}");
+    let wait_row = ledger
+        .iter()
+        .find(|a| a.error_class.as_deref() == Some("rate_limit_wait"))
+        .unwrap();
+    assert!(wait_row.duration_ms.unwrap() >= 50, "{wait_row:?}");
+    assert_eq!(chat_requests(&primary).await, 2, "primary hit exactly twice");
+    assert_eq!(chat_requests(&backup).await, 0, "fallback never hit");
+}
+
+/// Req 3.3: Retry-After larger than `upstream_retry_after_max_wait_ms`
+/// —— no wait, cooldown, immediate failover; primary hit exactly once.
+#[tokio::test]
+async fn oversized_retry_after_fails_over_without_waiting() {
+    use wiremock::matchers::{method, path};
+
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(rate_limited_response(10_000))
+        .mount(&primary)
+        .await;
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+        .mount(&backup)
+        .await;
+    let router = Router::new(
+        Arc::new(RwLock::new(retry_after_wait_config(
+            &primary,
+            &backup,
+            500,
+        ))),
+        test_metrics(),
+    );
+    let handle = ledger_handle();
+
+    let started = std::time::Instant::now();
+    let response = router
+        .route_request(&compression_request(false), Some(handle.clone()))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        response.extra.get("gateway_provider"),
+        Some(&serde_json::json!("backup"))
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_000),
+        "must not wait out the oversized Retry-After, took {elapsed:?}"
+    );
+    assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+    assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
+}
+
+/// Req 3.2: a non-primary 429 (primary failed 500 first) never waits —
+/// the request advances to the next candidate at once.
+#[tokio::test]
+async fn non_primary_429_does_not_wait() {
+    use wiremock::matchers::{method, path};
+
+    let a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&a)
+        .await;
+    let b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(rate_limited_response(60))
+        .mount(&b)
+        .await;
+    let c = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+        .mount(&c)
+        .await;
+    let mut config = create_test_config();
+    config.retry.max_retries_per_provider = 0;
+    config.retry.upstream_retry_after_max_wait_ms = 5_000;
+    config.providers = vec![
+        test_provider("a", a.uri()),
+        test_provider("b", b.uri()),
+        test_provider("c", c.uri()),
+    ];
+    config.model_groups = vec![test_group(vec![
+        test_model("a", 1),
+        test_model("b", 2),
+        test_model("c", 3),
+    ])];
+    let router = Arc::new(Router::new(Arc::new(RwLock::new(config)), test_metrics()));
+    let handle = ledger_handle();
+
+    let started = std::time::Instant::now();
+    let response = router
+        .route_request(&compression_request(false), Some(handle.clone()))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        response.extra.get("gateway_provider"),
+        Some(&serde_json::json!("c"))
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_000),
+        "non-primary 429 must not wait, took {elapsed:?}"
+    );
+	assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+	assert_eq!(chat_requests(&b).await, 1, "b hit exactly once");
+}
+
+/// Req 3.2 (review finding R1): primary-ness is request-scoped, not
+/// dispatch-scoped. The streaming primary fails 500 and falls back into
+/// a FRESH buffered dispatch (`route_request_with_exclusions` with `a`
+/// excluded) where `b` is candidate 0; b's small-Retry-After 429 with
+/// the knob on must NOT wait — the request already carries upstream
+/// attempt rows, so it is no longer on its primary. `max_retries=1`
+/// keeps the max-retries gate open so only the prior-attempts gate can
+/// block the wait.
+#[tokio::test]
+async fn fallback_429_after_failover_does_not_wait_in_fresh_dispatch() {
+	use wiremock::matchers::{method, path};
+
+	let a = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v1/chat/completions"))
+		.respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+		.mount(&a)
+		.await;
+	let b = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v1/chat/completions"))
+		.respond_with(rate_limited_response(60))
+		.mount(&b)
+		.await;
+	let c = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v1/chat/completions"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+		.mount(&c)
+		.await;
+	let mut config = create_test_config();
+	config.retry.max_retries_per_provider = 1;
+	config.retry.backoff_sequence_seconds = vec![0];
+	config.retry.upstream_retry_after_max_wait_ms = 5_000;
+	config.providers = vec![
+		test_provider("a", a.uri()),
+		test_provider("b", b.uri()),
+		test_provider("c", c.uri()),
+	];
+	config.model_groups = vec![test_group(vec![
+		test_model("a", 1),
+		test_model("b", 2),
+		test_model("c", 3),
+	])];
+	let router = Arc::new(Router::new(Arc::new(RwLock::new(config)), test_metrics()));
+	let handle = ledger_handle();
+
+	let started = std::time::Instant::now();
+	let response = router
+		.route_request_streaming(&compression_request(true), Some(handle.clone()))
+		.await
+		.unwrap();
+	let elapsed = started.elapsed();
+
+	let StreamingResponse::Buffered(response) = response else {
+		panic!("the rescued response must come from the buffered fallback");
+	};
+	assert_eq!(
+		response.extra.get("gateway_provider"),
+		Some(&serde_json::json!("c"))
+	);
+	assert!(
+		elapsed < Duration::from_millis(2_000),
+		"fallback 429 after a failover must not wait, took {elapsed:?}"
+	);
+	assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+	assert_eq!(chat_requests(&b).await, 1, "b hit exactly once — no waited retry");
+}
+
+/// Req 3.2 (review finding R2): `max_retries_per_provider = 0`
+/// disables the Retry-After wait — the waited retry would be a
+/// same-provider retry the config forbids, so the sleep is dead time.
+/// Primary 429 + small hint + knob on: immediate failover, no
+/// `rate_limit_wait` row, primary hit exactly once.
+#[tokio::test]
+async fn zero_max_retries_disables_retry_after_wait() {
+	use wiremock::matchers::{method, path};
+
+	let primary = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v1/chat/completions"))
+		.respond_with(rate_limited_response(60))
+		.mount(&primary)
+		.await;
+	let backup = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v1/chat/completions"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+		.mount(&backup)
+		.await;
+	let mut config = retry_after_wait_config(&primary, &backup, 5_000);
+	config.retry.max_retries_per_provider = 0;
+	let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+	let handle = ledger_handle();
+
+	let started = std::time::Instant::now();
+	let response = router
+		.route_request(&compression_request(false), Some(handle.clone()))
+		.await
+		.unwrap();
+	let elapsed = started.elapsed();
+
+	assert_eq!(
+		response.extra.get("gateway_provider"),
+		Some(&serde_json::json!("backup"))
+	);
+	assert!(
+		elapsed < Duration::from_millis(2_000),
+		"no wait when same-provider retries are forbidden, took {elapsed:?}"
+	);
+	assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+	assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
+}
+
+/// Req 3.4: the waited retry gets a second 429 —— no second wait; the
+/// provider is cooled down and the request fails over.
+#[tokio::test]
+async fn second_429_after_wait_does_not_wait_again() {
+    use wiremock::matchers::{method, path};
+
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(rate_limited_response(60))
+        .mount(&primary)
+        .await;
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+        .mount(&backup)
+        .await;
+    let router = Router::new(
+        Arc::new(RwLock::new(retry_after_wait_config(
+            &primary,
+            &backup,
+            5_000,
+        ))),
+        test_metrics(),
+    );
+    let handle = ledger_handle();
+
+    let response = router
+        .route_request(&compression_request(false), Some(handle.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.extra.get("gateway_provider"),
+        Some(&serde_json::json!("backup"))
+    );
+    let ledger = handle.take_failed_attempts();
+    let waits = ledger
+        .iter()
+        .filter(|a| a.error_class.as_deref() == Some("rate_limit_wait"))
+        .count();
+    assert_eq!(waits, 1, "exactly one wait per request: {ledger:?}");
+    assert_eq!(chat_requests(&primary).await, 2, "first try + one retry");
+}
+
+/// Req 3.5: `upstream_retry_after_max_wait_ms = 0` (the default) is
+/// byte-for-byte today's behavior — failover, no `rate_limit_wait` row.
+#[tokio::test]
+async fn zero_max_wait_keeps_todays_failover_behavior() {
+    use wiremock::matchers::{method, path};
+
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(rate_limited_response(60))
+        .mount(&primary)
+        .await;
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+        .mount(&backup)
+        .await;
+    let router = Router::new(
+        Arc::new(RwLock::new(retry_after_wait_config(
+            &primary,
+            &backup,
+            0,
+        ))),
+        test_metrics(),
+    );
+    let handle = ledger_handle();
+
+    let started = std::time::Instant::now();
+    let response = router
+        .route_request(&compression_request(false), Some(handle.clone()))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        response.extra.get("gateway_provider"),
+        Some(&serde_json::json!("backup"))
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_000),
+        "no wait with the knob off, took {elapsed:?}"
+    );
+ assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+ assert_eq!(chat_requests(&primary).await, 1);
+ }
+
+ /// Req 3.1 (review finding R3): an explicit `retry-after-ms: 0` hint
+ /// maps to the documented "hint of 0 → cooldown + failover" behavior —
+ /// no zero-second wait, no `rate_limit_wait` row, primary hit exactly
+ /// once, the fallback serves the request.
+ #[tokio::test]
+ async fn zero_retry_after_hint_fails_over_without_waiting() {
+ use wiremock::matchers::{method, path};
+
+ let primary = MockServer::start().await;
+ Mock::given(method("POST"))
+ .and(path("/v1/chat/completions"))
+ .respond_with(rate_limited_response(0))
+ .mount(&primary)
+ .await;
+ let backup = MockServer::start().await;
+ Mock::given(method("POST"))
+ .and(path("/v1/chat/completions"))
+ .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+ .mount(&backup)
+ .await;
+ let router = Router::new(
+ Arc::new(RwLock::new(retry_after_wait_config(
+ &primary,
+ &backup,
+ 5_000,
+ ))),
+ test_metrics(),
+ );
+ let handle = ledger_handle();
+
+ let started = std::time::Instant::now();
+ let response = router
+ .route_request(&compression_request(false), Some(handle.clone()))
+ .await
+ .unwrap();
+ let elapsed = started.elapsed();
+
+ assert_eq!(
+ response.extra.get("gateway_provider"),
+ Some(&serde_json::json!("backup"))
+ );
+ assert!(
+ elapsed < Duration::from_millis(2_000),
+ "a zero Retry-After hint must not sleep, took {elapsed:?}"
+ );
+ assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+ assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
+ }
+
+ /// Req 3.1 (review finding R4): a hint-less 429 (no Retry-After header
+ /// or body field) must NOT wait even with a generous knob — the
+ /// `default_rate_limit_cooldown_seconds` fallback is not an upstream
+ /// signal. Cooldown still applies; failover proceeds immediately.
+ #[tokio::test]
+ async fn hint_less_429_with_knobs_on_does_not_wait() {
+ use wiremock::matchers::{method, path};
+
+ let primary = MockServer::start().await;
+ Mock::given(method("POST"))
+ .and(path("/v1/chat/completions"))
+ .respond_with(
+ ResponseTemplate::new(429).set_body_json(serde_json::json!({
+ "error": {"message": "Rate limit exceeded"}
+ })),
+ )
+ .mount(&primary)
+ .await;
+ let backup = MockServer::start().await;
+ Mock::given(method("POST"))
+ .and(path("/v1/chat/completions"))
+ .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+ .mount(&backup)
+ .await;
+ let router = Router::new(
+ Arc::new(RwLock::new(retry_after_wait_config(
+ &primary,
+ &backup,
+ 60_000,
+ ))),
+ test_metrics(),
+ );
+ let handle = ledger_handle();
+
+ let started = std::time::Instant::now();
+ let response = router
+ .route_request(&compression_request(false), Some(handle.clone()))
+ .await
+ .unwrap();
+ let elapsed = started.elapsed();
+
+ assert_eq!(
+ response.extra.get("gateway_provider"),
+ Some(&serde_json::json!("backup"))
+ );
+ assert!(
+ elapsed < Duration::from_millis(2_000),
+ "a hint-less 429 must not wait out the 30s default cooldown, took {elapsed:?}"
+ );
+ assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+ assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
+ }
+
+ /// Req 3.1 (streaming arm): primary pass-through 429 + small
+/// Retry-After —— wait, then the same-provider pass-through retry
+/// succeeds (no buffered hop).
+#[tokio::test]
+async fn streaming_primary_429_waits_and_retries_passthrough() {
+    use wiremock::matchers::{method, path};
+
+    let a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(rate_limited_response(60))
+        .up_to_n_times(1)
+        .mount(&a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(STREAMED_TURN_SSE),
+        )
+        .mount(&a)
+        .await;
+    let b = MockServer::start().await;
+    // No `.expect(1)`: this test requires b to receive ZERO hits (the
+    // waited retry must rescue the request on a itself).
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(STREAMED_TURN_SSE),
+        )
+        .mount(&b)
+        .await;
+    let mut config = failover_pair_config(&a, &b);
+    config.retry.upstream_retry_after_max_wait_ms = 5_000;
+    let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+    let handle = ledger_handle();
+
+    let started = std::time::Instant::now();
+    let response = router
+        .route_request_streaming(&compression_request(true), Some(handle.clone()))
+        .await
+        .expect("waited pass-through retry succeeds");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(response, StreamingResponse::PassThrough { .. }),
+        "the retry must stay on the pass-through path"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(50),
+        "must have waited out the Retry-After, took {elapsed:?}"
+    );
+    assert!(has_rate_limit_wait(&handle.take_failed_attempts()));
+    assert_eq!(chat_requests(&a).await, 2, "primary hit exactly twice");
+    assert_eq!(chat_requests(&b).await, 0, "fallback never hit");
+}
+
+#[test]
+fn is_timeout_class_covers_router_timeouts_and_gateway_statuses() {
+    let provider = |status| GatewayError::Provider {
+        provider: "p".to_string(),
+        message: "HTTP".to_string(),
+        status_code: status,
+    };
         assert!(is_timeout_class(&GatewayError::TtfbTimeout(1)));
         assert!(is_timeout_class(&GatewayError::TotalTimeout(1)));
         assert!(is_timeout_class(&GatewayError::ChunkTimeout(1)));
@@ -15327,18 +16734,108 @@ extra: Default::default(),
             .await
             .expect("buffered fallback is served by b");
 
+let ledger = handle.take_failed_attempts();
+assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+assert_eq!(ledger[0].provider, "a");
+assert_eq!(ledger[0].status_code, Some(429));
+assert_eq!(ledger[0].error_class.as_deref(), Some("upstream_http_429"));
+assert!(ledger[0].duration_ms.is_some());
+a.verify().await;
+b.verify().await;
+}
+
+    /// Task 4 (retry-failover-core-overhaul): a streaming pass-through 500
+    /// classifies RetrySameProvider, so the provider is retried in pass-through
+    /// up to `max_retries_per_provider` (here 1) before the buffered failover.
+    #[tokio::test]
+    async fn streaming_passthrough_500_retries_same_provider_before_failover() {
+        use wiremock::matchers::{method, path};
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .up_to_n_times(1)
+            .mount(&a)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(STREAMED_TURN_SSE),
+            )
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
+            )
+            .mount(&b)
+            .await;
+        let router = failover_pair_router(&a, &b);
+        let handle = ledger_handle();
+
+        let response = router
+            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .await
+            .expect("a succeeds on its same-provider retry");
+
+        // The pass-through relay served the retry directly (no buffered hop).
+        assert!(
+            matches!(response, StreamingResponse::PassThrough { .. }),
+            "same-provider retry must stay on the pass-through path"
+        );
+
+        let ledger = handle.take_failed_attempts();
+        assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+        assert_eq!(ledger[0].provider, "a");
+        assert_eq!(ledger[0].status_code, Some(500));
+        assert_eq!(ledger[0].error_class.as_deref(), Some("upstream_http_500"));
+        // b never saw a request: no failover happened.
+        a.verify().await;
+        assert_eq!(chat_requests(&b).await, 0);
+        }
+
+    /// Task 4: 429 classifies FailOver — the streaming pass-through never
+    /// re-sends to the rate-limited provider; it cools down and fails over.
+    #[tokio::test]
+    async fn streaming_passthrough_429_fails_over_without_same_provider_retry() {
+        use wiremock::matchers::{method, path};
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": {"message": "Rate limit exceeded"}
+            })))
+            .expect(1)
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        mount_streamed_turn(&b).await;
+        let router = failover_pair_router(&a, &b);
+        let handle = ledger_handle();
+
+        router
+            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .await
+            .expect("buffered fallback is served by b");
+
         let ledger = handle.take_failed_attempts();
         assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
         assert_eq!(ledger[0].provider, "a");
         assert_eq!(ledger[0].status_code, Some(429));
-        assert_eq!(ledger[0].error_class.as_deref(), Some("upstream_http_429"));
-        assert!(ledger[0].duration_ms.is_some());
         a.verify().await;
         b.verify().await;
-    }
+        }
 
     #[tokio::test]
-    async fn breaker_prefilter_skip_is_recorded_once_per_request() {
+async fn breaker_prefilter_skip_is_recorded_once_per_request() {
         use wiremock::matchers::{method, path};
 
         let server = MockServer::start().await;
@@ -15801,17 +17298,19 @@ extra: Default::default(),
         phase: ActivePhase::Pending,
         stall_reason: None,
         last_error: None,
-        virtual_key_id: None,
-        started_at_ms: 0,
-        kind: crate::active_requests::RequestKind::Chat,
-        smart_routing_logged: false,
-        failed_attempts: Vec::new(),
-        outcome_logged: false,
-        breaker_skips_recorded: false,
-        reasoning_relay: None,
-    })));
-        let result = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+			virtual_key_id: None,
+			started_at_ms: 0,
+            kind: crate::active_requests::RequestKind::Chat,
+            smart_routing_logged: false,
+            failed_attempts: Vec::new(),
+            attempt_rows_total: 0,
+            rate_limit_wait_done: false,
+            outcome_logged: false,
+            breaker_skips_recorded: false,
+            reasoning_relay: None,
+        })));
+		let result = router
+			.route_request(&compression_request(false), Some(handle.clone()))
             .await;
         assert!(
             result.is_ok(),
@@ -16439,9 +17938,11 @@ extra: Default::default(),
             last_error: None,
             virtual_key_id: None,
             started_at_ms: 0,
-            kind: crate::active_requests::RequestKind::Stream,
+                kind: crate::active_requests::RequestKind::Stream,
                 smart_routing_logged: false,
                 failed_attempts: Vec::new(),
+                attempt_rows_total: 0,
+                rate_limit_wait_done: false,
                 outcome_logged: false,
                 breaker_skips_recorded: false,
                 reasoning_relay: None,
@@ -16676,20 +18177,69 @@ extra: Default::default(),
         );
     }
 
-    #[test]
-    fn test_calculate_retry_delay_without_jitter() {
-        let delay = Router::calculate_retry_delay(4, false, 0.2);
-        assert_eq!(delay, Duration::from_secs(4));
-    }
+#[test]
+fn test_calculate_retry_delay_without_jitter() {
+	let delay = Router::calculate_retry_delay(4, false, 0.2);
+	assert_eq!(delay, Duration::from_secs(4));
+}
 
-    #[test]
-    fn test_calculate_retry_delay_with_jitter_stays_in_bounds() {
-        for _ in 0..32 {
-            let delay = Router::calculate_retry_delay(10, true, 0.2);
-            assert!(delay >= Duration::from_secs(8));
-            assert!(delay <= Duration::from_secs(12));
-        }
-    }
+#[test]
+fn test_calculate_retry_delay_zero_ratio_is_exact_base() {
+	let delay = Router::calculate_retry_delay(4, true, 0.0);
+	assert_eq!(delay, Duration::from_secs(4));
+}
+
+#[test]
+fn test_calculate_retry_delay_with_jitter_stays_in_bounds() {
+	for _ in 0..32 {
+		let delay = Router::calculate_retry_delay(10, true, 0.2);
+		assert!(delay >= Duration::from_secs(8));
+		assert!(delay <= Duration::from_secs(12));
+	}
+}
+
+/// Req 2.3 (retry-failover-core-overhaul): seeded sampling must spread
+/// across the jitter window, not cluster — both halves of the
+/// `base*(1-ratio) ..= base*(1+ratio)` window get hit over 200 draws.
+#[test]
+fn test_calculate_retry_delay_with_rng_distributes_across_window() {
+	use rand::{rngs::StdRng, SeedableRng};
+
+	let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+	let mut lower_half = 0;
+	let mut upper_half = 0;
+	for _ in 0..200 {
+		let delay = Router::calculate_retry_delay_with_rng(&mut rng, 10, true, 0.2);
+		let midpoint = Duration::from_secs(10);
+		assert!(delay >= Duration::from_secs(8));
+		assert!(delay <= Duration::from_secs(12));
+		if delay < midpoint {
+			lower_half += 1;
+		} else {
+			upper_half += 1;
+		}
+	}
+	assert!(
+		lower_half > 0 && upper_half > 0,
+		"seeded jitter must hit both halves of the window (lower={lower_half}, upper={upper_half})"
+	);
+}
+
+/// Same-draw determinism through the injected RNG: a fixed seed must
+/// reproduce an identical sequence of delays.
+#[test]
+fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
+	use rand::{rngs::StdRng, SeedableRng};
+
+	let draw = |seed: u64| -> Vec<Duration> {
+		let mut rng = StdRng::seed_from_u64(seed);
+		(0..8)
+			.map(|_| Router::calculate_retry_delay_with_rng(&mut rng, 4, true, 0.5))
+			.collect()
+	};
+	assert_eq!(draw(42), draw(42));
+	assert_ne!(draw(42), draw(43));
+}
 
     #[tokio::test]
     async fn test_budget_exhausted_provider_is_skipped() {
@@ -19412,3 +20962,4 @@ async fn copilot_reload_preserves_manager_and_auth_state() {
 }
     }
 }
+

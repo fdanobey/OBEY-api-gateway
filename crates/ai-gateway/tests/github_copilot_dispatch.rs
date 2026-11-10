@@ -282,6 +282,8 @@ fn ledger_handle() -> ai_gateway::active_requests::ActiveRequestHandle {
         kind: RequestKind::Chat,
         smart_routing_logged: false,
         failed_attempts: Vec::new(),
+        attempt_rows_total: 0,
+        rate_limit_wait_done: false,
         outcome_logged: false,
         breaker_skips_recorded: false,
         reasoning_relay: None,
@@ -989,3 +991,4 @@ async fn pat_auth_env_var_name_resolves_through_real_dispatch() {
     copilot.verify().await;
     std::env::remove_var(env_var);
 }
+

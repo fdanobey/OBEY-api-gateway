@@ -1575,11 +1575,12 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     state
         .router
         .reload_compression_runtime(compression, precompressed_manager);
-    state.router.clear_circuit_breakers();
-    state.router.clear_rate_limiters();
-    state.router.clear_sticky_cache();
-    state.router.clear_http_clients();
-    state.router.clear_model_capabilities();
+        state.router.clear_circuit_breakers();
+        state.router.clear_rate_limiters();
+        state.router.clear_retry_budgets();
+        state.router.clear_sticky_cache();
+        state.router.clear_http_clients();
+        state.router.clear_model_capabilities();
 
     // Reset tool compression state on config reload (feedback loops, descriptions, etc.)
     {
