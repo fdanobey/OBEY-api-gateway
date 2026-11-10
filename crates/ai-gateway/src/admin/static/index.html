@@ -1098,6 +1098,14 @@ body.sec-banner-active{padding-top:3.2rem}
           <div class="error" id="retry-jitter-ratio-error" role="alert"></div>
         </div>
       </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="retry-after-max-wait">Retry-After Max Wait (ms)</label>
+          <input type="number" id="retry-after-max-wait" value="0" min="0" max="60000" step="500" aria-describedby="retry-after-max-wait-error">
+          <div class="hint">0 disables the Retry-After wait; valid 0-60000; recommended 15000</div>
+          <div class="error" id="retry-after-max-wait-error" role="alert"></div>
+        </div>
+      </div>
 </fieldset>
 <fieldset><legend>Cache-Aware Routing</legend>
 <div class="form-check">
@@ -3306,6 +3314,8 @@ function refreshModelGroupModels() {
   function validateRoutingPage() {
     var ok = true;
     if (!validateNonNegativeInt(document.getElementById('retry-max'), 'Max retries')) ok = false;
+    if (!validateNonNegativeInt(document.getElementById('retry-after-max-wait'), 'Retry-After max wait')) ok = false;
+    if (parseInt(document.getElementById('retry-after-max-wait').value, 10) > 60000) { showError(document.getElementById('retry-after-max-wait'), 'Retry-After max wait must be between 0 and 60000 ms'); ok = false; }
     if (!validateNonNegativeNum(document.getElementById('retry-backoff'), 'Backoff')) ok = false;
     if (!validatePositiveNum(document.getElementById('retry-multiplier'), 'Multiplier')) ok = false;
     if (!validateNonNegativeNum(document.getElementById('retry-jitter-ratio'), 'Jitter ratio')) ok = false;
@@ -4733,7 +4743,7 @@ var cs=cfg.codex_search||{}; document.getElementById('codex-search-enabled').che
     var ec=cfg.exact_cache||{}; document.getElementById('ecache-enabled').checked=ec.enabled!==false; document.getElementById('ecache-max-entries').value=ec.max_entries||5000; document.getElementById('ecache-ttl').value=ec.ttl_seconds!=null?ec.ttl_seconds:3600; document.getElementById('ecache-temp-threshold').value=ec.temperature_threshold!=null?ec.temperature_threshold:0.15;
     provList.innerHTML=''; /* xss-audit: static */ if(cfg.providers){cfg.providers.forEach(function(p){addProviderCard(p);});}
     grpList.innerHTML=''; /* xss-audit: static */ if(cfg.model_groups){cfg.model_groups.forEach(function(g){addGroupCard(g);});}
-    if(cfg.retry){document.getElementById('retry-max').value=cfg.retry.max_retries_per_provider||1; document.getElementById('retry-backoff').value=(cfg.retry.backoff_sequence_seconds&&cfg.retry.backoff_sequence_seconds[0])||1; if(cfg.retry.backoff_sequence_seconds&&cfg.retry.backoff_sequence_seconds.length>1&&cfg.retry.backoff_sequence_seconds[0]){document.getElementById('retry-multiplier').value=(cfg.retry.backoff_sequence_seconds[1]/cfg.retry.backoff_sequence_seconds[0]).toFixed(2).replace(/\.00$/,'');}else{document.getElementById('retry-multiplier').value=2;} document.getElementById('retry-jitter-enabled').value=cfg.retry.jitter_enabled===false?'false':'true'; document.getElementById('retry-jitter-ratio').value=cfg.retry.jitter_ratio!=null?cfg.retry.jitter_ratio:0.2;}
+    if(cfg.retry){document.getElementById('retry-max').value=cfg.retry.max_retries_per_provider||1; document.getElementById('retry-backoff').value=(cfg.retry.backoff_sequence_seconds&&cfg.retry.backoff_sequence_seconds[0])||1; if(cfg.retry.backoff_sequence_seconds&&cfg.retry.backoff_sequence_seconds.length>1&&cfg.retry.backoff_sequence_seconds[0]){document.getElementById('retry-multiplier').value=(cfg.retry.backoff_sequence_seconds[1]/cfg.retry.backoff_sequence_seconds[0]).toFixed(2).replace(/\.00$/,'');}else{document.getElementById('retry-multiplier').value=2;} document.getElementById('retry-jitter-enabled').value=cfg.retry.jitter_enabled===false?'false':'true'; document.getElementById('retry-jitter-ratio').value=cfg.retry.jitter_ratio!=null?cfg.retry.jitter_ratio:0.2; populateNonNegativeInt('retry-after-max-wait',cfg.retry.upstream_retry_after_max_wait_ms,0);}
     var car=cfg.cache_aware_routing||{};document.getElementById('car-enabled').checked=!!car.enabled;document.getElementById('car-ttl').value=car.stickiness_ttl_seconds!=null?car.stickiness_ttl_seconds:300;document.getElementById('car-default-min-tokens').value=car.default_cache_min_tokens!=null?car.default_cache_min_tokens:1024;document.getElementById('car-hit-rate').value=car.cost_sort_hit_rate!=null?car.cost_sort_hit_rate:0;
 populateReasoningCompat(cfg.reasoning_compat);
 if(cfg.cors){document.getElementById('cors-enabled').checked=!!cfg.cors.enabled; document.getElementById('cors-origins').value=(cfg.cors.allowed_origins||[]).join(', '); document.getElementById('cors-methods').value=(cfg.cors.allowed_methods||[]).join(', '); document.getElementById('cors-headers').value=(cfg.cors.allowed_headers||[]).join(', ');}
@@ -4914,7 +4924,7 @@ cfg.codex_search=csSearch;
     var retryBackoff=parseFloat(document.getElementById('retry-backoff').value);
     var retryMultiplier=parseFloat(document.getElementById('retry-multiplier').value);
     var retrySequence=[retryBackoff,retryBackoff*retryMultiplier,retryBackoff*retryMultiplier*retryMultiplier].map(function(v){return Math.max(0,Math.round(v));});
-    cfg.retry={max_retries_per_provider:retryMax,backoff_sequence_seconds:retrySequence,jitter_enabled:document.getElementById('retry-jitter-enabled').value==='true',jitter_ratio:parseFloat(document.getElementById('retry-jitter-ratio').value)};
+    cfg.retry={max_retries_per_provider:retryMax,backoff_sequence_seconds:retrySequence,jitter_enabled:document.getElementById('retry-jitter-enabled').value==='true',jitter_ratio:parseFloat(document.getElementById('retry-jitter-ratio').value),upstream_retry_after_max_wait_ms:collectNonNegativeInt('retry-after-max-wait',0)};
 cfg.cache_aware_routing={enabled:document.getElementById('car-enabled').checked,stickiness_ttl_seconds:Math.max(0,parseInt(document.getElementById('car-ttl').value,10)||0),default_cache_min_tokens:Math.max(0,parseInt(document.getElementById('car-default-min-tokens').value,10)||0),cost_sort_hit_rate:Math.min(1,Math.max(0,parseFloat(document.getElementById('car-hit-rate').value)||0))};
 cfg.reasoning_compat=collectReasoningCompat();
     cfg.cors={enabled:document.getElementById('cors-enabled').checked,allowed_origins:document.getElementById('cors-origins').value.split(',').map(function(s){return s.trim();}).filter(Boolean),allowed_methods:document.getElementById('cors-methods').value.split(',').map(function(s){return s.trim();}).filter(Boolean),allowed_headers:document.getElementById('cors-headers').value.split(',').map(function(s){return s.trim();}).filter(Boolean)};

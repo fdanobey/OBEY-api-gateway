@@ -136,9 +136,48 @@ Failed requests are retried within a provider before failing over to the next:
 retry:
   max_retries_per_provider: 1       # Retries per provider
   backoff_sequence_seconds: [1, 2, 4]
+  upstream_retry_after_max_wait_ms: 0 # Bounded primary 429 wait (0 = off, max 60000, 15000 recommended)
 ```
 
-Retries use exponential backoff and only trigger for transient errors (5xx, timeouts, network errors). Permanent errors (4xx) fail immediately.
+Retries use the backoff sequence below and trigger only for the error classes marked "retry" in the classification table above. All other classes fail over immediately.
+
+### Retry Classification (Unified)
+
+Both the buffered dispatch stack and the streaming pass-through stack now use one policy table, so behavior is identical in either mode:
+
+| Error class | Behavior |
+|-------------|----------|
+| Timeout-class (TTFB, total, chunk timeout; upstream 504/524) | Fail over immediately — no same-provider retry (unchanged, per ADR 0001) |
+| 429, 503, other 4xx | Fail over immediately — no same-provider retry |
+| 500/501/502/5xx, 408, network/body-read errors | Retry the same provider, up to `max_retries_per_provider` |
+
+### Jittered Backoff
+
+Retry backoff delay is uniformly randomized within ±`jitter_ratio` of the `backoff_sequence_seconds` value, using a real RNG. With jitter disabled (ratio 0), the exact sequence values apply (1, 2, 4 by default — unchanged).
+
+### Retry Budget (Zero-Config)
+
+Concurrent same-provider retries per provider are capped at max(3, 20% of active requests). When the budget is exhausted, the gateway fails over immediately and records a `retry_budget_exhausted` attempt row. First attempts are never delayed.
+
+### Deadline Cap
+
+Retries whose backoff would exceed the request's effective deadline are not scheduled — the request fails over (or returns) instead of overshooting the deadline.
+
+### Bounded Primary 429 Wait
+
+`retry.upstream_retry_after_max_wait_ms` (u64; 0 = off = current behavior; valid 0–60000; 15000 recommended) enables a bounded wait for the **primary** provider when it returns 429 with a parseable Retry-After hint:
+
+- The gateway waits the full Retry-After only while it stays within `upstream_retry_after_max_wait_ms` — once per request, holding no admission permit and raced against the request deadline — then retries the primary through normal admission. An over-cap Retry-After is not clamped: no wait, cooldown + failover.
+- Non-primary 429s, waits over budget, a second 429, or a hint of 0 keep the existing behavior: cooldown + failover.
+- Also configurable as a numeric control in the Admin UI's Retry Configuration fieldset (same range and help text).
+
+### Attempt Count Header
+
+Every response — buffered or streaming, success or failure — carries `x-obey-attempt-count`: the total attempt rows recorded in the request ledger for that request, counting upstream sends plus recorded skips (`circuit_open_skip`, `rate_limit_skip`, `retry_budget_exhausted`, `rate_limit_wait`). A request that never fails over reports 1; an exact- or semantic-cache hit reports 0, since no upstream dispatch occurs. On streaming responses whose headers commit before dispatch completes, the value is the best-known count at header time.
+
+### Sticky Cache Re-Pin on Failover
+
+When failover moves a request to a different provider, a sticky prompt-cache entry is re-pinned to the successful provider (prefix hash and TTL preserved). Each re-pin emits a debug log and increments the `obey_api_sticky_repins_total` metric (visible in `/metrics` when Prometheus is enabled).
 
 ---
 

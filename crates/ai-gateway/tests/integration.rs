@@ -399,6 +399,241 @@ async fn test_chat_completions_preserves_trace_id_header() {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. x-obey-attempt-count response header (retry-failover-core-overhaul
+//     Req 5.1-5.4): every client response documents the request's attempt
+//     ledger size (upstream sends + recorded skips).
+// ---------------------------------------------------------------------------
+
+/// Wiremock-backed multi-provider config for attempt-count tests
+/// (mirrors request_outcome_logging.rs's outcome_config shape).
+async fn attempt_count_config(
+    providers: &[(&str, String)],
+    max_retries: u32,
+) -> Config {
+    let provider_values: Vec<serde_json::Value> = providers
+        .iter()
+        .map(|(name, url)| {
+            serde_json::json!({ "name": name, "type": "openai", "base_url": url })
+        })
+        .collect();
+    let models: Vec<serde_json::Value> = providers
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| {
+            serde_json::json!({ "provider": name, "model": "gpt-4", "priority": index + 1 })
+        })
+        .collect();
+    let mut config: Config = serde_json::from_value(serde_json::json!({
+        "server": { "host": "127.0.0.1", "port": 0 },
+        "providers": provider_values,
+        "model_groups": [{ "name": "attempt-group", "models": models }]
+    }))
+    .expect("attempt-count test configuration should deserialize");
+    config.retry.max_retries_per_provider = max_retries;
+    config.retry.backoff_sequence_seconds = vec![0];
+    config.retry.jitter_enabled = false;
+    common::isolate_databases(&mut config);
+    config
+}
+
+async fn attempt_count_app(config: Config) -> axum::Router {
+    let server = GatewayServer::new(config, None).await.unwrap();
+    server.build_router()
+}
+
+fn chat_body(stream: bool) -> Body {
+    Body::from(
+        serde_json::json!({
+            "model": "attempt-group",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": stream
+        })
+        .to_string(),
+    )
+}
+
+fn chat_request(stream: bool) -> Request<Body> {
+    Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(chat_body(stream))
+        .unwrap()
+}
+
+fn chat_completion_body() -> serde_json::Value {
+    serde_json::json!({
+        "id": "chatcmpl-attempt-count",
+        "object": "chat.completion",
+        "created": 1_700_000_000_i64,
+        "model": "gpt-4",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "hi" },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
+    })
+}
+
+/// (a) Simple success, no failover: header = "1" (the single successful
+/// send; ledger rows = 0, +1 for the terminal send).
+#[tokio::test]
+async fn test_attempt_count_header_single_success_is_one() {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(chat_completion_body()),
+        )
+        .mount(&upstream)
+        .await;
+    let app = attempt_count_app(
+        attempt_count_config(&[("only-provider", upstream.uri())], 0).await,
+    )
+    .await;
+
+    let resp = app.oneshot(chat_request(false)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let header = resp
+        .headers()
+        .get("x-obey-attempt-count")
+        .expect("success response carries x-obey-attempt-count")
+        .to_str()
+        .unwrap();
+    assert_eq!(header, "1");
+}
+
+/// (b) Failover: first provider 500s (one ledger row), second succeeds
+/// (+1 terminal send) → header = "2".
+#[tokio::test]
+async fn test_attempt_count_header_failover_counts_attempts() {
+    let first = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("down"))
+        .mount(&first)
+        .await;
+    let second = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(chat_completion_body()),
+        )
+        .mount(&second)
+        .await;
+    let app = attempt_count_app(
+        attempt_count_config(&[("first", first.uri()), ("second", second.uri())], 0).await,
+    )
+    .await;
+
+    let resp = app.oneshot(chat_request(false)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let header = resp
+        .headers()
+        .get("x-obey-attempt-count")
+        .expect("failover success carries x-obey-attempt-count")
+        .to_str()
+        .unwrap();
+    assert_eq!(header, "2", "1 failed attempt row + 1 successful send");
+}
+
+/// (c) Streaming success, early-event path (default config): headers
+/// commit before routing runs inside the stream body, so the best-known
+/// count at header emission is 0 — the documented timing choice.
+#[tokio::test]
+async fn test_attempt_count_header_streaming_early_event_best_known_zero() {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(chat_completion_body()),
+        )
+        .mount(&upstream)
+        .await;
+    let app = attempt_count_app(
+        attempt_count_config(&[("stream-provider", upstream.uri())], 0).await,
+    )
+    .await;
+
+    let resp = app.oneshot(chat_request(true)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let header = resp
+        .headers()
+        .get("x-obey-attempt-count")
+        .expect("streaming response carries x-obey-attempt-count")
+        .to_str()
+        .unwrap();
+    assert_eq!(header, "0", "headers commit before routing on the early-event path");
+    // Drain the SSE body so the request guard completes.
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("[DONE]"));
+}
+
+/// (c') Streaming success, early-event disabled (buffer-and-replay):
+/// routing resolves before headers are attached → accurate count "1".
+#[tokio::test]
+async fn test_attempt_count_header_streaming_buffered_accurate_one() {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(chat_completion_body()),
+        )
+        .mount(&upstream)
+        .await;
+    let mut config = attempt_count_config(&[("buffered-provider", upstream.uri())], 0).await;
+    config.streaming = Some(StreamingConfig {
+        emit_early_event: false,
+        relay_reasoning_progress: false,
+        ..StreamingConfig::default()
+    });
+    let app = attempt_count_app(config).await;
+
+    let resp = app.oneshot(chat_request(true)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let header = resp
+        .headers()
+        .get("x-obey-attempt-count")
+        .expect("streaming response carries x-obey-attempt-count")
+        .to_str()
+        .unwrap();
+    assert_eq!(header, "1", "buffered path routes before headers");
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("[DONE]"));
+}
+
+/// (d) Error response (all providers fail): header present, count = the
+/// ledger rows (two failed sends, no +1).
+#[tokio::test]
+async fn test_attempt_count_header_all_providers_fail() {
+    let first = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("down"))
+        .mount(&first)
+        .await;
+    let second = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("down"))
+        .mount(&second)
+        .await;
+    let app = attempt_count_app(
+        attempt_count_config(&[("first", first.uri()), ("second", second.uri())], 0).await,
+    )
+    .await;
+
+    let resp = app.oneshot(chat_request(false)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let header = resp
+        .headers()
+        .get("x-obey-attempt-count")
+        .expect("error response carries x-obey-attempt-count")
+        .to_str()
+        .unwrap();
+    assert_eq!(header, "2", "two failed sends = two ledger rows");
+}
+
+// ---------------------------------------------------------------------------
 // 6. Models endpoint
 // ---------------------------------------------------------------------------
 

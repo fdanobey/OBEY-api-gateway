@@ -156,6 +156,15 @@ circuit_breaker:
 retry:
   max_retries_per_provider: 1
   backoff_sequence_seconds: [1, 2, 4]
+  # Bounded wait for the primary provider when it returns 429 with a parseable
+  # Retry-After hint: waits the full Retry-After only while it stays within
+  # this cap, once per request (no admission permit held, raced against the
+  # request deadline), then retries the primary through normal admission. An
+  # over-cap Retry-After is not clamped: no wait, cooldown + failover.
+  # Non-primary 429s, a second 429, or a hint of 0 fall back to cooldown +
+  # failover. 0 = off (default, current behavior). Range 0-60000; 15000
+  # recommended.
+  upstream_retry_after_max_wait_ms: 0
 
 logging:
   level: "info"                         # trace | debug | info | warn | error

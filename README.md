@@ -498,6 +498,7 @@ retry:
   max_retries_per_provider: 1        # Inline same-provider retries (default: 1)
   backoff_sequence_seconds: [1, 2, 4] # Waits between those retries
   jitter_enabled: true               # Randomize backoff to avoid thundering herds
+  upstream_retry_after_max_wait_ms: 0 # Bounded primary 429 wait; 0 = off, max 60000, 15000 recommended
 
 circuit_breaker:
   failure_threshold: 3               # Consecutive failures before opening (default: 3)
@@ -510,6 +511,13 @@ Notes:
 - The breaker is keyed per `provider:model`, not per provider, so one failing model does not sideline a provider's other models.
 - `backoff_sequence_seconds` escalates with each successive open, ending at 300s — a provider that keeps failing is retried every 5 minutes rather than hammered.
 - **All breakers reset on config hot-reload** (`POST /admin/config/reload`), which is the fastest way to clear a stuck provider without a restart.
+- **Retry classification is unified** across the buffered and streaming pass-through stacks: timeout-class errors (TTFB/total/chunk timeout, upstream 504/524), 429, 503, and other 4xx fail over immediately without a same-provider retry; 500/501/502/5xx, 408, and network/body-read errors retry the same provider up to `max_retries_per_provider` — identically in both stacks.
+- **Backoff jitter is uniformly randomized** within ±`jitter_ratio` of each sequence value using a real RNG; with jitter disabled (ratio 0), the exact sequence values apply.
+- **Retry budget (zero-config):** concurrent same-provider retries per provider are capped at max(3, 20% of active requests). When exhausted, the gateway fails over immediately and records a `retry_budget_exhausted` attempt row. First attempts are never delayed.
+- **Deadline cap:** retries whose backoff would exceed the request's effective deadline are not scheduled — the request fails over (or returns) instead.
+- **`x-obey-attempt-count`** appears on every response (buffered and streaming, success or failure): total attempt rows in the request ledger, including recorded skips (`circuit_open_skip`, `rate_limit_skip`, `retry_budget_exhausted`, `rate_limit_wait`). No-failover requests report 1; exact- and semantic-cache hits report 0 (no upstream dispatch occurs); on streaming responses whose headers commit before dispatch completes, it is the best-known count at header time.
+- **Sticky cache re-pin:** when failover moves a request to a new provider, a sticky prompt-cache entry re-pins to the successful provider (prefix hash and TTL preserved), with a debug log and the `obey_api_sticky_repins_total` metric in `/metrics`.
+- `upstream_retry_after_max_wait_ms` bounds the one-shot primary wait when the primary returns 429 with a parseable Retry-After hint (see [Rate Limit Handling](#rate-limit-handling)); non-primary 429s, over-budget waits, a second 429, or a 0 hint keep the existing cooldown + failover behavior.
 - Streaming pass-through gets exactly one attempt per provider: a live SSE relay cannot be safely retried inline once bytes have arrived, so failover advances to the next provider instead. The buffered fallback still honors `max_retries_per_provider`.
 - Rate-limit cooldowns are separate from breaker backoff and are documented under [How Routing Works](#how-routing-works).
 

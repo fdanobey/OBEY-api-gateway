@@ -1121,6 +1121,11 @@ pub struct RetryConfig {
     /// Default: 30s.
     #[serde(default = "default_rate_limit_cooldown_default")]
     pub default_rate_limit_cooldown_seconds: u64,
+    /// Bounded wait for the primary provider's own `Retry-After` after an
+    /// upstream 429. `0` disables the wait (today's behavior). Range
+    /// 0-60000 ms; 15000 is the recommended value.
+    #[serde(default = "default_upstream_retry_after_max_wait_ms")]
+    pub upstream_retry_after_max_wait_ms: u64,
 }
 
 impl Default for RetryConfig {
@@ -1132,6 +1137,7 @@ impl Default for RetryConfig {
             jitter_ratio: 0.2,
             max_rate_limit_cooldown_seconds: default_max_rate_limit_cooldown(),
             default_rate_limit_cooldown_seconds: default_rate_limit_cooldown_default(),
+            upstream_retry_after_max_wait_ms: default_upstream_retry_after_max_wait_ms(),
         }
     }
 }
@@ -1158,6 +1164,12 @@ fn default_max_rate_limit_cooldown() -> u64 {
 
 fn default_rate_limit_cooldown_default() -> u64 {
     30
+}
+
+fn default_upstream_retry_after_max_wait_ms() -> u64 {
+    // 0 = opt-in: preserves today's 429 failover behavior on upgrade
+    // (retry-failover-core-overhaul spec, DD-C).
+    0
 }
 
 /// Logging configuration
@@ -2806,5 +2818,44 @@ mod admin_security_config_tests {
             serde_yaml::from_str("auth:\n  allow_unauthenticated_non_loopback: true\n").unwrap();
         assert!(admin.auth.allow_unauthenticated_non_loopback);
         assert!(admin.auth_section_present);
+    }
+}
+
+#[cfg(test)]
+mod retry_config_tests {
+    use super::*;
+
+    // retry-failover-core-overhaul, Task 6: upstream Retry-After wait config.
+    // **Validates: Requirements 3.5, 3.7, 3.8**
+
+    #[test]
+    fn test_retry_config_absent_field_defaults_to_zero() {
+        // Old config YAML without the new key keeps today's behavior (0 =
+        // wait disabled) — backward compatibility on upgrade (Req 3.5/3.8).
+        let yaml = r#"
+max_retries_per_provider: 2
+backoff_sequence_seconds: [1, 2]
+jitter_enabled: false
+jitter_ratio: 0.1
+"#;
+        let cfg: RetryConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.upstream_retry_after_max_wait_ms, 0);
+
+        // Empty section and Default agree.
+        let cfg: RetryConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg, RetryConfig::default());
+        assert_eq!(cfg.upstream_retry_after_max_wait_ms, 0);
+    }
+
+    #[test]
+    fn test_retry_config_upstream_retry_after_max_wait_ms_round_trips() {
+        let cfg: RetryConfig =
+            serde_yaml::from_str("upstream_retry_after_max_wait_ms: 15000\n").unwrap();
+        assert_eq!(cfg.upstream_retry_after_max_wait_ms, 15000);
+
+        let serialized = serde_yaml::to_string(&cfg).unwrap();
+        let round_tripped: RetryConfig = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped, cfg);
+        assert_eq!(round_tripped.upstream_retry_after_max_wait_ms, 15000);
     }
 }
