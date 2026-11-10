@@ -39,7 +39,7 @@ sha2 = "0.10"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1.0"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 wiremock = "0.6"
 rcgen = "0.14"
 
