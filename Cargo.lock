@@ -434,9 +434,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-bedrock"
-version = "1.165.0"
+version = "1.166.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "086d90d6919e0d36b1ed5d83b3773e15a98f8cfa6d30b264936b0f7f1215dec6"
+checksum = "6a2046512ecd16913d858634bfa07fe2769b794f852989940f2d5fcab7877968"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -459,9 +459,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-bedrockruntime"
-version = "1.152.0"
+version = "1.153.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd3ff1fc9e5e8a2ac61bcc6ac82b13a57d431d6804d4461f9570a3b788b9549a"
+checksum = "89b8aeb4b1b6d5f9d377264cff21b4e4d773e66ee3c5582b4099a8fbc702bdb3"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -736,9 +736,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-schema"
-version = "1.1.0"
+version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bec8dae1015a6d959a5faf86fbdf77486cfe19e4ccb6ee009d8a46efc45028a4"
+checksum = "9543fc722ed4865ab29fb66bd7ed0bef7b029d265ba8c587144511e30006d431"
 dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
@@ -864,12 +864,13 @@ dependencies = [
 
 [[package]]
 name = "axum-server"
-version = "0.7.3"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1ab4a3ec9ea8a657c72d99a03a824af695bd0fb5ec639ccbd9cd3543b41a5f9"
+checksum = "b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc"
 dependencies = [
  "arc-swap",
  "bytes",
+ "either",
  "fs-err",
  "http",
  "http-body",
@@ -877,7 +878,6 @@ dependencies = [
  "hyper-util",
  "pin-project-lite",
  "rustls",
- "rustls-pemfile",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
@@ -1706,7 +1706,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2593,9 +2593,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.52.1"
+version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93e842fa72fd1e50ca4676a527641c13f5ee0d423ac699bfe1cd2afa3a4fdbac"
+checksum = "a42a11b47492e6a2cc76e9c7bcc8077776cb31dac444e0795d7f61bcc6441c08"
 dependencies = [
  "ahash",
  "bytecount",
@@ -2621,22 +2621,24 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.52.1"
+version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5d90ea83fa606c96f0b4737ecedf1fa6b624272022edc42039565f8d8af0b78"
+checksum = "107aeb6ff14b8deb5610096a8ce5c554ec89806b521147eaeb3cae05b07edb7a"
 dependencies = [
  "regex-syntax",
 ]
 
 [[package]]
 name = "jsonschema-value"
-version = "0.52.1"
+version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da4ab4cbe58181a117d8c3582844ce20b07184319b51ba6d756596c1c451aebc"
+checksum = "e281d6b177bb4834f2ffd6f92aa0443cffe29c996b251c8d94eb6f456186feba"
 dependencies = [
  "ahash",
  "bytecount",
  "fraction",
+ "getrandom 0.3.4",
+ "memchr",
  "num-cmp",
  "num-traits",
  "serde_json",
@@ -2719,9 +2721,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -4015,9 +4017,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.52.1"
+version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d38a014525040cdc9893361b7419bcf1f43b7ba7055eabaf6d91d6b75caa8b3f"
+checksum = "f42818036d3b37cda6bd4c494543158a36e431cb717015ef7c93acc6ba214d3b"
 dependencies = [
  "ahash",
  "fluent-uri",
@@ -4141,9 +4143,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.11.0",
  "fallible-iterator",
@@ -4238,7 +4240,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4270,15 +4272,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4306,7 +4299,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4805,10 +4798,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5803,7 +5796,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6483,14 +6476,15 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.2.1"
+version = "9.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "848dad21639597378c3be94c59fd4de683f0f6d8a5387575896e1245737d4f37"
+checksum = "23f17fbc870bfac28c6228aed7d6e6df352e26bf7015c4313727e16a7a01ce5e"
 dependencies = [
  "crc32fast",
  "flate2",
  "getrandom 0.4.2",
  "indexmap",
+ "libc",
  "memchr",
  "nix",
  "typed-path",

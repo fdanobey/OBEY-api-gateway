@@ -195,6 +195,7 @@ fn base_config() -> Config {
         cache_aware_routing: Default::default(),
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     }
 }
 

@@ -197,6 +197,7 @@ fn base_config(provider_uri: &str) -> Config {
         codex_search: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     }
 }
 

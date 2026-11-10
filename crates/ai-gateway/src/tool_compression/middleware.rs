@@ -13,10 +13,11 @@ use std::{
 };
 
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes},
     http::{header::HeaderValue, Request, Response},
 };
-use tokio::sync::RwLock;
+use futures::StreamExt;
+use tokio::sync::{mpsc, RwLock};
 use tower::{Layer, Service};
 
 use crate::dashboard::{CompressionEventHub, ToolCompressionEvent};
@@ -222,6 +223,13 @@ where
         let auto_tuner = Arc::clone(&self.auto_tuner);
 
         Box::pin(async move {
+            let started_at = tokio::time::Instant::now();
+            let resolution_timeout = config.try_read().ok().map(|config| {
+                std::time::Duration::from_secs(
+                    crate::runtime_limits::effective_request_timeout_seconds(&config),
+                )
+            });
+            let resolution_deadline = resolution_timeout.map(|timeout| started_at + timeout);
             // Only process POST requests that are JSON (chat completions).
             if !is_compressible_request(&request) {
                 return inner.call(request).await;
@@ -526,234 +534,487 @@ where
             // the client, which cannot execute it ("unavailable tool"). Buffering only
             // happens when synthetic tools were actually injected this request, so
             // ordinary streaming traffic keeps true pass-through behaviour.
-            let mut final_response = response;
-            let mut req_json = json_body.clone();
-            let mut steps = 0usize;
-            let step_budget = synthetic_step_budget(namespace_count);
-            // Canonical discovery keys already revealed this session (namespace/grouping
-            // only). Used so re-drills are reminded from session cache instead of being
-            // silently re-resolved, strengthening multi-turn memory of disclosed tools.
-            // Set once the discovery tools have been pulled from the outbound
-            // request for the final turn — see the budget branch below.
-            let mut synthetic_tools_withdrawn = false;
-            let mut already_disclosed: HashSet<String> = session_id
-                .as_ref()
-                .and_then(|sid| state.disclosure_targets.get(sid).map(|set| set.clone()))
-                .unwrap_or_default();
-            while synthetic_injected {
-                let sse = response_is_sse(&final_response);
-                let (resp_parts, resp_body) = final_response.into_parts();
-                let resp_bytes = match to_bytes(resp_body, max_body).await {
-                    Ok(b) => b,
-                    Err(_) => {
-                        final_response = Response::from_parts(resp_parts, Body::empty());
-                        break;
-                    }
-                };
-                let resp_json: serde_json::Value = match response_bytes_to_json(&resp_bytes, sse) {
-                    Some(v) => v,
-                    None => {
-                        final_response = Response::from_parts(resp_parts, Body::from(resp_bytes));
-                        break;
-                    }
-                };
-
-                if steps >= step_budget {
-                    if synthetic_tools_withdrawn {
-                        // The discovery tools are already gone from the outbound
-                        // request, so a synthetic call here should be impossible.
-                        // If one appears anyway it must still never be relayed —
-                        // the client cannot execute it. `sanitize_synthetic_response`
-                        // returns `None` when there is no synthetic call, which is
-                        // the normal exit and relays the model's real answer
-                        // untouched.
-                        match sanitize_synthetic_response(&resp_json, &original_tools, sse) {
-                            Some(sanitized) => {
-                                tracing::warn!(
-                                    model_group = %model_group,
-                                    steps,
-                                    "Model emitted a synthetic call after the discovery tools were withdrawn; answering locally rather than relaying a tool the client cannot execute"
-                                );
-                                let mut parts = resp_parts;
-                                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-                                final_response =
-                                    Response::from_parts(parts, Body::from(sanitized));
-                            }
+            let streaming_response = synthetic_injected && response_is_sse(&response);
+            let (response_head, response) = if streaming_response {
+                let (mut head, body) = response.into_parts();
+                head.headers.remove(axum::http::header::CONTENT_LENGTH);
+                (Some(head.clone()), Response::from_parts(head, body))
+            } else {
+                (None, response)
+            };
+            let (progress_tx, mut progress_rx) = mpsc::channel::<Bytes>(8);
+            let progress_tx = streaming_response.then_some(progress_tx);
+            let resolution = async move {
+                let mut final_response = response;
+                let mut req_json = json_body.clone();
+                let mut steps = 0usize;
+                let step_budget = synthetic_step_budget(namespace_count);
+                // Canonical discovery keys already revealed this session (namespace/grouping
+                // only). Used so re-drills are reminded from session cache instead of being
+                // silently re-resolved, strengthening multi-turn memory of disclosed tools.
+                // Set once the discovery tools have been pulled from the outbound
+                // request for the final turn — see the budget branch below.
+                let mut synthetic_tools_withdrawn = false;
+                let mut already_disclosed: HashSet<String> = session_id
+                    .as_ref()
+                    .and_then(|sid| state.disclosure_targets.get(sid).map(|set| set.clone()))
+                    .unwrap_or_default();
+                while synthetic_injected {
+                    let sse = response_is_sse(&final_response);
+                    let (resp_parts, resp_body) = final_response.into_parts();
+                    let (resp_bytes, relay_bytes) = match collect_disclosure_body(
+                        resp_body,
+                        sse,
+                        progress_tx.as_ref(),
+                        max_body,
+                    )
+                    .await
+                    {
+                        Ok(b) => b,
+                        Err(error) => {
+                            final_response = Response::from_parts(
+                                resp_parts,
+                                Body::from_stream(futures::stream::once(async move {
+                                    Err::<Bytes, _>(error)
+                                })),
+                            );
+                            break;
+                        }
+                    };
+                    let resp_json: serde_json::Value =
+                        match response_bytes_to_json(&resp_bytes, sse) {
+                            Some(v) => v,
                             None => {
                                 final_response =
-                                    Response::from_parts(resp_parts, Body::from(resp_bytes));
+                                    Response::from_parts(resp_parts, Body::from(relay_bytes));
+                                break;
                             }
+                        };
+
+                    if steps >= step_budget {
+                        if synthetic_tools_withdrawn {
+                            // The discovery tools are already gone from the outbound
+                            // request, so a synthetic call here should be impossible.
+                            // If one appears anyway it must still never be relayed —
+                            // the client cannot execute it. `sanitize_synthetic_response`
+                            // returns `None` when there is no synthetic call, which is
+                            // the normal exit and relays the model's real answer
+                            // untouched.
+                            match sanitize_synthetic_response(&resp_json, &original_tools, sse) {
+                                Some(sanitized) => {
+                                    tracing::warn!(
+                                        model_group = %model_group,
+                                        steps,
+                                        "Model emitted a synthetic call after the discovery tools were withdrawn; answering locally rather than relaying a tool the client cannot execute"
+                                    );
+                                    let mut parts = resp_parts;
+                                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                                    final_response =
+                                        Response::from_parts(parts, Body::from(sanitized));
+                                }
+                                None => {
+                                    final_response =
+                                        Response::from_parts(resp_parts, Body::from(relay_bytes));
+                                }
+                            }
+                            break;
                         }
-                        break;
+
+                        // Budget spent. Terminating here is what strands the client: a
+                        // gateway-authored assistant message reads as the final answer
+                        // and the agent stops mid-task. Instead withdraw the discovery
+                        // tools so the model cannot ask again, let the pending call
+                        // resolve below so it has the schemas, and give it one final
+                        // turn to either answer or call a real tool.
+                        tracing::debug!(
+                            model_group = %model_group,
+                            steps,
+                            "Synthetic drill-down budget exhausted; withdrawing the discovery tools for one final turn"
+                        );
+                        withdraw_synthetic_tools(&mut req_json, &original_tools);
+                        synthetic_tools_withdrawn = true;
                     }
 
-                    // Budget spent. Terminating here is what strands the client: a
-                    // gateway-authored assistant message reads as the final answer
-                    // and the agent stops mid-task. Instead withdraw the discovery
-                    // tools so the model cannot ask again, let the pending call
-                    // resolve below so it has the schemas, and give it one final
-                    // turn to either answer or call a real tool.
-                    tracing::debug!(
-                        model_group = %model_group,
-                        steps,
-                        "Synthetic drill-down budget exhausted; withdrawing the discovery tools for one final turn"
-                    );
-                    withdraw_synthetic_tools(&mut req_json, &original_tools);
-                    synthetic_tools_withdrawn = true;
-                }
+                    // ─── Re-drill detection ───────────────────────────────────
+                    // Every synthetic call this turn targets something already
+                    // disclosed AND already callable. Record it so chronic
+                    // re-drillers get their compression level stepped down, then fall
+                    // through to normal resolution.
+                    //
+                    // This used to answer locally and terminate the turn with
+                    // `finish_reason: "stop"` to save a provider round trip. That
+                    // saving is not actually available: a tool call the gateway
+                    // answers still needs a model turn to act on the answer. So
+                    // terminating handed the client a gateway-authored assistant
+                    // message ("Session cache hit: …") which harnesses render as the
+                    // final reply and stop on — killing the agent's task mid-work to
+                    // avoid one provider call. `resolve_synthetic_in_response` already
+                    // appends the sharper `REDRILL_HINT` for disclosed targets, so the
+                    // resubmit below carries the reminder that was the point.
+                    if is_pure_redrill(&resp_json, &req_json, &original_tools, &already_disclosed) {
+                        feedback_loop.record_outcome(&model_group, true);
+                        tracing::debug!(
+                            model_group = %model_group,
+                            "Model re-drilled targets already disclosed and callable; resolving with the re-drill reminder instead of ending the turn"
+                        );
+                    }
 
-                // ─── Re-drill detection ───────────────────────────────────
-                // Every synthetic call this turn targets something already
-                // disclosed AND already callable. Record it so chronic
-                // re-drillers get their compression level stepped down, then fall
-                // through to normal resolution.
-                //
-                // This used to answer locally and terminate the turn with
-                // `finish_reason: "stop"` to save a provider round trip. That
-                // saving is not actually available: a tool call the gateway
-                // answers still needs a model turn to act on the answer. So
-                // terminating handed the client a gateway-authored assistant
-                // message ("Session cache hit: …") which harnesses render as the
-                // final reply and stop on — killing the agent's task mid-work to
-                // avoid one provider call. `resolve_synthetic_in_response` already
-                // appends the sharper `REDRILL_HINT` for disclosed targets, so the
-                // resubmit below carries the reminder that was the point.
-                if is_pure_redrill(&resp_json, &req_json, &original_tools, &already_disclosed) {
-                    feedback_loop.record_outcome(&model_group, true);
-                    tracing::debug!(
-                        model_group = %model_group,
-                        "Model re-drilled targets already disclosed and callable; resolving with the re-drill reminder instead of ending the turn"
-                    );
-                }
-
-                match resolver::resolve_synthetic_in_response(
-                    &resp_json,
-                    &mut req_json,
-                    &original_tools,
-                    disclosure_max_tools,
-                    &already_disclosed,
-                ) {
-                    Some(disclosed) => {
-                        // Persist disclosed tools for multi-turn re-injection.
-                        if let Some(sid) = &session_id {
-                            let mut entry = state.disclosure_state.entry(sid.clone()).or_default();
-                            for n in &disclosed {
-                                entry.insert(n.clone());
-                            }
-                            // Record the discovery targets this turn so a later re-drill
-                            // is met with the stronger REDRILL_HINT reminder.
-                            let mut targets =
-                                state.disclosure_targets.entry(sid.clone()).or_default();
-                            if let Some(calls) = resp_json
-                                .pointer("/choices/0/message/tool_calls")
-                                .and_then(|v| v.as_array())
-                            {
-                                for call in calls {
-                                    let Some(fn_obj) = call.get("function").or(Some(call)) else {
-                                        continue;
-                                    };
-                                    let Some(name) = fn_obj.get("name").and_then(|n| n.as_str())
-                                    else {
-                                        continue;
-                                    };
-                                    let args = fn_obj
-                                        .get("arguments")
-                                        .and_then(|a| a.as_str())
-                                        .unwrap_or("{}");
-                                    if let Some(key) = resolver::discovery_key(name, args) {
-                                        already_disclosed.insert(key.clone());
-                                        targets.insert(key);
+                    match resolver::resolve_synthetic_in_response(
+                        &resp_json,
+                        &mut req_json,
+                        &original_tools,
+                        disclosure_max_tools,
+                        &already_disclosed,
+                    ) {
+                        Some(disclosed) => {
+                            // Persist disclosed tools for multi-turn re-injection.
+                            if let Some(sid) = &session_id {
+                                let mut entry =
+                                    state.disclosure_state.entry(sid.clone()).or_default();
+                                for n in &disclosed {
+                                    entry.insert(n.clone());
+                                }
+                                // Record the discovery targets this turn so a later re-drill
+                                // is met with the stronger REDRILL_HINT reminder.
+                                let mut targets =
+                                    state.disclosure_targets.entry(sid.clone()).or_default();
+                                if let Some(calls) = resp_json
+                                    .pointer("/choices/0/message/tool_calls")
+                                    .and_then(|v| v.as_array())
+                                {
+                                    for call in calls {
+                                        let Some(fn_obj) = call.get("function").or(Some(call))
+                                        else {
+                                            continue;
+                                        };
+                                        let Some(name) =
+                                            fn_obj.get("name").and_then(|n| n.as_str())
+                                        else {
+                                            continue;
+                                        };
+                                        let args = fn_obj
+                                            .get("arguments")
+                                            .and_then(|a| a.as_str())
+                                            .unwrap_or("{}");
+                                        if let Some(key) = resolver::discovery_key(name, args) {
+                                            already_disclosed.insert(key.clone());
+                                            targets.insert(key);
+                                        }
                                     }
                                 }
                             }
                         }
+                        None => {
+                            final_response =
+                                Response::from_parts(resp_parts, Body::from(relay_bytes));
+                            break;
+                        }
                     }
-                    None => {
-                        final_response = Response::from_parts(resp_parts, Body::from(resp_bytes));
-                        break;
+
+                    let next_body = match serde_json::to_vec(&req_json) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            final_response =
+                                Response::from_parts(resp_parts, Body::from(relay_bytes));
+                            break;
+                        }
+                    };
+                    let mut next_parts = parts_clone.clone();
+                    let len_value = HeaderValue::from_str(&next_body.len().to_string())
+                        .unwrap_or_else(|_| HeaderValue::from_static("0"));
+                    next_parts
+                        .headers
+                        .insert(axum::http::header::CONTENT_LENGTH, len_value);
+                    let mut next_req = Request::from_parts(next_parts, Body::from(next_body));
+                    next_req
+                        .extensions_mut()
+                        .insert(OriginalToolsExtension(Arc::new(original_tools.clone())));
+                    next_req
+                        .extensions_mut()
+                        .insert(ToolCompressionApplied(true));
+                    // The resubmit is an invisible extra LLM call: let the handler park a
+                    // `tool disclosure` stall reason on the in-flight request for the
+                    // dashboard while this round runs.
+                    next_req
+                        .extensions_mut()
+                        .insert(ToolDisclosureResubmit(true));
+                    match inner.call(next_req).await {
+                        Ok(r) => final_response = r,
+                        Err(e) => return Err(e),
                     }
+                    steps += 1;
                 }
 
-                let next_body = match serde_json::to_vec(&req_json) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        final_response = Response::from_parts(resp_parts, Body::from(resp_bytes));
-                        break;
+                let mut response = final_response;
+
+                // ─── Response-path error detection for Feedback Loop ──────────────
+                // Inspect the response for tool-call errors and feed results to FeedbackLoop.
+                // ──────────────────────────────────────────────────────────────────
+
+                // Set response headers with compression metadata.
+                set_compression_headers(&mut response, effective_level, ratio, tokens_saved);
+
+                // ─── Emit WebSocket dashboard compression event ───────────────────
+                // Determine tools pruned count (original - final after pruning stage).
+                let tools_pruned_count =
+                    original_token_estimate_tool_count.saturating_sub(compressed_tools.len());
+                let semantic_retrieval_active = ctx
+                    .strategies_applied
+                    .contains(&"semantic_retrieval".to_string());
+                let tools_deferred: Vec<String> =
+                    ctx.deferred_tools.iter().map(|t| t.name.clone()).collect();
+                let feedback_adjusted = feedback_loop.get_adjusted_level(&model_group).is_some();
+
+                // Generate a request ID for event correlation.
+                let request_id = format!("tc-{:016x}", compute_tool_hash(&json_body));
+
+                compression_events.publish_tool_compression(ToolCompressionEvent {
+                    request_id,
+                    model_group,
+                    level: level_to_str(effective_level).to_string(),
+                    original_tokens: original_token_estimate,
+                    compressed_tokens: compressed_token_estimate,
+                    strategies_applied: ctx.strategies_applied.clone(),
+                    tools_pruned_count,
+                    semantic_retrieval_active,
+                    tools_deferred,
+                    feedback_adjusted,
+                });
+
+                Ok(response)
+            };
+
+            if let Some(head) = response_head {
+                let stream = async_stream::try_stream! {
+                    let deadline = async move {
+                        match resolution_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => futures::future::pending::<()>().await,
+                        }
+                    };
+                    tokio::pin!(resolution, deadline);
+                    let response = loop {
+                        tokio::select! {
+                            biased;
+                            _ = &mut deadline => {
+                                yield disclosure_error_frame("Tool disclosure exceeded the gateway deadline", "gateway_timeout", 504, None);
+                                return;
+                            }
+                            Some(bytes) = progress_rx.recv() => yield bytes,
+                            result = &mut resolution => break result,
+                        }
+                    };
+                    let response = response.map_err(|_| std::io::Error::other("Tool disclosure resolution failed"))?;
+                    while let Ok(bytes) = progress_rx.try_recv() {
+                        yield bytes;
+                    }
+                    if !response_is_sse(&response) || !response.status().is_success() {
+                        let status = response.status().as_u16();
+                        let retry_after = response.headers().get(axum::http::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok()).map(str::to_owned);
+                        yield disclosure_error_frame("Tool disclosure resubmit did not return a successful event stream", "disclosure_resubmit_error", status, retry_after.as_deref());
+                        return;
+                    }
+                    let mut body = response.into_body().into_data_stream();
+                    while let Some(bytes) = body.next().await {
+                        yield bytes.map_err(std::io::Error::other)?;
                     }
                 };
-                let mut next_parts = parts_clone.clone();
-                let len_value = HeaderValue::from_str(&next_body.len().to_string())
-                    .unwrap_or_else(|_| HeaderValue::from_static("0"));
-                next_parts
-                    .headers
-                    .insert(axum::http::header::CONTENT_LENGTH, len_value);
-let mut next_req = Request::from_parts(next_parts, Body::from(next_body));
-next_req
-    .extensions_mut()
-    .insert(OriginalToolsExtension(Arc::new(original_tools.clone())));
-next_req
-    .extensions_mut()
-    .insert(ToolCompressionApplied(true));
-// The resubmit is an invisible extra LLM call: let the handler park a
-// `tool disclosure` stall reason on the in-flight request for the
-// dashboard while this round runs.
-next_req
-    .extensions_mut()
-    .insert(ToolDisclosureResubmit(true));
-match inner.call(next_req).await {
-                    Ok(r) => final_response = r,
-                    Err(e) => return Err(e),
-                }
-                steps += 1;
+                let stream = stream.map(|result: Result<Bytes, std::io::Error>| result);
+                let mut response = Response::from_parts(head, Body::from_stream(stream));
+                set_compression_headers(&mut response, effective_level, ratio, tokens_saved);
+                Ok(response)
+            } else {
+                resolution.await
             }
-
-            let mut response = final_response;
-
-            // ─── Response-path error detection for Feedback Loop ──────────────
-            // Inspect the response for tool-call errors and feed results to FeedbackLoop.
-            // ──────────────────────────────────────────────────────────────────
-
-            // Set response headers with compression metadata.
-            let headers = response.headers_mut();
-            if let Ok(v) = HeaderValue::from_str(&format!("{}", level_to_str(effective_level))) {
-                headers.insert(HEADER_LEVEL_RESPONSE, v);
-            }
-            if let Ok(v) = HeaderValue::from_str(&format!("{ratio:.4}")) {
-                headers.insert(HEADER_RATIO, v);
-            }
-            if let Ok(v) = HeaderValue::from_str(&format!("{tokens_saved}")) {
-                headers.insert(HEADER_TOKENS_SAVED, v);
-            }
-
-            // ─── Emit WebSocket dashboard compression event ───────────────────
-            // Determine tools pruned count (original - final after pruning stage).
-            let tools_pruned_count =
-                original_token_estimate_tool_count.saturating_sub(compressed_tools.len());
-            let semantic_retrieval_active = ctx
-                .strategies_applied
-                .contains(&"semantic_retrieval".to_string());
-            let tools_deferred: Vec<String> =
-                ctx.deferred_tools.iter().map(|t| t.name.clone()).collect();
-            let feedback_adjusted = feedback_loop.get_adjusted_level(&model_group).is_some();
-
-            // Generate a request ID for event correlation.
-            let request_id = format!("tc-{:016x}", compute_tool_hash(&json_body));
-
-            compression_events.publish_tool_compression(ToolCompressionEvent {
-                request_id,
-                model_group,
-                level: level_to_str(effective_level).to_string(),
-                original_tokens: original_token_estimate,
-                compressed_tokens: compressed_token_estimate,
-                strategies_applied: ctx.strategies_applied.clone(),
-                tools_pruned_count,
-                semantic_retrieval_active,
-                tools_deferred,
-                feedback_adjusted,
-            });
-
-            Ok(response)
         })
+    }
+}
+
+fn disclosure_error_frame(message: &str, code: &str, status: u16, retry_after: Option<&str>) -> Bytes {
+    Bytes::from(format!("data: {}\n\ndata: [DONE]\n\n", serde_json::json!({
+        "error": {"message": message, "type": "gateway_error", "code": code,
+            "status": status, "retry_after": retry_after}
+    })))
+}
+
+async fn collect_disclosure_body(
+    body: Body,
+    sse: bool,
+    progress: Option<&mpsc::Sender<Bytes>>,
+    limit: usize,
+) -> Result<(Bytes, Bytes), std::io::Error> {
+    let Some(progress) = progress.filter(|_| sse) else {
+        let bytes = to_bytes(body, limit).await.map_err(std::io::Error::other)?;
+        return Ok((bytes.clone(), bytes));
+    };
+    let mut stream = body.into_data_stream();
+    let mut original = Vec::new();
+    let mut retained = Vec::new();
+    let mut pending = Vec::new();
+    let mut scanner = SseFrameScanner::default();
+    // Ordering barrier: once a semantic (non-progress) frame has been retained,
+    // later progress frames are retained too. Forwarding them would reorder
+    // reasoning past content/tool-call frames the client has not seen yet.
+    let mut semantic_barrier = false;
+    while let Some(bytes) = stream.next().await {
+        let bytes = bytes.map_err(std::io::Error::other)?;
+        if bytes.len() > limit.saturating_sub(original.len()) {
+            return Err(std::io::Error::other(
+                "Tool disclosure response exceeds body limit",
+            ));
+        }
+        original.extend_from_slice(&bytes);
+        pending.extend_from_slice(&bytes);
+        let mut consumed = 0;
+        while let Some(end) = scanner.next_frame_end(&pending) {
+            let frame = &pending[consumed..end];
+            if !semantic_barrier && is_disclosure_progress(frame) {
+                progress
+                    .send(Bytes::copy_from_slice(frame))
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "Streaming client disconnected",
+                        )
+                    })?;
+            } else {
+                semantic_barrier = true;
+                retained.extend_from_slice(frame);
+            }
+            consumed = end;
+        }
+        if consumed > 0 {
+            pending.drain(..consumed);
+            scanner.retreat(consumed);
+        }
+    }
+    retained.extend_from_slice(&pending);
+    Ok((Bytes::from(original), Bytes::from(retained)))
+}
+
+/// Incremental SSE frame splitter.
+///
+/// Tracks how far `pending` has been scanned so a frame delivered across many
+/// small chunks is scanned once, not quadratically. Handles LF, CRLF, and
+/// bare-CR line endings; a trailing `\r` is held back until the next chunk
+/// resolves whether it opens a CRLF pair.
+#[derive(Default)]
+struct SseFrameScanner {
+    /// Offset in `pending` up to which bytes are known to hold no frame
+    /// terminator (they are mid-line or an ambiguous trailing `\r`).
+    scanned: usize,
+    /// Whether the line containing offset `scanned` already has content bytes
+    /// (`false` means `scanned` sits at a line start).
+    mid_line: bool,
+}
+
+impl SseFrameScanner {
+    /// Return the offset one past the next complete frame (empty line) in
+    /// `pending`, or `None` when no complete frame is buffered yet.
+    fn next_frame_end(&mut self, pending: &[u8]) -> Option<usize> {
+        let mut i = self.scanned;
+        let mut mid_line = self.mid_line;
+        while i < pending.len() {
+            let byte = pending[i];
+            if byte == b'\n' || byte == b'\r' {
+                if byte == b'\r' && i + 1 == pending.len() {
+                    break;
+                }
+                let len = if byte == b'\r' && pending[i + 1] == b'\n' {
+                    2
+                } else {
+                    1
+                };
+                if !mid_line {
+                    self.scanned = i + len;
+                    self.mid_line = false;
+                    return Some(i + len);
+                }
+                mid_line = false;
+                i += len;
+            } else {
+                mid_line = true;
+                i += 1;
+            }
+        }
+        self.scanned = i;
+        self.mid_line = mid_line;
+        None
+    }
+
+    /// Adjust the scan cursor after the caller drained `n` bytes from the
+    /// front of `pending`.
+    fn retreat(&mut self, n: usize) {
+        self.scanned = self.scanned.saturating_sub(n);
+    }
+}
+
+fn is_disclosure_progress(frame: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(frame) else {
+        return false;
+    };
+    let mut data = Vec::new();
+    for line in text.split(['\r', '\n']).filter(|line| !line.is_empty()) {
+        if line.starts_with(':') {
+            continue;
+        }
+        let Some(value) = line.strip_prefix("data:") else {
+            return false;
+        };
+        data.push(value.strip_prefix(' ').unwrap_or(value));
+    }
+    if data.is_empty() {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&data.join("\n")) else {
+        return false;
+    };
+    if value.get("error").is_some() || value.get("usage").is_some_and(|usage| !usage.is_null()) {
+        return false;
+    }
+    value
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .is_some_and(|choices| {
+            !choices.is_empty()
+                && choices.iter().all(|choice| {
+                    choice
+                        .get("finish_reason")
+                        .is_none_or(|reason| reason.is_null())
+                        && choice
+                            .get("delta")
+                            .and_then(|delta| delta.as_object())
+                            .is_some_and(|delta| {
+                                delta.iter().all(|(key, value)| match key.as_str() {
+                                    "role" => value.as_str() == Some("assistant"),
+                                    "reasoning_content" | "reasoning" => {
+                                        value.is_null() || value.is_string()
+                                    }
+                                    "content" => value.is_null() || value.as_str() == Some(""),
+                                    _ => false,
+                                })
+                            })
+                })
+        })
+}
+
+fn set_compression_headers(
+    response: &mut Response<Body>,
+    level: CompressionLevel,
+    ratio: f64,
+    tokens_saved: u64,
+) {
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(level_to_str(level)) {
+        headers.insert(HEADER_LEVEL_RESPONSE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&format!("{ratio:.4}")) {
+        headers.insert(HEADER_RATIO, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&tokens_saved.to_string()) {
+        headers.insert(HEADER_TOKENS_SAVED, value);
     }
 }
 
@@ -1677,6 +1938,170 @@ mod service_tests {
         String::from_utf8_lossy(&bytes).to_string()
     }
 
+    fn live_service(
+        bodies: Vec<Body>,
+    ) -> impl Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible>
+    {
+        let config = test_config();
+        let state = Arc::new(ToolCompressionState::new(
+            &config.try_read().unwrap().tool_compression,
+        ));
+        let bodies = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            bodies,
+        )));
+        let inner = tower::service_fn(move |_request: Request<Body>| {
+            let body = bodies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected resubmit");
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                        .body(body)
+                        .unwrap(),
+                )
+            }
+        });
+        ToolCompressionLayer::new(
+            config,
+            state,
+            Arc::new(Metrics::new()),
+            Arc::new(CompressionEventHub::new()),
+        )
+        .layer(inner)
+    }
+
+    fn channel_body() -> (mpsc::Sender<Bytes>, Body) {
+        let (sender, receiver) = mpsc::channel::<Bytes>(4);
+        let stream = futures::stream::unfold(receiver, |mut receiver| async move {
+            receiver
+                .recv()
+                .await
+                .map(|bytes| (Ok::<_, std::io::Error>(bytes), receiver))
+        });
+        (sender, Body::from_stream(stream))
+    }
+
+    fn reasoning_frame(text: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({
+                "id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "glm-5.3",
+                "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}]
+            })
+        )
+    }
+
+    #[tokio::test]
+    async fn disclosure_relays_heartbeats_before_completion_across_resubmits() {
+        let (first_tx, first_body) = channel_body();
+        let (second_tx, second_body) = channel_body();
+        let mut service = live_service(vec![first_body, second_body]);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.call(request_with_many_tools(true)),
+        )
+        .await
+        .expect("headers must not wait for body completion")
+        .unwrap();
+        assert!(response.headers().contains_key(HEADER_RATIO));
+        let mut stream = response.into_body().into_data_stream();
+        let heartbeat = reasoning_frame("Still working…\n").replace('\n', "\r\n");
+        let split = heartbeat.find('…').unwrap() + 1;
+        first_tx
+            .send(Bytes::copy_from_slice(&heartbeat.as_bytes()[..split]))
+            .await
+            .unwrap();
+        first_tx
+            .send(Bytes::copy_from_slice(&heartbeat.as_bytes()[split..]))
+            .await
+            .unwrap();
+        let progress = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("heartbeat must arrive while upstream is still open")
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.as_ref(), heartbeat.as_bytes());
+        first_tx
+            .send(Bytes::from(sse_tool_call(
+                resolver::GET_TOOLS_IN_NAMESPACE,
+                r#"{"namespace":"fs"}"#,
+            )))
+            .await
+            .unwrap();
+        drop(first_tx);
+        let second_heartbeat = reasoning_frame("Continuing…\n");
+        second_tx
+            .send(Bytes::from(second_heartbeat.clone()))
+            .await
+            .unwrap();
+        let progress = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("resubmitted turn must keep streaming progress")
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.as_ref(), second_heartbeat.as_bytes());
+        second_tx.send(Bytes::from_static(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")).await.unwrap();
+        drop(second_tx);
+        let mut final_bytes = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            final_bytes.extend_from_slice(&bytes.unwrap());
+        }
+        let text = String::from_utf8(final_bytes).unwrap();
+        assert!(text.contains("done"));
+        assert!(
+            !text.contains("reasoning_content"),
+            "progress must not replay"
+        );
+        assert!(!text.contains(resolver::GET_TOOLS_IN_NAMESPACE));
+        assert_eq!(text.matches("[DONE]").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn disclosure_stream_cancellation_drops_upstream() {
+        let (sender, body) = channel_body();
+        let mut service = live_service(vec![body]);
+        let response = service.call(request_with_many_tools(true)).await.unwrap();
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(1), sender.closed())
+            .await
+            .expect("disconnect must cancel upstream without a detached task");
+    }
+
+    #[tokio::test]
+    async fn disclosure_stream_propagates_body_errors() {
+        let body = Body::from_stream(futures::stream::once(async {
+            Err::<Bytes, _>(std::io::Error::other("upstream failed"))
+        }));
+        let mut service = live_service(vec![body]);
+        let response = service.call(request_with_many_tools(true)).await.unwrap();
+        assert!(to_bytes(response.into_body(), 1024).await.is_err());
+    }
+
+    #[test]
+    fn disclosure_progress_does_not_expose_tools_or_terminate_hidden_turns() {
+        assert!(is_disclosure_progress(
+            reasoning_frame("working").as_bytes()
+        ));
+        assert!(is_disclosure_progress(b": keep-alive\n\n"));
+        for payload in [
+            json!({"choices": [{"delta": {"tool_calls": [{"function": {"name": "ns_fs"}}]}}]}),
+            json!({"choices": [{"delta": {"reasoning_content": "thinking", "tool_calls": []}}]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {"total_tokens": 10}}),
+            json!({"choices": [{"delta": {"content": "answer"}}]}),
+            json!({"error": {"message": "failed"}}),
+        ] {
+            assert!(!is_disclosure_progress(
+                format!("data: {payload}\n\n").as_bytes()
+            ));
+        }
+        assert!(!is_disclosure_progress(b"data: [DONE]\n\n"));
+        assert!(!is_disclosure_progress(b"data: invalid\n\n"));
+    }
+
     /// Sanity: the grouper actually collapses the tools and injects the synthetic
     /// drill-down tool. If this fails, nothing downstream can be trusted.
     #[tokio::test]
@@ -2065,7 +2490,10 @@ mod service_tests {
         // `tools` array specifically — the message history legitimately still
         // mentions the synthetic name in the assistant's earlier tool_calls.
         let bodies = inner.seen_bodies.lock().unwrap().clone();
-        let last = bodies.last().expect("a resubmitted body must exist").clone();
+        let last = bodies
+            .last()
+            .expect("a resubmitted body must exist")
+            .clone();
         let offered: Vec<String> = last
             .get("tools")
             .and_then(|t| t.as_array())
@@ -2080,10 +2508,11 @@ mod service_tests {
             })
             .unwrap_or_default();
         assert!(
-            !offered.iter().any(|name| name
-                == resolver::GET_TOOLS_IN_NAMESPACE
-                || name == resolver::GET_TOOL_SCHEMA
-                || name.starts_with(resolver::NS_PREFIX)),
+            !offered
+                .iter()
+                .any(|name| name == resolver::GET_TOOLS_IN_NAMESPACE
+                    || name == resolver::GET_TOOL_SCHEMA
+                    || name.starts_with(resolver::NS_PREFIX)),
             "discovery tools must be withdrawn for the final turn, got: {offered:?}"
         );
         assert!(

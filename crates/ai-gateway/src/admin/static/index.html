@@ -284,6 +284,10 @@ svg.vk-chart .vk-chart-xlabel{fill:var(--text-muted);font-size:10px}
 .prov-header-row .form-group{margin:0}
 /* Webhooks (budget-alerts-unified-webhooks, Req 5.1, 5.2, 5.5) */
 .wh-table-wrap{overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
+/* Tracing (opentelemetry-trace-export, Req 8.1, 8.2, 7.3) */
+.otel-header-row{display:grid;grid-template-columns:1fr 1.4fr auto;gap:.75rem;align-items:end;margin-bottom:.5rem;padding:.6rem;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius)}
+.otel-header-row .form-group{margin:0}
+#otel-status-table td:first-child{white-space:nowrap;font-weight:600;width:35%}
 table.wh-table{width:100%;border-collapse:collapse;font-size:.8rem}
 table.wh-table th,table.wh-table td{padding:.5rem .6rem;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
 table.wh-table th{white-space:nowrap;background:var(--bg);font-weight:600}
@@ -366,6 +370,7 @@ body.sec-banner-active{padding-top:3.2rem}
     <li role="presentation"><button class="nav-btn" role="tab" type="button" data-page="structured-output" id="tab-structured-output" aria-controls="page-structured-output">Structured Output</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="memory" id="tab-memory" aria-controls="page-memory">Persistent Memory</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="webhooks" id="tab-webhooks" aria-controls="page-webhooks">Webhooks</button></li>
+<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="tracing" id="tab-tracing" aria-controls="page-tracing">Tracing</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="cost-reports" id="tab-cost-reports" aria-controls="page-cost-reports">Cost Reports</button></li>
 </ul>
   <div class="nav-footer">
@@ -2616,6 +2621,69 @@ body.sec-banner-active{padding-top:3.2rem}
 </div>
 </section>
 
+<!-- Tracing (opentelemetry-trace-export, Req 8.1, 8.2, 7.3) -->
+<section class="page" id="page-tracing" role="tabpanel" aria-labelledby="tab-tracing">
+<h2>Tracing</h2>
+<p class="hint" style="margin-bottom:1.5rem">OpenTelemetry trace export. When enabled, every client request becomes one trace (gateway root span + one child span per provider attempt) sent to your OTLP/HTTP collector. Disabled = no OTLP network activity.</p>
+
+<fieldset><legend>Export Settings</legend>
+<div class="form-check">
+<input type="checkbox" id="otel-enabled">
+<label for="otel-enabled">Enable trace export</label>
+</div>
+<div class="hint" style="margin-top:-.5rem;margin-bottom:1rem;margin-left:1.5rem">Opt-in. Enabling requires an endpoint below.</div>
+<div class="form-group">
+<label for="otel-endpoint">OTLP Endpoint</label>
+<input type="url" id="otel-endpoint" placeholder="http://localhost:4318/v1/traces" autocomplete="off" aria-describedby="otel-endpoint-error">
+<div class="hint">Full http/https URL of the collector's trace ingestion path (e.g. OpenTelemetry Collector, Jaeger, Tempo, Langfuse).</div>
+<div class="error" id="otel-endpoint-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="otel-service-name">Service Name</label>
+<input type="text" id="otel-service-name" placeholder="ai-gateway" autocomplete="off" aria-describedby="otel-service-name-error">
+<div class="hint">Reported as <code>service.name</code> on the resource. Blank = <code>ai-gateway</code>.</div>
+<div class="error" id="otel-service-name-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="otel-sampling-ratio">Sampling Ratio</label>
+<input type="number" id="otel-sampling-ratio" min="0" max="1" step="0.01" value="1" aria-describedby="otel-sampling-error">
+<div class="hint">0.0–1.0. Deterministic per trace id; requests carrying a sampled <code>traceparent</code> are always kept. For high traffic, prefer a low ratio plus tail sampling in the collector.</div>
+<div class="error" id="otel-sampling-error" role="alert"></div>
+</div>
+<div class="form-check">
+<input type="checkbox" id="otel-capture-content">
+<label for="otel-capture-content">Capture message content in spans</label>
+</div>
+<div class="hint" style="margin-top:-.5rem;margin-bottom:1rem;margin-left:1.5rem"><strong>Privacy warning:</strong> when enabled, truncated request/response text is written into the exported spans and leaves the gateway toward your tracing backend. Only enable on trusted, access-controlled collectors; it stays off by default.</div>
+</fieldset>
+
+<fieldset><legend>Auth Headers</legend>
+<div class="hint" style="margin-bottom:.75rem">Headers sent with every OTLP export POST (e.g. <code>authorization</code>). Values are masked once saved; leave a masked value unchanged to keep the stored one. Values support <code>${ENV_VAR}</code> substitution.</div>
+<div class="otel-headers-list" id="otel-headers-list"></div>
+<button type="button" class="btn btn-secondary btn-sm" id="otel-add-header">+ Add Header</button>
+</fieldset>
+
+<fieldset><legend>Exporter Status</legend>
+<div class="wh-deliveries-header">
+<div class="form-group" style="margin:0">
+<span class="hint">Point-in-time snapshot from the exporter. Host only — header values never appear here.</span>
+</div>
+<button type="button" class="btn btn-secondary btn-sm" id="otel-status-refresh">Refresh</button>
+</div>
+<table class="wh-table" id="otel-status-table">
+<caption class="sr-only">Exporter status</caption>
+<tbody id="otel-status-tbody">
+<tr id="otel-status-placeholder"><td colspan="2" class="wh-empty">Loading status…</td></tr>
+</tbody>
+</table>
+</fieldset>
+
+<div class="actions">
+<button class="btn btn-primary" id="otel-save">Save Tracing</button>
+<button class="btn btn-secondary" id="otel-reset">Reset</button>
+</div>
+</section>
+
 <!-- Cost Reports (billing-grade-cost-reporting, Req 5) -->
 <section class="page" id="page-cost-reports" role="tabpanel" aria-labelledby="tab-cost-reports">
 <h2>Cost Reports</h2>
@@ -2805,6 +2873,7 @@ if (pageId === 'smart-routing') { populateSmartRouting((config && config.smart_r
 if (pageId === 'virtual-keys') { vkOnOpen(); }
     if (pageId === 'guardrails') { loadGuardrailVirtualKeys(); }
  if (pageId === 'webhooks') { whOnOpen(); }
+if (pageId === 'tracing') { otelStatusLoad(); }
 if (pageId === 'cost-reports') { crOnOpen(); }
  if (pageId === 'circuit-breaker') { loadCircuitBreakerStates(); }
  if (pageId === 'providers') { refreshProvBudgetsBulk(); refreshCopilotStatuses(); }
@@ -3453,10 +3522,11 @@ if (!validatePositiveInt(ct, 'Chunk timeout')) ok = false;
         'page-compression': validateCompressionPage,
         'page-context': validateContextPage,
         'page-streaming': validateStreamingPage,
-        'page-loop-detection': validateLoopDetectionPage,
-        'page-guardrails': validateGuardrailsPage,
-        'page-structured-output': validateStructuredOutputPage
-    };
+'page-loop-detection': validateLoopDetectionPage,
+'page-guardrails': validateGuardrailsPage,
+'page-structured-output': validateStructuredOutputPage,
+'page-tracing': validateTracingPage
+};
 
   /** Validate the currently active page. Returns true if valid. */
   function validateActivePage() {
@@ -4681,9 +4751,10 @@ if(cfg.cors){document.getElementById('cors-enabled').checked=!!cfg.cors.enabled;
     }
     populateGuardrails(cfg.guardrails);
     populateStructuredOutput(cfg.structured_output);
-    populateToolCompression(cfg.tool_compression);
-    populateMemory(cfg.memory);
-  }
+populateToolCompression(cfg.tool_compression);
+populateMemory(cfg.memory);
+populateTelemetry(cfg.opentelemetry);
+}
 
   function populateSmartRouting(value){
 var v=value||{};var cascade=v.cascade||{};var boundaries=v.tier_boundaries||{};var quality=v.quality_evaluator||{};var cache=v.semantic_cache||{};var optimizer=v.online_optimizer||{};
@@ -4858,6 +4929,7 @@ cfg.reasoning_compat=collectReasoningCompat();
     cfg.loop_detection=collectLoopDetection();
     cfg.guardrails=collectGuardrails();
     if(document.getElementById('so-enabled').checked || (config && config.structured_output)){cfg.structured_output=collectStructuredOutput();}else{delete cfg.structured_output;}
+    cfg.opentelemetry=collectTelemetry();
     return cfg;
   }
 
@@ -8136,6 +8208,222 @@ document.getElementById('mem-qdrant-recreate').addEventListener('click', functio
 
   // --- Webhooks UI Logic (budget-alerts-unified-webhooks, Req 5.1, 5.2, 5.5) ---
 var WH_EVENTS = ['budget.warning', 'budget.exhausted', 'budget.reset'];
+
+// --- Tracing UI Logic (opentelemetry-trace-export, Req 8.1, 8.2, 7.3) ---
+// otelState.headers holds editor rows; a value left equal to the
+// `[configured]` mask is sent back verbatim so the backend preserves the
+// stored value on save (Req 8.2 round-trip rule). Stored values are never
+// displayed beyond the mask itself.
+var OTEL_SECRET_MASK = '[configured]';
+var otelState = { headers: [] };
+
+function otelTd(label) {
+var td = document.createElement('td');
+td.textContent = label;
+return td;
+}
+
+var otelHeaderRowSeq = 0;
+function otelAddHeaderRow(key, value) {
+var seq = ++otelHeaderRowSeq;
+var row = document.createElement('div');
+row.className = 'otel-header-row';
+var keyGroup = document.createElement('div');
+keyGroup.className = 'form-group';
+var keyLabel = document.createElement('label');
+keyLabel.textContent = 'Header Name';
+keyLabel.setAttribute('for', 'otel-header-name-' + seq);
+var keyIn = document.createElement('input');
+keyIn.type = 'text';
+keyIn.id = 'otel-header-name-' + seq;
+keyIn.className = 'otel-header-name';
+keyIn.name = 'otel_header_name';
+keyIn.placeholder = 'authorization';
+keyIn.autocomplete = 'off';
+keyIn.value = key || '';
+keyGroup.appendChild(keyLabel);
+keyGroup.appendChild(keyIn);
+var valGroup = document.createElement('div');
+valGroup.className = 'form-group';
+var valLabel = document.createElement('label');
+valLabel.textContent = 'Value';
+valLabel.setAttribute('for', 'otel-header-value-' + seq);
+var valIn = document.createElement('input');
+valIn.type = 'password';
+valIn.id = 'otel-header-value-' + seq;
+valIn.className = 'otel-header-value';
+valIn.name = 'otel_header_value';
+valIn.placeholder = 'value or ${ENV_VAR}';
+valIn.autocomplete = 'new-password';
+valIn.value = value || '';
+valGroup.appendChild(valLabel);
+valGroup.appendChild(valIn);
+var btnGroup = document.createElement('div');
+btnGroup.className = 'form-group';
+var btn = document.createElement('button');
+btn.type = 'button';
+btn.className = 'btn btn-danger btn-sm';
+btn.textContent = 'Remove';
+btn.setAttribute('aria-label', 'Remove header');
+btn.addEventListener('click', function() { row.remove(); });
+btnGroup.appendChild(btn);
+row.appendChild(keyGroup);
+row.appendChild(valGroup);
+row.appendChild(btnGroup);
+document.getElementById('otel-headers-list').appendChild(row);
+}
+
+function populateTelemetry(otel) {
+otel = otel || {};
+document.getElementById('otel-enabled').checked = !!otel.enabled;
+document.getElementById('otel-endpoint').value = otel.endpoint || '';
+document.getElementById('otel-service-name').value = otel.service_name || 'ai-gateway';
+document.getElementById('otel-sampling-ratio').value = otel.sampling_ratio != null ? otel.sampling_ratio : 1;
+document.getElementById('otel-capture-content').checked = !!otel.capture_content;
+var list = document.getElementById('otel-headers-list');
+list.innerHTML = ''; /* xss-audit: static */
+Object.keys(otel.headers || {}).forEach(function(k) {
+// GET responses carry the [configured] mask for every stored value;
+// echo it back untouched on save so the stored value is preserved.
+otelAddHeaderRow(k, otel.headers[k]);
+});
+clearAllErrors(document.getElementById('page-tracing'));
+}
+
+function collectTelemetry() {
+var headers = {};
+document.querySelectorAll('#otel-headers-list .otel-header-row').forEach(function(row) {
+var k = row.querySelector('.otel-header-name').value.trim();
+var v = row.querySelector('.otel-header-value').value;
+if (k) headers[k] = v;
+});
+var ratio = parseFloat(document.getElementById('otel-sampling-ratio').value);
+var endpoint = document.getElementById('otel-endpoint').value.trim();
+return {
+enabled: document.getElementById('otel-enabled').checked,
+endpoint: endpoint || null,
+headers: headers,
+sampling_ratio: isFinite(ratio) ? ratio : 1,
+capture_content: document.getElementById('otel-capture-content').checked,
+service_name: document.getElementById('otel-service-name').value.trim() || 'ai-gateway'
+};
+}
+
+function validateTracingPage() {
+clearAllErrors(document.getElementById('page-tracing'));
+var ok = true;
+var enabled = document.getElementById('otel-enabled').checked;
+var endpointIn = document.getElementById('otel-endpoint');
+var endpoint = endpointIn.value.trim();
+if (enabled && !endpoint) {
+showError(endpointIn, 'Endpoint is required when tracing is enabled');
+ok = false;
+} else if (endpoint && !/^https?:\/\//.test(endpoint)) {
+showError(endpointIn, 'Endpoint must be a valid http/https URL');
+ok = false;
+} else {
+clearError(endpointIn);
+}
+var ratioIn = document.getElementById('otel-sampling-ratio');
+var ratio = parseFloat(ratioIn.value);
+if (isNaN(ratio) || ratio < 0 || ratio > 1) {
+showError(ratioIn, 'Sampling ratio must be between 0.0 and 1.0');
+ok = false;
+} else {
+clearError(ratioIn);
+}
+var nameIn = document.getElementById('otel-service-name');
+var name = nameIn.value.trim();
+if (name.length > 100) {
+showError(nameIn, 'Service name must be at most 100 characters');
+ok = false;
+} else {
+clearError(nameIn);
+}
+// Header rows need a name when a value is present; masked values
+// without a stored pair are dropped server-side, so a name is
+// required for any meaningful save.
+document.querySelectorAll('#otel-headers-list .otel-header-row').forEach(function(row) {
+var nameEl = row.querySelector('.otel-header-name');
+var valEl = row.querySelector('.otel-header-value');
+if (valEl.value.trim() && !nameEl.value.trim()) {
+showError(nameEl, 'Header name is required when a value is set');
+ok = false;
+} else {
+clearError(nameEl);
+}
+});
+return ok;
+}
+
+function otelStatusRow(tr, label, value) {
+tr.appendChild(otelTd(label));
+tr.appendChild(otelTd(value));
+}
+
+function otelStatusLoad() {
+var tbody = document.getElementById('otel-status-tbody');
+tbody.innerHTML = ''; /* xss-audit: static */
+fetch(apiUrl('telemetry/status'))
+.then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+.then(function(s) {
+s = s || {};
+var tr = document.createElement('tr');
+var enabledTd = document.createElement('td');
+var enabledBadge = document.createElement('span');
+enabledBadge.className = 'wh-badge ' + (s.enabled ? 'wh-badge-ok' : 'wh-badge-unsigned');
+enabledBadge.textContent = s.enabled ? 'enabled' : 'disabled';
+enabledTd.appendChild(enabledBadge);
+tr.appendChild(otelTd('Export'));
+tr.appendChild(enabledTd);
+tbody.appendChild(tr);
+tr = document.createElement('tr');
+otelStatusRow(tr, 'Endpoint Host', s.endpoint_host || '—');
+tbody.appendChild(tr);
+tr = document.createElement('tr');
+otelStatusRow(tr, 'Spans Exported', s.spans_exported != null ? String(s.spans_exported) : '0');
+tbody.appendChild(tr);
+tr = document.createElement('tr');
+otelStatusRow(tr, 'Spans Dropped (queue full)', s.spans_dropped != null ? String(s.spans_dropped) : '0');
+tbody.appendChild(tr);
+tr = document.createElement('tr');
+otelStatusRow(tr, 'Export Failures', s.export_failures != null ? String(s.export_failures) : '0');
+tbody.appendChild(tr);
+tr = document.createElement('tr');
+var errTd = document.createElement('td');
+errTd.textContent = (s.last_error_class || '—') + (s.last_error_at_epoch ? ' (' + new Date(s.last_error_at_epoch * 1000).toLocaleString() + ')' : '');
+tr.appendChild(otelTd('Last Export Error'));
+tr.appendChild(errTd);
+tbody.appendChild(tr);
+tr = document.createElement('tr');
+var healthTd = document.createElement('td');
+var healthBadge = document.createElement('span');
+healthBadge.className = 'wh-badge ' + (s.healthy ? 'wh-badge-ok' : 'wh-badge-failing');
+healthBadge.textContent = s.healthy ? 'healthy' : 'unhealthy';
+healthTd.appendChild(healthBadge);
+tr.appendChild(otelTd('Exporter Health'));
+tr.appendChild(healthTd);
+tbody.appendChild(tr);
+})
+.catch(function(err) {
+var tr = document.createElement('tr');
+var td = document.createElement('td');
+td.colSpan = 2;
+td.className = 'wh-empty';
+td.textContent = 'Failed to load status: ' + err.message;
+tr.appendChild(td);
+tbody.appendChild(tr);
+});
+}
+
+(function otelWire() {
+document.getElementById('otel-add-header').addEventListener('click', function() { otelAddHeaderRow('', ''); });
+document.getElementById('otel-status-refresh').addEventListener('click', otelStatusLoad);
+document.getElementById('otel-save').addEventListener('click', saveConfig);
+document.getElementById('otel-reset').addEventListener('click', function() {
+if (config) populateTelemetry(config.opentelemetry);
+});
+})();
 // whState.endpoints holds editor state; secret keeps the masked sentinel
 // verbatim so an untouched field preserves the stored secret on save, and a
 // cleared field removes it. Stored secrets are never displayed.

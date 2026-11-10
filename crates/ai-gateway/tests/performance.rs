@@ -284,6 +284,7 @@ fn build_router_from_fixture(fixture: &ProviderSelectionFixture) -> Router {
         structured_output: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     };
     common::isolate_databases(&mut config);
     Router::new(Arc::new(RwLock::new(config)), test_metrics())
@@ -754,6 +755,7 @@ fn test_config() -> Config {
         structured_output: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     }
 }
 
@@ -1557,6 +1559,7 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
         structured_output: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     };
     common::isolate_databases(&mut config);
     let shared = Arc::new(RwLock::new(config));

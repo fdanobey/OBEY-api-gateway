@@ -345,6 +345,20 @@ impl Config {
             }
         }
 
+        // Validate OpenTelemetry trace export (opentelemetry-trace-export,
+        // Req 1.2, 1.3, 1.5): endpoint required and an http/https URL when
+        // enabled; sampling_ratio bounds always; every field validated even
+        // when disabled so a broken dormant config is reported.
+        if let Err(telemetry_errors) = self.opentelemetry.validate() {
+            errors.extend(telemetry_errors.into_iter().map(|error| {
+                ValidationError::InvalidValue {
+                    field: error.field,
+                    value: error.value,
+                    expected: error.expected,
+                }
+            }));
+        }
+
         let configured_provider_names: std::collections::HashSet<&str> = self
             .providers
             .iter()
@@ -1479,6 +1493,7 @@ mod property_tests {
             cache_aware_routing: Default::default(),
             reasoning_compat: Default::default(),
             webhooks: Default::default(),
+            opentelemetry: Default::default(),
         }
     }
 
@@ -4320,5 +4335,133 @@ model_groups:
 
         let config = load_and_validate_config(&path).unwrap();
         assert_eq!(config.server.host, default_bind_host());
+    }
+    // --- OpenTelemetry config validation (opentelemetry-trace-export,
+    // Req 1.1-1.5) ---
+
+    fn telemetry_config(enabled: bool, endpoint: Option<&str>, sampling_ratio: f64) -> Config {
+        let mut config = minimal_valid_config();
+        config.opentelemetry = crate::telemetry::TelemetryConfig {
+            enabled,
+            endpoint: endpoint.map(str::to_string),
+            sampling_ratio,
+            ..Default::default()
+        };
+        config
+    }
+
+    #[test]
+    fn opentelemetry_absent_section_is_valid_and_disabled() {
+        let config = minimal_valid_config();
+        assert!(!config.opentelemetry.enabled);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn opentelemetry_enabled_missing_endpoint_rejected() {
+        for endpoint in [None, Some("")] {
+            let config = telemetry_config(true, endpoint, 1.0);
+            let errors = config.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error,
+                    ValidationError::InvalidValue { field, .. }
+                    if field == "opentelemetry.endpoint"
+                )),
+                "endpoint {endpoint:?} should be rejected when enabled"
+            );
+        }
+    }
+
+    #[test]
+    fn opentelemetry_enabled_invalid_endpoint_url_rejected() {
+        for endpoint in [
+            "not-a-url",
+            "ftp://collector:4318/v1/traces",
+            "localhost:4318/v1/traces",
+        ] {
+            let config = telemetry_config(true, Some(endpoint), 1.0);
+            let errors = config.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error,
+                    ValidationError::InvalidValue { field, expected, .. }
+                    if field == "opentelemetry.endpoint"
+                        && expected.contains("http/https URL")
+                )),
+                "endpoint {endpoint} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn opentelemetry_enabled_valid_http_and_https_endpoints_accepted() {
+        for endpoint in [
+            "http://localhost:4318/v1/traces",
+            "https://collector.internal:4318/v1/traces",
+        ] {
+            let config = telemetry_config(true, Some(endpoint), 1.0);
+            assert!(
+                config.validate().is_ok(),
+                "endpoint {endpoint} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn opentelemetry_sampling_ratio_out_of_range_rejected_with_range() {
+        for ratio in [1.5, -0.1] {
+            let config = telemetry_config(true, Some("http://localhost:4318/v1/traces"), ratio);
+            let errors = config.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error,
+                    ValidationError::InvalidValue { field, expected, .. }
+                    if field == "opentelemetry.sampling_ratio"
+                        && expected.contains("[0.0, 1.0]")
+                )),
+                "sampling_ratio {ratio} should be rejected with the allowed range"
+            );
+        }
+    }
+
+    #[test]
+    fn opentelemetry_sampling_ratio_boundaries_accepted() {
+        for ratio in [0.0, 1.0] {
+            let config = telemetry_config(true, Some("http://localhost:4318/v1/traces"), ratio);
+            assert!(
+                config.validate().is_ok(),
+                "sampling_ratio {ratio} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn opentelemetry_disabled_but_invalid_is_still_rejected() {
+        // Dormant-but-broken configs are reported (Req 1.5): ratio out of
+        // bounds and a malformed endpoint both fail even with enabled=false.
+        let config = telemetry_config(false, Some("not-a-url"), 1.0);
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, .. }
+            if field == "opentelemetry.endpoint"
+        )));
+
+        let config = telemetry_config(false, None, 2.0);
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, .. }
+            if field == "opentelemetry.sampling_ratio"
+        )));
+    }
+
+    #[test]
+    fn opentelemetry_disabled_missing_endpoint_is_valid() {
+        // No endpoint requirement while dormant (only ratio/URL validity
+        // apply when disabled).
+        let config = telemetry_config(false, None, 1.0);
+        assert!(config.validate().is_ok());
     }
 }

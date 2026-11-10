@@ -113,6 +113,7 @@ fn test_config() -> Config {
         codex_search: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     }
 }
 
@@ -1167,6 +1168,165 @@ async fn test_streaming_placeholder_reasoning_on_heartbeats_when_enabled() {
         .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
         .collect();
     assert_eq!(content, "too late", "replay reconstructs the slow mock's content");
+}
+
+#[tokio::test]
+async fn test_streaming_high_tool_compression_relays_placeholder_before_upstream_finishes() {
+    use futures::StreamExt;
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::{mpsc, Notify};
+
+    let release_upstream = Arc::new(Notify::new());
+    let upstream_gate = Arc::clone(&release_upstream);
+    let (upstream_request_tx, mut upstream_request_rx) = mpsc::channel(1);
+    let upstream = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let gate = Arc::clone(&upstream_gate);
+            let request_tx = upstream_request_tx.clone();
+            async move {
+                request_tx.send(request).await.unwrap();
+                gate.notified().await;
+                axum::Json(serde_json::json!({
+                    "id": MOCK_PROVIDER_ID,
+                    "object": "chat.completion",
+                    "created": 1700000000_i64,
+                    "model": "glm-5.3",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "Finished after release" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13 }
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_uri = format!("http://{}", listener.local_addr().unwrap());
+    let upstream_task = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let mut cfg = streaming_test_config(&upstream_uri, true);
+    cfg.model_groups[0].models[0].model = "glm-5.3".to_string();
+    cfg.tool_compression.enabled = true;
+    cfg.tool_compression.level = ai_gateway::tool_compression::config::CompressionLevel::High;
+    cfg.tool_compression.auto_tuning.enabled = false;
+    cfg.tool_compression.namespace_grouping.enabled = true;
+    cfg.tool_compression.progressive_disclosure = true;
+    cfg.streaming = Some(StreamingConfig {
+        heartbeat_interval_seconds: 1,
+        placeholder_reasoning: true,
+        ..cfg.streaming.unwrap()
+    });
+    let app = build_app(cfg).await;
+    let tools: Vec<_> = (0..64)
+        .map(|index| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": format!("namespace{}_tool{}", index / 8, index % 8),
+                    "description": format!("Run operation {index} in its namespace"),
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "query": { "type": "string" } },
+                        "required": ["query"]
+                    }
+                }
+            })
+        })
+        .collect();
+    let request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "glm-5.3",
+                "messages": [{ "role": "user", "content": "Use the available tools to help" }],
+                "tools": tools,
+                "stream": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(10), app.oneshot(request))
+        .await
+        .expect("SSE headers must arrive while the upstream is still blocked")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    assert_eq!(response.headers()["x-tool-compression-level"], "high");
+
+    let mut stream = response.into_body().into_data_stream();
+    let mut raw = Vec::new();
+    let first_placeholder = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let bytes = stream
+                .next()
+                .await
+                .expect("stream ended before a placeholder arrived")
+                .expect("SSE body read failed");
+            raw.extend_from_slice(&bytes);
+            let complete_len = raw
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |position| position + 1);
+            for chunk in parse_sse_chunks(&raw[..complete_len]) {
+                if let Some(reasoning) = chunk["choices"][0]["delta"]["reasoning"].as_str() {
+                    if !reasoning.trim().is_empty() {
+                        return reasoning.to_string();
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("a data frame with delta.reasoning must arrive before upstream completion");
+    assert!(!raw_sse_data_lines(&raw).iter().any(|line| line == "[DONE]"));
+    assert!(parse_sse_chunks(&raw)
+        .iter()
+        .all(|chunk| chunk["choices"][0]["delta"]["content"].is_null()));
+    let upstream_request = upstream_request_rx
+        .try_recv()
+        .expect("the provider must have received the compressed request before the heartbeat");
+    let upstream_tools = upstream_request["tools"].as_array().unwrap();
+    assert!(upstream_tools.len() < 64, "namespace grouping must run");
+    for synthetic_name in ["ns_namespace0", "get_tools_in_namespace", "get_tool_schema"] {
+        assert!(
+            upstream_tools.iter().any(|tool| tool["function"]["name"] == synthetic_name),
+            "expected synthetic tool {synthetic_name} to activate disclosure response inspection"
+        );
+    }
+
+    release_upstream.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(bytes) = stream.next().await {
+            raw.extend_from_slice(&bytes.expect("SSE body read failed after upstream release"));
+        }
+    })
+    .await
+    .expect("stream must finish after releasing the upstream");
+    upstream_task.abort();
+
+    let chunks = parse_sse_chunks(&raw);
+    let content: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(content, "Finished after release");
+    assert!(chunks.iter().any(|chunk| chunk["choices"][0]["finish_reason"] == "stop"));
+    let data_lines = raw_sse_data_lines(&raw);
+    assert_eq!(data_lines.last().map(String::as_str), Some("[DONE]"));
+    assert_eq!(data_lines.iter().filter(|line| *line == "[DONE]").count(), 1);
+    assert_eq!(
+        chunks
+            .iter()
+            .filter_map(|chunk| chunk["choices"][0]["delta"]["reasoning"].as_str())
+            .filter(|reasoning| *reasoning == first_placeholder)
+            .count(),
+        1,
+        "the already-relayed placeholder must not be duplicated in the final replay"
+    );
 }
 
 /// Placeholder-reasoning-blob, Req 3 (default off): without the flag,

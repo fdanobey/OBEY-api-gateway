@@ -185,6 +185,7 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
         memory: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     }
 }
 

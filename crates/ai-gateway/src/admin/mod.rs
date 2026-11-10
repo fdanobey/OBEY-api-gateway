@@ -151,6 +151,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/circuit-breaker/reset", post(reset_circuit_breakers))
         .route("/cost-reports", get(get_cost_report))
         .route("/cost-reports/reconcile", get(get_cost_reconciliation))
+        .route("/telemetry/status", get(get_telemetry_status))
         .route("/security-status", get(security_status_handler))
         .route("/", get(index_handler))
         .route("/{*path}", get(static_handler))
@@ -482,6 +483,25 @@ fn redact_config_for_response(config: &Config) -> serde_json::Value {
         }
     }
 
+    // OpenTelemetry header values are masked with the same `[configured]`
+    // sentinel (opentelemetry-trace-export Req 8.2): every header VALUE is
+    // treated as credential-bearing. Header NAMES survive so the editor can
+    // display the pair. The PUT path preserves stored values when the mask
+    // comes back unchanged (see `preserve_masked_telemetry_headers`).
+    if let Some(opentelemetry) = body
+        .get_mut("opentelemetry")
+        .and_then(|v| v.as_object_mut())
+    {
+        if let Some(headers) = opentelemetry.get_mut("headers").and_then(|v| v.as_object_mut()) {
+            for (_name, value) in headers.iter_mut() {
+                if value.as_str().is_some_and(|s| !s.is_empty()) {
+                    *value =
+                        serde_json::Value::String(crate::webhooks::admin::SECRET_MASK.to_string());
+                }
+            }
+        }
+    }
+
     body
 }
 
@@ -740,6 +760,14 @@ fn normalize_config_for_storage(
         }
     }
 
+    // OpenTelemetry header values (opentelemetry-trace-export Req 8.2
+    // round-trip rule, same convention as webhook secrets): a value
+    // returned unchanged as the `[configured]` sentinel preserves the
+    // stored value for the same header name. A sentinel for a name with
+    // no stored value preserves nothing and must not persist the mask —
+    // the pair is dropped.
+    preserve_masked_telemetry_headers(&mut config.opentelemetry, existing_config.map(|cfg| &cfg.opentelemetry));
+
     normalize_smart_routing_credentials(
         &mut config.smart_routing,
         existing_config.map(|config| &config.smart_routing),
@@ -747,6 +775,36 @@ fn normalize_config_for_storage(
 
     Ok(config)
 }
+
+/// Mask-preserve rule for `opentelemetry.headers`: an incoming value
+/// equal to the `[configured]` sentinel keeps the stored value for the
+/// same header name; names whose stored value is absent are removed
+/// entirely (the mask literal must never reach the YAML file).
+fn preserve_masked_telemetry_headers(
+    incoming: &mut crate::telemetry::TelemetryConfig,
+    existing: Option<&crate::telemetry::TelemetryConfig>,
+) {
+    let Some(stored) = existing else {
+        // No stored section: the mask can't correspond to anything real.
+        incoming
+            .headers
+            .retain(|_, value| value != crate::webhooks::admin::SECRET_MASK);
+        return;
+    };
+    incoming.headers.retain(|name, value| {
+        if value != crate::webhooks::admin::SECRET_MASK {
+            return true;
+        }
+        match stored.headers.get(name).filter(|stored| !stored.is_empty()) {
+            Some(stored_value) => {
+                *value = stored_value.clone();
+                true
+            }
+            None => false,
+        }
+    });
+}
+
 
 /// Normalize Jev classifier credentials for storage, mirroring the provider
 /// api_key handling: plaintext keys are encrypted, encrypted keys are
@@ -1436,6 +1494,29 @@ async fn validate_config(Json(config): Json<Config>) -> Response {
                 .into_response()
         }
     }
+}
+
+/// GET /admin/telemetry/status — exporter health snapshot for the
+/// Tracing admin page (opentelemetry-trace-export Req 7.3). Served
+/// straight from the task-6 exporter getters: counters, last error
+/// class + timestamp, endpoint HOST only. Header values and full
+/// URLs are never part of the snapshot.
+async fn get_telemetry_status(State(state): State<AppState>) -> Response {
+    let status = state.telemetry_exporter.status().await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "enabled": status.enabled,
+            "endpoint_host": status.endpoint_host,
+            "spans_exported": status.spans_exported,
+            "spans_dropped": status.spans_dropped,
+            "export_failures": status.export_failures,
+            "last_error_class": status.last_error_class,
+            "last_error_at_epoch": status.last_error_at_epoch,
+            "healthy": status.healthy,
+        })),
+    )
+        .into_response()
 }
 
 /// POST /admin/config/reload — hot-reload from disk (Req 26.1-26.7)
@@ -3288,6 +3369,7 @@ mod tests {
                     codex_search: None,
                     reasoning_compat: Default::default(),
             webhooks: Default::default(),
+            opentelemetry: Default::default(),
                 })
             })
         })
@@ -4032,6 +4114,7 @@ retry:
             reasoning_models_allowlist: Default::default(),
             codex_search: None,
     webhooks: Default::default(),
+    opentelemetry: Default::default(),
             reasoning_compat: Default::default(),
         };
         config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
@@ -6421,6 +6504,152 @@ fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
         "sentinel for unknown URL must not persist the mask"
     );
 }
+
+    /// OpenTelemetry header values are masked in the full-config GET with
+    /// the same `[configured]` sentinel the webhook secrets use
+    /// (opentelemetry-trace-export Req 8.2: every GET surface).
+    #[test]
+    fn test_redact_config_for_response_masks_opentelemetry_headers() {
+        let mut config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
+        config.opentelemetry.enabled = true;
+        config.opentelemetry.endpoint = Some("http://localhost:4318/v1/traces".to_string());
+        config.opentelemetry.headers.insert(
+            "authorization".to_string(),
+            "Basic ${OTLP_AUTH}".to_string(),
+        );
+        config.opentelemetry.headers.insert(
+            "x-api-key".to_string(),
+            "literal-token-123".to_string(),
+        );
+
+        let redacted = redact_config_for_response(&config);
+        assert_eq!(
+            redacted["opentelemetry"]["headers"]["authorization"], "[configured]",
+            "telemetry header value must be masked in the full-config GET"
+        );
+        assert_eq!(
+            redacted["opentelemetry"]["headers"]["x-api-key"], "[configured]",
+            "every telemetry header value is credential-bearing"
+        );
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !serialized.contains("literal-token-123")
+                && !serialized.contains("Basic ${OTLP_AUTH}"),
+            "GET response leaked telemetry header value: {serialized}"
+        );
+    }
+
+    /// Full-config PUT round-trip (opentelemetry-trace-export Req 8.2): a
+    /// header value returned unchanged as the `[configured]` sentinel
+    /// preserves the stored value for the same name; an edited value
+    /// replaces it; a sentinel for a name with no stored value is dropped
+    /// (the mask literal must never reach the YAML file).
+    #[test]
+    fn test_normalize_config_for_storage_preserves_masked_telemetry_headers() {
+        let mut config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
+        config.opentelemetry.enabled = true;
+        config.opentelemetry.endpoint = Some("http://localhost:4318/v1/traces".to_string());
+        config.opentelemetry.headers.insert(
+            "authorization".to_string(),
+            "Basic stored-secret".to_string(),
+        );
+
+        // Round-trip body: same name, sentinel value -> stored value preserved.
+        let mut incoming = config.clone();
+        incoming.opentelemetry.headers.insert(
+            "authorization".to_string(),
+            crate::webhooks::admin::SECRET_MASK.to_string(),
+        );
+        // Edited value on another name -> replaces whatever was stored.
+        incoming.opentelemetry.headers.insert(
+            "x-api-key".to_string(),
+            "new-literal-token".to_string(),
+        );
+        // Sentinel for a name with no stored value -> dropped entirely.
+        incoming.opentelemetry.headers.insert(
+            "x-phantom".to_string(),
+            crate::webhooks::admin::SECRET_MASK.to_string(),
+        );
+        let stored =
+            normalize_config_for_storage(incoming, Some(&config)).expect("normalize must succeed");
+        assert_eq!(
+            stored.opentelemetry.headers.get("authorization").map(String::as_str),
+            Some("Basic stored-secret"),
+            "sentinel must preserve the stored value for the same header name"
+        );
+        assert_eq!(
+            stored.opentelemetry.headers.get("x-api-key").map(String::as_str),
+            Some("new-literal-token"),
+            "edited value must replace the stored one"
+        );
+        assert!(
+            !stored.opentelemetry.headers.contains_key("x-phantom"),
+            "sentinel for unknown name must be dropped, never persisted"
+        );
+    }
+
+    /// A mask sentinel arriving with no stored opentelemetry section at all
+    /// (e.g. first save after an out-of-band edit) must not persist the
+    /// mask literal either.
+    #[test]
+    fn test_normalize_config_for_storage_never_persists_telemetry_mask_without_stored_section() {
+        let config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
+
+        let mut incoming = config.clone();
+        incoming.opentelemetry.headers.insert(
+            "authorization".to_string(),
+            crate::webhooks::admin::SECRET_MASK.to_string(),
+        );
+        let stored =
+            normalize_config_for_storage(incoming, None).expect("normalize must succeed");
+        assert!(
+            !stored.opentelemetry.headers.contains_key("authorization"),
+            "mask must never be stored as a literal header value"
+        );
+    }
+
+    /// Tracing admin UI round-trip markers (opentelemetry-trace-export
+    /// Req 8.1, 8.2, 7.3): the page, its controls, the status card's
+    /// endpoint, and the mask-preserving save path must all stay embedded.
+    #[test]
+    fn tracing_admin_ui_has_page_controls_status_and_mask_flow() {
+        let asset = AdminAssets::get("index.html").expect("index embedded");
+        let html = std::str::from_utf8(&asset.data).unwrap();
+
+        for marker in [
+            "tab-tracing",
+            "page-tracing",
+            "otel-enabled",
+            "otel-endpoint",
+            "otel-service-name",
+            "otel-sampling-ratio",
+            "otel-capture-content",
+            "otel-headers-list",
+            "otel-status-tbody",
+            "function populateTelemetry",
+            "function collectTelemetry",
+            "function validateTracingPage",
+            "function otelStatusLoad",
+            "'page-tracing': validateTracingPage",
+            "cfg.opentelemetry=collectTelemetry()",
+            "apiUrl('telemetry/status')",
+            "OTEL_SECRET_MASK",
+        ] {
+            assert!(
+                html.contains(marker),
+                "missing tracing UI marker {marker}"
+            );
+        }
+    }
 
     /// C7 (R8): scheme-default ports normalize away in origin comparison, so
     /// `https://host` and `https://host:443` are the same origin (and ditto

@@ -1,4 +1,7 @@
 pub mod handlers;
+pub mod telemetry_seam;
+
+use crate::telemetry::exporter::TelemetryExporter;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -127,6 +130,14 @@ pub runtime_limits: Arc<crate::runtime_limits::RuntimeLimits>,
         /// test-send route reuses the built-once client instead of
         /// constructing a new notifier per request.
         pub webhook_notifier: Arc<WebhookNotifier>,
+        /// OTLP trace exporter (opentelemetry-trace-export spec, task
+        /// 6). Dormant until `apply_config` sees an enabled section;
+        /// span emission runs at the request-completion seams in
+        /// `handlers.rs` via `telemetry_seam`.
+        pub telemetry_exporter: TelemetryExporter,
+        /// Cheap lock-free telemetry snapshot (enabled flag + sampler
+        /// + content-capture settings) read per request completion.
+        pub telemetry_snapshot: Arc<telemetry_seam::TelemetrySnapshot>,
     }
 
 /// Core HTTP server wrapping Axum with middleware and integrated components.
@@ -587,6 +598,13 @@ if !config.webhooks.endpoints.is_empty() {
         ));
         loop_detector.spawn_eviction(&config.loop_detection);
 
+        // OTLP trace exporter (opentelemetry-trace-export spec): built
+        // dormant next to the shared metrics counters; the initial
+        // `apply_config` below enables it when the config says so.
+        let telemetry_exporter =
+            TelemetryExporter::new(metrics.otlp_telemetry_metrics());
+        let telemetry_snapshot = Arc::new(telemetry_seam::TelemetrySnapshot::new());
+
         let state = AppState {
             config: config_arc,
             config_path: Arc::new(
@@ -632,7 +650,21 @@ copilot_catalog,
             webhook_ledger,
             provider_budget_alerts,
             webhook_notifier,
+            telemetry_exporter: telemetry_exporter.clone(),
+            telemetry_snapshot: telemetry_snapshot.clone(),
         };
+
+        // Initial telemetry apply (Req 9 startup state): the config
+        // values are cloned out (no lock is held across the await) and
+        // the exporter + hot-path snapshot are configured together.
+        {
+            let (telemetry, logging) = {
+                let cfg = state.config.read().await;
+                (cfg.opentelemetry.clone(), cfg.logging.clone())
+            };
+            telemetry_snapshot.apply(&telemetry, &logging);
+            telemetry_exporter.apply_config(&telemetry).await;
+        }
 
         tracing::info!(
             configured_request_timeout_seconds = config.server.request_timeout_seconds,
@@ -1090,6 +1122,9 @@ copilot_catalog,
         // Server has stopped — all in-flight requests are complete.
         // Flush metrics and close database connections (Req 18.3, 18.4).
         tracing::info!("In-flight requests drained, cleaning up resources…");
+        // Final bounded flush of queued OTLP spans (Req 6.4); safe on
+        // a dormant exporter.
+        self.state.telemetry_exporter.shutdown_flush().await;
         metrics.flush();
         logger.flush();
         tracing::info!("Graceful shutdown complete");
@@ -1522,6 +1557,18 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
             max_request_size_bytes = state.runtime_limits.max_request_size_bytes(),
             "Per-request limits republished after config reload"
         );
+    }
+    // OTLP trace export (opentelemetry-trace-export spec, Req 9.1):
+    // re-apply the exporter and refresh the hot-path snapshot. Config
+    // values are cloned out so no config lock is held across the
+    // await (same discipline as the initial apply at construction).
+    {
+        let (telemetry, logging) = {
+            let cfg = state.config.read().await;
+            (cfg.opentelemetry.clone(), cfg.logging.clone())
+        };
+        state.telemetry_snapshot.apply(&telemetry, &logging);
+        state.telemetry_exporter.apply_config(&telemetry).await;
     }
     *state.structured_output_engine.write().await = rebuilt_structured_output_engine;
     state.loop_detector.apply_config(loop_detection).await;
@@ -1962,6 +2009,7 @@ mod tests {
             codex_search: None,
             reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
         }
     }
 
@@ -2965,6 +3013,7 @@ mod tests {
         codex_search: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     };
 
     let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -3569,6 +3618,7 @@ mod tests {
         codex_search: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     };
 
     // Write new config to disk

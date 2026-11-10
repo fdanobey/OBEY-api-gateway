@@ -23,6 +23,7 @@
 - [GitHub Copilot Provider](GitHub-Copilot-Provider)
 ### Operations
 - [Admin Panel & Dashboard](Admin-Panel-and-Dashboard)
+- [OpenTelemetry Trace Export](OpenTelemetry-Trace-Export)
 - [Security](Security)
 ---
 [GitHub Repository](https://github.com/fdanobey/OBEY-api-gateway) | [Releases](https://github.com/fdanobey/OBEY-api-gateway/releases)

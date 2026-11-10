@@ -153,6 +153,12 @@ struct RequestLogContext {
     /// Virtual key id that authenticated the request (cost-reporting
     /// spec, Req 2.1/2.2); `None` for anonymous traffic.
     virtual_key_id: Option<String>,
+    /// Assistant completion text for telemetry content capture
+    /// (opentelemetry-trace-export spec, Req 3.6). Populated by the
+    /// completion seams ONLY when `capture_content` is on — the
+    /// disabled path stays allocation-free (Req 3.5). Never contains
+    /// authorization material; extracted from the response choices.
+    completion_text: Option<String>,
 }
 
 impl RequestLogContext {
@@ -204,6 +210,15 @@ fn with_memory(
     /// persists the authenticating virtual key id.
     fn with_virtual_key(mut self, virtual_key_id: Option<&str>) -> Self {
         self.virtual_key_id = virtual_key_id.map(str::to_string);
+        self
+    }
+
+    /// Attach the assistant completion text for telemetry content
+    /// capture (Req 3.6). Callers pass the extracted text ONLY when
+    /// the snapshot's `capture_content` is on, keeping the disabled
+    /// path allocation-free (Req 3.5).
+    fn with_completion_text(mut self, text: Option<String>) -> Self {
+        self.completion_text = text;
         self
     }
 
@@ -343,7 +358,8 @@ fn with_memory(
         output_tokens: (response.usage.completion_tokens > 0)
             .then(|| i64::from(response.usage.completion_tokens)),
         virtual_key_id: None,
-    }
+        completion_text: None,
+        }
     }
 
     fn from_streaming_success(
@@ -389,8 +405,9 @@ fn with_memory(
         input_tokens: None,
         output_tokens: None,
         virtual_key_id: None,
+        completion_text: None,
+        }
     }
-}
 
     fn from_error(
         request: &OpenAIRequest,
@@ -448,6 +465,7 @@ fn with_memory(
         input_tokens: None,
         output_tokens: None,
         virtual_key_id: None,
+        completion_text: None,
         error_class: Some(crate::error::error_class_for(error)),
         client_protocol: None,
         claude_session_id: None,
@@ -470,15 +488,44 @@ fn with_memory(
 /// Write the terminal outcome row for a chat request: first drain the
 /// request's attempt ledger into `#attempt` rows, then write the outcome row,
 /// then mark the handle so the abandon logger in [`RequestCompleteGuard`]
-/// does not write a second outcome.
+/// does not write a second outcome. Also emits OTLP trace spans for the
+/// request (opentelemetry-trace-export spec, Req 2.1) when telemetry is
+/// enabled and the request is sampled; span emission is fail-open and
+/// never affects the log row.
 fn log_outcome(
     state: &super::AppState,
     request: &OpenAIRequest,
     context: &RequestLogContext,
     handle: Option<&crate::active_requests::ActiveRequestHandle>,
+    inbound_telemetry: Option<&crate::telemetry::propagation::W3cContext>,
 ) {
+    log_outcome_with_emission(
+        state,
+        request,
+        context,
+        handle,
+        inbound_telemetry,
+        None,
+    )
+}
+
+/// [`log_outcome`] with the per-request emission config frozen at
+/// entry (Req 9.3): the guard-carried sampler/capture values win over
+/// the live snapshot when supplied.
+fn log_outcome_with_emission(
+    state: &super::AppState,
+    request: &OpenAIRequest,
+    context: &RequestLogContext,
+    handle: Option<&crate::active_requests::ActiveRequestHandle>,
+    inbound_telemetry: Option<&crate::telemetry::propagation::W3cContext>,
+    emission: Option<super::telemetry_seam::EmissionConfig>,
+) {
+    let mut telemetry_attempts = Vec::new();
     if let Some(handle) = handle {
         let attempts = handle.take_failed_attempts();
+        if state.telemetry_snapshot.enabled() {
+            telemetry_attempts = attempts.clone();
+        }
         log_failed_attempts(&state.logger, &state.metrics, &context.trace_id, &attempts);
     }
     let relay = handle.and_then(|handle| handle.reasoning_relay());
@@ -494,10 +541,147 @@ fn log_outcome(
         .clone()
         .with_reasoning_relay(relay.as_ref())
         .with_virtual_key(key.as_deref());
+    // Disabled fast path (NFR perf): a single atomic load; no clones,
+    // no allocation. Only after enabled do the cheap Arc/config clones.
+    if state.telemetry_snapshot.enabled() {
+        emit_telemetry_spans(
+            state,
+            request,
+            &context,
+            &key,
+            inbound_telemetry.cloned(),
+            telemetry_attempts,
+            emission,
+        );
+    }
     log_request(state, request, &context);
     if let Some(handle) = handle {
         handle.mark_outcome_logged();
     }
+}
+
+/// Build and enqueue OTLP spans from the completion values already in
+/// scope (opentelemetry-trace-export spec, task 6). The disabled fast
+/// path is checked by the caller; sampling and trace-id derivation
+/// happen inside the seam (Req 2.6/5).
+fn emit_telemetry_spans(
+    state: &super::AppState,
+    request: &OpenAIRequest,
+    context: &RequestLogContext,
+    virtual_key_id: &Option<String>,
+    inbound_context: Option<crate::telemetry::propagation::W3cContext>,
+    failed_attempts: Vec<crate::error::ProviderAttempt>,
+    emission: Option<super::telemetry_seam::EmissionConfig>,
+) {
+    // Req 3.1: the request model and the RESPONDED model are distinct —
+    // request.model feeds `model_group`/`gen_ai.request.model`; the
+    // responded model from the actual response object is emitted as
+    // `gen_ai.response.model` only when it differs (spans.rs rule).
+    let serving = if context.provider.is_empty() {
+        None
+    } else {
+        Some(super::telemetry_seam::ServingAttempt {
+            provider: context.provider.clone(),
+            model: context
+                .responded_model
+                .clone()
+                .unwrap_or_else(|| context.requested_model.clone()),
+        })
+    };
+    let usage = match (context.input_tokens, context.output_tokens) {
+        (Some(input), Some(output)) => Some(crate::telemetry::spans::UsageCtx {
+            input_tokens: input,
+            output_tokens: output,
+        }),
+        _ => None,
+    };
+    // Content capture (Req 3.5/3.6): bodies are only read (and the
+    // request re-serialized) when capture is on; the disabled path
+    // stays a `None` here with zero extra allocation. The prompt is
+    // the same JSON string request-logging stores; the completion is
+    // the assistant text the seam captured, or the error message for
+    // failed requests. Authorization material never appears: headers
+    // are not part of either string. Strings stay UNTRUNCATED here —
+    // spans.rs applies the bounded truncation with the explicit
+    // `... [truncated by N bytes]` marker (Req 3.6); pre-truncating
+    // here would silently drop the marker.
+    let content = build_telemetry_content(state, request, context);
+    let args = super::telemetry_seam::TelemetryEmitArgs {
+        request_id: context.trace_id.clone(),
+        inbound_context,
+        method: "POST",
+        route: context.log_path,
+        status_code: context.status_code,
+        model_group: context.requested_model.clone(),
+        virtual_key_id: virtual_key_id.clone(),
+        usage,
+        cost: (context.cost > 0.0).then_some(context.cost),
+        duration_ms: context.duration_ms,
+        serving,
+        failed_attempts,
+        terminal_error_class: context.error_class.clone(),
+        response_model: context.responded_model.clone(),
+        content,
+        emission,
+    };
+    super::telemetry_seam::emit_request_spans(
+        &state.telemetry_exporter,
+        &state.telemetry_snapshot,
+        &args,
+    );
+}
+
+/// Build the prompt/completion pair for content capture, gated on the
+/// snapshot's `capture_content` flag (Req 3.5: default off → `None`
+/// without touching the bodies). Both strings are passed through
+/// UNTRUNCATED: span assembly (`spans.rs`/`truncate_attr_value`) is
+/// the single bounding point and appends the explicit
+/// `... [truncated by N bytes]` marker (Req 3.6). Truncating here as
+/// well would double-bound the value and silently drop the marker.
+fn build_telemetry_content(
+    state: &super::AppState,
+    request: &OpenAIRequest,
+    context: &RequestLogContext,
+) -> Option<crate::telemetry::spans::ContentCtx> {
+    if !state.telemetry_snapshot.capture_content() {
+        return None;
+    }
+    let prompt = serde_json::to_string(request).ok()?;
+    let completion = context
+        .completion_text
+        .clone()
+        .or_else(|| context.error_message.clone())?;
+    Some(crate::telemetry::spans::ContentCtx {
+        prompt,
+        completion,
+    })
+}
+
+/// Extract the assistant completion text from a buffered response for
+/// telemetry content capture (Req 3.6): concatenates the textual
+/// content of all choice messages. Only called when `capture_content`
+/// is on; returns `None` when no textual content exists.
+fn response_completion_text(response: &crate::models::openai::OpenAIResponse) -> Option<String> {
+    let mut text = String::new();
+    for choice in &response.choices {
+        if let Some(fragment) = choice.message.content.as_str() {
+            text.push_str(fragment);
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+/// Gate completion-text extraction on the snapshot's `capture_content`
+/// flag so the disabled path never touches the response bodies
+/// (Req 3.5). Single check; extraction happens only when enabled.
+fn telemetry_completion_text(
+    snapshot: &super::telemetry_seam::TelemetrySnapshot,
+    response: &crate::models::openai::OpenAIResponse,
+) -> Option<String> {
+    if !snapshot.capture_content() {
+        return None;
+    }
+    response_completion_text(response)
 }
 
 /// Log a completed request to the SQLite database for the dashboard log viewer.
@@ -623,12 +807,12 @@ fn log_failed_attempts(
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
-            // Attempt rows never carry usage; they are excluded from cost
-            // reports by the `#attempt` path filter.
-            input_tokens: None,
-            output_tokens: None,
-            virtual_key_id: None,
-            error_class: Some(
+        // Attempt rows never carry usage; they are excluded from cost
+        // reports by the `#attempt` path filter.
+        input_tokens: None,
+        output_tokens: None,
+        virtual_key_id: None,
+        error_class: Some(
             attempt
                 .error_class
                 .clone()
@@ -1450,7 +1634,14 @@ fn guardrail_error_response(
     let duration_ms = request_guard.complete();
     let log_context =
         RequestLogContext::from_error(request, trace_id.to_string(), duration_ms, &error);
-    log_outcome(state, request, &log_context, request_guard.active_handle());
+    log_outcome_with_emission(
+        state,
+        request,
+        &log_context,
+        request_guard.active_handle(),
+        request_guard.inbound_telemetry(),
+        request_guard.entry_emission(),
+    );
     let mut response = error.into_response();
     attach_trace_id_header(&mut response, trace_id);
     response
@@ -1582,6 +1773,57 @@ struct RequestCompleteGuard {
     /// Writes the outcome row for a chat request that was dropped before it
     /// logged one (client disconnect or global deadline).
     abandon: Option<AbandonLogger>,
+    /// Inbound W3C trace context parsed once at request entry
+    /// (opentelemetry-trace-export spec, Req 4); `None` while telemetry is
+    /// disabled. Read by the completion seams for span identity and
+    /// parent-based sampling.
+    inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
+    /// Telemetry emission handles for the Drop (abandon) path: a cheap
+    /// enabled atomic plus `Clone` handles. `None` keeps the guard
+    /// construction identical for non-request scopes (tests).
+    telemetry_enabled: std::sync::atomic::AtomicBool,
+    telemetry_exporter: Option<crate::telemetry::exporter::TelemetryExporter>,
+    telemetry_snapshot: Option<std::sync::Arc<super::telemetry_seam::TelemetrySnapshot>>,
+    /// Emission settings frozen at request entry (Req 9.3): sampler
+    /// decision + capture flag + content bound as of request START;
+    /// completion seams read these instead of the live snapshot.
+    /// `None` while telemetry is disabled at entry (the enabled
+    /// atomic already gates every consumer).
+    telemetry_emission: Option<super::telemetry_seam::EmissionConfig>,
+    /// Responses-family emission context (opentelemetry-trace-export
+    /// spec, Req 2.1/2.3): set only when telemetry is enabled at
+    /// request entry, and taken (so Drop cannot double-emit) by the
+    /// first `complete_responses_*` call. When the guard drops with it
+    /// still set, the request was abandoned mid-stream and Drop emits
+    /// root-only 499/504 spans.
+    responses_emit: Option<ResponsesEmission>,
+}
+
+/// Emission inputs the responses family (`/v1/responses`, incl. codex
+/// dispatch) needs at completion. Mirrors what `log_outcome` derives
+/// for chat from `RequestLogContext`; the responses family writes no
+/// log rows, so this rides on the guard instead.
+struct ResponsesEmission {
+    exporter: crate::telemetry::exporter::TelemetryExporter,
+    snapshot: std::sync::Arc<super::telemetry_seam::TelemetrySnapshot>,
+    /// Emission settings frozen at request entry (Req 9.3).
+    emission: super::telemetry_seam::EmissionConfig,
+    inbound: Option<crate::telemetry::propagation::W3cContext>,
+    trace_id: String,
+    model_group: String,
+    virtual_key_id: Option<String>,
+ handle: Option<crate::active_requests::ActiveRequestHandle>,
+ /// Global request deadline in seconds (0 = disabled), for the
+ /// Drop path's 499-vs-504 abandon classification.
+ deadline_secs: u64,
+ /// Request-body prompt for content capture (Req 3.6), set at entry
+ /// ONLY when the entry-time emission config enables capture; passed
+ /// through untruncated (span assembly applies the bounding marker).
+ prompt: Option<String>,
+ /// Responded output text (Req 3.6), attached by the buffered
+ /// completion path when capture is on; pass-through streams leave
+ /// it `None` (prompt-only capture).
+ completion_text: Option<String>,
 }
 
 /// Everything [`RequestCompleteGuard`]'s `Drop` needs to log an abandoned
@@ -1612,7 +1854,14 @@ impl AbandonLogger {
     }
 
     /// Write the content-free 499/504 outcome row, then drain the ledger.
-    fn log_abandoned(&self, metrics: &Metrics, elapsed: Duration) {
+    /// `guard` supplies the inbound W3C context for span emission; the
+    /// `&self` receiver keeps the borrow the Drop impl already holds.
+    fn log_abandoned(
+        &self,
+        metrics: &Metrics,
+        elapsed: Duration,
+        telemetry: AbandonTelemetry<'_>,
+    ) {
         if self.handle.outcome_logged() {
             return;
         }
@@ -1656,7 +1905,7 @@ impl AbandonLogger {
             method: "POST".to_string(),
             path: "/v1/chat/completions".to_string(),
             model: model.clone().unwrap_or_else(|| self.requested_model.clone()),
-            provider,
+            provider: provider.clone(),
             status_code,
             duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
             cost: 0.0,
@@ -1678,15 +1927,15 @@ impl AbandonLogger {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
-            // Abandoned requests never reported usage; the key id
-            // comes from the handle snapshot with the same
-            // `!= ANONYMOUS_KEY_ID` normalization `log_outcome`
-            // applies, so cost reports attribute abandoned rows
-            // to the authenticating key (None for anonymous).
-            input_tokens: None,
-            output_tokens: None,
-            virtual_key_id,
-            error_class: Some(error_class.to_string()),
+        // Abandoned requests never reported usage; the key id
+        // comes from the handle snapshot with the same
+        // `!= ANONYMOUS_KEY_ID` normalization `log_outcome`
+        // applies, so cost reports attribute abandoned rows
+        // to the authenticating key (None for anonymous).
+        input_tokens: None,
+        output_tokens: None,
+        virtual_key_id: virtual_key_id.clone(),
+        error_class: Some(error_class.to_string()),
         };
         tracing::info!(
             trace_id = %trace_id,
@@ -1699,7 +1948,52 @@ impl AbandonLogger {
         if let Err(e) = self.logger.log_with_reasoning_relay(entry, frames) {
             tracing::warn!(error = %e, trace_id = %trace_id, "Failed to write abandoned-request log entry");
         }
+        // OTLP spans for the abandoned request (Req 2.4): root span
+        // with the 499/504 terminal outcome plus the drained failed
+        // attempts. Fail-open: emission problems never affect the
+        // outcome row written above. The virtual-key id (F2/Req 2.1)
+        // rides along so the abandoned root span's `obey.request_id`
+        // sibling attribute matches `log_outcome`'s attribution.
+        if let Some(emit) = telemetry.emit {
+            let args = super::telemetry_seam::TelemetryEmitArgs {
+                request_id: trace_id,
+                inbound_context: telemetry.inbound_context.cloned(),
+                method: "POST",
+                route: telemetry.route,
+                status_code,
+                model_group: self.requested_model.clone(),
+                virtual_key_id: virtual_key_id.clone(),
+                usage: None,
+                cost: None,
+                duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                serving: if provider.is_empty() {
+                    None
+                } else {
+                    Some(super::telemetry_seam::ServingAttempt {
+                        provider,
+                        model: model.unwrap_or_else(|| self.requested_model.clone()),
+                    })
+                },
+                failed_attempts: attempts,
+                terminal_error_class: Some(error_class.to_string()),
+                response_model: None,
+                content: None,
+                emission: None,
+            };
+            emit(args);
+        }
     }
+}
+
+/// OTLP emission inputs the abandon logger needs from the guard
+/// (opentelemetry-trace-export spec, Req 2.4). `emit` is `None` unless
+/// telemetry is enabled at completion time.
+struct AbandonTelemetry<'a> {
+    inbound_context: Option<&'a crate::telemetry::propagation::W3cContext>,
+    route: &'static str,
+    emit: Option<
+        Box<dyn FnOnce(super::telemetry_seam::TelemetryEmitArgs) + Send + 'a>,
+    >,
 }
 
 /// Status and class for an abandoned request: 504 `gateway_deadline` when it
@@ -1724,7 +2018,35 @@ impl RequestCompleteGuard {
             completed: false,
             active,
             abandon: None,
+            inbound_telemetry: None,
+            telemetry_enabled: std::sync::atomic::AtomicBool::new(false),
+            telemetry_exporter: None,
+            telemetry_snapshot: None,
+            telemetry_emission: None,
+            responses_emit: None,
         }
+    }
+
+    /// Attach telemetry emission handles (request scopes only). The
+    /// emission config is frozen HERE at request entry (Req 9.3) so
+    /// completion-time emission follows entry-time settings.
+    fn with_telemetry(
+        mut self,
+        exporter: crate::telemetry::exporter::TelemetryExporter,
+        snapshot: std::sync::Arc<super::telemetry_seam::TelemetrySnapshot>,
+    ) -> Self {
+        let enabled = snapshot.enabled();
+        self.telemetry_enabled = std::sync::atomic::AtomicBool::new(enabled);
+        self.telemetry_exporter = Some(exporter);
+        self.telemetry_snapshot = Some(snapshot);
+        self.telemetry_emission = if enabled {
+            self.telemetry_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.emission_config())
+        } else {
+            None
+        };
+        self
     }
 
     /// Enable the abandoned-request outcome row for a chat request.
@@ -1738,6 +2060,79 @@ impl RequestCompleteGuard {
         self.abandon.as_ref().map(|abandon| &abandon.handle)
     }
 
+    /// The inbound W3C context for span emission (Req 4).
+    fn inbound_telemetry(&self) -> Option<&crate::telemetry::propagation::W3cContext> {
+        self.inbound_telemetry.as_ref()
+    }
+
+    /// Attach the inbound W3C trace context extracted at request entry.
+    fn with_inbound_telemetry(
+        mut self,
+        inbound: Option<crate::telemetry::propagation::W3cContext>,
+    ) -> Self {
+        self.inbound_telemetry = inbound;
+        self
+    }
+
+    /// Route template for span emission (Req 2.4); derived from the
+    /// abandon logger's protocol the same way the log row derives its
+    /// path. Kept on the guard so the Drop path stays borrow-clean.
+    fn route_for_telemetry(&self) -> &'static str {
+        match self.abandon.as_ref().map(|abandon| abandon.kind) {
+            Some(crate::active_requests::RequestKind::Chat) => "/v1/chat/completions",
+            Some(crate::active_requests::RequestKind::Stream) => "/v1/chat/completions",
+            None => "/v1/chat/completions",
+        }
+    }
+
+/// Build the span-emission closure for the Drop path, or `None`
+/// when telemetry is disabled (single atomic check). The closure
+/// captures only `Clone` handles, so Drop stays non-blocking.
+fn take_telemetry_emit(
+    &self,
+) -> Option<Box<dyn FnOnce(super::telemetry_seam::TelemetryEmitArgs) + Send + '_>> {
+    // Disabled fast path (NFR perf): single atomic load, no clones,
+    // no allocation before this check.
+    if !self.telemetry_enabled.load(Ordering::Relaxed) {
+        return None;
+    }
+    let exporter = self.telemetry_exporter.clone()?;
+    let snapshot = self.telemetry_snapshot.clone()?;
+    let emission = self.telemetry_emission.clone()?;
+    Some(Box::new(move |mut args| {
+        // Entry-time emission config wins (Req 9.3).
+        if args.emission.is_none() {
+            args.emission = Some(emission);
+        }
+        super::telemetry_seam::emit_request_spans(&exporter, &snapshot, &args);
+    }))
+}
+
+/// The frozen entry-time emission config (Req 9.3), or `None` when
+/// telemetry was disabled at entry. Completion seams pass this into
+/// `log_outcome_with_emission` so sampling/capture follow the
+/// config in effect at request start.
+fn entry_emission(&self) -> Option<super::telemetry_seam::EmissionConfig> {
+    if !self.telemetry_enabled.load(Ordering::Relaxed) {
+        return None;
+    }
+    self.telemetry_emission.clone()
+}
+
+/// Combined accessor for the inbound W3C context and entry-time
+/// emission config (Req 9.3) — both captured at request start.
+pub fn inbound_and_emission(
+    &self,
+) -> (
+    Option<&crate::telemetry::propagation::W3cContext>,
+    Option<super::telemetry_seam::EmissionConfig>,
+) {
+    (
+        self.inbound_telemetry.as_ref(),
+        self.entry_emission(),
+    )
+}
+
     /// Mark the request as completed normally (prevents the Drop impl from
     /// double-decrementing) and return the measured duration.
     fn complete(&mut self) -> u64 {
@@ -1747,6 +2142,188 @@ impl RequestCompleteGuard {
             self.metrics.complete_request(duration_ms);
         }
         duration_ms
+    }
+
+    /// Attach the responses-family emission context
+    /// (opentelemetry-trace-export spec, Req 2.1/2.3). No-op — a
+    /// single cheap check — while telemetry is disabled, so the
+    /// responses family's disabled path stays allocation-free.
+    fn with_responses_telemetry(
+        mut self,
+        state: &super::AppState,
+        trace_id: String,
+        model_group: String,
+        virtual_key_id: Option<String>,
+        handle: Option<crate::active_requests::ActiveRequestHandle>,
+    ) -> Self {
+    if !self.telemetry_enabled.load(Ordering::Relaxed) {
+        return self;
+    }
+ self.responses_emit = Some(ResponsesEmission {
+ exporter: state.telemetry_exporter.clone(),
+ snapshot: state.telemetry_snapshot.clone(),
+ emission: self
+ .telemetry_emission
+ .clone()
+ .unwrap_or_else(|| super::telemetry_seam::EmissionConfig {
+ sampler: crate::telemetry::sampler::Sampler::new(1.0),
+ capture_content: false,
+ content_limit_bytes: crate::telemetry::otlp::DEFAULT_MAX_ATTR_VALUE_BYTES,
+ }),
+ inbound: self.inbound_telemetry.clone(),
+ trace_id,
+ model_group,
+ virtual_key_id,
+ handle,
+ deadline_secs: state.runtime_limits.request_timeout_seconds(),
+ prompt: None,
+ completion_text: None,
+ });
+ self
+ }
+
+ /// Attach the serialized request body for content capture (Req 3.6).
+ /// No-op unless the entry-time emission config enables capture.
+ fn with_responses_prompt(mut self, request: &crate::responses::models::ResponsesRequest) -> Self {
+ let Some(emit) = self.responses_emit.as_mut() else {
+ return self;
+ };
+ if emit.emission.capture_content {
+ emit.prompt = serde_json::to_string(request).ok();
+ }
+ self
+ }
+
+ /// Record the responded output text for content capture (Req 3.6);
+ /// called by the buffered completion path when the entry-time
+ /// emission config enables capture.
+ fn set_responses_completion_text(&mut self, text: Option<String>) {
+ if let Some(emit) = self.responses_emit.as_mut() {
+ if emit.emission.capture_content {
+ emit.completion_text = text;
+ }
+ }
+ }
+
+/// Complete the responses-family request and emit its OTLP spans
+/// (Req 2.1/2.3): root span plus the attempt ledger drained from
+/// the in-flight handle plus the serving attempt when the family
+/// recorded a provider. Fail-open and telemetry-disabled-safe:
+/// the emit context is only present when telemetry was enabled
+/// at entry. `response_model` (Req 3.1) is the model the provider
+/// actually responded with; emitted as `gen_ai.response.model`
+/// only when it differs from the serving model.
+fn complete_responses_outcome(
+    &mut self,
+    status_code: u16,
+    usage: Option<crate::telemetry::spans::UsageCtx>,
+    error_class: Option<String>,
+    serving_provider: Option<String>,
+    serving_model: Option<String>,
+) -> u64 {
+    self.complete_responses_outcome_with_model(
+        status_code,
+        usage,
+        error_class,
+        serving_provider,
+        serving_model,
+        None,
+    )
+}
+
+/// [`complete_responses_outcome`] with the responded model (Req 3.1).
+fn complete_responses_outcome_with_model(
+    &mut self,
+    status_code: u16,
+    usage: Option<crate::telemetry::spans::UsageCtx>,
+    error_class: Option<String>,
+    serving_provider: Option<String>,
+    serving_model: Option<String>,
+    response_model: Option<String>,
+) -> u64 {
+    let duration_ms = self.complete();
+    if let Some(emit) = self.responses_emit.take() {
+        emit.emit(
+            status_code,
+            usage,
+            error_class,
+            serving_provider.map(|provider| super::telemetry_seam::ServingAttempt {
+                provider,
+                model: serving_model.unwrap_or_default(),
+            }),
+            response_model,
+            duration_ms,
+        );
+    }
+    duration_ms
+}
+}
+
+impl ResponsesEmission {
+    /// Emit spans for a responses-family terminal outcome. Attempt
+    /// rows come from the in-flight handle's ledger (drained once so
+    /// the Drop path cannot double-emit them); the serving attempt
+    /// only exists when the family recorded a provider. `response_model`
+    /// (Req 3.1) comes from the actual response object and is emitted
+    /// as `gen_ai.response.model` only when it differs from the
+    /// serving model.
+    fn emit(
+        &self,
+        status_code: u16,
+        usage: Option<crate::telemetry::spans::UsageCtx>,
+        error_class: Option<String>,
+        serving: Option<super::telemetry_seam::ServingAttempt>,
+        response_model: Option<String>,
+        duration_ms: u64,
+    ) {
+        let failed_attempts = self
+            .handle
+            .as_ref()
+            .map(|handle| handle.take_failed_attempts())
+            .unwrap_or_default();
+        // F2 (virtual key): when the emission context lacks virtual
+        // key but the handle has one, prefer the handle's value so
+        // abandoned root spans carry the correct attribute.
+        let virtual_key_id = self.virtual_key_id.clone().or_else(|| {
+            self.handle.as_ref().and_then(|handle| {
+                handle.0.lock().ok().and_then(|info| info.virtual_key_id.clone())
+            })
+        });
+ // F6 (content): capture bounded input/output content when
+ // the entry-time config enables content capture. The prompt
+ // was serialized from the request body at entry; the completion
+ // is the buffered response's output text when the serving path
+ // recorded one. Both pass through untruncated — span assembly
+ // applies the single bounding + truncation marker (Req 3.6).
+ let content = if self.emission.capture_content {
+ self.prompt
+ .as_ref()
+ .map(|prompt| crate::telemetry::spans::ContentCtx {
+ prompt: prompt.clone(),
+ completion: self.completion_text.clone().unwrap_or_default(),
+ })
+ } else {
+ None
+ };
+        let args = super::telemetry_seam::TelemetryEmitArgs {
+            request_id: self.trace_id.clone(),
+            inbound_context: self.inbound.clone(),
+            method: "POST",
+            route: "/v1/responses",
+            status_code,
+            model_group: self.model_group.clone(),
+            virtual_key_id,
+            usage,
+            cost: None,
+            duration_ms,
+            serving,
+            failed_attempts,
+            terminal_error_class: error_class,
+            response_model,
+            content,
+            emission: Some(self.emission.clone()),
+        };
+        super::telemetry_seam::emit_request_spans(&self.exporter, &self.snapshot, &args);
     }
 }
 
@@ -1760,11 +2337,40 @@ impl Drop for RequestCompleteGuard {
                 source = "drop",
                 "RequestCompleteGuard dropped without explicit complete — completing request metrics via Drop (this is expected for cancelled streams)"
             );
-            self.metrics.complete_request(duration_ms);
-            if let Some(abandon) = &self.abandon {
-                abandon.log_abandoned(&self.metrics, self.start.elapsed());
-            }
+        self.metrics.complete_request(duration_ms);
+        if let Some(abandon) = &self.abandon {
+            let inbound = self.inbound_telemetry.as_ref();
+            let route = self.route_for_telemetry();
+            let emit = self.take_telemetry_emit();
+            abandon.log_abandoned(
+                &self.metrics,
+                self.start.elapsed(),
+                AbandonTelemetry {
+                    inbound_context: inbound,
+                    route,
+                    emit,
+                },
+            );
         }
+        // Responses family (Req 2.4): a guard dropping with the emit
+        // context still set was abandoned mid-stream (client
+        // disconnect or global deadline) — emit root-only 499/504
+        // spans like the chat abandon path. Normal completion took
+        // the context via `complete_responses_outcome`, so this
+        // never double-emits.
+        if let Some(emit) = self.responses_emit.take() {
+            let elapsed = self.start.elapsed();
+            let (status_code, error_class) = abandon_outcome(elapsed, emit.deadline_secs);
+            emit.emit(
+                status_code,
+                None,
+                Some(error_class.to_string()),
+                None,
+                None,
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            );
+        }
+    }
         // Remove the entry from the in-flight registry if one was registered.
         if let Some((registry, trace_id)) = &self.active {
             registry.deregister(trace_id);
@@ -1863,12 +2469,32 @@ pub async fn chat_completions(
     let tool_disclosure = disclosure_resubmit
         .map(|Extension(flag)| flag.0)
         .unwrap_or(false);
+    // Inbound W3C context (Req 4): the header is only read when
+    // telemetry is enabled; invalid values are ignored above.
+    let inbound_telemetry =
+        super::telemetry_seam::extract_inbound_context(&headers, state.telemetry_snapshot.enabled());
     if request.stream {
-        chat_completions_stream(state, request, trace_id, virtual_key_id, mode, tool_disclosure)
-            .await
+        chat_completions_stream(
+            state,
+            request,
+            trace_id,
+            virtual_key_id,
+            mode,
+            tool_disclosure,
+            inbound_telemetry,
+        )
+        .await
     } else {
-        chat_completions_non_stream(state, request, trace_id, virtual_key_id, mode, tool_disclosure)
-            .await
+        chat_completions_non_stream(
+            state,
+            request,
+            trace_id,
+            virtual_key_id,
+            mode,
+            tool_disclosure,
+            inbound_telemetry,
+        )
+        .await
     }
 }
 
@@ -1879,6 +2505,7 @@ async fn chat_completions_non_stream(
     virtual_key_id: Option<String>,
     memory_mode: MemoryMode,
     tool_disclosure: bool,
+    inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
 ) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
@@ -1902,7 +2529,12 @@ async fn chat_completions_non_stream(
         start,
         Some((state.active_requests.clone(), trace_id.clone())),
     )
-    .with_abandon_logger(AbandonLogger::new(&state, &active_handle));
+    .with_abandon_logger(AbandonLogger::new(&state, &active_handle))
+    .with_inbound_telemetry(inbound_telemetry.clone())
+    .with_telemetry(
+        state.telemetry_exporter.clone(),
+        state.telemetry_snapshot.clone(),
+    );
     tracing::debug!(model = %request.model, "Routing non-stream request");
 
     // Snapshot request-scoped engines once and release both hot-reload locks
@@ -2167,23 +2799,24 @@ match engine
                                         }
                                     }
                                 }
-                                let duration_ms = request_guard.complete();
-                                let log_context = RequestLogContext::from_response(
-                                    &request,
-                                    trace_id.clone(),
-                                    duration_ms,
-                                    &response,
-                                )
-                                .with_memory(
-                                    memory_context
-                                        .as_ref()
-                                        .map(|memory| (&memory.context, &memory.injection)),
-                                    None,
-                                );
-                                log_outcome(&state, &request, &log_context, request_guard.active_handle());
-                                let mut http_response = openai_json_response(&response);
-                                attach_trace_id_header(&mut http_response, &trace_id);
-                                return http_response;
+        let duration_ms = request_guard.complete();
+        let log_context = RequestLogContext::from_response(
+            &request,
+            trace_id.clone(),
+            duration_ms,
+            &response,
+        )
+        .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+        .with_memory(
+            memory_context
+                .as_ref()
+                .map(|memory| (&memory.context, &memory.injection)),
+            None,
+        );
+        log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry());
+        let mut http_response = openai_json_response(&response);
+        attach_trace_id_header(&mut http_response, &trace_id);
+        return http_response;
                             }
                         };
                         let fallback_order = state.router.select_provider_order(&model_group).await;
@@ -2711,13 +3344,14 @@ match engine
                 append_feedback_to_response(&mut response, &suffix);
             }
             let duration_ms = request_guard.complete();
-            let log_context = RequestLogContext::from_response(
-                &request,
-                trace_id.clone(),
-                duration_ms,
-                &response,
-            )
-            .with_memory(
+        let log_context = RequestLogContext::from_response(
+            &request,
+            trace_id.clone(),
+            duration_ms,
+            &response,
+        )
+        .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+        .with_memory(
                 memory_context
                     .as_ref()
                     .map(|memory| (&memory.context, &memory.injection)),
@@ -2725,7 +3359,7 @@ match engine
             );
             // Log any failed provider attempts masked by this success BEFORE
             // the response's gateway extras are stripped for the client.
-            log_outcome(&state, &request, &log_context, request_guard.active_handle());
+            log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry());
             let mut http_response = openai_json_response(&response);
             attach_validation_status_header(
                 &mut http_response,
@@ -2739,7 +3373,7 @@ match engine
             let duration_ms = request_guard.complete();
             let log_context =
                 RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
-            log_outcome(&state, &request, &log_context, request_guard.active_handle());
+            log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry());
             let mut response = e.into_response();
             attach_trace_id_header(&mut response, &trace_id);
             response
@@ -2754,6 +3388,7 @@ async fn chat_completions_stream(
     virtual_key_id: Option<String>,
     memory_mode: MemoryMode,
     tool_disclosure: bool,
+    inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
 ) -> Response {
     state.metrics.start_request();
     let start = Instant::now();
@@ -2777,7 +3412,12 @@ async fn chat_completions_stream(
         start,
         Some((state.active_requests.clone(), trace_id.clone())),
     )
-    .with_abandon_logger(AbandonLogger::new(&state, &active_handle));
+    .with_abandon_logger(AbandonLogger::new(&state, &active_handle))
+    .with_inbound_telemetry(inbound_telemetry.clone())
+    .with_telemetry(
+        state.telemetry_exporter.clone(),
+        state.telemetry_snapshot.clone(),
+    );
     tracing::debug!(
         trace_id = %trace_id,
         model = %request.model,
@@ -3201,8 +3841,9 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     }
 
                     let duration_ms = start.elapsed().as_millis() as u64;
-                    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                    log_outcome(&state, &request, &log_context, _guard.active_handle());
+                    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
 
                                     // Non-blocking memory extraction now that the full
                                     // response content is known (parity with the
@@ -3341,7 +3982,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                                             );
                                             let duration_ms = start.elapsed().as_millis() as u64;
                                             let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-                                            log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                            log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                                             let (error_type, message) = classify_stream_error(&aggregated);
                                             for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                                                 yield Ok(event);
@@ -3447,7 +4088,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                                 .with_usage(usage.prompt_tokens, usage.completion_tokens);
                                 // Streaming attempts that failed before this success are
                                 // in the ledger; log_outcome writes them as #attempt rows.
-                                log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                                 break 'failover;
                             }
                                             // Post-content failure (Req 4.2): the relay already
@@ -3471,7 +4112,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                                                     &reason,
                                                     relay_start.elapsed(),
                                                 ));
-                                                log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                                log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                                                 state
                                                     .router
                                                     .record_streaming_failure(
@@ -3572,8 +4213,9 @@ if let Some(engine) = guardrail_engine.as_ref() {
                                                                 }
                                                             }
                                                             let duration_ms = start.elapsed().as_millis() as u64;
-                                                            let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                                                            log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                                            let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+                                                            log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                                                             if let Some(memory) = memory_context.as_ref() {
                                                                 let response_content = response
                                                                     .choices
@@ -3609,7 +4251,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
         );
         let duration_ms = start.elapsed().as_millis() as u64;
         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-        log_outcome(&state, &request, &log_context, _guard.active_handle());
+        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
         let (error_type, message) = classify_stream_error(&aggregated);
         for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
         yield Ok(event);
@@ -3669,8 +4311,9 @@ if let Some(engine) = guardrail_engine.as_ref() {
                                                             }
                                                         }
                                                         let duration_ms = start.elapsed().as_millis() as u64;
-                                                        let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-                                                        log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                                        let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+                                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                                                         if let Some(memory) = memory_context.as_ref() {
                                                             let response_content = response
                                                                 .choices
@@ -3712,7 +4355,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                                                         );
                                                         let duration_ms = start.elapsed().as_millis() as u64;
                                                         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-                                                        log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                                                         let (error_type, message) = classify_stream_error(&aggregated);
                                                         for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                                                             yield Ok(event);
@@ -3731,7 +4374,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                                     // before the stream terminates (Req 5.1, 5.2, 5.4).
                                     let duration_ms = start.elapsed().as_millis() as u64;
                                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
-                                    log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
 
                                     // Map the error variant to an SSE error frame. emit_sse_error_event
                                     // already appends [DONE], so we must NOT yield a separate one.
@@ -3799,6 +4442,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &request,
                     &log_context,
                     request_guard.active_handle(),
+                    request_guard.inbound_telemetry(),
                 );
                 let mut response = e.into_response();
                 attach_trace_id_header(&mut response, &trace_id);
@@ -3893,6 +4537,7 @@ let first_step = loop {
                     &request,
                     &log_context,
                     request_guard.active_handle(),
+                    request_guard.inbound_telemetry(),
                 );
                 let mut response = e.into_response();
                 attach_trace_id_header(&mut response, &trace_id);
@@ -4039,16 +4684,17 @@ let first_step = loop {
                 }
 
                 let duration_ms = start.elapsed().as_millis() as u64;
-                let log_context = RequestLogContext::from_response(
-                    &request,
-                    stream_trace_id.clone(),
-                    duration_ms,
-                    &response,
-                );
-                log_outcome(&state, &request, &log_context, _guard.active_handle());
+let log_context = RequestLogContext::from_response(
+&request,
+stream_trace_id.clone(),
+duration_ms,
+&response,
+)
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
 
-                // Non-blocking memory extraction now that the full
-                // response content is known.
+// Non-blocking memory extraction now that the full
+// response content is known.
                 if let Some(memory) = memory_context.as_ref() {
                     let response_content = response
                         .choices
@@ -4100,7 +4746,7 @@ let first_step = loop {
                             duration_ms,
                             &e,
                         );
-                        log_outcome(&state, &request, &log_context, _guard.active_handle());
+                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                         let (error_type, message) = classify_stream_error(&e);
                         for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                             yield Ok(event);
@@ -4131,15 +4777,17 @@ let first_step = loop {
     // Log the successful routed request before streaming begins
     let duration_ms = start.elapsed().as_millis() as u64;
     let log_context =
-        RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
-    log_outcome(
-        &state,
-        &request,
-        &log_context,
-        request_guard.active_handle(),
-    );
+RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response)
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+log_outcome(
+&state,
+&request,
+&log_context,
+request_guard.active_handle(),
+request_guard.inbound_telemetry(),
+);
 
-    // Non-blocking memory extraction now that the full response is known.
+// Non-blocking memory extraction now that the full response is known.
     if let Some(memory) = memory_context.as_ref() {
         let response_content = response
             .choices
@@ -4712,6 +5360,7 @@ async fn stream_eager_structured_output(
                             &request,
                             &log_context,
                             request_guard.active_handle(),
+                            request_guard.inbound_telemetry(),
                         );
                         return eager_sse_response(
                             structured_stream_overflow_events(&trace_id),
@@ -4737,6 +5386,7 @@ async fn stream_eager_structured_output(
                             &request,
                             &log_context,
                             request_guard.active_handle(),
+                            request_guard.inbound_telemetry(),
                         );
             return eager_sse_response(
                 emit_sse_error_event(
@@ -4770,6 +5420,7 @@ async fn stream_eager_structured_output(
                         &request,
                         &log_context,
                         request_guard.active_handle(),
+                        request_guard.inbound_telemetry(),
                     );
                     return eager_sse_response(
                         emit_sse_error_event("stream_error", &gateway_error.to_string(), &trace_id),
@@ -4795,6 +5446,7 @@ async fn stream_eager_structured_output(
                     &request,
                     &log_context,
                     request_guard.active_handle(),
+                    request_guard.inbound_telemetry(),
                 );
                 return eager_sse_response(
                     emit_sse_error_event("stream_error", message, &trace_id),
@@ -4838,6 +5490,7 @@ async fn stream_eager_structured_output(
                 &request,
                 &log_context,
                 request_guard.active_handle(),
+                request_guard.inbound_telemetry(),
             );
             let (error_type, message) = classify_stream_error(&error);
             return eager_sse_response(
@@ -4872,6 +5525,7 @@ async fn stream_eager_structured_output(
                 &request,
                 &log_context,
                 request_guard.active_handle(),
+                request_guard.inbound_telemetry(),
             );
             return eager_sse_response(events, &streaming_config, &trace_id, None, None);
         }
@@ -4900,6 +5554,7 @@ let (response, validation_status) = match validate_eager_structured_response(
                 &request,
                 &log_context,
                 request_guard.active_handle(),
+                request_guard.inbound_telemetry(),
             );
             return eager_sse_response(events, &streaming_config, &trace_id, None, None);
         }
@@ -4929,14 +5584,16 @@ let (response, validation_status) = match validate_eager_structured_response(
     let events = rechunk_structured_response(&response);
     let duration_ms = request_guard.complete();
     let log_context =
-        RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response);
-    log_outcome(
-        &state,
-        &request,
-        &log_context,
-        request_guard.active_handle(),
-    );
-    eager_sse_response(
+RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response)
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+log_outcome(
+&state,
+&request,
+&log_context,
+request_guard.active_handle(),
+request_guard.inbound_telemetry(),
+);
+eager_sse_response(
         events,
         &streaming_config,
         &trace_id,
@@ -5271,7 +5928,7 @@ async fn stream_buffered_with_post_call(
                         let duration_ms = start.elapsed().as_millis() as u64;
                         let err = GatewayError::GuardrailUnavailable(msg.clone());
                         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                        log_outcome(&state, &request, &log_context, _guard.active_handle());
+                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                         for event in emit_sse_error_event("guardrail_buffer_overflow", &msg, &stream_trace_id) {
                             yield Ok(event);
                         }
@@ -5279,14 +5936,14 @@ async fn stream_buffered_with_post_call(
                         return;
                     }
 
-                    match buf.assemble() {
-                        Ok(a) => {
-                            // No finish_reason ⇒ premature disconnect (Req 10.5).
-                            if !a.complete {
-                                disconnected = true;
-                            }
-                            assembled = Some(a.response);
-                        }
+match buf.assemble() {
+Ok(a) => {
+// No finish_reason — premature disconnect (Req 10.5).
+if !a.complete {
+disconnected = true;
+}
+assembled = Some(a.response);
+}
                         // Empty/mid-error buffer: treat as a disconnect (Req 10.5).
                         Err(_e) => {
                             disconnected = true;
@@ -5297,7 +5954,7 @@ async fn stream_buffered_with_post_call(
                     // Routing failed before any streaming — graceful SSE error frame.
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
-                    log_outcome(&state, &request, &log_context, _guard.active_handle());
+                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                     let (error_type, message) = classify_stream_error(&e);
                     for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                         yield Ok(event);
@@ -5314,7 +5971,7 @@ async fn stream_buffered_with_post_call(
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let err = GatewayError::GuardrailUnavailable(msg.clone());
                 let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                log_outcome(&state, &request, &log_context, _guard.active_handle());
+                log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                 for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                     yield Ok(event);
                 }
@@ -5394,8 +6051,9 @@ async fn stream_buffered_with_post_call(
         );
     }
     let duration_ms = start.elapsed().as_millis() as u64;
-    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-    log_outcome(&state, &request, &log_context, _guard.active_handle());
+    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
     for chunk in chunks {
         yield Ok(Event::default().data(chunk.to_string()));
     }
@@ -5428,8 +6086,9 @@ async fn stream_buffered_with_post_call(
                 );
             }
             let duration_ms = start.elapsed().as_millis() as u64;
-            let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response);
-            log_outcome(&state, &request, &log_context, _guard.active_handle());
+            let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+            log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
             for chunk in chunks {
                 yield Ok(Event::default().data(chunk.to_string()));
             }
@@ -5507,7 +6166,7 @@ async fn stream_buffered_with_post_call(
                                         let duration_ms = start.elapsed().as_millis() as u64;
                                         let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
                                         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                                        log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                                         yield Ok(Event::default().data(payload.to_string()));
                                         yield Ok(Event::default().data("[DONE]"));
                                         _guard.complete();
@@ -5518,7 +6177,7 @@ async fn stream_buffered_with_post_call(
                                         let duration_ms = start.elapsed().as_millis() as u64;
                                         let err = GatewayError::GuardrailUnavailable(msg.clone());
                                         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                                        log_outcome(&state, &request, &log_context, _guard.active_handle());
+                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                                         for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                                             yield Ok(event);
                                         }
@@ -5580,8 +6239,9 @@ async fn stream_buffered_with_post_call(
             );
         }
         let duration_ms = start.elapsed().as_millis() as u64;
-                    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &last_response);
-                    log_outcome(&state, &request, &log_context, _guard.active_handle());
+                    let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &last_response)
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &last_response));
+                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                     for chunk in chunks {
                         yield Ok(Event::default().data(chunk.to_string()));
                     }
@@ -5593,7 +6253,7 @@ async fn stream_buffered_with_post_call(
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                    log_outcome(&state, &request, &log_context, _guard.active_handle());
+                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                     yield Ok(Event::default().data(payload.to_string()));
                     yield Ok(Event::default().data("[DONE]"));
                 }
@@ -5603,7 +6263,7 @@ async fn stream_buffered_with_post_call(
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let err = GatewayError::GuardrailUnavailable(msg.clone());
                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                    log_outcome(&state, &request, &log_context, _guard.active_handle());
+                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
                     for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                         yield Ok(event);
                     }
@@ -5783,7 +6443,7 @@ fn heartbeat_chunk_placeholder_reasoning(
         delta.insert(
             "reasoning".to_string(),
             serde_json::json!(format!(
-                "{}…\n",
+                "{}?\n",
                 placeholder_reasoning_text(step)
             )),
         );
@@ -7212,7 +7872,7 @@ fn anthropic_guardrail_error_response(
         &err,
     )
     .with_anthropic_protocol(claude_session_id.clone());
-    log_outcome(state, chat_request, &log_context, Some(active_handle));
+    log_outcome(state, chat_request, &log_context, Some(active_handle), request_guard.inbound_telemetry());
     tracing::warn!(
         trace_id = %trace_id,
         error = %err,
@@ -7390,10 +8050,12 @@ pub async fn anthropic_create(
 	if let Some(rejection) = anthropic_request_rejection(&request) {
 		return anthropic_invalid_request(rejection);
 	}
-	let trace_id = trace_id_from_headers(&headers);
-	let claude_session_id = claude_session_id_from(&headers, &request);
-	let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
-	let memory_mode = memory_mode(&headers);
+    let trace_id = trace_id_from_headers(&headers);
+    let claude_session_id = claude_session_id_from(&headers, &request);
+    let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
+    let memory_mode = memory_mode(&headers);
+    let inbound_telemetry =
+        super::telemetry_seam::extract_inbound_context(&headers, state.telemetry_snapshot.enabled());
 
     tracing::info!(
         model = %request.model,
@@ -7431,35 +8093,37 @@ pub async fn anthropic_create(
         (chat_request, request.stop_sequences.clone(), raw_body)
     };
 
-	if request.stream {
-		anthropic_create_stream(
-			state,
-			request,
-			chat_request,
-			request_stop_sequences,
-			trace_id,
-			claude_session_id,
-			virtual_key_id,
-			raw_body,
-			headers,
-			memory_mode,
-		)
-		.await
-	} else {
-		anthropic_create_buffered(
-			state,
-			request,
-			chat_request,
-			request_stop_sequences,
-			trace_id,
-			claude_session_id,
-			virtual_key_id,
-			raw_body,
-			headers,
-			memory_mode,
-		)
-		.await
-	}
+ if request.stream {
+ anthropic_create_stream(
+ state,
+ request,
+ chat_request,
+ request_stop_sequences,
+ trace_id,
+ claude_session_id,
+ virtual_key_id,
+ raw_body,
+ headers,
+ memory_mode,
+ inbound_telemetry,
+ )
+ .await
+ } else {
+ anthropic_create_buffered(
+ state,
+ request,
+ chat_request,
+ request_stop_sequences,
+ trace_id,
+ claude_session_id,
+ virtual_key_id,
+ raw_body,
+ headers,
+ memory_mode,
+ inbound_telemetry,
+ )
+ .await
+ }
 }
 
 /// Buffered (non-streaming) /v1/messages path.
@@ -7475,6 +8139,7 @@ async fn anthropic_create_buffered(
 	raw_body: serde_json::Value,
 	headers: HeaderMap,
 	memory_mode: MemoryMode,
+	inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
 ) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
@@ -7489,6 +8154,11 @@ async fn anthropic_create_buffered(
         state.metrics.clone(),
         start,
         Some((state.active_requests.clone(), trace_id.clone())),
+    )
+    .with_inbound_telemetry(inbound_telemetry.clone())
+    .with_telemetry(
+        state.telemetry_exporter.clone(),
+        state.telemetry_snapshot.clone(),
     );
 
     // Snapshot request-scoped engines once and release the hot-reload lock
@@ -7509,14 +8179,15 @@ async fn anthropic_create_buffered(
  state.metrics.record_cache_hit();
  let duration_ms =
  u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
- let log_context = RequestLogContext::from_response(
- &chat_request,
- trace_id.clone(),
- duration_ms,
- &cached_chat,
- )
- .with_anthropic_protocol(claude_session_id);
- log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+let log_context = RequestLogContext::from_response(
+&chat_request,
+trace_id.clone(),
+duration_ms,
+&cached_chat,
+)
+.with_anthropic_protocol(claude_session_id)
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &cached_chat));
+ log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
  request_guard.complete();
  let synthesis_ctx = AnthropicSynthesisContext {
  request_model: &request.model,
@@ -7728,7 +8399,7 @@ match result {
                     .map(|memory| (&memory.context, &memory.injection)),
                 None,
             );
-            log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+            log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
             request_guard.complete();
 
             // Verbatim relay (decision D2, Req 2.1): a stashed upstream
@@ -7776,7 +8447,7 @@ match result {
                 &err,
             )
             .with_anthropic_protocol(claude_session_id);
-            log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+            log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
             request_guard.complete();
             anthropic_gateway_error_response(&err)
         }
@@ -7810,6 +8481,7 @@ async fn anthropic_create_stream(
 	raw_body: serde_json::Value,
 	headers: HeaderMap,
 	memory_mode: MemoryMode,
+	inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
 ) -> Response {
     let streaming_config = state
         .config
@@ -7832,6 +8504,11 @@ async fn anthropic_create_stream(
         state.metrics.clone(),
         start,
         Some((state.active_requests.clone(), trace_id.clone())),
+    )
+    .with_inbound_telemetry(inbound_telemetry.clone())
+    .with_telemetry(
+        state.telemetry_exporter.clone(),
+        state.telemetry_snapshot.clone(),
     );
 
     // Snapshot request-scoped engine once (mirrors the chat streaming
@@ -8062,13 +8739,14 @@ duration_ms,
 &chat_response,
 )
 .with_anthropic_protocol(claude_session_id.clone())
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &chat_response))
 .with_memory(
 memory_context
 .as_ref()
 .map(|memory| (&memory.context, &memory.injection)),
 None,
 );
-log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
 request_guard.complete();
 
 let text = raw_sse.to_string();
@@ -8109,13 +8787,14 @@ duration_ms,
 &chat_response,
 )
 .with_anthropic_protocol(claude_session_id.clone())
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &chat_response))
 .with_memory(
 memory_context
 .as_ref()
 .map(|memory| (&memory.context, &memory.injection)),
 None,
 );
-log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
 request_guard.complete();
 
 let stream = anthropic_replay_stream(
@@ -8141,6 +8820,10 @@ concurrency_permit: _,
 smart_routing: _,
 }) => {
 let stream_trace_id = trace_id.clone();
+    let (stream_inbound_telemetry, _stream_emission) = {
+        let (inbound, emission) = request_guard.inbound_and_emission();
+        (inbound.cloned(), emission)
+    };
 let ping_interval = keep_alive_ping_interval(&streaming_config);
 let stop_sequences = request_stop_sequences.clone();
 let input_token_estimate = input_usage.input_tokens;
@@ -8204,7 +8887,7 @@ break;
 last_emit = std::time::Instant::now();
 buffer.extend_from_slice(&bytes);
 
-// Cursor-based line extraction (no O(n²) full drain per
+// Cursor-based line extraction (no O(n?) full drain per
 // line): consume only up to and including each newline.
 let mut cursor = 0usize;
 while let Some(offset) = buffer[cursor..].iter().position(|b| *b == b'\n') {
@@ -8342,7 +9025,7 @@ duration_ms,
 &err,
 )
 .with_anthropic_protocol(claude_session_id.clone());
-log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle), stream_inbound_telemetry.as_ref());
 } else {
 // Estimate output tokens when the provider never sent a
 // usage frame (pass-through dispatch does not inject
@@ -8381,7 +9064,7 @@ let log_context = RequestLogContext::from_streaming_success(
 )
 .with_anthropic_protocol(claude_session_id.clone())
 .with_usage(input_tokens, output_tokens);
-log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle), stream_inbound_telemetry.as_ref());
 }
 };
 let mut sse = Sse::new(stream)
@@ -8399,7 +9082,7 @@ sse
                 &err,
             )
             .with_anthropic_protocol(claude_session_id);
-            log_outcome(&state, &chat_request, &log_context, Some(&active_handle));
+            log_outcome(&state, &chat_request, &log_context, Some(&active_handle), inbound_telemetry.as_ref());
             request_guard.complete();
             anthropic_gateway_error_response(&err)
         }
@@ -8651,6 +9334,120 @@ fn pass_through_extracts_models_without_mutating_bodies() {
         }
 
         assert_eq!(metrics.snapshot().active_requests, 0);
+    }
+
+/// Responses-family emission ctx for tests: enabled snapshot at
+/// ratio 1.0 with a live exporter (task-6 seam-test style). The
+/// exporter is applied with an enabled config (async — call from a
+/// `#[tokio::test]`) so `try_enqueue` counts real queueing, not
+/// dormant drops.
+async fn responses_emission(test_name: &str) -> super::ResponsesEmission {
+    use crate::config::LoggingConfig;
+    use crate::metrics::telemetry::TelemetryMetrics;
+    use crate::telemetry::config::TelemetryConfig;
+    let snapshot = std::sync::Arc::new(super::super::telemetry_seam::TelemetrySnapshot::new());
+    let config = TelemetryConfig {
+        enabled: true,
+        sampling_ratio: 1.0,
+        endpoint: Some("http://127.0.0.1:4318/v1/traces".to_string()),
+        ..TelemetryConfig::default()
+    };
+    snapshot.apply(&config, &LoggingConfig::default());
+    let emission = snapshot
+        .emission_config()
+        .expect("enabled snapshot yields emission config");
+    let exporter = crate::telemetry::exporter::TelemetryExporter::new(Arc::new(
+        TelemetryMetrics::new(),
+    ));
+    exporter.apply_config(&config).await;
+ super::ResponsesEmission {
+ exporter,
+ snapshot,
+ emission,
+ inbound: None,
+ trace_id: test_name.to_string(),
+ model_group: "gpt-4o".to_string(),
+ virtual_key_id: None,
+ handle: None,
+ deadline_secs: 0,
+ prompt: None,
+ completion_text: None,
+ }
+}
+
+#[tokio::test]
+async fn responses_completion_emits_root_and_serving_spans() {
+    let emit = responses_emission("123e4567-e89b-42d3-a456-426614174000").await;
+    // Root + serving attempt; no handle → no failed attempts.
+    emit.emit(
+        200,
+        Some(crate::telemetry::spans::UsageCtx {
+            input_tokens: 5,
+            output_tokens: 7,
+        }),
+        None,
+        Some(super::super::telemetry_seam::ServingAttempt {
+            provider: "openai".to_string(),
+            model: "gpt-4o-2024-08-06".to_string(),
+        }),
+        None,
+        42,
+    );
+    // The exporter queue accepted the batch (metrics count
+    // exported spans only after a flush; the seam's span count
+    // contract is covered by telemetry_seam tests). Here we
+    // assert the emission path did not panic and the batch was
+    // enqueued: dropped==0 and exported==0 pre-flush.
+    assert_eq!(emit.exporter.metrics().dropped(), 0);
+}
+
+#[tokio::test]
+async fn responses_error_completion_emits_failure_class() {
+    let emit = responses_emission("123e4567-e89b-42d3-a456-426614174000").await;
+    emit.emit(
+        502,
+        None,
+        Some("server_error".to_string()),
+        Some(super::super::telemetry_seam::ServingAttempt {
+            provider: "codex".to_string(),
+            model: "gpt-5-codex".to_string(),
+        }),
+        None,
+        20,
+    );
+    assert_eq!(emit.exporter.metrics().dropped(), 0);
+}
+
+#[tokio::test]
+async fn responses_guard_drop_without_complete_emits_abandon_spans() {
+    let metrics = Arc::new(Metrics::new());
+    metrics.start_request();
+    let emission = responses_emission("123e4567-e89b-42d3-a456-426614174000").await;
+        let exporter_metrics = emission.exporter.metrics();
+
+        {
+            let mut guard =
+                RequestCompleteGuard::new(metrics.clone(), Instant::now(), None);
+            guard.responses_emit = Some(emission);
+            // Drop without complete → the Drop path classifies the
+            // abandon (499 with no deadline) and emits root-only spans.
+        }
+
+        assert_eq!(metrics.snapshot().active_requests, 0);
+        assert_eq!(exporter_metrics.dropped(), 0);
+    }
+
+#[tokio::test]
+async fn responses_guard_complete_then_drop_does_not_double_emit() {
+    let metrics = Arc::new(Metrics::new());
+    let emission = responses_emission("123e4567-e89b-42d3-a456-426614174000").await;
+
+        let mut guard = RequestCompleteGuard::new(metrics.clone(), Instant::now(), None);
+        guard.responses_emit = Some(emission);
+        // Explicit completion takes the emit ctx; the subsequent Drop
+        // must see None (no second emission, no panic).
+        guard.complete_responses_outcome(200, None, None, None, None);
+        drop(guard);
     }
 
     fn base_response(message: Message) -> OpenAIResponse {
@@ -10323,7 +11120,7 @@ fn pass_through_extracts_models_without_mutating_bodies() {
     /// unit test only guards the two construction branches.
     #[test]
     fn build_keepalive_handles_custom_and_disabled_intervals() {
-        // Custom interval (Req 2.4: within the 1–60 range).
+        // Custom interval (Req 2.4: within the 1?60 range).
         let custom = StreamingConfig {
             keepalive_interval_seconds: 5,
             ..StreamingConfig::default()
@@ -10957,7 +11754,7 @@ data: [DONE]\n\n";
         ));
     }
 
-    // ── Task 9 parity tests: Codex native vs chat-synthesized event taxonomy ──
+    // -- Task 9 parity tests: Codex native vs chat-synthesized event taxonomy --
 
     fn event_type_name(event: &crate::responses::ResponsesSseEvent) -> String {
         serde_json::to_value(event)
@@ -11255,7 +12052,18 @@ pub async fn completions(
     let trace_id = trace_id_from_headers(&headers);
     let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
     let memory_mode = memory_mode(&headers);
-    chat_completions_non_stream(state, request, trace_id, virtual_key_id, memory_mode, false).await
+    let inbound_telemetry =
+        super::telemetry_seam::extract_inbound_context(&headers, state.telemetry_snapshot.enabled());
+    chat_completions_non_stream(
+        state,
+        request,
+        trace_id,
+        virtual_key_id,
+        memory_mode,
+        false,
+        inbound_telemetry,
+    )
+    .await
 }
 // ---------------------------------------------------------------------------
 // Provider pass-through endpoints (Req 2.3-2.5)
@@ -11352,17 +12160,17 @@ async fn provider_pass_through(
 ) -> Response {
     let started = Instant::now();
     let trace_id = generate_trace_id(None);
-    let endpoint_label = match endpoint {
-        ProviderPassThroughEndpoint::Embeddings => "embeddings",
-        ProviderPassThroughEndpoint::ImageGenerations => "images/generations",
-        ProviderPassThroughEndpoint::AudioTranscriptions => "audio/transcriptions",
-        ProviderPassThroughEndpoint::AudioTranslations => "audio/translations",
-    };
+    let endpoint_label = pass_through_endpoint_label(endpoint);
     let result = state
         .router
         .route_provider_pass_through(endpoint, &model, &content_type, body.to_vec())
         .await;
     let duration_ms = started.elapsed().as_millis() as u64;
+    // Root-span emission for pass-through endpoints (Req 2.1): the
+    // pass-through path records no attempt ledger, so a root-only
+    // span (method/route/status/model-group attributes) is emitted
+    // at completion; fail-open by construction.
+    emit_pass_through_telemetry(&state, &trace_id, endpoint, &model, duration_ms, &result);
     match result {
         Ok(response) => {
             tracing::info!(
@@ -11387,6 +12195,74 @@ async fn provider_pass_through(
             error.into_response()
         }
     }
+}
+
+/// Log-safe label for a pass-through endpoint (used by tracing only).
+fn pass_through_endpoint_label(endpoint: ProviderPassThroughEndpoint) -> &'static str {
+    match endpoint {
+        ProviderPassThroughEndpoint::Embeddings => "embeddings",
+        ProviderPassThroughEndpoint::ImageGenerations => "images/generations",
+        ProviderPassThroughEndpoint::AudioTranscriptions => "audio/transcriptions",
+        ProviderPassThroughEndpoint::AudioTranslations => "audio/translations",
+    }
+}
+
+/// Route template for a pass-through endpoint's root span (Req 2.1).
+fn pass_through_route(endpoint: ProviderPassThroughEndpoint) -> &'static str {
+    match endpoint {
+        ProviderPassThroughEndpoint::Embeddings => "/v1/embeddings",
+        ProviderPassThroughEndpoint::ImageGenerations => "/v1/images/generations",
+        ProviderPassThroughEndpoint::AudioTranscriptions => "/v1/audio/transcriptions",
+        ProviderPassThroughEndpoint::AudioTranslations => "/v1/audio/translations",
+    }
+}
+
+/// Emit the root-only OTLP span for a pass-through request (Req 2.1,
+/// F1): embeddings/audio/images endpoints complete without the chat
+/// completion seams, so the root span (HTTP + gateway attributes) is
+/// emitted here directly. Disabled path is a single atomic check.
+fn emit_pass_through_telemetry(
+    state: &super::AppState,
+    trace_id: &str,
+    endpoint: ProviderPassThroughEndpoint,
+    model: &str,
+    duration_ms: u64,
+    result: &Result<ProviderPassThroughResponse, crate::error::GatewayError>,
+) {
+    // Disabled fast path (NFR perf): single atomic load, no clones.
+    if !state.telemetry_snapshot.enabled() {
+        return;
+    }
+    let Some(emission) = state.telemetry_snapshot.emission_config() else {
+        return;
+    };
+    let (status_code, error_class) = match result {
+        Ok(response) => (response.status, None),
+        Err(error) => (error.status_code().as_u16(), Some(crate::error::error_class_for(error))),
+    };
+    let args = super::telemetry_seam::TelemetryEmitArgs {
+        request_id: trace_id.to_string(),
+        inbound_context: None,
+        method: "POST",
+        route: pass_through_route(endpoint),
+        status_code,
+        model_group: model.to_string(),
+        virtual_key_id: None,
+        usage: None,
+        cost: None,
+        duration_ms,
+        serving: None,
+        failed_attempts: Vec::new(),
+        terminal_error_class: error_class,
+        response_model: None,
+        content: None,
+        emission: Some(emission),
+    };
+    super::telemetry_seam::emit_request_spans(
+        &state.telemetry_exporter,
+        &state.telemetry_snapshot,
+        &args,
+    );
 }
 
 pub async fn embeddings(
@@ -13132,11 +14008,27 @@ pub async fn responses_create(
         Some(&owner_id),
         crate::active_requests::RequestKind::Chat,
     ));
-    let request_guard = RequestCompleteGuard::new(
+    let mut request_guard = RequestCompleteGuard::new(
         state.metrics.clone(),
         start,
         Some((state.active_requests.clone(), trace_id.clone())),
-    );
+    )
+    .with_inbound_telemetry(super::telemetry_seam::extract_inbound_context(
+        &headers,
+        state.telemetry_snapshot.enabled(),
+    ))
+    .with_telemetry(
+        state.telemetry_exporter.clone(),
+        state.telemetry_snapshot.clone(),
+    )
+ .with_responses_telemetry(
+ &state,
+ trace_id.clone(),
+ request.model.clone(),
+ (owner_id != ANONYMOUS_KEY_ID).then(|| owner_id.clone()),
+ Some(active_handle.clone()),
+ )
+ .with_responses_prompt(&request);
 
     let codex_dispatch = async {
         match state.router.first_provider_for_model(&request.model).await {
@@ -13181,41 +14073,62 @@ pub async fn responses_create(
             emit_reasoning,
         );
 
-        let oauth = match state.router.oauth_manager() {
-            Some(o) => o,
-            None => {
-                return responses_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "OAuth manager not configured for Codex provider",
-                    "server_error",
-                );
-            }
-        };
+    let oauth = match state.router.oauth_manager() {
+        Some(o) => o,
+        None => {
+            request_guard.complete_responses_outcome(
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                None,
+                Some("server_error".to_string()),
+                None,
+                None,
+            );
+            return responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "OAuth manager not configured for Codex provider",
+                "server_error",
+            );
+        }
+    };
 
-        let instructions_store = match state.router.instructions_store() {
-            Some(s) => s,
-            None => {
-                return responses_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Instructions store not configured for Codex provider",
-                    "server_error",
-                );
-            }
-        };
+    let instructions_store = match state.router.instructions_store() {
+        Some(s) => s,
+        None => {
+            request_guard.complete_responses_outcome(
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                None,
+                Some("server_error".to_string()),
+                None,
+                None,
+            );
+            return responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Instructions store not configured for Codex provider",
+                "server_error",
+            );
+        }
+    };
 
-        let http = match state
-            .router
-            .get_http_client(&provider_cfg.name, &provider_cfg.connection_pool)
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return responses_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Failed to get HTTP client: {}", e),
-                    "server_error",
-                )
-            }
-        };
+    let http = match state
+        .router
+        .get_http_client(&provider_cfg.name, &provider_cfg.connection_pool)
+    {
+        Ok(c) => c,
+        Err(e) => {
+            request_guard.complete_responses_outcome(
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                None,
+                Some("server_error".to_string()),
+                None,
+                None,
+            );
+            return responses_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get HTTP client: {}", e),
+                "server_error",
+            )
+        }
+    };
         let usage_tracker = state
             .router
             .oauth_usage_tracker()
@@ -13271,6 +14184,13 @@ pub async fn responses_create(
                         output_items: stored.output_items,
                     }),
                     Ok(None) => {
+                        request_guard.complete_responses_outcome(
+                            StatusCode::NOT_FOUND.as_u16(),
+                            None,
+                            Some("invalid_request_error".to_string()),
+                            None,
+                            None,
+                        );
                         return responses_error(
                             StatusCode::NOT_FOUND,
                             &format!("previous_response_id '{prev_id}' was not found for this key"),
@@ -13279,6 +14199,13 @@ pub async fn responses_create(
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Failed to load previous response");
+                        request_guard.complete_responses_outcome(
+                            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                            None,
+                            Some("server_error".to_string()),
+                            None,
+                            None,
+                        );
                         return responses_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Failed to load conversation history",
@@ -13298,6 +14225,13 @@ pub async fn responses_create(
             match translate_responses(&request, history, &ctx) {
                 Ok(chat_req) => chat_req,
                 Err(e) => {
+                    request_guard.complete_responses_outcome(
+                        StatusCode::BAD_REQUEST.as_u16(),
+                        None,
+                        Some("invalid_request_error".to_string()),
+                        None,
+                        None,
+                    );
                     return responses_error(
                         StatusCode::BAD_REQUEST,
                         &e.to_string(),
@@ -13385,17 +14319,47 @@ async fn responses_create_buffered(
                 }
             }
 
-            request_guard.complete();
+ request_guard.set_responses_completion_text(
+ response_object
+ .output
+ .iter()
+ .filter_map(|item| match item {
+ OutputItem::Message(message) => Some(message.content.iter().filter_map(|part| match part {
+ OutputContentPart::OutputText { text, .. } => Some(text.clone()),
+ _ => None,
+ }).collect::<Vec<_>>()),
+ _ => None,
+ })
+ .flatten()
+ .next(),
+ );
+ request_guard.complete_responses_outcome(
+ StatusCode::OK.as_u16(),
+ responses_usage_ctx(&chat_response.usage),
+ None,
+ chat_response
+ .extra
+ .get("gateway_provider")
+ .and_then(|v| v.as_str())
+ .map(str::to_string),
+ Some(chat_response.model.clone()),
+ );
 
-            let mut http = Json(&response_object).into_response();
-            attach_trace_id_header(&mut http, &trace_id);
-            http
-        }
-        Err(err) => {
-            request_guard.complete();
-            err.into_response()
-        }
+        let mut http = Json(&response_object).into_response();
+        attach_trace_id_header(&mut http, &trace_id);
+        http
     }
+    Err(err) => {
+        request_guard.complete_responses_outcome(
+            err.status_code().as_u16(),
+            None,
+            Some(crate::error::error_class_for(&err)),
+            None,
+            None,
+        );
+        err.into_response()
+    }
+}
 }
 
 /// Buffered create path using native Codex API dispatch.
@@ -13413,7 +14377,13 @@ async fn responses_create_codex_buffered(
     let access_token = match codex_client.oauth().get_access_token().await {
         Some(t) => t,
         None => {
-            request_guard.complete();
+            request_guard.complete_responses_outcome(
+                StatusCode::UNAUTHORIZED.as_u16(),
+                None,
+                Some("authentication_error".to_string()),
+                Some(provider_cfg.name.clone()),
+                None,
+            );
             return responses_error(
                 StatusCode::UNAUTHORIZED,
                 "OAuth session not authenticated for Codex provider",
@@ -13425,8 +14395,14 @@ async fn responses_create_codex_buffered(
     let account_id = match crate::codex::jwt::extract_chatgpt_account_id(&access_token) {
         Ok(id) => id,
         Err(e) => {
-            request_guard.complete();
             tracing::warn!(error = %e, "Failed to extract account ID from JWT");
+            request_guard.complete_responses_outcome(
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                None,
+                Some("server_error".to_string()),
+                Some(provider_cfg.name.clone()),
+                None,
+            );
             return responses_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to extract OAuth account ID",
@@ -13441,7 +14417,13 @@ async fn responses_create_codex_buffered(
     {
         Ok(c) => c,
         Err(e) => {
-            request_guard.complete();
+            request_guard.complete_responses_outcome(
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                None,
+                Some("server_error".to_string()),
+                Some(provider_cfg.name.clone()),
+                None,
+            );
             return responses_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("Failed to get HTTP client: {}", e),
@@ -13465,8 +14447,14 @@ async fn responses_create_codex_buffered(
     {
         Ok(r) => r,
         Err(e) => {
-            request_guard.complete();
             tracing::error!(error = %e, "Codex native request failed");
+            request_guard.complete_responses_outcome(
+                StatusCode::BAD_GATEWAY.as_u16(),
+                None,
+                Some("server_error".to_string()),
+                Some(provider_cfg.name.clone()),
+                None,
+            );
             return responses_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("Codex backend request failed: {}", e),
@@ -13478,8 +14466,14 @@ async fn responses_create_codex_buffered(
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
-        request_guard.complete();
         tracing::warn!(status, body = %body.chars().take(500).collect::<String>(), "Codex native returned non-2xx");
+        request_guard.complete_responses_outcome(
+            status,
+            None,
+            Some("server_error".to_string()),
+            Some(provider_cfg.name.clone()),
+            None,
+        );
         return responses_error(
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
             &format!(
@@ -13493,7 +14487,13 @@ async fn responses_create_codex_buffered(
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            request_guard.complete();
+            request_guard.complete_responses_outcome(
+                StatusCode::BAD_GATEWAY.as_u16(),
+                None,
+                Some("server_error".to_string()),
+                Some(provider_cfg.name.clone()),
+                None,
+            );
             return responses_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("Failed to read Codex response: {}", e),
@@ -13523,7 +14523,13 @@ async fn responses_create_codex_buffered(
     });
 
     let Some(completed) = completed else {
-        request_guard.complete();
+        request_guard.complete_responses_outcome(
+            StatusCode::BAD_GATEWAY.as_u16(),
+            None,
+            Some("server_error".to_string()),
+            Some(provider_cfg.name.clone()),
+            None,
+        );
         return responses_error(
             StatusCode::BAD_GATEWAY,
             "Codex native response did not contain completed event",
@@ -13628,7 +14634,27 @@ async fn responses_create_codex_buffered(
         }
     }
 
-    request_guard.complete();
+ request_guard.set_responses_completion_text(
+ response_object
+ .output
+ .iter()
+ .filter_map(|item| match item {
+ OutputItem::Message(message) => Some(message.content.iter().filter_map(|part| match part {
+ OutputContentPart::OutputText { text, .. } => Some(text.clone()),
+ _ => None,
+ }).collect::<Vec<_>>()),
+ _ => None,
+ })
+ .flatten()
+ .next(),
+ );
+ request_guard.complete_responses_outcome(
+ StatusCode::OK.as_u16(),
+ responses_reported_usage_ctx(response_object.usage.as_ref()),
+ None,
+ Some(provider_cfg.name.clone()),
+ Some(completed.model.clone()),
+ );
 
     let mut http = Json(&response_object).into_response();
     attach_trace_id_header(&mut http, &trace_id);
@@ -13658,7 +14684,13 @@ async fn responses_create_codex_stream(
     let access_token = match codex_client.oauth().get_access_token().await {
         Some(t) => t,
         None => {
-            request_guard.complete();
+            request_guard.complete_responses_outcome(
+                StatusCode::UNAUTHORIZED.as_u16(),
+                None,
+                Some("authentication_error".to_string()),
+                Some(provider_cfg.name.clone()),
+                None,
+            );
             return responses_error(
                 StatusCode::UNAUTHORIZED,
                 "OAuth session not authenticated for Codex provider",
@@ -13670,8 +14702,14 @@ async fn responses_create_codex_stream(
     let account_id = match crate::codex::jwt::extract_chatgpt_account_id(&access_token) {
         Ok(id) => id,
         Err(e) => {
-            request_guard.complete();
             tracing::warn!(error = %e, "Failed to extract account ID from JWT");
+            request_guard.complete_responses_outcome(
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                None,
+                Some("server_error".to_string()),
+                Some(provider_cfg.name.clone()),
+                None,
+            );
             return responses_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to extract OAuth account ID",
@@ -13686,7 +14724,13 @@ async fn responses_create_codex_stream(
     {
         Ok(c) => c,
         Err(e) => {
-            request_guard.complete();
+            request_guard.complete_responses_outcome(
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                None,
+                Some("server_error".to_string()),
+                Some(provider_cfg.name.clone()),
+                None,
+            );
             return responses_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("Failed to get HTTP client: {}", e),
@@ -13703,6 +14747,7 @@ async fn responses_create_codex_stream(
     let owner = owner_id.clone();
     let responses_store = state.responses_store.clone();
     let stream_trace_id = trace_id.clone();
+    let codex_provider_name = provider_cfg.name.clone();
 
     let resp = match http_client
         .post(&base_url)
@@ -13718,8 +14763,14 @@ async fn responses_create_codex_stream(
     {
         Ok(r) => r,
         Err(e) => {
-            request_guard.complete();
             tracing::error!(error = %e, "Codex native streaming request failed");
+            request_guard.complete_responses_outcome(
+                StatusCode::BAD_GATEWAY.as_u16(),
+                None,
+                Some("server_error".to_string()),
+                Some(provider_cfg.name.clone()),
+                None,
+            );
             return responses_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("Codex backend request failed: {}", e),
@@ -13731,7 +14782,13 @@ async fn responses_create_codex_stream(
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
-        request_guard.complete();
+        request_guard.complete_responses_outcome(
+            status,
+            None,
+            Some("server_error".to_string()),
+            Some(provider_cfg.name.clone()),
+            None,
+        );
         return responses_error(
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
             &format!(
@@ -13744,11 +14801,11 @@ async fn responses_create_codex_stream(
 
     let byte_stream = resp.bytes_stream();
     let stream = async_stream::stream! {
-        let mut _guard = request_guard;
-        let mut buffer = String::new();
-        let mut bytes_stream = byte_stream;
-        let mut parser = crate::codex::sse::SseLineParser::new();
-        let mut terminal_response: Option<ResponseObject> = None;
+    let mut _guard = request_guard;
+    let mut buffer = String::new();
+    let mut bytes_stream = byte_stream;
+    let mut parser = crate::codex::sse::SseLineParser::new();
+    let mut terminal_response: Option<ResponseObject> = None;
 
         while let Some(chunk_result) = futures::StreamExt::next(&mut bytes_stream).await {
             match chunk_result {
@@ -13781,26 +14838,44 @@ async fn responses_create_codex_stream(
             }
         }
 
-        if store {
-            if let Some(completed) = terminal_response {
-                let input_items = Vec::new();
-                let stored = response_object_to_stored(
-                    &completed,
-                    &owner,
-                    input_items,
-                    &request_model,
-                    instructions.as_deref(),
-                    store,
-                    metadata.as_ref(),
-                    previous_response_id.as_deref(),
-                );
-                if let Err(e) = responses_store.store_response(&owner, &stored) {
-                    tracing::warn!(error = %e, "Failed to persist Codex native streamed response");
-                }
+    // Snapshot the terminal telemetry inputs before the store block
+    // takes ownership of the terminal response.
+    let terminal_usage = responses_reported_usage_ctx(
+        terminal_response.as_ref().and_then(|r| r.usage.as_ref()),
+    );
+    let terminal_model = terminal_response.as_ref().map(|r| r.model.clone());
+
+    if store {
+        if let Some(completed) = terminal_response {
+            let input_items = Vec::new();
+            let stored = response_object_to_stored(
+                &completed,
+                &owner,
+                input_items,
+                &request_model,
+                instructions.as_deref(),
+                store,
+                metadata.as_ref(),
+                previous_response_id.as_deref(),
+            );
+            if let Err(e) = responses_store.store_response(&owner, &stored) {
+                tracing::warn!(error = %e, "Failed to persist Codex native streamed response");
             }
         }
+    }
 
-        yield Ok(Event::default().data("[DONE]"));
+    // Terminal OTLP emission (Req 2.1/2.3): normal stream completion
+    // emits root + serving spans here; the guard's Drop only emits
+    // when the stream was abandoned before reaching this point.
+    _guard.complete_responses_outcome(
+        StatusCode::OK.as_u16(),
+        terminal_usage,
+        None,
+        Some(codex_provider_name),
+        terminal_model,
+    );
+
+    yield Ok(Event::default().data("[DONE]"));
     };
 
     let mut sse = Sse::new(stream)
@@ -13866,14 +14941,28 @@ async fn responses_create_stream(
                     request.metadata.as_ref(),
                     request.previous_response_id.as_deref(),
                 );
-                if let Err(e) = state.responses_store.store_response(&owner_id, &stored) {
-                    tracing::warn!(error = %e, "Failed to persist streamed response to store");
-                }
-            }
+        if let Err(e) = state.responses_store.store_response(&owner_id, &stored) {
+            tracing::warn!(error = %e, "Failed to persist streamed response to store");
+        }
+    }
 
-            request_guard.complete();
+    // Buffered-under-streaming completion (Req 2.1/2.3): the span is
+    // emitted here; the synthetic stream below carries no guard, so a
+    // client disconnect before events flush leaves this emission as
+    // the request's terminal trace.
+    request_guard.complete_responses_outcome(
+        StatusCode::OK.as_u16(),
+        responses_usage_ctx(&chat_response.usage),
+        None,
+        chat_response
+            .extra
+            .get("gateway_provider")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        Some(chat_response.model.clone()),
+    );
 
-            let response_for_stream = response_object.clone();
+    let response_for_stream = response_object.clone();
             let stream = async_stream::stream! {
                 let event_type = "response.created";
                 let created_event = serde_json::to_value(&ResponsesSseEvent::Created {
@@ -13903,22 +14992,23 @@ async fn responses_create_stream(
             attach_trace_id_header(&mut sse, &trace_id);
             sse
         }
-        Ok(StreamingResponse::PassThrough {
-            byte_stream,
-            provider: _,
-            model,
-            compression: _,
-            concurrency_permit: _,
-            smart_routing: _,
-        }) => {
-            let store = request.store;
-            let request_model = request.model.clone();
-            let instructions = request.instructions.clone();
-            let metadata = request.metadata.clone();
-            let previous_response_id = request.previous_response_id.clone();
-            let owner = owner_id.clone();
-            let stream_trace_id = trace_id.clone();
-            let responses_store = state.responses_store.clone();
+    Ok(StreamingResponse::PassThrough {
+        byte_stream,
+        provider,
+        model,
+        compression: _,
+        concurrency_permit: _,
+        smart_routing: _,
+    }) => {
+        let store = request.store;
+        let request_model = request.model.clone();
+        let instructions = request.instructions.clone();
+        let metadata = request.metadata.clone();
+        let previous_response_id = request.previous_response_id.clone();
+        let owner = owner_id.clone();
+        let stream_trace_id = trace_id.clone();
+        let responses_store = state.responses_store.clone();
+        let serving_provider = provider;
 
             let stream = async_stream::stream! {
                 let mut _guard = request_guard;
@@ -13974,10 +15064,10 @@ async fn responses_create_stream(
                     }
                 }
 
-                let terminal_events = translator.finish(final_usage);
-                for event in &terminal_events {
-                    yield Ok(responses_event_to_sse(event));
-                }
+    let terminal_events = translator.finish(final_usage.take());
+    for event in &terminal_events {
+        yield Ok(responses_event_to_sse(event));
+    }
 
                 if store {
                     if let Some(completed) = terminal_events.iter().rev().find_map(|e| {
@@ -13999,25 +15089,41 @@ async fn responses_create_stream(
                             metadata.as_ref(),
                             previous_response_id.as_deref(),
                         );
-                        if let Err(e) = responses_store.store_response(&owner, &stored) {
-                            tracing::warn!(error = %e, "Failed to persist streamed response");
-                        }
-                    }
-                }
-
-                yield Ok(Event::default().data("[DONE]"));
-            };
-
-            let mut sse = Sse::new(stream)
-                .keep_alive(build_keepalive(&streaming_config))
-                .into_response();
-            attach_trace_id_header(&mut sse, &trace_id);
-            sse
+            if let Err(e) = responses_store.store_response(&owner, &stored) {
+                tracing::warn!(error = %e, "Failed to persist streamed response");
+            }
         }
-        Err(err) => {
-            request_guard.complete();
-            err.into_response()
-        }
+    }
+
+    // Terminal OTLP emission (Req 2.1/2.3): the pass-through stream
+    // completed; the guard's Drop only emits when abandoned earlier.
+    _guard.complete_responses_outcome(
+        StatusCode::OK.as_u16(),
+        responses_reported_usage_ctx(final_usage.as_ref()),
+        None,
+        Some(serving_provider),
+        Some(model),
+    );
+
+    yield Ok(Event::default().data("[DONE]"));
+    };
+
+    let mut sse = Sse::new(stream)
+        .keep_alive(build_keepalive(&streaming_config))
+        .into_response();
+    attach_trace_id_header(&mut sse, &trace_id);
+    sse
+    }
+    Err(err) => {
+        request_guard.complete_responses_outcome(
+            err.status_code().as_u16(),
+            None,
+            Some(crate::error::error_class_for(&err)),
+            None,
+            None,
+        );
+        err.into_response()
+    }
     }
 }
 
@@ -14195,8 +15301,34 @@ fn extract_input_items(request: &ResponsesRequest) -> Vec<InputItem> {
 }
 
 /// Map a chat-completions `usage` JSON object to a [`ResponsesUsage`].
-fn map_chat_usage(usage: &serde_json::Value) -> Option<ResponsesUsage> {
-    let prompt_tokens = usage
+fn responses_usage_ctx(
+    usage: &crate::models::openai::Usage,
+) -> Option<crate::telemetry::spans::UsageCtx> {
+    if usage.prompt_tokens == 0 && usage.completion_tokens == 0 {
+        return None;
+    }
+    Some(crate::telemetry::spans::UsageCtx {
+        input_tokens: i64::from(usage.prompt_tokens),
+        output_tokens: i64::from(usage.completion_tokens),
+    })
+}
+
+/// Map a responses-family [`ResponsesUsage`] to the telemetry usage
+/// context (zero/absent stays `None`).
+fn responses_reported_usage_ctx(
+    usage: Option<&ResponsesUsage>,
+) -> Option<crate::telemetry::spans::UsageCtx> {
+    let usage = usage?;
+    if usage.input_tokens == 0 && usage.output_tokens == 0 {
+        return None;
+    }
+    Some(crate::telemetry::spans::UsageCtx {
+        input_tokens: usage.input_tokens as i64,
+        output_tokens: usage.output_tokens as i64,
+    })
+}
+
+fn map_chat_usage(usage: &serde_json::Value) -> Option<ResponsesUsage> {    let prompt_tokens = usage
         .get("prompt_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);

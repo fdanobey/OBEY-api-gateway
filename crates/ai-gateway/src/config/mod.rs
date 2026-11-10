@@ -14,6 +14,7 @@ use crate::security::outbound_fetch::OutboundFetchConfig;
 use crate::smart_routing::config::SmartRoutingConfig;
 use crate::smart_routing::tier::{SmartRoutingTier, TaskType};
 use crate::structured_output::config::{StructuredOutputConfig, StructuredOutputOverride};
+use crate::telemetry::TelemetryConfig;
 use crate::tool_compression::config::ToolCompressionConfig;
 
 pub mod validation;
@@ -30,7 +31,7 @@ static ENV_VAR_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
 
 /// Resolve environment variable references in a string
 /// Supports ${ENV_VAR} syntax
-fn resolve_env_var_in_string(value: &str) -> String {
+pub(crate) fn resolve_env_var_in_string(value: &str) -> String {
     let mut result = value.to_string();
 
     for cap in ENV_VAR_REGEX.captures_iter(value) {
@@ -153,6 +154,11 @@ pub struct Config {
     /// spec.
     #[serde(default)]
     pub webhooks: WebhooksConfig,
+    /// OpenTelemetry trace export. Absent section applies
+    /// [`TelemetryConfig::default`] (fully disabled, no OTLP network
+    /// activity). See the `opentelemetry-trace-export` spec.
+    #[serde(default)]
+    pub opentelemetry: TelemetryConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -30,6 +30,7 @@ pub mod secrets;
 pub mod security;
 pub mod smart_routing;
 pub mod structured_output;
+pub mod telemetry;
 pub mod tool_compression;
 #[cfg(feature = "tray")]
 pub mod tray;

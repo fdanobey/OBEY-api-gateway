@@ -156,6 +156,7 @@ fn base_config(base_url: &str) -> Config {
         memory: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
+        opentelemetry: Default::default(),
     }
 }
 
