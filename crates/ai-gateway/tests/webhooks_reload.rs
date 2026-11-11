@@ -31,7 +31,7 @@ use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
 use ai_gateway::webhooks::events::BudgetAlertEvent;
 
-mod common;
+use crate::common;
 
 const PROVIDER_NAME: &str = "budget-provider";
 const WEBHOOK_SECRET: &str = "whsec_test_secret";

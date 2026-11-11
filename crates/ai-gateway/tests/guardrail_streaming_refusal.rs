@@ -30,7 +30,7 @@ use ai_gateway::guardrail::{
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-mod common;
+use crate::common;
 
 // ---------------------------------------------------------------------------
 // Config builders

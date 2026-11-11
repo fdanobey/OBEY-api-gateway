@@ -11,7 +11,7 @@
 //! calls, so they manage a shared temp directory directly — the same
 //! pattern as `virtual_keys_integration` / `token_compression_observability`.
 
-mod common;
+use crate::common;
 
 use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;

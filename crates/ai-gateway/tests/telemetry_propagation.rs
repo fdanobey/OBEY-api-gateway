@@ -6,7 +6,7 @@
 //! parent span ids, sampled-flag override in both directions, invalid-header
 //! fallback, and the disabled zero-export path.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

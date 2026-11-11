@@ -45,7 +45,7 @@ use ai_gateway::guardrail::{
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-mod common;
+use crate::common;
 
 // ---------------------------------------------------------------------------
 // Config builders (local — this file must not edit shared test helpers).

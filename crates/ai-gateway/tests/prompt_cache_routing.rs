@@ -13,7 +13,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
 
-mod common;
+use crate::common;
 
 // ---------------------------------------------------------------------------
 // Helpers

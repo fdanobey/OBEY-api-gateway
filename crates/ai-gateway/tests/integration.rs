@@ -11,7 +11,7 @@ use tower::ServiceExt;
 use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
 
-mod common;
+use crate::common;
 
 /// Build a minimal valid Config for integration tests.
 fn test_config() -> Config {

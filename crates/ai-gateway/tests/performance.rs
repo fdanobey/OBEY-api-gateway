@@ -39,7 +39,7 @@ use ai_gateway::router::{CircuitBreaker, LatencyTracker};
 use ai_gateway::smart_routing::config::ClassifierMode;
 use ai_gateway::smart_routing::heuristic::HeuristicScorer;
 
-mod common;
+use crate::common;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 

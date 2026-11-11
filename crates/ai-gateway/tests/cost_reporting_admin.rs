@@ -15,7 +15,7 @@
 //! - reconcile: 400 on bad params (Req 3.4); zero-activity zeros (Req 3.2)
 //! - 500 on query failure: static envelope message, no internals leaked
 
-mod common;
+use crate::common;
 
 use ai_gateway::config::{AdminAuthConfig, Config};
 use ai_gateway::gateway::GatewayServer;

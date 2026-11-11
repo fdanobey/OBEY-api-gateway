@@ -41,7 +41,10 @@ const UNREACHABLE_QDRANT_URL: &str = "http://127.0.0.1:1";
 /// Build a [`SemanticProvider`] with the embedding endpoint pointed at
 /// `embedding_base_url` and the Qdrant client pointed at `qdrant_url`.
 fn make_provider(embedding_base_url: String, qdrant_url: &str) -> SemanticProvider {
+    // Skip the blocking build-time health check: against an unreachable
+    // URL it costs a full refused connect (~2 s on Windows) per provider.
     let qdrant = Qdrant::from_url(qdrant_url)
+        .skip_compatibility_check()
         .build()
         .expect("qdrant client builds from url");
 

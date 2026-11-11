@@ -37,7 +37,7 @@ use ai_gateway::config::Config;
 use ai_gateway::gateway::GatewayServer;
 use serde_json::{json, Value};
 
-mod common;
+use crate::common;
 
 // Unique raw secrets per concern so cross-test leakage in an assertion
 // message is unambiguous.

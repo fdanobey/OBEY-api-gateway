@@ -592,7 +592,14 @@ mod tests {
     #[test]
     fn provider_type_is_semantic() {
         let provider = SemanticProvider::new(
-            Arc::new(Qdrant::from_url("http://localhost:6334").build().unwrap()),
+            // Skip the blocking build-time health check (~2 s per refused
+            // loopback connect on Windows).
+            Arc::new(
+                Qdrant::from_url("http://localhost:6334")
+                    .skip_compatibility_check()
+                    .build()
+                    .unwrap(),
+            ),
             Client::new(),
             "test-provider".to_string(),
             "text-embedding-3-small".to_string(),

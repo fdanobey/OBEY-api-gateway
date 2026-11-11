@@ -474,8 +474,20 @@ impl RequestLogger {
         let conn = Connection::open(db_path)?;
         let database_path = db_path.to_string_lossy().into_owned();
 
-        // Create schema
+        // WAL + NORMAL synchronous keeps batched commits cheap; flush()
+        // checkpoints the WAL for durability on graceful shutdown. Applied
+        // before the schema migration so its ~30 DDL statements do not each
+        // pay a rollback-journal fsync (the connection moves to the writer).
+        let _ = conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        );
+
+        // Create schema.
         Self::create_schema(&conn)?;
+        // Move the schema out of the WAL into the main file (one fsync), so
+        // the on-disk layout after startup matches a rollback-journal
+        // migration: readers opening the file see the schema there.
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
 
         let (sender, receiver) = mpsc::sync_channel(LOG_QUEUE_CAPACITY);
         let writer = std::thread::Builder::new()
@@ -834,11 +846,6 @@ impl BodySanitizer {
 /// transaction.
 fn writer_loop(mut conn: Connection, config: LoggingConfig, receiver: Receiver<LoggerCommand>) {
     let sanitizer = BodySanitizer::new(config.clone());
-    // WAL + NORMAL synchronous keeps batched commits cheap; flush()
-    // checkpoints the WAL for durability on graceful shutdown.
-    let _ = conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
-    );
 
     while let Ok(command) = receiver.recv() {
         match command {
@@ -2688,7 +2695,12 @@ mod property_tests {
 
     // Property 12: Request Logging Completeness
     // Validates: Requirements 14.1, 14.2, 33.2, 33.5
+    // Every case opens a fresh on-disk SQLite database; 64 cases matches the
+    // crate-wide proptest budget (the 256 default made these the slowest
+    // unit tests in the suite).
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn prop_request_logging_completeness(entry in arb_log_entry()) {
             let config = LoggingConfig::default();
@@ -2723,6 +2735,8 @@ mod property_tests {
     // Property 14: Log Retention Cleanup
     // Validates: Requirements 14.6, 38.2
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn prop_log_retention_cleanup(
             retention_days in 1u32..90u32,
@@ -2806,6 +2820,8 @@ mod property_tests {
     // Property 31: Body Logging Size Limit
     // Validates: Requirements 27.4
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn prop_body_logging_size_limit(
             body_size in 1usize..5000usize,
@@ -2880,6 +2896,8 @@ mod property_tests {
     // Property 32: Body Logging Field Exclusion
     // Validates: Requirements 27.6
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn prop_body_logging_field_exclusion(
             secret_value in "[a-zA-Z0-9]{10,50}",
@@ -2955,6 +2973,8 @@ mod property_tests {
     // Property 10: API Key Redaction
     // Validates: Requirements 19.3, 19.4, 19.9, 19.10
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn prop_api_key_redaction(
             message in "[a-zA-Z0-9 ]{10,50}",

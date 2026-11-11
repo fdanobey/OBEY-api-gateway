@@ -11,55 +11,12 @@ use std::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod active_requests;
-mod admin;
-#[allow(dead_code, unused_imports)]
-mod anthropic;
-mod assistants;
-mod cache;
-mod codex;
-#[allow(dead_code, unused_imports)]
-mod compression;
-mod config;
-#[allow(dead_code, unused_imports)]
-mod cost_reporting;
-mod context;
-mod dashboard;
-mod description_utils;
-mod error;
-mod gateway;
-mod guardrail;
-mod logger;
-#[allow(dead_code, unused_imports)]
-mod loop_detection;
-#[allow(dead_code, unused_imports)]
-mod memory;
-mod metrics;
-mod models;
-mod oauth;
-mod providers;
-mod reasoning_compat;
-mod reasoning_relay;
-mod request_body_limit;
-mod responses;
-mod router;
-mod runtime_limits;
-mod secrets;
-#[allow(dead_code, unused_imports)]
-mod security;
-#[allow(dead_code, unused_imports)]
-mod smart_routing;
-#[allow(dead_code, unused_imports)]
-mod structured_output;
-#[allow(dead_code, unused_imports)]
-mod telemetry;
-#[allow(dead_code, unused_imports)]
-mod tool_compression;
+// The binary links the `ai_gateway` library instead of re-declaring every
+// module with `mod`: re-declaring compiled the whole crate twice and made
+// `cargo test` run the library's unit tests a second time in the bin harness.
 #[cfg(feature = "tray")]
-mod tray;
-mod virtual_keys;
-#[allow(dead_code, unused_imports)]
-mod webhooks;
+use ai_gateway::tray;
+use ai_gateway::{compression, config, gateway, models};
 
 #[derive(Parser, Debug)]
 #[command(name = "ai-gateway")]

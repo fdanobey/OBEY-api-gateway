@@ -2,7 +2,7 @@
 //! `#attempt` log row, and a request the client abandons still leaves one
 //! outcome row (499 `client_disconnect`) instead of vanishing from the log.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

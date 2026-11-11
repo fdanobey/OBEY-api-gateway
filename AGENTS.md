@@ -37,6 +37,14 @@ Wall-clock budget tests are marked `#[ignore]` and run with `--ignored`:
 
 Every `GatewayServer::new` opens SQLite databases. Tests use `common::isolate_databases` to redirect these into unique temp directories, avoiding lock contention across parallel tests.
 
+### Test Binaries (keep the build small)
+
+- Integration tests compile into one binary, `tests/suite.rs` (`autotests = false`). A new `tests/foo.rs` must be declared there as `mod foo;` (it reaches helpers with `use crate::common;`); `every_test_file_is_compiled` fails otherwise. Run one file with `cargo test -p ai-gateway --test suite foo::`.
+- Only files that mutate process-global state another file depends on get their own `[[test]]` target (the `github_copilot_*` files set `AI_GATEWAY_DATA_DIR`).
+- `src/main.rs` uses the `ai_gateway` library; never re-declare library modules with `mod` there (that compiled the crate twice and ran every unit test twice).
+- The test profile builds `ai-gateway` at `opt-level = 0` and dependencies at `opt-level = 2` (root `Cargo.toml`).
+- `Qdrant::from_url(..).build()` runs a blocking health check; on Windows a refused loopback connect costs ~2 s. Test clients use `.skip_compatibility_check()`.
+
 ## Non-Obvious Patterns
 
 - **API key resolution**: `api_key_env` in config is tried as env var name first, falls back to literal value if env var not found ([`router.rs:286-291`](crates/ai-gateway/src/router/router.rs:286))

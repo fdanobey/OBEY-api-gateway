@@ -7,7 +7,7 @@
 //! conjunctive filters, `#attempt` exclusion, and the sum-equality
 //! invariant across groupings (Requirement 2.3).
 
-mod common;
+use crate::common;
 
 use ai_gateway::cost_reporting::{
     query::fetch_report, GroupBy, ReportRow, ValidatedCostReportParams, ValidatedRange,

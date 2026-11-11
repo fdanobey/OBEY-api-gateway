@@ -12,7 +12,7 @@ use tower::ServiceExt;
 use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
 
-mod common;
+use crate::common;
 
 /// Build a minimal valid Config with a Codex-style provider (oauth + openai).
 fn codex_test_config() -> Config {

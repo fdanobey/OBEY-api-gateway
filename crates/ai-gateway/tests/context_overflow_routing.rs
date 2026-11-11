@@ -13,7 +13,7 @@
 //! - ADR-0002: a gate-skipped attempt never debits the provider rate token
 //!   (tokens consumed == real upstream requests).
 
-mod common;
+use crate::common;
 
 use ai_gateway::config::Config;
 use ai_gateway::gateway::GatewayServer;

@@ -51,7 +51,7 @@ use uuid::Uuid;
 use wiremock::matchers::{method as wm_method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-mod common;
+use crate::common;
 
 // ---------------------------------------------------------------------------
 // Fakes

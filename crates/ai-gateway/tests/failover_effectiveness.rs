@@ -28,7 +28,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use ai_gateway::config::Config;
 use ai_gateway::gateway::GatewayServer;
 
-mod common;
+use crate::common;
 
 /// Wall-clock budget per effectiveness scenario (suite target < 60 s).
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(30);

@@ -1,8 +1,9 @@
 //! Shared test utilities for integration tests.
 //!
-//! Each integration-test file in `tests/` is compiled as its own crate, so
-//! they cannot share code through `src/`. A file at `tests/common/mod.rs` is
-//! the Cargo-blessed way to share helpers across test binaries.
+//! Integration-test files compile into the `suite` binary (`tests/suite.rs`,
+//! which declares this module once; files reach it via `use crate::common`)
+//! plus a few standalone `[[test]]` targets that declare `mod common;`
+//! themselves.
 //!
 //! ## Purpose
 //!
@@ -17,8 +18,8 @@
 //! [`isolate_databases`] redirects every database into a unique temporary
 //! directory so no two servers ever touch the same file.
 //!
-//! Every test binary embeds this module in full but uses only a subset of
-//! its helpers; unused ones would trip `dead_code` in the other binaries
+//! Every test binary embeds this module in full but the standalone ones use
+//! only a subset of its helpers; unused ones would trip `dead_code` there
 //! (e.g. `budget_persistence` uses [`budget_test_config`] but keeps stable
 //! database paths instead of calling [`isolate_databases`]). The lint is
 //! scoped here rather than at each embedding site.

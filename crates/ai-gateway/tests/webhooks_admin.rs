@@ -31,7 +31,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
 
-mod common;
+use crate::common;
 
 const RAW_SECRET: &str = "whsec_raw_admin_secret";
 

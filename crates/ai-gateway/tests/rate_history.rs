@@ -2,7 +2,7 @@
 //! trailing-60s per-second request buckets from the logs database so the
 //! dashboard request-rate chart is populated on load and WS reconnect.
 
-mod common;
+use crate::common;
 
 use ai_gateway::config::Config;
 use ai_gateway::gateway::GatewayServer;

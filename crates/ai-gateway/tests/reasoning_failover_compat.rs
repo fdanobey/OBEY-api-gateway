@@ -31,7 +31,7 @@ use ai_gateway::gateway::GatewayServer;
 use ai_gateway::reasoning_compat::config::ReasoningFamily;
 use ai_gateway::reasoning_compat::ReasoningCompatConfig;
 
-mod common;
+use crate::common;
 
 // ---------------------------------------------------------------------------
 // Harness

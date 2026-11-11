@@ -51,5 +51,13 @@ codegen-units = 1
 panic = "abort"
 
 [profile.test]
-opt-level = 2
+# ai-gateway itself is ~8.5 MB of source: at opt-level 2 one rustc for its
+# test harness needed ~8 GB and >12 min. opt-level 1 is the floor: at 0 the
+# request-handler futures overflow the 2 MB test-thread stack. Dependencies
+# (compiled once and cached) stay optimised below.
+opt-level = 1
+debug = "line-tables-only"
 incremental = true
+
+[profile.test.package."*"]
+opt-level = 2

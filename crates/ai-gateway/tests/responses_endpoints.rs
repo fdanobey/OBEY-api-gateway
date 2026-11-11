@@ -26,7 +26,7 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-mod common;
+use crate::common;
 
 struct TestServer {
     server: GatewayServer,

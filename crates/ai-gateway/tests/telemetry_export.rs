@@ -6,7 +6,7 @@
 //! gzip-compressed OTLP/HTTP JSON payloads received by a wiremock mock
 //! collector — the same wire format a real OpenTelemetry Collector parses.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

@@ -3,6 +3,9 @@ name = "ai-gateway"
 version = "0.7.10"
 edition = "2021"
 build = "build.rs"
+# Integration tests compile into one binary (tests/suite.rs) instead of one
+# per file; see the [[test]] targets below.
+autotests = false
 
 [features]
 default = []
@@ -22,6 +25,24 @@ path = "src/lib.rs"
 [[bin]]
 name = "ai-gateway"
 path = "src/main.rs"
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+
+# These set the process-global AI_GATEWAY_DATA_DIR to their own directories,
+# so each keeps a separate process.
+[[test]]
+name = "github_copilot_admin"
+path = "tests/github_copilot_admin.rs"
+
+[[test]]
+name = "github_copilot_dispatch"
+path = "tests/github_copilot_dispatch.rs"
+
+[[test]]
+name = "github_copilot_oauth_login"
+path = "tests/github_copilot_oauth_login.rs"
 
 [dependencies]
 tokio = { workspace = true }

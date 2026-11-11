@@ -4457,15 +4457,15 @@ retry:
                     .uri("/admin/config")
                     .body(axum::body::Body::empty())
                     .unwrap();
-                let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+                // One auth-enabled server serves steps 1-3: auth is checked
+                // per request, and each GatewayServer::new opens six SQLite
+                // databases, which dominated this property's runtime.
+                let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
                 assert_eq!(resp.status(), StatusCode::UNAUTHORIZED,
                     "Auth enabled + no creds must be 401");
 
                 // 2) Valid credentials → 200 (Req 35.1, 35.3)
-                let server2 = crate::gateway::GatewayServer::new(
-                    test_config_with_auth_env(true, &user_env, &pass_env), None
-                ).await.unwrap();
-                let app2 = server2.build_router();
+                let app2 = app.clone();
                 let req = axum::http::Request::builder()
                     .method("GET")
                     .uri("/admin/config")
@@ -4489,10 +4489,7 @@ retry:
                     bad_pass.clone()
                 };
 
-                let server3 = crate::gateway::GatewayServer::new(
-                    test_config_with_auth_env(true, &user_env, &pass_env), None
-                ).await.unwrap();
-                let app3 = server3.build_router();
+                let app3 = app;
                 let req = axum::http::Request::builder()
                     .method("GET")
                     .uri("/admin/config")

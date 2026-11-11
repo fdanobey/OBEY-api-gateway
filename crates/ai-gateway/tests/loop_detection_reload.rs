@@ -4,7 +4,7 @@ use ai_gateway::{
     loop_detection::SessionState,
 };
 
-mod common;
+use crate::common;
 
 fn minimal_config() -> Config {
     let mut config: Config = serde_yaml::from_str("server:\n  host: 127.0.0.1\n  port: 8080\nproviders:\n  - name: p\n    type: openai\n    base_url: http://localhost\n    timeout_seconds: 30\nmodel_groups:\n  - name: g\n    models:\n      - provider: p\n        model: gpt-4\n").unwrap();

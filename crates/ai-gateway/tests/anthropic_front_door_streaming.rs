@@ -24,7 +24,7 @@
 //!    chain: full beta capture (unknown values, comma-joined multi-header
 //!    form) into the passthrough scope the Mantle adapter reads.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

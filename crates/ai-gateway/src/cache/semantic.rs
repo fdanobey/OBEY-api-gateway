@@ -493,6 +493,19 @@ fn normalize_qdrant_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Qdrant client for unit tests. `build()` otherwise runs a blocking
+/// compatibility health check against the URL; with nothing listening,
+/// Windows takes ~2 s to refuse each loopback connect.
+#[cfg(test)]
+fn test_qdrant_client() -> Arc<Qdrant> {
+    Arc::new(
+        Qdrant::from_url("http://localhost:6333")
+            .skip_compatibility_check()
+            .build()
+            .unwrap(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,7 +600,7 @@ mod tests {
         use crate::models::openai::Message;
 
         let cache = SemanticCache {
-            qdrant_client: Arc::new(Qdrant::from_url("http://localhost:6333").build().unwrap()),
+            qdrant_client: test_qdrant_client(),
             http_client: Client::new(),
             similarity_threshold: 0.95,
             collection_name: "test".to_string(),
@@ -657,7 +670,7 @@ mod tests {
             .await;
 
         let cache = SemanticCache {
-            qdrant_client: Arc::new(Qdrant::from_url("http://localhost:6333").build().unwrap()),
+            qdrant_client: test_qdrant_client(),
             http_client: Client::new(),
             similarity_threshold: 0.95,
             collection_name: "test".to_string(),
@@ -690,7 +703,7 @@ mod tests {
             .await;
 
         let cache = SemanticCache {
-            qdrant_client: Arc::new(Qdrant::from_url("http://localhost:6333").build().unwrap()),
+            qdrant_client: test_qdrant_client(),
             http_client: Client::new(),
             similarity_threshold: 0.95,
             collection_name: "test".to_string(),
@@ -732,7 +745,7 @@ mod tests {
             .await;
 
         let cache = SemanticCache {
-            qdrant_client: Arc::new(Qdrant::from_url("http://localhost:6333").build().unwrap()),
+            qdrant_client: test_qdrant_client(),
             http_client: Client::new(),
             similarity_threshold: 0.95,
             collection_name: "test".to_string(),
@@ -770,7 +783,7 @@ mod property_tests {
         ) {
             // Create cache with specific threshold
             let cache = SemanticCache {
-                qdrant_client: Arc::new(Qdrant::from_url("http://localhost:6333").build().unwrap()),
+                qdrant_client: test_qdrant_client(),
                 http_client: Client::new(),
                 similarity_threshold: threshold,
                 collection_name: "test".to_string(),
@@ -802,9 +815,24 @@ mod property_tests {
         }
     }
 
+    /// Probed once per test process: whether anything listens on the local
+    /// Qdrant port. Without it every case below would pay a full refused
+    /// connect (~2 s on Windows) only to skip.
+    fn local_qdrant_listening() -> bool {
+        static LISTENING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LISTENING.get_or_init(|| {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 6333));
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250))
+                .is_ok()
+        })
+    }
+
     // Property 39: Semantic Cache Round-Trip
     // **Validates: Requirements 15.2, 15.3, 15.5, 42.2, 42.6**
     proptest! {
+        // Each case creates a fresh Qdrant collection when a server is up.
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
         #[test]
         fn prop_semantic_cache_round_trip(
             model in "[a-z]{3,10}",
@@ -816,6 +844,12 @@ mod property_tests {
             use crate::models::openai::Message;
             use wiremock::{MockServer, Mock, ResponseTemplate};
             use wiremock::matchers::{method, path};
+
+            if !local_qdrant_listening() {
+                // Skip when Qdrant is unavailable (same outcome as the
+                // `ensure_collection` guard below, without the connect cost).
+                return Ok(());
+            }
 
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let mock_server = MockServer::start().await;
@@ -839,7 +873,7 @@ mod property_tests {
                     .await;
 
                 let cache = SemanticCache {
-                    qdrant_client: Arc::new(Qdrant::from_url("http://localhost:6333").build().unwrap()),
+                    qdrant_client: test_qdrant_client(),
                     http_client: Client::new(),
                     similarity_threshold: 0.95,
                     collection_name: format!("test_roundtrip_{}", uuid::Uuid::new_v4()),

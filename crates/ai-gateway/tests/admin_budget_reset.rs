@@ -20,7 +20,7 @@ use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
 use ai_gateway::virtual_keys::models::{CreateKeyParams, UsageRecord};
 
-mod common;
+use crate::common;
 
 const PROVIDER_NAME: &str = "budget-provider";
 

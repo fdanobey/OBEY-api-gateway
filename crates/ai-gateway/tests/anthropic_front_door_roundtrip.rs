@@ -37,7 +37,7 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-mod common;
+use crate::common;
 
 const VERSION: &str = "2023-06-01";
 
