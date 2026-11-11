@@ -505,7 +505,7 @@ impl MemorySystem {
                 scanner.clone(),
                 Arc::clone(&provider),
                 1,
-                Duration::from_secs(30),
+                Duration::from_secs(config.auto_extract_timeout_seconds),
                 metrics.clone(),
             )?
             .with_stored_entry_callback(Arc::new(move |entry| {
@@ -1025,6 +1025,8 @@ impl MemorySystem {
         warn_sensitive_storage_once(&new_config);
 
         let previous_qdrant = self.config.read().await.qdrant.clone();
+        self.extractor
+            .set_provider_timeout(Duration::from_secs(new_config.auto_extract_timeout_seconds));
         *self.config.write().await = new_config.clone();
         {
             let mut scheduler = self.decay_scheduler.lock().map_err(|_| {

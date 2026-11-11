@@ -66,13 +66,9 @@ pub struct GatewayExtractionAdapter {
 
 impl GatewayExtractionAdapter {
     pub fn new(config: Arc<RwLock<Config>>) -> Self {
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             config,
-            http_client,
+            http_client: reqwest::Client::new(),
         }
     }
 

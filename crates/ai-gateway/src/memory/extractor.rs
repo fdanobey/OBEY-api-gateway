@@ -230,7 +230,9 @@ pub struct MemoryExtractor {
     sensitive_scanner: Arc<SensitiveContentScanner>,
     provider: Arc<dyn MemoryExtractionProvider>,
     provider_semaphore: Arc<Semaphore>,
-    provider_timeout: Duration,
+    /// Shared so config hot-reload can retune the provider timeout without
+    /// rebuilding the extractor (and dropping the stored-entry callback).
+    provider_timeout: std::sync::RwLock<Duration>,
     metrics: Arc<MemoryMetrics>,
     stored_entry_callback: Option<Arc<dyn Fn(MemoryEntry) + Send + Sync>>,
 }
@@ -276,10 +278,27 @@ impl MemoryExtractor {
             sensitive_scanner,
             provider,
             provider_semaphore: Arc::new(Semaphore::new(maximum_concurrent_provider_calls)),
-            provider_timeout,
+            provider_timeout: std::sync::RwLock::new(provider_timeout),
             metrics,
             stored_entry_callback: None,
         })
+    }
+
+    /// Retune the per-call provider timeout, e.g. on config hot-reload.
+    ///
+    /// Returns the previous value. In-flight extraction calls keep the
+    /// timeout they captured at spawn. Zero durations are ignored because
+    /// construction-time validation excludes them.
+    pub(crate) fn set_provider_timeout(&self, provider_timeout: Duration) -> Duration {
+        let mut guard = self
+            .provider_timeout
+            .write()
+            .expect("memory extraction timeout lock poisoned");
+        let previous = *guard;
+        if !provider_timeout.is_zero() {
+            *guard = provider_timeout;
+        }
+        previous
     }
 
     pub(crate) fn with_stored_entry_callback(
@@ -382,7 +401,10 @@ impl MemoryExtractor {
         let metrics = self.metrics.clone();
         let stored_entry_callback = self.stored_entry_callback.clone();
         let semaphore = self.provider_semaphore.clone();
-        let provider_timeout = self.provider_timeout;
+        let provider_timeout = *self
+            .provider_timeout
+            .read()
+            .expect("memory extraction timeout lock poisoned");
 
         AsyncExtractionSchedule::Spawned(tokio::spawn(async move {
             let permit = match semaphore.acquire_owned().await {
@@ -701,27 +723,40 @@ async fn store_candidates(
 ) -> Result<ExtractionCounts, MemoryError> {
     let mut counts = ExtractionCounts::default();
 
+    let candidates = {
+        let mut below_minimum_word_count = 0u32;
+        let mut kept = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let content = candidate.content.trim();
+            let character_count = content.chars().count();
+            if !(MIN_MEMORY_CHARS..=MAX_MEMORY_CHARS).contains(&character_count) {
+                counts.rejected = counts.rejected.saturating_add(1);
+                tracing::warn!(
+                    character_count,
+                    "discarding memory extraction outside content length limits"
+                );
+                continue;
+            }
+
+            let word_count = content.split_whitespace().count();
+            if word_count < MIN_MEMORY_WORDS {
+                counts.rejected = counts.rejected.saturating_add(1);
+                below_minimum_word_count = below_minimum_word_count.saturating_add(1);
+                continue;
+            }
+
+            kept.push(candidate);
+        }
+        if below_minimum_word_count > 0 {
+            tracing::warn!(
+                "({below_minimum_word_count}) memory candidates discarded due to minimum word count not being met"
+            );
+        }
+        kept
+    };
+
     for candidate in candidates {
         let content = candidate.content.trim();
-        let character_count = content.chars().count();
-        if !(MIN_MEMORY_CHARS..=MAX_MEMORY_CHARS).contains(&character_count) {
-            counts.rejected = counts.rejected.saturating_add(1);
-            tracing::warn!(
-                character_count,
-                "discarding memory extraction outside content length limits"
-            );
-            continue;
-        }
-
-	let word_count = content.split_whitespace().count();
-	if word_count < MIN_MEMORY_WORDS {
-		counts.rejected = counts.rejected.saturating_add(1);
-		tracing::warn!(
-			word_count,
-			"discarding memory extraction below minimum word count"
-		);
-		continue;
-	}
 
 	// Reject image or binary content that would pollute the text search
 	// index and cause issues when re-injected into non-vision models.
@@ -981,6 +1016,219 @@ mod tests {
         );
     }
 
+#[derive(Clone)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn captured_warnings() -> Arc<std::sync::Mutex<Vec<u8>>> {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+fn word_count_warning_count(output: &Arc<std::sync::Mutex<Vec<u8>>>) -> (usize, String) {
+    let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    (
+        text.matches("memory candidates discarded due to minimum word count not being met")
+            .count(),
+        text,
+    )
+}
+
+#[test]
+fn word_count_rejections_emit_one_aggregated_warning_line_per_batch() {
+    let provider = Arc::new(MockProvider::new(MockResponse::Candidates(Vec::new())));
+    let (extractor, store) = test_extractor(provider, 1, Duration::from_secs(1));
+    let candidates = vec![
+        StructuredMemoryCandidate {
+            content: "prefer tabs".to_owned(),
+            memory_type: MemoryType::Preference,
+        },
+        StructuredMemoryCandidate {
+            content: "short one".to_owned(),
+            memory_type: MemoryType::Context,
+        },
+        StructuredMemoryCandidate {
+            content: "one-worded".to_owned(),
+            memory_type: MemoryType::Fact,
+        },
+        StructuredMemoryCandidate {
+            content: "The project uses SQLite for storage".to_owned(),
+            memory_type: MemoryType::Fact,
+        },
+    ];
+
+    let output = captured_warnings();
+    let capture = LogCapture(output.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || capture.clone())
+        .finish();
+    let namespace = namespace();
+    let counts = tracing::subscriber::with_default(subscriber, || {
+        futures::executor::block_on(extractor.persist_compression_candidates(
+            candidates,
+            &namespace,
+            None,
+            ExtractionPolicy::default(),
+        ))
+    })
+    .unwrap();
+
+    assert_eq!(counts.rejected, 3);
+    assert_eq!(counts.stored, 1);
+    assert_eq!(
+        store.namespace_count("user::test::project::abc").unwrap(),
+        1
+    );
+    let (warning_count, text) = word_count_warning_count(&output);
+    assert_eq!(warning_count, 1);
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(lines[0].starts_with(" WARN "), "{text}");
+    assert!(lines[0].ends_with(
+        "(3) memory candidates discarded due to minimum word count not being met"
+    ), "{text}");
+    assert_eq!(store.namespace_count("user::test").unwrap(), 0);
+    let stored_content = store
+        .list_entries("user::test::project::abc", 10, 0)
+        .unwrap()
+        .entries;
+    assert_eq!(stored_content.len(), 1);
+    assert_eq!(
+        stored_content[0].content,
+        "The project uses SQLite for storage"
+    );
+}
+
+#[test]
+fn word_count_warning_precedes_storage_errors_and_preserves_length_priority() {
+    let provider = Arc::new(MockProvider::new(MockResponse::Candidates(Vec::new())));
+    let (extractor, store) = test_extractor(provider, 1, Duration::from_secs(1));
+    let candidates = [
+        "The project uses SQLite",
+        "short",
+        "two words",
+        "tiny",
+    ]
+    .into_iter()
+    .map(|content| StructuredMemoryCandidate {
+        content: content.to_owned(),
+        memory_type: MemoryType::Fact,
+    })
+    .chain(std::iter::once(StructuredMemoryCandidate {
+        content: "x".repeat(MAX_MEMORY_CHARS + 1),
+        memory_type: MemoryType::Fact,
+    }))
+    .collect();
+    let output = captured_warnings();
+    let capture = LogCapture(output.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || capture.clone())
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, || {
+        futures::executor::block_on(extractor.persist_compression_candidates(
+            candidates,
+            &namespace(),
+            None,
+            ExtractionPolicy {
+                max_memories_per_namespace: 0,
+                ..ExtractionPolicy::default()
+            },
+        ))
+    });
+
+    assert!(matches!(result, Err(MemoryError::Config(_))));
+    let (warning_count, text) = word_count_warning_count(&output);
+    assert_eq!(warning_count, 1, "{text}");
+    assert!(text.contains(
+        "(2) memory candidates discarded due to minimum word count not being met"
+    ), "{text}");
+    assert_eq!(
+        text.matches("discarding memory extraction outside content length limits").count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(store.namespace_count("user::test::project::abc").unwrap(), 0);
+}
+
+#[test]
+fn batches_without_word_count_rejections_emit_no_warning() {
+    let provider = Arc::new(MockProvider::new(MockResponse::Candidates(Vec::new())));
+    let (extractor, store) = test_extractor(provider, 1, Duration::from_secs(1));
+    let candidates = vec![
+        StructuredMemoryCandidate {
+            content: "The project uses SQLite for storage".to_owned(),
+            memory_type: MemoryType::Fact,
+        },
+        StructuredMemoryCandidate {
+            content: "The team prefers tabs over spaces".to_owned(),
+            memory_type: MemoryType::Preference,
+        },
+    ];
+
+    let output = captured_warnings();
+    let capture = LogCapture(output.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || capture.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        futures::executor::block_on(extractor.persist_compression_candidates(
+            candidates,
+            &namespace(),
+            None,
+            ExtractionPolicy::default(),
+        ))
+    })
+    .unwrap();
+
+    let (warning_count, _) = word_count_warning_count(&output);
+    assert_eq!(warning_count, 0);
+    assert_eq!(
+        store.namespace_count("user::test::project::abc").unwrap(),
+        1
+    );
+    assert_eq!(store.namespace_count("user::test").unwrap(), 1);
+}
+
+#[test]
+fn empty_batches_emit_no_word_count_warning() {
+    let provider = Arc::new(MockProvider::new(MockResponse::Candidates(Vec::new())));
+    let (extractor, _) = test_extractor(provider, 1, Duration::from_secs(1));
+
+    let output = captured_warnings();
+    let capture = LogCapture(output.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || capture.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        futures::executor::block_on(extractor.persist_compression_candidates(
+            Vec::new(),
+            &namespace(),
+            None,
+            ExtractionPolicy::default(),
+        ))
+    })
+    .unwrap();
+
+    let (warning_count, _) = word_count_warning_count(&output);
+    assert_eq!(warning_count, 0);
+}
+
     #[tokio::test]
     async fn async_threshold_filters_roles_and_provider_candidates_use_namespaces() {
         let provider = Arc::new(MockProvider::new(MockResponse::Candidates(vec![
@@ -1107,10 +1355,38 @@ fn looks_like_image_or_binary_detects_image_patterns() {
 	assert!(looks_like_image_or_binary(
 		"{\"type\":\"input_image\",\"image_url\":\"https://example.com/img.png\"}"
 	));
-	// Plain text memory should pass
-	assert!(!looks_like_image_or_binary(
-		"I prefer concise code comments and snake_case for variables."
-	));
+    // Plain text memory should pass
+    assert!(!looks_like_image_or_binary(
+        "I prefer concise code comments and snake_case for variables."
+    ));
+}
+
+#[tokio::test]
+async fn provider_timeout_is_retunable_after_construction() {
+    let blocked = Arc::new(MockProvider::new(MockResponse::Block));
+    let (extractor, _) = test_extractor(blocked, 1, Duration::from_secs(60));
+    let messages = vec![
+        ExtractionMessage::caller(ExtractionRole::User, "question"),
+        ExtractionMessage::caller(ExtractionRole::Assistant, "answer"),
+    ];
+
+    assert_eq!(
+        extractor.set_provider_timeout(Duration::from_millis(20)),
+        Duration::from_secs(60)
+    );
+    assert_eq!(
+        extractor.set_provider_timeout(Duration::ZERO),
+        Duration::from_millis(20),
+        "zero timeout must be rejected without changing the current value"
+    );
+    assert_eq!(
+        await_spawned(extractor.spawn_after_delivery(async_request(messages))).await,
+        AsyncExtractionOutcome::TimedOut
+    );
+    assert_eq!(
+        extractor.set_provider_timeout(Duration::from_secs(60)),
+        Duration::from_millis(20)
+    );
 }
 }
 

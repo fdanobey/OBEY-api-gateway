@@ -66,8 +66,9 @@ memory:
   auto_extract_enabled: false
   auto_extract_provider: openai
   auto_extract_model: gpt-4.1-mini
-  auto_extract_min_turns: 4
-  decay_schedule_hours: 24
+auto_extract_min_turns: 4
+auto_extract_timeout_seconds: 30
+decay_schedule_hours: 24
   max_memories_per_namespace: 1000
   allow_sensitive_storage: false
   show_feedback: true
@@ -95,6 +96,7 @@ memory:
 | `auto_extract_provider` | — | Provider to use for extraction (must be configured) |
 | `auto_extract_model` | — | Model to use for extraction |
 | `auto_extract_min_turns` | `4` | Minimum conversation turns before triggering extraction (1–100) |
+| `auto_extract_timeout_seconds` | `30` | Wall-clock ceiling for one extraction provider call in seconds (1–600); on timeout the extraction is discarded and logged, the request itself is unaffected. Hot-reloadable. |
 | `decay_schedule_hours` | `24` | How often relevance decay runs (1–8760) |
 | `max_memories_per_namespace` | `1000` | Maximum entries per namespace before eviction (1–100000) |
 | `allow_sensitive_storage` | `false` | When disabled, PII-like content is rejected |
