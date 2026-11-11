@@ -482,7 +482,7 @@ impl RequestLogger {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
         );
 
-        // Create schema.
+        // Create schema
         Self::create_schema(&conn)?;
         // Move the schema out of the WAL into the main file (one fsync), so
         // the on-disk layout after startup matches a rollback-journal

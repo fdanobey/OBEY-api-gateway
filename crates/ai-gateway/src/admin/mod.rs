@@ -4937,22 +4937,11 @@ Mock::given(method("GET"))
 }
 }
 
-/// Hermetic secure-storage dir for the Copilot admin tests (same
-/// `AI_GATEWAY_DATA_DIR` isolation pattern as the manager tests and the
-/// admin oauth test at the 5366-ish `test_connection` isolation): point
-/// the env var at a process-wide temp dir exactly once, create the
-/// master key eagerly, then hand each test a unique credential file so
-/// parallel tests never collide.
+/// Hermetic secure-storage dir for the Copilot admin tests: the shared
+/// unit-test secrets dir (master key already created). Each test gets a
+/// unique credential file so parallel tests never collide.
 fn copilot_admin_secure_dir() -> &'static std::path::Path {
-use std::sync::OnceLock;
-static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
-DIR.get_or_init(|| {
-let dir = tempfile::tempdir().expect("temp secure dir");
-let leaked = Box::leak(Box::new(dir.keep()));
-std::env::set_var("AI_GATEWAY_DATA_DIR", &*leaked);
-let _ = crate::secrets::load_or_create_master_key();
-leaked.to_path_buf()
-})
+crate::secrets::test_support::shared_data_dir()
 }
 
 /// Unique store path for one Copilot admin test.
@@ -6743,21 +6732,16 @@ fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
     /// with the same 400 shape as a guard rejection (invalid base_url).
     #[tokio::test]
     async fn test_connection_unparseable_base_url_fails_closed() {
-        // Isolate the OAuth token store so seeding a session never touches the
-        // operator's real ai-gateway data directory.
-        let data_dir = std::env::temp_dir().join(format!(
-            "obey-admin-oauth-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&data_dir).unwrap();
-        std::env::set_var("AI_GATEWAY_DATA_DIR", &data_dir);
+        // Private secrets dir: the session seeded below is persisted to the
+        // fixed `oauth_tokens.enc` path, which every other test's
+        // `GatewayServer::new` would otherwise load from the shared dir.
+        let data_dir = crate::secrets::test_support::scoped_data_dir();
         let mut config = test_config_with_auth(false);
         config.providers[0].auth_method = Some("oauth".to_string());
         config.providers[0].codex_base_url_override = Some("::::not a url::::".to_string());
         let server = crate::gateway::GatewayServer::new(config, None)
             .await
             .unwrap();
-        std::env::remove_var("AI_GATEWAY_DATA_DIR");
 
         // Seed an authenticated OAuth session so the handler passes the oauth
         // checks and reaches the URL guard.
@@ -6789,7 +6773,7 @@ fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "invalid base_url");
 
-        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(data_dir.path());
     }
 
     /// T5 (R1): OpenOptIn middleware pin — explicit `security_mode:

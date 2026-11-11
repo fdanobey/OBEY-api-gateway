@@ -9,7 +9,8 @@ const APP_DIR_NAME: &str = "ai-gateway";
 /// Explicit override for the secrets/master-key directory. Recommended for
 /// containers (Docker) where `HOME`/`XDG_CONFIG_HOME`/`APPDATA` are unset;
 /// point it at a mounted volume so the master key (and encrypted secrets)
-/// persist across restarts.
+/// persist across restarts. Not consulted by unit tests (see `test_support`).
+#[cfg(not(test))]
 const DATA_DIR_ENV: &str = "AI_GATEWAY_DATA_DIR";
 const MASTER_KEY_FILE: &str = "master.key";
 const ENCRYPTED_PREFIX: &str = "enc-v1:";
@@ -37,10 +38,12 @@ pub enum SecretError {
 }
 
 pub fn load_or_create_master_key() -> Result<[u8; KEY_SIZE], SecretError> {
-    let key_path = master_key_path()?;
+    load_or_create_master_key_at(&master_key_path()?)
+}
 
+fn load_or_create_master_key_at(key_path: &PathBuf) -> Result<[u8; KEY_SIZE], SecretError> {
     if key_path.exists() {
-        return read_master_key(&key_path);
+        return read_master_key(key_path);
     }
 
     if let Some(parent) = key_path.parent() {
@@ -51,10 +54,10 @@ pub fn load_or_create_master_key() -> Result<[u8; KEY_SIZE], SecretError> {
     let mut key = [0u8; KEY_SIZE];
     SysRng.try_fill_bytes(&mut key).expect("OS RNG failed while generating master key");
 
-    fs::write(&key_path, STANDARD.encode(key))
+    fs::write(key_path, STANDARD.encode(key))
         .map_err(|e| SecretError::WriteMasterKey(e.to_string()))?;
 
-    set_owner_only_permissions(&key_path)
+    set_owner_only_permissions(key_path)
         .map_err(|e| SecretError::WriteMasterKey(e.to_string()))?;
 
     Ok(key)
@@ -202,7 +205,22 @@ pub(crate) fn storage_dir_path() -> Result<PathBuf, SecretError> {
 /// 4. `$HOME/.config/ai-gateway`
 /// 5. `./.ai-gateway` relative to the current working directory (fallback so
 ///    headless/container environments without HOME never hard-fail)
+///
+/// Unit-test builds skip this resolution entirely and use
+/// [`test_support::current_data_dir`].
 pub(crate) fn storage_dir() -> Result<PathBuf, SecretError> {
+    #[cfg(test)]
+    {
+        Ok(test_support::current_data_dir())
+    }
+    #[cfg(not(test))]
+    {
+        profile_storage_dir()
+    }
+}
+
+#[cfg(not(test))]
+fn profile_storage_dir() -> Result<PathBuf, SecretError> {
     let appdata = if cfg!(target_os = "windows") {
         std::env::var("APPDATA").ok()
     } else {
@@ -286,6 +304,85 @@ pub(crate) fn set_owner_only_permissions(path: &PathBuf) -> std::io::Result<()> 
 #[cfg(not(unix))]
 pub(crate) fn set_owner_only_permissions(_path: &PathBuf) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Secrets-directory isolation for unit tests.
+///
+/// In `cfg(test)` builds [`storage_dir`] never reads `AI_GATEWAY_DATA_DIR`
+/// or the user profile, so no test touches the operator's real master key
+/// or OAuth sessions, and no test mutates the process-global environment
+/// (parallel tests used to repoint `AI_GATEWAY_DATA_DIR` under each other,
+/// which surfaced as `DecryptFailed` and lost Copilot sessions).
+///
+/// Every test shares [`shared_data_dir`]; credential files inside it need
+/// unique names. A test that persists to a fixed default path (e.g.
+/// `oauth_tokens.enc`, which every `GatewayServer::new` loads) takes a
+/// private directory with [`scoped_data_dir`] instead.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{load_or_create_master_key_at, MASTER_KEY_FILE};
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    thread_local! {
+        static SCOPED_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Directory [`super::storage_dir`] resolves to on the calling thread.
+    pub(crate) fn current_data_dir() -> PathBuf {
+        SCOPED_DIR
+            .with(|scoped| scoped.borrow().clone())
+            .unwrap_or_else(|| shared_data_dir().to_path_buf())
+    }
+
+    /// Process-wide temporary secrets directory used by every unit test.
+    pub(crate) fn shared_data_dir() -> &'static Path {
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        DIR.get_or_init(new_data_dir)
+    }
+
+    /// Kept (never deleted) temp dir with its master key already created:
+    /// `load_or_create_master_key` is check-then-create, so concurrent first
+    /// users would otherwise race and encrypt under different keys.
+    fn new_data_dir() -> PathBuf {
+        let dir = tempfile::Builder::new()
+            .prefix("obey-test-secrets-")
+            .tempdir()
+            .expect("create test secrets dir")
+            .keep();
+        load_or_create_master_key_at(&dir.join(MASTER_KEY_FILE)).expect("create test master key");
+        dir
+    }
+
+    /// Private secrets directory for the current thread until the guard
+    /// drops. Covers a `#[tokio::test]` body, whose default current-thread
+    /// runtime also runs every task it spawns on this thread; work moved to
+    /// other threads (`spawn_blocking`, multi-thread runtimes) still sees
+    /// [`shared_data_dir`].
+    pub(crate) fn scoped_data_dir() -> ScopedDataDir {
+        let dir = new_data_dir();
+        let previous = SCOPED_DIR.with(|scoped| scoped.replace(Some(dir.clone())));
+        ScopedDataDir { dir, previous }
+    }
+
+    pub(crate) struct ScopedDataDir {
+        dir: PathBuf,
+        previous: Option<PathBuf>,
+    }
+
+    impl ScopedDataDir {
+        pub(crate) fn path(&self) -> &Path {
+            &self.dir
+        }
+    }
+
+    impl Drop for ScopedDataDir {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            SCOPED_DIR.with(|scoped| *scoped.borrow_mut() = previous);
+        }
+    }
 }
 
 #[cfg(test)]

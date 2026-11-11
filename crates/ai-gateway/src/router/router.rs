@@ -20526,15 +20526,7 @@ mod property_tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         fn secure_dir() -> &'static std::path::Path {
-            use std::sync::OnceLock;
-            static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
-            DIR.get_or_init(|| {
-                let dir = tempfile::tempdir().expect("temp secure dir");
-                let leaked = Box::leak(Box::new(dir.keep()));
-                std::env::set_var("AI_GATEWAY_DATA_DIR", &*leaked);
-                let _ = crate::secrets::load_or_create_master_key();
-                leaked.to_path_buf()
-            })
+            crate::secrets::test_support::shared_data_dir()
         }
 
         fn unique_store(tag: &str) -> CopilotTokenStore {

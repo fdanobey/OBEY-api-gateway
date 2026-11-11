@@ -53,8 +53,9 @@ panic = "abort"
 [profile.test]
 # ai-gateway itself is ~8.5 MB of source: at opt-level 2 one rustc for its
 # test harness needed ~8 GB and >12 min. opt-level 1 is the floor: at 0 the
-# request-handler futures overflow the 2 MB test-thread stack. Dependencies
-# (compiled once and cached) stay optimised below.
+# request-handler futures overflow the 2 MiB test-thread stack and the
+# performance.rs debug-build gate fails. Dependencies (compiled once and
+# cached) stay optimised below.
 opt-level = 1
 debug = "line-tables-only"
 incremental = true

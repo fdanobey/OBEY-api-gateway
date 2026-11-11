@@ -68,29 +68,12 @@ use super::store::CopilotTokenStore;
 
 /// Hermetic secure-storage dir shared by the Copilot lib tests.
 ///
-/// `secrets::storage_dir()` resolves `AI_GATEWAY_DATA_DIR` on every
-/// call, so pointing it at a process-wide temp dir exactly once (before
-/// any `save`/`load` runs) isolates the master key from the developer
-/// machine. Each test then uses its own unique file name inside the
-/// dir, so parallel tests never share a credential file.
+/// The shared unit-test secrets dir (`secrets::test_support`), isolated
+/// from the developer machine with its master key already created. Each
+/// test uses its own unique file name inside it, so parallel tests never
+/// share a credential file.
 pub(crate) fn secure_dir() -> &'static std::path::Path {
-use std::sync::OnceLock;
-static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
-DIR.get_or_init(|| {
-let dir = tempfile::tempdir().expect("temp secure dir");
-// Leak the buffer so the path stays valid for the process
-// lifetime; the OS reclaims temp content on reboot and these
-// are throwaway test keys.
-let leaked = Box::leak(Box::new(dir.keep()));
-std::env::set_var("AI_GATEWAY_DATA_DIR", &*leaked);
-// Create the master key eagerly while still inside the once
-// init: `load_or_create_master_key()` has check-then-create
-// semantics, so letting concurrent tests race the first
-// `save()` could regenerate the key under a load and fail
-// decryption.
-let _ = crate::secrets::load_or_create_master_key();
-leaked.to_path_buf()
-})
+crate::secrets::test_support::shared_data_dir()
 }
 
 /// Unique credential store inside the shared secure dir for one test,

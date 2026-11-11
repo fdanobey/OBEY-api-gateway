@@ -3822,34 +3822,13 @@ mod tests {
 
 // ---- github-copilot-oauth-provider, task 9 gateway wiring ---------
 
-/// Serializes the copilot wiring tests: `AI_GATEWAY_DATA_DIR` is
-/// process-global and sibling admin tests run in parallel, so each
-/// test holds this lock for its whole body (same pattern as the
-/// admin oauth tests' `ENV_LOCK`).
-static COPILOT_WIRING_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Point `AI_GATEWAY_DATA_DIR` at a leaked (kept) temp dir, create the
-/// master key, and return the dir path. `keep()` ensures the env var
-/// never dangles at a deleted directory mid-suite.
-fn copilot_wiring_secure_dir(guard: &std::sync::MutexGuard<'static, ()>) -> std::path::PathBuf {
-    let _ = guard;
-    let dir = tempfile::tempdir().expect("temp data dir").keep();
-    std::env::set_var("AI_GATEWAY_DATA_DIR", &dir);
-    let _ = crate::secrets::load_or_create_master_key();
-    dir
-}
+// Storage (master key + copilot store) is the shared unit-test secrets
+// dir (`secrets::test_support`), so these tests need no env setup.
 
 /// Copilot catalog construction: attached when a github-copilot
 /// provider exists + master key available; absent otherwise.
 #[tokio::test]
 async fn copilot_catalog_attached_when_provider_configured() {
-    let _guard = COPILOT_WIRING_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Isolate storage (master key + copilot store) like the router
-    // copilot tests.
-    let _dir = copilot_wiring_secure_dir(&_guard);
-
         let mut config = minimal_config();
         config.providers.push(Provider {
             name: "copilot-test".to_string(),
@@ -3909,11 +3888,6 @@ async fn copilot_catalog_attached_when_provider_configured() {
 /// No github-copilot provider → no catalog (nothing to sync).
 #[tokio::test]
 async fn copilot_catalog_absent_without_copilot_provider() {
-    let _guard = COPILOT_WIRING_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _dir = copilot_wiring_secure_dir(&_guard);
-
         let mut config = minimal_config();
         let storage_dir = std::env::temp_dir().join(format!(
             "obey-gw-copilot-none-{}",
@@ -3941,10 +3915,7 @@ async fn models_list_includes_enabled_copilot_catalog_models() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let _guard = COPILOT_WIRING_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let dir = copilot_wiring_secure_dir(&_guard);
+    let dir = crate::secrets::test_support::shared_data_dir();
 
         // Catalog upstream: one enabled + one disabled entry.
         let upstream = MockServer::start().await;

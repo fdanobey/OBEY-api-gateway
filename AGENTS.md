@@ -41,8 +41,9 @@ Every `GatewayServer::new` opens SQLite databases. Tests use `common::isolate_da
 
 - Integration tests compile into one binary, `tests/suite.rs` (`autotests = false`). A new `tests/foo.rs` must be declared there as `mod foo;` (it reaches helpers with `use crate::common;`); `every_test_file_is_compiled` fails otherwise. Run one file with `cargo test -p ai-gateway --test suite foo::`.
 - Only files that mutate process-global state another file depends on get their own `[[test]]` target (the `github_copilot_*` files set `AI_GATEWAY_DATA_DIR`).
+- Library unit tests never set `AI_GATEWAY_DATA_DIR`: in `cfg(test)` builds `secrets::storage_dir()` resolves to `secrets::test_support::shared_data_dir()` (one temp dir per process, master key pre-created). Use unique credential file names in it; a test that persists to a fixed default path (`oauth_tokens.enc`, `copilot_tokens.enc`) takes `test_support::scoped_data_dir()` for its body.
 - `src/main.rs` uses the `ai_gateway` library; never re-declare library modules with `mod` there (that compiled the crate twice and ran every unit test twice).
-- The test profile builds `ai-gateway` at `opt-level = 0` and dependencies at `opt-level = 2` (root `Cargo.toml`).
+- The test profile builds `ai-gateway` at `opt-level = 1` and dependencies at `opt-level = 2` (root `Cargo.toml`). Do not raise it back to 2 (≈8 GB per rustc, the OOM cause) or drop it to 0 (stack overflows in `anthropic_front_door_streaming`, `performance.rs` gate fails).
 - `Qdrant::from_url(..).build()` runs a blocking health check; on Windows a refused loopback connect costs ~2 s. Test clients use `.skip_compatibility_check()`.
 
 ## Non-Obvious Patterns
