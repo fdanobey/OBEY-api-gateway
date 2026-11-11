@@ -189,6 +189,8 @@ The hosted NVIDIA catalog is volatile, so the gateway ships a small maintained f
 
 Maintainers synchronize the fallback with [`scripts/sync-nvidia-nim-fallback.ps1`](../scripts/sync-nvidia-nim-fallback.ps1). The weekly GitHub Actions workflow requires the repository secret `NVIDIA_API_KEY`; it confirms retired/unreachable entries in two consecutive probes before opening a replacement PR. The scope is the hosted catalog at `https://integrate.api.nvidia.com/v1`, not the self-host NIM Support Matrix.
 
+Capacity metadata ingested from upstream `/v1/models` responses — including provider aliases such as vLLM's `max_model_len` — is covered in [Models Endpoint Metadata](Models-Endpoint-Metadata).
+
 ---
 
 ## vLLM

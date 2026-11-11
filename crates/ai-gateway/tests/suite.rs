@@ -63,6 +63,7 @@ mod loop_detection_simhash;
 mod loop_detection_vk_overrides;
 mod memory_enhancement_integration;
 mod mock_providers;
+mod models_context_metadata;
 mod pass_through_routes;
 mod performance;
 mod prompt_cache_routing;

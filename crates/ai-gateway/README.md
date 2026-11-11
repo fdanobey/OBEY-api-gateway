@@ -292,6 +292,7 @@ Copilot responses carry `x-ratelimit-*` headers, which the gateway parses into t
 | `POST` | `/v1/completions` | Legacy completions |
 | `POST` | `/v1/embeddings` | Embeddings |
 | `GET` | `/v1/models` | List available models |
+| `GET` | `/v1/models/{model_id}` | Retrieve one model entry (404 unknown/hidden) |
 | `POST` | `/v1/images/generations` | Image generation |
 | `POST` | `/v1/audio/transcriptions` | Audio transcription |
 | `POST` | `/v1/audio/translations` | Audio translation |
@@ -301,6 +302,8 @@ Copilot responses carry `x-ratelimit-*` headers, which the gateway parses into t
 | `*` | `/v1/fine_tuning/**` | Fine-tuning API passthrough |
 
 All `/v1/*` endpoints are OpenAI-compatible. Model discovery normally reflects configured groups and provider entries. NVIDIA NIM additionally ships a small maintained fallback catalog that is used only when its hosted `/v1/models` endpoint fails or returns no models; explicit `manual_models` values are merged first as overrides.
+
+`/v1/models` entries expose optional `context_window` and `max_completion_tokens` capacity fields. Group entries advertise the MAX over enabled candidates' positive declared windows; per-model entries use the model's declared `context_window`, with the first declaration winning when a model appears in multiple groups. Unknown capacity is omitted. During upstream ingestion from OpenAI-compatible `/models` responses, the aliases `context_length` (OpenRouter), `max_model_len` (vLLM) and `max_output_tokens` (LiteLLM, mapped to `max_completion_tokens`) are accepted.
 
 The chat completions endpoint echoes request correlation through the `x-trace-id` response header. If the client provides `x-request-id` or `x-trace-id`, that value is reused; otherwise the gateway generates one.
 

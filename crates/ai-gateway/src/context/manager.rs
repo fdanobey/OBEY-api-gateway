@@ -396,6 +396,27 @@ mod tests {
     }
 
     #[test]
+    fn test_capability_cache_fed_from_openrouter_alias_fields() {
+        let json = r#"{"id":"openrouter/auto","object":"model","owned_by":"openrouter","context_length":200000,"max_output_tokens":8192}"#;
+        let model: Model =
+            serde_json::from_str(json).expect("OpenRouter-style payload should deserialize");
+
+        let caps = ModelCapabilities::from_model(&model)
+            .expect("alias-derived context_window should yield capabilities");
+        assert_eq!(caps.model_id, "openrouter/auto");
+        assert_eq!(caps.context_window, 200000);
+        assert_eq!(caps.max_completion_tokens, Some(8192));
+
+        let manager = ContextManager::new();
+        manager.store_capabilities(caps);
+        let cached = manager
+            .get_capabilities("openrouter/auto")
+            .expect("stored capabilities should be readable before TTL expiry");
+        assert_eq!(cached.context_window, 200000);
+        assert_eq!(cached.max_completion_tokens, Some(8192));
+    }
+
+    #[test]
     fn test_context_length_error_detection() {
         let manager = ContextManager::new();
 

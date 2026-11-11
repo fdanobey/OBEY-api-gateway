@@ -1,4 +1,5 @@
 pub mod handlers;
+pub mod models_metadata;
 pub mod telemetry_seam;
 
 use crate::telemetry::exporter::TelemetryExporter;
@@ -721,8 +722,11 @@ copilot_catalog,
             // Audio (Req 2.5)
             .route("/v1/audio/transcriptions", post(audio_transcriptions))
             .route("/v1/audio/translations", post(audio_translations))
-            // Models (Req 2.6, 2.12)
+            // Models (Req 2.6, 2.12). Catch-all `{*model_id}` so
+            // slash-containing ids (NVIDIA NIM `meta/llama-3.1-70b-instruct`)
+            // retrieve correctly; no other `/v1/models/...` subroutes exist.
             .route("/v1/models", get(list_models))
+            .route("/v1/models/{*model_id}", get(get_model))
             // Assistants (Req 2.7)
             .route(
                 "/v1/assistants",

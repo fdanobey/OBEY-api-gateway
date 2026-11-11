@@ -14,6 +14,7 @@
 - [Assistants & Responses API](Assistants-and-Responses-API)
 - [Anthropic Messages Front Door](Anthropic-Messages-Front-Door)
 - [Streaming](Streaming)
+- [Models Endpoint Metadata](Models-Endpoint-Metadata)
 - [Caching](Caching)
 - [Token Compression](Token-Compression)
 - [Tool Definition Compression](Tool-Definition-Compression)

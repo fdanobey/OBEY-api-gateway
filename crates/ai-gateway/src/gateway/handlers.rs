@@ -12631,104 +12631,32 @@ pub async fn list_models(
             .is_some_and(|q| q.split('&').any(|pair| pair == "beta=true"));
 
     let config = state.config.read().await;
-    let mut all_models: Vec<Model> = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
 
-    // List model group names first so clients can target groups directly
-    for group in &config.model_groups {
-        if seen_ids.insert(group.name.clone()) {
-            all_models.push(Model {
-                id: group.name.clone(),
-                object: "model".to_string(),
-                owned_by: "gateway".to_string(),
-                created: None,
-                context_window: None,
-                max_completion_tokens: None,
-                supports_vision: false,
-            });
+    // Pre-fetch the Copilot catalog models (async read) before entry
+    // building so the shared builder stays a pure sync function.
+    let copilot_models: Vec<Model> = if config
+        .providers
+        .iter()
+        .any(|p| p.provider_type == "github-copilot")
+    {
+        match &state.copilot_catalog {
+            Some(catalog) => catalog.enabled_models().await,
+            None => Vec::new(),
         }
-    }
+    } else {
+        Vec::new()
+    };
 
-    // Also list individual model names for backward compatibility
-    for group in &config.model_groups {
-        for pm in &group.models {
-            if seen_ids.insert(pm.model.clone()) {
-                all_models.push(Model {
-                    id: pm.model.clone(),
-                    object: "model".to_string(),
-                    owned_by: pm.provider.clone(),
-                    created: None,
-                    context_window: None,
-                    max_completion_tokens: None,
-                    supports_vision: false,
-                });
-            }
-        }
-    }
-
-    // Include manually specified models from provider configs first, then add
-    // the NVIDIA NIM built-in fallback. The existing dedup preserves manual
-    // entries as explicit overrides.
-    for provider in &config.providers {
-        for model_id in &provider.manual_models {
-            if seen_ids.insert(model_id.clone()) {
-                all_models.push(Model {
-                    id: model_id.clone(),
-                    object: "model".to_string(),
-                    owned_by: provider.name.clone(),
-                    created: None,
-                    context_window: None,
-                    max_completion_tokens: None,
-                    supports_vision: false,
-                });
-            }
-        }
-
-        if provider.provider_type == "nvidia_nim" {
-            for mut model in crate::providers::nvidia_nim::fallback_models() {
-                model.owned_by = provider.name.clone();
-                if seen_ids.insert(model.id.clone()) {
-                    all_models.push(model);
-                }
-            }
-        }
-    }
-
-    // GitHub Copilot catalog models (github-copilot-oauth-provider,
-    // Req 5.2 / task 9 wiring): when a `github-copilot` provider
-    // exists and the catalog sync is attached, aggregate the
-    // entitlement-filtered enabled models. Empty until the first
-    // successful fetch (never blocks, never errors).
-    if config.providers.iter().any(|p| p.provider_type == "github-copilot") {
-        if let Some(catalog) = &state.copilot_catalog {
-            for model in catalog.enabled_models().await {
-                if seen_ids.insert(model.id.clone()) {
-                    all_models.push(model);
-                }
-            }
-        }
-    }
-
-    // When the caller authenticated with a virtual key that has a model_access
-    // restriction, filter the list to only models/groups in the allowed set.
-    // A permitted model group name also grants visibility to all individual
-    // models within that group.
-    if let Some(ref authenticated) = authenticated_key {
-        if let Some(ref allowed) = authenticated.model_access {
-            // Build the expanded set: explicit allowed entries + all individual
-            // model IDs belonging to allowed model groups.
-            let mut visible: std::collections::HashSet<&str> =
-                allowed.iter().map(|s| s.as_str()).collect();
-            for group in &config.model_groups {
-                if allowed.iter().any(|a| a == &group.name) {
-                    for pm in &group.models {
-                        visible.insert(&pm.model);
-                    }
-                }
-            }
-            all_models.retain(|m| visible.contains(m.id.as_str()));
-        }
-    }
+    // Shared entry pipeline (spec models-list-context-metadata):
+    // groups → group models → manual models → NIM fallback → Copilot
+    // catalog, capacity attached from config, then the virtual-key
+    // model_access visibility filter — one pipeline for the list and
+    // retrieve endpoints.
+    let all_models = crate::gateway::models_metadata::build_models_entries(
+        authenticated_key.as_ref(),
+        &config,
+        &copilot_models,
+    );
 
     if anthropic_shape {
         let data: Vec<serde_json::Value> = all_models
@@ -12751,6 +12679,66 @@ pub async fn list_models(
     };
 
     Json(response).into_response()
+}
+
+/// Retrieve a single model entry — GET /v1/models/{model_id} (spec
+/// models-list-context-metadata).
+///
+/// Runs the same shared pipeline as `list_models` (groups → group models →
+/// manual models → NIM fallback → Copilot catalog, capacity attached, then
+/// the virtual-key `model_access` visibility filter) and selects the first
+/// entry whose id equals the path param. Group entries are emitted before
+/// per-model entries, so a group id resolves to the group aggregate entry.
+///
+/// OpenAI-shape only (the bare model object, no `data` wrapper): no
+/// `anthropic-version` branch here. Unknown ids and ids hidden by the
+/// virtual-key filter are indistinguishable — both 404 via the shared
+/// error-json helper.
+pub async fn get_model(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    // Extract the authenticated key from request extensions (set by the vk
+    // auth middleware when a valid virtual key is presented).
+    let authenticated_key = request.extensions().get::<AuthenticatedKey>().cloned();
+
+    let config = state.config.read().await;
+
+    // Pre-fetch the Copilot catalog models (async read) before entry
+    // building so the shared builder stays a pure sync function.
+    let copilot_models: Vec<Model> = if config
+        .providers
+        .iter()
+        .any(|p| p.provider_type == "github-copilot")
+    {
+        match &state.copilot_catalog {
+            Some(catalog) => catalog.enabled_models().await,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Shared entry pipeline (spec models-list-context-metadata):
+    // groups → group models → manual models → NIM fallback → Copilot
+    // catalog, capacity attached from config, then the virtual-key
+    // model_access visibility filter — one pipeline for the list and
+    // retrieve endpoints.
+    let all_models = crate::gateway::models_metadata::build_models_entries(
+        authenticated_key.as_ref(),
+        &config,
+        &copilot_models,
+    );
+
+    match all_models.into_iter().find(|m| m.id == model_id) {
+        Some(model) => Json(model).into_response(),
+        None => responses_error(
+            StatusCode::NOT_FOUND,
+            &format!("The model '{model_id}' does not exist"),
+            "invalid_request_error",
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
