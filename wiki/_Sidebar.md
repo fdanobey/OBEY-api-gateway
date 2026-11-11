@@ -7,6 +7,12 @@
 - [Providers](Providers)
 ### Core Features
 - [Routing & Failover](Routing-and-Failover)
+- [Smart Model Routing](Smart-Routing)
+- [System One Classifiers (Jev & Laya)](Smart-Routing-Jev-Classifier)
+- [Cache-Aware Routing](Cache-Aware-Routing)
+- [Reasoning Compatibility](Reasoning-Compatibility)
+- [Assistants & Responses API](Assistants-and-Responses-API)
+- [Anthropic Messages Front Door](Anthropic-Messages-Front-Door)
 - [Streaming](Streaming)
 - [Caching](Caching)
 - [Token Compression](Token-Compression)
@@ -22,8 +28,8 @@
 - [OAuth & Codex](OAuth-and-Codex)
 - [GitHub Copilot Provider](GitHub-Copilot-Provider)
 ### Operations
-- [Admin Panel & Dashboard](Admin-Panel-and-Dashboard)
 - [OpenTelemetry Trace Export](OpenTelemetry-Trace-Export)
+- [Admin Panel & Dashboard](Admin-Panel-and-Dashboard)
 - [Security](Security)
 ---
 [GitHub Repository](https://github.com/fdanobey/OBEY-api-gateway) | [Releases](https://github.com/fdanobey/OBEY-api-gateway/releases)
