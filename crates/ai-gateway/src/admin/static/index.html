@@ -2303,6 +2303,11 @@ body.sec-banner-active{padding-top:3.2rem}
 <input type="number" id="mem-extract-min-turns" value="4" min="1" max="100" style="max-width:200px">
 <div class="hint">Minimum conversation turns before triggering extraction</div>
 </div>
+<div class="form-group">
+<label for="mem-extract-timeout">Extraction Timeout (seconds)</label>
+<input type="number" id="mem-extract-timeout" value="30" min="1" max="600" style="max-width:200px">
+<div class="hint">Wall-clock ceiling for one automatic extraction provider call (1–600)</div>
+</div>
 </fieldset>
 
 <fieldset><legend>Background Consolidation</legend>
@@ -7638,6 +7643,7 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
       setSelectOptions(document.getElementById('mem-extract-model'), '-- select provider first --', [], '');
     }
     document.getElementById('mem-extract-min-turns').value = mem.auto_extract_min_turns || 4;
+document.getElementById('mem-extract-timeout').value = mem.auto_extract_timeout_seconds || 30;
 document.getElementById('mem-consolidation-enabled').checked = !!mem.consolidation_enabled;
 document.getElementById('mem-consolidation-provider').value = mem.consolidation_provider || '';
 var consolEffProv = mem.consolidation_provider || mem.auto_extract_provider || '';
@@ -7673,6 +7679,7 @@ memLoadStats();
       auto_extract_provider: document.getElementById('mem-extract-provider').value.trim(),
       auto_extract_model: document.getElementById('mem-extract-model').value.trim(),
       auto_extract_min_turns: parseInt(document.getElementById('mem-extract-min-turns').value, 10) || 4,
+auto_extract_timeout_seconds: parseInt(document.getElementById('mem-extract-timeout').value, 10) || 30,
 consolidation_enabled: document.getElementById('mem-consolidation-enabled').checked,
 consolidation_provider: document.getElementById('mem-consolidation-provider').value.trim(),
 consolidation_model: document.getElementById('mem-consolidation-model').value.trim(),

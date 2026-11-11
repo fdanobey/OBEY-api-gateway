@@ -2141,10 +2141,15 @@ mod tests {
             .unwrap();
 
         config.memory.as_mut().unwrap().max_injection_tokens = 123;
+        config.memory.as_mut().unwrap().auto_extract_timeout_seconds = 90;
         server.reload_config(config.clone()).await.unwrap();
         let reloaded = server.state.memory_system.read().await.clone().unwrap();
         assert!(Arc::ptr_eq(&memory, &reloaded));
         assert!(reloaded.store.get_entry_by_id(entry.id).unwrap().is_some());
+        assert_eq!(
+            reloaded.extractor.set_provider_timeout(std::time::Duration::from_secs(90)),
+            std::time::Duration::from_secs(90)
+        );
 
         config.memory.as_mut().unwrap().database_path = directory
             .path()

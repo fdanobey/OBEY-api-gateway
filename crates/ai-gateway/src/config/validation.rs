@@ -2514,6 +2514,7 @@ model_groups:
             auto_extract_provider: " ".to_string(),
             auto_extract_model: String::new(),
             auto_extract_min_turns: 0,
+            auto_extract_timeout_seconds: 0,
             decay_schedule_hours: 0,
             max_memories_per_namespace: 0,
             ..Default::default()
@@ -2536,6 +2537,7 @@ model_groups:
             "memory.auto_extract_provider",
             "memory.auto_extract_model",
             "memory.auto_extract_min_turns",
+            "memory.auto_extract_timeout_seconds",
             "memory.decay_schedule_hours",
             "memory.max_memories_per_namespace",
         ] {

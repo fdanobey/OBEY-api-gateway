@@ -10,6 +10,7 @@ use super::InjectionStrategy;
 const MAX_DATABASE_PATH_CHARS: usize = 4_096;
 const MAX_INJECTION_TOKENS: u32 = 10_000;
 const MAX_AUTO_EXTRACT_MIN_TURNS: u32 = 100;
+const MAX_AUTO_EXTRACT_TIMEOUT_SECONDS: u64 = 600;
 const MAX_DECAY_SCHEDULE_HOURS: u32 = 8_760;
 const MAX_MEMORIES_PER_NAMESPACE: u32 = 100_000;
 const MAX_QDRANT_COLLECTION_CHARS: usize = 255;
@@ -26,6 +27,10 @@ pub struct MemoryConfig {
     pub auto_extract_provider: String,
     pub auto_extract_model: String,
     pub auto_extract_min_turns: u32,
+    /// Wall-clock ceiling for one automatic extraction provider call. On
+    /// timeout the extraction is discarded and logged; the request itself
+    /// already completed. Range 1..=600s.
+    pub auto_extract_timeout_seconds: u64,
     pub decay_schedule_hours: u32,
     pub consolidation_enabled: bool,
     pub consolidation_provider: String,
@@ -49,6 +54,7 @@ impl Default for MemoryConfig {
             auto_extract_provider: String::new(),
             auto_extract_model: String::new(),
             auto_extract_min_turns: 4,
+            auto_extract_timeout_seconds: 30,
             decay_schedule_hours: 24,
             consolidation_enabled: false,
             consolidation_provider: String::new(),
@@ -115,6 +121,13 @@ impl MemoryConfig {
             self.auto_extract_min_turns,
             1,
             MAX_AUTO_EXTRACT_MIN_TURNS,
+            &mut errors,
+        );
+        validate_u64_range(
+            "auto_extract_timeout_seconds",
+            self.auto_extract_timeout_seconds,
+            1,
+            MAX_AUTO_EXTRACT_TIMEOUT_SECONDS,
             &mut errors,
         );
         validate_u32_range(
@@ -493,6 +506,21 @@ fn validate_char_range(
     }
 }
 
+fn validate_u64_range(
+    field: &str,
+    value: u64,
+    min: u64,
+    max: u64,
+    errors: &mut Vec<MemoryConfigError>,
+) {
+    if !(min..=max).contains(&value) {
+        errors.push(MemoryConfigError::new(
+            field,
+            format!("has value {value}; expected a value in {min}..={max}"),
+        ));
+    }
+}
+
 fn validate_u32_range(
     field: &str,
     value: u32,
@@ -683,6 +711,7 @@ mod tests {
         assert!(config.auto_extract_provider.is_empty());
         assert!(config.auto_extract_model.is_empty());
         assert_eq!(config.auto_extract_min_turns, 4);
+        assert_eq!(config.auto_extract_timeout_seconds, 30);
         assert_eq!(config.decay_schedule_hours, 24);
         assert_eq!(config.max_memories_per_namespace, 1_000);
         assert!(!config.allow_sensitive_storage);
@@ -699,6 +728,11 @@ mod tests {
             let config = MemoryConfig {
                 max_injection_tokens: tokens,
                 auto_extract_min_turns: if tokens == 0 { 1 } else { 100 },
+                auto_extract_timeout_seconds: if tokens == 0 {
+                    1
+                } else {
+                    MAX_AUTO_EXTRACT_TIMEOUT_SECONDS
+                },
                 decay_schedule_hours: if tokens == 0 { 1 } else { 8_760 },
                 max_memories_per_namespace: if tokens == 0 { 1 } else { 100_000 },
                 ..MemoryConfig::default()
@@ -722,6 +756,13 @@ mod tests {
                 },
             ),
             (
+                "auto_extract_timeout_seconds",
+                MemoryConfig {
+                    auto_extract_timeout_seconds: MAX_AUTO_EXTRACT_TIMEOUT_SECONDS + 1,
+                    ..MemoryConfig::default()
+                },
+            ),
+            (
                 "decay_schedule_hours",
                 MemoryConfig {
                     decay_schedule_hours: 8_761,
@@ -732,6 +773,13 @@ mod tests {
                 "max_memories_per_namespace",
                 MemoryConfig {
                     max_memories_per_namespace: 100_001,
+                    ..MemoryConfig::default()
+                },
+            ),
+            (
+                "auto_extract_timeout_seconds",
+                MemoryConfig {
+                    auto_extract_timeout_seconds: 0,
                     ..MemoryConfig::default()
                 },
             ),
