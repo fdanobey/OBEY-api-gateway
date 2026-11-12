@@ -1,6 +1,6 @@
 [package]
 name = "ai-gateway"
-version = "0.7.10"
+version = "0.7.11"
 edition = "2021"
 build = "build.rs"
 # Integration tests compile into one binary (tests/suite.rs) instead of one
