@@ -2,7 +2,7 @@ use crate::active_requests::{ActivePhase, ActiveRequestHandle, StallReason};
 use crate::compression::{
     caveman::apply_caveman_output,
     config::CompressionConfig,
-    pipeline::{CompressionPipeline, CompressionRequestMetadata},
+    pipeline::{CompressionPipeline, CompressionRequestMetadata, CPU_OFFLOAD_MIN_BYTES},
     precompressed::{PrecompressedLoadStatus, PrecompressedManager},
     stats::CompressionStats,
     CompressiblePayload, CompressionContext,
@@ -38,9 +38,7 @@ use crate::router::retry_policy::{self, RetryDecision};
 use crate::smart_routing::budget_controller::BudgetController;
 use crate::smart_routing::systemone::client::{SystemOneCallError, SystemOneClient};
 use crate::smart_routing::systemone::discovery::{DiscoveryError, ModelDiscovery, ModelsFetcher};
-use crate::smart_routing::systemone::models::{
-    ModelsListing, SystemOneRequest, SystemOneResponse,
-};
+use crate::smart_routing::systemone::models::{ModelsListing, SystemOneRequest, SystemOneResponse};
 use crate::smart_routing::systemone::{ConfidenceSelection, SystemOneFamily};
 use crate::smart_routing::{
     PinnedRoutingContext, RoutingDiagnostics, RoutingPlanOutcome, RoutingPlanningError,
@@ -423,11 +421,8 @@ struct DecisionModelsFetcher<'a> {
 
 impl ModelsFetcher for DecisionModelsFetcher<'_> {
     fn fetch(&self) -> Result<ModelsListing, String> {
-        futures::executor::block_on(
-            self.client
-                .list_models_with(self.api_key, self.timeout),
-        )
-        .map_err(|error| error.to_string())
+        futures::executor::block_on(self.client.list_models_with(self.api_key, self.timeout))
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -504,9 +499,9 @@ fn decision_terminal_error(
                 status_code: Some(*status),
             })
         }
-        SystemOneCallError::Unavailable { status, message, .. }
-            if status_is_upstream_bad_request(*status) =>
-        {
+        SystemOneCallError::Unavailable {
+            status, message, ..
+        } if status_is_upstream_bad_request(*status) => {
             let detail = match message {
                 Some(body) => format!("{body} (HTTP 400)"),
                 None => format!(
@@ -857,10 +852,10 @@ pub struct Router {
     /// time the shortfall is detectable, so there is nothing left to retry.
     /// In-memory only — resets on process restart.
     degenerate_stream_combos: Arc<std::sync::RwLock<HashSet<String>>>,
-/// Prompt-cache sticky routing affinity (prefix hash → last successful
-/// provider/model, TTL-bounded). Zero-TTL when cache-aware routing is
-/// disabled, so lookups always miss (Req 1.4, prompt-cache-routing spec).
-sticky_cache: StickyCache,
+    /// Prompt-cache sticky routing affinity (prefix hash → last successful
+    /// provider/model, TTL-bounded). Zero-TTL when cache-aware routing is
+    /// disabled, so lookups always miss (Req 1.4, prompt-cache-routing spec).
+    sticky_cache: StickyCache,
     /// Provider-budget alert hook (budget-alerts-unified-webhooks, Task 5):
     /// threshold evaluation + `budget.reset` events for provider scopes.
     /// `None` until gateway startup wires it (built-once notifier); every
@@ -1291,16 +1286,16 @@ impl Router {
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
-        provider_budget_alerts: None,
-        copilot_manager: None,
-        copilot_catalog: None,
-        copilot_usage_tracker: None,
-        decision_clients: Arc::new(DashMap::new()),
-        decision_discovery: Arc::new(DashMap::new()),
+            provider_budget_alerts: None,
+            copilot_manager: None,
+            copilot_catalog: None,
+            copilot_usage_tracker: None,
+            decision_clients: Arc::new(DashMap::new()),
+            decision_discovery: Arc::new(DashMap::new()),
+        }
     }
-}
 
-/// Create a new Router with explicit context configuration
+    /// Create a new Router with explicit context configuration
     #[allow(dead_code)]
     pub fn with_context_config(
         config: Arc<RwLock<Config>>,
@@ -1344,15 +1339,15 @@ impl Router {
             search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-        sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
-        provider_budget_alerts: None,
-        copilot_manager: None,
-        copilot_catalog: None,
-        copilot_usage_tracker: None,
-        decision_clients: Arc::new(DashMap::new()),
-        decision_discovery: Arc::new(DashMap::new()),
+            sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
+            provider_budget_alerts: None,
+            copilot_manager: None,
+            copilot_catalog: None,
+            copilot_usage_tracker: None,
+            decision_clients: Arc::new(DashMap::new()),
+            decision_discovery: Arc::new(DashMap::new()),
+        }
     }
-}
 
     /// Attach an [`OAuthManager`](crate::oauth::OAuthManager) so providers
     /// configured with `auth_method: oauth` can resolve a Bearer access token
@@ -1647,24 +1642,26 @@ impl Router {
         }
 
         let counter = crate::compression::token_counter::TokenCounter::new();
+        let before_tokens = counter.count_per_message(before_request);
         let before_owned = before_request
             .messages
             .iter()
             .enumerate()
-            .map(|(index, message)| {
+            .zip(&before_tokens)
+            .map(|((index, message), tokens)| {
                 let content = message.content_as_text();
-                let tokens = Self::message_token_count(&counter, before_request, message);
-                (index.to_string(), content, tokens)
+                (index.to_string(), content, *tokens as u32)
             })
             .collect::<Vec<_>>();
+        let after_tokens = counter.count_per_message(after_request);
         let after_owned = after_request
             .messages
             .iter()
             .enumerate()
-            .map(|(index, message)| {
+            .zip(&after_tokens)
+            .map(|((index, message), tokens)| {
                 let content = message.content_as_text();
-                let tokens = Self::message_token_count(&counter, after_request, message);
-                (index.to_string(), content, tokens)
+                (index.to_string(), content, *tokens as u32)
             })
             .collect::<Vec<_>>();
         let before = before_owned
@@ -1730,14 +1727,44 @@ impl Router {
         });
     }
 
-    fn message_token_count(
-        counter: &crate::compression::token_counter::TokenCounter,
-        request: &OpenAIRequest,
-        message: &Message,
-    ) -> u32 {
-        let mut one = request.clone();
-        one.messages = vec![message.clone()];
-        counter.count_request(&one)
+    fn refresh_precompressed_metadata(payload: &mut CompressiblePayload) {
+        let counter = crate::compression::token_counter::TokenCounter::new();
+        let model = payload.model.clone();
+        let wire_messages = payload
+            .messages
+            .iter()
+            .map(|message| Message {
+                role: message.role.clone(),
+                content: message.content.as_value().clone(),
+                extra: message.extra.clone(),
+            })
+            .collect::<Vec<_>>();
+        let request = OpenAIRequest {
+            model,
+            messages: wire_messages,
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: Default::default(),
+        };
+        // Marginal per-message tokens: the full single-message-request count
+        // minus the empty-request skeleton, computed once for all messages.
+        let skeleton = counter.count_request(&OpenAIRequest {
+            model: request.model.clone(),
+            messages: Vec::new(),
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: request.extra.clone(),
+        });
+        let skeleton = u64::from(skeleton);
+        for (message, tokens) in payload
+            .messages
+            .iter_mut()
+            .zip(counter.count_per_message(&request))
+        {
+            message.token_count = tokens.saturating_sub(skeleton).min(u32::MAX as u64) as u32;
+        }
     }
 
     fn load_precompressed_references(
@@ -1772,30 +1799,6 @@ impl Router {
         }
         payload.refresh_metadata();
         inserted_markers
-    }
-
-    fn refresh_precompressed_metadata(payload: &mut CompressiblePayload) {
-        let counter = crate::compression::token_counter::TokenCounter::new();
-        let model = payload.model.clone();
-        for message in &mut payload.messages {
-            let wire_message = Message {
-                role: message.role.clone(),
-                content: message.content.as_value().clone(),
-                extra: message.extra.clone(),
-            };
-            let mut request = OpenAIRequest {
-                model: model.clone(),
-                messages: vec![wire_message],
-                stream: false,
-                temperature: None,
-                max_tokens: None,
-                extra: Default::default(),
-            };
-            let with_message = counter.count_request(&request);
-            request.messages.clear();
-            let without_message = counter.count_request(&request);
-            message.token_count = with_message.saturating_sub(without_message);
-        }
     }
 
     fn replace_precompressed_value(
@@ -2126,34 +2129,32 @@ impl Router {
         // runs so the attempt-0 delay is explainable.
         let _routing_stall =
             ActiveRequestHandle::begin_stall_opt(active, StallReason::SmartRouting);
-        let (tier_group, overflow, decision, bypassed, diagnostics) = match self
-            .smart_routing_plan(request, &model_group)
-            .await?
-        {
-            Some(plan) => {
-                let mut tier_group = model_group.clone();
-                tier_group.models = plan.candidates;
-                let overflow = if plan.bypassed {
-                    Vec::new()
-                } else {
-                    plan.overflow
-                };
-                (
-                    tier_group,
-                    overflow,
-                    Some(plan.decision),
-                    plan.bypassed,
-                    plan.diagnostics,
-                )
-            }
-            None => (
-                model_group.clone(),
-                Vec::new(),
-                None,
-                true,
-                RoutingDiagnostics::default(),
-            ),
-        };
+        let (tier_group, overflow, decision, bypassed, diagnostics) =
+            match self.smart_routing_plan(request, &model_group).await? {
+                Some(plan) => {
+                    let mut tier_group = model_group.clone();
+                    tier_group.models = plan.candidates;
+                    let overflow = if plan.bypassed {
+                        Vec::new()
+                    } else {
+                        plan.overflow
+                    };
+                    (
+                        tier_group,
+                        overflow,
+                        Some(plan.decision),
+                        plan.bypassed,
+                        plan.diagnostics,
+                    )
+                }
+                None => (
+                    model_group.clone(),
+                    Vec::new(),
+                    None,
+                    true,
+                    RoutingDiagnostics::default(),
+                ),
+            };
 
         let mut providers = self.select_provider_order(&tier_group).await;
         // Cache-aware sticky routing (Req 1.2): promote the provider that
@@ -2493,12 +2494,10 @@ impl Router {
         }
         let prefix_hash = StickyCache::compute_prefix_hash(request);
         let usage = Some(extract_cache_usage(usage));
-        if let Some(previous_provider) = self.sticky_cache.repin(
-            prefix_hash,
-            provider.to_string(),
-            model.to_string(),
-            usage,
-        ) {
+        if let Some(previous_provider) =
+            self.sticky_cache
+                .repin(prefix_hash, provider.to_string(), model.to_string(), usage)
+        {
             debug!(
                 from_provider = %previous_provider,
                 to_provider = %provider,
@@ -2509,12 +2508,8 @@ impl Router {
             self.metrics.record_sticky_repin();
             return;
         }
-        self.sticky_cache.insert(
-            prefix_hash,
-            provider.to_string(),
-            model.to_string(),
-            usage,
-        );
+        self.sticky_cache
+            .insert(prefix_hash, provider.to_string(), model.to_string(), usage);
         debug!(provider = %provider, model = %model, prefix_hash, "sticky_recorded");
     }
 
@@ -2794,7 +2789,7 @@ impl Router {
         model: &str,
         duration: std::time::Duration,
         usage: &Usage,
-) -> f64 {
+    ) -> f64 {
         let cb_key = format!("{}:{}", provider, model);
         let cb = self.get_circuit_breaker(&cb_key).await;
         cb.record_success().await;
@@ -2954,59 +2949,59 @@ impl Router {
         if !crate::virtual_keys::budget::window_expired(&window, window_start, chrono::Utc::now()) {
             return false;
         }
-// Roll the durable window first (CAS on the window_start we read:
-// zero spend + new window_start only when no other writer advanced
-// it); a store failure downgrades to metrics-only rollover, never
-// fails the request.
-match store.reset_window(provider, window_start_epoch) {
-Ok(Some(outcome)) => {
-self.metrics.reset_provider_spend(provider);
-// Budget-reset webhook (budget-alerts-unified-webhooks,
-// Req 2.1): a prior window at/over the limit (the
-// provider had been budget-skipped) emits
-// `budget.reset(window_rollover)` with the NEW anchor.
-// Rides a spawned task — this method is on the request
-// path, so nothing synchronous is added (Req 1.10).
-// Only the CAS WINNER emits: `reset_window` returns
-// did_reset atomically with the anchor it stamped, so a
-// racing request whose CAS missed stays silent and the
-// winner uses exactly the anchor its own reset landed
-// (no post-hoc read-back that may belong to a later
-// reset).
-if outcome.did_reset && outcome.previous_spend >= budget_config.limit_usd {
-if let Some(alerts) = self.provider_budget_alerts.clone() {
-let provider = provider.to_string();
-let config = self.config.clone();
-let new_anchor = outcome.new_anchor;
-tokio::spawn(async move {
-alerts
-.note_provider_reset(
-&config,
-&provider,
-crate::webhooks::events::ResetSource::WindowRollover,
-new_anchor,
-)
-.await;
-});
-}
-}
-}
-Ok(None) => {
-// No durable row: nothing was rolled durably, but the
-// in-memory window check above passed — roll the metrics
-// atomics so the hot path still sees a fresh window.
-self.metrics.reset_provider_spend(provider);
-}
-Err(error) => {
-warn!(
-provider = %provider,
-error = %error,
-"Failed to persist provider budget window rollover; keeping in-memory spend (durable/in-memory stay consistent)"
-);
-}
-}
-true
-}
+        // Roll the durable window first (CAS on the window_start we read:
+        // zero spend + new window_start only when no other writer advanced
+        // it); a store failure downgrades to metrics-only rollover, never
+        // fails the request.
+        match store.reset_window(provider, window_start_epoch) {
+            Ok(Some(outcome)) => {
+                self.metrics.reset_provider_spend(provider);
+                // Budget-reset webhook (budget-alerts-unified-webhooks,
+                // Req 2.1): a prior window at/over the limit (the
+                // provider had been budget-skipped) emits
+                // `budget.reset(window_rollover)` with the NEW anchor.
+                // Rides a spawned task — this method is on the request
+                // path, so nothing synchronous is added (Req 1.10).
+                // Only the CAS WINNER emits: `reset_window` returns
+                // did_reset atomically with the anchor it stamped, so a
+                // racing request whose CAS missed stays silent and the
+                // winner uses exactly the anchor its own reset landed
+                // (no post-hoc read-back that may belong to a later
+                // reset).
+                if outcome.did_reset && outcome.previous_spend >= budget_config.limit_usd {
+                    if let Some(alerts) = self.provider_budget_alerts.clone() {
+                        let provider = provider.to_string();
+                        let config = self.config.clone();
+                        let new_anchor = outcome.new_anchor;
+                        tokio::spawn(async move {
+                            alerts
+                                .note_provider_reset(
+                                    &config,
+                                    &provider,
+                                    crate::webhooks::events::ResetSource::WindowRollover,
+                                    new_anchor,
+                                )
+                                .await;
+                        });
+                    }
+                }
+            }
+            Ok(None) => {
+                // No durable row: nothing was rolled durably, but the
+                // in-memory window check above passed — roll the metrics
+                // atomics so the hot path still sees a fresh window.
+                self.metrics.reset_provider_spend(provider);
+            }
+            Err(error) => {
+                warn!(
+                provider = %provider,
+                error = %error,
+                "Failed to persist provider budget window rollover; keeping in-memory spend (durable/in-memory stay consistent)"
+                );
+            }
+        }
+        true
+    }
 
     /// Detect and strip image content parts from messages when the target
     /// model does not support vision inputs.
@@ -3726,21 +3721,21 @@ true
     /// the lazy TTL eviction in `StickyCache::get`; called periodically
     /// by the gateway background task so dead conversations don't
     /// accumulate).
-pub fn evict_expired_sticky_entries(&self) {
-    self.sticky_cache.evict_expired();
-}
+    pub fn evict_expired_sticky_entries(&self) {
+        self.sticky_cache.evict_expired();
+    }
 
-/// Test/observability probe: the fresh sticky-affinity entry for a
-/// conversation prefix, if any. Computes the prefix hash the same way
-/// the routing path does (original client request).
-#[allow(dead_code)] // public accessor / test-only; unused in the binary build
-pub fn sticky_entry_for_request(
-    &self,
-    request: &OpenAIRequest,
-) -> Option<crate::router::sticky_cache::ProviderStickyEntry> {
-    self.sticky_cache
-        .get(StickyCache::compute_prefix_hash(request))
-}
+    /// Test/observability probe: the fresh sticky-affinity entry for a
+    /// conversation prefix, if any. Computes the prefix hash the same way
+    /// the routing path does (original client request).
+    #[allow(dead_code)] // public accessor / test-only; unused in the binary build
+    pub fn sticky_entry_for_request(
+        &self,
+        request: &OpenAIRequest,
+    ) -> Option<crate::router::sticky_cache::ProviderStickyEntry> {
+        self.sticky_cache
+            .get(StickyCache::compute_prefix_hash(request))
+    }
 
     fn provider_concurrency_limiter(
         &self,
@@ -3760,25 +3755,25 @@ pub fn sticky_entry_for_request(
                 limiter
             }
         };
-    limiter.update_limit(limit);
-    limiter
-}
+        limiter.update_limit(limit);
+        limiter
+    }
 
-/// Live active in-flight count for a provider, read from the provider
-/// concurrency registry (retry-failover-core-overhaul Req 4.5: the retry
-/// budget follows live active counts, not accumulated state).
-///
-/// Source: `ProviderConcurrencyLimiter::in_flight` — requests currently
-/// holding a provider slot (active). The limiter does not track queue
-/// depth (pending waiters) separately, so the active count is the live
-/// approximation used for budget admission. Sync std mutex lock, taken
-/// without any await point.
-fn provider_active_count(&self, provider_name: &str) -> u64 {
-    self.provider_concurrency_limiters
-        .get(provider_name)
-        .map(|limiter| limiter.in_flight() as u64)
-        .unwrap_or(0)
-}
+    /// Live active in-flight count for a provider, read from the provider
+    /// concurrency registry (retry-failover-core-overhaul Req 4.5: the retry
+    /// budget follows live active counts, not accumulated state).
+    ///
+    /// Source: `ProviderConcurrencyLimiter::in_flight` — requests currently
+    /// holding a provider slot (active). The limiter does not track queue
+    /// depth (pending waiters) separately, so the active count is the live
+    /// approximation used for budget admission. Sync std mutex lock, taken
+    /// without any await point.
+    fn provider_active_count(&self, provider_name: &str) -> u64 {
+        self.provider_concurrency_limiters
+            .get(provider_name)
+            .map(|limiter| limiter.in_flight() as u64)
+            .unwrap_or(0)
+    }
 
     /// Acquire one provider-wide in-flight request slot, giving up after `wait`.
     ///
@@ -4085,59 +4080,59 @@ fn provider_active_count(&self, provider_name: &str) -> u64 {
         }
     }
 
-/// Trim provider-supplied error text to a single short line so the
-/// dashboard cell stays readable.
-fn truncate_for_display(text: &str) -> String {
-    const MAX: usize = 140;
-    let one_line: String = text
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .take(MAX)
-        .collect();
-    if one_line.chars().count() == MAX {
-        format!("{}—…", one_line)
-    } else {
-        one_line
+    /// Trim provider-supplied error text to a single short line so the
+    /// dashboard cell stays readable.
+    fn truncate_for_display(text: &str) -> String {
+        const MAX: usize = 140;
+        let one_line: String = text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(MAX)
+            .collect();
+        if one_line.chars().count() == MAX {
+            format!("{}—…", one_line)
+        } else {
+            one_line
+        }
     }
-}
 
-/// Bounded Retry-After wait for the primary candidate (retry-failover-
-/// core-overhaul, Req 3.1-3.9). Pure eligibility check: returns the
-/// duration to wait when this 429 qualifies for the one-shot wait,
-/// `None` when today's behavior (cooldown + failover) must run.
-///
-/// Eligibility (Req 3.1-3.5): primary candidate, parseable Retry-After
-/// (`cooldown`, already parsed by the caller — never parsed twice),
-/// `upstream_retry_after_max_wait_ms > 0`, Retry-After within the cap,
-/// and the request has not waited before (caller-tracked flag). The
-/// cooldown must also be a real upstream signal (R4: the fabricated
-/// `default_rate_limit_cooldown_seconds` fallback is not a hint) and
-/// non-zero (R3: an explicit `Retry-After: 0` maps to cooldown +
-/// failover per the documented behavior, not a zero-second sleep).
-///
-/// Request-scoped gates (review findings R1/R2):
-/// - `has_prior_attempts`: primary-ness belongs to the REQUEST, not
-///   the dispatch. A failover re-entry (streaming → buffered
-///   `route_request_with_exclusions`) starts a fresh candidate list
-///   whose index 0 is a fallback; any attempt-ledger row (upstream
-///   sends + skips) proves the request already left its primary, so a
-///   non-primary 429 must fail over immediately (Req 3.2).
-/// - `max_retries_per_provider == 0`: the waited retry IS a
-///   same-provider retry; with none allowed the sleep would be dead
-///   time, so today's cooldown + failover runs instead.
-fn retry_after_wait_duration(
-    is_primary_candidate: bool,
-    waited_before: bool,
-    has_prior_attempts: bool,
-    max_retries_per_provider: u32,
-    max_wait_ms: u64,
-    cooldown: Duration,
-    cooldown_from_upstream: bool,
-) -> Option<Duration> {
-    if !is_primary_candidate
+    /// Bounded Retry-After wait for the primary candidate (retry-failover-
+    /// core-overhaul, Req 3.1-3.9). Pure eligibility check: returns the
+    /// duration to wait when this 429 qualifies for the one-shot wait,
+    /// `None` when today's behavior (cooldown + failover) must run.
+    ///
+    /// Eligibility (Req 3.1-3.5): primary candidate, parseable Retry-After
+    /// (`cooldown`, already parsed by the caller — never parsed twice),
+    /// `upstream_retry_after_max_wait_ms > 0`, Retry-After within the cap,
+    /// and the request has not waited before (caller-tracked flag). The
+    /// cooldown must also be a real upstream signal (R4: the fabricated
+    /// `default_rate_limit_cooldown_seconds` fallback is not a hint) and
+    /// non-zero (R3: an explicit `Retry-After: 0` maps to cooldown +
+    /// failover per the documented behavior, not a zero-second sleep).
+    ///
+    /// Request-scoped gates (review findings R1/R2):
+    /// - `has_prior_attempts`: primary-ness belongs to the REQUEST, not
+    ///   the dispatch. A failover re-entry (streaming → buffered
+    ///   `route_request_with_exclusions`) starts a fresh candidate list
+    ///   whose index 0 is a fallback; any attempt-ledger row (upstream
+    ///   sends + skips) proves the request already left its primary, so a
+    ///   non-primary 429 must fail over immediately (Req 3.2).
+    /// - `max_retries_per_provider == 0`: the waited retry IS a
+    ///   same-provider retry; with none allowed the sleep would be dead
+    ///   time, so today's cooldown + failover runs instead.
+    fn retry_after_wait_duration(
+        is_primary_candidate: bool,
+        waited_before: bool,
+        has_prior_attempts: bool,
+        max_retries_per_provider: u32,
+        max_wait_ms: u64,
+        cooldown: Duration,
+        cooldown_from_upstream: bool,
+    ) -> Option<Duration> {
+        if !is_primary_candidate
         || waited_before
         || has_prior_attempts
         || max_retries_per_provider == 0
@@ -4150,99 +4145,99 @@ fn retry_after_wait_duration(
         // zero-second wait — sleep-free immediate retry is not what
         // the knob promises. Run today's cooldown + failover instead.
         || cooldown.is_zero()
-    {
-        return None;
+        {
+            return None;
+        }
+        let max_wait = Duration::from_millis(max_wait_ms);
+        (cooldown <= max_wait).then(|| cooldown.min(max_wait))
     }
-    let max_wait = Duration::from_millis(max_wait_ms);
-    (cooldown <= max_wait).then(|| cooldown.min(max_wait))
-}
 
-/// Wait out a qualifying Retry-After (Req 3.1) and record the
-/// `rate_limit_wait` ledger row (Req 3.6).
-///
-/// Wait discipline (Req 3.9): the caller must have dropped the provider
-/// concurrency permit before calling; no config lock is taken here. The
-/// sleep is raced against the gateway request deadline
-/// (`request_deadline_ms`, resolved from
-/// `effective_request_timeout_seconds`); the clock is the
-/// `ActiveRequestHandle::elapsed_ms` arrival stamp, the same source the
-/// Req 1.6 backoff cap reads. On deadline expiry the wait abandons the
-/// retry: `false` is returned so the caller runs today's
-/// cooldown + failover path with no retry sent and no rate token
-/// consumed. A client-disconnect signal is not observable mid-dispatch
-/// in either stack (the `RequestCompleteGuard` abandon path lives in
-/// the handlers), so the deadline race is the enforcement seam.
-async fn maybe_wait_retry_after(
-    active: Option<&ActiveRequestHandle>,
-    provider: &str,
-    model: &str,
-    retry_after: Duration,
-    request_deadline_ms: Option<i64>,
-) -> bool {
-    let started = std::time::Instant::now();
-    // Pre-flight (Req 1.6 pattern): never even start a sleep that would
-    // wake past the deadline.
-    if let (Some(handle), Some(deadline_ms)) = (active, request_deadline_ms) {
-        if handle.elapsed_ms() + retry_after.as_millis() as i64 >= deadline_ms {
-            warn!(
+    /// Wait out a qualifying Retry-After (Req 3.1) and record the
+    /// `rate_limit_wait` ledger row (Req 3.6).
+    ///
+    /// Wait discipline (Req 3.9): the caller must have dropped the provider
+    /// concurrency permit before calling; no config lock is taken here. The
+    /// sleep is raced against the gateway request deadline
+    /// (`request_deadline_ms`, resolved from
+    /// `effective_request_timeout_seconds`); the clock is the
+    /// `ActiveRequestHandle::elapsed_ms` arrival stamp, the same source the
+    /// Req 1.6 backoff cap reads. On deadline expiry the wait abandons the
+    /// retry: `false` is returned so the caller runs today's
+    /// cooldown + failover path with no retry sent and no rate token
+    /// consumed. A client-disconnect signal is not observable mid-dispatch
+    /// in either stack (the `RequestCompleteGuard` abandon path lives in
+    /// the handlers), so the deadline race is the enforcement seam.
+    async fn maybe_wait_retry_after(
+        active: Option<&ActiveRequestHandle>,
+        provider: &str,
+        model: &str,
+        retry_after: Duration,
+        request_deadline_ms: Option<i64>,
+    ) -> bool {
+        let started = std::time::Instant::now();
+        // Pre-flight (Req 1.6 pattern): never even start a sleep that would
+        // wake past the deadline.
+        if let (Some(handle), Some(deadline_ms)) = (active, request_deadline_ms) {
+            if handle.elapsed_ms() + retry_after.as_millis() as i64 >= deadline_ms {
+                warn!(
                 provider,
                 retry_after_ms = retry_after.as_millis() as u64,
                 deadline_ms,
                 "Retry-After wait would pass the gateway request deadline — failing over instead"
             );
-            return false;
+                return false;
+            }
         }
-    }
-    // Surface the invisible wait on the in-flight registry (RAII, same
-    // pattern as the backoff stall).
-    let _stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
-        active,
-        crate::active_requests::StallReason::RateLimitWait,
-    );
-    tokio::time::sleep(retry_after).await;
-    _stall.end();
-    let waited = started.elapsed();
-    // Req 3.6: operators see why time was spent. Content-free class,
-    // actual waited duration, status 429 to align with the rate-limit
-    // family rows.
-    if let Some(handle) = active {
-        handle.record_failed_attempt(
-            ProviderAttempt::new(
-                provider.to_string(),
-                model.to_string(),
-                format!(
+        // Surface the invisible wait on the in-flight registry (RAII, same
+        // pattern as the backoff stall).
+        let _stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+            active,
+            crate::active_requests::StallReason::RateLimitWait,
+        );
+        tokio::time::sleep(retry_after).await;
+        _stall.end();
+        let waited = started.elapsed();
+        // Req 3.6: operators see why time was spent. Content-free class,
+        // actual waited duration, status 429 to align with the rate-limit
+        // family rows.
+        if let Some(handle) = active {
+            handle.record_failed_attempt(
+                ProviderAttempt::new(
+                    provider.to_string(),
+                    model.to_string(),
+                    format!(
                     "waited for upstream Retry-After ({} ms) before retrying the primary provider",
                     waited.as_millis()
                 ),
-                Some(429),
-            )
-            .with_duration(waited)
-            .with_error_class("rate_limit_wait"),
-        );
-    }
-    // Deadline fired mid-sleep (the pre-flight passed but the deadline
-    // landed inside the window): abandon the retry, exactly as if the
-    // pre-flight had refused.
-    if let (Some(handle), Some(deadline_ms)) = (active, request_deadline_ms) {
-        if handle.elapsed_ms() >= deadline_ms {
-            warn!(
+                    Some(429),
+                )
+                .with_duration(waited)
+                .with_error_class("rate_limit_wait"),
+            );
+        }
+        // Deadline fired mid-sleep (the pre-flight passed but the deadline
+        // landed inside the window): abandon the retry, exactly as if the
+        // pre-flight had refused.
+        if let (Some(handle), Some(deadline_ms)) = (active, request_deadline_ms) {
+            if handle.elapsed_ms() >= deadline_ms {
+                warn!(
                 provider,
                 waited_ms = waited.as_millis() as u64,
                 deadline_ms,
                 "Gateway request deadline fired during the Retry-After wait — abandoning the retry"
             );
-            return false;
+                return false;
+            }
         }
+        info!(
+            provider,
+            waited_ms = waited.as_millis() as u64,
+            "Waited out upstream Retry-After; retrying the primary provider"
+        );
+        true
     }
-    info!(
-        provider,
-        waited_ms = waited.as_millis() as u64,
-        "Waited out upstream Retry-After; retrying the primary provider"
-    );
-    true
-}
 
-/// Compute the cooldown duration to apply for a rate-limit response.
+    /// Compute the cooldown duration to apply for a rate-limit response.
     ///
     /// Looks at, in order of preference:
     /// 1. `Retry-After` HTTP header (seconds, or HTTP-date)
@@ -4284,32 +4279,32 @@ async fn maybe_wait_retry_after(
             .and_then(|p| p.max_rate_limit_cooldown_seconds);
         drop(config);
 
- Self::compute_rate_limit_cooldown(
- headers,
- body,
- default_cooldown,
- provider_cap_secs,
- global_cap_secs,
- )
- }
+        Self::compute_rate_limit_cooldown(
+            headers,
+            body,
+            default_cooldown,
+            provider_cap_secs,
+            global_cap_secs,
+        )
+    }
 
- /// Whether the last [`Self::parse_rate_limit_cooldown`] call found a
- /// real upstream Retry-After signal, as opposed to falling back to
- /// the configured default cooldown (R4, retry-failover-core-overhaul:
- /// Req 3.1 lets only a parseable hint drive the bounded wait).
- ///
- /// Mirrors the header → body → period-marker preference of
- /// [`Self::compute_rate_limit_cooldown`] without re-parsing text:
- /// each stage's parser is already pure and cheap.
- async fn upstream_rate_limit_cooldown_hint(
- &self,
- headers: Option<&reqwest::header::HeaderMap>,
- body: &str,
- ) -> bool {
- headers.is_some_and(|h| Self::cooldown_from_headers(h).is_some())
- || Self::cooldown_from_body(body).is_some()
- || Self::cooldown_from_period_marker(body).is_some()
- }
+    /// Whether the last [`Self::parse_rate_limit_cooldown`] call found a
+    /// real upstream Retry-After signal, as opposed to falling back to
+    /// the configured default cooldown (R4, retry-failover-core-overhaul:
+    /// Req 3.1 lets only a parseable hint drive the bounded wait).
+    ///
+    /// Mirrors the header → body → period-marker preference of
+    /// [`Self::compute_rate_limit_cooldown`] without re-parsing text:
+    /// each stage's parser is already pure and cheap.
+    async fn upstream_rate_limit_cooldown_hint(
+        &self,
+        headers: Option<&reqwest::header::HeaderMap>,
+        body: &str,
+    ) -> bool {
+        headers.is_some_and(|h| Self::cooldown_from_headers(h).is_some())
+            || Self::cooldown_from_body(body).is_some()
+            || Self::cooldown_from_period_marker(body).is_some()
+    }
 
     /// Pure cooldown computation — no I/O. Exposed for unit testing the
     /// header / body / period-marker parsing without spinning up a router.
@@ -4801,106 +4796,106 @@ async fn maybe_wait_retry_after(
     ///
     /// `first_send` says who pays the rate-limit token for the first upstream
     /// send; every further send is charged inside (ADR 0002).
-pub async fn attempt_with_retry(
-    &self,
-    provider_name: &str,
-    request: &OpenAIRequest,
-    provider_model: &ProviderModel,
-    active: Option<ActiveRequestHandle>,
-    base_attempt: usize,
-    first_send: FirstSendToken,
-    is_primary_candidate: bool,
-) -> Result<OpenAIResponse, GatewayError> {
-    self.attempt_with_retry_with_permit(
-        provider_name,
-        request,
-        provider_model,
-        active,
-        base_attempt,
-        None,
-        first_send,
-        false,
-        is_primary_candidate,
-    )
-    .await
-}
+    pub async fn attempt_with_retry(
+        &self,
+        provider_name: &str,
+        request: &OpenAIRequest,
+        provider_model: &ProviderModel,
+        active: Option<ActiveRequestHandle>,
+        base_attempt: usize,
+        first_send: FirstSendToken,
+        is_primary_candidate: bool,
+    ) -> Result<OpenAIResponse, GatewayError> {
+        self.attempt_with_retry_with_permit(
+            provider_name,
+            request,
+            provider_model,
+            active,
+            base_attempt,
+            None,
+            first_send,
+            false,
+            is_primary_candidate,
+        )
+        .await
+    }
 
     /// Dispatch variant that skips the routing phase of the proactive context
     /// gate and reduces the request copy unconditionally (`route_then_reduce`
     /// exhaustion: the first candidate is retried with reduction once no
     /// fitting candidate remains). A reduction that still cannot fit returns
     /// the same 413 [`GatewayError::ContextCapacityExceeded`] as the gate.
-async fn attempt_with_retry_forced_reduce(
-    &self,
-    provider_name: &str,
-    request: &OpenAIRequest,
-    provider_model: &ProviderModel,
-    active: Option<ActiveRequestHandle>,
-    base_attempt: usize,
-    first_send: FirstSendToken,
-    is_primary_candidate: bool,
-) -> Result<OpenAIResponse, GatewayError> {
-    self.attempt_with_retry_with_permit(
-        provider_name,
-        request,
-        provider_model,
-        active,
-        base_attempt,
-        None,
-        first_send,
-        true,
-        is_primary_candidate,
-    )
-    .await
-}
+    async fn attempt_with_retry_forced_reduce(
+        &self,
+        provider_name: &str,
+        request: &OpenAIRequest,
+        provider_model: &ProviderModel,
+        active: Option<ActiveRequestHandle>,
+        base_attempt: usize,
+        first_send: FirstSendToken,
+        is_primary_candidate: bool,
+    ) -> Result<OpenAIResponse, GatewayError> {
+        self.attempt_with_retry_with_permit(
+            provider_name,
+            request,
+            provider_model,
+            active,
+            base_attempt,
+            None,
+            first_send,
+            true,
+            is_primary_candidate,
+        )
+        .await
+    }
 
-async fn attempt_with_retry_with_permit(
-    &self,
-    provider_name: &str,
-    request: &OpenAIRequest,
-    provider_model: &ProviderModel,
-    active: Option<ActiveRequestHandle>,
-    base_attempt: usize,
-    concurrency_permit: Option<ProviderConcurrencyPermit>,
-    first_send: FirstSendToken,
-    force_context_reduce: bool,
-    is_primary_candidate: bool,
-) -> Result<OpenAIResponse, GatewayError> {
-    let provider_cfg = {
-        let config = self.config.read().await;
-        config
-            .providers
-            .iter()
-            .find(|p| p.name == provider_name)
-            .cloned()
-            .ok_or_else(|| {
-                GatewayError::Configuration(format!(
-                    "Provider '{}' not found in config",
-                    provider_name
-                ))
-            })?
-    };
-    let _concurrency_permit = match concurrency_permit {
-        Some(permit) => permit,
-        None => {
-            self.acquire_provider_slot_or_reject(&provider_cfg, &provider_model.model)
-                .await?
-        }
-    };
-    self.dispatch_attempts_under_permit(
-        provider_name,
-        request,
-        provider_model,
-        active,
-        base_attempt,
-        provider_cfg,
-        first_send,
-        force_context_reduce,
-        is_primary_candidate,
-        _concurrency_permit,
-    )
-    .await
-}
+    async fn attempt_with_retry_with_permit(
+        &self,
+        provider_name: &str,
+        request: &OpenAIRequest,
+        provider_model: &ProviderModel,
+        active: Option<ActiveRequestHandle>,
+        base_attempt: usize,
+        concurrency_permit: Option<ProviderConcurrencyPermit>,
+        first_send: FirstSendToken,
+        force_context_reduce: bool,
+        is_primary_candidate: bool,
+    ) -> Result<OpenAIResponse, GatewayError> {
+        let provider_cfg = {
+            let config = self.config.read().await;
+            config
+                .providers
+                .iter()
+                .find(|p| p.name == provider_name)
+                .cloned()
+                .ok_or_else(|| {
+                    GatewayError::Configuration(format!(
+                        "Provider '{}' not found in config",
+                        provider_name
+                    ))
+                })?
+        };
+        let _concurrency_permit = match concurrency_permit {
+            Some(permit) => permit,
+            None => {
+                self.acquire_provider_slot_or_reject(&provider_cfg, &provider_model.model)
+                    .await?
+            }
+        };
+        self.dispatch_attempts_under_permit(
+            provider_name,
+            request,
+            provider_model,
+            active,
+            base_attempt,
+            provider_cfg,
+            first_send,
+            force_context_reduce,
+            is_primary_candidate,
+            _concurrency_permit,
+        )
+        .await
+    }
 
     /// Returns the effective Codex Search configuration when the feature is
     /// enabled and a valid OpenAI OAuth token exists, `None` otherwise.
@@ -5259,38 +5254,38 @@ async fn attempt_with_retry_with_permit(
         }
     }
 
-async fn dispatch_attempts_under_permit(
-    &self,
-    provider_name: &str,
-    request: &OpenAIRequest,
-    provider_model: &ProviderModel,
-    active: Option<ActiveRequestHandle>,
-    base_attempt: usize,
-    provider_cfg: Provider,
-    first_send: FirstSendToken,
-    force_context_reduce: bool,
-    is_primary_candidate: bool,
-    mut concurrency_permit: ProviderConcurrencyPermit,
-) -> Result<OpenAIResponse, GatewayError> {
-    // Fetched before the config guard below: `get_rate_limiter` may read
-    // the config itself. Sends after the first one are debited here; the
-    // provider permit is held, so nothing in this function waits for a
-    // token (ADR 0002).
-    let rate_limiter = self.get_rate_limiter(provider_name).await;
-    let mut send_prepaid = first_send == FirstSendToken::Prepaid;
-    let config = self.config.read().await;
-    let max_retries = config.retry.max_retries_per_provider;
-    let backoff_sequence = config.retry.backoff_sequence_seconds.clone();
-    let context_config = config.context.clone();
-    // Bounded Retry-After wait (retry-failover-core-overhaul, Req 3.1-3.9),
-    // snapshotted here so the wait never runs under the config guard.
-    let retry_after_max_wait_ms = config.retry.upstream_retry_after_max_wait_ms;
-    // Gateway request deadline for the wait race (same Req 1.6 source the
-    // backoff cap below reads).
-    let wait_deadline_ms = {
-        let secs = crate::runtime_limits::effective_request_timeout_seconds(&config);
-        (secs > 0).then(|| secs as i64 * 1000)
-    };
+    async fn dispatch_attempts_under_permit(
+        &self,
+        provider_name: &str,
+        request: &OpenAIRequest,
+        provider_model: &ProviderModel,
+        active: Option<ActiveRequestHandle>,
+        base_attempt: usize,
+        provider_cfg: Provider,
+        first_send: FirstSendToken,
+        force_context_reduce: bool,
+        is_primary_candidate: bool,
+        mut concurrency_permit: ProviderConcurrencyPermit,
+    ) -> Result<OpenAIResponse, GatewayError> {
+        // Fetched before the config guard below: `get_rate_limiter` may read
+        // the config itself. Sends after the first one are debited here; the
+        // provider permit is held, so nothing in this function waits for a
+        // token (ADR 0002).
+        let rate_limiter = self.get_rate_limiter(provider_name).await;
+        let mut send_prepaid = first_send == FirstSendToken::Prepaid;
+        let config = self.config.read().await;
+        let max_retries = config.retry.max_retries_per_provider;
+        let backoff_sequence = config.retry.backoff_sequence_seconds.clone();
+        let context_config = config.context.clone();
+        // Bounded Retry-After wait (retry-failover-core-overhaul, Req 3.1-3.9),
+        // snapshotted here so the wait never runs under the config guard.
+        let retry_after_max_wait_ms = config.retry.upstream_retry_after_max_wait_ms;
+        // Gateway request deadline for the wait race (same Req 1.6 source the
+        // backoff cap below reads).
+        let wait_deadline_ms = {
+            let secs = crate::runtime_limits::effective_request_timeout_seconds(&config);
+            (secs > 0).then(|| secs as i64 * 1000)
+        };
 
         // ─── Codex dispatch (Req 10.1, 10.2) ────────────────────────────────
         let is_codex = provider_cfg.auth_method.as_deref() == Some("oauth")
@@ -5400,24 +5395,24 @@ async fn dispatch_attempts_under_permit(
                     codex_search_config.effective_base_url(),
                     codex_search_config.effective_timeout(),
                 ));
-            let interceptor = crate::codex::search::interceptor::ToolInterceptor::new(
-                executor,
-                codex_search_config.effective_max_iterations(),
-                codex_search_config.effective_output_to_chat(),
-                codex_search_budget,
-            );
-            // Search rounds are extra upstream calls invisible to the client;
-            // surface the stall reason while the loop runs. RAII: the previous
-            // marker is restored even when `?` propagates an error.
-            let _search_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
-                active.as_ref(),
-                crate::active_requests::StallReason::CodexSearch,
-            );
-            let intercepted = interceptor
-                .intercept(&codex_client, codex_request, result.response)
-                .await?;
-            _search_stall.end();
-            let mut final_response = intercepted.response;
+                let interceptor = crate::codex::search::interceptor::ToolInterceptor::new(
+                    executor,
+                    codex_search_config.effective_max_iterations(),
+                    codex_search_config.effective_output_to_chat(),
+                    codex_search_budget,
+                );
+                // Search rounds are extra upstream calls invisible to the client;
+                // surface the stall reason while the loop runs. RAII: the previous
+                // marker is restored even when `?` propagates an error.
+                let _search_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                    active.as_ref(),
+                    crate::active_requests::StallReason::CodexSearch,
+                );
+                let intercepted = interceptor
+                    .intercept(&codex_client, codex_request, result.response)
+                    .await?;
+                _search_stall.end();
+                let mut final_response = intercepted.response;
                 // Stripping the gateway's own tool calls can leave a turn with
                 // neither content nor tool calls, which clients read as a
                 // finished, empty reply and stop on.
@@ -5472,15 +5467,15 @@ async fn dispatch_attempts_under_permit(
                 provider_cfg.effective_custom_headers(),
             )
             .await?;
-        let bedrock_client =
-            MeteredClient::new(&bedrock_client, rate_limiter.clone(), first_send);
-        let mut response = self
-            .dispatch_buffered_with_context_retry(&bedrock_client, bedrock_request)
-            .await?
-            .response;
-        Self::attach_context_reduction(&mut response, context_reduction.as_ref());
-        return Ok(response);
-    }
+            let bedrock_client =
+                MeteredClient::new(&bedrock_client, rate_limiter.clone(), first_send);
+            let mut response = self
+                .dispatch_buffered_with_context_retry(&bedrock_client, bedrock_request)
+                .await?
+                .response;
+            Self::attach_context_reduction(&mut response, context_reduction.as_ref());
+            return Ok(response);
+        }
 
         // ─── GitHub Copilot dispatch (github-copilot-oauth-provider,
         // task 9 / Req 4.3, 9.1) ───────────────────────────────────────────
@@ -5547,8 +5542,7 @@ async fn dispatch_attempts_under_permit(
                 None => None,
             };
 
-            let metered =
-                MeteredClient::new(&copilot_client, rate_limiter.clone(), first_send);
+            let metered = MeteredClient::new(&copilot_client, rate_limiter.clone(), first_send);
             // Req 4.3 (router side): on an upstream 401/403 auth-class
             // failure, force ONE token refresh + ONE re-dispatch before
             // giving up on this provider. force_refresh() invalidates the
@@ -5565,8 +5559,9 @@ async fn dispatch_attempts_under_permit(
                 .await
             {
                 Ok(response) => response,
-                Err(err) if crate::providers::github_copilot::is_copilot_auth_error(&err)
-                    && provider_cfg.auth_method.as_deref() != Some("api-key") =>
+                Err(err)
+                    if crate::providers::github_copilot::is_copilot_auth_error(&err)
+                        && provider_cfg.auth_method.as_deref() != Some("api-key") =>
                 {
                     if let Some(handle) = &active {
                         handle.set_last_error(&err.to_string());
@@ -5592,13 +5587,13 @@ async fn dispatch_attempts_under_permit(
                 Err(err) => return Err(err),
             };
 
-        let mut response = result.response;
-        Self::attach_context_reduction(&mut response, context_reduction.as_ref());
-        return Ok(response);
-    }
-    // ─── End GitHub Copilot dispatch ───────────────────────────────────
+            let mut response = result.response;
+            Self::attach_context_reduction(&mut response, context_reduction.as_ref());
+            return Ok(response);
+        }
+        // ─── End GitHub Copilot dispatch ───────────────────────────────────
 
-    // OAuth bearer override (Req 6.2): when the provider declares
+        // OAuth bearer override (Req 6.2): when the provider declares
         // `auth_method: oauth` and the OAuth manager has a live,
         // non-expired access token, use it as the outgoing Bearer in place
         // of any configured api_key.
@@ -5667,15 +5662,15 @@ async fn dispatch_attempts_under_permit(
         let reasoning = provider_cfg.reasoning;
         let reasoning_compat_cfg = config.reasoning_compat.clone();
         let provider_region = provider_cfg.region.clone();
-let is_oauth_provider = provider_cfg.auth_method.as_deref() == Some("oauth");
-let jitter_enabled = config.retry.jitter_enabled;
-let jitter_ratio = config.retry.jitter_ratio;
-// Gateway request deadline for the retry-loop cap (Req 1.6): resolved
-// from the same source the deadline middleware enforces; 0 disables.
-let request_deadline_ms = {
-	let secs = crate::runtime_limits::effective_request_timeout_seconds(&config);
-	(secs > 0).then(|| secs as i64 * 1000)
-};
+        let is_oauth_provider = provider_cfg.auth_method.as_deref() == Some("oauth");
+        let jitter_enabled = config.retry.jitter_enabled;
+        let jitter_ratio = config.retry.jitter_ratio;
+        // Gateway request deadline for the retry-loop cap (Req 1.6): resolved
+        // from the same source the deadline middleware enforces; 0 disables.
+        let request_deadline_ms = {
+            let secs = crate::runtime_limits::effective_request_timeout_seconds(&config);
+            (secs > 0).then(|| secs as i64 * 1000)
+        };
         let cache_aware_routing_cfg = config.cache_aware_routing.clone();
         let configured_base_url = provider_cfg.base_url.clone();
         // Proactive context-overflow enforcement snapshot (context-overflow
@@ -5997,23 +5992,23 @@ let request_deadline_ms = {
         let mut reasoning_strip_retry_done = false;
         // One-shot `stream:false` fallback: a 400 that rejects `stream` /
         // `stream_options` retries the same provider once without them.
-let mut stream_fallback_done = false;
-let mut skip_next_backoff = false;
-// One-shot bounded Retry-After wait (retry-failover-core-overhaul,
-// Req 3.1-3.9): the primary candidate's first qualifying 429 may wait
-// out the provider's own Retry-Before signal and retry the same
-// provider. Cross-stack marker: if the streaming pass-through already
-// waited (its fallback re-enters this buffered loop), the ledger
-// carries `rate_limit_wait` and this loop must not wait again.
+        let mut stream_fallback_done = false;
+        let mut skip_next_backoff = false;
+        // One-shot bounded Retry-After wait (retry-failover-core-overhaul,
+        // Req 3.1-3.9): the primary candidate's first qualifying 429 may wait
+        // out the provider's own Retry-Before signal and retry the same
+        // provider. Cross-stack marker: if the streaming pass-through already
+        // waited (its fallback re-enters this buffered loop), the ledger
+        // carries `rate_limit_wait` and this loop must not wait again.
         let mut retry_after_waited = active
             .as_ref()
             .is_some_and(|h| h.has_recorded_rate_limit_wait());
-	// R1: request-scoped primary-ness — snapshot the ledger row count at
-	// dispatch entry. Rows recorded BEFORE this dispatch (a failed try or
-	// skip on an earlier candidate, e.g. the streaming→buffered failover
-	// hop) prove the request already left its primary; rows this loop
-	// records for its own same-provider retries do not.
-	let attempt_rows_at_dispatch = active.as_ref().map_or(0, |h| h.attempt_rows_total());
+        // R1: request-scoped primary-ness — snapshot the ledger row count at
+        // dispatch entry. Rows recorded BEFORE this dispatch (a failed try or
+        // skip on an earlier candidate, e.g. the streaming→buffered failover
+        // hop) prove the request already left its primary; rows this loop
+        // records for its own same-provider retries do not.
+        let attempt_rows_at_dispatch = active.as_ref().map_or(0, |h| h.attempt_rows_total());
         // Every failed HTTP try goes into the request's attempt ledger
         // (DD7), so retries rescued later are still visible in the log.
         let record_try = |err: &GatewayError,
@@ -6046,10 +6041,7 @@ let mut skip_next_backoff = false;
             // `retry_budget_exhausted` ledger row (Req 4.2).
             let _retry_budget_slot = if attempt > 0 {
                 let active = self.provider_active_count(provider_name);
-                match self
-                    .retry_budgets
-                    .try_acquire_retry(provider_name, active)
-                {
+                match self.retry_budgets.try_acquire_retry(provider_name, active) {
                     Some(slot) => Some(slot),
                     None => {
                         warn!(
@@ -6098,51 +6090,51 @@ let mut skip_next_backoff = false;
                     }
                 }
 
-		let backoff_secs = backoff_sequence
-			.get((attempt - 1) as usize)
-			.copied()
-			.unwrap_or(4);
-		let retry_delay =
-			Self::calculate_retry_delay(backoff_secs, jitter_enabled, jitter_ratio);
-		// Req 1.6 (retry-failover-core-overhaul): the gateway request
-		// deadline caps the whole retry loop. Reuse the existing
-		// deadline source (effective_request_timeout_seconds, the same
-		// value the deadline middleware enforces) and the
-		// ActiveRequestInfo clock (elapsed_ms, the same source
-		// pre_dispatch_ms reads): if waiting out this backoff would wake
-		// past the deadline, do not schedule — advance to the next
-		// candidate / return now.
-		if let (Some(handle), Some(deadline_ms)) = (&active, request_deadline_ms) {
-			let wake_at_ms = handle.elapsed_ms() + retry_delay.as_millis() as i64;
-			if wake_at_ms >= deadline_ms {
-				warn!(
+                let backoff_secs = backoff_sequence
+                    .get((attempt - 1) as usize)
+                    .copied()
+                    .unwrap_or(4);
+                let retry_delay =
+                    Self::calculate_retry_delay(backoff_secs, jitter_enabled, jitter_ratio);
+                // Req 1.6 (retry-failover-core-overhaul): the gateway request
+                // deadline caps the whole retry loop. Reuse the existing
+                // deadline source (effective_request_timeout_seconds, the same
+                // value the deadline middleware enforces) and the
+                // ActiveRequestInfo clock (elapsed_ms, the same source
+                // pre_dispatch_ms reads): if waiting out this backoff would wake
+                // past the deadline, do not schedule — advance to the next
+                // candidate / return now.
+                if let (Some(handle), Some(deadline_ms)) = (&active, request_deadline_ms) {
+                    let wake_at_ms = handle.elapsed_ms() + retry_delay.as_millis() as i64;
+                    if wake_at_ms >= deadline_ms {
+                        warn!(
 					provider = provider_name,
 					attempt,
 					delay_ms = retry_delay.as_millis() as u64,
 					deadline_ms,
 					"Retry backoff would pass the gateway request deadline — failing over instead of scheduling"
 				);
-				break;
-			}
-		}
-		self.metrics
-            .record_provider_retry(provider_name, retry_delay.as_millis() as u64);
-        // Report the retry to the in-flight registry: same provider,
-        // retrying after the previous attempt's error. The backoff stall is
-        // RAII so the marker restores correctly on any exit path.
-        if let Some(handle) = &active {
-            handle.set_phase(ActivePhase::Retry);
-            handle.set_attempt(base_attempt + attempt as usize);
-            if let Some(err) = &last_error {
-                handle.set_last_error(&err.to_string());
-            }
-        }
-        let _backoff_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
-            active.as_ref(),
-            crate::active_requests::StallReason::RetryBackoff,
-        );
-        tokio::time::sleep(retry_delay).await;
-        _backoff_stall.end();
+                        break;
+                    }
+                }
+                self.metrics
+                    .record_provider_retry(provider_name, retry_delay.as_millis() as u64);
+                // Report the retry to the in-flight registry: same provider,
+                // retrying after the previous attempt's error. The backoff stall is
+                // RAII so the marker restores correctly on any exit path.
+                if let Some(handle) = &active {
+                    handle.set_phase(ActivePhase::Retry);
+                    handle.set_attempt(base_attempt + attempt as usize);
+                    if let Some(err) = &last_error {
+                        handle.set_last_error(&err.to_string());
+                    }
+                }
+                let _backoff_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                    active.as_ref(),
+                    crate::active_requests::StallReason::RetryBackoff,
+                );
+                tokio::time::sleep(retry_delay).await;
+                _backoff_stall.end();
                 debug!(
                     provider = provider_name,
                     attempt,
@@ -6218,35 +6210,35 @@ let mut skip_next_backoff = false;
                         }
                     }
 
-            // Streamed success body: read incrementally so the TTFB
-            // deadline covers the first body chunk and an idle gap is
-            // detected, while a generation that keeps sending bytes
-            // runs up to the total timeout.
-            // Otherwise (stream:false, or an error status whose body is
-            // a small JSON envelope) read the body with the remaining
-            // total timeout budget, exactly as before.
-            let body_result = if stream_upstream && status.is_success() {
-                let started = tokio::time::Instant::from_std(request_start);
-                let limits = UpstreamBodyLimits {
-                    first_byte_deadline: started + ttfb_timeout,
-                    ttfb_secs: ttfb_timeout_secs,
-                    idle: Some(Duration::from_secs(chunk_timeout_secs)),
-                    total_deadline: started + total_timeout,
-                    total_secs: total_timeout_secs,
-                };
-                // Buffered dispatch: the upstream SSE is reassembled before
-                // any client byte is emitted, which the client experiences as
-                // a silent wait — say so on the dashboard while it runs.
-                let _buffering_stall =
-                    crate::active_requests::ActiveRequestHandle::begin_stall_opt(
-                        active.as_ref(),
-                        crate::active_requests::StallReason::Buffering,
-                    );
-                let read =
-                    read_upstream_body(response, &limits, provider_name, relay.as_ref()).await;
-                _buffering_stall.end();
-                match read
-                {
+                    // Streamed success body: read incrementally so the TTFB
+                    // deadline covers the first body chunk and an idle gap is
+                    // detected, while a generation that keeps sending bytes
+                    // runs up to the total timeout.
+                    // Otherwise (stream:false, or an error status whose body is
+                    // a small JSON envelope) read the body with the remaining
+                    // total timeout budget, exactly as before.
+                    let body_result = if stream_upstream && status.is_success() {
+                        let started = tokio::time::Instant::from_std(request_start);
+                        let limits = UpstreamBodyLimits {
+                            first_byte_deadline: started + ttfb_timeout,
+                            ttfb_secs: ttfb_timeout_secs,
+                            idle: Some(Duration::from_secs(chunk_timeout_secs)),
+                            total_deadline: started + total_timeout,
+                            total_secs: total_timeout_secs,
+                        };
+                        // Buffered dispatch: the upstream SSE is reassembled before
+                        // any client byte is emitted, which the client experiences as
+                        // a silent wait — say so on the dashboard while it runs.
+                        let _buffering_stall =
+                            crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+                                active.as_ref(),
+                                crate::active_requests::StallReason::Buffering,
+                            );
+                        let read =
+                            read_upstream_body(response, &limits, provider_name, relay.as_ref())
+                                .await;
+                        _buffering_stall.end();
+                        match read {
                             Ok(text) => Ok(Ok(text)),
                             Err(e) => {
                                 warn!(
@@ -6500,7 +6492,7 @@ let mut skip_next_backoff = false;
                                 stream_upstream,
                                 "Provider returned SSE, reassembling"
                             );
-                            match Self::reassemble_sse_stream(&body_text) {
+                            match Self::reassemble_sse_stream_offloaded(&body_text).await {
                                 Ok(reassembled) if !reassembled.completed => {
                                     // Neither [DONE] nor any finish_reason: the
                                     // stream was cut short. Retryable.
@@ -6856,114 +6848,114 @@ let mut skip_next_backoff = false;
                             }
                         }
 
-// For rate-limit signals, parse Retry-After /
-// retry_after_ms and put the provider in a
-// bounded cooldown window so subsequent requests
-// skip it via select_provider_order without
-// re-issuing.
-if Self::is_rate_limited(status_code, &body_text) {
- let cooldown = self
- .parse_rate_limit_cooldown(
- provider_name,
- Some(&response_headers),
- &body_text,
- )
- .await;
- // R4: only a real upstream Retry-After signal may drive the
- // bounded wait; a hint-less 429 (parser fell back to the
- // configured default cooldown) fails over per Req 3.1.
- let cooldown_from_upstream = self
- .upstream_rate_limit_cooldown_hint(
- Some(&response_headers),
- &body_text,
- )
- .await;
- // Bounded Retry-After wait (retry-failover-core-overhaul,
-// Req 3.1-3.9): the primary candidate's first
-// qualifying 429 may wait out the provider's own
-// Retry-After and retry the same provider through
-// normal admission (the retry send below re-enters
-// the debit gate — exactly one token per send, ADR
-// 0002). The parsed cooldown IS the Retry-After;
-// it is reused, never parsed twice. The provider
-// permit is dropped before the wait (Req 3.9 wait
-// discipline) and re-acquired after; a saturated
-// provider surfaces its usual 503 rather than
-// blocking the wait.
- if let Some(wait) = Self::retry_after_wait_duration(
- is_primary_candidate,
- retry_after_waited,
- // R1: rows from a previous dispatch mean this request
- // already failed over, so the current dispatch's index 0
- // is a fallback, not the primary.
- attempt_rows_at_dispatch > 0,
- max_retries,
- retry_after_max_wait_ms,
- cooldown,
- cooldown_from_upstream,
- ) {
-                retry_after_waited = true;
-                // The cooldown still applies: a second request
-                // hitting this provider while this one waits must
-                // not re-send into the same rate limit.
-                self.get_rate_limiter(provider_name)
-                    .await
-                    .apply_cooldown(cooldown)
-                    .await;
-                drop(concurrency_permit);
-let waited = Self::maybe_wait_retry_after(
-active.as_ref(),
-provider_name,
-&provider_model.model,
-wait,
-wait_deadline_ms,
-)
-.await;
- if waited {
- // R5: record the 429 try row BEFORE re-acquiring the
- // provider slot (mirrors the streaming arm's ordering):
- // a saturation reject below must not drop the ledger row
- // for the 429 the upstream really returned.
- record_try(&err, None, None, request_start);
- // Re-acquire the provider slot; a reject fails
- // the request with the usual saturated-provider
- // 503 instead of the original 429.
- concurrency_permit = self
- .acquire_provider_slot_or_reject(
- &provider_cfg,
- &provider_model.model,
- )
- .await?;
- skip_next_backoff = true;
- last_error = Some(err);
- continue;
- }
-// Deadline fired (or loomed) during the wait: run
-// today's cooldown + failover path below — no
-// retry was sent, no rate token consumed.
-}
-let rate_limiter = self.get_rate_limiter(provider_name).await;
-rate_limiter.apply_cooldown(cooldown).await;
-self.metrics
-.record_provider_rate_limit_exhausted(provider_name);
-let now_secs = SystemTime::now()
-.duration_since(UNIX_EPOCH)
-.map(|d| d.as_secs())
-.unwrap_or(0);
-let deadline = now_secs.saturating_add(cooldown.as_secs());
-self.metrics.set_provider_cooldown(
-provider_name,
-Self::friendly_failure_reason(Some(status_code), &body_text),
-deadline,
-);
+                        // For rate-limit signals, parse Retry-After /
+                        // retry_after_ms and put the provider in a
+                        // bounded cooldown window so subsequent requests
+                        // skip it via select_provider_order without
+                        // re-issuing.
+                        if Self::is_rate_limited(status_code, &body_text) {
+                            let cooldown = self
+                                .parse_rate_limit_cooldown(
+                                    provider_name,
+                                    Some(&response_headers),
+                                    &body_text,
+                                )
+                                .await;
+                            // R4: only a real upstream Retry-After signal may drive the
+                            // bounded wait; a hint-less 429 (parser fell back to the
+                            // configured default cooldown) fails over per Req 3.1.
+                            let cooldown_from_upstream = self
+                                .upstream_rate_limit_cooldown_hint(
+                                    Some(&response_headers),
+                                    &body_text,
+                                )
+                                .await;
+                            // Bounded Retry-After wait (retry-failover-core-overhaul,
+                            // Req 3.1-3.9): the primary candidate's first
+                            // qualifying 429 may wait out the provider's own
+                            // Retry-After and retry the same provider through
+                            // normal admission (the retry send below re-enters
+                            // the debit gate — exactly one token per send, ADR
+                            // 0002). The parsed cooldown IS the Retry-After;
+                            // it is reused, never parsed twice. The provider
+                            // permit is dropped before the wait (Req 3.9 wait
+                            // discipline) and re-acquired after; a saturated
+                            // provider surfaces its usual 503 rather than
+                            // blocking the wait.
+                            if let Some(wait) = Self::retry_after_wait_duration(
+                                is_primary_candidate,
+                                retry_after_waited,
+                                // R1: rows from a previous dispatch mean this request
+                                // already failed over, so the current dispatch's index 0
+                                // is a fallback, not the primary.
+                                attempt_rows_at_dispatch > 0,
+                                max_retries,
+                                retry_after_max_wait_ms,
+                                cooldown,
+                                cooldown_from_upstream,
+                            ) {
+                                retry_after_waited = true;
+                                // The cooldown still applies: a second request
+                                // hitting this provider while this one waits must
+                                // not re-send into the same rate limit.
+                                self.get_rate_limiter(provider_name)
+                                    .await
+                                    .apply_cooldown(cooldown)
+                                    .await;
+                                drop(concurrency_permit);
+                                let waited = Self::maybe_wait_retry_after(
+                                    active.as_ref(),
+                                    provider_name,
+                                    &provider_model.model,
+                                    wait,
+                                    wait_deadline_ms,
+                                )
+                                .await;
+                                if waited {
+                                    // R5: record the 429 try row BEFORE re-acquiring the
+                                    // provider slot (mirrors the streaming arm's ordering):
+                                    // a saturation reject below must not drop the ledger row
+                                    // for the 429 the upstream really returned.
+                                    record_try(&err, None, None, request_start);
+                                    // Re-acquire the provider slot; a reject fails
+                                    // the request with the usual saturated-provider
+                                    // 503 instead of the original 429.
+                                    concurrency_permit = self
+                                        .acquire_provider_slot_or_reject(
+                                            &provider_cfg,
+                                            &provider_model.model,
+                                        )
+                                        .await?;
+                                    skip_next_backoff = true;
+                                    last_error = Some(err);
+                                    continue;
+                                }
+                                // Deadline fired (or loomed) during the wait: run
+                                // today's cooldown + failover path below — no
+                                // retry was sent, no rate token consumed.
+                            }
+                            let rate_limiter = self.get_rate_limiter(provider_name).await;
+                            rate_limiter.apply_cooldown(cooldown).await;
+                            self.metrics
+                                .record_provider_rate_limit_exhausted(provider_name);
+                            let now_secs = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let deadline = now_secs.saturating_add(cooldown.as_secs());
+                            self.metrics.set_provider_cooldown(
+                                provider_name,
+                                Self::friendly_failure_reason(Some(status_code), &body_text),
+                                deadline,
+                            );
 
-warn!(
-provider = provider_name,
-status = status_code,
-cooldown_ms = cooldown.as_millis() as u64,
-"Rate limited, failing over and cooling down provider"
-);
-} else {
+                            warn!(
+                                provider = provider_name,
+                                status = status_code,
+                                cooldown_ms = cooldown.as_millis() as u64,
+                                "Rate limited, failing over and cooling down provider"
+                            );
+                        } else {
                             warn!(
                                 provider = provider_name,
                                 status = status_code,
@@ -6990,83 +6982,83 @@ cooldown_ms = cooldown.as_millis() as u64,
                         record_try(&err, None, None, request_start);
                         return Err(err);
                     }
-		// Single policy table (retry-failover-core-overhaul, Component 1):
-		// every non-4xx attempt decision flows through
-		// retry_policy::classify. RetrySameProvider keeps the
-		// max_retries_per_provider loop; FailOver returns the error so
-		// the failover layer advances to the next candidate. Mechanism
-		// one-shots (image strip, reasoning strip, context truncation,
-		// OAuth refresh) stay caller-owned above.
-		if retry_policy::classify(&err) == RetryDecision::FailOver {
-			// The 503 / timeout-class labels below are only for log
-			// fidelity; both previously failed over, matching the table.
-			if status_code == 503 {
-				warn!(
-					provider = provider_name,
-					status = status_code,
-					"Service unavailable, failing over immediately"
-				);
-				record_try(&err, None, None, request_start);
-				return Err(err);
-			}
-			if is_timeout_class(&err) {
-				// DD10: an upstream gateway timeout (504/524) on a
-				// long generation repeats on retry and duplicates the
-				// provider-side work, so fail over immediately.
-				warn!(
+                    // Single policy table (retry-failover-core-overhaul, Component 1):
+                    // every non-4xx attempt decision flows through
+                    // retry_policy::classify. RetrySameProvider keeps the
+                    // max_retries_per_provider loop; FailOver returns the error so
+                    // the failover layer advances to the next candidate. Mechanism
+                    // one-shots (image strip, reasoning strip, context truncation,
+                    // OAuth refresh) stay caller-owned above.
+                    if retry_policy::classify(&err) == RetryDecision::FailOver {
+                        // The 503 / timeout-class labels below are only for log
+                        // fidelity; both previously failed over, matching the table.
+                        if status_code == 503 {
+                            warn!(
+                                provider = provider_name,
+                                status = status_code,
+                                "Service unavailable, failing over immediately"
+                            );
+                            record_try(&err, None, None, request_start);
+                            return Err(err);
+                        }
+                        if is_timeout_class(&err) {
+                            // DD10: an upstream gateway timeout (504/524) on a
+                            // long generation repeats on retry and duplicates the
+                            // provider-side work, so fail over immediately.
+                            warn!(
 					provider = provider_name,
 					status = status_code,
 					"Upstream gateway timeout, failing over without same-provider retry"
 				);
-				record_try(&err, None, None, request_start);
-				return Err(err);
-			}
-			warn!(
-				provider = provider_name,
-				status = status_code,
-				"Non-retryable per policy table, failing over"
-			);
-			record_try(&err, None, None, request_start);
-			return Err(err);
-		}
+                            record_try(&err, None, None, request_start);
+                            return Err(err);
+                        }
+                        warn!(
+                            provider = provider_name,
+                            status = status_code,
+                            "Non-retryable per policy table, failing over"
+                        );
+                        record_try(&err, None, None, request_start);
+                        return Err(err);
+                    }
 
-		warn!(
-			provider = provider_name,
-			status = status_code,
-			attempt,
-			"Retryable error"
-		);
-		record_try(&err, None, None, request_start);
-		last_error = Some(err);
-	}
-	Err(e) => {
-		let err = GatewayError::Provider {
-			provider: provider_name.to_string(),
-			message: format!("Request failed: {}", e),
-			status_code: None,
-		};
-		// Log full error chain for network diagnostics
-		let mut cause_chain = String::new();
-		let mut source: Option<&dyn StdError> = std::error::Error::source(&e);
-		while let Some(cause) = source {
-			cause_chain.push_str(&format!(" -> {}", cause));
-			source = std::error::Error::source(cause);
-		}
-		warn!(
-			provider = provider_name,
-			attempt,
-			error = %e,
-			causes = %cause_chain,
-			is_timeout = e.is_timeout(),
-			is_connect = e.is_connect(),
-			"Network error"
-		);
-		// Network errors stay in the retry budget (classify ->
-		// RetrySameProvider; Provider{status_code: None} is transport
-		// failure, not an HTTP status).
-		record_try(&err, Some("network_error"), Some(502), request_start);
-		last_error = Some(err);
-	}
+                    warn!(
+                        provider = provider_name,
+                        status = status_code,
+                        attempt,
+                        "Retryable error"
+                    );
+                    record_try(&err, None, None, request_start);
+                    last_error = Some(err);
+                }
+                Err(e) => {
+                    let err = GatewayError::Provider {
+                        provider: provider_name.to_string(),
+                        message: format!("Request failed: {}", e),
+                        status_code: None,
+                    };
+                    // Log full error chain for network diagnostics
+                    let mut cause_chain = String::new();
+                    let mut source: Option<&dyn StdError> = std::error::Error::source(&e);
+                    while let Some(cause) = source {
+                        cause_chain.push_str(&format!(" -> {}", cause));
+                        source = std::error::Error::source(cause);
+                    }
+                    warn!(
+                        provider = provider_name,
+                        attempt,
+                        error = %e,
+                        causes = %cause_chain,
+                        is_timeout = e.is_timeout(),
+                        is_connect = e.is_connect(),
+                        "Network error"
+                    );
+                    // Network errors stay in the retry budget (classify ->
+                    // RetrySameProvider; Provider{status_code: None} is transport
+                    // failure, not an HTTP status).
+                    record_try(&err, Some("network_error"), Some(502), request_start);
+                    last_error = Some(err);
+                }
             }
         }
 
@@ -7297,6 +7289,25 @@ cooldown_ms = cooldown.as_millis() as u64,
         Self::reassemble_sse_stream(body)
             .map(|reassembled| reassembled.response)
             .map_err(|e| e.to_string())
+    }
+
+    /// Reassembles SSE bodies inline below [`CPU_OFFLOAD_MIN_BYTES`] and on
+    /// the blocking pool at or above it, so the per-chunk JSON parsing and
+    /// string assembly of a fully-buffered body never occupy a Tokio worker
+    /// (Req 1.3/1.4, spec multi-core-utilization). The blocking closure owns
+    /// a copy of the buffered text and the result is byte-identical either
+    /// way: the same [`Self::reassemble_sse_stream`] runs, only the thread
+    /// changes.
+    async fn reassemble_sse_stream_offloaded(
+        body: &str,
+    ) -> Result<SseReassembly, SseReassemblyError> {
+        if body.len() < CPU_OFFLOAD_MIN_BYTES {
+            return Self::reassemble_sse_stream(body);
+        }
+        let body = body.to_string();
+        tokio::task::spawn_blocking(move || Self::reassemble_sse_stream(&body))
+            .await
+            .expect("SSE reassembly blocking task panicked")
     }
 
     /// Reassemble an SSE body and report whether the stream actually finished
@@ -7864,66 +7875,66 @@ cooldown_ms = cooldown.as_millis() as u64,
                 continue;
             }
 
-        // Defense-in-depth: re-check the durable upstream-driven
-        // cooldown that backs the dashboard. `select_provider_order`
-        // already filters on this, but a config hot-reload between
-        // selection and failover (or any direct call to
-        // `route_with_failover`) could leave a stale provider in the
-        // candidate list. The metrics store survives
-        // `clear_rate_limiters()`, so it is the authoritative gate
-        // for "this provider returned 429 / Retry-After recently".
-        if let Some(remaining) = self
-            .metrics
-            .provider_cooldown_remaining_secs(&provider_model.provider)
-        {
-            debug!(
-                provider = %provider_model.provider,
-                model = %provider_model.model,
-                cooldown_remaining_secs = remaining,
-                "Upstream rate-limit cooldown active, skipping provider"
-            );
-            Self::push_attempt(
-                &mut attempts,
-                active.as_ref(),
-                ProviderAttempt::new(
-                    provider_model.provider.clone(),
-                    provider_model.model.clone(),
-                    format!(
-                        "Provider in upstream rate-limit cooldown ({}s remaining)",
-                        remaining
-                    ),
-                    Some(429),
-                )
-                .with_duration(start.elapsed())
-                .with_error_class("cooldown_skip"),
-            );
-            continue;
-        }
+            // Defense-in-depth: re-check the durable upstream-driven
+            // cooldown that backs the dashboard. `select_provider_order`
+            // already filters on this, but a config hot-reload between
+            // selection and failover (or any direct call to
+            // `route_with_failover`) could leave a stale provider in the
+            // candidate list. The metrics store survives
+            // `clear_rate_limiters()`, so it is the authoritative gate
+            // for "this provider returned 429 / Retry-After recently".
+            if let Some(remaining) = self
+                .metrics
+                .provider_cooldown_remaining_secs(&provider_model.provider)
+            {
+                debug!(
+                    provider = %provider_model.provider,
+                    model = %provider_model.model,
+                    cooldown_remaining_secs = remaining,
+                    "Upstream rate-limit cooldown active, skipping provider"
+                );
+                Self::push_attempt(
+                    &mut attempts,
+                    active.as_ref(),
+                    ProviderAttempt::new(
+                        provider_model.provider.clone(),
+                        provider_model.model.clone(),
+                        format!(
+                            "Provider in upstream rate-limit cooldown ({}s remaining)",
+                            remaining
+                        ),
+                        Some(429),
+                    )
+                    .with_duration(start.elapsed())
+                    .with_error_class("cooldown_skip"),
+                );
+                continue;
+            }
 
-        // GitHub Copilot eligibility gate (Req 9.2): a device-oauth
-        // candidate whose session is Unauthenticated/Expired is
-        // ineligible — SKIP, not error — so the request fails over to
-        // the next provider without a spurious upstream attempt. Same
-        // observability shape as the rate-limit/budget skips above (one
-        // ledger row via push_attempt, error_class `copilot_auth_skip`).
-        // `api-key` (PAT) candidates have no session state and stay
-        // eligible; a missing manager (no master key at startup) also
-        // skips — there is no credential to dispatch with.
-        {
-            let device_oauth = {
-                let config = self.config.read().await;
-                config
-                    .providers
-                    .iter()
-                    .find(|p| p.name == provider_model.provider)
-                    .map(|p| {
-                        p.provider_type == "github-copilot"
-                            && p.auth_method.as_deref() != Some("api-key")
-                    })
-                    .unwrap_or(false)
-            };
-            if device_oauth {
-                let eligible = match &self.copilot_manager {
+            // GitHub Copilot eligibility gate (Req 9.2): a device-oauth
+            // candidate whose session is Unauthenticated/Expired is
+            // ineligible — SKIP, not error — so the request fails over to
+            // the next provider without a spurious upstream attempt. Same
+            // observability shape as the rate-limit/budget skips above (one
+            // ledger row via push_attempt, error_class `copilot_auth_skip`).
+            // `api-key` (PAT) candidates have no session state and stay
+            // eligible; a missing manager (no master key at startup) also
+            // skips — there is no credential to dispatch with.
+            {
+                let device_oauth = {
+                    let config = self.config.read().await;
+                    config
+                        .providers
+                        .iter()
+                        .find(|p| p.name == provider_model.provider)
+                        .map(|p| {
+                            p.provider_type == "github-copilot"
+                                && p.auth_method.as_deref() != Some("api-key")
+                        })
+                        .unwrap_or(false)
+                };
+                if device_oauth {
+                    let eligible = match &self.copilot_manager {
                     None => Err("no Copilot token manager attached (gateway started without a master key)"),
                     Some(manager) => match manager.session_state().await {
                         CopilotSessionState::Authenticated { .. } => Ok(()),
@@ -7939,33 +7950,31 @@ cooldown_ms = cooldown.as_millis() as u64,
                         ),
                     },
                 };
-                if let Err(reason) = eligible {
-                    debug!(
-                        provider = %provider_model.provider,
-                        model = %provider_model.model,
-                        reason,
-                        "Copilot session ineligible, skipping provider"
-                    );
-                    Self::push_attempt(
-                        &mut attempts,
-                        active.as_ref(),
-                        ProviderAttempt::new(
-                            provider_model.provider.clone(),
-                            provider_model.model.clone(),
-                            format!(
-                                "{reason}; skipping per Req 9.2 (no fallback credential)"
-                            ),
-                            Some(401),
-                        )
-                        .with_duration(start.elapsed())
-                        .with_error_class("copilot_auth_skip"),
-                    );
-                    continue;
+                    if let Err(reason) = eligible {
+                        debug!(
+                            provider = %provider_model.provider,
+                            model = %provider_model.model,
+                            reason,
+                            "Copilot session ineligible, skipping provider"
+                        );
+                        Self::push_attempt(
+                            &mut attempts,
+                            active.as_ref(),
+                            ProviderAttempt::new(
+                                provider_model.provider.clone(),
+                                provider_model.model.clone(),
+                                format!("{reason}; skipping per Req 9.2 (no fallback credential)"),
+                                Some(401),
+                            )
+                            .with_duration(start.elapsed())
+                            .with_error_class("copilot_auth_skip"),
+                        );
+                        continue;
+                    }
                 }
             }
-        }
 
-        // Admission gate (ADR 0002): take the token for this candidate's
+            // Admission gate (ADR 0002): take the token for this candidate's
             // first upstream send. The primary candidate may wait briefly for
             // its next token (at most one refill, capped by
             // `rate_limit_max_wait_ms`) instead of failing over to a slower
@@ -8056,36 +8065,36 @@ cooldown_ms = cooldown.as_millis() as u64,
                 handle.set_target(&provider_model.provider, &provider_model.model, phase);
                 handle.set_attempt(attempt_counter);
             }
-        let ledger_before = active.as_ref().map_or(0, |h| h.failed_attempt_count());
-        // Primary-candidate flag for the bounded Retry-After wait (Req
-        // 3.1-3.3): only the first candidate this request dispatches to
-        // may wait. The forced-reduce fallback (candidate_index =
-        // usize::MAX) re-dispatches an already-tried candidate, never a
-        // fresh primary, so it never qualifies either.
-        let is_primary_candidate = candidate_index == 0;
-        let dispatch_result = if force_context_reduce {
-            self.attempt_with_retry_forced_reduce(
-                &provider_model.provider,
-                &prepared_request,
-                &provider_model,
-                active.clone(),
-                attempt_counter,
-                FirstSendToken::Prepaid,
-                is_primary_candidate,
-            )
-            .await
-        } else {
-            self.attempt_with_retry(
-                &provider_model.provider,
-                &prepared_request,
-                &provider_model,
-                active.clone(),
-                attempt_counter,
-                FirstSendToken::Prepaid,
-                is_primary_candidate,
-            )
-            .await
-        };
+            let ledger_before = active.as_ref().map_or(0, |h| h.failed_attempt_count());
+            // Primary-candidate flag for the bounded Retry-After wait (Req
+            // 3.1-3.3): only the first candidate this request dispatches to
+            // may wait. The forced-reduce fallback (candidate_index =
+            // usize::MAX) re-dispatches an already-tried candidate, never a
+            // fresh primary, so it never qualifies either.
+            let is_primary_candidate = candidate_index == 0;
+            let dispatch_result = if force_context_reduce {
+                self.attempt_with_retry_forced_reduce(
+                    &provider_model.provider,
+                    &prepared_request,
+                    &provider_model,
+                    active.clone(),
+                    attempt_counter,
+                    FirstSendToken::Prepaid,
+                    is_primary_candidate,
+                )
+                .await
+            } else {
+                self.attempt_with_retry(
+                    &provider_model.provider,
+                    &prepared_request,
+                    &provider_model,
+                    active.clone(),
+                    attempt_counter,
+                    FirstSendToken::Prepaid,
+                    is_primary_candidate,
+                )
+                .await
+            };
             match dispatch_result {
                 Ok(mut response) => {
                     // ---- Repair the turn before judging it ----------------
@@ -8415,51 +8424,51 @@ cooldown_ms = cooldown.as_millis() as u64,
                     self.metrics
                         .clear_provider_cooldown(&provider_model.provider);
 
-        // Cache-aware actual cost (Req 3.5): price the response's usage
-        // split (uncached / cache-read / cache-creation) at the model's
-        // per-million rates. Bit-identical to the previous base-price
-        // formula when the usage carries no cache fields, so providers
-        // that never report cache telemetry are unaffected.
-        let usage_known = response.usage.total_tokens > 0
-            || response.usage.prompt_tokens > 0
-            || response.usage.completion_tokens > 0;
-        // Req 9.3 (github-copilot-oauth-provider): Copilot models are
-        // subscription-included — token usage IS recorded (usage rows
-        // below carry the model name + provider attribution), but the
-        // computed cost is forced to zero so per-token rates never
-        // bill a subscription-included model, even when the operator
-        // configured rates in the group entry.
-        let is_copilot_provider = {
-            let config = self.config.read().await;
-            config.providers.iter().any(|p| {
-                p.name == provider_model.provider && p.provider_type == "github-copilot"
-            })
-        };
-        let total_cost = if is_copilot_provider {
-            0.0
-        } else if usage_known {
-            let cost = compute_actual_cost(&provider_model, &response.usage);
-            if cost > 0.0 {
-                self.metrics.add_cost(&provider_model.provider, cost);
-                // Durable budget accrual (persistent budgets, Task 4):
-                // persist for every provider — limits are metadata in
-                // the store; off-path write, never blocks the response.
-                self.metrics
-                    .persist_provider_spend(&provider_model.provider, cost);
-            }
-            record_cache_usage(
-                &self.metrics,
-                &provider_model.provider,
-                &provider_model,
-                &response.usage,
-                cost,
-            );
-            cost
-        } else {
-            self.metrics
-                .record_provider_unknown_cost(&provider_model.provider);
-            0.0
-        };
+                    // Cache-aware actual cost (Req 3.5): price the response's usage
+                    // split (uncached / cache-read / cache-creation) at the model's
+                    // per-million rates. Bit-identical to the previous base-price
+                    // formula when the usage carries no cache fields, so providers
+                    // that never report cache telemetry are unaffected.
+                    let usage_known = response.usage.total_tokens > 0
+                        || response.usage.prompt_tokens > 0
+                        || response.usage.completion_tokens > 0;
+                    // Req 9.3 (github-copilot-oauth-provider): Copilot models are
+                    // subscription-included — token usage IS recorded (usage rows
+                    // below carry the model name + provider attribution), but the
+                    // computed cost is forced to zero so per-token rates never
+                    // bill a subscription-included model, even when the operator
+                    // configured rates in the group entry.
+                    let is_copilot_provider = {
+                        let config = self.config.read().await;
+                        config.providers.iter().any(|p| {
+                            p.name == provider_model.provider && p.provider_type == "github-copilot"
+                        })
+                    };
+                    let total_cost = if is_copilot_provider {
+                        0.0
+                    } else if usage_known {
+                        let cost = compute_actual_cost(&provider_model, &response.usage);
+                        if cost > 0.0 {
+                            self.metrics.add_cost(&provider_model.provider, cost);
+                            // Durable budget accrual (persistent budgets, Task 4):
+                            // persist for every provider — limits are metadata in
+                            // the store; off-path write, never blocks the response.
+                            self.metrics
+                                .persist_provider_spend(&provider_model.provider, cost);
+                        }
+                        record_cache_usage(
+                            &self.metrics,
+                            &provider_model.provider,
+                            &provider_model,
+                            &response.usage,
+                            cost,
+                        );
+                        cost
+                    } else {
+                        self.metrics
+                            .record_provider_unknown_cost(&provider_model.provider);
+                        0.0
+                    };
 
                     // Reasoning-token attribution (Req 4.7): extract the reasoning /
                     // thinking token count (any carrier shape, never double-counted) and
@@ -10922,11 +10931,11 @@ visible content. Do not restate your plan and do not end your turn without doing
             decision: mut routing_decision,
             bypassed: routing_bypassed,
             diagnostics: routing_diagnostics,
-} = self
-.resolve_routed_providers(&prepared_request, model_group, active.as_ref())
-.await?;
-// Drop explicitly excluded provider:model entries (streaming 429
-// fallback — see `route_request_streaming_excluding`).
+        } = self
+            .resolve_routed_providers(&prepared_request, model_group, active.as_ref())
+            .await?;
+        // Drop explicitly excluded provider:model entries (streaming 429
+        // fallback — see `route_request_streaming_excluding`).
         let providers = if exclude.is_empty() {
             providers
         } else {
@@ -11152,14 +11161,14 @@ visible content. Do not restate your plan and do not end your turn without doing
             decision: routing_decision,
             bypassed: routing_bypassed,
             diagnostics: routing_diagnostics,
-} = self
-.resolve_routed_providers(&prepared_request, model_group, active.as_ref())
-.await?;
-if providers.is_empty() {
-return Err(GatewayError::InvalidRequest(
-"No available providers for model".to_string(),
-));
-}
+        } = self
+            .resolve_routed_providers(&prepared_request, model_group, active.as_ref())
+            .await?;
+        if providers.is_empty() {
+            return Err(GatewayError::InvalidRequest(
+                "No available providers for model".to_string(),
+            ));
+        }
 
         // Pass-through disabled globally, or Smart Routing applied without
         // Streaming Reliability → buffer the whole request.
@@ -11226,30 +11235,30 @@ return Err(GatewayError::InvalidRequest(
             break;
         }
 
-// No pass-through slot is immediately available. Preserve provider
-// order by waiting for the first saturated candidate, then use the
-// normal buffered route so cross-provider failover remains intact.
-// `Option` so the Retry-After wait can drop the permit before sleeping
-// and re-acquire it after (Req 3.9 wait discipline).
-let (provider_model, mut concurrency_permit) = match chosen {
-    Some(chosen) => {
-        let (provider_model, permit) = chosen;
-        (provider_model, Some(permit))
-    }
-    None => {
-        let Some((provider_model, provider_cfg)) = chosen_without_capacity else {
-            debug!("No eligible pass-through provider, using buffered path");
-            return Ok(StreamingResponse::Buffered(
-                self.route_request(request, active.clone()).await?,
-            ));
+        // No pass-through slot is immediately available. Preserve provider
+        // order by waiting for the first saturated candidate, then use the
+        // normal buffered route so cross-provider failover remains intact.
+        // `Option` so the Retry-After wait can drop the permit before sleeping
+        // and re-acquire it after (Req 3.9 wait discipline).
+        let (provider_model, mut concurrency_permit) = match chosen {
+            Some(chosen) => {
+                let (provider_model, permit) = chosen;
+                (provider_model, Some(permit))
+            }
+            None => {
+                let Some((provider_model, provider_cfg)) = chosen_without_capacity else {
+                    debug!("No eligible pass-through provider, using buffered path");
+                    return Ok(StreamingResponse::Buffered(
+                        self.route_request(request, active.clone()).await?,
+                    ));
+                };
+                debug!(provider = %provider_model.provider, model = %provider_model.model, "Waiting for provider concurrency before buffered dispatch");
+                drop(provider_cfg);
+                return Ok(StreamingResponse::Buffered(
+                    self.route_request(request, active.clone()).await?,
+                ));
+            }
         };
-        debug!(provider = %provider_model.provider, model = %provider_model.model, "Waiting for provider concurrency before buffered dispatch");
-        drop(provider_cfg);
-        return Ok(StreamingResponse::Buffered(
-            self.route_request(request, active.clone()).await?,
-        ));
-    }
-};
 
         // Report the streaming pass-through target to the in-flight registry.
         // If providers were excluded it means an earlier pass-through failed and
@@ -11534,52 +11543,52 @@ let (provider_model, mut concurrency_permit) = match chosen {
         }
         let http_client = self.get_or_create_http_client(&provider_model.provider, &pool_config)?;
 
-// Retry policy inputs (retry-failover-core-overhaul, Task 4): same
-// sources as the buffered dispatch loop (max_retries_per_provider,
-// backoff sequence + jitter, and the Req 1.6 gateway deadline cap),
-// plus the bounded Retry-After wait knob (Req 3.1-3.9).
-let (
-    max_retries,
-    backoff_sequence,
-    jitter_enabled,
-    jitter_ratio,
-    request_deadline_ms,
-    retry_after_max_wait_ms,
-    provider_cfg_max_connections,
-) = {
-    let config = self.config.read().await;
-    let deadline_ms = {
-        let secs = crate::runtime_limits::effective_request_timeout_seconds(&config);
-        (secs > 0).then(|| secs as i64 * 1000)
-    };
-    let max_connections = config
-        .providers
-        .iter()
-        .find(|p| p.name == provider_model.provider)
-        .map(|p| p.max_connections)
-        .unwrap_or(10);
-    (
-        config.retry.max_retries_per_provider,
-        config.retry.backoff_sequence_seconds.clone(),
-        config.retry.jitter_enabled,
-        config.retry.jitter_ratio,
-        deadline_ms,
-        config.retry.upstream_retry_after_max_wait_ms,
-        max_connections,
-    )
-};
-let mut last_error: Option<GatewayError> = None;
-// One-shot backoff skip for the Retry-After waited retry: the wait
-// itself IS the delay, so the loop's own backoff must not stack on top.
-let mut skip_next_backoff = false;
+        // Retry policy inputs (retry-failover-core-overhaul, Task 4): same
+        // sources as the buffered dispatch loop (max_retries_per_provider,
+        // backoff sequence + jitter, and the Req 1.6 gateway deadline cap),
+        // plus the bounded Retry-After wait knob (Req 3.1-3.9).
+        let (
+            max_retries,
+            backoff_sequence,
+            jitter_enabled,
+            jitter_ratio,
+            request_deadline_ms,
+            retry_after_max_wait_ms,
+            provider_cfg_max_connections,
+        ) = {
+            let config = self.config.read().await;
+            let deadline_ms = {
+                let secs = crate::runtime_limits::effective_request_timeout_seconds(&config);
+                (secs > 0).then(|| secs as i64 * 1000)
+            };
+            let max_connections = config
+                .providers
+                .iter()
+                .find(|p| p.name == provider_model.provider)
+                .map(|p| p.max_connections)
+                .unwrap_or(10);
+            (
+                config.retry.max_retries_per_provider,
+                config.retry.backoff_sequence_seconds.clone(),
+                config.retry.jitter_enabled,
+                config.retry.jitter_ratio,
+                deadline_ms,
+                config.retry.upstream_retry_after_max_wait_ms,
+                max_connections,
+            )
+        };
+        let mut last_error: Option<GatewayError> = None;
+        // One-shot backoff skip for the Retry-After waited retry: the wait
+        // itself IS the delay, so the loop's own backoff must not stack on top.
+        let mut skip_next_backoff = false;
 
-	let pre_dispatch_ms = active.as_ref().map_or(0, ActiveRequestHandle::elapsed_ms);
-	// R1: request-scoped primary-ness — rows recorded before this
-	// dispatch (e.g. a buffered failover re-entry after an earlier
-	// candidate failed) prove the request already left its primary;
-	// this loop's own rows must not count.
-	let attempt_rows_at_dispatch = active.as_ref().map_or(0, |h| h.attempt_rows_total());
-	tracing::info!(provider = %provider_model.provider, %url, model = %provider_model.model, ttfb_timeout_secs, pre_dispatch_ms, "Calling provider (streaming pass-through)");
+        let pre_dispatch_ms = active.as_ref().map_or(0, ActiveRequestHandle::elapsed_ms);
+        // R1: request-scoped primary-ness — rows recorded before this
+        // dispatch (e.g. a buffered failover re-entry after an earlier
+        // candidate failed) prove the request already left its primary;
+        // this loop's own rows must not count.
+        let attempt_rows_at_dispatch = active.as_ref().map_or(0, |h| h.attempt_rows_total());
+        tracing::info!(provider = %provider_model.provider, %url, model = %provider_model.model, ttfb_timeout_secs, pre_dispatch_ms, "Calling provider (streaming pass-through)");
 
         let mut response = None;
         for attempt in 0..=max_retries {
@@ -11628,13 +11637,16 @@ let mut skip_next_backoff = false;
             } else {
                 None
             };
-        if attempt > 0 && !skip_next_backoff {
-            skip_next_backoff = false;
-            let retry_delay = Self::calculate_retry_delay(
-                backoff_sequence.get((attempt - 1) as usize).copied().unwrap_or(4),
-                jitter_enabled,
-                jitter_ratio,
-            );
+            if attempt > 0 && !skip_next_backoff {
+                skip_next_backoff = false;
+                let retry_delay = Self::calculate_retry_delay(
+                    backoff_sequence
+                        .get((attempt - 1) as usize)
+                        .copied()
+                        .unwrap_or(4),
+                    jitter_enabled,
+                    jitter_ratio,
+                );
                 // Req 1.6 (retry-failover-core-overhaul): same cap as the
                 // buffered loop — waking past the gateway request deadline
                 // means failing over now instead of scheduling the sleep.
@@ -11651,8 +11663,10 @@ let mut skip_next_backoff = false;
                         break;
                     }
                 }
-                self.metrics
-                    .record_provider_retry(&provider_model.provider, retry_delay.as_millis() as u64);
+                self.metrics.record_provider_retry(
+                    &provider_model.provider,
+                    retry_delay.as_millis() as u64,
+                );
                 if let Some(handle) = &active {
                     handle.set_phase(ActivePhase::Retry);
                     handle.set_attempt(attempt as usize);
@@ -11664,30 +11678,30 @@ let mut skip_next_backoff = false;
                     active.as_ref(),
                     crate::active_requests::StallReason::RetryBackoff,
                 );
-        tokio::time::sleep(retry_delay).await;
-        _backoff_stall.end();
-        // ADR 0002: one token per real upstream request — every
-        // re-send re-enters the admission gate.
-        let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
-        if !rate_limiter.consume().await {
-            warn!(provider = %provider_model.provider, "Rate limit exhausted before streaming retry, failing over");
-            self.metrics
-                .record_provider_rate_limit_exhausted(&provider_model.provider);
-            break;
-        }
-        } else if attempt > 0 {
-            // Backoff skipped (Retry-After waited retry): the wait was
-            // the delay, but the admission gate is NOT skipped — one
-            // token per real upstream send (ADR 0002).
-            skip_next_backoff = false;
-            let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
-            if !rate_limiter.consume().await {
-                warn!(provider = %provider_model.provider, "Rate limit exhausted before streaming retry, failing over");
-                self.metrics
-                    .record_provider_rate_limit_exhausted(&provider_model.provider);
-                break;
+                tokio::time::sleep(retry_delay).await;
+                _backoff_stall.end();
+                // ADR 0002: one token per real upstream request — every
+                // re-send re-enters the admission gate.
+                let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
+                if !rate_limiter.consume().await {
+                    warn!(provider = %provider_model.provider, "Rate limit exhausted before streaming retry, failing over");
+                    self.metrics
+                        .record_provider_rate_limit_exhausted(&provider_model.provider);
+                    break;
+                }
+            } else if attempt > 0 {
+                // Backoff skipped (Retry-After waited retry): the wait was
+                // the delay, but the admission gate is NOT skipped — one
+                // token per real upstream send (ADR 0002).
+                skip_next_backoff = false;
+                let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
+                if !rate_limiter.consume().await {
+                    warn!(provider = %provider_model.provider, "Rate limit exhausted before streaming retry, failing over");
+                    self.metrics
+                        .record_provider_rate_limit_exhausted(&provider_model.provider);
+                    break;
+                }
             }
-        }
 
             let mut req_builder = http_client
                 .post(&url)
@@ -11750,7 +11764,13 @@ let mut skip_next_backoff = false;
                         request_start,
                     );
                     return self
-                        .passthrough_fallback_excluding(request, exclude, active, &provider_model, err)
+                        .passthrough_fallback_excluding(
+                            request,
+                            exclude,
+                            active,
+                            &provider_model,
+                            err,
+                        )
                         .await;
                 }
             };
@@ -11786,101 +11806,98 @@ let mut skip_next_backoff = false;
                     None,
                     request_start,
                 );
-        if Self::is_rate_limited(status_code, &body_text) {
-            // Rate-limit response on the streaming pass-through: apply
-            // the dedicated upstream cooldown (RateLimiter + durable
-            // metrics store, both consulted by the routing gates) and
-            // exclude this provider:model from the buffered fallback so
-            // it is not immediately retried while the cooldown is
-            // active. No circuit-breaker failure is recorded — a
-            // rate-limited provider is paused, not unhealthy.
- let cooldown = self
- .parse_rate_limit_cooldown(
- &provider_model.provider,
- Some(&response_headers),
- &body_text,
- )
- .await;
- // R4: only a real upstream Retry-After signal may drive the
- // bounded wait (Req 3.1); hint-less 429s fail over with the
- // default cooldown applied.
- let cooldown_from_upstream = self
- .upstream_rate_limit_cooldown_hint(
- Some(&response_headers),
- &body_text,
- )
- .await;
- // Bounded Retry-After wait (retry-failover-core-overhaul,
- // Req 3.1-3.9), streaming arm: the primary candidate's
-            // first qualifying 429 may wait out the provider's own
-            // Retry-After and retry the same provider in pass-through.
-            // The parsed cooldown IS the Retry-After (never parsed
-            // twice); the permit is dropped before the wait and
-            // re-acquired after; the retry re-enters `consume()` at the
-            // top of the loop — one token per real send (ADR 0002).
-            // `exclude.is_empty()` marks this dispatch as the
-            // request's primary candidate; the monotonic wait-done
-            // marker makes the one-shot wait cross-stack (a buffered
-            // fallback that already waited never waits again).
-        let is_primary = exclude.is_empty()
-            && !active
-                .as_ref()
-                .is_some_and(|h| h.has_recorded_rate_limit_wait());
-        if let Some(wait) = Self::retry_after_wait_duration(
-            is_primary,
-            false,
-            // R1: rows from a previous dispatch prove the request
-            // already failed over, even when this fresh dispatch's
-            // exclude list is empty. The monotonic wait marker
-            // above stays as the cross-stack one-shot-wait guard.
-            attempt_rows_at_dispatch > 0,
-            max_retries,
-            retry_after_max_wait_ms,
-            cooldown,
-            cooldown_from_upstream,
-        ) {
-                // Cooldown still applies while this request waits.
-                self.get_rate_limiter(&provider_model.provider)
-                    .await
-                    .apply_cooldown(cooldown)
-                    .await;
-                let permit_taken = concurrency_permit.take();
-                drop(permit_taken);
-                let waited = Self::maybe_wait_retry_after(
-                    active.as_ref(),
-                    &provider_model.provider,
-                    &provider_model.model,
-                    wait,
-                    request_deadline_ms,
-                )
-                .await;
-                if waited {
-                    // Re-acquire the provider slot; saturation rejects
-                    // with the usual 503 through the fallback sink.
-                    concurrency_permit = match self.try_acquire_provider_concurrency(
-                        &provider_model.provider,
-                        provider_cfg_max_connections,
+                if Self::is_rate_limited(status_code, &body_text) {
+                    // Rate-limit response on the streaming pass-through: apply
+                    // the dedicated upstream cooldown (RateLimiter + durable
+                    // metrics store, both consulted by the routing gates) and
+                    // exclude this provider:model from the buffered fallback so
+                    // it is not immediately retried while the cooldown is
+                    // active. No circuit-breaker failure is recorded — a
+                    // rate-limited provider is paused, not unhealthy.
+                    let cooldown = self
+                        .parse_rate_limit_cooldown(
+                            &provider_model.provider,
+                            Some(&response_headers),
+                            &body_text,
+                        )
+                        .await;
+                    // R4: only a real upstream Retry-After signal may drive the
+                    // bounded wait (Req 3.1); hint-less 429s fail over with the
+                    // default cooldown applied.
+                    let cooldown_from_upstream = self
+                        .upstream_rate_limit_cooldown_hint(Some(&response_headers), &body_text)
+                        .await;
+                    // Bounded Retry-After wait (retry-failover-core-overhaul,
+                    // Req 3.1-3.9), streaming arm: the primary candidate's
+                    // first qualifying 429 may wait out the provider's own
+                    // Retry-After and retry the same provider in pass-through.
+                    // The parsed cooldown IS the Retry-After (never parsed
+                    // twice); the permit is dropped before the wait and
+                    // re-acquired after; the retry re-enters `consume()` at the
+                    // top of the loop — one token per real send (ADR 0002).
+                    // `exclude.is_empty()` marks this dispatch as the
+                    // request's primary candidate; the monotonic wait-done
+                    // marker makes the one-shot wait cross-stack (a buffered
+                    // fallback that already waited never waits again).
+                    let is_primary = exclude.is_empty()
+                        && !active
+                            .as_ref()
+                            .is_some_and(|h| h.has_recorded_rate_limit_wait());
+                    if let Some(wait) = Self::retry_after_wait_duration(
+                        is_primary,
+                        false,
+                        // R1: rows from a previous dispatch prove the request
+                        // already failed over, even when this fresh dispatch's
+                        // exclude list is empty. The monotonic wait marker
+                        // above stays as the cross-stack one-shot-wait guard.
+                        attempt_rows_at_dispatch > 0,
+                        max_retries,
+                        retry_after_max_wait_ms,
+                        cooldown,
+                        cooldown_from_upstream,
                     ) {
-                        Some(permit) => Some(permit),
-                        None => {
-                            warn!(
-                                provider = %provider_model.provider,
-                                "Provider saturated after Retry-After wait — falling back to buffered path"
-                            );
+                        // Cooldown still applies while this request waits.
+                        self.get_rate_limiter(&provider_model.provider)
+                            .await
+                            .apply_cooldown(cooldown)
+                            .await;
+                        let permit_taken = concurrency_permit.take();
+                        drop(permit_taken);
+                        let waited = Self::maybe_wait_retry_after(
+                            active.as_ref(),
+                            &provider_model.provider,
+                            &provider_model.model,
+                            wait,
+                            request_deadline_ms,
+                        )
+                        .await;
+                        if waited {
+                            // Re-acquire the provider slot; saturation rejects
+                            // with the usual 503 through the fallback sink.
+                            concurrency_permit = match self.try_acquire_provider_concurrency(
+                                &provider_model.provider,
+                                provider_cfg_max_connections,
+                            ) {
+                                Some(permit) => Some(permit),
+                                None => {
+                                    warn!(
+                                        provider = %provider_model.provider,
+                                        "Provider saturated after Retry-After wait — falling back to buffered path"
+                                    );
+                                    last_error = Some(err);
+                                    break;
+                                }
+                            };
                             last_error = Some(err);
-                            break;
+                            skip_next_backoff = true;
+                            continue;
                         }
-                    };
-                    last_error = Some(err);
-                    skip_next_backoff = true;
-                    continue;
-                }
-                // Deadline fired during the wait: fall through to the
-                // cooldown + failover below — no retry sent, no token
-                // consumed for it.
-            }
-            let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
-            rate_limiter.apply_cooldown(cooldown).await;
+                        // Deadline fired during the wait: fall through to the
+                        // cooldown + failover below — no retry sent, no token
+                        // consumed for it.
+                    }
+                    let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
+                    rate_limiter.apply_cooldown(cooldown).await;
                     self.metrics
                         .record_provider_rate_limit_exhausted(&provider_model.provider);
                     let now_secs = SystemTime::now()
@@ -11901,7 +11918,8 @@ let mut skip_next_backoff = false;
                     );
                     drop(concurrency_permit.take());
                     let mut excluded = exclude.to_vec();
-                    let failed_key = format!("{}:{}", provider_model.provider, provider_model.model);
+                    let failed_key =
+                        format!("{}:{}", provider_model.provider, provider_model.model);
                     if !excluded.contains(&failed_key) {
                         excluded.push(failed_key);
                     }
@@ -11966,7 +11984,8 @@ let mut skip_next_backoff = false;
                     // part of the whole body. Scrub those before the buffered
                     // retry so the fallback isn't re-sending the same trigger.
                     if removed == 0 {
-                        let tools_removed = Self::strip_image_fields_from_tools(&mut stripped_request);
+                        let tools_removed =
+                            Self::strip_image_fields_from_tools(&mut stripped_request);
                         if tools_removed > 0 {
                             warn!(
                                 provider = %provider_model.provider,
@@ -12015,7 +12034,13 @@ let mut skip_next_backoff = false;
                     warn!(provider = %provider_model.provider, status = status_code, "Provider returned server error (streaming), falling back to buffered path without this provider");
                     drop(concurrency_permit.take());
                     return self
-                        .passthrough_fallback_excluding(request, exclude, active, &provider_model, err)
+                        .passthrough_fallback_excluding(
+                            request,
+                            exclude,
+                            active,
+                            &provider_model,
+                            err,
+                        )
                         .await;
                 }
                 warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
@@ -12063,7 +12088,7 @@ let mut skip_next_backoff = false;
                     .emit(&model_group.name, active.as_ref());
             }
         }
-Ok(StreamingResponse::PassThrough {
+        Ok(StreamingResponse::PassThrough {
     byte_stream: response,
     provider: provider_model.provider.clone(),
     model: provider_model.model.clone(),
@@ -12073,7 +12098,7 @@ Ok(StreamingResponse::PassThrough {
     ),
     smart_routing,
 })
-}
+    }
 
     pub async fn route_provider_pass_through(
         &self,
@@ -12133,230 +12158,238 @@ Ok(StreamingResponse::PassThrough {
     // Decision routing (decisions-api spec)
     // -------------------------------------------------------------------
 
-/// Route a System One decision request (`/v1/decisions`) to the first
-/// healthy decision provider: jev/laya family providers matched by
-/// family token (or `auto`/bare alias), generic systemone providers
-/// matched by exact `manual_models` id. Same-family/same-id failover
-/// only — cross-family substitution never happens (design D4). Single
-/// pass, no streaming (design D8).
-///
-/// Returns the provider's answer envelope with the resolved model id
-/// echoed in `response.model` (Req 2.4) plus the serving provider name,
-/// and carries the accumulated attempt ledger BOTH ways (F1/Req 2.7):
-/// `Ok` returns the prior failed attempts alongside the response (the
-/// caller consumes them for telemetry); `Err` returns every attempt
-/// with the terminal error.
-pub async fn route_decision(
-    &self,
-    request: &SystemOneRequest,
-) -> Result<(SystemOneResponse, String, Vec<ProviderAttempt>), (GatewayError, Vec<ProviderAttempt>)> {
-    let requested_model = request.model.trim().to_string();
-    let candidates = match self.decision_candidates(&requested_model).await {
-        Ok(candidates) => candidates,
-        // No-candidate 404s precede any attempt; empty ledger.
-        Err(error) => return Err((error, Vec::new())),
-    };
-    let mut attempts: Vec<ProviderAttempt> = Vec::new();
-
-    for candidate in &candidates {
-        let provider_name = candidate.provider.name.clone();
-        let started = std::time::Instant::now();
-
-        // Admission 1: provider concurrency slot. A saturated slot
-        // fails over to the next same-family candidate (503 row).
-        let _concurrency_permit = match self
-            .acquire_provider_slot_or_reject(&candidate.provider, &requested_model)
-            .await
-        {
-            Ok(permit) => permit,
-            Err(error) => {
-                attempts.push(
-                    ProviderAttempt::new(
-                        provider_name.clone(),
-                        requested_model.clone(),
-                        error.to_string(),
-                        Some(attempt_status_for(&error)),
-                    )
-                    .with_duration(started.elapsed())
-                    .with_error_class("slot_saturated"),
-                );
-                continue;
-            }
+    /// Route a System One decision request (`/v1/decisions`) to the first
+    /// healthy decision provider: jev/laya family providers matched by
+    /// family token (or `auto`/bare alias), generic systemone providers
+    /// matched by exact `manual_models` id. Same-family/same-id failover
+    /// only — cross-family substitution never happens (design D4). Single
+    /// pass, no streaming (design D8).
+    ///
+    /// Returns the provider's answer envelope with the resolved model id
+    /// echoed in `response.model` (Req 2.4) plus the serving provider name,
+    /// and carries the accumulated attempt ledger BOTH ways (F1/Req 2.7):
+    /// `Ok` returns the prior failed attempts alongside the response (the
+    /// caller consumes them for telemetry); `Err` returns every attempt
+    /// with the terminal error.
+    pub async fn route_decision(
+        &self,
+        request: &SystemOneRequest,
+    ) -> Result<
+        (SystemOneResponse, String, Vec<ProviderAttempt>),
+        (GatewayError, Vec<ProviderAttempt>),
+    > {
+        let requested_model = request.model.trim().to_string();
+        let candidates = match self.decision_candidates(&requested_model).await {
+            Ok(candidates) => candidates,
+            // No-candidate 404s precede any attempt; empty ledger.
+            Err(error) => return Err((error, Vec::new())),
         };
+        let mut attempts: Vec<ProviderAttempt> = Vec::new();
 
-        // Admission 2 (F3a): rate-limit admission happens AFTER client
-        // build and key resolution, immediately before the real upstream
-        // call(s) — one blocking-wait-free token per admitted try (ADR
-        // 0002). A local skip or upstream cooldown fails over (429 row).
-        let rate_limiter = self.get_rate_limiter(&provider_name).await;
-        let client = match self.decision_client_for(candidate).await {
-            Ok(client) => client,
-            Err(error) => {
-                attempts.push(
-                    ProviderAttempt::new(
-                        provider_name.clone(),
-                        requested_model.clone(),
-                        error.to_string(),
-                        Some(attempt_status_for(&error)),
-                    )
-                    .with_duration(started.elapsed())
-                    .with_error_class(&error_class_for(&error)),
-                );
-                continue;
-            }
-        };
-        // F4: a missing API key is a terminal Auth-class attempt — never
-        // send an empty Bearer upstream.
-        let api_key = candidate.provider.resolve_api_key();
-        let api_key_ref = match api_key.as_deref() {
-            Some(key) => Some(key),
-            None => {
-                attempts.push(
-                    ProviderAttempt::new(
-                        provider_name.clone(),
-                        requested_model.clone(),
-                        format!(
-                            "No API key resolved for provider '{provider_name}'; \
-                             check the provider API key configuration"
-                        ),
-                        Some(502),
-                    )
-                    .with_duration(started.elapsed())
-                    .with_error_class("auth"),
-                );
-                continue;
-            }
-        };
+        for candidate in &candidates {
+            let provider_name = candidate.provider.name.clone();
+            let started = std::time::Instant::now();
 
-        // Model resolution: pinned ids forward verbatim; `auto`/bare
-        // family aliases resolve via the per-provider TTL-cached
-        // discovery (Req 2.3). Resolution failure fails over.
-        //
-        // Per-try timeout budget from the provider timeout config
-        // (Req 3.1), flooring at 1s so a zero config cannot spin.
-        let timeout_seconds = candidate
-            .provider
-            .effective_total_timeout(if let Some(pinned) = &candidate.pinned_model {
-                pinned.as_str()
-            } else {
-                requested_model.as_str()
-            })
-            .max(1);
-        let resolved_model = match &candidate.pinned_model {
-            Some(pinned) => pinned.clone(),
-            None => {
-                // F3b: the discovery listing is a real upstream request —
-                // it takes its own non-blocking token before dispatch.
-                if !rate_limiter.consume().await {
+            // Admission 1: provider concurrency slot. A saturated slot
+            // fails over to the next same-family candidate (503 row).
+            let _concurrency_permit = match self
+                .acquire_provider_slot_or_reject(&candidate.provider, &requested_model)
+                .await
+            {
+                Ok(permit) => permit,
+                Err(error) => {
                     attempts.push(
                         ProviderAttempt::new(
                             provider_name.clone(),
                             requested_model.clone(),
-                            "Rate limit exhausted".to_string(),
-                            Some(429),
+                            error.to_string(),
+                            Some(attempt_status_for(&error)),
                         )
                         .with_duration(started.elapsed())
-                        .with_error_class("rate_limit_skip"),
+                        .with_error_class("slot_saturated"),
                     );
                     continue;
                 }
-                match self
-                    .resolve_decision_model(&client, candidate, api_key_ref, Duration::from_secs(timeout_seconds))
-                    .await
-                {
-                    Ok(model) => model,
-                    Err((message, status, is_timeout)) => {
+            };
+
+            // Admission 2 (F3a): rate-limit admission happens AFTER client
+            // build and key resolution, immediately before the real upstream
+            // call(s) — one blocking-wait-free token per admitted try (ADR
+            // 0002). A local skip or upstream cooldown fails over (429 row).
+            let rate_limiter = self.get_rate_limiter(&provider_name).await;
+            let client = match self.decision_client_for(candidate).await {
+                Ok(client) => client,
+                Err(error) => {
+                    attempts.push(
+                        ProviderAttempt::new(
+                            provider_name.clone(),
+                            requested_model.clone(),
+                            error.to_string(),
+                            Some(attempt_status_for(&error)),
+                        )
+                        .with_duration(started.elapsed())
+                        .with_error_class(&error_class_for(&error)),
+                    );
+                    continue;
+                }
+            };
+            // F4: a missing API key is a terminal Auth-class attempt — never
+            // send an empty Bearer upstream.
+            let api_key = candidate.provider.resolve_api_key();
+            let api_key_ref = match api_key.as_deref() {
+                Some(key) => Some(key),
+                None => {
+                    attempts.push(
+                        ProviderAttempt::new(
+                            provider_name.clone(),
+                            requested_model.clone(),
+                            format!(
+                                "No API key resolved for provider '{provider_name}'; \
+                             check the provider API key configuration"
+                            ),
+                            Some(502),
+                        )
+                        .with_duration(started.elapsed())
+                        .with_error_class("auth"),
+                    );
+                    continue;
+                }
+            };
+
+            // Model resolution: pinned ids forward verbatim; `auto`/bare
+            // family aliases resolve via the per-provider TTL-cached
+            // discovery (Req 2.3). Resolution failure fails over.
+            //
+            // Per-try timeout budget from the provider timeout config
+            // (Req 3.1), flooring at 1s so a zero config cannot spin.
+            let timeout_seconds = candidate
+                .provider
+                .effective_total_timeout(if let Some(pinned) = &candidate.pinned_model {
+                    pinned.as_str()
+                } else {
+                    requested_model.as_str()
+                })
+                .max(1);
+            let resolved_model = match &candidate.pinned_model {
+                Some(pinned) => pinned.clone(),
+                None => {
+                    // F3b: the discovery listing is a real upstream request —
+                    // it takes its own non-blocking token before dispatch.
+                    if !rate_limiter.consume().await {
                         attempts.push(
                             ProviderAttempt::new(
                                 provider_name.clone(),
                                 requested_model.clone(),
-                                message,
-                                Some(status),
+                                "Rate limit exhausted".to_string(),
+                                Some(429),
                             )
                             .with_duration(started.elapsed())
-                            .with_error_class(if is_timeout { "timeout" } else { "other" }),
+                            .with_error_class("rate_limit_skip"),
                         );
                         continue;
                     }
+                    match self
+                        .resolve_decision_model(
+                            &client,
+                            candidate,
+                            api_key_ref,
+                            Duration::from_secs(timeout_seconds),
+                        )
+                        .await
+                    {
+                        Ok(model) => model,
+                        Err((message, status, is_timeout)) => {
+                            attempts.push(
+                                ProviderAttempt::new(
+                                    provider_name.clone(),
+                                    requested_model.clone(),
+                                    message,
+                                    Some(status),
+                                )
+                                .with_duration(started.elapsed())
+                                .with_error_class(if is_timeout { "timeout" } else { "other" }),
+                            );
+                            continue;
+                        }
+                    }
                 }
-            }
-        };
+            };
 
-        let outgoing = SystemOneRequest {
-            state: request.state.clone(),
-            model: resolved_model.clone(),
-            questions: request.questions.clone(),
-        };
-        // F3a: consume the evaluate token immediately before the real
-        // upstream call (client-internal retries debit via the hook).
-        if !rate_limiter.consume().await {
-            attempts.push(
-                ProviderAttempt::new(
-                    provider_name.clone(),
-                    resolved_model.clone(),
-                    "Rate limit exhausted".to_string(),
-                    Some(429),
-                )
-                .with_duration(started.elapsed())
-                .with_error_class("rate_limit_skip"),
-            );
-            continue;
-        }
-        match tokio::time::timeout(
-            Duration::from_secs(timeout_seconds),
-            client.evaluate_with(&outgoing, api_key_ref, Duration::from_secs(timeout_seconds)),
-        )
-        .await
-        {
-            Ok(Ok(mut response)) => {
-                // Alias-drift visibility (Req 2.4 vs 1.5/F7): only
-                // auto/bare-alias requests echo the resolved id; pinned
-                // ids return the provider's echo verbatim.
-                if candidate.pinned_model.is_none() {
-                    response.model = resolved_model.clone();
-                }
-                return Ok((response, provider_name, attempts));
-            }
-            Err(_) => {
+            let outgoing = SystemOneRequest {
+                state: request.state.clone(),
+                model: resolved_model.clone(),
+                questions: request.questions.clone(),
+            };
+            // F3a: consume the evaluate token immediately before the real
+            // upstream call (client-internal retries debit via the hook).
+            if !rate_limiter.consume().await {
                 attempts.push(
                     ProviderAttempt::new(
                         provider_name.clone(),
                         resolved_model.clone(),
-                        format!("Decision evaluation timed out after {timeout_seconds}s"),
-                        Some(504),
+                        "Rate limit exhausted".to_string(),
+                        Some(429),
                     )
                     .with_duration(started.elapsed())
-                    .with_error_class("timeout"),
+                    .with_error_class("rate_limit_skip"),
                 );
                 continue;
             }
-            Ok(Err(call_error)) => {
-                attempts.push(
-                    ProviderAttempt::new(
-                        provider_name.clone(),
-                        resolved_model.clone(),
-                        call_error.to_string(),
-                        Some(decision_call_error_status(&call_error)),
-                    )
-                    .with_duration(started.elapsed())
-                    .with_error_class(call_error.class()),
-                );
-                // Deterministic classes are terminal (Req 3.3): exact
-                // status, no retry, no failover. Transient/timeout/
-                // unavailable fail over to the next candidate.
-                if let Some(error) = decision_terminal_error(&provider_name, &call_error) {
-                    return Err((error, attempts));
+            match tokio::time::timeout(
+                Duration::from_secs(timeout_seconds),
+                client.evaluate_with(&outgoing, api_key_ref, Duration::from_secs(timeout_seconds)),
+            )
+            .await
+            {
+                Ok(Ok(mut response)) => {
+                    // Alias-drift visibility (Req 2.4 vs 1.5/F7): only
+                    // auto/bare-alias requests echo the resolved id; pinned
+                    // ids return the provider's echo verbatim.
+                    if candidate.pinned_model.is_none() {
+                        response.model = resolved_model.clone();
+                    }
+                    return Ok((response, provider_name, attempts));
                 }
-                continue;
+                Err(_) => {
+                    attempts.push(
+                        ProviderAttempt::new(
+                            provider_name.clone(),
+                            resolved_model.clone(),
+                            format!("Decision evaluation timed out after {timeout_seconds}s"),
+                            Some(504),
+                        )
+                        .with_duration(started.elapsed())
+                        .with_error_class("timeout"),
+                    );
+                    continue;
+                }
+                Ok(Err(call_error)) => {
+                    attempts.push(
+                        ProviderAttempt::new(
+                            provider_name.clone(),
+                            resolved_model.clone(),
+                            call_error.to_string(),
+                            Some(decision_call_error_status(&call_error)),
+                        )
+                        .with_duration(started.elapsed())
+                        .with_error_class(call_error.class()),
+                    );
+                    // Deterministic classes are terminal (Req 3.3): exact
+                    // status, no retry, no failover. Transient/timeout/
+                    // unavailable fail over to the next candidate.
+                    if let Some(error) = decision_terminal_error(&provider_name, &call_error) {
+                        return Err((error, attempts));
+                    }
+                    continue;
+                }
             }
         }
+
+        Err((
+            GatewayError::AllProvidersFailed(AggregatedError::new(attempts)),
+            Vec::new(),
+        ))
     }
-
-    Err((
-        GatewayError::AllProvidersFailed(AggregatedError::new(attempts)),
-        Vec::new(),
-    ))
-}
 
     /// Decision-provider candidates for a requested model (Req 2.2), in
     /// config declaration order — the operator's provider priority for
@@ -12381,23 +12414,23 @@ pub async fn route_decision(
             let family = match provider.provider_type.as_str() {
                 "jev" => SystemOneFamily::JEV,
                 "laya" => SystemOneFamily::LAYA,
-            "systemone" => {
-                has_generic_provider = true;
-                // Req 2.2: exact, case-sensitive id match ("exactly
-                // matches") — no case-folding on manual_models ids.
-                if provider
-                    .manual_models
-                    .iter()
-                    .any(|id| id.trim() == requested_model)
-                {
-                    candidates.push(DecisionCandidate {
-                        provider: Arc::new(provider.clone()),
-                        family: GENERIC_SYSTEMONE_FAMILY,
-                        pinned_model: Some(requested_model.to_string()),
-                    });
+                "systemone" => {
+                    has_generic_provider = true;
+                    // Req 2.2: exact, case-sensitive id match ("exactly
+                    // matches") — no case-folding on manual_models ids.
+                    if provider
+                        .manual_models
+                        .iter()
+                        .any(|id| id.trim() == requested_model)
+                    {
+                        candidates.push(DecisionCandidate {
+                            provider: Arc::new(provider.clone()),
+                            family: GENERIC_SYSTEMONE_FAMILY,
+                            pinned_model: Some(requested_model.to_string()),
+                        });
+                    }
+                    continue;
                 }
-                continue;
-            }
                 _ => continue,
             };
             let serves_request = if is_auto {
@@ -12414,17 +12447,17 @@ pub async fn route_decision(
             if !serves_request {
                 continue;
             }
-        let pinned_model = if Self::is_bare_decision_alias(requested_model, &family) {
-            None
-        } else {
-            Some(requested_model.to_string())
-        };
-        candidates.push(DecisionCandidate {
-            provider: Arc::new(provider.clone()),
-            family,
-            pinned_model,
-        });
-    }
+            let pinned_model = if Self::is_bare_decision_alias(requested_model, &family) {
+                None
+            } else {
+                Some(requested_model.to_string())
+            };
+            candidates.push(DecisionCandidate {
+                provider: Arc::new(provider.clone()),
+                family,
+                pinned_model,
+            });
+        }
 
         drop(config);
 
@@ -12455,131 +12488,130 @@ pub async fn route_decision(
     /// must resolve through model discovery rather than forward pinned.
     fn is_bare_decision_alias(model: &str, family: &SystemOneFamily) -> bool {
         let trimmed = model.trim();
-        trimmed.eq_ignore_ascii_case("auto")
-            || trimmed.eq_ignore_ascii_case(family.model_token)
+        trimmed.eq_ignore_ascii_case("auto") || trimmed.eq_ignore_ascii_case(family.model_token)
     }
 
-/// Cached per-provider decision client (keyed by provider name,
-/// cleared on hot-reload via [`Self::clear_http_clients`]). Only
-/// transport-level state is cached (F5): the API key and per-try
-/// deadline are supplied per call, and retry/backoff settings are read
-/// at build time (hot-reload clears the cache).
-async fn decision_client_for(
-    &self,
-    candidate: &DecisionCandidate,
-) -> Result<Arc<SystemOneClient>, GatewayError> {
-    if let Some(existing) = self.decision_clients.get(&candidate.provider.name) {
-        return Ok(existing.clone());
-    }
-    let provider = &candidate.provider;
-    let provider_name = provider.name.clone();
-    let base_url = provider
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .ok_or_else(|| GatewayError::Provider {
-            provider: provider_name.clone(),
-            message: "Provider base URL is not configured".to_string(),
-            status_code: Some(500),
-        })?
-        .to_string();
-    let (max_retries, backoff) = {
-        let config = self.config.read().await;
-        (
-            u8::try_from(config.retry.max_retries_per_provider).unwrap_or(u8::MAX),
-            Duration::from_secs(
-                config
-                    .retry
-                    .backoff_sequence_seconds
-                    .first()
-                    .copied()
-                    .unwrap_or(1),
-            ),
-        )
-    };
-    // Per-retry charge hook (ADR 0002): every client-internal retry is a
-    // real upstream request and takes one token, non-blocking.
-    let limiter = self.get_rate_limiter(&provider_name).await;
-    let client = Arc::new(
-        SystemOneClient::with_optional_authorization(
-            candidate.family,
-            &base_url,
-            // Key and deadline are per-call (F5); None until then.
-            None,
-            // Non-model fallback deadline; the outer per-try timeout in
-            // route_decision governs the real budget.
-            Duration::from_secs(600),
-            max_retries,
-            backoff,
-        )
-        .map_err(|error| GatewayError::Provider {
-            provider: provider_name.clone(),
-            message: format!("Failed to build decision client: {error}"),
-            status_code: Some(502),
-        })?
-        .with_retry_debit(std::sync::Arc::new(move || {
-            let limiter = limiter.clone();
-            Box::pin(async move {
-                limiter.debit().await;
-            })
-        })),
-    );
-    self.decision_clients.insert(provider_name, client.clone());
-    Ok(client)
-}
-
-/// Resolve the concrete model id for an `auto`/alias request via the
-/// per-provider TTL-cached discovery (Req 2.3). Discovery failure
-/// fails over as a transient-class attempt. The listing is a real
-/// upstream request (ADR 0002): `admission` is the already-consumed
-/// listing token, and the spawn_blocking is bounded by `budget` so the
-/// per-candidate worst case stays within one per-try timeout (F6).
-async fn resolve_decision_model(
-    &self,
-    client: &Arc<SystemOneClient>,
-    candidate: &DecisionCandidate,
-    api_key: Option<&str>,
-    budget: Duration,
-) -> Result<String, (String, u16, bool)> {
-    let discovery = self.decision_discovery_for(candidate);
-    let client = Arc::clone(client);
-    let api_key = api_key.map(str::to_string);
-    let bounded = tokio::time::timeout(budget, tokio::task::spawn_blocking(move || {
-        let fetcher = DecisionModelsFetcher {
-            client,
-            api_key: api_key.as_deref(),
-            timeout: budget,
+    /// Cached per-provider decision client (keyed by provider name,
+    /// cleared on hot-reload via [`Self::clear_http_clients`]). Only
+    /// transport-level state is cached (F5): the API key and per-try
+    /// deadline are supplied per call, and retry/backoff settings are read
+    /// at build time (hot-reload clears the cache).
+    async fn decision_client_for(
+        &self,
+        candidate: &DecisionCandidate,
+    ) -> Result<Arc<SystemOneClient>, GatewayError> {
+        if let Some(existing) = self.decision_clients.get(&candidate.provider.name) {
+            return Ok(existing.clone());
+        }
+        let provider = &candidate.provider;
+        let provider_name = provider.name.clone();
+        let base_url = provider
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| GatewayError::Provider {
+                provider: provider_name.clone(),
+                message: "Provider base URL is not configured".to_string(),
+                status_code: Some(500),
+            })?
+            .to_string();
+        let (max_retries, backoff) = {
+            let config = self.config.read().await;
+            (
+                u8::try_from(config.retry.max_retries_per_provider).unwrap_or(u8::MAX),
+                Duration::from_secs(
+                    config
+                        .retry
+                        .backoff_sequence_seconds
+                        .first()
+                        .copied()
+                        .unwrap_or(1),
+                ),
+            )
         };
-        discovery.resolve(&fetcher)
-    }))
-    .await;
-    let outcome = match bounded {
-        // Discovery timed out within the per-try budget (F6).
-        Err(_) => return Err(("Model discovery timed out".to_string(), 504, true)),
-        Ok(outer) => outer.map_err(|error| {
-            (format!("Model discovery task failed: {error}"), 502, false)
-        })?,
-    };
-    match outcome {
-        Ok(resolved) => Ok(resolved.model),
-        Err(DiscoveryError::NoModelAtEndpoint) => Err((
-            "The endpoint's model listing contains no family-capable model".to_string(),
-            502,
-            false,
-        )),
-        Err(DiscoveryError::ModelUnavailable { model }) => Err((
-            format!("Model '{model}' is unavailable at the endpoint"),
-            502,
-            false,
-        )),
-        Err(DiscoveryError::Listing(message)) => Err((
-            format!("Model listing failed: {message}"),
-            502,
-            false,
-        )),
+        // Per-retry charge hook (ADR 0002): every client-internal retry is a
+        // real upstream request and takes one token, non-blocking.
+        let limiter = self.get_rate_limiter(&provider_name).await;
+        let client = Arc::new(
+            SystemOneClient::with_optional_authorization(
+                candidate.family,
+                &base_url,
+                // Key and deadline are per-call (F5); None until then.
+                None,
+                // Non-model fallback deadline; the outer per-try timeout in
+                // route_decision governs the real budget.
+                Duration::from_secs(600),
+                max_retries,
+                backoff,
+            )
+            .map_err(|error| GatewayError::Provider {
+                provider: provider_name.clone(),
+                message: format!("Failed to build decision client: {error}"),
+                status_code: Some(502),
+            })?
+            .with_retry_debit(std::sync::Arc::new(move || {
+                let limiter = limiter.clone();
+                Box::pin(async move {
+                    limiter.debit().await;
+                })
+            })),
+        );
+        self.decision_clients.insert(provider_name, client.clone());
+        Ok(client)
     }
-}
+
+    /// Resolve the concrete model id for an `auto`/alias request via the
+    /// per-provider TTL-cached discovery (Req 2.3). Discovery failure
+    /// fails over as a transient-class attempt. The listing is a real
+    /// upstream request (ADR 0002): `admission` is the already-consumed
+    /// listing token, and the spawn_blocking is bounded by `budget` so the
+    /// per-candidate worst case stays within one per-try timeout (F6).
+    async fn resolve_decision_model(
+        &self,
+        client: &Arc<SystemOneClient>,
+        candidate: &DecisionCandidate,
+        api_key: Option<&str>,
+        budget: Duration,
+    ) -> Result<String, (String, u16, bool)> {
+        let discovery = self.decision_discovery_for(candidate);
+        let client = Arc::clone(client);
+        let api_key = api_key.map(str::to_string);
+        let bounded = tokio::time::timeout(
+            budget,
+            tokio::task::spawn_blocking(move || {
+                let fetcher = DecisionModelsFetcher {
+                    client,
+                    api_key: api_key.as_deref(),
+                    timeout: budget,
+                };
+                discovery.resolve(&fetcher)
+            }),
+        )
+        .await;
+        let outcome = match bounded {
+            // Discovery timed out within the per-try budget (F6).
+            Err(_) => return Err(("Model discovery timed out".to_string(), 504, true)),
+            Ok(outer) => outer
+                .map_err(|error| (format!("Model discovery task failed: {error}"), 502, false))?,
+        };
+        match outcome {
+            Ok(resolved) => Ok(resolved.model),
+            Err(DiscoveryError::NoModelAtEndpoint) => Err((
+                "The endpoint's model listing contains no family-capable model".to_string(),
+                502,
+                false,
+            )),
+            Err(DiscoveryError::ModelUnavailable { model }) => Err((
+                format!("Model '{model}' is unavailable at the endpoint"),
+                502,
+                false,
+            )),
+            Err(DiscoveryError::Listing(message)) => {
+                Err((format!("Model listing failed: {message}"), 502, false))
+            }
+        }
+    }
 
     /// Cached per-provider model discovery for alias resolution (always
     /// configured for `auto`, so resolution takes the listing path; TTL
@@ -13074,40 +13106,40 @@ async fn resolve_decision_model(
         Ok(http_client)
     }
 
-	fn calculate_retry_delay(
-		base_delay_secs: u64,
-		jitter_enabled: bool,
-		jitter_ratio: f64,
-	) -> Duration {
-		let mut rng = rand::rng();
-		Self::calculate_retry_delay_with_rng(
-			&mut rng,
-			base_delay_secs,
-			jitter_enabled,
-			jitter_ratio,
-		)
-	}
+    fn calculate_retry_delay(
+        base_delay_secs: u64,
+        jitter_enabled: bool,
+        jitter_ratio: f64,
+    ) -> Duration {
+        let mut rng = rand::rng();
+        Self::calculate_retry_delay_with_rng(
+            &mut rng,
+            base_delay_secs,
+            jitter_enabled,
+            jitter_ratio,
+        )
+    }
 
-	/// Seedable core of [`Self::calculate_retry_delay`] (Req 2.3): identical
-	/// semantics, but the RNG is injected so tests can sample the
-	/// distribution deterministically via `StdRng::seed_from_u64`.
-	fn calculate_retry_delay_with_rng<R: rand::Rng>(
-		rng: &mut R,
-		base_delay_secs: u64,
-		jitter_enabled: bool,
-		jitter_ratio: f64,
-	) -> Duration {
-		use rand::RngExt;
+    /// Seedable core of [`Self::calculate_retry_delay`] (Req 2.3): identical
+    /// semantics, but the RNG is injected so tests can sample the
+    /// distribution deterministically via `StdRng::seed_from_u64`.
+    fn calculate_retry_delay_with_rng<R: rand::Rng>(
+        rng: &mut R,
+        base_delay_secs: u64,
+        jitter_enabled: bool,
+        jitter_ratio: f64,
+    ) -> Duration {
+        use rand::RngExt;
 
-		if !jitter_enabled || jitter_ratio <= 0.0 {
-			return Duration::from_secs(base_delay_secs);
-		}
+        if !jitter_enabled || jitter_ratio <= 0.0 {
+            return Duration::from_secs(base_delay_secs);
+        }
 
-		let lower_bound = (1.0 - jitter_ratio).max(0.0);
-		let upper_bound = 1.0 + jitter_ratio;
-		let multiplier = rng.random_range(lower_bound..=upper_bound);
-		Duration::from_secs_f64((base_delay_secs as f64) * multiplier)
-	}
+        let lower_bound = (1.0 - jitter_ratio).max(0.0);
+        let upper_bound = 1.0 + jitter_ratio;
+        let multiplier = rng.random_range(lower_bound..=upper_bound);
+        Duration::from_secs_f64((base_delay_secs as f64) * multiplier)
+    }
 }
 
 #[cfg(test)]
@@ -14585,8 +14617,8 @@ mod tests {
             codex_search: None,
             cache_aware_routing: Default::default(),
             reasoning_compat: Default::default(),
-        webhooks: Default::default(),
-        opentelemetry: Default::default(),
+            webhooks: Default::default(),
+            opentelemetry: Default::default(),
         }
     }
 
@@ -15333,6 +15365,93 @@ mod tests {
         );
     }
 
+    /// Req 1.3-1.5 (spec multi-core-utilization): at or above the offload
+    /// threshold the reassembly runs on the blocking pool; below it inline.
+    /// Both paths must produce byte-identical assembled JSON.
+    #[tokio::test]
+    async fn sse_reassembly_offloaded_above_threshold_matches_inline_output() {
+        fn synthetic_sse(total_len: usize) -> String {
+            let mut body = String::new();
+            // Fill with content deltas until the body crosses `total_len`.
+            while body.len() < total_len {
+                body.push_str(
+"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"0123456789abcdef\"}}],\"usage\":null}\n\n",
+        );
+            }
+            body.push_str(
+"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+    );
+            body.push_str(
+"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":80},\"completion_tokens_details\":{\"reasoning_tokens\":12}}}\n\n",
+    );
+            body.push_str("data: [DONE]\n\n");
+            body
+        }
+
+        let below = synthetic_sse(CPU_OFFLOAD_MIN_BYTES / 2);
+        let above = synthetic_sse(CPU_OFFLOAD_MIN_BYTES + 1);
+        assert!(below.len() < CPU_OFFLOAD_MIN_BYTES);
+        assert!(above.len() >= CPU_OFFLOAD_MIN_BYTES);
+
+        // Ground truth: the (still available) inline parse of each body.
+        let below_inline = Router::reassemble_sse_stream(&below).unwrap();
+        let above_inline = Router::reassemble_sse_stream(&above).unwrap();
+
+        // The offloaded gate picks the thread by size: `below` stays inline,
+        // `above` flows through spawn_blocking. Both must match their inline
+        // parse byte-for-byte (requirement 1.5).
+        let below_gated = Router::reassemble_sse_stream_offloaded(&below)
+            .await
+            .unwrap();
+        let above_gated = Router::reassemble_sse_stream_offloaded(&above)
+            .await
+            .unwrap();
+
+        assert_eq!(below_gated.completed, below_inline.completed);
+        assert!(below_gated.completed);
+        assert_eq!(above_gated.completed, above_inline.completed);
+        assert!(above_gated.completed);
+
+        let below_json = serde_json::to_vec(&below_gated.response).unwrap();
+        let above_json = serde_json::to_vec(&above_gated.response).unwrap();
+        assert_eq!(
+            below_json,
+            serde_json::to_vec(&below_inline.response).unwrap()
+        );
+        assert_eq!(
+            above_json,
+            serde_json::to_vec(&above_inline.response).unwrap()
+        );
+
+        // Same-frame-count check: the assembled content scales with the body
+        // size and both paths assembled every delta.
+        let deltas_below = below.matches("0123456789abcdef").count();
+        let deltas_above = above.matches("0123456789abcdef").count();
+        assert!(deltas_above > deltas_below);
+        for (body, expected) in [(&below_gated, deltas_below), (&above_gated, deltas_above)] {
+            let content = body
+                .response
+                .choices
+                .first()
+                .unwrap()
+                .message
+                .content
+                .as_str()
+                .unwrap_or_default();
+            assert_eq!(content.matches("0123456789abcdef").count(), expected);
+        }
+
+        // Usage details survive both paths (DD6).
+        for body in [&below_gated, &above_gated] {
+            assert_eq!(body.response.usage.prompt_tokens, 100);
+            assert_eq!(body.response.usage.total_tokens, 120);
+            assert_eq!(
+                body.response.usage.extra["prompt_tokens_details"]["cached_tokens"],
+                80
+            );
+        }
+    }
+
     /// A synthetic upstream response whose body yields each chunk after its delay.
     fn timed_body_response(chunks: Vec<(Duration, &'static str)>) -> reqwest::Response {
         let stream = async_stream::stream! {
@@ -15683,29 +15802,29 @@ mod tests {
                 model_group: None,
                 provider: None,
                 model: None,
-            attempt: 0,
-            phase: ActivePhase::Pending,
-            stall_reason: None,
-            last_error: None,
-		virtual_key_id: None,
-		// Real arrival stamp: the retry-loop deadline cap (Req 1.6)
-		// reads elapsed time from this field, and a synthetic 0
-		// would read as "already past every deadline".
-		started_at_ms: SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.map(|d| d.as_millis() as i64)
-			.unwrap_or(0),
-            kind: crate::active_requests::RequestKind::Chat,
-            smart_routing_logged: false,
-            failed_attempts: Vec::new(),
-            attempt_rows_total: 0,
-            rate_limit_wait_done: false,
-            outcome_logged: false,
-            breaker_skips_recorded: false,
-            reasoning_relay: None,
-        },
-    )
-}
+                attempt: 0,
+                phase: ActivePhase::Pending,
+                stall_reason: None,
+                last_error: None,
+                virtual_key_id: None,
+                // Real arrival stamp: the retry-loop deadline cap (Req 1.6)
+                // reads elapsed time from this field, and a synthetic 0
+                // would read as "already past every deadline".
+                started_at_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0),
+                kind: crate::active_requests::RequestKind::Chat,
+                smart_routing_logged: false,
+                failed_attempts: Vec::new(),
+                attempt_rows_total: 0,
+                rate_limit_wait_done: false,
+                outcome_logged: false,
+                breaker_skips_recorded: false,
+                reasoning_relay: None,
+            },
+        )
+    }
 
     #[tokio::test]
     async fn ttfb_timeout_attempt_records_duration_and_error_class() {
@@ -15916,116 +16035,116 @@ mod tests {
             .await
             .expect("provider b answers after a's retries");
 
-    let ledger = handle.take_failed_attempts();
-    assert_eq!(ledger.len(), 2, "ledger: {ledger:?}");
-    assert!(ledger
-        .iter()
-        .all(|attempt| attempt.status_code == Some(500)));
-    a.verify().await;
-    b.verify().await;
-}
-
-/// Concurrent-outage guard for the retry budget (spec
-/// retry-failover-core-overhaul, Req 4.1-4.5): 16 concurrent requests
-/// against a primary that always 500s (retryable class) with one
-/// same-provider retry allowed each. With live active ~= 16 the budget
-/// admits at most max(3, 16/5) = 3 concurrent retries, so:
-/// (a) every request still succeeds via the healthy fallback,
-/// (b) primary wire hits == first attempts + admitted retries
-///     (16 + 3, not 16 + 16),
-/// (c) the requests refused a slot carry a `retry_budget_exhausted`
-///     ledger row.
-///
-/// Determinism: the primary mock delays every response 500 ms, so all
-/// first attempts complete in one wave and the winners hold their retry
-/// slots (through the retry send) far longer than the losers' checks
-/// take; the refused requests therefore observe in_flight == threshold.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_outage_retry_budget_caps_same_provider_retries() {
-    use wiremock::matchers::{method, path};
-
-    const N: usize = 16;
-    const CAP: usize = 3; // max(3, N/5) (floor) with N = 16
-
-    let a = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(500)
-                .set_body_string("boom")
-                .set_delay(Duration::from_millis(500)),
-        )
-        .mount(&a)
-        .await;
-    let b = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(STREAMED_TURN_SSE),
-        )
-        .expect(N as u64)
-        .mount(&b)
-        .await;
-
-    let mut config = create_test_config();
-    config.retry.max_retries_per_provider = 1;
-    config.retry.backoff_sequence_seconds = vec![0];
-    let mut provider_a = test_provider("a", a.uri());
-    provider_a.max_connections = 32;
-    let mut provider_b = test_provider("b", b.uri());
-    provider_b.max_connections = 32;
-    config.providers = vec![provider_a, provider_b];
-    config.model_groups = vec![test_group(vec![test_model("a", 1), test_model("b", 2)])];
-    let router = Arc::new(Router::new(Arc::new(RwLock::new(config)), test_metrics()));
-
-    let handles: Vec<_> = (0..N).map(|_| ledger_handle()).collect();
-    let mut tasks = Vec::new();
-    for handle in &handles {
-        let router = Arc::clone(&router);
-        let handle = handle.clone();
-        tasks.push(tokio::spawn(async move {
-            router
-                .route_request(&compression_request(false), Some(handle))
-                .await
-                .expect("fallback provider must answer")
-        }));
-    }
-    for task in tasks {
-        task.await.expect("request task must not panic");
-    }
-
-    // (b) wire hits on the failing primary: every request sent its first
-    // attempt; only CAP retries were admitted.
-    let a_hits = chat_requests(&a).await;
-    assert_eq!(
-        a_hits,
-        N + CAP,
-        "expected {N} first attempts + {CAP} budgeted retries on primary, got {a_hits}"
-    );
-
-    // (c) every refused request carries a retry_budget_exhausted row;
-    // the CAP winners carry their two upstream_http_500 rows instead.
-    let mut exhausted = 0;
-    for handle in &handles {
         let ledger = handle.take_failed_attempts();
-        if ledger
+        assert_eq!(ledger.len(), 2, "ledger: {ledger:?}");
+        assert!(ledger
             .iter()
-            .any(|attempt| attempt.error_class.as_deref() == Some("retry_budget_exhausted"))
-        {
-            exhausted += 1;
-        }
+            .all(|attempt| attempt.status_code == Some(500)));
+        a.verify().await;
+        b.verify().await;
     }
-    assert_eq!(
-        exhausted,
-        N - CAP,
-        "expected {} requests refused by the retry budget, got {exhausted}",
-        N - CAP
-    );
-    a.verify().await;
-    b.verify().await;
-}
+
+    /// Concurrent-outage guard for the retry budget (spec
+    /// retry-failover-core-overhaul, Req 4.1-4.5): 16 concurrent requests
+    /// against a primary that always 500s (retryable class) with one
+    /// same-provider retry allowed each. With live active ~= 16 the budget
+    /// admits at most max(3, 16/5) = 3 concurrent retries, so:
+    /// (a) every request still succeeds via the healthy fallback,
+    /// (b) primary wire hits == first attempts + admitted retries
+    ///     (16 + 3, not 16 + 16),
+    /// (c) the requests refused a slot carry a `retry_budget_exhausted`
+    ///     ledger row.
+    ///
+    /// Determinism: the primary mock delays every response 500 ms, so all
+    /// first attempts complete in one wave and the winners hold their retry
+    /// slots (through the retry send) far longer than the losers' checks
+    /// take; the refused requests therefore observe in_flight == threshold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_outage_retry_budget_caps_same_provider_retries() {
+        use wiremock::matchers::{method, path};
+
+        const N: usize = 16;
+        const CAP: usize = 3; // max(3, N/5) (floor) with N = 16
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("boom")
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
+            )
+            .expect(N as u64)
+            .mount(&b)
+            .await;
+
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 1;
+        config.retry.backoff_sequence_seconds = vec![0];
+        let mut provider_a = test_provider("a", a.uri());
+        provider_a.max_connections = 32;
+        let mut provider_b = test_provider("b", b.uri());
+        provider_b.max_connections = 32;
+        config.providers = vec![provider_a, provider_b];
+        config.model_groups = vec![test_group(vec![test_model("a", 1), test_model("b", 2)])];
+        let router = Arc::new(Router::new(Arc::new(RwLock::new(config)), test_metrics()));
+
+        let handles: Vec<_> = (0..N).map(|_| ledger_handle()).collect();
+        let mut tasks = Vec::new();
+        for handle in &handles {
+            let router = Arc::clone(&router);
+            let handle = handle.clone();
+            tasks.push(tokio::spawn(async move {
+                router
+                    .route_request(&compression_request(false), Some(handle))
+                    .await
+                    .expect("fallback provider must answer")
+            }));
+        }
+        for task in tasks {
+            task.await.expect("request task must not panic");
+        }
+
+        // (b) wire hits on the failing primary: every request sent its first
+        // attempt; only CAP retries were admitted.
+        let a_hits = chat_requests(&a).await;
+        assert_eq!(
+            a_hits,
+            N + CAP,
+            "expected {N} first attempts + {CAP} budgeted retries on primary, got {a_hits}"
+        );
+
+        // (c) every refused request carries a retry_budget_exhausted row;
+        // the CAP winners carry their two upstream_http_500 rows instead.
+        let mut exhausted = 0;
+        for handle in &handles {
+            let ledger = handle.take_failed_attempts();
+            if ledger
+                .iter()
+                .any(|attempt| attempt.error_class.as_deref() == Some("retry_budget_exhausted"))
+            {
+                exhausted += 1;
+            }
+        }
+        assert_eq!(
+            exhausted,
+            N - CAP,
+            "expected {} requests refused by the retry budget, got {exhausted}",
+            N - CAP
+        );
+        a.verify().await;
+        b.verify().await;
+    }
 
     // ────────────────────────────────────────────────────────────────────
     // ADR 0002: provider rate-limit accounting
@@ -16714,581 +16833,571 @@ extra: Default::default(),
         assert_eq!(chat_requests(&primary).await, 0);
     }
 
-// ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
-// Bounded Retry-After wait for the primary provider (Req 3.1-3.9,
-// retry-failover-core-overhaul)
-// ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+    // ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+    // Bounded Retry-After wait for the primary provider (Req 3.1-3.9,
+    // retry-failover-core-overhaul)
+    // ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
-/// Config like [`rate_limited_config`] plus the Retry-After wait knob.
-fn retry_after_wait_config(
-    primary: &MockServer,
-    backup: &MockServer,
-    retry_after_max_wait_ms: u64,
-) -> Config {
-    let mut config = rate_limited_config(primary, backup, 0, Some(0));
-    config.retry.upstream_retry_after_max_wait_ms = retry_after_max_wait_ms;
-    config
-}
+    /// Config like [`rate_limited_config`] plus the Retry-After wait knob.
+    fn retry_after_wait_config(
+        primary: &MockServer,
+        backup: &MockServer,
+        retry_after_max_wait_ms: u64,
+    ) -> Config {
+        let mut config = rate_limited_config(primary, backup, 0, Some(0));
+        config.retry.upstream_retry_after_max_wait_ms = retry_after_max_wait_ms;
+        config
+    }
 
-/// A 429 response carrying a millisecond-precision `retry-after-ms`
-/// header (parsed first by `cooldown_from_headers`).
-fn rate_limited_response(retry_after_ms: u64) -> ResponseTemplate {
-    ResponseTemplate::new(429)
-        .insert_header("retry-after-ms", retry_after_ms.to_string())
-        .set_body_json(serde_json::json!({
+    /// A 429 response carrying a millisecond-precision `retry-after-ms`
+    /// header (parsed first by `cooldown_from_headers`).
+    fn rate_limited_response(retry_after_ms: u64) -> ResponseTemplate {
+        ResponseTemplate::new(429)
+            .insert_header("retry-after-ms", retry_after_ms.to_string())
+            .set_body_json(serde_json::json!({
+                "error": {"message": "Rate limit exceeded"}
+            }))
+    }
+
+    fn has_rate_limit_wait(ledger: &[ProviderAttempt]) -> bool {
+        ledger
+            .iter()
+            .any(|a| a.error_class.as_deref() == Some("rate_limit_wait"))
+    }
+
+    /// Req 3.1/3.6: primary 429 + small Retry-After —— the gateway waits,
+    /// retries the SAME provider, succeeds; a `rate_limit_wait` ledger row
+    /// records the wait; the fallback is never hit.
+    #[tokio::test]
+    async fn primary_429_waits_retry_after_and_retries_same_provider() {
+        use wiremock::matchers::{method, path};
+
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(rate_limited_response(60))
+            .up_to_n_times(1)
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&primary)
+            .await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&backup)
+            .await;
+        let router = Router::new(
+            Arc::new(RwLock::new(retry_after_wait_config(
+                &primary, &backup, 5_000,
+            ))),
+            test_metrics(),
+        );
+        let handle = ledger_handle();
+
+        let started = std::time::Instant::now();
+        let response = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("primary"))
+        );
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "must have waited out the Retry-After, took {elapsed:?}"
+        );
+        let ledger = handle.take_failed_attempts();
+        assert!(has_rate_limit_wait(&ledger), "ledger: {ledger:?}");
+        let wait_row = ledger
+            .iter()
+            .find(|a| a.error_class.as_deref() == Some("rate_limit_wait"))
+            .unwrap();
+        assert!(wait_row.duration_ms.unwrap() >= 50, "{wait_row:?}");
+        assert_eq!(
+            chat_requests(&primary).await,
+            2,
+            "primary hit exactly twice"
+        );
+        assert_eq!(chat_requests(&backup).await, 0, "fallback never hit");
+    }
+
+    /// Req 3.3: Retry-After larger than `upstream_retry_after_max_wait_ms`
+    /// —— no wait, cooldown, immediate failover; primary hit exactly once.
+    #[tokio::test]
+    async fn oversized_retry_after_fails_over_without_waiting() {
+        use wiremock::matchers::{method, path};
+
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(rate_limited_response(10_000))
+            .mount(&primary)
+            .await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&backup)
+            .await;
+        let router = Router::new(
+            Arc::new(RwLock::new(retry_after_wait_config(&primary, &backup, 500))),
+            test_metrics(),
+        );
+        let handle = ledger_handle();
+
+        let started = std::time::Instant::now();
+        let response = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("backup"))
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "must not wait out the oversized Retry-After, took {elapsed:?}"
+        );
+        assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+        assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
+    }
+
+    /// Req 3.2: a non-primary 429 (primary failed 500 first) never waits —
+    /// the request advances to the next candidate at once.
+    #[tokio::test]
+    async fn non_primary_429_does_not_wait() {
+        use wiremock::matchers::{method, path};
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(rate_limited_response(60))
+            .mount(&b)
+            .await;
+        let c = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&c)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.retry.upstream_retry_after_max_wait_ms = 5_000;
+        config.providers = vec![
+            test_provider("a", a.uri()),
+            test_provider("b", b.uri()),
+            test_provider("c", c.uri()),
+        ];
+        config.model_groups = vec![test_group(vec![
+            test_model("a", 1),
+            test_model("b", 2),
+            test_model("c", 3),
+        ])];
+        let router = Arc::new(Router::new(Arc::new(RwLock::new(config)), test_metrics()));
+        let handle = ledger_handle();
+
+        let started = std::time::Instant::now();
+        let response = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("c"))
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "non-primary 429 must not wait, took {elapsed:?}"
+        );
+        assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+        assert_eq!(chat_requests(&b).await, 1, "b hit exactly once");
+    }
+
+    /// Req 3.2 (review finding R1): primary-ness is request-scoped, not
+    /// dispatch-scoped. The streaming primary fails 500 and falls back into
+    /// a FRESH buffered dispatch (`route_request_with_exclusions` with `a`
+    /// excluded) where `b` is candidate 0; b's small-Retry-After 429 with
+    /// the knob on must NOT wait — the request already carries upstream
+    /// attempt rows, so it is no longer on its primary. `max_retries=1`
+    /// keeps the max-retries gate open so only the prior-attempts gate can
+    /// block the wait.
+    #[tokio::test]
+    async fn fallback_429_after_failover_does_not_wait_in_fresh_dispatch() {
+        use wiremock::matchers::{method, path};
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(rate_limited_response(60))
+            .mount(&b)
+            .await;
+        let c = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&c)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 1;
+        config.retry.backoff_sequence_seconds = vec![0];
+        config.retry.upstream_retry_after_max_wait_ms = 5_000;
+        config.providers = vec![
+            test_provider("a", a.uri()),
+            test_provider("b", b.uri()),
+            test_provider("c", c.uri()),
+        ];
+        config.model_groups = vec![test_group(vec![
+            test_model("a", 1),
+            test_model("b", 2),
+            test_model("c", 3),
+        ])];
+        let router = Arc::new(Router::new(Arc::new(RwLock::new(config)), test_metrics()));
+        let handle = ledger_handle();
+
+        let started = std::time::Instant::now();
+        let response = router
+            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        let StreamingResponse::Buffered(response) = response else {
+            panic!("the rescued response must come from the buffered fallback");
+        };
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("c"))
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "fallback 429 after a failover must not wait, took {elapsed:?}"
+        );
+        assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+        assert_eq!(
+            chat_requests(&b).await,
+            1,
+            "b hit exactly once — no waited retry"
+        );
+    }
+
+    /// Req 3.2 (review finding R2): `max_retries_per_provider = 0`
+    /// disables the Retry-After wait — the waited retry would be a
+    /// same-provider retry the config forbids, so the sleep is dead time.
+    /// Primary 429 + small hint + knob on: immediate failover, no
+    /// `rate_limit_wait` row, primary hit exactly once.
+    #[tokio::test]
+    async fn zero_max_retries_disables_retry_after_wait() {
+        use wiremock::matchers::{method, path};
+
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(rate_limited_response(60))
+            .mount(&primary)
+            .await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&backup)
+            .await;
+        let mut config = retry_after_wait_config(&primary, &backup, 5_000);
+        config.retry.max_retries_per_provider = 0;
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let handle = ledger_handle();
+
+        let started = std::time::Instant::now();
+        let response = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("backup"))
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "no wait when same-provider retries are forbidden, took {elapsed:?}"
+        );
+        assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+        assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
+    }
+
+    /// Req 3.4: the waited retry gets a second 429 —— no second wait; the
+    /// provider is cooled down and the request fails over.
+    #[tokio::test]
+    async fn second_429_after_wait_does_not_wait_again() {
+        use wiremock::matchers::{method, path};
+
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(rate_limited_response(60))
+            .mount(&primary)
+            .await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&backup)
+            .await;
+        let router = Router::new(
+            Arc::new(RwLock::new(retry_after_wait_config(
+                &primary, &backup, 5_000,
+            ))),
+            test_metrics(),
+        );
+        let handle = ledger_handle();
+
+        let response = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("backup"))
+        );
+        let ledger = handle.take_failed_attempts();
+        let waits = ledger
+            .iter()
+            .filter(|a| a.error_class.as_deref() == Some("rate_limit_wait"))
+            .count();
+        assert_eq!(waits, 1, "exactly one wait per request: {ledger:?}");
+        assert_eq!(chat_requests(&primary).await, 2, "first try + one retry");
+    }
+
+    /// Req 3.5: `upstream_retry_after_max_wait_ms = 0` (the default) is
+    /// byte-for-byte today's behavior — failover, no `rate_limit_wait` row.
+    #[tokio::test]
+    async fn zero_max_wait_keeps_todays_failover_behavior() {
+        use wiremock::matchers::{method, path};
+
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(rate_limited_response(60))
+            .mount(&primary)
+            .await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&backup)
+            .await;
+        let router = Router::new(
+            Arc::new(RwLock::new(retry_after_wait_config(&primary, &backup, 0))),
+            test_metrics(),
+        );
+        let handle = ledger_handle();
+
+        let started = std::time::Instant::now();
+        let response = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("backup"))
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "no wait with the knob off, took {elapsed:?}"
+        );
+        assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+        assert_eq!(chat_requests(&primary).await, 1);
+    }
+
+    /// Req 3.1 (review finding R3): an explicit `retry-after-ms: 0` hint
+    /// maps to the documented "hint of 0 → cooldown + failover" behavior —
+    /// no zero-second wait, no `rate_limit_wait` row, primary hit exactly
+    /// once, the fallback serves the request.
+    #[tokio::test]
+    async fn zero_retry_after_hint_fails_over_without_waiting() {
+        use wiremock::matchers::{method, path};
+
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(rate_limited_response(0))
+            .mount(&primary)
+            .await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&backup)
+            .await;
+        let router = Router::new(
+            Arc::new(RwLock::new(retry_after_wait_config(
+                &primary, &backup, 5_000,
+            ))),
+            test_metrics(),
+        );
+        let handle = ledger_handle();
+
+        let started = std::time::Instant::now();
+        let response = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("backup"))
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "a zero Retry-After hint must not sleep, took {elapsed:?}"
+        );
+        assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+        assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
+    }
+
+    /// Req 3.1 (review finding R4): a hint-less 429 (no Retry-After header
+    /// or body field) must NOT wait even with a generous knob — the
+    /// `default_rate_limit_cooldown_seconds` fallback is not an upstream
+    /// signal. Cooldown still applies; failover proceeds immediately.
+    #[tokio::test]
+    async fn hint_less_429_with_knobs_on_does_not_wait() {
+        use wiremock::matchers::{method, path};
+
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
             "error": {"message": "Rate limit exceeded"}
-        }))
-}
+            })))
+            .mount(&primary)
+            .await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .mount(&backup)
+            .await;
+        let router = Router::new(
+            Arc::new(RwLock::new(retry_after_wait_config(
+                &primary, &backup, 60_000,
+            ))),
+            test_metrics(),
+        );
+        let handle = ledger_handle();
 
-fn has_rate_limit_wait(ledger: &[ProviderAttempt]) -> bool {
-    ledger
-        .iter()
-        .any(|a| a.error_class.as_deref() == Some("rate_limit_wait"))
-}
+        let started = std::time::Instant::now();
+        let response = router
+            .route_request(&compression_request(false), Some(handle.clone()))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
 
-/// Req 3.1/3.6: primary 429 + small Retry-After —— the gateway waits,
-/// retries the SAME provider, succeeds; a `rate_limit_wait` ledger row
-/// records the wait; the fallback is never hit.
-#[tokio::test]
-async fn primary_429_waits_retry_after_and_retries_same_provider() {
-    use wiremock::matchers::{method, path};
+        assert_eq!(
+            response.extra.get("gateway_provider"),
+            Some(&serde_json::json!("backup"))
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "a hint-less 429 must not wait out the 30s default cooldown, took {elapsed:?}"
+        );
+        assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
+        assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
+    }
 
-    let primary = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(rate_limited_response(60))
-        .up_to_n_times(1)
-        .mount(&primary)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
-        .mount(&primary)
-        .await;
-    let backup = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
-        .mount(&backup)
-        .await;
-    let router = Router::new(
-        Arc::new(RwLock::new(retry_after_wait_config(
-            &primary,
-            &backup,
-            5_000,
-        ))),
-        test_metrics(),
-    );
-    let handle = ledger_handle();
+    /// Req 3.1 (streaming arm): primary pass-through 429 + small
+    /// Retry-After —— wait, then the same-provider pass-through retry
+    /// succeeds (no buffered hop).
+    #[tokio::test]
+    async fn streaming_primary_429_waits_and_retries_passthrough() {
+        use wiremock::matchers::{method, path};
 
-    let started = std::time::Instant::now();
-    let response = router
-        .route_request(&compression_request(false), Some(handle.clone()))
-        .await
-        .unwrap();
-    let elapsed = started.elapsed();
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(rate_limited_response(60))
+            .up_to_n_times(1)
+            .mount(&a)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
+            )
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        // No `.expect(1)`: this test requires b to receive ZERO hits (the
+        // waited retry must rescue the request on a itself).
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
+            )
+            .mount(&b)
+            .await;
+        let mut config = failover_pair_config(&a, &b);
+        config.retry.upstream_retry_after_max_wait_ms = 5_000;
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let handle = ledger_handle();
 
-    assert_eq!(
-        response.extra.get("gateway_provider"),
-        Some(&serde_json::json!("primary"))
-    );
-    assert!(
-        elapsed >= Duration::from_millis(50),
-        "must have waited out the Retry-After, took {elapsed:?}"
-    );
-    let ledger = handle.take_failed_attempts();
-    assert!(has_rate_limit_wait(&ledger), "ledger: {ledger:?}");
-    let wait_row = ledger
-        .iter()
-        .find(|a| a.error_class.as_deref() == Some("rate_limit_wait"))
-        .unwrap();
-    assert!(wait_row.duration_ms.unwrap() >= 50, "{wait_row:?}");
-    assert_eq!(chat_requests(&primary).await, 2, "primary hit exactly twice");
-    assert_eq!(chat_requests(&backup).await, 0, "fallback never hit");
-}
+        let started = std::time::Instant::now();
+        let response = router
+            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .await
+            .expect("waited pass-through retry succeeds");
+        let elapsed = started.elapsed();
 
-/// Req 3.3: Retry-After larger than `upstream_retry_after_max_wait_ms`
-/// —— no wait, cooldown, immediate failover; primary hit exactly once.
-#[tokio::test]
-async fn oversized_retry_after_fails_over_without_waiting() {
-    use wiremock::matchers::{method, path};
+        assert!(
+            matches!(response, StreamingResponse::PassThrough { .. }),
+            "the retry must stay on the pass-through path"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "must have waited out the Retry-After, took {elapsed:?}"
+        );
+        assert!(has_rate_limit_wait(&handle.take_failed_attempts()));
+        assert_eq!(chat_requests(&a).await, 2, "primary hit exactly twice");
+        assert_eq!(chat_requests(&b).await, 0, "fallback never hit");
+    }
 
-    let primary = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(rate_limited_response(10_000))
-        .mount(&primary)
-        .await;
-    let backup = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
-        .mount(&backup)
-        .await;
-    let router = Router::new(
-        Arc::new(RwLock::new(retry_after_wait_config(
-            &primary,
-            &backup,
-            500,
-        ))),
-        test_metrics(),
-    );
-    let handle = ledger_handle();
-
-    let started = std::time::Instant::now();
-    let response = router
-        .route_request(&compression_request(false), Some(handle.clone()))
-        .await
-        .unwrap();
-    let elapsed = started.elapsed();
-
-    assert_eq!(
-        response.extra.get("gateway_provider"),
-        Some(&serde_json::json!("backup"))
-    );
-    assert!(
-        elapsed < Duration::from_millis(2_000),
-        "must not wait out the oversized Retry-After, took {elapsed:?}"
-    );
-    assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
-    assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
-}
-
-/// Req 3.2: a non-primary 429 (primary failed 500 first) never waits —
-/// the request advances to the next candidate at once.
-#[tokio::test]
-async fn non_primary_429_does_not_wait() {
-    use wiremock::matchers::{method, path};
-
-    let a = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&a)
-        .await;
-    let b = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(rate_limited_response(60))
-        .mount(&b)
-        .await;
-    let c = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
-        .mount(&c)
-        .await;
-    let mut config = create_test_config();
-    config.retry.max_retries_per_provider = 0;
-    config.retry.upstream_retry_after_max_wait_ms = 5_000;
-    config.providers = vec![
-        test_provider("a", a.uri()),
-        test_provider("b", b.uri()),
-        test_provider("c", c.uri()),
-    ];
-    config.model_groups = vec![test_group(vec![
-        test_model("a", 1),
-        test_model("b", 2),
-        test_model("c", 3),
-    ])];
-    let router = Arc::new(Router::new(Arc::new(RwLock::new(config)), test_metrics()));
-    let handle = ledger_handle();
-
-    let started = std::time::Instant::now();
-    let response = router
-        .route_request(&compression_request(false), Some(handle.clone()))
-        .await
-        .unwrap();
-    let elapsed = started.elapsed();
-
-    assert_eq!(
-        response.extra.get("gateway_provider"),
-        Some(&serde_json::json!("c"))
-    );
-    assert!(
-        elapsed < Duration::from_millis(2_000),
-        "non-primary 429 must not wait, took {elapsed:?}"
-    );
-	assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
-	assert_eq!(chat_requests(&b).await, 1, "b hit exactly once");
-}
-
-/// Req 3.2 (review finding R1): primary-ness is request-scoped, not
-/// dispatch-scoped. The streaming primary fails 500 and falls back into
-/// a FRESH buffered dispatch (`route_request_with_exclusions` with `a`
-/// excluded) where `b` is candidate 0; b's small-Retry-After 429 with
-/// the knob on must NOT wait — the request already carries upstream
-/// attempt rows, so it is no longer on its primary. `max_retries=1`
-/// keeps the max-retries gate open so only the prior-attempts gate can
-/// block the wait.
-#[tokio::test]
-async fn fallback_429_after_failover_does_not_wait_in_fresh_dispatch() {
-	use wiremock::matchers::{method, path};
-
-	let a = MockServer::start().await;
-	Mock::given(method("POST"))
-		.and(path("/v1/chat/completions"))
-		.respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-		.mount(&a)
-		.await;
-	let b = MockServer::start().await;
-	Mock::given(method("POST"))
-		.and(path("/v1/chat/completions"))
-		.respond_with(rate_limited_response(60))
-		.mount(&b)
-		.await;
-	let c = MockServer::start().await;
-	Mock::given(method("POST"))
-		.and(path("/v1/chat/completions"))
-		.respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
-		.mount(&c)
-		.await;
-	let mut config = create_test_config();
-	config.retry.max_retries_per_provider = 1;
-	config.retry.backoff_sequence_seconds = vec![0];
-	config.retry.upstream_retry_after_max_wait_ms = 5_000;
-	config.providers = vec![
-		test_provider("a", a.uri()),
-		test_provider("b", b.uri()),
-		test_provider("c", c.uri()),
-	];
-	config.model_groups = vec![test_group(vec![
-		test_model("a", 1),
-		test_model("b", 2),
-		test_model("c", 3),
-	])];
-	let router = Arc::new(Router::new(Arc::new(RwLock::new(config)), test_metrics()));
-	let handle = ledger_handle();
-
-	let started = std::time::Instant::now();
-	let response = router
-		.route_request_streaming(&compression_request(true), Some(handle.clone()))
-		.await
-		.unwrap();
-	let elapsed = started.elapsed();
-
-	let StreamingResponse::Buffered(response) = response else {
-		panic!("the rescued response must come from the buffered fallback");
-	};
-	assert_eq!(
-		response.extra.get("gateway_provider"),
-		Some(&serde_json::json!("c"))
-	);
-	assert!(
-		elapsed < Duration::from_millis(2_000),
-		"fallback 429 after a failover must not wait, took {elapsed:?}"
-	);
-	assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
-	assert_eq!(chat_requests(&b).await, 1, "b hit exactly once — no waited retry");
-}
-
-/// Req 3.2 (review finding R2): `max_retries_per_provider = 0`
-/// disables the Retry-After wait — the waited retry would be a
-/// same-provider retry the config forbids, so the sleep is dead time.
-/// Primary 429 + small hint + knob on: immediate failover, no
-/// `rate_limit_wait` row, primary hit exactly once.
-#[tokio::test]
-async fn zero_max_retries_disables_retry_after_wait() {
-	use wiremock::matchers::{method, path};
-
-	let primary = MockServer::start().await;
-	Mock::given(method("POST"))
-		.and(path("/v1/chat/completions"))
-		.respond_with(rate_limited_response(60))
-		.mount(&primary)
-		.await;
-	let backup = MockServer::start().await;
-	Mock::given(method("POST"))
-		.and(path("/v1/chat/completions"))
-		.respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
-		.mount(&backup)
-		.await;
-	let mut config = retry_after_wait_config(&primary, &backup, 5_000);
-	config.retry.max_retries_per_provider = 0;
-	let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
-	let handle = ledger_handle();
-
-	let started = std::time::Instant::now();
-	let response = router
-		.route_request(&compression_request(false), Some(handle.clone()))
-		.await
-		.unwrap();
-	let elapsed = started.elapsed();
-
-	assert_eq!(
-		response.extra.get("gateway_provider"),
-		Some(&serde_json::json!("backup"))
-	);
-	assert!(
-		elapsed < Duration::from_millis(2_000),
-		"no wait when same-provider retries are forbidden, took {elapsed:?}"
-	);
-	assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
-	assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
-}
-
-/// Req 3.4: the waited retry gets a second 429 —— no second wait; the
-/// provider is cooled down and the request fails over.
-#[tokio::test]
-async fn second_429_after_wait_does_not_wait_again() {
-    use wiremock::matchers::{method, path};
-
-    let primary = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(rate_limited_response(60))
-        .mount(&primary)
-        .await;
-    let backup = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
-        .mount(&backup)
-        .await;
-    let router = Router::new(
-        Arc::new(RwLock::new(retry_after_wait_config(
-            &primary,
-            &backup,
-            5_000,
-        ))),
-        test_metrics(),
-    );
-    let handle = ledger_handle();
-
-    let response = router
-        .route_request(&compression_request(false), Some(handle.clone()))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.extra.get("gateway_provider"),
-        Some(&serde_json::json!("backup"))
-    );
-    let ledger = handle.take_failed_attempts();
-    let waits = ledger
-        .iter()
-        .filter(|a| a.error_class.as_deref() == Some("rate_limit_wait"))
-        .count();
-    assert_eq!(waits, 1, "exactly one wait per request: {ledger:?}");
-    assert_eq!(chat_requests(&primary).await, 2, "first try + one retry");
-}
-
-/// Req 3.5: `upstream_retry_after_max_wait_ms = 0` (the default) is
-/// byte-for-byte today's behavior — failover, no `rate_limit_wait` row.
-#[tokio::test]
-async fn zero_max_wait_keeps_todays_failover_behavior() {
-    use wiremock::matchers::{method, path};
-
-    let primary = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(rate_limited_response(60))
-        .mount(&primary)
-        .await;
-    let backup = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
-        .mount(&backup)
-        .await;
-    let router = Router::new(
-        Arc::new(RwLock::new(retry_after_wait_config(
-            &primary,
-            &backup,
-            0,
-        ))),
-        test_metrics(),
-    );
-    let handle = ledger_handle();
-
-    let started = std::time::Instant::now();
-    let response = router
-        .route_request(&compression_request(false), Some(handle.clone()))
-        .await
-        .unwrap();
-    let elapsed = started.elapsed();
-
-    assert_eq!(
-        response.extra.get("gateway_provider"),
-        Some(&serde_json::json!("backup"))
-    );
-    assert!(
-        elapsed < Duration::from_millis(2_000),
-        "no wait with the knob off, took {elapsed:?}"
-    );
- assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
- assert_eq!(chat_requests(&primary).await, 1);
- }
-
- /// Req 3.1 (review finding R3): an explicit `retry-after-ms: 0` hint
- /// maps to the documented "hint of 0 → cooldown + failover" behavior —
- /// no zero-second wait, no `rate_limit_wait` row, primary hit exactly
- /// once, the fallback serves the request.
- #[tokio::test]
- async fn zero_retry_after_hint_fails_over_without_waiting() {
- use wiremock::matchers::{method, path};
-
- let primary = MockServer::start().await;
- Mock::given(method("POST"))
- .and(path("/v1/chat/completions"))
- .respond_with(rate_limited_response(0))
- .mount(&primary)
- .await;
- let backup = MockServer::start().await;
- Mock::given(method("POST"))
- .and(path("/v1/chat/completions"))
- .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
- .mount(&backup)
- .await;
- let router = Router::new(
- Arc::new(RwLock::new(retry_after_wait_config(
- &primary,
- &backup,
- 5_000,
- ))),
- test_metrics(),
- );
- let handle = ledger_handle();
-
- let started = std::time::Instant::now();
- let response = router
- .route_request(&compression_request(false), Some(handle.clone()))
- .await
- .unwrap();
- let elapsed = started.elapsed();
-
- assert_eq!(
- response.extra.get("gateway_provider"),
- Some(&serde_json::json!("backup"))
- );
- assert!(
- elapsed < Duration::from_millis(2_000),
- "a zero Retry-After hint must not sleep, took {elapsed:?}"
- );
- assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
- assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
- }
-
- /// Req 3.1 (review finding R4): a hint-less 429 (no Retry-After header
- /// or body field) must NOT wait even with a generous knob — the
- /// `default_rate_limit_cooldown_seconds` fallback is not an upstream
- /// signal. Cooldown still applies; failover proceeds immediately.
- #[tokio::test]
- async fn hint_less_429_with_knobs_on_does_not_wait() {
- use wiremock::matchers::{method, path};
-
- let primary = MockServer::start().await;
- Mock::given(method("POST"))
- .and(path("/v1/chat/completions"))
- .respond_with(
- ResponseTemplate::new(429).set_body_json(serde_json::json!({
- "error": {"message": "Rate limit exceeded"}
- })),
- )
- .mount(&primary)
- .await;
- let backup = MockServer::start().await;
- Mock::given(method("POST"))
- .and(path("/v1/chat/completions"))
- .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
- .mount(&backup)
- .await;
- let router = Router::new(
- Arc::new(RwLock::new(retry_after_wait_config(
- &primary,
- &backup,
- 60_000,
- ))),
- test_metrics(),
- );
- let handle = ledger_handle();
-
- let started = std::time::Instant::now();
- let response = router
- .route_request(&compression_request(false), Some(handle.clone()))
- .await
- .unwrap();
- let elapsed = started.elapsed();
-
- assert_eq!(
- response.extra.get("gateway_provider"),
- Some(&serde_json::json!("backup"))
- );
- assert!(
- elapsed < Duration::from_millis(2_000),
- "a hint-less 429 must not wait out the 30s default cooldown, took {elapsed:?}"
- );
- assert!(!has_rate_limit_wait(&handle.take_failed_attempts()));
- assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
- }
-
- /// Req 3.1 (streaming arm): primary pass-through 429 + small
-/// Retry-After —— wait, then the same-provider pass-through retry
-/// succeeds (no buffered hop).
-#[tokio::test]
-async fn streaming_primary_429_waits_and_retries_passthrough() {
-    use wiremock::matchers::{method, path};
-
-    let a = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(rate_limited_response(60))
-        .up_to_n_times(1)
-        .mount(&a)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(STREAMED_TURN_SSE),
-        )
-        .mount(&a)
-        .await;
-    let b = MockServer::start().await;
-    // No `.expect(1)`: this test requires b to receive ZERO hits (the
-    // waited retry must rescue the request on a itself).
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(STREAMED_TURN_SSE),
-        )
-        .mount(&b)
-        .await;
-    let mut config = failover_pair_config(&a, &b);
-    config.retry.upstream_retry_after_max_wait_ms = 5_000;
-    let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
-    let handle = ledger_handle();
-
-    let started = std::time::Instant::now();
-    let response = router
-        .route_request_streaming(&compression_request(true), Some(handle.clone()))
-        .await
-        .expect("waited pass-through retry succeeds");
-    let elapsed = started.elapsed();
-
-    assert!(
-        matches!(response, StreamingResponse::PassThrough { .. }),
-        "the retry must stay on the pass-through path"
-    );
-    assert!(
-        elapsed >= Duration::from_millis(50),
-        "must have waited out the Retry-After, took {elapsed:?}"
-    );
-    assert!(has_rate_limit_wait(&handle.take_failed_attempts()));
-    assert_eq!(chat_requests(&a).await, 2, "primary hit exactly twice");
-    assert_eq!(chat_requests(&b).await, 0, "fallback never hit");
-}
-
-#[test]
-fn is_timeout_class_covers_router_timeouts_and_gateway_statuses() {
-    let provider = |status| GatewayError::Provider {
-        provider: "p".to_string(),
-        message: "HTTP".to_string(),
-        status_code: status,
-    };
+    #[test]
+    fn is_timeout_class_covers_router_timeouts_and_gateway_statuses() {
+        let provider = |status| GatewayError::Provider {
+            provider: "p".to_string(),
+            message: "HTTP".to_string(),
+            status_code: status,
+        };
         assert!(is_timeout_class(&GatewayError::TtfbTimeout(1)));
         assert!(is_timeout_class(&GatewayError::TotalTimeout(1)));
         assert!(is_timeout_class(&GatewayError::ChunkTimeout(1)));
@@ -17375,15 +17484,15 @@ fn is_timeout_class_covers_router_timeouts_and_gateway_statuses() {
             .await
             .expect("buffered fallback is served by b");
 
-let ledger = handle.take_failed_attempts();
-assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
-assert_eq!(ledger[0].provider, "a");
-assert_eq!(ledger[0].status_code, Some(429));
-assert_eq!(ledger[0].error_class.as_deref(), Some("upstream_http_429"));
-assert!(ledger[0].duration_ms.is_some());
-a.verify().await;
-b.verify().await;
-}
+        let ledger = handle.take_failed_attempts();
+        assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+        assert_eq!(ledger[0].provider, "a");
+        assert_eq!(ledger[0].status_code, Some(429));
+        assert_eq!(ledger[0].error_class.as_deref(), Some("upstream_http_429"));
+        assert!(ledger[0].duration_ms.is_some());
+        a.verify().await;
+        b.verify().await;
+    }
 
     /// Task 4 (retry-failover-core-overhaul): a streaming pass-through 500
     /// classifies RetrySameProvider, so the provider is retried in pass-through
@@ -17403,8 +17512,8 @@ b.verify().await;
             .and(path("/v1/chat/completions"))
             .respond_with(
                 ResponseTemplate::new(200)
-            .insert_header("content-type", "text/event-stream")
-            .set_body_string(STREAMED_TURN_SSE),
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
             )
             .mount(&a)
             .await;
@@ -17440,7 +17549,7 @@ b.verify().await;
         // b never saw a request: no failover happened.
         a.verify().await;
         assert_eq!(chat_requests(&b).await, 0);
-        }
+    }
 
     /// Task 4: 429 classifies FailOver — the streaming pass-through never
     /// re-sends to the rate-limited provider; it cools down and fails over.
@@ -17473,10 +17582,10 @@ b.verify().await;
         assert_eq!(ledger[0].status_code, Some(429));
         a.verify().await;
         b.verify().await;
-        }
+    }
 
     #[tokio::test]
-async fn breaker_prefilter_skip_is_recorded_once_per_request() {
+    async fn breaker_prefilter_skip_is_recorded_once_per_request() {
         use wiremock::matchers::{method, path};
 
         let server = MockServer::start().await;
@@ -17935,12 +18044,12 @@ async fn breaker_prefilter_skip_is_recorded_once_per_request() {
             model_group: None,
             provider: None,
             model: None,
-        attempt: 0,
-        phase: ActivePhase::Pending,
-        stall_reason: None,
-        last_error: None,
-			virtual_key_id: None,
-			started_at_ms: 0,
+            attempt: 0,
+            phase: ActivePhase::Pending,
+            stall_reason: None,
+            last_error: None,
+            virtual_key_id: None,
+            started_at_ms: 0,
             kind: crate::active_requests::RequestKind::Chat,
             smart_routing_logged: false,
             failed_attempts: Vec::new(),
@@ -17950,8 +18059,8 @@ async fn breaker_prefilter_skip_is_recorded_once_per_request() {
             breaker_skips_recorded: false,
             reasoning_relay: None,
         })));
-		let result = router
-			.route_request(&compression_request(false), Some(handle.clone()))
+        let result = router
+            .route_request(&compression_request(false), Some(handle.clone()))
             .await;
         assert!(
             result.is_ok(),
@@ -18573,12 +18682,12 @@ async fn breaker_prefilter_skip_is_recorded_once_per_request() {
                 model_group: None,
                 provider: None,
                 model: None,
-            attempt: 0,
-            phase: ActivePhase::Pending,
-            stall_reason: None,
-            last_error: None,
-            virtual_key_id: None,
-            started_at_ms: 0,
+                attempt: 0,
+                phase: ActivePhase::Pending,
+                stall_reason: None,
+                last_error: None,
+                virtual_key_id: None,
+                started_at_ms: 0,
                 kind: crate::active_requests::RequestKind::Stream,
                 smart_routing_logged: false,
                 failed_attempts: Vec::new(),
@@ -18818,69 +18927,69 @@ async fn breaker_prefilter_skip_is_recorded_once_per_request() {
         );
     }
 
-#[test]
-fn test_calculate_retry_delay_without_jitter() {
-	let delay = Router::calculate_retry_delay(4, false, 0.2);
-	assert_eq!(delay, Duration::from_secs(4));
-}
+    #[test]
+    fn test_calculate_retry_delay_without_jitter() {
+        let delay = Router::calculate_retry_delay(4, false, 0.2);
+        assert_eq!(delay, Duration::from_secs(4));
+    }
 
-#[test]
-fn test_calculate_retry_delay_zero_ratio_is_exact_base() {
-	let delay = Router::calculate_retry_delay(4, true, 0.0);
-	assert_eq!(delay, Duration::from_secs(4));
-}
+    #[test]
+    fn test_calculate_retry_delay_zero_ratio_is_exact_base() {
+        let delay = Router::calculate_retry_delay(4, true, 0.0);
+        assert_eq!(delay, Duration::from_secs(4));
+    }
 
-#[test]
-fn test_calculate_retry_delay_with_jitter_stays_in_bounds() {
-	for _ in 0..32 {
-		let delay = Router::calculate_retry_delay(10, true, 0.2);
-		assert!(delay >= Duration::from_secs(8));
-		assert!(delay <= Duration::from_secs(12));
-	}
-}
+    #[test]
+    fn test_calculate_retry_delay_with_jitter_stays_in_bounds() {
+        for _ in 0..32 {
+            let delay = Router::calculate_retry_delay(10, true, 0.2);
+            assert!(delay >= Duration::from_secs(8));
+            assert!(delay <= Duration::from_secs(12));
+        }
+    }
 
-/// Req 2.3 (retry-failover-core-overhaul): seeded sampling must spread
-/// across the jitter window, not cluster — both halves of the
-/// `base*(1-ratio) ..= base*(1+ratio)` window get hit over 200 draws.
-#[test]
-fn test_calculate_retry_delay_with_rng_distributes_across_window() {
-	use rand::{rngs::StdRng, SeedableRng};
+    /// Req 2.3 (retry-failover-core-overhaul): seeded sampling must spread
+    /// across the jitter window, not cluster — both halves of the
+    /// `base*(1-ratio) ..= base*(1+ratio)` window get hit over 200 draws.
+    #[test]
+    fn test_calculate_retry_delay_with_rng_distributes_across_window() {
+        use rand::{rngs::StdRng, SeedableRng};
 
-	let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-	let mut lower_half = 0;
-	let mut upper_half = 0;
-	for _ in 0..200 {
-		let delay = Router::calculate_retry_delay_with_rng(&mut rng, 10, true, 0.2);
-		let midpoint = Duration::from_secs(10);
-		assert!(delay >= Duration::from_secs(8));
-		assert!(delay <= Duration::from_secs(12));
-		if delay < midpoint {
-			lower_half += 1;
-		} else {
-			upper_half += 1;
-		}
-	}
-	assert!(
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let mut lower_half = 0;
+        let mut upper_half = 0;
+        for _ in 0..200 {
+            let delay = Router::calculate_retry_delay_with_rng(&mut rng, 10, true, 0.2);
+            let midpoint = Duration::from_secs(10);
+            assert!(delay >= Duration::from_secs(8));
+            assert!(delay <= Duration::from_secs(12));
+            if delay < midpoint {
+                lower_half += 1;
+            } else {
+                upper_half += 1;
+            }
+        }
+        assert!(
 		lower_half > 0 && upper_half > 0,
 		"seeded jitter must hit both halves of the window (lower={lower_half}, upper={upper_half})"
 	);
-}
+    }
 
-/// Same-draw determinism through the injected RNG: a fixed seed must
-/// reproduce an identical sequence of delays.
-#[test]
-fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
-	use rand::{rngs::StdRng, SeedableRng};
+    /// Same-draw determinism through the injected RNG: a fixed seed must
+    /// reproduce an identical sequence of delays.
+    #[test]
+    fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
+        use rand::{rngs::StdRng, SeedableRng};
 
-	let draw = |seed: u64| -> Vec<Duration> {
-		let mut rng = StdRng::seed_from_u64(seed);
-		(0..8)
-			.map(|_| Router::calculate_retry_delay_with_rng(&mut rng, 4, true, 0.5))
-			.collect()
-	};
-	assert_eq!(draw(42), draw(42));
-	assert_ne!(draw(42), draw(43));
-}
+        let draw = |seed: u64| -> Vec<Duration> {
+            let mut rng = StdRng::seed_from_u64(seed);
+            (0..8)
+                .map(|_| Router::calculate_retry_delay_with_rng(&mut rng, 4, true, 0.5))
+                .collect()
+        };
+        assert_eq!(draw(42), draw(42));
+        assert_ne!(draw(42), draw(43));
+    }
 
     #[tokio::test]
     async fn test_budget_exhausted_provider_is_skipped() {
@@ -18910,7 +19019,7 @@ fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
             budget: Some(crate::config::ProviderBudgetConfig {
                 limit_usd: 1.0,
                 reset_policy: Some(crate::config::BudgetResetPolicy::Manual),
-        alert_threshold_percent: None,
+                alert_threshold_percent: None,
             }),
             manual_models: vec![],
             global_inference_profile: false,
@@ -20038,7 +20147,7 @@ fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
                 std::time::Duration::from_millis(10),
                 &usage,
             )
-        .await;
+            .await;
         assert_eq!(unpriced, 0.0);
     }
 
@@ -20073,7 +20182,11 @@ fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
                 .decision_candidates(requested)
                 .await
                 .unwrap_or_else(|error| panic!("versioned jev id must match: {error:?}"));
-            assert_eq!(candidates.len(), 1, "only the jev provider serves {requested}");
+            assert_eq!(
+                candidates.len(),
+                1,
+                "only the jev provider serves {requested}"
+            );
             assert_eq!(candidates[0].provider.name, "jev-a");
             assert_eq!(candidates[0].family.name, "jev");
             assert_eq!(
@@ -20088,7 +20201,11 @@ fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
                 .decision_candidates(requested)
                 .await
                 .unwrap_or_else(|error| panic!("versioned laya id must match: {error:?}"));
-            assert_eq!(candidates.len(), 1, "only the laya provider serves {requested}");
+            assert_eq!(
+                candidates.len(),
+                1,
+                "only the laya provider serves {requested}"
+            );
             assert_eq!(candidates[0].provider.name, "laya-a");
             assert_eq!(candidates[0].family.name, "laya");
             assert_eq!(candidates[0].pinned_model.as_deref(), Some(requested));
@@ -20145,7 +20262,9 @@ fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
             assert!(candidate.pinned_model.is_none());
         }
         assert!(
-            candidates.iter().all(|candidate| candidate.provider.name != "laya-a"),
+            candidates
+                .iter()
+                .all(|candidate| candidate.provider.name != "laya-a"),
             "auto must never produce cross-family candidates"
         );
 
@@ -20191,7 +20310,10 @@ fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
                 ..
             } => {
                 assert_eq!(status_code, Some(404));
-                assert!(message.contains("drex-2"), "message must name the model: {message}");
+                assert!(
+                    message.contains("drex-2"),
+                    "message must name the model: {message}"
+                );
             }
             other => panic!("expected 404 provider error, got {other:?}"),
         }
@@ -20251,7 +20373,10 @@ fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
 
     #[tokio::test]
     async fn decision_candidates_without_decision_providers_returns_404_naming_model() {
-        let router = decision_router(vec![test_provider("chat", "http://localhost:1/v1".to_string())]);
+        let router = decision_router(vec![test_provider(
+            "chat",
+            "http://localhost:1/v1".to_string(),
+        )]);
 
         let error = router
             .decision_candidates("jev-9.9.9")
@@ -20266,7 +20391,10 @@ fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
             } => {
                 assert_eq!(provider, "decisions");
                 assert_eq!(status_code, Some(404));
-                assert!(message.contains("jev-9.9.9"), "message must name the model: {message}");
+                assert!(
+                    message.contains("jev-9.9.9"),
+                    "message must name the model: {message}"
+                );
             }
             other => panic!("expected decisions 404, got {other:?}"),
         }
@@ -20301,7 +20429,10 @@ fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
             decision_call_error_status(&SystemOneCallError::PayloadTooLarge),
             413
         );
-        assert_eq!(decision_call_error_status(&SystemOneCallError::Timeout), 504);
+        assert_eq!(
+            decision_call_error_status(&SystemOneCallError::Timeout),
+            504
+        );
         assert_eq!(
             decision_call_error_status(&SystemOneCallError::Unavailable {
                 reason: "upstream rejected".to_string(),
@@ -21541,11 +21672,11 @@ mod property_tests {
             ref other => panic!("hint content must be a string, got: {other:?}"),
         });
 
-    // No system message at all: the hint becomes the first message.
-    let mut messages = vec![msg("user"), msg("assistant")];
-    Router::insert_tool_calling_hint(&mut messages);
-    assert_eq!(messages[0].role, "system");
-    assert_eq!(messages[1].role, "user");
+        // No system message at all: the hint becomes the first message.
+        let mut messages = vec![msg("user"), msg("assistant")];
+        Router::insert_tool_calling_hint(&mut messages);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
     }
 
     // ---- github-copilot-oauth-provider, task 9 wiring ------------------
@@ -21553,7 +21684,7 @@ mod property_tests {
     mod copilot_wiring {
         use super::super::tests::{
             completion_response, compression_request, create_test_config, ledger_handle,
-            test_metrics, test_group, test_model_named, test_provider,
+            test_group, test_metrics, test_model_named, test_provider,
         };
         use super::*;
         use crate::oauth::github_copilot::manager::{
@@ -21568,8 +21699,7 @@ mod property_tests {
         }
 
         fn unique_store(tag: &str) -> CopilotTokenStore {
-            static COUNTER: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             CopilotTokenStore::new(secure_dir().join(format!("wire_{tag}_{n}.enc")))
         }
@@ -21589,10 +21719,7 @@ mod property_tests {
             p
         }
 
-        fn copilot_config(
-            copilot_base: &str,
-            fallback_base: &str,
-        ) -> Config {
+        fn copilot_config(copilot_base: &str, fallback_base: &str) -> Config {
             let mut config = create_test_config();
             config.retry.max_retries_per_provider = 0;
             config.providers = vec![
@@ -21723,24 +21850,22 @@ mod property_tests {
             let copilot = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({
-                        "id": "chatcmpl-copilot",
-                        "object": "chat.completion",
-                        "created": 1,
-                        "model": "gpt-5-copilot",
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "ok"},
-                            "finish_reason": "stop",
-                        }],
-                        "usage": {
-                            "prompt_tokens": 10,
-                            "completion_tokens": 5,
-                            "total_tokens": 15,
-                        },
-                    }),
-                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-copilot",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gpt-5-copilot",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15,
+                    },
+                })))
                 .expect(1)
                 .mount(&copilot)
                 .await;
@@ -21799,199 +21924,199 @@ mod property_tests {
             assert!(handle.take_failed_attempts().is_empty());
         }
 
-/// Req 4.3 (router side): upstream 401 on a Copilot attempt → ONE
-/// forced token refresh + ONE re-dispatch, then failover when the
-/// retry also auth-fails. The forced exchange is itself rejected 401
-/// (entitlement missing → session Expired), so the re-dispatch fails
-/// in bearer resolution without a second upstream POST.
-#[tokio::test]
-async fn copilot_upstream_401_refreshes_once_then_fails_over() {
-    let copilot = MockServer::start().await;
-    let exchange = MockServer::start().await;
-    let fallback = MockServer::start().await;
+        /// Req 4.3 (router side): upstream 401 on a Copilot attempt → ONE
+        /// forced token refresh + ONE re-dispatch, then failover when the
+        /// retry also auth-fails. The forced exchange is itself rejected 401
+        /// (entitlement missing → session Expired), so the re-dispatch fails
+        /// in bearer resolution without a second upstream POST.
+        #[tokio::test]
+        async fn copilot_upstream_401_refreshes_once_then_fails_over() {
+            let copilot = MockServer::start().await;
+            let exchange = MockServer::start().await;
+            let fallback = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(401).set_body_string("token revoked"))
-        // First dispatch only: the forced exchange rejects 401 → the
-        // session flips Expired → the single re-dispatch short-circuits
-        // in bearer resolution (no second upstream POST).
-        .expect(1)
-        .mount(&copilot)
-        .await;
-    // Forced-refresh exchange rejects with 401 — no real network: the
-    // rescue's force_refresh() must hit this wiremock endpoint.
-    Mock::given(method("GET"))
-        .and(path("/copilot_internal/v2/token"))
-        .respond_with(ResponseTemplate::new(401).set_body_string("no copilot seat"))
-        .expect(1)
-        .mount(&exchange)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
-        .expect(1)
-        .mount(&fallback)
-        .await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(401).set_body_string("token revoked"))
+                // First dispatch only: the forced exchange rejects 401 → the
+                // session flips Expired → the single re-dispatch short-circuits
+                // in bearer resolution (no second upstream POST).
+                .expect(1)
+                .mount(&copilot)
+                .await;
+            // Forced-refresh exchange rejects with 401 — no real network: the
+            // rescue's force_refresh() must hit this wiremock endpoint.
+            Mock::given(method("GET"))
+                .and(path("/copilot_internal/v2/token"))
+                .respond_with(ResponseTemplate::new(401).set_body_string("no copilot seat"))
+                .expect(1)
+                .mount(&exchange)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+                .expect(1)
+                .mount(&fallback)
+                .await;
 
-    let store = unique_store("401");
-    store
-        .save(&CopilotStoredCredentials {
-            github_access_token: "gho-test".into(),
-            copilot_token: Some("tid=revoked".into()),
-            copilot_expires_at: Some(now_plus(3600)),
-            api_base: copilot.uri(),
-            machine_id: "6f9619ff".into(),
-            sku: Some("copilot_pro".into()),
-            scopes: "read:user".into(),
-            updated_at: now_plus(0),
-        })
-        .unwrap();
-    let manager = CopilotTokenManager::with_endpoints(
-        store,
-        reqwest::Client::new(),
-        CopilotEndpoints {
-            device_flow: crate::oauth::github_copilot::device_flow::DeviceFlowEndpoints::production(),
-            copilot_token_url: format!("{}/copilot_internal/v2/token", exchange.uri()),
-        },
-    );
-    manager.load_existing_session().await.unwrap();
+            let store = unique_store("401");
+            store
+                .save(&CopilotStoredCredentials {
+                    github_access_token: "gho-test".into(),
+                    copilot_token: Some("tid=revoked".into()),
+                    copilot_expires_at: Some(now_plus(3600)),
+                    api_base: copilot.uri(),
+                    machine_id: "6f9619ff".into(),
+                    sku: Some("copilot_pro".into()),
+                    scopes: "read:user".into(),
+                    updated_at: now_plus(0),
+                })
+                .unwrap();
+            let manager = CopilotTokenManager::with_endpoints(
+                store,
+                reqwest::Client::new(),
+                CopilotEndpoints {
+                    device_flow:
+                        crate::oauth::github_copilot::device_flow::DeviceFlowEndpoints::production(),
+                    copilot_token_url: format!("{}/copilot_internal/v2/token", exchange.uri()),
+                },
+            );
+            manager.load_existing_session().await.unwrap();
 
-    let mut router = Router::new(
-        Arc::new(RwLock::new(copilot_config(&copilot.uri(), &fallback.uri()))),
-        test_metrics(),
-    );
-    router.set_copilot_manager(Arc::new(manager));
+            let mut router = Router::new(
+                Arc::new(RwLock::new(copilot_config(&copilot.uri(), &fallback.uri()))),
+                test_metrics(),
+            );
+            router.set_copilot_manager(Arc::new(manager));
 
-    let handle = ledger_handle();
-    let response = router
-        .route_request(&compression_request(false), Some(handle.clone()))
-        .await
-        .expect("fails over after the single auth rescue");
-    assert_eq!(
-        response.extra.get("gateway_provider"),
-        Some(&serde_json::json!("fallback"))
-    );
-    // Exactly 1 copilot dispatch + 1 forced exchange, then failover.
-    copilot.verify().await;
-    exchange.verify().await;
-}
+            let handle = ledger_handle();
+            let response = router
+                .route_request(&compression_request(false), Some(handle.clone()))
+                .await
+                .expect("fails over after the single auth rescue");
+            assert_eq!(
+                response.extra.get("gateway_provider"),
+                Some(&serde_json::json!("fallback"))
+            );
+            // Exactly 1 copilot dispatch + 1 forced exchange, then failover.
+            copilot.verify().await;
+            exchange.verify().await;
+        }
 
-/// NFR Reliability: reload never clears Copilot auth state. Drives the
-/// same router-surface calls the gateway's real hot-reload entry
-/// (`apply_runtime_config_update`) makes — smart-router reload, breaker
-/// / rate-limiter / sticky-cache / http-client / model-capability
-/// clears, compression-runtime reload — with a config whose copilot
-/// provider is RENAMED ("copilot-2"), then asserts from the router
-/// side: the SAME manager Arc stays attached, the session state
-/// survives, and a post-reload dispatch still authenticates and serves
-/// through it.
-#[tokio::test]
-async fn copilot_reload_preserves_manager_and_auth_state() {
-    let copilot = MockServer::start().await;
-    let fallback = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-copilot-reload",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "gpt-5-copilot",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "ok"},
-                "finish_reason": "stop",
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-        })))
-        .expect(1)
-        .mount(&copilot)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
-        .mount(&fallback)
-        .await;
+        /// NFR Reliability: reload never clears Copilot auth state. Drives the
+        /// same router-surface calls the gateway's real hot-reload entry
+        /// (`apply_runtime_config_update`) makes — smart-router reload, breaker
+        /// / rate-limiter / sticky-cache / http-client / model-capability
+        /// clears, compression-runtime reload — with a config whose copilot
+        /// provider is RENAMED ("copilot-2"), then asserts from the router
+        /// side: the SAME manager Arc stays attached, the session state
+        /// survives, and a post-reload dispatch still authenticates and serves
+        /// through it.
+        #[tokio::test]
+        async fn copilot_reload_preserves_manager_and_auth_state() {
+            let copilot = MockServer::start().await;
+            let fallback = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-copilot-reload",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gpt-5-copilot",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                })))
+                .expect(1)
+                .mount(&copilot)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+                .mount(&fallback)
+                .await;
 
-    let store = unique_store("reload");
-    store
-        .save(&CopilotStoredCredentials {
-            github_access_token: "gho-test".into(),
-            copilot_token: Some("tid=live".into()),
-            copilot_expires_at: Some(now_plus(3600)),
-            api_base: copilot.uri(),
-            machine_id: "6f9619ff".into(),
-            sku: None,
-            scopes: "read:user".into(),
-            updated_at: now_plus(0),
-        })
-        .unwrap();
-    let manager = Arc::new(CopilotTokenManager::with_endpoints(
-        store,
-        reqwest::Client::new(),
-        CopilotEndpoints::production(),
-    ));
-    manager.load_existing_session().await.unwrap();
+            let store = unique_store("reload");
+            store
+                .save(&CopilotStoredCredentials {
+                    github_access_token: "gho-test".into(),
+                    copilot_token: Some("tid=live".into()),
+                    copilot_expires_at: Some(now_plus(3600)),
+                    api_base: copilot.uri(),
+                    machine_id: "6f9619ff".into(),
+                    sku: None,
+                    scopes: "read:user".into(),
+                    updated_at: now_plus(0),
+                })
+                .unwrap();
+            let manager = Arc::new(CopilotTokenManager::with_endpoints(
+                store,
+                reqwest::Client::new(),
+                CopilotEndpoints::production(),
+            ));
+            manager.load_existing_session().await.unwrap();
 
-    // Pre-reload config: provider named "copilot".
-    let config = copilot_config(&copilot.uri(), &fallback.uri());
-    let config_lock = Arc::new(RwLock::new(config));
-    let mut router = Router::new(config_lock.clone(), test_metrics());
-    router.set_copilot_manager(manager.clone());
-    let attached_before = router.copilot_manager.clone().expect("manager attached");
-    assert!(Arc::ptr_eq(&attached_before, &manager));
+            // Pre-reload config: provider named "copilot".
+            let config = copilot_config(&copilot.uri(), &fallback.uri());
+            let config_lock = Arc::new(RwLock::new(config));
+            let mut router = Router::new(config_lock.clone(), test_metrics());
+            router.set_copilot_manager(manager.clone());
+            let attached_before = router.copilot_manager.clone().expect("manager attached");
+            assert!(Arc::ptr_eq(&attached_before, &manager));
 
-    // Publish the reloaded config: same shape but the copilot provider
-    // is RENAMED ("copilot-2") — a reload that drops/reconstructs auth
-    // state would lose the manager here.
-    let mut reloaded = copilot_config(&copilot.uri(), &fallback.uri());
-    reloaded.providers[0].name = "copilot-2".to_string();
-    reloaded.model_groups[0].models[0].provider = "copilot-2".to_string();
-    *config_lock.write().await = reloaded;
+            // Publish the reloaded config: same shape but the copilot provider
+            // is RENAMED ("copilot-2") — a reload that drops/reconstructs auth
+            // state would lose the manager here.
+            let mut reloaded = copilot_config(&copilot.uri(), &fallback.uri());
+            reloaded.providers[0].name = "copilot-2".to_string();
+            reloaded.model_groups[0].models[0].provider = "copilot-2".to_string();
+            *config_lock.write().await = reloaded;
 
-    // Drive the same router-surface calls apply_runtime_config_update
-    // makes on hot-reload (gateway/mod.rs): nothing here may touch the
-    // copilot manager/catalog fields.
-    {
-        let cfg = config_lock.read().await;
-        router
-            .reload_smart_router(cfg.smart_routing.clone())
-            .expect("smart router reload");
-        router.reload_compression_runtime(
-            cfg.compression.clone(),
-            None,
-        );
+            // Drive the same router-surface calls apply_runtime_config_update
+            // makes on hot-reload (gateway/mod.rs): nothing here may touch the
+            // copilot manager/catalog fields.
+            {
+                let cfg = config_lock.read().await;
+                router
+                    .reload_smart_router(cfg.smart_routing.clone())
+                    .expect("smart router reload");
+                router.reload_compression_runtime(cfg.compression.clone(), None);
+            }
+            router.clear_circuit_breakers();
+            router.clear_rate_limiters();
+            router.clear_sticky_cache();
+            router.clear_http_clients();
+            router.clear_model_capabilities();
+
+            // Router side: the same manager Arc survived the reload untouched.
+            let attached_after = router
+                .copilot_manager
+                .clone()
+                .expect("manager survives reload");
+            assert!(
+                Arc::ptr_eq(&attached_after, &manager),
+                "reload must keep the SAME CopilotTokenManager Arc"
+            );
+            // Auth state untouched by the config swap + router reload surface.
+            assert!(matches!(
+                manager.session_state().await,
+                CopilotSessionState::Authenticated { .. }
+            ));
+
+            // Behavioral proof: a post-reload dispatch through the renamed
+            // provider still authenticates with the seeded session and serves.
+            let response = router
+                .route_request(&compression_request(false), Some(ledger_handle()))
+                .await
+                .expect("post-reload dispatch succeeds");
+            assert_eq!(
+                response.extra.get("gateway_provider"),
+                Some(&serde_json::json!("copilot-2"))
+            );
+            copilot.verify().await;
+        }
     }
-    router.clear_circuit_breakers();
-    router.clear_rate_limiters();
-    router.clear_sticky_cache();
-    router.clear_http_clients();
-    router.clear_model_capabilities();
-
-    // Router side: the same manager Arc survived the reload untouched.
-    let attached_after = router.copilot_manager.clone().expect("manager survives reload");
-    assert!(
-        Arc::ptr_eq(&attached_after, &manager),
-        "reload must keep the SAME CopilotTokenManager Arc"
-    );
-    // Auth state untouched by the config swap + router reload surface.
-    assert!(matches!(
-        manager.session_state().await,
-        CopilotSessionState::Authenticated { .. }
-    ));
-
-    // Behavioral proof: a post-reload dispatch through the renamed
-    // provider still authenticates with the seeded session and serves.
-    let response = router
-        .route_request(&compression_request(false), Some(ledger_handle()))
-        .await
-        .expect("post-reload dispatch succeeds");
-    assert_eq!(
-        response.extra.get("gateway_provider"),
-        Some(&serde_json::json!("copilot-2"))
-    );
-    copilot.verify().await;
 }
-    }
-}
-

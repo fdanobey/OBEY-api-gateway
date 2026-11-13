@@ -420,18 +420,48 @@ fn append_chars(target: &mut String, source: &str, maximum_chars: usize) -> usiz
 }
 
 fn truncate_prompt_to_token_limit(prompt: &mut String) {
+    truncate_prompt_chars_to_token_limit(prompt, MAX_CLASSIFIER_PROMPT_TOKENS);
+
+    debug_assert!(
+        tiktoken_rs::cl100k_base_singleton()
+            .encode_with_special_tokens(prompt)
+            .len()
+            <= MAX_CLASSIFIER_PROMPT_TOKENS
+    );
+}
+
+fn truncate_prompt_chars_to_token_limit(prompt: &mut String, limit: usize) {
     let tokenizer = tiktoken_rs::cl100k_base_singleton();
     let prefix_len = CLASSIFIER_PROMPT_PREFIX.len();
 
-    while tokenizer.encode_with_special_tokens(prompt).len() > MAX_CLASSIFIER_PROMPT_TOKENS
-        && prompt.len() > prefix_len
-    {
-        prompt.pop();
+    if tokenizer.encode_with_special_tokens(prompt).len() <= limit {
+        return;
+    }
+    if prompt.len() <= prefix_len {
+        return;
     }
 
-    debug_assert!(
-        tokenizer.encode_with_special_tokens(prompt).len() <= MAX_CLASSIFIER_PROMPT_TOKENS
-    );
+    let mut boundaries: Vec<usize> = prompt.char_indices().map(|(index, _)| index).collect();
+    boundaries.push(prompt.len());
+
+    let floor_index = boundaries
+        .iter()
+        .rposition(|&boundary| boundary <= prefix_len)
+        .expect("byte zero is always a char boundary");
+
+    let mut low = floor_index;
+    let mut high = boundaries.len() - 1;
+    while low < high {
+        let mid = low + (high - low + 1) / 2;
+        let candidate = &prompt[..boundaries[mid]];
+        if tokenizer.encode_with_special_tokens(candidate).len() <= limit {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    prompt.truncate(boundaries[low]);
 }
 
 #[cfg(test)]
@@ -569,6 +599,20 @@ mod tests {
         }
     }
 
+    /// Pre-optimization reference for `truncate_prompt_chars_to_token_limit`,
+    /// kept verbatim so the binary-search rewrite can be property-tested for
+    /// byte-identical output against the original character-pop loop.
+    fn legacy_truncate_prompt_to_token_limit(prompt: &mut String, limit: usize) {
+        let tokenizer = tiktoken_rs::cl100k_base_singleton();
+        let prefix_len = CLASSIFIER_PROMPT_PREFIX.len();
+
+        while tokenizer.encode_with_special_tokens(prompt).len() > limit
+            && prompt.len() > prefix_len
+        {
+            prompt.pop();
+        }
+    }
+
     #[test]
     fn labels_parse_strictly_and_map_to_required_scores() {
         assert_eq!(ClassifierLabel::parse(" SIMPLE ").unwrap().score(), 0.15);
@@ -628,52 +672,67 @@ mod tests {
     }
 
     proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
-    #[test]
-    fn property_5_cache_capacity_never_exceeds_1000(
-    insertions in prop::collection::vec((any::<u64>(), 0u8..=2), 1_001..=1_200),
-    ) {
-    let now = Instant::now();
-    let mut state = CacheState::new(CLASSIFIER_CACHE_CAPACITY);
+        #[test]
+        fn property_5_cache_capacity_never_exceeds_1000(
+        insertions in prop::collection::vec((any::<u64>(), 0u8..=2), 1_001..=1_200),
+        ) {
+        let now = Instant::now();
+        let mut state = CacheState::new(CLASSIFIER_CACHE_CAPACITY);
 
-    for (fingerprint, score_index) in insertions {
-    let score = [0.15, 0.50, 0.85][usize::from(score_index)];
-    state.insert(
-    fingerprint,
-    score,
-    now,
-    CLASSIFIER_CACHE_TTL,
-    CLASSIFIER_CACHE_CAPACITY,
-    );
-    prop_assert!(state.entries.len() <= CLASSIFIER_CACHE_CAPACITY);
-    prop_assert!(state.lru.len() <= CLASSIFIER_CACHE_CAPACITY);
-    }
-    }
+        for (fingerprint, score_index) in insertions {
+        let score = [0.15, 0.50, 0.85][usize::from(score_index)];
+        state.insert(
+        fingerprint,
+        score,
+        now,
+        CLASSIFIER_CACHE_TTL,
+        CLASSIFIER_CACHE_CAPACITY,
+        );
+        prop_assert!(state.entries.len() <= CLASSIFIER_CACHE_CAPACITY);
+        prop_assert!(state.lru.len() <= CLASSIFIER_CACHE_CAPACITY);
+        }
+        }
 
     #[test]
     fn property_6_exact_hit_returns_cached_score_without_invoker_call(
-    content in prop::collection::vec(any::<char>(), 0..=256)
-    .prop_map(|characters| characters.into_iter().collect::<String>()),
-    cached_score_basis_points in 0u16..=10_000,
+        content in prop::collection::vec(any::<char>(), 0..=256)
+            .prop_map(|characters| characters.into_iter().collect::<String>()),
+        cached_score_basis_points in 0u16..=10_000,
     ) {
-    let invoker = MockInvoker::error(ClassifierInvokerError::Backend);
-    let classifier = LlmClassifier::new("fixed-classifier", invoker.clone());
-    let request = request(Value::String(content));
-    let model_group = model_group();
-    let pinned_context = PinnedRoutingContext::default();
-    let cached_score = f64::from(cached_score_basis_points) / 10_000.0;
-    classifier
-    .cache
-    .insert(request_fingerprint(&request), cached_score);
+        let invoker = MockInvoker::error(ClassifierInvokerError::Backend);
+        let classifier = LlmClassifier::new("fixed-classifier", invoker.clone());
+        let request = request(Value::String(content));
+        let model_group = model_group();
+        let pinned_context = PinnedRoutingContext::default();
+        let cached_score = f64::from(cached_score_basis_points) / 10_000.0;
+        classifier
+            .cache
+            .insert(request_fingerprint(&request), cached_score);
 
-    let output = futures::executor::block_on(
-    classifier.classify(input(&request, &model_group, &pinned_context)),
-    )
-    .unwrap();
+        let output = futures::executor::block_on(
+            classifier.classify(input(&request, &model_group, &pinned_context)),
+        )
+        .unwrap();
 
-    prop_assert_eq!(output.score, cached_score);
-    prop_assert_eq!(invoker.calls.load(Ordering::SeqCst), 0);
+        prop_assert_eq!(output.score, cached_score);
+        prop_assert_eq!(invoker.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn property_7_truncation_matches_legacy_character_pop_loop(
+        suffix in prop::collection::vec(any::<char>(), 0..=1_024)
+            .prop_map(|characters| characters.into_iter().collect::<String>()),
+        limit in 16usize..=4_096,
+    ) {
+        let prompt = format!("{CLASSIFIER_PROMPT_PREFIX}{suffix}");
+        let mut truncated = prompt.clone();
+        truncate_prompt_chars_to_token_limit(&mut truncated, limit);
+        let mut legacy = prompt.clone();
+        legacy_truncate_prompt_to_token_limit(&mut legacy, limit);
+
+        prop_assert_eq!(truncated, legacy);
     }
     }
 

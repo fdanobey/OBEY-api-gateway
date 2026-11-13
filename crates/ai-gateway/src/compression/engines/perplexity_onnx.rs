@@ -55,10 +55,11 @@ impl RedundancyScorerLoader for OnnxRedundancyScorerLoader {
                 reason: "install the ONNX runtime from the admin Compression page".to_owned(),
             });
         }
- let environment = ensure_runtime(&runtime_path).map_err(|reason| ScorerError::RuntimeUnavailable {
- path: runtime_path,
- reason,
- })?;
+        let environment =
+            ensure_runtime(&runtime_path).map_err(|reason| ScorerError::RuntimeUnavailable {
+                path: runtime_path,
+                reason,
+            })?;
 
         let mut tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|error| ScorerError::ScoringFailed {
@@ -77,35 +78,35 @@ impl RedundancyScorerLoader for OnnxRedundancyScorerLoader {
                 scorer: MODEL_NAME.to_owned(),
                 reason: format!("failed to configure tokenizer truncation: {error}"),
             })?;
- let session = Session::builder(&environment)
- .and_then(|mut builder| builder.commit_from_file(model_path))
- .map_err(|error| ScorerError::ScoringFailed {
- scorer: MODEL_NAME.to_owned(),
- reason: format!("failed to load model `{}`: {error}", model_path.display()),
- })?;
+        let session = Session::builder(&environment)
+            .and_then(|mut builder| builder.commit_from_file(model_path))
+            .map_err(|error| ScorerError::ScoringFailed {
+                scorer: MODEL_NAME.to_owned(),
+                reason: format!("failed to load model `{}`: {error}", model_path.display()),
+            })?;
 
         Ok(Arc::new(OnnxRedundancyScorer {
             tokenizer,
-            session: Mutex::new(session),
+            session: Arc::new(Mutex::new(session)),
         }))
     }
 }
 
 fn ensure_runtime(runtime_path: &Path) -> Result<ort::environment::Environment, String> {
- ORT_INITIALIZED
- .get_or_init(|| {
- ort::init_from(runtime_path.display().to_string())
- .map_err(|error| error.to_string())?
- .with_name("obey-api-gateway")
- .build()
- .map_err(|error| error.to_string())
- })
- .clone()
+    ORT_INITIALIZED
+        .get_or_init(|| {
+            ort::init_from(runtime_path.display().to_string())
+                .map_err(|error| error.to_string())?
+                .with_name("obey-api-gateway")
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .clone()
 }
 
 pub struct OnnxRedundancyScorer {
     tokenizer: Tokenizer,
-    session: Mutex<Session>,
+    session: Arc<Mutex<Session>>,
 }
 
 impl std::fmt::Debug for OnnxRedundancyScorer {
@@ -188,29 +189,63 @@ impl OnnxRedundancyScorer {
             .iter()
             .map(|value| i64::from(*value))
             .collect::<Vec<_>>();
-        let input_ids = Tensor::from_array(([1usize, sequence_length], input_ids))
-            .map_err(|error| scoring_error(error.to_string()))?;
-        let attention_mask = Tensor::from_array(([1usize, sequence_length], attention_mask))
-            .map_err(|error| scoring_error(error.to_string()))?;
-        let mut session = self
-            .session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let outputs = session
-            .run(ort::inputs![
-                "input_ids" => input_ids,
-                "attention_mask" => attention_mask
-            ])
-            .map_err(|error| scoring_error(error.to_string()))?;
-        let output = outputs
-            .get("logits")
-            .or_else(|| outputs.get("output"))
-            .ok_or_else(|| invalid_output("model returned no logits output"))?;
-        let (shape, logits) = output
-            .try_extract_tensor::<f32>()
-            .map_err(|error| invalid_output(error.to_string()))?;
-        logits_to_retention_scores(shape, logits, sequence_length)
+        // ONNX inference must not run inline on a tokio worker
+        // (Requirement 1.2). On the multi-thread runtime,
+        // `block_in_place` hands the worker core to another thread and
+        // runs the inference inline — no channel is involved, so a
+        // blocking-pool thread that reaches this boundary through the
+        // pipeline's offload path (`spawn_blocking` + `block_on`, which
+        // enters the runtime with `allow_block_in_place`) executes it
+        // inline as well and nested-offload deadlock is impossible: no
+        // spawn_blocking thread ever waits on a sender that needs a
+        // tokio worker. The session mutex guard is held only within this
+        // thread, keeping session access serialized. On a current-thread
+        // runtime (tests) or without any runtime there is no second
+        // worker to hand off to and nothing to protect, so the closure
+        // also runs inline.
+        let session = Arc::clone(&self.session);
+        let inference = move || {
+            run_session_inference(&session, input_ids, attention_mask, sequence_length)
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if handle.runtime_flavor()
+                    == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(inference)
+            }
+            _ => inference(),
+        }
     }
+}
+
+fn run_session_inference(
+    session: &Mutex<Session>,
+    input_ids: Vec<i64>,
+    attention_mask: Vec<i64>,
+    sequence_length: usize,
+) -> Result<Vec<f32>, ScorerError> {
+    let input_ids = Tensor::from_array(([1usize, sequence_length], input_ids))
+        .map_err(|error| scoring_error(error.to_string()))?;
+    let attention_mask = Tensor::from_array(([1usize, sequence_length], attention_mask))
+        .map_err(|error| scoring_error(error.to_string()))?;
+    let mut session = session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let outputs = session
+        .run(ort::inputs![
+            "input_ids" => input_ids,
+            "attention_mask" => attention_mask
+        ])
+        .map_err(|error| scoring_error(error.to_string()))?;
+    let output = outputs
+        .get("logits")
+        .or_else(|| outputs.get("output"))
+        .ok_or_else(|| invalid_output("model returned no logits output"))?;
+    let (shape, logits) = output
+        .try_extract_tensor::<f32>()
+        .map_err(|error| invalid_output(error.to_string()))?;
+    logits_to_retention_scores(shape, logits, sequence_length)
 }
 
 fn logits_to_retention_scores(

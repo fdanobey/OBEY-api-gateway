@@ -12,9 +12,11 @@
 //! - Provider-selection fixtures for latency history coverage
 //! - 4/16/64 candidate scenarios without upstream network calls
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tokio::sync::RwLock;
@@ -24,11 +26,18 @@ use ai_gateway::anthropic::{
     synthesize_anthropic_response, translate as translate_anthropic, AnthropicRequest,
     AnthropicSynthesisContext,
 };
-use ai_gateway::compression::pipeline::{CompressionPipeline, CompressionRequestMetadata};
+use ai_gateway::compression::pipeline::{
+    CompressionPipeline, CompressionRequestMetadata, CPU_OFFLOAD_MIN_BYTES,
+};
 use ai_gateway::compression::token_counter::TokenCounter;
 use ai_gateway::compression::{CompressiblePayload, CompressionContext, CompressionLevel};
 use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
+use ai_gateway::memory::{
+    run_consolidation, ConsolidationContext, ConsolidationCounts, MemoryExtractionProvider,
+    MemoryExtractionProviderError, MemoryExtractionProviderRequest, MemoryStore, NewMemoryEntry,
+    StructuredMemoryCandidate,
+};
 use ai_gateway::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
 use ai_gateway::responses::{
     synthesize, translate, ResponsesInput, ResponsesRequest, SynthesisContext, TranslationContext,
@@ -1805,5 +1814,620 @@ async fn responses_translation_overhead_within_budget() {
         "p95 {:?} exceeds {:?}",
         report.p95,
         BUDGET
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-core utilization regression guards (spec multi-core-utilization, Task 11)
+// ---------------------------------------------------------------------------
+
+/// Builds an OpenAIRequest of roughly `target_bytes` message text. The Lite
+/// engine and the token counter both key off the pipeline's estimated
+/// payload size, so message content dominates the wire estimate.
+fn offload_threshold_request(target_bytes: usize) -> OpenAIRequest {
+    // Split into a few messages so the fixture mirrors real conversations;
+    // per-message content is what the per-message token counting encodes.
+    let message_count = 4;
+    let per_message = target_bytes / message_count;
+    OpenAIRequest {
+        model: "test-group".to_string(),
+        messages: (0..message_count)
+            .map(|index| Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String(format!(
+                    "Analyze item {index}: explain the reasoning and provide a concise implementation. {}",
+                    "x".repeat(per_message)
+                )),
+                extra: serde_json::Map::new(),
+            })
+            .collect(),
+        stream: false,
+        temperature: Some(0.0),
+        max_tokens: Some(512),
+        extra: serde_json::Map::new(),
+    }
+}
+
+/// A compression context like the router's, with pipeline-shared helpers.
+fn guard_context() -> CompressionContext {
+    CompressionContext::new("gpt-4o", "guard-provider")
+}
+
+/// Like [`offload_threshold_request`], but with content the Lite engine
+/// genuinely transforms (collapsible whitespace runs), so path probes can
+/// assert an engine actually applied instead of passing through.
+fn whitespace_compressible_request(target_bytes: usize) -> OpenAIRequest {
+    let message_count = 4;
+    let per_message = target_bytes / message_count;
+    OpenAIRequest {
+        model: "test-group".to_string(),
+        messages: (0..message_count)
+            .map(|index| Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String(format!(
+                    "Analyze item {index}: summarize. {}",
+                    "word  ".repeat(per_message / 6)
+                )),
+                extra: serde_json::Map::new(),
+            })
+            .collect(),
+        stream: false,
+        temperature: Some(0.0),
+        max_tokens: Some(512),
+        extra: serde_json::Map::new(),
+    }
+}
+
+/// Requirement 1.4 / NFR Performance: a request well under
+/// `CPU_OFFLOAD_MIN_BYTES` must keep the inline (no thread-hop) path, so its
+/// median compress_auto overhead stays in the same band as the pre-change
+/// small-request behavior. The guard asserts the small-request median stays
+/// below a generous absolute ceiling derived from the 10 ms forwarding
+/// budget, and that a large payload pays the expected heavier cost — proving
+/// the small path did not silently start hopping threads (which would push
+/// it toward the large path's latency band).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "wall-clock offload guard (multi-core spec Req 1.4): run perf suite with --ignored"]
+async fn small_request_median_overhead_below_offload_threshold() {
+    const WARMUP: usize = 10;
+    const ITERATIONS: usize = 200;
+    // Generous debug-build ceiling: the small request runs inline, so its
+    // median must stay an order of magnitude under the blocking-pool path,
+    // which pays a thread hop plus a ~512 KiB encode.
+    const SMALL_MEDIAN_CEILING: Duration = Duration::from_millis(100);
+
+    let pipeline = CompressionPipeline::from_config(
+        ai_gateway::compression::config::CompressionConfig::default(),
+    );
+    let mut enabled = ai_gateway::compression::config::CompressionConfig::default();
+    enabled.enabled = true;
+    enabled.default_level = CompressionLevel::Lite;
+    enabled.auto_threshold_tokens = 512;
+    let effective = enabled.resolve(None, None);
+    let small_request = offload_threshold_request(CPU_OFFLOAD_MIN_BYTES / 8);
+
+    // The fixture must genuinely sit below the threshold, or this test proves
+    // nothing about the small path.
+    let small_payload = CompressiblePayload::from(&small_request);
+    let small_bytes = small_payload
+        .messages
+        .iter()
+        .map(|message| message.role.len() + message.content.as_value().to_string().len())
+        .sum::<usize>();
+    assert!(
+        small_bytes < CPU_OFFLOAD_MIN_BYTES,
+        "small fixture must be below the offload threshold: {small_bytes} bytes"
+    );
+
+    for _ in 0..WARMUP {
+        let _ = pipeline
+            .compress_auto(
+                CompressiblePayload::from(&small_request),
+                guard_context(),
+                effective,
+                CompressionRequestMetadata::default(),
+            )
+            .await;
+    }
+
+    let mut small_samples = ResponsivenessSampleSet::new();
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        let result = std::hint::black_box(
+            pipeline
+                .compress_auto(
+                    CompressiblePayload::from(&small_request),
+                    guard_context(),
+                    effective,
+                    CompressionRequestMetadata::default(),
+                )
+                .await,
+        );
+        samples_record_checked(&mut small_samples, start.elapsed());
+        assert!(
+            !result.error,
+            "small-path pipeline errored: {:?}",
+            result.errors
+        );
+        assert!(!result.timed_out);
+    }
+
+    let small_report = small_samples.report();
+    eprintln!("small_request_offload_guard: {small_report}");
+    assert!(
+        small_report.median < SMALL_MEDIAN_CEILING,
+        "small-request median {:?} exceeds {:?} — the inline path likely lost its no-thread-hop behavior (Req 1.4)",
+        small_report.median,
+        SMALL_MEDIAN_CEILING
+    );
+}
+
+/// Requirement 1.4 (execution-path guard): a request well under
+/// `CPU_OFFLOAD_MIN_BYTES` must run its pipeline without any
+/// spawn_blocking hops. Proven by starvation rather than timing: the probe
+/// drives compress_auto on a current-thread runtime whose single
+/// blocking-pool thread is permanently occupied, so any spawn_blocking on
+/// the small path would queue behind the blocker and stall into the
+/// timeout; completing — with a compression engine actually applied —
+/// proves the inline path. No production hook was added for this probe.
+#[test]
+fn small_request_pipeline_runs_inline_with_blocked_blocking_pool() {
+    let mut enabled = ai_gateway::compression::config::CompressionConfig::default();
+    enabled.enabled = true;
+    enabled.default_level = CompressionLevel::Lite;
+    enabled.auto_threshold_tokens = 512;
+    let effective = enabled.resolve(None, None);
+    let small_request = whitespace_compressible_request(CPU_OFFLOAD_MIN_BYTES / 8);
+
+    // The fixture must genuinely sit below the threshold and be Lite-
+    // compressible, or this probe proves nothing about the small path.
+    let small_payload = CompressiblePayload::from(&small_request);
+    let small_bytes = small_payload
+        .messages
+        .iter()
+        .map(|message| message.role.len() + message.content.as_value().to_string().len())
+        .sum::<usize>();
+    assert!(
+        small_bytes < CPU_OFFLOAD_MIN_BYTES,
+        "probe fixture must be below the offload threshold: {small_bytes} bytes"
+    );
+
+    let pipeline = CompressionPipeline::from_config(
+        ai_gateway::compression::config::CompressionConfig::default(),
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("probe runtime must build");
+
+    let result = runtime.block_on(async {
+        // Occupy the only blocking-pool thread for the probe's lifetime;
+        // the poll loop (not an unbounded sleep) lets the probe release
+        // it deterministically instead of stalling runtime shutdown.
+        let blocker_stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&blocker_stop);
+        let blocker = tokio::task::spawn_blocking(move || {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        let attempt = tokio::time::timeout(
+            TEST_TIMEOUT,
+            pipeline.compress_auto(
+                CompressiblePayload::from(&small_request),
+                guard_context(),
+                effective,
+                CompressionRequestMetadata::default(),
+            ),
+        )
+        .await;
+        blocker_stop.store(true, Ordering::SeqCst);
+        let _ = blocker.await;
+        attempt.expect(
+            "small-request compress_auto stalled while the blocking pool was \
+             occupied — the below-threshold path must stay inline (Req 1.4)",
+        )
+    });
+
+    assert!(
+        !result.engines_applied.is_empty(),
+        "probe is vacuous: no compression engine ran for the small request"
+    );
+    assert!(
+        !result.error,
+        "probe pipeline errored: {:?}",
+        result.errors
+    );
+    assert!(!result.timed_out);
+}
+
+/// Records a sample, guarding against clock artifacts (zero-width samples
+/// distort percentile math on fast paths).
+fn samples_record_checked(samples: &mut ResponsivenessSampleSet, elapsed: Duration) {
+    if elapsed > Duration::ZERO {
+        samples.record(elapsed);
+    } else {
+        samples.record(Duration::from_nanos(1));
+    }
+}
+
+/// Requirement 1.1 / NFR Performance: concurrent large-payload p95 must not
+/// regress. The baseline is captured in-test (same machine, same run): the
+/// p95 of sequential large-payload compress_auto executions defines the
+/// inline reference band, and the p95 of `CONCURRENCY` simultaneous
+/// large-payload executions (which flow through spawn_blocking) must stay
+/// within a generous multiple of that baseline. A regressed offload would
+/// serialize big encodes onto tokio workers and blow well past the factor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "wall-clock large-payload p95 guard (multi-core spec NFR): run perf suite with --ignored"]
+async fn concurrent_large_payload_p95_within_baseline_multiple() {
+    const WARMUP: usize = 5;
+    const SEQUENTIAL_ITERATIONS: usize = 30;
+    const CONCURRENCY: usize = 8;
+    // Generous CI/PC-noise tolerance: 8 concurrent 1 MiB payloads share CPU
+    // cores, so even a healthy blocking-pool run lands well above 1x.
+    const ALLOWED_FACTOR: f64 = 20.0;
+
+    let mut config = ai_gateway::compression::config::CompressionConfig::default();
+    config.enabled = true;
+    config.default_level = CompressionLevel::Lite;
+    config.auto_threshold_tokens = 512;
+    let pipeline = Arc::new(CompressionPipeline::from_config(config.clone()));
+    let effective = config.resolve(None, None);
+    let large_request = offload_threshold_request(CPU_OFFLOAD_MIN_BYTES + 1024);
+
+    // The fixture must genuinely flow through the offload path.
+    let large_payload = CompressiblePayload::from(&large_request);
+    let large_bytes = large_payload
+        .messages
+        .iter()
+        .map(|message| message.role.len() + message.content.as_value().to_string().len())
+        .sum::<usize>();
+    assert!(
+        large_bytes >= CPU_OFFLOAD_MIN_BYTES,
+        "large fixture must reach the offload threshold: {large_bytes} bytes"
+    );
+
+    for _ in 0..WARMUP {
+        let _ = pipeline
+            .compress_auto(
+                CompressiblePayload::from(&large_request),
+                guard_context(),
+                effective,
+                CompressionRequestMetadata::default(),
+            )
+            .await;
+    }
+
+    // In-test baseline: sequential large-payload executions.
+    let mut baseline_samples = ResponsivenessSampleSet::new();
+    for _ in 0..SEQUENTIAL_ITERATIONS {
+        let start = Instant::now();
+        let result = std::hint::black_box(
+            pipeline
+                .compress_auto(
+                    CompressiblePayload::from(&large_request),
+                    guard_context(),
+                    effective,
+                    CompressionRequestMetadata::default(),
+                )
+                .await,
+        );
+        samples_record_checked(&mut baseline_samples, start.elapsed());
+        assert!(
+            !result.error,
+            "baseline pipeline errored: {:?}",
+            result.errors
+        );
+        assert!(!result.timed_out);
+    }
+    let baseline = baseline_samples.report();
+    eprintln!("large_payload_baseline (sequential): {baseline}");
+    assert!(
+        baseline.p95 > Duration::ZERO,
+        "baseline p95 must be measurable"
+    );
+
+    // Concurrent large payloads: every request now goes through
+    // spawn_blocking, and none may starve the others into the multiple.
+    //
+    // Worker-responsiveness guard (primary): while the large payloads
+    // compress, a tiny yield-loop heartbeat task keeps running on the
+    // runtime. If the heavy CPU work regressed onto tokio workers, every
+    // worker would be saturated and the heartbeat's scheduling latency
+    // would inflate to engine-runtime multiples; a healthy blocking-pool
+    // offload leaves the workers free, so its p95 stays far below the
+    // bound even under CI-grade noise.
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(2);
+    const HEARTBEAT_P95_BOUND: Duration = Duration::from_secs(2);
+    let heartbeat_stop = Arc::new(AtomicBool::new(false));
+    let heartbeat_samples = Arc::new(std::sync::Mutex::new(ResponsivenessSampleSet::new()));
+    let heartbeat_handle = {
+        let stop = Arc::clone(&heartbeat_stop);
+        let samples = Arc::clone(&heartbeat_samples);
+        tokio::spawn(async move {
+            // Fixed-schedule beats: each beat's sample is how late the
+            // runtime polled it against its scheduled fire time. Healthy
+            // workers keep the drift at timer-granularity; workers blocked
+            // by inlined engine CPU accumulate engine-runtime multiples.
+            let started = tokio::time::Instant::now();
+            let mut beats = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                beats += 1;
+                let target = started + HEARTBEAT_INTERVAL * beats;
+                tokio::time::sleep_until(target).await;
+                let now = tokio::time::Instant::now();
+                let drift = now
+                    .checked_duration_since(target)
+                    .unwrap_or_default();
+                samples.lock().unwrap().record(drift);
+            }
+        })
+    };
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
+    let large_request = Arc::new(large_request);
+    let mut handles = Vec::with_capacity(CONCURRENCY);
+    for _ in 0..CONCURRENCY {
+        let pipeline = Arc::clone(&pipeline);
+        let request = Arc::clone(&large_request);
+        let effective = effective;
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let start = Instant::now();
+            let result = pipeline
+                .compress_auto(
+                    CompressiblePayload::from(&*request),
+                    guard_context(),
+                    effective,
+                    CompressionRequestMetadata::default(),
+                )
+                .await;
+            (start.elapsed(), result)
+        }));
+    }
+
+    let mut concurrent_samples = ResponsivenessSampleSet::new();
+    for handle in handles {
+        let (elapsed, result) = handle.await.expect("concurrent compression task panicked");
+        samples_record_checked(&mut concurrent_samples, elapsed);
+        assert!(
+            !result.error,
+            "concurrent pipeline errored: {:?}",
+            result.errors
+        );
+        assert!(!result.timed_out);
+    }
+    let concurrent = concurrent_samples.report();
+    eprintln!("large_payload_concurrent[{}]: {concurrent}", CONCURRENCY);
+
+    // Stop the heartbeat and judge worker responsiveness (primary guard).
+    heartbeat_stop.store(true, Ordering::SeqCst);
+    heartbeat_handle
+        .await
+        .expect("heartbeat task panicked");
+    let heartbeat = heartbeat_samples.lock().unwrap().report();
+    eprintln!("worker_heartbeat[2ms beats]: {heartbeat}");
+    assert!(
+        heartbeat.p95 < HEARTBEAT_P95_BOUND,
+        "heartbeat p95 {:?} exceeds {:?} while {CONCURRENCY} large payloads \
+         compressed — CPU work likely regressed onto tokio workers",
+        heartbeat.p95,
+        HEARTBEAT_P95_BOUND,
+    );
+
+    let factor = concurrent.p95.as_secs_f64() / baseline.p95.as_secs_f64();
+    eprintln!(
+        "large_payload_p95_factor: concurrent_p95={:?} baseline_p95={:?} factor={factor:.1}x (allowed {ALLOWED_FACTOR}x)",
+        concurrent.p95,
+        baseline.p95
+    );
+    assert!(
+        factor <= ALLOWED_FACTOR,
+        "concurrent large-payload p95 {factor:.1}x baseline exceeds {ALLOWED_FACTOR}x — \
+         spawn_blocking offload may have regressed onto tokio workers",
+    );
+}
+
+/// Delaying mock consolidation provider (mirrors the unit-test
+/// `DelayedConsolidationProvider`): fixed per-call latency so the
+/// bounded-parallelism wall-time reduction is observable, and empty
+/// decisions so the fixture stays write-light.
+struct DelayedGuardConsolidationProvider {
+    delay: Duration,
+    calls: AtomicUsize,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+impl DelayedGuardConsolidationProvider {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            calls: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
+    fn enter(&self) {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut seen = self.max_in_flight.load(Ordering::SeqCst);
+        while seen < now {
+            match self.max_in_flight.compare_exchange(
+                seen,
+                now,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => seen = actual,
+            }
+        }
+    }
+
+    fn exit(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl MemoryExtractionProvider for DelayedGuardConsolidationProvider {
+    async fn extract(
+        &self,
+        _request: MemoryExtractionProviderRequest,
+    ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.enter();
+        tokio::time::sleep(self.delay).await;
+        self.exit();
+        Ok(vec![StructuredMemoryCandidate {
+            content: "[]".to_owned(),
+            memory_type: ai_gateway::memory::MemoryType::Fact,
+        }])
+    }
+}
+
+/// Seeds `pairs` disjoint near-duplicate entry pairs into one namespace,
+/// mirroring the unit-test fixture: each pair carries unique anchor tokens
+/// so cross-pair similarity stays below the grouping threshold while the
+/// pair itself groups (one independent batch per pair).
+async fn seed_guard_consolidation_pairs(store: &MemoryStore, pairs: usize) {
+    for index in 0..pairs {
+        store
+            .store_entry(
+                NewMemoryEntry {
+                    namespace: "user::perf-guard".to_owned(),
+                    content: format!("deploy target follows kappa{index} omega{index}"),
+                    memory_type: ai_gateway::memory::MemoryType::Fact,
+                    source_request_id: None,
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .store_entry(
+                NewMemoryEntry {
+                    namespace: "user::perf-guard".to_owned(),
+                    content: format!("deploy target follows kappa{index} omega{index} note"),
+                    memory_type: ai_gateway::memory::MemoryType::Fact,
+                    source_request_id: None,
+                },
+                None,
+            )
+            .unwrap();
+    }
+}
+
+/// Builds a `ConsolidationContext` over an in-memory store with the given
+/// batch-concurrency bound (mock provider, no live network).
+async fn guard_consolidation_context(
+    provider: Arc<DelayedGuardConsolidationProvider>,
+    max_concurrent_batches: usize,
+) -> (ConsolidationContext, Arc<MemoryStore>) {
+    let store = Arc::new(MemoryStore::new(std::path::Path::new(":memory:")).unwrap());
+    let scanner = Arc::new(
+        ai_gateway::memory::SensitiveContentScanner::new(&[], None)
+            .expect("guard scanner must compile"),
+    );
+    let context = ConsolidationContext {
+        store: store.clone(),
+        provider: provider as Arc<dyn MemoryExtractionProvider>,
+        scanner,
+        vector_tier: None,
+        allow_sensitive_storage: false,
+        provider_name: "internal-provider".to_owned(),
+        model: "consolidator-model".to_owned(),
+        maximum_concurrent_provider_calls: max_concurrent_batches,
+        provider_timeout: Duration::from_secs(30),
+        progress: None,
+    };
+    (context, store)
+}
+
+/// NFR Performance: a consolidation pass over many independent batches
+/// finishes measurably faster at concurrency 4 than at concurrency 1, using
+/// only a delaying mock provider and in-memory databases.
+///
+/// Six batches at 150 ms mock latency: sequential ~900 ms; concurrency 4
+/// approaches 2 batch-times (~300 ms). The guard is a ratio assertion —
+/// parallel must come in under half the sequential wall time — so machine
+/// noise cannot flip it while a genuine serialization regression fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "wall-clock consolidation guard (multi-core spec NFR): run perf suite with --ignored"]
+async fn consolidation_wall_time_reduces_at_concurrency_four() {
+    let delay = Duration::from_millis(150);
+    let pair_count = 6usize;
+
+    let provider = Arc::new(DelayedGuardConsolidationProvider::new(delay));
+    let sequential_provider = provider.clone();
+    let (context, store) = guard_consolidation_context(provider, 1).await;
+    seed_guard_consolidation_pairs(&store, pair_count).await;
+    let sequential_start = Instant::now();
+    let sequential_counts: ConsolidationCounts = run_consolidation(context).await.unwrap();
+    let sequential_elapsed = sequential_start.elapsed();
+
+    let provider = Arc::new(DelayedGuardConsolidationProvider::new(delay));
+    let parallel_provider = provider.clone();
+    let (context, store) = guard_consolidation_context(provider, 4).await;
+    seed_guard_consolidation_pairs(&store, pair_count).await;
+    let parallel_start = Instant::now();
+    let parallel_counts: ConsolidationCounts = run_consolidation(context).await.unwrap();
+    let parallel_elapsed = parallel_start.elapsed();
+
+    eprintln!(
+        "consolidation_wall_time: sequential={sequential_elapsed:?} concurrency4={parallel_elapsed:?}"
+    );
+    // The delaying provider answers "[]" (no decisions), so nothing merges;
+    // the fixture invariant is one provider call per seeded pair-batch.
+    assert_eq!(
+        sequential_provider.calls(),
+        pair_count,
+        "sequential pass must dispatch one batch per seeded pair"
+    );
+    assert_eq!(
+        parallel_provider.calls(),
+        pair_count,
+        "parallel pass must dispatch one batch per seeded pair"
+    );
+    assert_eq!(sequential_counts.merged, 0);
+    assert_eq!(parallel_counts.merged, 0);
+    // Overlap guards: the sequential pass must never overlap provider
+    // calls, while the concurrency-4 pass must genuinely run provider
+    // calls in parallel (>= 2 observed in flight) without exceeding the
+    // configured bound of 4 — a fully serialized dispatch fails the first
+    // bound, and an unbounded one fails the second.
+    assert_eq!(
+        sequential_provider.max_in_flight(),
+        1,
+        "sequential pass must keep provider calls non-overlapping"
+    );
+    assert!(
+        parallel_provider.max_in_flight() >= 2,
+        "concurrency-4 pass never overlapped provider calls (max in flight = {}) — \
+         dispatch may have serialized",
+        parallel_provider.max_in_flight()
+    );
+    assert!(
+        parallel_provider.max_in_flight() <= 4,
+        "concurrency-4 pass exceeded its bound (max in flight = {})",
+        parallel_provider.max_in_flight()
+    );
+    assert!(
+        parallel_elapsed < sequential_elapsed / 2,
+        "concurrency-4 pass ({parallel_elapsed:?}) must finish in less than half the \
+         sequential wall time ({sequential_elapsed:?}) — bounded parallelism may have regressed",
     );
 }

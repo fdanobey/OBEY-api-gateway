@@ -62,6 +62,7 @@ where
         .route("/search", get(search))
         .route("/export", get(export))
         .route("/consolidate", axum::routing::post(consolidate))
+        .route("/consolidation/status", get(consolidation_status))
         .route(
             "/namespaces/{namespace}",
             axum::routing::delete(clear_namespace),
@@ -203,7 +204,10 @@ async fn list_entries(
 /// inside [`MemoryStore::search_entries`], so it always answers 200. Filters
 /// are validated here for actionable 400 responses before reaching the store,
 /// where they would otherwise surface as configuration errors.
-async fn search(State(state): State<MemoryAdminState>, Query(query): Query<SearchQuery>) -> Response {
+async fn search(
+    State(state): State<MemoryAdminState>,
+    Query(query): Query<SearchQuery>,
+) -> Response {
     if let Some(namespace) = &query.namespace {
         if !validate_namespace(namespace) {
             return bad_request("namespace is invalid");
@@ -256,10 +260,7 @@ async fn search(State(state): State<MemoryAdminState>, Query(query): Query<Searc
 }
 
 fn is_valid_memory_type(memory_type: &str) -> bool {
-    matches!(
-        memory_type,
-        "preference" | "fact" | "context" | "decision"
-    )
+    matches!(memory_type, "preference" | "fact" | "context" | "decision")
 }
 
 fn memory_type_label(memory_type: MemoryType) -> &'static str {
@@ -399,7 +400,10 @@ async fn supersede_entry(
     let (target, replacement) = {
         let store = Arc::clone(&system.store);
         match spawn_store_task(move || {
-            Ok((store.get_entry_by_id(id)?, store.get_entry_by_id(superseded_by)?))
+            Ok((
+                store.get_entry_by_id(id)?,
+                store.get_entry_by_id(superseded_by)?,
+            ))
         })
         .await
         {
@@ -485,39 +489,34 @@ async fn export(State(state): State<MemoryAdminState>) -> Response {
     .into_response()
 }
 
-/// Run one consolidation pass immediately and return its outcome counts
-/// (Req 3.8).
+/// Start one consolidation pass as a background job (Req 3.1) and return
+/// immediately with 202, a job identifier, and the status URL.
 ///
-/// The pass itself is delegated to [`MemorySystem::run_consolidation_now`],
-/// which shares the context construction and metric recording of the
-/// post-decay background hook (Req 3.6). A manual operator trigger runs even
-/// while `consolidation_enabled` is false; the only 503 is the unconfigured
+/// The pass itself is delegated to
+/// [`MemorySystem::start_consolidation_job`], which shares the context
+/// construction and metric recording of the post-decay background hook
+/// (Req 3.5). A manual operator trigger runs even while
+/// `consolidation_enabled` is false; the only 503 is the unconfigured
 /// case, when the provider/model pair does not resolve through the Req 3.7
 /// fallback chain (`consolidation_provider` falling back to
-/// `auto_extract_provider`). Failures inside the pass are per-batch and come
-/// back as `provider_errors`/`skipped_batches` counts; only infrastructure
-/// errors surface here, sanitized through the shared `MemoryError` mapping.
+/// `auto_extract_provider`). Failures inside the pass are per-batch and
+/// surface through the status endpoint's error summary; only
+/// infrastructure errors surface here, sanitized through the shared
+/// `MemoryError` mapping.
 async fn consolidate(State(state): State<MemoryAdminState>) -> Response {
     let system = match resolve_system(&state).await {
         Ok(system) => system,
         Err(response) => return response,
     };
-    if system.config.read().await.resolve_consolidation_pair().is_none() {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "consolidation provider is not configured",
-            "consolidation_unavailable",
-        );
-    }
-    match system.run_consolidation_now().await {
-        Ok(counts) => Json(json!({
-            "merged": counts.merged,
-            "superseded": counts.superseded,
-            "kept": counts.kept,
-            "skipped_batches": counts.skipped_batches,
-            "provider_errors": counts.provider_errors,
-        }))
-        .into_response(),
+    match system.start_consolidation_job().await {
+        Ok(job_id) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "job_id": job_id,
+                "status_url": "/admin/memory/consolidation/status",
+            })),
+        )
+            .into_response(),
         Err(MemoryError::Config(_)) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "consolidation provider is not configured",
@@ -529,6 +528,21 @@ async fn consolidate(State(state): State<MemoryAdminState>) -> Response {
             "consolidation_in_progress",
         ),
         Err(error) => memory_error_response(error),
+    }
+}
+
+/// Content-free status of the most recent consolidation job (Req 3.3):
+/// job id, state, timestamps, namespace/batch progress counters, and a
+/// stable snake_case error-class summary. Never memory content or
+/// secrets (C9). Answers 404-shaped `{"job": null}` before any trigger.
+async fn consolidation_status(State(state): State<MemoryAdminState>) -> Response {
+    let system = match resolve_system(&state).await {
+        Ok(system) => system,
+        Err(response) => return response,
+    };
+    match system.consolidation_job_status().await {
+        Some(status) => Json(status).into_response(),
+        None => Json(json!({ "job": null })).into_response(),
     }
 }
 
@@ -564,19 +578,16 @@ async fn stats(State(state): State<MemoryAdminState>) -> Response {
     {
         // Last-pass consolidation summary (Req 3.6); present only after a
         // pass — manual or post-decay — has completed at least once.
-        let consolidation = system
-            .metrics
-            .last_consolidation_pass()
-            .map(|pass| {
-                json!({
-                    "merged": pass.counts.merged,
-                    "superseded": pass.counts.superseded,
-                    "kept": pass.counts.kept,
-                    "skipped_batches": pass.counts.skipped_batches,
-                    "provider_errors": pass.counts.provider_errors,
-                    "last_run": pass.completed_at,
-                })
-            });
+        let consolidation = system.metrics.last_consolidation_pass().map(|pass| {
+            json!({
+                "merged": pass.counts.merged,
+                "superseded": pass.counts.superseded,
+                "kept": pass.counts.kept,
+                "skipped_batches": pass.counts.skipped_batches,
+                "provider_errors": pass.counts.provider_errors,
+                "last_run": pass.completed_at,
+            })
+        });
         Json(json!({
             "total_count": stats.total_count,
             "memories_per_namespace": stats.memories_per_namespace,
@@ -699,8 +710,7 @@ async fn recreate_qdrant_collection(State(state): State<MemoryAdminState>) -> Re
     system.set_vector_tier(None).await;
     {
         let store = Arc::clone(&system.store);
-        if let Err(error) =
-            spawn_store_task(move || store.mark_all_vector_entries_pending()).await
+        if let Err(error) = spawn_store_task(move || store.mark_all_vector_entries_pending()).await
         {
             tracing::warn!(error = %error, "Failed to mark vector entries pending after collection recreation");
         }
@@ -757,11 +767,11 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-use super::*;
-use crate::memory::{
-    MemoryConfig, MemoryExtractionProvider, MemoryExtractionProviderError,
-    MemoryExtractionProviderRequest, StructuredMemoryCandidate,
-};
+    use super::*;
+    use crate::memory::{
+        MemoryConfig, MemoryExtractionProvider, MemoryExtractionProviderError,
+        MemoryExtractionProviderRequest, StructuredMemoryCandidate,
+    };
 
     async fn system() -> Arc<MemorySystem> {
         let config = MemoryConfig {
@@ -951,31 +961,31 @@ use crate::memory::{
 
     #[tokio::test]
     async fn optional_disabled_state_returns_json_503() {
-    let handle: OptionalMemorySystem = Arc::new(RwLock::new(None));
-    let app = routes(handle);
-    for (method, uri) in [
-        ("GET", "/entries?namespace=user%3A%3Aalpha"),
-        ("GET", "/stats"),
-        ("GET", "/projects"),
-        ("GET", "/search?q=anything"),
-        ("GET", "/export"),
-        ("POST", "/consolidate"),
-        ("DELETE", &format!("/entries/{}", Uuid::new_v4())),
-        ("DELETE", "/namespaces/user%3A%3Aalpha"),
-    ] {
-        let (status, body) = request(app.clone(), method, uri, None).await;
+        let handle: OptionalMemorySystem = Arc::new(RwLock::new(None));
+        let app = routes(handle);
+        for (method, uri) in [
+            ("GET", "/entries?namespace=user%3A%3Aalpha"),
+            ("GET", "/stats"),
+            ("GET", "/projects"),
+            ("GET", "/search?q=anything"),
+            ("GET", "/export"),
+            ("POST", "/consolidate"),
+            ("DELETE", &format!("/entries/{}", Uuid::new_v4())),
+            ("DELETE", "/namespaces/user%3A%3Aalpha"),
+        ] {
+            let (status, body) = request(app.clone(), method, uri, None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["error"]["type"], "service_unavailable");
+        }
+        let (status, body) = request(
+            app,
+            "POST",
+            &format!("/entries/{}/supersede", Uuid::new_v4()),
+            Some(json!({"superseded_by": Uuid::new_v4().to_string()})),
+        )
+        .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["type"], "service_unavailable");
-    }
-    let (status, body) = request(
-        app,
-        "POST",
-        &format!("/entries/{}/supersede", Uuid::new_v4()),
-        Some(json!({"superseded_by": Uuid::new_v4().to_string()})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"]["type"], "service_unavailable");
     }
 
     #[tokio::test]
@@ -1011,14 +1021,14 @@ use crate::memory::{
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"]["message"].is_string());
 
-    let missing = format!("/entries/{}", Uuid::new_v4());
-    let (status, body) = request(
-        app,
-        "PATCH",
-        &missing,
-        Some(json!({"content": "valid realistic content", "memory_type": "fact"})),
-    )
-    .await;
+        let missing = format!("/entries/{}", Uuid::new_v4());
+        let (status, body) = request(
+            app,
+            "PATCH",
+            &missing,
+            Some(json!({"content": "valid realistic content", "memory_type": "fact"})),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["type"], "not_found");
     }
@@ -1037,7 +1047,11 @@ use crate::memory::{
             app.clone(),
             "POST",
             "/entries",
-            Some(entry("user::two", "unrelated preference text", "preference")),
+            Some(entry(
+                "user::two",
+                "unrelated preference text",
+                "preference",
+            )),
         )
         .await;
         let (status, page) = request(app.clone(), "GET", "/search?q=kubernetes", None).await;
@@ -1063,11 +1077,18 @@ use crate::memory::{
         assert_eq!(status, StatusCode::OK);
         assert_eq!(page["total_count"], 1);
 
-        let (status, body) = request(app.clone(), "GET", "/search?q=x&memory_type=bogus", None).await;
+        let (status, body) =
+            request(app.clone(), "GET", "/search?q=x&memory_type=bogus", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request");
 
-        let (status, _) = request(app.clone(), "GET", "/search?q=x&namespace=user%3A%3A%2A", None).await;
+        let (status, _) = request(
+            app.clone(),
+            "GET",
+            "/search?q=x&namespace=user%3A%3A%2A",
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
@@ -1144,84 +1165,84 @@ use crate::memory::{
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["type"], "not_found");
 
-    let missing_by = format!(
-        "/entries/{}/supersede",
-        replacement["id"].as_str().unwrap()
-    );
-    let (status, _) = request(
-        app,
-        "POST",
-        &missing_by,
-        Some(json!({"superseded_by": Uuid::new_v4().to_string()})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn supersede_rejects_self_and_cross_namespace_pairs() {
-    let app = routes(system().await);
-    let (_, target) = request(
-        app.clone(),
-        "POST",
-        "/entries",
-        Some(entry("user::same", "same namespace fact", "fact")),
-    )
-    .await;
-    let (_, other_namespace) = request(
-        app.clone(),
-        "POST",
-        "/entries",
-        Some(entry("user::other", "other namespace fact", "fact")),
-    )
-    .await;
-    let uri = format!("/entries/{}/supersede", target["id"].as_str().unwrap());
-
-    let (status, body) = request(
-        app.clone(),
-        "POST",
-        &uri,
-        Some(json!({"superseded_by": target["id"].as_str().unwrap()})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["type"], "invalid_request");
-
-    let (status, body) = request(
-        app,
-        "POST",
-        &uri,
-        Some(json!({"superseded_by": other_namespace["id"].as_str().unwrap()})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["error"]["message"].as_str().unwrap().contains("namespace"));
-}
-
-#[tokio::test]
-async fn pagination_out_of_range_is_actionable_400() {
-    let app = routes(system().await);
-    for uri in [
-        "/entries?namespace=user%3A%3Aalpha&limit=0",
-        "/entries?namespace=user%3A%3Aalpha&limit=201",
-        "/entries?namespace=user%3A%3Aalpha&offset=1000001",
-        "/search?q=x&limit=0",
-        "/search?q=x&limit=201",
-        "/search?q=x&offset=1000001",
-    ] {
-        let (status, body) = request(app.clone(), "GET", uri, None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "uri: {uri}");
-        assert_eq!(body["error"]["type"], "invalid_request");
+        let missing_by = format!("/entries/{}/supersede", replacement["id"].as_str().unwrap());
+        let (status, _) = request(
+            app,
+            "POST",
+            &missing_by,
+            Some(json!({"superseded_by": Uuid::new_v4().to_string()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
-    let (status, _) = request(
-        app,
-        "GET",
-        "/entries?namespace=user%3A%3Aalpha&limit=200&offset=1000000",
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-}
+
+    #[tokio::test]
+    async fn supersede_rejects_self_and_cross_namespace_pairs() {
+        let app = routes(system().await);
+        let (_, target) = request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::same", "same namespace fact", "fact")),
+        )
+        .await;
+        let (_, other_namespace) = request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::other", "other namespace fact", "fact")),
+        )
+        .await;
+        let uri = format!("/entries/{}/supersede", target["id"].as_str().unwrap());
+
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            &uri,
+            Some(json!({"superseded_by": target["id"].as_str().unwrap()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request");
+
+        let (status, body) = request(
+            app,
+            "POST",
+            &uri,
+            Some(json!({"superseded_by": other_namespace["id"].as_str().unwrap()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("namespace"));
+    }
+
+    #[tokio::test]
+    async fn pagination_out_of_range_is_actionable_400() {
+        let app = routes(system().await);
+        for uri in [
+            "/entries?namespace=user%3A%3Aalpha&limit=0",
+            "/entries?namespace=user%3A%3Aalpha&limit=201",
+            "/entries?namespace=user%3A%3Aalpha&offset=1000001",
+            "/search?q=x&limit=0",
+            "/search?q=x&limit=201",
+            "/search?q=x&offset=1000001",
+        ] {
+            let (status, body) = request(app.clone(), "GET", uri, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "uri: {uri}");
+            assert_eq!(body["error"]["type"], "invalid_request");
+        }
+        let (status, _) = request(
+            app,
+            "GET",
+            "/entries?namespace=user%3A%3Aalpha&limit=200&offset=1000000",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
 
     #[tokio::test]
     async fn list_includes_superseded_only_when_requested() {
@@ -1266,217 +1287,330 @@ async fn pagination_out_of_range_is_actionable_400() {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(page["total_count"], 2);
-        assert!(page["entries"].as_array().unwrap().iter().any(|entry| {
-            entry["superseded_by"].is_string()
-        }));
-    }
-
-#[tokio::test]
-async fn consolidate_reports_unavailable_without_resolvable_pair() {
-    let app = routes(system().await);
-    let (status, body) = request(app, "POST", "/consolidate", None).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"]["type"], "consolidation_unavailable");
-
-    // A provider name without a model does not resolve the Req 3.7 pair.
-    let config = MemoryConfig {
-        database_path: ":memory:".to_owned(),
-        auto_extract_provider: "test-provider".to_owned(),
-        ..MemoryConfig::default()
-    };
-    let configured =
-        Arc::new(MemorySystem::new(config, None, None).await.unwrap());
-    let app = routes(configured);
-    let (status, body) = request(app, "POST", "/consolidate", None).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"]["type"], "consolidation_unavailable");
-}
-
-/// Fake provider that merges every batch it is asked about, mirroring the
-/// consolidation.rs test fakes: decisions travel as candidate contents.
-struct FakeConsolidationProvider;
-
-#[async_trait::async_trait]
-impl MemoryExtractionProvider for FakeConsolidationProvider {
-    async fn extract(
-        &self,
-        request: MemoryExtractionProviderRequest,
-    ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
-        let payload: Value = serde_json::from_str(&request.messages[0].content).unwrap();
-        let source_ids: Vec<String> = payload["entries"]
+        assert!(page["entries"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|entry| entry["id"].as_str().unwrap().to_owned())
-            .collect();
-        let decision = json!([{
-            "action": "merge",
-            "source_ids": source_ids,
-            "merged_content": "merged consolidation fact",
-        }])
-        .to_string();
-        Ok(vec![StructuredMemoryCandidate {
-            content: decision,
-            memory_type: MemoryType::Fact,
-        }])
+            .any(|entry| { entry["superseded_by"].is_string() }));
     }
-}
 
-async fn consolidation_system(config: MemoryConfig) -> Arc<MemorySystem> {
-    Arc::new(
-        MemorySystem::new(config, None, Some(Arc::new(FakeConsolidationProvider)))
-            .await
-            .unwrap(),
-    )
-}
+    #[tokio::test]
+    async fn consolidate_reports_unavailable_without_resolvable_pair() {
+        let app = routes(system().await);
+        let (status, body) = request(app, "POST", "/consolidate", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "consolidation_unavailable");
 
-#[tokio::test]
-async fn consolidate_runs_one_pass_and_stats_reports_last_pass() {
-    let config = MemoryConfig {
-        database_path: ":memory:".to_owned(),
-        consolidation_provider: "fake-provider".to_owned(),
-        consolidation_model: "fake-model".to_owned(),
-        ..MemoryConfig::default()
-    };
-    let app = routes(consolidation_system(config).await);
-    for content in [
-        "the deploy target is fly.io eu-west",
-        "the deploy target is fly.io eu-west region",
-    ] {
+        // A provider name without a model does not resolve the Req 3.7 pair.
+        let config = MemoryConfig {
+            database_path: ":memory:".to_owned(),
+            auto_extract_provider: "test-provider".to_owned(),
+            ..MemoryConfig::default()
+        };
+        let configured = Arc::new(MemorySystem::new(config, None, None).await.unwrap());
+        let app = routes(configured);
+        let (status, body) = request(app, "POST", "/consolidate", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "consolidation_unavailable");
+    }
+
+    /// Fake provider that merges every batch it is asked about, mirroring the
+    /// consolidation.rs test fakes: decisions travel as candidate contents.
+    struct FakeConsolidationProvider;
+
+    #[async_trait::async_trait]
+    impl MemoryExtractionProvider for FakeConsolidationProvider {
+        async fn extract(
+            &self,
+            request: MemoryExtractionProviderRequest,
+        ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+            let payload: Value = serde_json::from_str(&request.messages[0].content).unwrap();
+            let source_ids: Vec<String> = payload["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["id"].as_str().unwrap().to_owned())
+                .collect();
+            let decision = json!([{
+                "action": "merge",
+                "source_ids": source_ids,
+                "merged_content": "merged consolidation fact",
+            }])
+            .to_string();
+            Ok(vec![StructuredMemoryCandidate {
+                content: decision,
+                memory_type: MemoryType::Fact,
+            }])
+        }
+    }
+
+    /// Fake provider whose every call fails, used to assert the failed job
+    /// state and the content-free error summary.
+    struct AlwaysFailingConsolidationProvider;
+
+    #[async_trait::async_trait]
+    impl MemoryExtractionProvider for AlwaysFailingConsolidationProvider {
+        async fn extract(
+            &self,
+            _request: MemoryExtractionProviderRequest,
+        ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+            Err(MemoryExtractionProviderError {
+                message: "provider exploded with secret sk-xyz detail".to_owned(),
+            })
+        }
+    }
+
+    async fn consolidation_system(config: MemoryConfig) -> Arc<MemorySystem> {
+        Arc::new(
+            MemorySystem::new(config, None, Some(Arc::new(FakeConsolidationProvider)))
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// Poll `/consolidation/status` until the job reaches a terminal state.
+    async fn wait_for_terminal_consolidation(app: &Router) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let (status, body) =
+                    request(app.clone(), "GET", "/consolidation/status", None).await;
+                assert_eq!(status, StatusCode::OK);
+                let state = body["state"].as_str().unwrap_or_default();
+                if state == "completed" || state == "failed" {
+                    return body;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("consolidation job must reach a terminal state")
+    }
+
+    #[tokio::test]
+    async fn consolidate_starts_background_job_and_status_reports_completion() {
+        let config = MemoryConfig {
+            database_path: ":memory:".to_owned(),
+            consolidation_provider: "fake-provider".to_owned(),
+            consolidation_model: "fake-model".to_owned(),
+            ..MemoryConfig::default()
+        };
+        let app = routes(consolidation_system(config).await);
+        for content in [
+            "the deploy target is fly.io eu-west",
+            "the deploy target is fly.io eu-west region",
+        ] {
+            request(
+                app.clone(),
+                "POST",
+                "/entries",
+                Some(entry("user::dup", content, "fact")),
+            )
+            .await;
+        }
+
+        // No job yet: status answers a null job placeholder.
+        let (status, body) = request(app.clone(), "GET", "/consolidation/status", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["job"].is_null());
+
+        let (status, stats) = request(app.clone(), "GET", "/stats", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(stats["consolidation"].is_null());
+
+        // 202 + job id immediately; the pass runs in the background.
+        let (status, started) = request(app.clone(), "POST", "/consolidate", None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job_id = started["job_id"].as_str().unwrap().to_owned();
+        assert!(!job_id.is_empty());
+        assert_eq!(started["status_url"], "/admin/memory/consolidation/status");
+
+        // The background pass completes; poll the status endpoint until the
+        // job reaches a terminal state.
+        let body = wait_for_terminal_consolidation(&app).await;
+        assert_eq!(body["job_id"], job_id);
+        assert_eq!(body["state"], "completed");
+        assert!(body["started_at"].is_string());
+        assert!(body["finished_at"].is_string());
+        assert_eq!(body["namespaces_total"], 1);
+        assert_eq!(body["namespaces_done"], 1);
+        assert_eq!(body["batches_total"], 1);
+        assert_eq!(body["batches_done"], 1);
+        assert_eq!(body["counts"]["merged"], 1);
+        assert_eq!(body["counts"]["superseded"], 2);
+        assert_eq!(body["counts"]["kept"], 0);
+        assert_eq!(body["counts"]["skipped_batches"], 0);
+        assert_eq!(body["counts"]["provider_errors"], 0);
+        assert!(body.get("error_summary").is_none());
+
+        let (status, stats) = request(app, "GET", "/stats", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stats["consolidation"]["merged"], 1);
+        assert_eq!(stats["consolidation"]["superseded"], 2);
+        assert_eq!(stats["consolidation"]["kept"], 0);
+        assert_eq!(stats["consolidation"]["skipped_batches"], 0);
+        assert_eq!(stats["consolidation"]["provider_errors"], 0);
+        assert!(stats["consolidation"]["last_run"].is_string());
+    }
+
+    #[tokio::test]
+    async fn consolidate_resolves_pair_through_auto_extract_fallback() {
+        let config = MemoryConfig {
+            database_path: ":memory:".to_owned(),
+            auto_extract_provider: "fake-provider".to_owned(),
+            auto_extract_model: "fake-model".to_owned(),
+            ..MemoryConfig::default()
+        };
+        let app = routes(consolidation_system(config).await);
         request(
             app.clone(),
             "POST",
             "/entries",
-            Some(entry("user::dup", content, "fact")),
+            Some(entry(
+                "user::fallback",
+                "rust is the primary language here",
+                "fact",
+            )),
         )
         .await;
+        let (status, started) = request(app.clone(), "POST", "/consolidate", None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(started["job_id"].is_string());
+        let body = wait_for_terminal_consolidation(&app).await;
+        assert_eq!(body["state"], "completed");
+        assert_eq!(body["counts"]["merged"], 0);
+        assert_eq!(body["counts"]["superseded"], 0);
+        assert_eq!(body["counts"]["kept"], 1);
     }
 
-    let (status, stats) = request(app.clone(), "GET", "/stats", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(stats["consolidation"].is_null());
+    #[tokio::test]
+    async fn consolidate_reports_conflict_while_pass_is_running() {
+        let config = MemoryConfig {
+            database_path: ":memory:".to_owned(),
+            consolidation_provider: "fake-provider".to_owned(),
+            consolidation_model: "fake-model".to_owned(),
+            ..MemoryConfig::default()
+        };
+        let system = consolidation_system(config).await;
+        // Hold the shared pass gate as a background pass would, so the manual
+        // trigger must answer 409 instead of racing the running pass.
+        let _gate = system.consolidation_pass_gate.try_lock().unwrap();
+        let app = routes(Arc::clone(&system));
+        let (status, body) = request(app, "POST", "/consolidate", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"], "consolidation_in_progress");
+    }
 
-    let (status, counts) = request(app.clone(), "POST", "/consolidate", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(counts["merged"], 1);
-    assert_eq!(counts["superseded"], 2);
-    assert_eq!(counts["kept"], 0);
-    assert_eq!(counts["skipped_batches"], 0);
-    assert_eq!(counts["provider_errors"], 0);
+    #[tokio::test]
+    async fn consolidation_status_reports_failed_with_content_free_error_summary() {
+        let config = MemoryConfig {
+            database_path: ":memory:".to_owned(),
+            consolidation_provider: "fake-provider".to_owned(),
+            consolidation_model: "fake-model".to_owned(),
+            ..MemoryConfig::default()
+        };
+        let system = Arc::new(
+            MemorySystem::new(
+                config,
+                None,
+                Some(Arc::new(AlwaysFailingConsolidationProvider)),
+            )
+            .await
+            .unwrap(),
+        );
+        let app = routes(Arc::clone(&system));
+        // Two near-duplicate entries form one batch so the failing provider
+        // fails the only batch and the pass reports `failed`.
+        for content in [
+            "the deploy target is fly.io eu-west",
+            "the deploy target is fly.io eu-west region",
+        ] {
+            request(
+                app.clone(),
+                "POST",
+                "/entries",
+                Some(entry("user::failing", content, "fact")),
+            )
+            .await;
+        }
+        let (status, _started) = request(app.clone(), "POST", "/consolidate", None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let body = wait_for_terminal_consolidation(&app).await;
+        assert_eq!(body["state"], "failed");
+        assert_eq!(body["counts"]["provider_errors"], 1);
+        let summary = body["error_summary"].as_array().expect("error summary");
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0]["class"], "provider_error");
+        assert_eq!(summary[0]["count"], 1);
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains("fly.io"),
+            "status payload must never leak memory content (C9)"
+        );
+        assert!(
+            !serialized.contains("secret"),
+            "status payload must never leak provider error detail (C9)"
+        );
+        assert!(
+            !serialized.contains("sk-"),
+            "status payload must never leak secrets (C9)"
+        );
+    }
 
-    let (status, stats) = request(app, "GET", "/stats", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(stats["consolidation"]["merged"], 1);
-    assert_eq!(stats["consolidation"]["superseded"], 2);
-    assert_eq!(stats["consolidation"]["kept"], 0);
-    assert_eq!(stats["consolidation"]["skipped_batches"], 0);
-    assert_eq!(stats["consolidation"]["provider_errors"], 0);
-    assert!(stats["consolidation"]["last_run"].is_string());
-}
+    #[tokio::test]
+    async fn edit_reports_conflict_for_superseded_entry() {
+        let app = routes(system().await);
+        let (_, created) = request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::superseded", "first useful fact", "fact")),
+        )
+        .await;
+        let (_, replacement) = request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::superseded", "second useful fact", "fact")),
+        )
+        .await;
+        let target_uri = format!("/entries/{}", created["id"].as_str().unwrap());
+        request(
+            app.clone(),
+            "POST",
+            &format!("/entries/{}/supersede", created["id"].as_str().unwrap()),
+            Some(json!({"superseded_by": replacement["id"].as_str().unwrap()})),
+        )
+        .await;
+        let (status, body) = request(
+            app,
+            "PATCH",
+            &target_uri,
+            Some(json!({"content": "revised useful fact", "memory_type": "fact"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"], "already_superseded");
+    }
 
-#[tokio::test]
-async fn consolidate_resolves_pair_through_auto_extract_fallback() {
-    let config = MemoryConfig {
-        database_path: ":memory:".to_owned(),
-        auto_extract_provider: "fake-provider".to_owned(),
-        auto_extract_model: "fake-model".to_owned(),
-        ..MemoryConfig::default()
-    };
-    let app = routes(consolidation_system(config).await);
-    request(
-        app.clone(),
-        "POST",
-        "/entries",
-        Some(entry(
-            "user::fallback",
-            "rust is the primary language here",
-            "fact",
-        )),
-    )
-    .await;
-    let (status, counts) = request(app, "POST", "/consolidate", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(counts["merged"], 0);
-    assert_eq!(counts["superseded"], 0);
-    assert_eq!(counts["kept"], 1);
-}
-
-#[tokio::test]
-async fn consolidate_reports_conflict_while_pass_is_running() {
-    let config = MemoryConfig {
-        database_path: ":memory:".to_owned(),
-        consolidation_provider: "fake-provider".to_owned(),
-        consolidation_model: "fake-model".to_owned(),
-        ..MemoryConfig::default()
-    };
-    let system = consolidation_system(config).await;
-    // Hold the shared pass gate as a background pass would, so the manual
-    // trigger must answer 409 instead of racing the running pass.
-    let _gate = system.consolidation_pass_gate.try_lock().unwrap();
-    let app = routes(Arc::clone(&system));
-    let (status, body) = request(app, "POST", "/consolidate", None).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"]["type"], "consolidation_in_progress");
-}
-
-#[tokio::test]
-async fn edit_reports_conflict_for_superseded_entry() {
-    let app = routes(system().await);
-    let (_, created) = request(
-        app.clone(),
-        "POST",
-        "/entries",
-        Some(entry("user::superseded", "first useful fact", "fact")),
-    )
-    .await;
-    let (_, replacement) = request(
-        app.clone(),
-        "POST",
-        "/entries",
-        Some(entry("user::superseded", "second useful fact", "fact")),
-    )
-    .await;
-    let target_uri = format!("/entries/{}", created["id"].as_str().unwrap());
-    request(
-        app.clone(),
-        "POST",
-        &format!(
-            "/entries/{}/supersede",
-            created["id"].as_str().unwrap()
-        ),
-        Some(json!({"superseded_by": replacement["id"].as_str().unwrap()})),
-    )
-    .await;
-    let (status, body) = request(
-        app,
-        "PATCH",
-        &target_uri,
-        Some(json!({"content": "revised useful fact", "memory_type": "fact"})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"]["type"], "already_superseded");
-}
-
-#[tokio::test]
-async fn edit_rejects_single_word_content() {
-    let app = routes(system().await);
-    let (_, created) = request(
-        app.clone(),
-        "POST",
-        "/entries",
-        Some(entry("user::edit-words", "original useful fact", "fact")),
-    )
-    .await;
-    let uri = format!("/entries/{}", created["id"].as_str().unwrap());
-    let (status, body) = request(
-        app,
-        "PATCH",
-        &uri,
-        Some(json!({"content": "sufficiently-long-word", "memory_type": "fact"})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["type"], "invalid_request");
-}
+    #[tokio::test]
+    async fn edit_rejects_single_word_content() {
+        let app = routes(system().await);
+        let (_, created) = request(
+            app.clone(),
+            "POST",
+            "/entries",
+            Some(entry("user::edit-words", "original useful fact", "fact")),
+        )
+        .await;
+        let uri = format!("/entries/{}", created["id"].as_str().unwrap());
+        let (status, body) = request(
+            app,
+            "PATCH",
+            &uri,
+            Some(json!({"content": "sufficiently-long-word", "memory_type": "fact"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request");
+    }
 }

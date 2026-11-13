@@ -44,7 +44,6 @@ pub const MAX_CLASSIFIER_TOKENS: usize = 512;
 
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const SHA256_HEX_LENGTH: usize = 64;
-const ONNX_WEIGHTS_SUFFIX: &str = ".onnx";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -217,15 +216,16 @@ use std::sync::{Mutex, OnceLock};
 use ort::{session::Session, value::Tensor};
 use tokenizers::{EncodeInput, Tokenizer, TruncationParams};
 
-static ML_ORT_INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
+static ML_ORT_INITIALIZED: OnceLock<Result<ort::environment::Environment, String>> =
+    OnceLock::new();
 
-fn ensure_runtime(runtime_path: &Path) -> Result<(), String> {
+fn ensure_runtime(runtime_path: &Path) -> Result<ort::environment::Environment, String> {
     ML_ORT_INITIALIZED
         .get_or_init(|| {
             ort::init_from(runtime_path.display().to_string())
+                .map_err(|error| error.to_string())?
                 .with_name("obey-api-gateway-ml-router")
-                .commit()
-                .map(|_| ())
+                .build()
                 .map_err(|error| error.to_string())
         })
         .clone()
@@ -272,7 +272,7 @@ impl MlClassifierBackend for OnnxClassifierBackend {
                 runtime_path.display()
             )));
         }
-        ensure_runtime(&runtime_path).map_err(MlClassifierError::Backend)?;
+        let environment = ensure_runtime(&runtime_path).map_err(MlClassifierError::Backend)?;
 
         let tokenizer_path = artifact.tokenizer_path();
         let mut tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|error| {
@@ -292,8 +292,8 @@ impl MlClassifierBackend for OnnxClassifierBackend {
                 ))
             })?;
 
-        let session = Session::builder()
-            .and_then(|builder| builder.commit_from_file(weights_path))
+        let session = Session::builder(&environment)
+            .and_then(|mut builder| builder.commit_from_file(weights_path))
             .map_err(|error| {
                 MlClassifierError::Backend(format!(
                     "failed to load model `{}`: {error}",
@@ -462,16 +462,19 @@ use crate::smart_routing::{
 
 /// Adapter wrapping [`MlClassifier<OnnxClassifierBackend>`] as a thread-safe
 /// [`OptionalClassifier`] suitable for injection into [`SmartRouter`].
+/// ONNX inference runs on the tokio blocking pool (Requirement 1.2); the
+/// classifier mutex guard lives inside the blocking closure, so session
+/// access stays serialized exactly as before.
 pub struct OnnxMlAdapter {
-    inner: std::sync::Mutex<MlClassifier<OnnxClassifierBackend>>,
+    inner: std::sync::Arc<std::sync::Mutex<MlClassifier<OnnxClassifierBackend>>>,
 }
 
 impl OnnxMlAdapter {
     pub fn load(artifact_root: impl AsRef<Path>) -> Result<Self, MlClassifierError> {
         Ok(Self {
-            inner: std::sync::Mutex::new(MlClassifier::<OnnxClassifierBackend>::load(
-                artifact_root,
-            )?),
+            inner: std::sync::Arc::new(std::sync::Mutex::new(
+                MlClassifier::<OnnxClassifierBackend>::load(artifact_root)?,
+            )),
         })
     }
 }
@@ -489,16 +492,27 @@ impl OptionalClassifier for OnnxMlAdapter {
         input: ClassifierInput<'_>,
     ) -> Result<ClassifierOutput, ClassifierFailure> {
         let text = extract_request_text(input.request);
-        let classifier = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match classifier.score(&text) {
-            Ok(score) => Ok(ClassifierOutput::score(f64::from(score.value()))),
-            Err(error) => {
+        let classifier = std::sync::Arc::clone(&self.inner);
+        let score = tokio::task::spawn_blocking(move || {
+            let classifier = classifier
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            classifier.score(&text)
+        })
+        .await
+        .map_err(|join_error| {
+            tracing::warn!(error = %join_error, "ML classifier blocking task failed");
+            ClassifierFailure::Backend
+        })
+        .and_then(|score| {
+            score.map_err(|error| {
                 tracing::warn!(error = %error, "ML classifier inference failed");
-                Err(ClassifierFailure::Backend)
-            }
+                ClassifierFailure::Backend
+            })
+        });
+        match score {
+            Ok(score) => Ok(ClassifierOutput::score(f64::from(score.value()))),
+            Err(failure) => Err(failure),
         }
     }
 }

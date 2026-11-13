@@ -58,8 +58,7 @@ pub struct AppState {
     /// for the admin `/admin/oauth/github-copilot/*` family. `None` without
     /// a master-key path (the same gate that constructs the router's
     /// manager).
-    pub copilot_manager:
-    Option<Arc<crate::oauth::github_copilot::manager::CopilotTokenManager>>,
+    pub copilot_manager: Option<Arc<crate::oauth::github_copilot::manager::CopilotTokenManager>>,
     /// Copilot usage tracker (short/weekly/premium windows fed by the
     /// task-7 adapter); same `Arc` as the router's. `None` under the same
     /// master-key gate as `copilot_manager`.
@@ -67,8 +66,7 @@ pub struct AppState {
     /// Copilot model catalog sync (task 8); feeds `/v1/models` when a
     /// `github-copilot` provider exists. `None` under the same
     /// master-key gate as the router's Copilot token manager.
-    pub copilot_catalog:
-    Option<Arc<crate::oauth::github_copilot::catalog::CopilotCatalogSync>>,
+    pub copilot_catalog: Option<Arc<crate::oauth::github_copilot::catalog::CopilotCatalogSync>>,
     pub codex_models_discovery: Arc<crate::codex::models_discovery::ModelsDiscovery>,
     /// Virtual key manager: caller authentication and usage governance.
     /// Always present; enforcement is gated by `config.virtual_keys.enforcement`
@@ -112,35 +110,35 @@ pub struct AppState {
     /// Local SQLite store for Responses API (`/v1/responses`) stateful
     /// persistence: `store`, `previous_response_id`, retrieval endpoints.
     pub responses_store: Arc<ResponsesStore>,
-/// Lock-free snapshot of the per-request limits (body size, global
-/// deadline). Read on every request instead of taking `config.read()`, so a
-/// queued config writer cannot stall the whole gateway.
-pub runtime_limits: Arc<crate::runtime_limits::RuntimeLimits>,
-/// Budget-alert webhook subsystem (budget-alerts-unified-webhooks,
-/// Task 5): durable event/delivery ledger at `webhooks.db` (sibling of
-/// `budgets.db`) plus the built-once notifier + provider evaluation
-/// hook. The ledger's idempotent schema init runs at startup even when
-/// dormant; the DORMANCY CONTRACT (Req 3.3) — no evaluation, no ledger
-/// writes with zero endpoints — is enforced inside the hook/notifier,
-        /// not by omitting the store.
-        pub webhook_ledger: Arc<WebhookLedgerStore>,
-        /// `None`-free handle to the provider alert hook; methods internally
-        /// no-op while `config.webhooks.endpoints` is empty (Req 3.3).
-        pub provider_budget_alerts: Arc<ProviderBudgetAlerts>,
-        /// The shared notifier behind `provider_budget_alerts` (same
-        /// construction, same Arc) — held separately so the admin
-        /// test-send route reuses the built-once client instead of
-        /// constructing a new notifier per request.
-        pub webhook_notifier: Arc<WebhookNotifier>,
-        /// OTLP trace exporter (opentelemetry-trace-export spec, task
-        /// 6). Dormant until `apply_config` sees an enabled section;
-        /// span emission runs at the request-completion seams in
-        /// `handlers.rs` via `telemetry_seam`.
-        pub telemetry_exporter: TelemetryExporter,
-        /// Cheap lock-free telemetry snapshot (enabled flag + sampler
-        /// + content-capture settings) read per request completion.
-        pub telemetry_snapshot: Arc<telemetry_seam::TelemetrySnapshot>,
-    }
+    /// Lock-free snapshot of the per-request limits (body size, global
+    /// deadline). Read on every request instead of taking `config.read()`, so a
+    /// queued config writer cannot stall the whole gateway.
+    pub runtime_limits: Arc<crate::runtime_limits::RuntimeLimits>,
+    /// Budget-alert webhook subsystem (budget-alerts-unified-webhooks,
+    /// Task 5): durable event/delivery ledger at `webhooks.db` (sibling of
+    /// `budgets.db`) plus the built-once notifier + provider evaluation
+    /// hook. The ledger's idempotent schema init runs at startup even when
+    /// dormant; the DORMANCY CONTRACT (Req 3.3) — no evaluation, no ledger
+    /// writes with zero endpoints — is enforced inside the hook/notifier,
+    /// not by omitting the store.
+    pub webhook_ledger: Arc<WebhookLedgerStore>,
+    /// `None`-free handle to the provider alert hook; methods internally
+    /// no-op while `config.webhooks.endpoints` is empty (Req 3.3).
+    pub provider_budget_alerts: Arc<ProviderBudgetAlerts>,
+    /// The shared notifier behind `provider_budget_alerts` (same
+    /// construction, same Arc) — held separately so the admin
+    /// test-send route reuses the built-once client instead of
+    /// constructing a new notifier per request.
+    pub webhook_notifier: Arc<WebhookNotifier>,
+    /// OTLP trace exporter (opentelemetry-trace-export spec, task
+    /// 6). Dormant until `apply_config` sees an enabled section;
+    /// span emission runs at the request-completion seams in
+    /// `handlers.rs` via `telemetry_seam`.
+    pub telemetry_exporter: TelemetryExporter,
+    /// Cheap lock-free telemetry snapshot (enabled flag + sampler
+    /// + content-capture settings) read per request completion.
+    pub telemetry_snapshot: Arc<telemetry_seam::TelemetrySnapshot>,
+}
 
 /// Core HTTP server wrapping Axum with middleware and integrated components.
 pub struct GatewayServer {
@@ -203,17 +201,17 @@ impl GatewayServer {
             // wins over the fresh atomics). Providers without a configured limit
             // still have their persisted spend restored here; their future spend
             // accrual is Task 4.
-        metrics.set_provider_budget_store(store.clone());
-        metrics.seed_provider_budget_limits(&config);
-        restore_provider_budgets(&metrics, store.as_ref(), &budgets_path)?;
-    }
+            metrics.set_provider_budget_store(store.clone());
+            metrics.seed_provider_budget_limits(&config);
+            restore_provider_budgets(&metrics, store.as_ref(), &budgets_path)?;
+        }
 
-    // --- Budget-alert webhooks (budget-alerts-unified-webhooks, Task 5) ---
-    // `webhooks.db` follows the sibling placement rule of `budgets.db`
-    // (same parent as the logs database). The ledger's idempotent schema
-    // init runs here regardless of dormancy (allowed by the contract);
-    // a store open failure is non-fatal — the ledger is observability,
-    // not a safety control (design, Error Handling 3) — so the gateway
+        // --- Budget-alert webhooks (budget-alerts-unified-webhooks, Task 5) ---
+        // `webhooks.db` follows the sibling placement rule of `budgets.db`
+        // (same parent as the logs database). The ledger's idempotent schema
+        // init runs here regardless of dormancy (allowed by the contract);
+        // a store open failure is non-fatal — the ledger is observability,
+        // not a safety control (design, Error Handling 3) — so the gateway
         // starts with alerting degraded instead of refusing to boot.
         let webhooks_path = webhooks_db_path(&config.logging.database_path);
         let (webhook_ledger, webhook_notifier, provider_budget_alerts) =
@@ -317,20 +315,36 @@ impl GatewayServer {
 
         // --- Codex InstructionsStore construction (Req 7.1, 7.2, 7.8) ---
         // Only constructed when at least one Codex-capable provider exists.
-        let has_codex_provider = config
-            .providers
-            .iter()
-            .any(|p| p.auth_method.as_deref() == Some("oauth") && p.provider_type == "openai");
+        let has_codex_provider = config.providers.iter().any(is_codex_oauth_provider);
         if has_codex_provider {
             match crate::codex::InstructionsStore::new(&config).await {
                 Ok(store) => {
                     let store = Arc::new(store);
                     router.set_instructions_store(store.clone());
-                    // Spawn a background refresh (non-blocking) so the first
-                    // fetch doesn't delay /healthz readiness (Req 7.8).
+                    // Background refresh (non-blocking) so the first fetch
+                    // doesn't delay /healthz readiness (Req 7.8). It repeats
+                    // hourly so long-running gateways pick up new prompts;
+                    // `maybe_refresh` applies its own 24-hour gate, so most
+                    // ticks are no-ops. Ticks are skipped while the live
+                    // config has no OAuth OpenAI provider (hot-reload).
                     let refresh_store = store.clone();
+                    let refresh_config = config_arc.clone();
                     tokio::spawn(async move {
-                        refresh_store.maybe_refresh().await;
+                        let mut tick = tokio::time::interval(CODEX_REFRESH_TICK);
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        loop {
+                            // First tick completes immediately: startup refresh.
+                            tick.tick().await;
+                            let has_codex_provider = refresh_config
+                                .read()
+                                .await
+                                .providers
+                                .iter()
+                                .any(is_codex_oauth_provider);
+                            if has_codex_provider {
+                                refresh_store.maybe_refresh().await;
+                            }
+                        }
                     });
                 }
                 Err(e) => {
@@ -339,9 +353,9 @@ impl GatewayServer {
             }
         }
 
-// --- OAuth UsageTracker wiring ---
-let oauth_usage_tracker = Arc::new(crate::oauth::UsageTracker::new());
-router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
+        // --- OAuth UsageTracker wiring ---
+        let oauth_usage_tracker = Arc::new(crate::oauth::UsageTracker::new());
+        router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
 
         // --- GitHub Copilot manager + catalog wiring
         // (github-copilot-oauth-provider, task 9) ---
@@ -356,12 +370,12 @@ router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
         let (copilot_manager, copilot_usage_tracker) = match crate::secrets::master_key_path() {
             Ok(key_path) => {
                 let storage_dir = key_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
                 let store = crate::oauth::github_copilot::store::CopilotTokenStore::new(
-                crate::oauth::github_copilot::store::CopilotTokenStore::default_path(
-                storage_dir,
-                ),
+                    crate::oauth::github_copilot::store::CopilotTokenStore::default_path(
+                        storage_dir,
+                    ),
                 );
                 let manager = Arc::new(
                     crate::oauth::github_copilot::manager::CopilotTokenManager::new(
@@ -372,7 +386,7 @@ router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
 
                 // Restore any persisted session (enc-v1 store, Req 3.2).
                 if let Err(e) = manager.load_existing_session().await {
-                tracing::warn!(error = %e, "Failed to load persisted Copilot session; starting unauthenticated");
+                    tracing::warn!(error = %e, "Failed to load persisted Copilot session; starting unauthenticated");
                 }
 
                 // Background lifecycle (refresh tick + backoff, Req 3.3).
@@ -383,24 +397,24 @@ router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
                 router.set_copilot_usage_tracker(copilot_usage_tracker.clone());
 
                 (Some(manager), Some(copilot_usage_tracker))
-                }
+            }
             Err(e) => {
-            tracing::warn!(error = %e, "Could not determine Copilot OAuth storage path; Copilot OAuth disabled");
+                tracing::warn!(error = %e, "Could not determine Copilot OAuth storage path; Copilot OAuth disabled");
                 (None, None)
-                }
-            };
+            }
+        };
         let copilot_catalog = match (&copilot_manager, &copilot_usage_tracker) {
             (Some(manager), Some(_)) => {
                 // Catalog sync (task 8): owner-tagged with the first
                 // configured github-copilot provider's name; background
                 // sync fetches post-auth on the shared cadence. Only
                 // constructed when a github-copilot provider exists.
-        if config
-            .providers
-            .iter()
-            .any(|p| p.provider_type == "github-copilot")
-        {
-            let owner = copilot_catalog_owner(&config);
+                if config
+                    .providers
+                    .iter()
+                    .any(|p| p.provider_type == "github-copilot")
+                {
+                    let owner = copilot_catalog_owner(&config);
                     let catalog = Arc::new(
                         crate::oauth::github_copilot::catalog::CopilotCatalogSync::with_owner(
                             manager.clone(),
@@ -408,23 +422,23 @@ router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
                             owner.clone(),
                         ),
                     );
-                        // Seed the configured explicit models list (Req 5.3
-                        // input) from the initial config; the reload path
-                        // re-seeds below without touching auth state.
-                        // Explicit Copilot models live in model-group entries
-                        // pointing at the provider (Provider has no `models`
-                        // list in this config schema).
-                        let configured_models = copilot_configured_models(&config, &owner);
-                        catalog.set_configured_models(configured_models).await;
-                        catalog.clone().spawn_background_sync();
-                        router.set_copilot_catalog(catalog.clone());
-                        Some(catalog)
-                    } else {
-                        None
-                    }
+                    // Seed the configured explicit models list (Req 5.3
+                    // input) from the initial config; the reload path
+                    // re-seeds below without touching auth state.
+                    // Explicit Copilot models live in model-group entries
+                    // pointing at the provider (Provider has no `models`
+                    // list in this config schema).
+                    let configured_models = copilot_configured_models(&config, &owner);
+                    catalog.set_configured_models(configured_models).await;
+                    catalog.clone().spawn_background_sync();
+                    router.set_copilot_catalog(catalog.clone());
+                    Some(catalog)
+                } else {
+                    None
                 }
+            }
             (None, _) | (_, None) => None,
-            };
+        };
 
         // --- Budget-alert webhooks activation (budget-alerts-unified-webhooks,
         // Task 5) ---
@@ -452,9 +466,7 @@ router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
                         let Some(budget) = &provider.budget else {
                             continue;
                         };
-                        if let Ok(Some(row)) = store
-                            .get_spend_and_window(&provider.name)
-                        {
+                        if let Ok(Some(row)) = store.get_spend_and_window(&provider.name) {
                             let warn_pct = budget.alert_threshold_percent.unwrap_or(80);
                             alerts_for_seed.seed_from_recovered(
                                 ScopeRef::Provider {
@@ -498,9 +510,7 @@ router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
             } else {
                 // Dormancy (Req 3.3): evaluation funnel stays unset — no
                 // evaluation, no ledger writes, beyond the schema init above.
-                tracing::info!(
-                    "budget-alert webhooks dormant: no endpoints configured"
-                );
+                tracing::info!("budget-alert webhooks dormant: no endpoints configured");
             }
         }
 
@@ -515,23 +525,23 @@ router.set_oauth_usage_tracker(oauth_usage_tracker.clone());
             Arc::new(manager)
         };
 
-// --- VK alert restart seeding (budget-alerts-unified-webhooks, Task 6) ---
-// Mirrors the provider seeding above (design "Component 1", D11; Reqs
-// 1.2, 4.6): when the webhook subsystem is active, seed each VK
-// scope's fired-state from the keys.db durable spend vs limit under
-// the key's current window anchor, so an already-warned/exhausted key
-// never re-announces after a restart. Fixed warn 80 (design D9).
-// Spawned off the critical startup path; a read failure is logged and
-// skipped (non-fatal — seeding is best-effort re-derivation).
-//
-// The spawn is detached, so a first accrual may evaluate before the
-// seed lands — safe by the seed's MONOTONIC merge (AlertState::
-// seed_from_recovered ORs into a live same-anchor entry and never
-// clears flags, and spend within one window anchor never decreases,
-// so a live entry's flags are always at least as advanced as the
-// seed's). Chosen over blocking-startup seeding per the minimal-fix
-// rule.
-if !config.webhooks.endpoints.is_empty() {
+        // --- VK alert restart seeding (budget-alerts-unified-webhooks, Task 6) ---
+        // Mirrors the provider seeding above (design "Component 1", D11; Reqs
+        // 1.2, 4.6): when the webhook subsystem is active, seed each VK
+        // scope's fired-state from the keys.db durable spend vs limit under
+        // the key's current window anchor, so an already-warned/exhausted key
+        // never re-announces after a restart. Fixed warn 80 (design D9).
+        // Spawned off the critical startup path; a read failure is logged and
+        // skipped (non-fatal — seeding is best-effort re-derivation).
+        //
+        // The spawn is detached, so a first accrual may evaluate before the
+        // seed lands — safe by the seed's MONOTONIC merge (AlertState::
+        // seed_from_recovered ORs into a live same-anchor entry and never
+        // clears flags, and spend within one window anchor never decreases,
+        // so a live entry's flags are always at least as advanced as the
+        // seed's). Chosen over blocking-startup seeding per the minimal-fix
+        // rule.
+        if !config.webhooks.endpoints.is_empty() {
             let alerts_for_seed = provider_budget_alerts.alert_state().clone();
             let manager_for_seed = virtual_key_manager.clone();
             tokio::spawn(async move {
@@ -541,8 +551,7 @@ if !config.webhooks.endpoints.is_empty() {
                             let Some(limit) = state.budget_limit_usd else {
                                 continue;
                             };
-                            let anchor =
-                                state.window_start.map(|ws| ws.timestamp()).unwrap_or(0);
+                            let anchor = state.window_start.map(|ws| ws.timestamp()).unwrap_or(0);
                             alerts_for_seed.seed_from_recovered(
                                 ScopeRef::VirtualKey {
                                     key_id: state.key_id.clone(),
@@ -603,8 +612,7 @@ if !config.webhooks.endpoints.is_empty() {
         // OTLP trace exporter (opentelemetry-trace-export spec): built
         // dormant next to the shared metrics counters; the initial
         // `apply_config` below enables it when the config says so.
-        let telemetry_exporter =
-            TelemetryExporter::new(metrics.otlp_telemetry_metrics());
+        let telemetry_exporter = TelemetryExporter::new(metrics.otlp_telemetry_metrics());
         let telemetry_snapshot = Arc::new(telemetry_seam::TelemetrySnapshot::new());
 
         let state = AppState {
@@ -619,11 +627,11 @@ if !config.webhooks.endpoints.is_empty() {
             exact_cache: Arc::new(ExactCache::new(&config.exact_cache)),
             metrics,
             shutting_down: Arc::new(AtomicBool::new(false)),
-oauth_manager,
-oauth_usage_tracker,
-copilot_manager,
-copilot_usage_tracker,
-copilot_catalog,
+            oauth_manager,
+            oauth_usage_tracker,
+            copilot_manager,
+            copilot_usage_tracker,
+            copilot_catalog,
             codex_models_discovery: Arc::new(crate::codex::models_discovery::ModelsDiscovery::new()),
             virtual_key_manager,
             active_runs: Arc::new(DashMap::new()),
@@ -647,8 +655,8 @@ copilot_catalog,
             tool_compression_state: Arc::new(crate::tool_compression::ToolCompressionState::new(
                 &config.tool_compression,
             )),
-        responses_store: Arc::new(responses_store),
-        runtime_limits: Arc::new(crate::runtime_limits::RuntimeLimits::from_config(&config)),
+            responses_store: Arc::new(responses_store),
+            runtime_limits: Arc::new(crate::runtime_limits::RuntimeLimits::from_config(&config)),
             webhook_ledger,
             provider_budget_alerts,
             webhook_notifier,
@@ -720,14 +728,14 @@ copilot_catalog,
             .route("/v1/embeddings", post(embeddings))
             // Images (Req 2.4)
             .route("/v1/images/generations", post(image_generations))
-// Audio (Req 2.5)
-.route("/v1/audio/transcriptions", post(audio_transcriptions))
-.route("/v1/audio/translations", post(audio_translations))
-// Decisions front door (decisions-api spec, Req 1.1/1.2): typed
-// System One decision requests; `/v1/systemone` is the alias route
-// served by the same handler.
-.route("/v1/decisions", post(decisions::create_decision))
-.route("/v1/systemone", post(decisions::create_decision))
+            // Audio (Req 2.5)
+            .route("/v1/audio/transcriptions", post(audio_transcriptions))
+            .route("/v1/audio/translations", post(audio_translations))
+            // Decisions front door (decisions-api spec, Req 1.1/1.2): typed
+            // System One decision requests; `/v1/systemone` is the alias route
+            // served by the same handler.
+            .route("/v1/decisions", post(decisions::create_decision))
+            .route("/v1/systemone", post(decisions::create_decision))
             // Models (Req 2.6, 2.12). Catch-all `{*model_id}` so
             // slash-containing ids (NVIDIA NIM `meta/llama-3.1-70b-instruct`)
             // retrieve correctly; no other `/v1/models/...` subroutes exist.
@@ -809,10 +817,7 @@ copilot_catalog,
             // the route (axum default); `anthropic-version` handling lives in
             // the handler. `/v1/messages/count_tokens` must be registered
             // BEFORE `/v1/messages` so it is not shadowed.
-            .route(
-                "/v1/messages/count_tokens",
-                post(anthropic_count_tokens),
-            )
+            .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
             .route("/v1/messages", post(anthropic_create));
 
         let api_routes =
@@ -1585,12 +1590,12 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     state
         .router
         .reload_compression_runtime(compression, precompressed_manager);
-        state.router.clear_circuit_breakers();
-        state.router.clear_rate_limiters();
-        state.router.clear_retry_budgets();
-        state.router.clear_sticky_cache();
-        state.router.clear_http_clients();
-        state.router.clear_model_capabilities();
+    state.router.clear_circuit_breakers();
+    state.router.clear_rate_limiters();
+    state.router.clear_retry_budgets();
+    state.router.clear_sticky_cache();
+    state.router.clear_http_clients();
+    state.router.clear_model_capabilities();
 
     // Reset tool compression state on config reload (feedback loops, descriptions, etc.)
     {
@@ -1685,9 +1690,9 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
         }
     };
 
-if let Some(new_engine) = rebuilt {
-    *state.guardrail_engine.write().await = new_engine;
-}
+    if let Some(new_engine) = rebuilt {
+        *state.guardrail_engine.write().await = new_engine;
+    }
 }
 
 /// Install the post-persist provider evaluation funnel on the metrics
@@ -1700,30 +1705,39 @@ if let Some(new_engine) = rebuilt {
 /// check (Req 3.3) no-ops evaluation while zero endpoints are
 /// configured, which is cheaper and safer than racing a removal.
 fn ensure_provider_spend_hook(state: &AppState) {
-let alerts = state.provider_budget_alerts.clone();
-let hook_config = state.config.clone();
-state.metrics.set_provider_spend_hook(Arc::new(
-move |provider, spent, anchor| {
-let alerts = alerts.clone();
-let config = hook_config.clone();
-let provider = provider.to_string();
-match tokio::runtime::Handle::try_current() {
-Ok(handle) => {
-handle.spawn(async move {
-alerts
-    .evaluate_provider(&config, &provider, spent, anchor)
-    .await;
-});
+    let alerts = state.provider_budget_alerts.clone();
+    let hook_config = state.config.clone();
+    state
+        .metrics
+        .set_provider_spend_hook(Arc::new(move |provider, spent, anchor| {
+            let alerts = alerts.clone();
+            let config = hook_config.clone();
+            let provider = provider.to_string();
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        alerts
+                            .evaluate_provider(&config, &provider, spent, anchor)
+                            .await;
+                    });
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        provider = %provider,
+                        "no tokio runtime; provider budget alert evaluation skipped"
+                    );
+                }
+            }
+        }));
 }
-Err(_) => {
-tracing::warn!(
-    provider = %provider,
-    "no tokio runtime; provider budget alert evaluation skipped"
-);
-}
-}
-},
-));
+
+/// How often the Codex prompt refresher wakes. The store's own 24-hour gate
+/// decides whether a wake-up actually fetches.
+const CODEX_REFRESH_TICK: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// `true` for providers served through the Codex backend (OAuth OpenAI).
+fn is_codex_oauth_provider(p: &crate::config::Provider) -> bool {
+    p.auth_method.as_deref() == Some("oauth") && p.provider_type == "openai"
 }
 
 /// Wait for SIGTERM / SIGINT (Req 18.1-18.5).
@@ -2019,8 +2033,8 @@ mod tests {
             reasoning_models_allowlist: Default::default(),
             codex_search: None,
             reasoning_compat: Default::default(),
-        webhooks: Default::default(),
-        opentelemetry: Default::default(),
+            webhooks: Default::default(),
+            opentelemetry: Default::default(),
         }
     }
 
@@ -2157,8 +2171,46 @@ mod tests {
         assert!(Arc::ptr_eq(&memory, &reloaded));
         assert!(reloaded.store.get_entry_by_id(entry.id).unwrap().is_some());
         assert_eq!(
-            reloaded.extractor.set_provider_timeout(std::time::Duration::from_secs(90)),
+            reloaded
+                .extractor
+                .set_provider_timeout(std::time::Duration::from_secs(90)),
             std::time::Duration::from_secs(90)
+        );
+
+        // Out-of-range consolidation concurrency is rejected by the memory
+        // system's reload validation; the previous snapshot (and its config
+        // value) is retained without activation (Req 4.4).
+        config
+            .memory
+            .as_mut()
+            .unwrap()
+            .consolidation_max_concurrent_batches = 9;
+        server.reload_config(config.clone()).await.unwrap();
+        let rejected = server.state.memory_system.read().await.clone().unwrap();
+        assert!(Arc::ptr_eq(&memory, &rejected));
+        assert_eq!(
+            rejected
+                .config
+                .read()
+                .await
+                .consolidation_max_concurrent_batches,
+            2
+        );
+        config
+            .memory
+            .as_mut()
+            .unwrap()
+            .consolidation_max_concurrent_batches = 1;
+        server.reload_config(config.clone()).await.unwrap();
+        let accepted = server.state.memory_system.read().await.clone().unwrap();
+        assert!(Arc::ptr_eq(&memory, &accepted));
+        assert_eq!(
+            accepted
+                .config
+                .read()
+                .await
+                .consolidation_max_concurrent_batches,
+            1
         );
 
         config.memory.as_mut().unwrap().database_path = directory
@@ -3810,8 +3862,8 @@ mod tests {
         assert!(text.contains("obey_memory_decay_evictions_total 0"));
     }
 
-        #[tokio::test]
-        async fn test_prometheus_disabled_returns_404() {
+    #[tokio::test]
+    async fn test_prometheus_disabled_returns_404() {
         // Prometheus disabled (default)
         let server = GatewayServer::new(minimal_config(), None).await.unwrap();
         let app = server.build_router();
@@ -3826,15 +3878,15 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-// ---- github-copilot-oauth-provider, task 9 gateway wiring ---------
+    // ---- github-copilot-oauth-provider, task 9 gateway wiring ---------
 
-// Storage (master key + copilot store) is the shared unit-test secrets
-// dir (`secrets::test_support`), so these tests need no env setup.
+    // Storage (master key + copilot store) is the shared unit-test secrets
+    // dir (`secrets::test_support`), so these tests need no env setup.
 
-/// Copilot catalog construction: attached when a github-copilot
-/// provider exists + master key available; absent otherwise.
-#[tokio::test]
-async fn copilot_catalog_attached_when_provider_configured() {
+    /// Copilot catalog construction: attached when a github-copilot
+    /// provider exists + master key available; absent otherwise.
+    #[tokio::test]
+    async fn copilot_catalog_attached_when_provider_configured() {
         let mut config = minimal_config();
         config.providers.push(Provider {
             name: "copilot-test".to_string(),
@@ -3872,13 +3924,10 @@ async fn copilot_catalog_attached_when_provider_configured() {
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
         });
-        let storage_dir = std::env::temp_dir().join(format!(
-            "obey-gw-copilot-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let storage_dir =
+            std::env::temp_dir().join(format!("obey-gw-copilot-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&storage_dir).unwrap();
-        config.logging.database_path =
-            storage_dir.join("logs.db").to_string_lossy().into_owned();
+        config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
         config.virtual_keys.database_path =
             storage_dir.join("keys.db").to_string_lossy().into_owned();
 
@@ -3891,17 +3940,16 @@ async fn copilot_catalog_attached_when_provider_configured() {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
-/// No github-copilot provider → no catalog (nothing to sync).
-#[tokio::test]
-async fn copilot_catalog_absent_without_copilot_provider() {
+    /// No github-copilot provider → no catalog (nothing to sync).
+    #[tokio::test]
+    async fn copilot_catalog_absent_without_copilot_provider() {
         let mut config = minimal_config();
         let storage_dir = std::env::temp_dir().join(format!(
             "obey-gw-copilot-none-{}",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&storage_dir).unwrap();
-        config.logging.database_path =
-            storage_dir.join("logs.db").to_string_lossy().into_owned();
+        config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
         config.virtual_keys.database_path =
             storage_dir.join("keys.db").to_string_lossy().into_owned();
 
@@ -3916,12 +3964,12 @@ async fn copilot_catalog_absent_without_copilot_provider() {
     /// Drives a real catalog sync over wiremock, then asserts the
     /// aggregated response carries the enabled (entitlement-filtered)
     /// models with the provider as `owned_by`.
-#[tokio::test]
-async fn models_list_includes_enabled_copilot_catalog_models() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    #[tokio::test]
+    async fn models_list_includes_enabled_copilot_catalog_models() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let dir = crate::secrets::test_support::shared_data_dir();
+        let dir = crate::secrets::test_support::shared_data_dir();
 
         // Catalog upstream: one enabled + one disabled entry.
         let upstream = MockServer::start().await;
@@ -3990,8 +4038,7 @@ async fn models_list_includes_enabled_copilot_catalog_models() {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&storage_dir).unwrap();
-        config.logging.database_path =
-            storage_dir.join("logs.db").to_string_lossy().into_owned();
+        config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
         config.virtual_keys.database_path =
             storage_dir.join("keys.db").to_string_lossy().into_owned();
 
@@ -4020,25 +4067,27 @@ async fn models_list_includes_enabled_copilot_catalog_models() {
             dir.join("models_tokens.enc"),
         );
         store
-            .save(&crate::oauth::github_copilot::store::CopilotStoredCredentials {
-                github_access_token: "gho-test".into(),
-                copilot_token: Some("tid=live".into()),
-                copilot_expires_at: Some(
-                    std::time::SystemTime::now()
+            .save(
+                &crate::oauth::github_copilot::store::CopilotStoredCredentials {
+                    github_access_token: "gho-test".into(),
+                    copilot_token: Some("tid=live".into()),
+                    copilot_expires_at: Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                            + 3600,
+                    ),
+                    api_base: upstream.uri(),
+                    machine_id: "6f9619ff".into(),
+                    sku: Some("copilot_pro".into()),
+                    scopes: "read:user".into(),
+                    updated_at: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
-                        .as_secs()
-                        + 3600,
-                ),
-                api_base: upstream.uri(),
-                machine_id: "6f9619ff".into(),
-                sku: Some("copilot_pro".into()),
-                scopes: "read:user".into(),
-                updated_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            })
+                        .as_secs(),
+                },
+            )
             .unwrap();
         manager.load_existing_session().await.unwrap();
         assert!(matches!(

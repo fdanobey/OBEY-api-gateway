@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, fmt, sync::Arc, time::Instant};
 
+use serde_json::Value;
 use tokio::task::JoinError;
 
 use super::{
@@ -32,6 +33,13 @@ const RTK: &str = "rtk";
 const PERPLEXITY: &str = "perplexity";
 const TOOL_DEF: &str = "tool_def";
 const LANGUAGE_PACK: &str = "language_pack";
+
+/// Payloads at or above this estimated wire size have their compression
+/// engine work driven on the blocking pool instead of a Tokio worker
+/// (`spawn_blocking` + `Handle::block_on`), so regex/BPE passes cannot
+/// starve concurrent request I/O. The threshold is deliberately not
+/// configurable: below it, code paths are untouched.
+pub const CPU_OFFLOAD_MIN_BYTES: usize = 256 * 1024;
 
 /// Request-scoped values needed by the pipeline and later statistics emission.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -404,7 +412,7 @@ impl CompressionPipeline {
         let started = Instant::now();
         let mut original = payload;
         original.refresh_metadata();
-        let original_tokens = count_tokens(&self.token_counter, &original);
+        let original_tokens = count_tokens_offloaded(&self.token_counter, &original).await;
         let auto_trigger_decision =
             auto_only.then(|| decide_compression(original_tokens, &effective));
         let config = { self.config.read().await.clone() };
@@ -521,19 +529,27 @@ impl CompressionPipeline {
             let engine_context = context.clone();
             let task_engine_name = engine_name.clone();
             let engine_started = Instant::now();
-            let mut task = tokio::spawn(async move {
-                let mut candidate = before;
-                let (result, tool_report) = engine.compress(&mut candidate, &engine_context).await;
-                (candidate, result, tool_report)
-            });
+            let offload = estimated_payload_bytes(&before) >= CPU_OFFLOAD_MIN_BYTES;
+        let mut task = spawn_engine_task(offload, engine, before, engine_context);
 
-            let task_result = if let Some(deadline) = deadline {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                match tokio::time::timeout(remaining, &mut task).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        task.abort();
-                        let _ = task.await;
+        let task_result = if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, &mut task.handle).await {
+                Ok(result) => result,
+                Err(_) => {
+                    if task.offloaded {
+                        // Blocking-pool tasks cannot be aborted once running;
+                        // awaiting the handle would stall until the engine
+                        // finishes, defeating the deadline. Detach instead:
+                        // the task completes on the blocking pool and its
+                        // result is dropped.
+                        drop(task.handle);
+                    } else {
+                        // Tokio tasks abort at their await points, so the
+                        // original abort-and-drain semantics are preserved.
+                        task.handle.abort();
+                        let _ = task.handle.await;
+                    }
                         tracing::warn!(
                             request_id = %metadata.request_id,
                             engine = %task_engine_name,
@@ -563,9 +579,9 @@ impl CompressionPipeline {
                         };
                     }
                 }
-            } else {
-                task.await
-            };
+        } else {
+            task.handle.await
+        };
 
             let (candidate, _reported, tool_report) = match task_result {
                 Ok(completed) => completed,
@@ -582,7 +598,7 @@ impl CompressionPipeline {
                 }
             };
 
-            let candidate_tokens = count_tokens(&self.token_counter, &candidate);
+            let candidate_tokens = count_tokens_offloaded(&self.token_counter, &candidate).await;
             let accepted = candidate_tokens <= before_tokens;
             let applied = accepted && candidate != current;
             let tokens_after = if accepted {
@@ -749,6 +765,113 @@ fn count_tokens(counter: &TokenCounter, payload: &CompressiblePayload) -> u32 {
     counter.count_request(&payload.clone().into_openai_request())
 }
 
+/// Counts request tokens inline below [`CPU_OFFLOAD_MIN_BYTES`] and on the
+/// blocking pool at or above it, so large-payload BPE encoding never
+/// occupies a Tokio worker. The count is identical either way: the same
+/// `count_request` runs, only the thread changes.
+async fn count_tokens_offloaded(counter: &Arc<TokenCounter>, payload: &CompressiblePayload) -> u32 {
+    if estimated_payload_bytes(payload) < CPU_OFFLOAD_MIN_BYTES {
+        return count_tokens(counter, payload);
+    }
+    let counter = Arc::clone(counter);
+    let request = payload.clone().into_openai_request();
+    tokio::task::spawn_blocking(move || counter.count_request(&request))
+        .await
+        .expect("token-count blocking task panicked")
+}
+
+/// Approximates the payload's serialized size in bytes without allocating.
+/// Only feeds the [`CPU_OFFLOAD_MIN_BYTES`] gate, so punctuation overhead
+/// is deliberately ignored.
+fn estimated_payload_bytes(payload: &CompressiblePayload) -> usize {
+    let mut bytes = payload.model.len();
+    if let Some(tools) = &payload.tool_definitions {
+        bytes += json_value_bytes(tools);
+    }
+    for message in &payload.messages {
+        bytes += message.role.len() + json_value_bytes(message.content.as_value());
+        bytes += message
+            .extra
+            .iter()
+            .map(|(key, value)| key.len() + json_value_bytes(value))
+            .sum::<usize>();
+    }
+    bytes += payload
+        .extra
+        .iter()
+        .map(|(key, value)| key.len() + json_value_bytes(value))
+        .sum::<usize>();
+    bytes
+}
+
+fn json_value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 4,
+        Value::Number(_) => 8,
+        Value::String(text) => text.len() + 2,
+        Value::Array(items) => items.iter().map(json_value_bytes).sum(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, item)| key.len() + json_value_bytes(item))
+            .sum(),
+    }
+}
+
+/// A spawned compression-engine task together with the execution flavor.
+///
+/// `offloaded` records whether the engine runs on the blocking pool
+/// (`spawn_blocking` + `Handle::block_on`) or as a regular Tokio task.
+/// Blocking-pool tasks cannot be aborted once running, so deadline
+/// handling must detach them instead of abort-and-await.
+struct EngineTask {
+    handle: tokio::task::JoinHandle<(
+        CompressiblePayload,
+        EngineResult,
+        ToolDefinitionCompressionReport,
+    )>,
+    offloaded: bool,
+}
+
+/// Runs one compression engine for a single engine slot.
+///
+/// Below [`CPU_OFFLOAD_MIN_BYTES`] this is the previous inline spawn:
+/// `tokio::spawn` driving the engine future on a worker. At or above the
+/// threshold the engine is driven on the blocking pool instead — the
+/// same call-site pattern as the memory consolidation hook
+/// (`memory::decay`): the closure owns the engine, the candidate payload,
+/// and the context by value, and `Handle::block_on` drives the async
+/// engine boundary on the blocking thread so its regex/BPE passes and
+/// JSON clones never occupy a Tokio worker.
+///
+/// Both paths return the same `(payload, EngineResult, report)` tuple, so
+/// the output is byte-identical above and below the threshold; only the
+/// executing thread differs.
+fn spawn_engine_task(
+    offload: bool,
+    engine: RegisteredEngine,
+    mut candidate: CompressiblePayload,
+    context: CompressionContext,
+) -> EngineTask {
+    if !offload {
+        return EngineTask {
+            handle: tokio::spawn(async move {
+                let (result, tool_report) = engine.compress(&mut candidate, &context).await;
+                (candidate, result, tool_report)
+            }),
+            offloaded: false,
+        };
+    }
+    let handle = tokio::runtime::Handle::current();
+    EngineTask {
+        handle: tokio::task::spawn_blocking(move || {
+            let (result, tool_report) = handle.block_on(engine.compress(&mut candidate, &context));
+            (candidate, result, tool_report)
+        }),
+        offloaded: true,
+    }
+}
+
 fn cache_downgrade_for(
     payload: &CompressiblePayload,
     context: &CompressionContext,
@@ -807,14 +930,17 @@ mod tests {
     use crate::compression::config::{CustomPipelineConfig, TimeBudgetConfig};
     use crate::models::openai::OpenAIRequest;
 
-    #[derive(Clone)]
-    enum TestAction {
-        Replace(String),
-        Append(String),
-        Sleep(std::time::Duration),
-        Panic,
-        Noop,
-    }
+#[derive(Clone)]
+enum TestAction {
+    Replace(String),
+    Append(String),
+    Sleep(std::time::Duration),
+    /// Blocks the executing thread with a synchronous sleep, mirroring
+    /// uncancellable blocking-pool engine work (cannot be aborted).
+    Block(std::time::Duration),
+    Panic,
+    Noop,
+}
 
     struct TestEngine {
         name: String,
@@ -856,8 +982,11 @@ mod tests {
                         content.push_str(text);
                     }
                 }
-                TestAction::Sleep(duration) => tokio::time::sleep(*duration).await,
-                TestAction::Panic => panic!("injected engine panic"),
+            TestAction::Sleep(duration) => tokio::time::sleep(*duration).await,
+            TestAction::Block(duration) => {
+                std::thread::sleep(*duration);
+            }
+            TestAction::Panic => panic!("injected engine panic"),
                 TestAction::Noop => {}
             }
             let after = count_tokens(&context.token_counter, payload);
@@ -1293,13 +1422,56 @@ mod tests {
             )
             .await;
 
-        assert!(result.timed_out);
-        assert_eq!(result.payload, original);
-        assert_eq!(result.final_tokens, result.original_tokens);
-    }
+ assert!(result.timed_out);
+ assert_eq!(result.payload, original);
+ assert_eq!(result.final_tokens, result.original_tokens);
+}
 
-    #[tokio::test]
-    async fn panic_restores_pre_engine_payload_and_continues() {
+/// Above the offload threshold the engine runs inside `spawn_blocking`,
+/// which cannot be aborted once running. A deadline overrun must
+/// therefore detach the blocking task and forward the original payload
+/// immediately instead of awaiting the uncancellable work.
+#[tokio::test]
+async fn offloaded_engine_timeout_detaches_blocking_task_and_forwards_original() {
+ let calls = Arc::new(Mutex::new(Vec::new()));
+ let mut config = CompressionConfig::default();
+ config.time_budget_ms = TimeBudgetConfig {
+ lite: 10,
+ ..TimeBudgetConfig::default()
+ }; let pipeline = injected_pipeline(
+ config,
+ vec![(
+ "lite",
+ Arc::new(TestEngine::new(
+ "lite",
+ TestAction::Block(std::time::Duration::from_millis(1_500)),
+ calls,
+ )),
+ )],
+ );
+ let original = threshold_payload(CPU_OFFLOAD_MIN_BYTES + 1);
+ assert!(estimated_payload_bytes(&original) >= CPU_OFFLOAD_MIN_BYTES);
+ let started = Instant::now();
+ let result = pipeline
+ .compress(
+ original.clone(),
+ context(None),
+ effective(CompressionLevel::Lite),
+ CompressionRequestMetadata::default(),
+ )
+ .await;
+
+ assert!(result.timed_out);
+ assert_eq!(payload_wire_bytes(&result.payload), payload_wire_bytes(&original));
+ assert_eq!(result.final_tokens, result.original_tokens);
+ // The deadline is honored: the uncancellable blocking engine work is
+ // detached, not awaited, so the call returns near the 10 ms budget
+ // rather than after the engine finishes.
+ assert!(started.elapsed() < std::time::Duration::from_millis(1_000));
+}
+
+#[tokio::test]
+async fn panic_restores_pre_engine_payload_and_continues() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut config = CompressionConfig::default();
         config.custom_pipelines.insert(
@@ -1493,5 +1665,151 @@ mod tests {
         assert!(!first.tool_definitions_cache_hit);
         assert!(second.tool_definitions_cache_hit);
         assert_eq!(first.engine_results[0].engine_name, "tool_def");
+    }
+
+    fn threshold_payload(bytes: usize) -> CompressiblePayload {
+        let filler = "a".repeat(bytes.saturating_sub(1));
+        let request: OpenAIRequest = serde_json::from_value(json!({
+        "model": "gpt-4",
+        "messages": [{
+        "role": "user",
+        "content": format!("Filler prefix\n\n{filler}\n\n   filler suffix   ")
+        }]
+        }))
+        .unwrap();
+        request.into()
+    }
+
+    fn payload_wire_bytes(payload: &CompressiblePayload) -> Vec<u8> {
+        serde_json::to_vec(&payload.clone().into_openai_request()).unwrap()
+    }
+
+    /// Requirement 1.5: compressed output is byte-identical above and below
+    /// `CPU_OFFLOAD_MIN_BYTES` (and to what the inline path produced before
+    /// the offload), because the blocking-pool path runs the same engines on
+    /// the same inputs — only the executing thread differs.
+#[tokio::test]
+async fn compressed_output_is_byte_identical_above_and_below_offload_threshold() {
+    // Test-only budget inflation: the production default (500 ms) is a
+    // wall-clock budget, and under a loaded 2-thread test runner the real
+    // engines can exceed it mid-run, which forwards the original payload
+    // and would fail the byte-equality assertions below as a flake. The
+    // generous budget keeps the test about threshold-crossing determinism,
+    // not scheduling latency.
+    let mut config = CompressionConfig::default();
+    config.time_budget_ms = TimeBudgetConfig {
+        lite: 60_000,
+        standard: 60_000,
+        aggressive: 60_000,
+        ultra: 60_000,
+        rtk: 60_000,
+        stacked: 60_000,
+    };
+    let pipeline = CompressionPipeline::from_config(config);
+
+        let below = threshold_payload(CPU_OFFLOAD_MIN_BYTES / 2);
+        let above = threshold_payload(CPU_OFFLOAD_MIN_BYTES + 1);
+        assert!(estimated_payload_bytes(&below) < CPU_OFFLOAD_MIN_BYTES);
+        assert!(estimated_payload_bytes(&above) >= CPU_OFFLOAD_MIN_BYTES);
+
+        // Same input through both execution paths of the engine boundary:
+        // the inline `tokio::spawn` path (below threshold, unchanged from
+        // before the offload) and the blocking-pool path (at/above it).
+        let engine = pipeline.engines.get(LITE).cloned().unwrap();
+        let engine_context = {
+            let mut engine_context = context(None);
+            engine_context.token_counter = Arc::clone(&pipeline.token_counter);
+            engine_context.protection_scanner = Arc::clone(&pipeline.protection_scanner);
+            engine_context
+        };
+    let (inline_payload, inline_result, _) = spawn_engine_task(
+        false,
+        engine.clone(),
+        above.clone(),
+        engine_context.clone(),
+    )
+    .handle
+    .await
+    .unwrap();
+    let (blocking_payload, blocking_result, _) =
+        spawn_engine_task(true, engine, above.clone(), engine_context)
+            .handle
+            .await
+            .unwrap();
+        assert_eq!(
+            payload_wire_bytes(&inline_payload),
+            payload_wire_bytes(&blocking_payload)
+        );
+        assert_eq!(inline_result.engine_name, blocking_result.engine_name);
+        assert_eq!(inline_result.tokens_before, blocking_result.tokens_before);
+        assert_eq!(inline_result.tokens_after, blocking_result.tokens_after);
+        assert_eq!(inline_result.applied, blocking_result.applied);
+
+        for level in [
+            CompressionLevel::Lite,
+            CompressionLevel::Standard,
+            CompressionLevel::Aggressive,
+        ] {
+            let below_result = pipeline
+                .compress(
+                    below.clone(),
+                    context(None),
+                    effective(level),
+                    CompressionRequestMetadata::default(),
+                )
+                .await;
+            let above_result = pipeline
+                .compress(
+                    above.clone(),
+                    context(None),
+                    effective(level),
+                    CompressionRequestMetadata::default(),
+                )
+                .await;
+
+            assert_eq!(below_result.level, level);
+            assert_eq!(above_result.level, level);
+            assert!(below_result.errors.is_empty());
+            assert!(above_result.errors.is_empty());
+
+            // The engine transformed both payloads; the pipeline accepted it.
+            assert!(!below_result.engines_applied.is_empty());
+            assert!(!above_result.engines_applied.is_empty());
+            assert_ne!(
+                payload_wire_bytes(&below_result.payload),
+                payload_wire_bytes(&below)
+            );
+            assert_ne!(
+                payload_wire_bytes(&above_result.payload),
+                payload_wire_bytes(&above)
+            );
+
+            // Engines are deterministic, so re-running either size band
+            // reproduces identical bytes.
+            let below_again = pipeline
+                .compress(
+                    below.clone(),
+                    context(None),
+                    effective(level),
+                    CompressionRequestMetadata::default(),
+                )
+                .await;
+            assert_eq!(
+                payload_wire_bytes(&below_again.payload),
+                payload_wire_bytes(&below_result.payload)
+            );
+            let above_again = pipeline
+                .compress(
+                    above.clone(),
+                    context(None),
+                    effective(level),
+                    CompressionRequestMetadata::default(),
+                )
+                .await;
+            assert_eq!(
+                payload_wire_bytes(&above_again.payload),
+                payload_wire_bytes(&above_result.payload)
+            );
+        }
     }
 }

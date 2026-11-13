@@ -7,15 +7,16 @@
 //! failure after prior decisions is reported with the actual committed counts.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::extractor::{
-    ExtractionMessage, ExtractionRole, MemoryExtractionProvider,
-    MemoryExtractionProviderRequest,
+    ExtractionMessage, ExtractionRole, MemoryExtractionProvider, MemoryExtractionProviderRequest,
 };
 use super::sensitive::{SensitiveContentScanner, SensitiveScanOptions};
 use super::store::MemoryStore;
@@ -74,7 +75,9 @@ enum RawDecision {
         superseded_id: String,
         superseded_by_id: String,
     },
-    Keep { id: String },
+    Keep {
+        id: String,
+    },
 }
 
 /// Counts recorded for one consolidation pass.
@@ -87,6 +90,67 @@ pub struct ConsolidationCounts {
     pub provider_errors: u32,
 }
 
+/// Live progress counters for one running pass, shared with the job
+/// registry so the admin status endpoint can observe namespaces and
+/// batches as they complete without touching pass internals (C9: the
+/// counters carry no memory content).
+#[derive(Debug, Default)]
+pub struct ConsolidationProgress {
+    namespaces_total: AtomicU64,
+    namespaces_done: AtomicU64,
+    batches_total: AtomicU64,
+    batches_done: AtomicU64,
+    provider_errors: AtomicU64,
+    skipped_batches: AtomicU64,
+}
+
+impl ConsolidationProgress {
+    /// Content-free snapshot of the counters for status reporting.
+    pub fn snapshot(&self) -> ConsolidationProgressSnapshot {
+        ConsolidationProgressSnapshot {
+            namespaces_total: self.namespaces_total.load(Ordering::SeqCst),
+            namespaces_done: self.namespaces_done.load(Ordering::SeqCst),
+            batches_total: self.batches_total.load(Ordering::SeqCst),
+            batches_done: self.batches_done.load(Ordering::SeqCst),
+            provider_errors: self.provider_errors.load(Ordering::SeqCst),
+            skipped_batches: self.skipped_batches.load(Ordering::SeqCst),
+        }
+    }
+
+    fn set_namespaces_total(&self, total: u64) {
+        self.namespaces_total.store(total, Ordering::SeqCst);
+    }
+
+    fn finish_namespace(&self) {
+        self.namespaces_done.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn add_batches(&self, batches: u64) {
+        self.batches_total.fetch_add(batches, Ordering::SeqCst);
+    }
+
+    fn finish_batch(&self, provider_error: bool, skipped: bool) {
+        self.batches_done.fetch_add(1, Ordering::SeqCst);
+        if provider_error {
+            self.provider_errors.fetch_add(1, Ordering::SeqCst);
+        }
+        if skipped {
+            self.skipped_batches.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Immutable, content-free copy of [`ConsolidationProgress`] counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ConsolidationProgressSnapshot {
+    pub namespaces_total: u64,
+    pub namespaces_done: u64,
+    pub batches_total: u64,
+    pub batches_done: u64,
+    pub provider_errors: u64,
+    pub skipped_batches: u64,
+}
+
 /// Group active entries into provider-call batches.
 ///
 /// Entries are bucketed by namespace and memory type, then chained into groups
@@ -97,11 +161,9 @@ pub struct ConsolidationCounts {
 pub fn group_candidates(entries: &[MemoryEntry]) -> Vec<Vec<MemoryEntry>> {
     let mut buckets: Vec<(String, MemoryType, Vec<usize>)> = Vec::new();
     for (position, entry) in entries.iter().enumerate() {
-        let index = match buckets
-            .iter()
-            .position(|(namespace, memory_type, _)| {
-                namespace == &entry.namespace && *memory_type == entry.memory_type
-            }) {
+        let index = match buckets.iter().position(|(namespace, memory_type, _)| {
+            namespace == &entry.namespace && *memory_type == entry.memory_type
+        }) {
             Some(index) => index,
             None => {
                 buckets.push((entry.namespace.clone(), entry.memory_type, Vec::new()));
@@ -111,7 +173,8 @@ pub fn group_candidates(entries: &[MemoryEntry]) -> Vec<Vec<MemoryEntry>> {
         buckets[index].2.push(position);
     }
     buckets.sort_by(|left, right| {
-        left.0.cmp(&right.0)
+        left.0
+            .cmp(&right.0)
             .then_with(|| memory_type_rank(left.1).cmp(&memory_type_rank(right.1)))
     });
 
@@ -246,22 +309,34 @@ pub struct ConsolidationContext {
     pub allow_sensitive_storage: bool,
     pub provider_name: String,
     pub model: String,
+    /// Maximum batches processed concurrently within one pass
+    /// (requirement 4.1).
     pub maximum_concurrent_provider_calls: usize,
     pub provider_timeout: Duration,
+    /// Shared progress counters for the background-job status endpoint;
+    /// `None` for direct callers that do not report progress.
+    pub progress: Option<Arc<ConsolidationProgress>>,
 }
 
 /// Run one consolidation pass across all namespaces.
 ///
-/// Each namespace is grouped deterministically and dispatched in bounded
-/// batches; provider errors and parse failures skip their batch with sanitized
-/// logging. Merged content passes the same sensitive scan and validation as
-/// manual creation before any store write.
+/// Every namespace is grouped deterministically up front (listing is
+/// sequential so the snapshot of active sources is fixed before the first
+/// provider call), then the disjoint batches of ALL namespaces are
+/// flattened into one pass-wide bounded stream — parallelism is no longer
+/// per-namespace, so many namespaces with one batch each still reach the
+/// configured concurrency. Outcomes fold incrementally as each batch
+/// completes, so progress counters and the error summary update per batch
+/// instead of after the slowest one. Provider errors and parse failures
+/// skip their batch with sanitized logging; merged content passes the
+/// same sensitive scan and validation as manual creation before any store
+/// write.
 pub async fn run_consolidation(
     context: ConsolidationContext,
 ) -> Result<ConsolidationCounts, MemoryError> {
     if context.maximum_concurrent_provider_calls == 0 {
         return Err(MemoryError::Config(
-            "maximum concurrent consolidation calls must be at least 1".to_owned(),
+            "consolidation batch concurrency must be at least 1".to_owned(),
         ));
     }
     if context.provider_timeout.is_zero() {
@@ -275,6 +350,16 @@ pub async fn run_consolidation(
     };
 
     let mut counts = ConsolidationCounts::default();
+    if let Some(progress) = context.progress.as_ref() {
+        progress.set_namespaces_total(namespaces.len() as u64);
+    }
+    // Snapshot every namespace's batches before dispatching: listing is
+    // sequential, so the active-source set a pass merges is fixed before
+    // the first provider call and cannot shift under concurrent batches.
+    let mut all_batches = Vec::new();
+    // Per-namespace count of batches whose outcomes have not been folded
+    // yet; a namespace finishes when its last batch outcome lands.
+    let mut namespace_remaining = Vec::new();
     for namespace in namespaces {
         let namespace_name = namespace.namespace.clone();
         let mut entries = Vec::new();
@@ -295,32 +380,109 @@ pub async fn run_consolidation(
             }
         }
         let groups = group_candidates(&entries);
+        // Reject singletons and cap oversized groups up front so the
+        // per-batch work is pure dispatch; overflow entries stay untouched
+        // and are accounted as kept, matching the sequential pass.
+        let mut batches = Vec::new();
         for mut group in groups {
             if group.len() < 2 {
                 counts.kept += 1;
                 continue;
             }
-            // Hard cap per provider call; overflow entries are not sent and
-            // stay untouched, so they are accounted as kept.
             if group.len() > MAX_ENTRIES_PER_PROVIDER_CALL {
-            let overflow = group.len() - MAX_ENTRIES_PER_PROVIDER_CALL;
-            counts.kept = saturating_count(counts.kept as usize + overflow);
-            group.truncate(MAX_ENTRIES_PER_PROVIDER_CALL);
+                let overflow = group.len() - MAX_ENTRIES_PER_PROVIDER_CALL;
+                counts.kept = saturating_count(counts.kept as usize + overflow);
+                group.truncate(MAX_ENTRIES_PER_PROVIDER_CALL);
             }
-            let result = process_batch(&context, &group).await;
-            match result {
-                BatchOutcome::Applied(applied) => {
-                    counts.merged = saturating_count(counts.merged as usize + applied.merged);
-                    counts.superseded =
-                        saturating_count(counts.superseded as usize + applied.superseded);
-                    counts.kept = saturating_count(counts.kept as usize + applied.kept);
+            batches.push(group);
+        }
+        if let Some(progress) = context.progress.as_ref() {
+            progress.add_batches(batches.len() as u64);
+        }
+        if batches.is_empty() {
+            // Nothing to dispatch for this namespace; it is done the
+            // moment its (empty) batch set is folded.
+            if let Some(progress) = context.progress.as_ref() {
+                progress.finish_namespace();
+            }
+            continue;
+        }
+        namespace_remaining.push(AtomicU64::new(batches.len() as u64));
+        let namespace_index = namespace_remaining.len() - 1;
+        all_batches.extend(
+            batches
+                .into_iter()
+                .map(move |group| (namespace_index, group)),
+        );
+    }
+    // Pass-wide bounded parallelism (requirement 4.1): flatten the
+    // disjoint batches of every namespace into one stream dispatched up
+    // to `maximum_concurrent_provider_calls` at once, and fold each
+    // outcome incrementally (while-next) as it completes — every
+    // per-batch outcome is an additive counter so the totals match the
+    // sequential pass exactly, and progress/error counters update per
+    // batch instead of after the slowest one. Each outcome carries its
+    // namespace index because `buffer_unordered` emits in completion
+    // order, not dispatch order.
+    let mut namespace_stream =
+        futures::stream::iter(all_batches.into_iter().map(|(namespace_index, group)| {
+            let context = &context;
+            async move {
+                let outcome = process_batch(context, &group).await;
+                (namespace_index, outcome)
+            }
+        }))
+        .buffer_unordered(context.maximum_concurrent_provider_calls);
+    while let Some((namespace_index, outcome)) = namespace_stream.next().await {
+        match outcome {
+            BatchOutcome::Applied(applied) => {
+                counts.merged = saturating_count(counts.merged as usize + applied.merged);
+                counts.superseded =
+                    saturating_count(counts.superseded as usize + applied.superseded);
+                counts.kept = saturating_count(counts.kept as usize + applied.kept);
+                if let Some(progress) = context.progress.as_ref() {
+                    progress.finish_batch(false, false);
                 }
-                BatchOutcome::ProviderError => counts.provider_errors += 1,
-                BatchOutcome::BatchSkipped => counts.skipped_batches += 1,
+            }
+            BatchOutcome::ProviderError => {
+                counts.provider_errors += 1;
+                if let Some(progress) = context.progress.as_ref() {
+                    progress.finish_batch(true, false);
+                }
+            }
+            BatchOutcome::BatchSkipped => {
+                counts.skipped_batches += 1;
+                if let Some(progress) = context.progress.as_ref() {
+                    progress.finish_batch(false, true);
+                }
             }
         }
+        // Per-namespace progress: the namespace is done when its last
+        // batch outcome has been folded. The stream emits outcomes in
+        // completion order, so each outcome decrements its own
+        // namespace's remaining-batch counter.
+        finish_namespace_outcome(&namespace_remaining, namespace_index, context.progress.as_deref());
     }
     Ok(counts)
+}
+
+/// Decrement the remaining-batch count of one namespace after an outcome
+/// was folded, marking namespace progress when its last batch landed.
+/// Outcome arrival order is completion order, so each folded outcome
+/// consumes exactly one remaining slot of the namespace it belongs to.
+fn finish_namespace_outcome(
+    namespace_remaining: &[AtomicU64],
+    namespace_index: usize,
+    progress: Option<&ConsolidationProgress>,
+) {
+    let Some(remaining) = namespace_remaining.get(namespace_index) else {
+        return;
+    };
+    if remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+        if let Some(progress) = progress {
+            progress.finish_namespace();
+        }
+    }
 }
 
 enum BatchOutcome {
@@ -389,7 +551,11 @@ async fn process_batch(context: &ConsolidationContext, group: &[MemoryEntry]) ->
     };
 
     for decision in &decisions {
-        if let Decision::Merge { source_ids, merged_content } = decision {
+        if let Decision::Merge {
+            source_ids,
+            merged_content,
+        } = decision
+        {
             if !validate_merge(context, group, source_ids, merged_content).await {
                 return BatchOutcome::BatchSkipped;
             }
@@ -402,27 +568,46 @@ async fn process_batch(context: &ConsolidationContext, group: &[MemoryEntry]) ->
             if applied.merged == 0 && applied.superseded == 0 && applied.kept == 0 {
                 return BatchOutcome::BatchSkipped;
             }
-            tracing::warn!(merged = applied.merged, superseded = applied.superseded, kept = applied.kept, "memory consolidation batch partially applied");
+            tracing::warn!(
+                merged = applied.merged,
+                superseded = applied.superseded,
+                kept = applied.kept,
+                "memory consolidation batch partially applied"
+            );
             break;
         }
     }
     BatchOutcome::Applied(applied)
 }
 
-async fn apply_decision(context: &ConsolidationContext, group: &[MemoryEntry], decision: Decision, applied: &mut AppliedCounts) -> bool {
+async fn apply_decision(
+    context: &ConsolidationContext,
+    group: &[MemoryEntry],
+    decision: Decision,
+    applied: &mut AppliedCounts,
+) -> bool {
     match decision {
-        Decision::Merge { source_ids, merged_content } => {
-            let Some(marked) = apply_merge(context, group, &source_ids, &merged_content).await else {
+        Decision::Merge {
+            source_ids,
+            merged_content,
+        } => {
+            let Some(marked) = apply_merge(context, group, &source_ids, &merged_content).await
+            else {
                 return false;
             };
             applied.merged += 1;
             applied.superseded += marked;
         }
-        Decision::Supersede { superseded_id, superseded_by_id } => {
+        Decision::Supersede {
+            superseded_id,
+            superseded_by_id,
+        } => {
             let marked = match spawn_store_task({
                 let store = Arc::clone(&context.store);
                 move || store.mark_superseded(&[superseded_id], superseded_by_id)
-            }).await {
+            })
+            .await
+            {
                 Ok(marked) => marked,
                 Err(_) => {
                     tracing::warn!("memory consolidation supersede failed");
@@ -430,7 +615,9 @@ async fn apply_decision(context: &ConsolidationContext, group: &[MemoryEntry], d
                 }
             };
             applied.superseded += marked;
-            if marked != 0 { schedule_vector_delete(context, superseded_id).await; }
+            if marked != 0 {
+                schedule_vector_delete(context, superseded_id).await;
+            }
         }
         Decision::Keep { id } => {
             if group.iter().any(|entry| entry.id == id) {
@@ -442,15 +629,29 @@ async fn apply_decision(context: &ConsolidationContext, group: &[MemoryEntry], d
 }
 
 /// Validate a merge before any batch write.
-async fn validate_merge(context: &ConsolidationContext, group: &[MemoryEntry], source_ids: &[Uuid], merged_content: &str) -> bool {
-    let sources = source_ids.iter().filter_map(|id| group.iter().find(|entry| &entry.id == id)).collect::<Vec<_>>();
-    if sources.len() != source_ids.len() || sources.is_empty() || source_ids.iter().collect::<HashSet<_>>().len() != source_ids.len() {
+async fn validate_merge(
+    context: &ConsolidationContext,
+    group: &[MemoryEntry],
+    source_ids: &[Uuid],
+    merged_content: &str,
+) -> bool {
+    let sources = source_ids
+        .iter()
+        .filter_map(|id| group.iter().find(|entry| &entry.id == id))
+        .collect::<Vec<_>>();
+    if sources.len() != source_ids.len()
+        || sources.is_empty()
+        || source_ids.iter().collect::<HashSet<_>>().len() != source_ids.len()
+    {
         tracing::warn!("memory consolidation merge has invalid sources");
         return false;
     }
     let namespace = &sources[0].namespace;
     let memory_type = sources[0].memory_type;
-    if sources.iter().any(|entry| &entry.namespace != namespace || entry.memory_type != memory_type) {
+    if sources
+        .iter()
+        .any(|entry| &entry.namespace != namespace || entry.memory_type != memory_type)
+    {
         tracing::warn!("memory consolidation merge mixes namespaces or types");
         return false;
     }
@@ -462,10 +663,17 @@ async fn validate_merge(context: &ConsolidationContext, group: &[MemoryEntry], s
         tracing::warn!("memory consolidation merged content is below minimum word count");
         return false;
     }
-    let scan = match context.scanner.scan_with_options(merged_content, SensitiveScanOptions {
-        allow_sensitive_storage: context.allow_sensitive_storage,
-        ..SensitiveScanOptions::default()
-    }).await {
+    let scan = match context
+        .scanner
+        .scan_with_options(
+            merged_content,
+            SensitiveScanOptions {
+                allow_sensitive_storage: context.allow_sensitive_storage,
+                ..SensitiveScanOptions::default()
+            },
+        )
+        .await
+    {
         Ok(scan) => scan,
         Err(_) => {
             tracing::warn!("memory consolidation sensitive scan failed");
@@ -485,7 +693,12 @@ async fn validate_merge(context: &ConsolidationContext, group: &[MemoryEntry], s
 /// helper's transaction requires every source UPDATE to affect exactly one
 /// row (or the whole merge rolls back), so a successful commit marks
 /// exactly `source_ids.len()` rows.
-async fn apply_merge(context: &ConsolidationContext, group: &[MemoryEntry], source_ids: &[Uuid], merged_content: &str) -> Option<usize> {
+async fn apply_merge(
+    context: &ConsolidationContext,
+    group: &[MemoryEntry],
+    source_ids: &[Uuid],
+    merged_content: &str,
+) -> Option<usize> {
     let first = group.iter().find(|entry| entry.id == source_ids[0])?;
     let namespace = first.namespace.clone();
     let memory_type = first.memory_type;
@@ -493,7 +706,16 @@ async fn apply_merge(context: &ConsolidationContext, group: &[MemoryEntry], sour
         let store = Arc::clone(&context.store);
         let content = merged_content.to_owned();
         let source_ids = source_ids.to_vec();
-        match spawn_store_task(move || store.create_merged_entry_with_supersession(&namespace, &content, memory_type, &source_ids)).await {
+        match spawn_store_task(move || {
+            store.create_merged_entry_with_supersession(
+                &namespace,
+                &content,
+                memory_type,
+                &source_ids,
+            )
+        })
+        .await
+        {
             Ok(merged) => merged,
             Err(_) => {
                 tracing::warn!("memory consolidation merge write failed");
@@ -502,7 +724,9 @@ async fn apply_merge(context: &ConsolidationContext, group: &[MemoryEntry], sour
         }
     };
     schedule_vector_index(context, merged).await;
-    for id in source_ids { schedule_vector_delete(context, *id).await; }
+    for id in source_ids {
+        schedule_vector_delete(context, *id).await;
+    }
     Some(source_ids.len())
 }
 
@@ -554,10 +778,10 @@ fn batch_prompt(group: &[MemoryEntry]) -> String {
     serde_json::json!({
         "entries": entries,
         "instructions": "Decide for each entry group: merge near-duplicates into one entry, \
-supersede contradictions, or keep. Respond ONLY as a JSON array of decisions: \
-[{\"action\":\"merge\",\"source_ids\":[...],\"merged_content\":\"...\"}, \
-{\"action\":\"supersede\",\"superseded_id\":\"...\",\"superseded_by_id\":\"...\"}, \
-{\"action\":\"keep\",\"id\":\"...\"}]",
+    supersede contradictions, or keep. Respond ONLY as a JSON array of decisions: \
+    [{\"action\":\"merge\",\"source_ids\":[...],\"merged_content\":\"...\"}, \
+    {\"action\":\"supersede\",\"superseded_id\":\"...\",\"superseded_by_id\":\"...\"}, \
+    {\"action\":\"keep\",\"id\":\"...\"}]",
     })
     .to_string()
 }
@@ -592,14 +816,24 @@ mod tests {
     #[test]
     fn near_duplicates_in_same_namespace_and_type_group() {
         let entries = vec![
-            entry(1, "user::a", MemoryType::Fact, "The deploy target is fly.io eu-west"),
+            entry(
+                1,
+                "user::a",
+                MemoryType::Fact,
+                "The deploy target is fly.io eu-west",
+            ),
             entry(
                 2,
                 "user::a",
                 MemoryType::Fact,
                 "The deploy target is fly.io eu-west region",
             ),
-            entry(3, "user::a", MemoryType::Fact, "Rust is the primary language"),
+            entry(
+                3,
+                "user::a",
+                MemoryType::Fact,
+                "Rust is the primary language",
+            ),
         ];
         let groups = group_candidates(&entries);
         assert_eq!(groups.len(), 2);
@@ -614,14 +848,24 @@ mod tests {
     #[test]
     fn different_type_or_namespace_never_group() {
         let entries = vec![
-            entry(1, "user::a", MemoryType::Fact, "The deploy target is fly.io eu-west"),
+            entry(
+                1,
+                "user::a",
+                MemoryType::Fact,
+                "The deploy target is fly.io eu-west",
+            ),
             entry(
                 2,
                 "user::a",
                 MemoryType::Preference,
                 "The deploy target is fly.io eu-west",
             ),
-            entry(3, "user::b", MemoryType::Fact, "The deploy target is fly.io eu-west"),
+            entry(
+                3,
+                "user::b",
+                MemoryType::Fact,
+                "The deploy target is fly.io eu-west",
+            ),
         ];
         let groups = group_candidates(&entries);
         assert_eq!(groups.len(), 3);
@@ -633,7 +877,12 @@ mod tests {
         let entries = vec![
             entry(1, "user::a", MemoryType::Fact, "alpha beta gamma delta"),
             entry(2, "user::a", MemoryType::Fact, "alpha beta gamma epsilon"),
-            entry(3, "user::a", MemoryType::Fact, "unrelated single entry here"),
+            entry(
+                3,
+                "user::a",
+                MemoryType::Fact,
+                "unrelated single entry here",
+            ),
         ];
         let first = group_candidates(&entries);
         let second = group_candidates(&entries);
@@ -683,7 +932,10 @@ mod tests {
             parse_decisions("not json", &ids).unwrap_err(),
             ConsolidationError::MalformedJson
         );
-        let wrong_schema = format!("[{{\"action\":\"vanish\",\"id\":\"{}\"}}]", Uuid::from_u128(1));
+        let wrong_schema = format!(
+            "[{{\"action\":\"vanish\",\"id\":\"{}\"}}]",
+            Uuid::from_u128(1)
+        );
         assert_eq!(
             parse_decisions(&wrong_schema, &ids).unwrap_err(),
             ConsolidationError::SchemaMismatch { index: 0 }
@@ -693,7 +945,10 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_ids() {
         let ids = valid_ids(&[1]);
-        let unknown = format!("[{{\"action\":\"keep\",\"id\":\"{}\"}}]", Uuid::from_u128(99));
+        let unknown = format!(
+            "[{{\"action\":\"keep\",\"id\":\"{}\"}}]",
+            Uuid::from_u128(99)
+        );
         assert_eq!(
             parse_decisions(&unknown, &ids).unwrap_err(),
             ConsolidationError::UnknownId { index: 0 }
@@ -728,6 +983,9 @@ mod tests {
     struct FakeConsolidationProvider {
         contents: std::sync::Mutex<Vec<String>>,
         fail: bool,
+        /// Answer each call with one merge decision covering the batch's own
+        /// entry ids, so multi-batch fixtures work under any dispatch order.
+        merge_all: bool,
         calls: AtomicUsize,
         max_payload_entries: AtomicUsize,
     }
@@ -737,6 +995,17 @@ mod tests {
             Self {
                 contents: std::sync::Mutex::new(vec![raw_json]),
                 fail: false,
+                merge_all: false,
+                calls: AtomicUsize::new(0),
+                max_payload_entries: AtomicUsize::new(0),
+            }
+        }
+
+        fn merging() -> Self {
+            Self {
+                contents: std::sync::Mutex::new(Vec::new()),
+                fail: false,
+                merge_all: true,
                 calls: AtomicUsize::new(0),
                 max_payload_entries: AtomicUsize::new(0),
             }
@@ -746,6 +1015,7 @@ mod tests {
             Self {
                 contents: std::sync::Mutex::new(Vec::new()),
                 fail: true,
+                merge_all: false,
                 calls: AtomicUsize::new(0),
                 max_payload_entries: AtomicUsize::new(0),
             }
@@ -772,9 +1042,25 @@ mod tests {
             }
             let payload: serde_json::Value =
                 serde_json::from_str(&request.messages[0].content).unwrap();
-            let size = payload["entries"].as_array().unwrap().len();
-            self.max_payload_entries
-                .fetch_max(size, Ordering::SeqCst);
+            let entries = payload["entries"].as_array().unwrap();
+            let size = entries.len();
+            self.max_payload_entries.fetch_max(size, Ordering::SeqCst);
+            if self.merge_all {
+                let source_ids = entries
+                    .iter()
+                    .map(|entry| entry["id"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                let decision = serde_json::json!([{
+                    "action": "merge",
+                    "source_ids": source_ids,
+                    "merged_content": "Deployments run on fly.io in eu-west.",
+                }])
+                .to_string();
+                return Ok(vec![StructuredMemoryCandidate {
+                    content: decision,
+                    memory_type: MemoryType::Fact,
+                }]);
+            }
             Ok(self
                 .contents
                 .lock()
@@ -802,7 +1088,11 @@ mod tests {
             Ok(())
         }
 
-        async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<VectorMatch>, MemoryError> {
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<VectorMatch>, MemoryError> {
             Ok(Vec::new())
         }
 
@@ -816,18 +1106,27 @@ mod tests {
         provider: Arc<FakeConsolidationProvider>,
         tier: Option<Arc<RecordingTier>>,
     ) -> (ConsolidationContext, Arc<MemoryStore>) {
+        test_context_with_concurrency(provider, tier, 1).await
+    }
+
+    async fn test_context_with_concurrency(
+        provider: Arc<dyn MemoryExtractionProvider>,
+        tier: Option<Arc<RecordingTier>>,
+        max_concurrent_batches: usize,
+    ) -> (ConsolidationContext, Arc<MemoryStore>) {
         let store = Arc::new(MemoryStore::new(std::path::Path::new(":memory:")).unwrap());
         let scanner = Arc::new(SensitiveContentScanner::new(&[], None).unwrap());
         let context = ConsolidationContext {
             store: store.clone(),
-            provider,
+            provider: provider as Arc<dyn MemoryExtractionProvider>,
             scanner,
             vector_tier: tier.map(|tier| tier as Arc<dyn MemoryVectorTier>),
             allow_sensitive_storage: false,
             provider_name: "internal-provider".to_owned(),
             model: "consolidator-model".to_owned(),
-            maximum_concurrent_provider_calls: 1,
+            maximum_concurrent_provider_calls: max_concurrent_batches,
             provider_timeout: Duration::from_secs(2),
+            progress: None,
         };
         (context, store)
     }
@@ -889,7 +1188,10 @@ mod tests {
 
         let active = store.list_entries("user::test", 10, 0).unwrap();
         assert_eq!(active.entries.len(), 1);
-        assert_eq!(active.entries[0].content, "Deployments run on fly.io in eu-west.");
+        assert_eq!(
+            active.entries[0].content,
+            "Deployments run on fly.io in eu-west."
+        );
         let archived = store
             .list_entries_with_superseded("user::test", 10, 0, true)
             .unwrap();
@@ -932,7 +1234,14 @@ mod tests {
         assert_eq!(counts.kept, 1);
         // Nothing changed in the failing namespace.
         assert!(store.get_entry_by_id(first).unwrap().is_some());
-        assert_eq!(store.list_entries("user::test", 10, 0).unwrap().entries.len(), 2);
+        assert_eq!(
+            store
+                .list_entries("user::test", 10, 0)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
         assert_eq!(provider.calls(), 1);
     }
 
@@ -946,7 +1255,14 @@ mod tests {
 
         assert_eq!(counts.skipped_batches, 1);
         assert_eq!(counts.merged, 0);
-        assert_eq!(store.list_entries("user::test", 10, 0).unwrap().entries.len(), 2);
+        assert_eq!(
+            store
+                .list_entries("user::test", 10, 0)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -962,181 +1278,535 @@ mod tests {
 
         assert_eq!(counts.skipped_batches, 1);
         assert_eq!(counts.merged, 0);
-        assert_eq!(store.list_entries("user::test", 10, 0).unwrap().entries.len(), 2);
-        assert!(store.get_entry_by_id(first).unwrap().unwrap().superseded_by.is_none());
+        assert_eq!(
+            store
+                .list_entries("user::test", 10, 0)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+        assert!(store
+            .get_entry_by_id(first)
+            .unwrap()
+            .unwrap()
+            .superseded_by
+            .is_none());
 
-    // allow_sensitive_storage bypasses the scan and the merge applies.
-    context.allow_sensitive_storage = true;
-    let counts = run_consolidation(context).await.unwrap();
-    assert_eq!(counts.merged, 1);
-}
+        // allow_sensitive_storage bypasses the scan and the merge applies.
+        context.allow_sensitive_storage = true;
+        let counts = run_consolidation(context).await.unwrap();
+        assert_eq!(counts.merged, 1);
+    }
 
-#[tokio::test]
-async fn single_word_merged_content_is_skipped() {
-    let provider = Arc::new(FakeConsolidationProvider::decisions(String::new()));
-    let (context, store) = test_context(provider.clone(), None).await;
-    let (first, second) = seed_near_duplicates(&store).await;
-    *provider.contents.lock().unwrap() = vec![format!(
+    #[tokio::test]
+    async fn single_word_merged_content_is_skipped() {
+        let provider = Arc::new(FakeConsolidationProvider::decisions(String::new()));
+        let (context, store) = test_context(provider.clone(), None).await;
+        let (first, second) = seed_near_duplicates(&store).await;
+        *provider.contents.lock().unwrap() = vec![format!(
         "[{{\"action\":\"merge\",\"source_ids\":[\"{first}\",\"{second}\"],\"merged_content\":\"sufficiently-long-single-word\"}}]"
     )];
 
-    let counts = run_consolidation(context).await.unwrap();
+        let counts = run_consolidation(context).await.unwrap();
 
-    assert_eq!(counts.skipped_batches, 1);
-    assert_eq!(counts.merged, 0);
-    assert_eq!(store.list_entries("user::test", 10, 0).unwrap().entries.len(), 2);
-    assert!(store.get_entry_by_id(first).unwrap().unwrap().superseded_by.is_none());
-}
-
-#[tokio::test]
-async fn batches_are_capped_at_forty_entries_per_provider_call() {
-    let provider = Arc::new(FakeConsolidationProvider::decisions("[]".to_owned()));
-    let (context, store) = test_context(provider.clone(), None).await;
-    for index in 0..45 {
-        store
-            .store_entry(
-                NewMemoryEntry {
-                    namespace: "user::cap".to_owned(),
-                    content: format!("Shared alpha beta gamma token number {index}"),
-                    memory_type: MemoryType::Fact,
-                    source_request_id: None,
-                },
-                None,
-            )
-            .unwrap();
+        assert_eq!(counts.skipped_batches, 1);
+        assert_eq!(counts.merged, 0);
+        assert_eq!(
+            store
+                .list_entries("user::test", 10, 0)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+        assert!(store
+            .get_entry_by_id(first)
+            .unwrap()
+            .unwrap()
+            .superseded_by
+            .is_none());
     }
 
-    let counts = run_consolidation(context).await.unwrap();
+    #[tokio::test]
+    async fn batches_are_capped_at_forty_entries_per_provider_call() {
+        let provider = Arc::new(FakeConsolidationProvider::decisions("[]".to_owned()));
+        let (context, store) = test_context(provider.clone(), None).await;
+        for index in 0..45 {
+            store
+                .store_entry(
+                    NewMemoryEntry {
+                        namespace: "user::cap".to_owned(),
+                        content: format!("Shared alpha beta gamma token number {index}"),
+                        memory_type: MemoryType::Fact,
+                        source_request_id: None,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
 
-    assert_eq!(provider.calls(), 1);
-    assert_eq!(
-        provider.max_payload_entries.load(Ordering::SeqCst),
-        MAX_ENTRIES_PER_PROVIDER_CALL
-    );
-    // One capped batch (provider answered []) plus the five overflow
-    // entries fall outside the cap and are accounted as kept.
-    assert_eq!(counts.kept, 5);
-    assert_eq!(counts.skipped_batches, 0);
-}
+        let counts = run_consolidation(context).await.unwrap();
 
-#[tokio::test]
-async fn namespaces_beyond_the_list_limit_are_fully_paginated() {
-    // MAX_LIST_LIMIT clamps every list_entries page to 200 rows; a
-    // near-duplicate pair seeded as the two oldest entries lands on the
-    // second page (listing is created_at DESC). Without pagination the pair
-    // is never listed, never grouped, and the provider is never called.
-    let provider = Arc::new(FakeConsolidationProvider::decisions(String::new()));
-    let (context, store) = test_context(provider.clone(), None).await;
-
-    let base = 1_700_000_000i64;
-    let filler_count = crate::memory::store::MAX_LIST_LIMIT;
-    for index in 0..filler_count {
-        store
-            .store_entry(
-                MemoryEntry {
-                    id: Uuid::from_u128(1_000 + index as u128),
-                    namespace: "user::paged".to_owned(),
-                    content: format!("omega{index} sigma{index} tau{index} rho{index}"),
-                    memory_type: MemoryType::Fact,
-                    relevance_score: 1.0,
-                    created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
-                        base + index as i64,
-                        0,
-                    )
-                    .unwrap(),
-                    last_accessed_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
-                        base + index as i64,
-                        0,
-                    )
-                    .unwrap(),
-                    access_count: 0,
-                    source_request_id: None,
-                    updated_at: None,
-                    superseded_by: None,
-                },
-                None,
-            )
-            .unwrap();
-    }
-    let pair_base = base - 10;
-    let mut pair_ids = Vec::new();
-    for offset in 0..2 {
-        let content = if offset == 0 {
-            "The deploy target is fly.io eu-west".to_owned()
-        } else {
-            "The deploy target is fly.io eu-west region".to_owned()
-        };
-        let entry = store
-            .store_entry(
-                MemoryEntry {
-                    id: Uuid::from_u128(2_000 + offset),
-                    namespace: "user::paged".to_owned(),
-                    content,
-                    memory_type: MemoryType::Fact,
-                    relevance_score: 1.0,
-                    created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
-                        pair_base - offset as i64,
-                        0,
-                    )
-                    .unwrap(),
-                    last_accessed_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
-                        pair_base - offset as i64,
-                        0,
-                    )
-                    .unwrap(),
-                    access_count: 0,
-                    source_request_id: None,
-                    updated_at: None,
-                    superseded_by: None,
-                },
-                None,
-            )
-            .unwrap();
-        pair_ids.push(entry.id);
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(
+            provider.max_payload_entries.load(Ordering::SeqCst),
+            MAX_ENTRIES_PER_PROVIDER_CALL
+        );
+        // One capped batch (provider answered []) plus the five overflow
+        // entries fall outside the cap and are accounted as kept.
+        assert_eq!(counts.kept, 5);
+        assert_eq!(counts.skipped_batches, 0);
     }
 
-    *provider.contents.lock().unwrap() = vec![merge_decisions_json(&pair_ids)];
-    let counts = run_consolidation(context).await.unwrap();
+    #[tokio::test]
+    async fn namespaces_beyond_the_list_limit_are_fully_paginated() {
+        // MAX_LIST_LIMIT clamps every list_entries page to 200 rows; a
+        // near-duplicate pair seeded as the two oldest entries lands on the
+        // second page (listing is created_at DESC). Without pagination the pair
+        // is never listed, never grouped, and the provider is never called.
+        let provider = Arc::new(FakeConsolidationProvider::decisions(String::new()));
+        let (context, store) = test_context(provider.clone(), None).await;
 
-    assert_eq!(provider.calls(), 1, "the second-page pair must reach the provider");
-    assert_eq!(counts.merged, 1);
-    assert_eq!(counts.superseded, 2);
-    // The dissimilar fillers stay kept (one group each); the pair was merged.
-    assert_eq!(counts.kept as usize, filler_count);
-    let active = store.list_entries("user::paged", 10, 0).unwrap();
-    assert_eq!(active.total_count, 201);
-}
+        let base = 1_700_000_000i64;
+        let filler_count = crate::memory::store::MAX_LIST_LIMIT;
+        for index in 0..filler_count {
+            store
+                .store_entry(
+                    MemoryEntry {
+                        id: Uuid::from_u128(1_000 + index as u128),
+                        namespace: "user::paged".to_owned(),
+                        content: format!("omega{index} sigma{index} tau{index} rho{index}"),
+                        memory_type: MemoryType::Fact,
+                        relevance_score: 1.0,
+                        created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            base + index as i64,
+                            0,
+                        )
+                        .unwrap(),
+                        last_accessed_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            base + index as i64,
+                            0,
+                        )
+                        .unwrap(),
+                        access_count: 0,
+                        source_request_id: None,
+                        updated_at: None,
+                        superseded_by: None,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        let pair_base = base - 10;
+        let mut pair_ids = Vec::new();
+        for offset in 0..2 {
+            let content = if offset == 0 {
+                "The deploy target is fly.io eu-west".to_owned()
+            } else {
+                "The deploy target is fly.io eu-west region".to_owned()
+            };
+            let entry = store
+                .store_entry(
+                    MemoryEntry {
+                        id: Uuid::from_u128(2_000 + offset),
+                        namespace: "user::paged".to_owned(),
+                        content,
+                        memory_type: MemoryType::Fact,
+                        relevance_score: 1.0,
+                        created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            pair_base - offset as i64,
+                            0,
+                        )
+                        .unwrap(),
+                        last_accessed_at: chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            pair_base - offset as i64,
+                            0,
+                        )
+                        .unwrap(),
+                        access_count: 0,
+                        source_request_id: None,
+                        updated_at: None,
+                        superseded_by: None,
+                    },
+                    None,
+                )
+                .unwrap();
+            pair_ids.push(entry.id);
+        }
 
-#[tokio::test]
-async fn batch_with_any_invalid_merge_is_skipped_before_writes() {
-    // The whole decision set is validated before any write: a valid merge
-    // followed by an invalid (sensitive) merge must skip the batch with
-    // nothing persisted, not apply the first merge and then stop.
-    let provider = Arc::new(FakeConsolidationProvider::decisions(String::new()));
-    let (context, store) = test_context(provider.clone(), None).await;
-    let (first, second) = seed_near_duplicates(&store).await;
-    // A second near-duplicate pair in another namespace shares the batch?
-    // No: batches never mix namespaces, so put both decisions in one batch
-    // by making the single group's decision list contain two merges: one
-    // valid for the real pair and one whose sources are the same pair but
-    // with sensitive merged content.
-    let ids = [first, second];
-    let id_list = ids
-        .iter()
-        .map(|id| format!("\"{id}\""))
-        .collect::<Vec<_>>()
-        .join(",");
-    *provider.contents.lock().unwrap() = vec![format!(
+        *provider.contents.lock().unwrap() = vec![merge_decisions_json(&pair_ids)];
+        let counts = run_consolidation(context).await.unwrap();
+
+        assert_eq!(
+            provider.calls(),
+            1,
+            "the second-page pair must reach the provider"
+        );
+        assert_eq!(counts.merged, 1);
+        assert_eq!(counts.superseded, 2);
+        // The dissimilar fillers stay kept (one group each); the pair was merged.
+        assert_eq!(counts.kept as usize, filler_count);
+        let active = store.list_entries("user::paged", 10, 0).unwrap();
+        assert_eq!(active.total_count, 201);
+    }
+
+    #[tokio::test]
+    async fn batch_with_any_invalid_merge_is_skipped_before_writes() {
+        // The whole decision set is validated before any write: a valid merge
+        // followed by an invalid (sensitive) merge must skip the batch with
+        // nothing persisted, not apply the first merge and then stop.
+        let provider = Arc::new(FakeConsolidationProvider::decisions(String::new()));
+        let (context, store) = test_context(provider.clone(), None).await;
+        let (first, second) = seed_near_duplicates(&store).await;
+        // A second near-duplicate pair in another namespace shares the batch?
+        // No: batches never mix namespaces, so put both decisions in one batch
+        // by making the single group's decision list contain two merges: one
+        // valid for the real pair and one whose sources are the same pair but
+        // with sensitive merged content.
+        let ids = [first, second];
+        let id_list = ids
+            .iter()
+            .map(|id| format!("\"{id}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        *provider.contents.lock().unwrap() = vec![format!(
         "[{{\"action\":\"merge\",\"source_ids\":[{id_list}],\"merged_content\":\"Deployments run on fly.io in eu-west.\"}}, \
           {{\"action\":\"merge\",\"source_ids\":[{id_list}],\"merged_content\":\"The api key is sk-abcdefghijklmnopqrst\"}}]"
     )];
 
+        let counts = run_consolidation(context).await.unwrap();
+
+        assert_eq!(counts.skipped_batches, 1);
+        assert_eq!(counts.merged, 0);
+        assert_eq!(counts.superseded, 0);
+        assert_eq!(
+            store
+                .list_entries("user::test", 10, 0)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+        assert!(store
+            .get_entry_by_id(first)
+            .unwrap()
+            .unwrap()
+            .superseded_by
+            .is_none());
+    }
+
+    /// Seed `pairs` disjoint near-duplicate pairs in one namespace so a single
+    /// pass dispatches `pairs` independent batches. Every pair carries unique
+    /// anchor tokens (`kappa{i}`/`omega{i}`); cross-pair token-set similarity
+    /// lands at 3/7 < 0.6, well below the grouping threshold, while the pair
+    /// itself stays at 5/6 >= 0.6.
+    async fn seed_multi_namespace_fixture(store: &MemoryStore, pairs: usize) {
+        for index in 0..pairs {
+            store
+                .store_entry(
+                    NewMemoryEntry {
+                        namespace: "user::parallel".to_owned(),
+                        content: format!("deploy target follows kappa{index} omega{index}"),
+                        memory_type: MemoryType::Fact,
+                        source_request_id: None,
+                    },
+                    None,
+                )
+                .unwrap();
+            store
+                .store_entry(
+                    NewMemoryEntry {
+                        namespace: "user::parallel".to_owned(),
+                        content: format!("deploy target follows kappa{index} omega{index} note"),
+                        memory_type: MemoryType::Fact,
+                        source_request_id: None,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+    }
+
+/// Capture the store state the namespace must reach after the pass: one
+/// active merged entry per seeded pair, both sources superseded by it.
+/// The merged entry's fresh UUID is normalized to a fixed marker so id
+/// generation cannot change the comparison across runs; rows are sorted
+/// by content so completion order cannot change it either. Each state
+/// row pairs the merged content with the normalized contents of exactly
+/// the two sources it superseded, so a wrong source-to-merge association
+/// (one batch's decision applied to another batch's entries) fails the
+/// comparison instead of hiding behind identical merged contents.
+async fn snapshot_store_state(
+    store: &MemoryStore,
+    pairs: usize,
+) -> Vec<(String, String)> {
+    let active = store.list_entries("user::parallel", 1000, 0).unwrap();
+    assert_eq!(active.entries.len(), pairs);
+    let archived = store
+        .list_entries_with_superseded("user::parallel", 1000, 0, true)
+        .unwrap();
+    assert_eq!(archived.entries.len(), 3 * pairs);
+    let mut state = Vec::new();
+    for merged in &active.entries {
+        let mut sources = archived
+            .entries
+            .iter()
+            .filter(|entry| entry.superseded_by == Some(merged.id))
+            .collect::<Vec<_>>();
+        assert_eq!(sources.len(), 2, "each pair must supersede both sources");
+        sources.sort_by(|left, right| left.content.cmp(&right.content));
+        let source_key = sources
+            .iter()
+            .map(|entry| normalize_snapshot_content(&entry.content))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        state.push((normalize_snapshot_content(&merged.content), source_key));
+    }
+    state.sort();
+    // Every merged entry must own a distinct source pair; duplicate keys
+    // mean two merges claimed the same sources (wrong association).
+    let mut distinct = state.clone();
+    distinct.dedup();
+    assert_eq!(distinct.len(), state.len(), "source pairs must be distinct");
+    state
+}
+
+/// Whitespace-normalized comparison form of stored content: trims and
+/// collapses runs of whitespace so only real content differences — not
+/// incidental spacing — can change a snapshot comparison.
+fn normalize_snapshot_content(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[tokio::test]
+async fn output_is_identical_at_concurrency_one_and_four() {
+    // Requirement 4.2: the same multi-batch fixture must produce identical
+    // final store state and pass counts at concurrency 1 and 4.
+    let pair_count = 8;
+    let mut results = Vec::new();
+    for concurrency in [1usize, 4] {
+        let provider = Arc::new(FakeConsolidationProvider::merging());
+        let (context, store) =
+            test_context_with_concurrency(provider.clone(), None, concurrency).await;
+        seed_multi_namespace_fixture(&store, pair_count).await;
+        let counts = run_consolidation(context).await.unwrap();
+        let state = snapshot_store_state(&store, pair_count).await;
+        results.push((counts, state, provider.calls()));
+    }
+
+    let (sequential_counts, sequential_state, sequential_calls) = results.remove(0);
+    let (parallel_counts, parallel_state, parallel_calls) = results.remove(0);
+    assert_eq!(sequential_counts, parallel_counts);
+    assert_eq!(sequential_state, parallel_state);
+    assert_eq!(sequential_calls, pair_count);
+    assert_eq!(parallel_calls, pair_count);
+    assert_eq!(sequential_counts.merged, pair_count as u32);
+    assert_eq!(sequential_counts.superseded, 2 * pair_count as u32);
+
+    // Overlap assertions with a coordinated provider: at concurrency 4
+    // the fixture's batches must actually execute concurrently — four
+    // calls in flight at once — and the in-flight count must never
+    // exceed the configured bound. Sequential execution could never
+    // assemble the wave, so these assertions fail the instantly-ready
+    // provider that once passed this test.
+    let wave = 4;
+    let provider = Arc::new(OverlapConsolidationProvider::new(wave));
+    let (context, store) = test_context_with_concurrency(provider.clone(), None, wave).await;
+    seed_multi_namespace_fixture(&store, pair_count).await;
+    let counts = run_consolidation(context).await.unwrap();
+    assert_eq!(counts.merged, pair_count as u32);
+    assert_eq!(provider.calls(), pair_count);
+    assert_eq!(
+        provider.max_in_flight(),
+        wave,
+        "at concurrency {wave} exactly {wave} batches must overlap at the \
+         provider boundary"
+    );
+    assert!(
+        provider.max_in_flight() <= wave,
+        "in-flight provider calls must never exceed the configured bound"
+    );
+    snapshot_store_state(&store, pair_count).await;
+}
+
+/// Requirement 4.1 (pass-wide parallelism): namespaces with one batch
+/// each must still reach the configured concurrency together — the
+/// disjoint batches are flattened across namespaces into one bounded
+/// stream, not dispatched per namespace. Four namespaces × one batch
+/// each at concurrency 4 must assemble one four-way barrier wave; under
+/// per-namespace dispatch the wave could never form. Per-namespace
+/// progress accounting must still land: every namespace counts as done
+/// once its (single) batch outcome is folded.
+#[tokio::test]
+async fn single_batch_namespaces_flatten_into_one_pass_wide_stream() {
+    let namespaces = 4;
+    let wave = 4;
+    let provider = Arc::new(OverlapConsolidationProvider::new(wave));
+    let progress = Arc::new(ConsolidationProgress::default());
+    let (mut context, store) =
+        test_context_with_concurrency(provider.clone(), None, wave).await;
+    for index in 0..namespaces {
+        for content in [
+            format!("alpha project follows nu{index} psi{index}"),
+            format!("alpha project follows nu{index} psi{index} tail"),
+        ] {
+            store
+                .store_entry(
+                    NewMemoryEntry {
+                        namespace: format!("user::flat{index}"),
+                        content,
+                        memory_type: MemoryType::Fact,
+                        source_request_id: None,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+    }
+    context.progress = Some(Arc::clone(&progress));
     let counts = run_consolidation(context).await.unwrap();
 
-    assert_eq!(counts.skipped_batches, 1);
-    assert_eq!(counts.merged, 0);
-    assert_eq!(counts.superseded, 0);
-    assert_eq!(store.list_entries("user::test", 10, 0).unwrap().entries.len(), 2);
-    assert!(store.get_entry_by_id(first).unwrap().unwrap().superseded_by.is_none());
+    assert_eq!(counts.merged, namespaces as u32);
+    assert_eq!(counts.superseded, 2 * namespaces as u32);
+    assert_eq!(provider.calls(), namespaces);
+    assert_eq!(
+        provider.max_in_flight(),
+        wave,
+        "four one-batch namespaces must overlap at concurrency {wave}"
+    );
+    let snapshot = progress.snapshot();
+    assert_eq!(snapshot.namespaces_total, namespaces as u64);
+    assert_eq!(snapshot.namespaces_done, namespaces as u64);
+    assert_eq!(snapshot.batches_total, namespaces as u64);
+    assert_eq!(snapshot.batches_done, namespaces as u64);
 }
+
+/// Delaying provider whose per-call latency can be forced so the wall-time
+/// reduction from bounded parallelism is observable.
+struct DelayedConsolidationProvider {
+    delay: Duration,
+    calls: AtomicUsize,
+}
+
+impl DelayedConsolidationProvider {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl MemoryExtractionProvider for DelayedConsolidationProvider {
+    async fn extract(
+        &self,
+        _request: MemoryExtractionProviderRequest,
+    ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        Ok(vec![StructuredMemoryCandidate {
+            content: "[]".to_owned(),
+            memory_type: MemoryType::Fact,
+        }])
+    }
+}
+
+/// Merging provider that coordinates concurrent calls through in-flight
+/// counters and a cyclic barrier so the concurrency identity test can
+/// assert real overlap: every wave of `wave_size` calls parks at the
+/// barrier until all of them are in flight simultaneously, then each
+/// answers with a merge decision covering its own batch's entry ids
+/// (disjoint across concurrent calls). A barrier (not a polled counter)
+/// makes the rendezvous race-free: no participant can observe a
+/// partially assembled wave and strand its siblings.
+struct OverlapConsolidationProvider {
+    calls: AtomicUsize,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+    barrier: tokio::sync::Barrier,
+}
+
+impl OverlapConsolidationProvider {
+    fn new(wave_size: usize) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            barrier: tokio::sync::Barrier::new(wave_size),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl MemoryExtractionProvider for OverlapConsolidationProvider {
+    async fn extract(
+        &self,
+        request: MemoryExtractionProviderRequest,
+    ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let entered = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(entered, Ordering::SeqCst);
+        // Park at the barrier until the full wave is concurrently in
+        // flight. At concurrency N the first N dispatched batches meet
+        // here; if execution were sequential, the wave could never
+        // assemble and the provider timeout would fail the pass.
+        self.barrier.wait().await;
+        let payload: serde_json::Value =
+            serde_json::from_str(&request.messages[0].content).unwrap();
+        let source_ids = payload["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let decision = serde_json::json!([{
+            "action": "merge",
+            "source_ids": source_ids,
+            "merged_content": "Deployments run on fly.io in eu-west.",
+        }])
+        .to_string();
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(vec![StructuredMemoryCandidate {
+            content: decision,
+            memory_type: MemoryType::Fact,
+        }])
+    }
+}
+
+    #[tokio::test]
+    #[ignore]
+    async fn wall_time_reduces_with_bounded_parallelism() {
+        // NFR Performance: a multi-batch pass finishes faster when the
+        // provider tolerates concurrent requests. Six batches at 60 ms each:
+        // sequential ~360 ms; concurrency 4 should approach two batch times.
+        let delay = Duration::from_millis(60);
+        let pair_count = 6;
+
+        let provider = Arc::new(DelayedConsolidationProvider::new(delay));
+        let (context, store) = test_context_with_concurrency(provider, None, 1).await;
+        seed_multi_namespace_fixture(&store, pair_count).await;
+        let sequential_start = std::time::Instant::now();
+        run_consolidation(context).await.unwrap();
+        let sequential_elapsed = sequential_start.elapsed();
+
+        let provider = Arc::new(DelayedConsolidationProvider::new(delay));
+        let (context, store) = test_context_with_concurrency(provider, None, 4).await;
+        seed_multi_namespace_fixture(&store, pair_count).await;
+        let parallel_start = std::time::Instant::now();
+        run_consolidation(context).await.unwrap();
+        let parallel_elapsed = parallel_start.elapsed();
+
+        assert!(parallel_elapsed < sequential_elapsed,
+        "parallel pass ({parallel_elapsed:?}) must be faster than sequential ({sequential_elapsed:?})");
+    }
 }

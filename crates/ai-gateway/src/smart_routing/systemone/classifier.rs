@@ -9,6 +9,7 @@
 //! LLM classifiers. No payload content ever reaches logs, metrics, or errors.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,9 @@ use crate::smart_routing::{
 
 use super::client::SystemOneClient;
 use super::compose::{self, ComposeResult, JevTrustConfig};
-use super::discovery::{DiscoveryError, ModelDiscovery, ModelsFetcher, ResolutionOrigin};
+use super::discovery::{
+    DiscoveryError, ModelDiscovery, ModelsFetcher, ResolutionOrigin, ResolvedModel,
+};
 use super::models::{ModelsListing, SystemOneRequest};
 use super::rubric;
 use super::SystemOneFamily;
@@ -63,18 +66,33 @@ pub struct SystemOneClassificationDetail {
     pub confidence: f64,
 }
 
-/// Adapter bridging the async `SystemOneClient` to the sync `ModelsFetcher`
-/// boundary. Runs inside `tokio::task::block_in_place` during resolution so
-/// the synchronous discovery cache stays simple.
-struct ClientFetcher {
-    client: Arc<SystemOneClient>,
+/// Fetcher that records whether discovery actually needs a network fetch.
+/// `ModelDiscovery::resolve` calls `fetch` only after the pinned check and
+/// the TTL cache miss, so `attempted == false` proves the outcome was
+/// served without any fetch — the Req 5.2 fast path.
+struct FetchProbe {
+    attempted: AtomicBool,
 }
 
-impl ModelsFetcher for ClientFetcher {
+impl ModelsFetcher for FetchProbe {
     fn fetch(&self) -> Result<ModelsListing, String> {
-        // Discovery shares the evaluation timeout budget; the caller wraps
-        // this in the per-call timeout already.
-        futures::executor::block_on(self.client.list_models()).map_err(|error| error.to_string())
+        self.attempted.store(true, Ordering::SeqCst);
+        Err("probe".to_string())
+    }
+}
+
+/// Fetcher serving an already-awaited listing result, so
+/// `ModelDiscovery::resolve` performs its full select/cache/fallback logic
+/// on the request path without a blocking network call (Req 5.1).
+struct PrefetchedFetcher {
+    outcome: Result<ModelsListing, String>,
+}
+
+impl ModelsFetcher for PrefetchedFetcher {
+    fn fetch(&self) -> Result<ModelsListing, String> {
+        // `resolve` consumes exactly one fetch; clone preserves the
+        // original for a hypothetical second call.
+        self.outcome.clone()
     }
 }
 
@@ -195,8 +213,15 @@ impl CacheState {
 pub struct SystemOneClassifier {
     family: SystemOneFamily,
     client: Arc<SystemOneClient>,
-    discovery: ModelDiscovery,
-    fetcher: ClientFetcher,
+    discovery: Arc<ModelDiscovery>,
+    /// Serializes discovery resolution (probe → fetch → replay) for this
+    /// classifier so the probe's transient sentinel entry is never
+    /// observable by another caller: concurrent resolves wait here and then
+    /// serve the real cached outcome.
+    discovery_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The listing fetch used on a confirmed cache miss; injectable in
+    /// tests so discovery semantics are provable without network.
+    discovery_fetch: ListingFetch,
     settings: SystemOneEndpointSettings,
     trust: JevTrustConfig,
     timeout: Duration,
@@ -237,19 +262,21 @@ impl SystemOneClassifier {
             )
             .map_err(|_| ClassifierFailure::Backend)?,
         );
-        let discovery = ModelDiscovery::new(family, &settings.model, settings.discovery_ttl_secs);
-        let fetcher = ClientFetcher {
-            client: client.clone(),
-        };
+        let discovery = Arc::new(ModelDiscovery::new(
+            family,
+            &settings.model,
+            settings.discovery_ttl_secs,
+        ));
         let effective_char_budget = Mutex::new(settings.char_budget);
 
-        Ok(Self {
-            family,
-            cache: ScoreCache::new(SCORE_CACHE_CAPACITY, SCORE_CACHE_TTL),
-            client,
-            discovery,
-            fetcher,
-            settings,
+    Ok(Self {
+        family,
+        cache: ScoreCache::new(SCORE_CACHE_CAPACITY, SCORE_CACHE_TTL),
+        client: Arc::clone(&client),
+        discovery,
+        discovery_gate: Arc::new(tokio::sync::Mutex::new(())),
+        discovery_fetch: ListingFetch::Client(client),
+        settings,
             trust,
             timeout,
             effective_char_budget,
@@ -258,25 +285,26 @@ impl SystemOneClassifier {
     }
 
     /// Best-effort startup resolution so the first request does not pay the
-    /// discovery cost and operators see the resolved model in logs.
+    /// discovery cost and operators see the resolved model in logs. Spawned
+    /// because router construction is synchronous; the fetch runs on the
+    /// async runtime (no tokio worker is blocked or removed from rotation).
+    /// Priming goes through the same resolve helper as the request path so
+    /// the pinned/cached fast path and negative-cache TTL semantics apply.
     pub fn prime_discovery(&self) {
-        let outcome = tokio::task::block_in_place(|| self.discovery.resolve(&self.fetcher));
-        match outcome {
-            Ok(resolved) => tracing::info!(
-                family = self.family.name,
-                model = %resolved.model,
-                origin = ?resolved.origin,
-                "System One classifier ready"
-            ),
-            Err(DiscoveryError::NoModelAtEndpoint) => {
-                // ModelDiscovery already emitted its rate-limited warning.
-            }
-            Err(error) => tracing::warn!(
-                family = self.family.name,
-                error = %format!("{error:?}"),
-                "System One classifier model discovery deferred to first request"
-            ),
+        let resolver = DiscoveryResolver {
+            discovery: Arc::clone(&self.discovery),
+            gate: Arc::clone(&self.discovery_gate),
+            fetch: self.discovery_fetch.clone(),
+        };
+        let family = self.family;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let outcome = resolver.resolve().await;
+                log_priming(family.name, outcome);
+            });
         }
+        // Without a runtime there is nothing to prime onto; discovery
+        // defers to the first request as before.
     }
 
     /// Invalidate cached discovery (hot-reload semantics).
@@ -356,7 +384,9 @@ impl SystemOneClassifier {
             ));
         }
 
-        let resolved = tokio::task::block_in_place(|| self.discovery.resolve(&self.fetcher))
+        let resolved = self
+            .resolve_discovery()
+            .await
             .map_err(map_discovery_failure)?;
         let discovery_refreshed = matches!(resolved.origin, ResolutionOrigin::Auto);
 
@@ -392,14 +422,14 @@ impl SystemOneClassifier {
                     .call_failure_warnings
                     .allow(self.family.name, other.class())
                 {
-                let status = match &other {
-                    super::client::SystemOneCallError::Transient { status }
-                    | super::client::SystemOneCallError::Auth { status }
-                    | super::client::SystemOneCallError::BadRequest { status, .. } => {
-                        Some(*status)
-                    }
-                    _ => None,
-                };
+                    let status = match &other {
+                        super::client::SystemOneCallError::Transient { status }
+                        | super::client::SystemOneCallError::Auth { status }
+                        | super::client::SystemOneCallError::BadRequest { status, .. } => {
+                            Some(*status)
+                        }
+                        _ => None,
+                    };
                     tracing::warn!(
                         family = %self.family.name,
                         error_class = %other.class(),
@@ -516,6 +546,106 @@ impl OptionalClassifier for SystemOneClassifier {
     }
 }
 
+impl SystemOneClassifier {
+    /// Resolve model discovery without blocking a tokio worker (Req 5.1).
+    async fn resolve_discovery(&self) -> Result<ResolvedModel, DiscoveryError> {
+        DiscoveryResolver {
+            discovery: Arc::clone(&self.discovery),
+            gate: Arc::clone(&self.discovery_gate),
+            fetch: self.discovery_fetch.clone(),
+        }
+        .resolve()
+        .await
+    }
+}
+
+/// Gated discovery resolution shared by the request path and priming.
+///
+/// A probe resolve runs first, mirroring `ModelDiscovery::resolve`'s sync
+/// pinned/cached fast path. When the probe's fetcher is never invoked the
+/// outcome came from a pin or a fresh (including negatively cached) entry,
+/// so it is returned as-is — no network await, nothing spawned (Req 5.2).
+/// Only a confirmed miss (the probe's fetcher fired) awaits the real
+/// listing fetch and replays the outcome through
+/// `ModelDiscovery::resolve`, dropping the probe's sentinel entry first so
+/// TTL caching, negative caching, and the Laya missing-listing fallback
+/// all run through discovery's own unchanged logic (Req 5.1).
+///
+/// The whole miss path (probe → invalidate → await fetch → replay) runs
+/// behind a per-classifier async gate. The probe stores a sentinel
+/// `"probe"` failure via `ModelDiscovery::resolve`'s own caching; the gate
+/// guarantees no other caller of this classifier resolves between the
+/// store and the `invalidate()`: concurrent callers queue on the gate and
+/// then observe only REAL outcomes — a fresh resolution or a negative
+/// cache entry written by the fetch path. From every other caller's point
+/// of view the probe is read-only against the cache.
+struct DiscoveryResolver {
+    discovery: Arc<ModelDiscovery>,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    fetch: ListingFetch,
+}
+
+impl DiscoveryResolver {
+    async fn resolve(&self) -> Result<ResolvedModel, DiscoveryError> {
+        let _guard = self.gate.lock().await;
+        let probe = FetchProbe {
+            attempted: AtomicBool::new(false),
+        };
+        let outcome = self.discovery.resolve(&probe);
+        if !probe.attempted.load(Ordering::SeqCst) {
+            return outcome;
+        }
+        self.discovery.invalidate();
+        let fetcher = PrefetchedFetcher {
+            outcome: self.fetch.fetch().await,
+        };
+        self.discovery.resolve(&fetcher)
+    }
+}
+
+/// The real listing fetch performed once the probe confirms a cache miss.
+/// Production awaits the client's native async `list_models`; tests
+/// inject a deterministic counted fetch so discovery behavior is provable
+/// without network.
+#[derive(Clone)]
+enum ListingFetch {
+    /// Production: `SystemOneClient::list_models`.
+    Client(Arc<SystemOneClient>),
+    /// Test seam: a deterministic, call-counted fetch (F4).
+    #[cfg(test)]
+    Injected(Arc<tests::CountingFetcher>),
+}
+
+impl ListingFetch {
+    async fn fetch(&self) -> Result<ModelsListing, String> {
+        match self {
+            Self::Client(client) => client.list_models().await.map_err(|e| e.to_string()),
+            #[cfg(test)]
+            Self::Injected(fetcher) => fetcher.fetch().await,
+        }
+    }
+}
+
+/// Priming outcome logging, unchanged from the blocking version.
+fn log_priming(family: &'static str, outcome: Result<ResolvedModel, DiscoveryError>) {
+    match outcome {
+        Ok(resolved) => tracing::info!(
+            family,
+            model = %resolved.model,
+            origin = ?resolved.origin,
+            "System One classifier ready"
+        ),
+        Err(DiscoveryError::NoModelAtEndpoint) => {
+            // ModelDiscovery already emitted its rate-limited warning.
+        }
+        Err(error) => tracing::warn!(
+            family,
+            error = %format!("{error:?}"),
+            "System One classifier model discovery deferred to first request"
+        ),
+    }
+}
+
 fn map_discovery_failure(error: DiscoveryError) -> ClassifierFailure {
     match error {
         DiscoveryError::NoModelAtEndpoint => ClassifierFailure::NoJevAtEndpoint,
@@ -583,6 +713,7 @@ mod tests {
 
     use super::*;
     use crate::models::openai::Message;
+    use crate::smart_routing::systemone::models::ModelEntry;
 
     fn settings() -> SystemOneEndpointSettings {
         SystemOneEndpointSettings {
@@ -643,7 +774,7 @@ mod tests {
         assert_eq!(classifier.reduce_char_budget(), 256, "floor is respected");
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn classify_without_network_fails_gracefully() {
         // The default base URL is unreachable in tests; every outcome must be
         // a typed failure, never a panic. Timeout is the expected class since
@@ -666,6 +797,167 @@ mod tests {
             .await;
         assert!(outcome.is_err());
     }
+
+    /// Req 5.2: a pinned model serves discovery synchronously — the probe
+    /// fetcher never fires, so no network future is created and nothing is
+    /// spawned. Behavioral proof: resolution succeeds without any fetch.
+    #[tokio::test]
+    async fn discovery_fast_path_serves_pin_without_fetch() {
+        let mut pinned = settings();
+        pinned.model = "jev-1.13.0".to_string();
+        let classifier = SystemOneClassifier::new(SystemOneFamily::JEV, pinned, "key").unwrap();
+
+        let resolved = classifier.resolve_discovery().await.unwrap();
+        assert_eq!(resolved.model, "jev-1.13.0");
+        assert_eq!(resolved.origin, ResolutionOrigin::Pinned);
+    }
+
+/// Req 5.2: a fresh cached resolution serves discovery without a fetch —
+/// the probe fetcher never fires on the second call.
+#[tokio::test]
+async fn discovery_fast_path_serves_cache_without_fetch() {
+    // Prime the cache by hand (no network): the listing path runs through
+    // ModelDiscovery's own logic.
+    let classifier = SystemOneClassifier::new(SystemOneFamily::JEV, settings(), "key").unwrap();
+    let listing = ModelsListing {
+        data: vec![ModelEntry {
+            id: "jev-1.13.0".to_string(),
+            owned_by: None,
+        }],
+    };
+    let primed = crate::smart_routing::systemone::discovery::ModelDiscovery::resolve(
+        &classifier.discovery,
+        &PrefetchedFetcher {
+            outcome: Ok(listing),
+        },
+    )
+    .unwrap();
+    assert_eq!(primed.origin, ResolutionOrigin::Auto);
+
+    // Cache hit: served as Cached without any fetch attempt.
+    let resolved = classifier.resolve_discovery().await.unwrap();
+    assert_eq!(resolved.model, "jev-1.13.0");
+    assert_eq!(resolved.origin, ResolutionOrigin::Cached);
+}
+
+/// Deterministic, call-counted listing fetch for discovery tests: no
+/// network, replays a fixed outcome, and records how many times the
+/// real-fetch seam fired.
+pub(crate) struct CountingFetcher {
+    listing: Result<ModelsListing, String>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingFetcher {
+    fn listing(ids: &[&str]) -> Self {
+        Self {
+            listing: Ok(ModelsListing {
+                data: ids
+                    .iter()
+                    .map(|id| ModelEntry {
+                        id: id.to_string(),
+                        owned_by: None,
+                    })
+                    .collect(),
+            }),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn failing(message: &str) -> Self {
+        Self {
+            listing: Err(message.to_string()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn fetch(&self) -> Result<ModelsListing, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.listing.clone()
+    }
+}
+
+/// Build a classifier whose miss-path listing fetch is the injected
+/// `CountingFetcher` instead of the network client.
+fn classifier_with_fetch(
+    fetcher: Arc<CountingFetcher>,
+) -> SystemOneClassifier {
+    let mut classifier = SystemOneClassifier::new(SystemOneFamily::JEV, settings(), "key").unwrap();
+    classifier.discovery_fetch = ListingFetch::Injected(fetcher);
+    classifier
+}
+
+/// Req 5.1 + 4 (F4a): a successful miss-path discovery resolves via the
+/// async fetch, caches the resolution, and the next resolve is served
+/// from the TTL cache with zero additional fetch calls.
+#[tokio::test]
+async fn discovery_success_populates_cache_and_cache_hit_skips_refetch() {
+    let fetcher = Arc::new(CountingFetcher::listing(&["jev-1.12.0", "jev-1.13.0"]));
+    let classifier = classifier_with_fetch(Arc::clone(&fetcher));
+
+    // Miss → real fetch → Auto resolution cached.
+    let first = classifier.resolve_discovery().await.unwrap();
+    assert_eq!(first.model, "jev-1.13.0");
+    assert_eq!(first.origin, ResolutionOrigin::Auto);
+    assert_eq!(fetcher.calls(), 1);
+
+    // Cache hit inside the TTL: no refetch.
+    let second = classifier.resolve_discovery().await.unwrap();
+    assert_eq!(second.model, "jev-1.13.0");
+    assert_eq!(second.origin, ResolutionOrigin::Cached);
+    assert_eq!(fetcher.calls(), 1);
+}
+
+/// Req 5.1 + 4 (F4c): a failed miss-path discovery negative-caches the
+/// typed failure; a subsequent resolve within the TTL errors again
+/// WITHOUT a refetch.
+#[tokio::test]
+async fn discovery_failure_is_negatively_cached_within_ttl() {
+    let fetcher = Arc::new(CountingFetcher::failing("endpoint unreachable"));
+    let classifier = classifier_with_fetch(Arc::clone(&fetcher));
+
+    let first = classifier.resolve_discovery().await;
+    assert!(matches!(first, Err(DiscoveryError::Listing(_))));
+    assert_eq!(fetcher.calls(), 1);
+
+    // Served from the negative cache: same typed error, no refetch.
+    let second = classifier.resolve_discovery().await;
+    assert!(matches!(second, Err(DiscoveryError::Listing(_))));
+    assert_eq!(fetcher.calls(), 1);
+}
+
+/// F3 (via F4d): concurrent resolves on a cache miss never observe the
+/// probe's transient sentinel failure — the per-classifier gate
+/// serializes probe → invalidate → fetch → replay, so every caller sees
+/// either the real resolution or the real (negative-)cached outcome, and
+/// the real fetch fires exactly once.
+#[tokio::test]
+async fn concurrent_misses_never_observe_probe_sentinel() {
+    let fetcher = Arc::new(CountingFetcher::listing(&["jev-1.13.0"]));
+    let classifier = Arc::new(classifier_with_fetch(Arc::clone(&fetcher)));
+
+    let mut resolves = Vec::new();
+    for _ in 0..8 {
+        let classifier = Arc::clone(&classifier);
+        resolves.push(tokio::spawn(async move {
+            classifier.resolve_discovery().await
+        }));
+    }
+    let outcomes = futures::future::join_all(resolves).await;
+
+    // Exactly one real fetch; every caller resolved the real model and
+    // never saw the probe's `Listing("probe")` sentinel.
+    assert_eq!(fetcher.calls(), 1);
+    for outcome in outcomes {
+        let resolved = outcome.unwrap();
+        assert_eq!(resolved.unwrap().model, "jev-1.13.0");
+    }
+}
+
 
     #[test]
     fn fingerprint_ignores_tool_messages() {

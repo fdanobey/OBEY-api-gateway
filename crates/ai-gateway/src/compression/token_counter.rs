@@ -49,28 +49,31 @@ impl TokenCounter {
     /// be counted twice.
     pub fn count_request(&self, request: &OpenAIRequest) -> u32 {
         let bpe = self.for_model(&request.model);
-        let mut total = Self::count_with(bpe, &request.model);
+        let mut total = Self::count_request_skeleton(bpe, &request.model, &request.extra);
 
         for message in &request.messages {
             total = total.saturating_add(Self::count_message_with(bpe, message));
         }
 
-        if let Some(tools) = request.extra.get("tools") {
-            total = total.saturating_add(Self::count_json_with(bpe, tools));
-        }
-        if let Some(tool_choice) = request.extra.get("tool_choice") {
-            total = total.saturating_add(Self::count_json_with(bpe, tool_choice));
-        }
+        total
+    }
 
-        for (key, value) in &request.extra {
-            if key == "tools" || key == "tool_choice" {
-                continue;
-            }
-            total = total.saturating_add(Self::count_with(bpe, key));
-            total = total.saturating_add(Self::count_json_with(bpe, value));
-        }
+    /// Counts tokens per message exactly like `count_request` on a clone of
+    /// `request` keeping only that message, in a single pass over the message
+    /// list with no whole-request clones.
+    ///
+    /// The request skeleton (model, top-level tools, tool choice, other
+    /// extension fields and reply priming) is encoded once and added to every
+    /// per-message framing, role, content and extension-field count.
+    pub fn count_per_message(&self, request: &OpenAIRequest) -> Vec<u64> {
+        let bpe = self.for_model(&request.model);
+        let base = Self::count_request_skeleton(bpe, &request.model, &request.extra);
 
-        total.saturating_add(REPLY_PRIMING_TOKENS)
+        request
+            .messages
+            .iter()
+            .map(|message| u64::from(base.saturating_add(Self::count_message_with(bpe, message))))
+            .collect()
     }
 
     /// Character-based fallback for callers that cannot use a tokenizer.
@@ -117,6 +120,31 @@ impl TokenCounter {
             before.is_none_or(|character| !character.is_ascii_alphanumeric())
                 && after.is_none_or(|character| !character.is_ascii_alphanumeric())
         })
+    }
+
+    fn count_request_skeleton(
+        bpe: &CoreBPE,
+        model: &str,
+        extra: &serde_json::Map<String, Value>,
+    ) -> u32 {
+        let mut total = Self::count_with(bpe, model);
+
+        if let Some(tools) = extra.get("tools") {
+            total = total.saturating_add(Self::count_json_with(bpe, tools));
+        }
+        if let Some(tool_choice) = extra.get("tool_choice") {
+            total = total.saturating_add(Self::count_json_with(bpe, tool_choice));
+        }
+
+        for (key, value) in extra {
+            if key == "tools" || key == "tool_choice" {
+                continue;
+            }
+            total = total.saturating_add(Self::count_with(bpe, key));
+            total = total.saturating_add(Self::count_json_with(bpe, value));
+        }
+
+        total.saturating_add(REPLY_PRIMING_TOKENS)
     }
 
     fn count_message_with(bpe: &CoreBPE, message: &Message) -> u32 {
@@ -296,6 +324,67 @@ mod tests {
         let text = "a".repeat(100_000);
 
         assert!(counter.count_text("gpt-4o", &text) > 0);
+    }
+
+    fn legacy_single_message_request_count(
+        counter: &TokenCounter,
+        request: &OpenAIRequest,
+        index: usize,
+    ) -> u64 {
+        let mut one = request.clone();
+        one.messages = vec![request.messages[index].clone()];
+        u64::from(counter.count_request(&one))
+    }
+
+    #[test]
+    fn count_per_message_matches_single_message_request_counts() {
+        let counter = TokenCounter::new();
+        let mut extra = Map::new();
+        extra.insert(
+            "tools".to_owned(),
+            json!([{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}]),
+        );
+        extra.insert("top_p".to_owned(), json!(0.9));
+
+        for message_count in [1usize, 5, 50, 200] {
+            let messages = (0..message_count)
+                .map(|index| {
+                    if index % 5 == 0 {
+                        let mut assistant = message(
+                            "assistant",
+                            json!([{"type": "text", "text": format!("Part {index}.")}]),
+                        );
+                        assistant.extra.insert(
+                            "tool_calls".to_owned(),
+                            json!([{"id": format!("call_{index}"), "type": "function", "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}}]),
+                        );
+                        assistant
+                    } else if index % 5 == 1 {
+                        message("system", json!(format!("System note {index}.")))
+                    } else if index % 5 == 2 {
+                        message("user", json!(format!("Question number {index} about tokens?")))
+                    } else if index % 5 == 3 {
+                        message("user", serde_json::Value::Null)
+                    } else {
+                        message(
+                            "user",
+                            json!([{"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}]),
+                        )
+                    }
+                })
+                .collect();
+            let request = request("gpt-4o", messages, extra.clone());
+
+            let per_message = counter.count_per_message(&request);
+            assert_eq!(per_message.len(), message_count);
+            for (index, tokens) in per_message.into_iter().enumerate() {
+                assert_eq!(
+                    tokens,
+                    legacy_single_message_request_count(&counter, &request, index),
+                    "message {index} of {message_count} must match the legacy recount"
+                );
+            }
+        }
     }
 
     proptest! {

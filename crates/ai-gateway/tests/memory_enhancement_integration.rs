@@ -206,6 +206,34 @@ async fn create_entry(system: &MemorySystem, namespace: &str, content: &str) -> 
         .expect("entry creation should succeed")
 }
 
+/// Trigger a manual consolidation background job and poll the registry
+/// until it reaches a terminal state, returning the recorded counts.
+async fn run_consolidation_job_to_completion(system: &MemorySystem) -> ConsolidationCounts {
+    let job_id = system
+        .start_consolidation_job()
+        .await
+        .expect("manual consolidation job must be accepted");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = system
+                .consolidation_job_status()
+                .await
+                .expect("job record must exist after a trigger");
+            assert_eq!(status.job_id, job_id, "registry must keep the latest job");
+            if let Some(counts) = status.counts {
+                assert_ne!(
+                    status.state,
+                    ai_gateway::memory::ConsolidationJobState::Running
+                );
+                return counts;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("consolidation job must reach a terminal state")
+}
+
 /// Mirror the src-test convention: poll with `yield_now` inside a timeout
 /// until spawned vector tasks have recorded `expected` matching events.
 async fn wait_for_events(tier: &RecordingVectorTier, event: &str, expected: usize) {
@@ -329,7 +357,12 @@ async fn gateway_with_memory(mock_uri: &str) -> GatewayFixture {
         .await
         .clone()
         .expect("memory system should initialize");
-    create_entry(&system, "user::default", "The user prefers dark mode in editors").await;
+    create_entry(
+        &system,
+        "user::default",
+        "The user prefers dark mode in editors",
+    )
+    .await;
     let app = server.build_router();
     GatewayFixture {
         server,
@@ -356,8 +389,8 @@ fn chat_request_with_stream(
         "messages": [{ "role": "user", "content": user_content }],
         "stream": stream
     });
-    let mut builder = Request::post("/v1/chat/completions")
-        .header("content-type", "application/json");
+    let mut builder =
+        Request::post("/v1/chat/completions").header("content-type", "application/json");
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
@@ -383,9 +416,11 @@ fn any_message_contains(body: &serde_json::Value, needle: &str) -> bool {
     body["messages"]
         .as_array()
         .map(|messages| {
-            messages
-                .iter()
-                .any(|message| message["content"].as_str().is_some_and(|c| c.contains(needle)))
+            messages.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains(needle))
+            })
         })
         .unwrap_or(false)
 }
@@ -416,7 +451,10 @@ async fn admin_edit_updates_content_type_and_reindexes() {
     let updated: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(updated["content"], "Edited useful content for the entry.");
     assert_eq!(updated["memory_type"], "context");
-    assert!(updated["updated_at"].is_i64(), "edit must record updated_at");
+    assert!(
+        updated["updated_at"].is_i64(),
+        "edit must record updated_at"
+    );
 
     // Reindex path: the stale point is deleted (awaited inline by
     // admin_edit) and the edited entry is re-indexed by a spawned task.
@@ -483,10 +521,18 @@ async fn admin_edit_rejects_invalid_and_sensitive_content() {
 async fn superseded_entry_is_excluded_from_retrieval_but_listed() {
     let provider = Arc::new(FakeExtractionProvider::new());
     let MemoryFixture { system, .. } = memory_system_with(provider).await;
-    let old =
-        create_entry(&system, "user::default", "The API endpoint is example.com/api/v1").await;
-    let new =
-        create_entry(&system, "user::default", "The API endpoint is example.com/api/v2").await;
+    let old = create_entry(
+        &system,
+        "user::default",
+        "The API endpoint is example.com/api/v1",
+    )
+    .await;
+    let new = create_entry(
+        &system,
+        "user::default",
+        "The API endpoint is example.com/api/v2",
+    )
+    .await;
 
     let app = ai_gateway::memory::admin::routes(system.clone());
     let request = Request::post(format!("/entries/{}/supersede", old.id))
@@ -568,7 +614,9 @@ async fn admin_delete_endpoint_issues_vector_point_delete() {
     let entry = create_entry(&system, "user::delete-http", DUP_A).await;
 
     let app = ai_gateway::memory::admin::routes(system.clone());
-    let request = Request::delete(format!("/entries/{}", entry.id)).body(Body::empty()).unwrap();
+    let request = Request::delete(format!("/entries/{}", entry.id))
+        .body(Body::empty())
+        .unwrap();
     let (status, _body) = send(app, request).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
@@ -581,7 +629,9 @@ async fn admin_delete_endpoint_issues_vector_point_delete() {
 
     // A repeated DELETE answers 404 without a second tier delete.
     let app = ai_gateway::memory::admin::routes(system);
-    let request = Request::delete(format!("/entries/{}", entry.id)).body(Body::empty()).unwrap();
+    let request = Request::delete(format!("/entries/{}", entry.id))
+        .body(Body::empty())
+        .unwrap();
     let (status, _body) = send(app, request).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(tier.count(&format!("delete:{}", entry.id)), 1);
@@ -683,7 +733,7 @@ async fn consolidation_merges_near_duplicates_and_supersedes_sources() {
         .to_string(),
     );
 
-    let counts = system.run_consolidation_now().await.unwrap();
+    let counts = run_consolidation_job_to_completion(&system).await;
     assert_eq!(
         counts,
         ConsolidationCounts {
@@ -738,7 +788,7 @@ async fn malformed_provider_output_skips_batch_and_serving_continues() {
     let _b = create_entry(&system, "user::malformed", DUP_B).await;
 
     provider.set_raw_output("this is not valid JSON".to_owned());
-    let counts = system.run_consolidation_now().await.unwrap();
+    let counts = run_consolidation_job_to_completion(&system).await;
     assert_eq!(counts.skipped_batches, 1);
     assert_eq!(counts.merged, 0);
     assert_eq!(counts.superseded, 0);
@@ -775,8 +825,18 @@ async fn admin_search_finds_entries_across_namespaces() {
     let provider = Arc::new(FakeExtractionProvider::new());
     let MemoryFixture { system, .. } = memory_system_with(provider).await;
     create_entry(&system, "user::alpha", "Kubernetes rollout strategy notes").await;
-    create_entry(&system, "user::beta", "Kubernetes ingress configuration details").await;
-    create_entry(&system, "user::gamma", "Unrelated lunch preferences listed here").await;
+    create_entry(
+        &system,
+        "user::beta",
+        "Kubernetes ingress configuration details",
+    )
+    .await;
+    create_entry(
+        &system,
+        "user::gamma",
+        "Unrelated lunch preferences listed here",
+    )
+    .await;
 
     let app = ai_gateway::memory::admin::routes(system);
     let request = Request::get("/search?q=kubernetes")
@@ -832,9 +892,11 @@ async fn admin_export_includes_superseded_entries_and_total() {
     let entries = export["entries"].as_array().unwrap();
     let superseded = entries
         .iter()
-        .find(|entry| entry["content"]
-            .as_str()
-            .is_some_and(|content| content.contains("superseded")))
+        .find(|entry| {
+            entry["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("superseded"))
+        })
         .expect("export must include the superseded entry");
     assert_eq!(
         superseded["superseded_by"].as_str().unwrap(),
@@ -1031,7 +1093,9 @@ fn consolidation_falls_back_to_auto_extract_pair() {
         auto_extract_model: "test-model".to_owned(),
         ..MemoryConfig::default()
     };
-    assert!(config.validate_with_provider_names(["test-provider"]).is_ok());
+    assert!(config
+        .validate_with_provider_names(["test-provider"])
+        .is_ok());
     assert_eq!(
         config.resolve_consolidation_pair().unwrap(),
         ("test-provider".to_owned(), "test-model".to_owned())
@@ -1042,7 +1106,12 @@ fn consolidation_falls_back_to_auto_extract_pair() {
 async fn gateway_hot_reload_applies_consolidation_settings() {
     let mock = start_mock_provider().await;
     let server_uri = mock.uri();
-    let GatewayFixture { server, system, mut config, .. } = gateway_with_memory(&server_uri).await;
+    let GatewayFixture {
+        server,
+        system,
+        mut config,
+        ..
+    } = gateway_with_memory(&server_uri).await;
     assert!(
         !system.config.read().await.consolidation_enabled,
         "consolidation must start disabled"

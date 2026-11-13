@@ -2329,6 +2329,11 @@ body.sec-banner-active{padding-top:3.2rem}
 <div class="hint">Empty falls back to the auto-extract model; list shows the effective (fallback) provider's models</div>
 </div>
 </div>
+<div class="form-group">
+<label for="mem-consolidation-max-concurrent">Max Concurrent Batches</label>
+<input type="number" id="mem-consolidation-max-concurrent" value="2" min="1" max="8" style="max-width:200px">
+<div class="hint">Batches processed in parallel during one consolidation pass (1–8)</div>
+</div>
 </fieldset>
 
     <fieldset><legend>Vector Search (Qdrant)</legend>
@@ -7649,6 +7654,7 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
     document.getElementById('mem-extract-min-turns').value = mem.auto_extract_min_turns || 4;
 document.getElementById('mem-extract-timeout').value = mem.auto_extract_timeout_seconds || 30;
 document.getElementById('mem-consolidation-enabled').checked = !!mem.consolidation_enabled;
+document.getElementById('mem-consolidation-max-concurrent').value = mem.consolidation_max_concurrent_batches != null ? mem.consolidation_max_concurrent_batches : 2;
 document.getElementById('mem-consolidation-provider').value = mem.consolidation_provider || '';
 var consolEffProv = mem.consolidation_provider || mem.auto_extract_provider || '';
 if (consolEffProv) {
@@ -7667,11 +7673,12 @@ setSelectOptions(document.getElementById('mem-consolidation-model'), '-- select 
     }
 document.getElementById('mem-qdrant-fts-weight').value = q.fts_weight != null ? q.fts_weight : 0.4;
 document.getElementById('mem-qdrant-vector-weight').value = q.vector_weight != null ? q.vector_weight : 0.5;
-var vdEl = document.getElementById('mem-qdrant-vector-dimension');
-vdEl.value = q.vector_dimension != null ? q.vector_dimension : '';
-memLoadStats();
+    var vdEl = document.getElementById('mem-qdrant-vector-dimension');
+    vdEl.value = q.vector_dimension != null ? q.vector_dimension : '';
+    memLoadStats();
     memLoadProjects();
-  }
+    memLoadConsolidationStatus();
+}
 
   function collectMemory() {
     var mem = {
@@ -7687,6 +7694,7 @@ auto_extract_timeout_seconds: parseInt(document.getElementById('mem-extract-time
 consolidation_enabled: document.getElementById('mem-consolidation-enabled').checked,
 consolidation_provider: document.getElementById('mem-consolidation-provider').value.trim(),
 consolidation_model: document.getElementById('mem-consolidation-model').value.trim(),
+consolidation_max_concurrent_batches: parseInt(document.getElementById('mem-consolidation-max-concurrent').value, 10) || 2,
       decay_schedule_hours: parseInt(document.getElementById('mem-decay-hours').value, 10) || 24,
       max_memories_per_namespace: parseInt(document.getElementById('mem-max-per-ns').value, 10) || 1000,
       allow_sensitive_storage: document.getElementById('mem-allow-sensitive').checked,
@@ -8126,30 +8134,131 @@ setStatus('Memory export downloaded (' + (data.total != null ? data.total : (dat
 })
 .catch(function(err) { setStatus('Memory export failed: ' + err.message); showToast('Export failed: ' + err.message, true); });
 });
+// Background consolidation job (202 + job id): submit, then poll the
+// status endpoint until the job reaches a terminal state.
+var memConsolidatePoll = null;
+// The status endpoint answers the job object DIRECTLY (flat shape) once
+// any job was triggered; only a never-triggered system answers
+// {"job": null}. Accept both shapes (F1).
+function memExtractJob(d) {
+    if (!d) return null;
+    if (d.job) return d.job;
+    return (d.job_id && d.state) ? d : null;
+}
+function memFormatJobSummary(job) {
+    var parts = 'Namespaces ' + (job.namespaces_done != null ? job.namespaces_done : '?') + '/' + (job.namespaces_total != null ? job.namespaces_total : '?') +
+    ', batches ' + (job.batches_done != null ? job.batches_done : '?') + '/' + (job.batches_total != null ? job.batches_total : '?');
+    if (job.error_summary && job.error_summary.length) {
+        parts += ', errors ' + job.error_summary.map(function(e) { return e.class + '×' + e.count; }).join(', ');
+    }
+    return parts;
+}
+function memRenderJobStatus(job) {
+    var statusEl = document.getElementById('mem-consolidate-status');
+    if (!job) { statusEl.textContent = ''; return; }
+    if (job.state === 'running' || job.state === 'queued') {
+        statusEl.textContent = 'Job ' + job.job_id + ' — ' + memFormatJobSummary(job);
+        statusEl.style.color = 'var(--text-muted)';
+    } else if (job.state === 'completed') {
+        statusEl.textContent = 'Job ' + job.job_id + ' completed — ' + memFormatJobSummary(job);
+        statusEl.style.color = job.error_summary && job.error_summary.length ? '#8a6d0b' : 'var(--success)';
+    } else {
+        statusEl.textContent = 'Job ' + job.job_id + ' failed — ' + memFormatJobSummary(job);
+        statusEl.style.color = 'var(--danger)';
+    }
+}
+function memPollConsolidation(jobId, done) {
+    if (memConsolidatePoll) { clearTimeout(memConsolidatePoll); }
+    memConsolidatePoll = setTimeout(function() {
+        fetch(memApiUrl('consolidation/status'))
+        .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function(d) {
+            var job = memExtractJob(d);
+            if (!job) {
+                // No job recorded (never triggered, or the gateway lost
+                // the in-memory record): graceful empty state, not an
+                // error — stop polling and restore the button.
+                memConsolidatePoll = null;
+                memRenderJobStatus(null);
+                document.getElementById('mem-consolidate-btn').disabled = false;
+                setStatus('No consolidation job recorded');
+                return;
+            }
+            memRenderJobStatus(job);
+            if (job.state === 'running' || job.state === 'queued') { memPollConsolidation(jobId, done); return; }
+            memConsolidatePoll = null;
+            done(job);
+        })
+        .catch(function(err) {
+            memConsolidatePoll = null;
+            document.getElementById('mem-consolidate-btn').disabled = false;
+            var statusEl = document.getElementById('mem-consolidate-status');
+            statusEl.textContent = 'Status check failed';
+            statusEl.style.color = 'var(--danger)';
+            statusEl.title = err.message || 'Consolidation status unavailable';
+            setStatus('Consolidation status failed: ' + err.message);
+        });
+    }, 1000);
+}
+// Panel load: fetch the current job status once so reopening the Memory
+// panel shows an in-flight job (and resumes polling) or the last job's
+// terminal state instead of a blank line (F2). {"job": null} clears the
+// line — a graceful empty state, not an error.
+function memLoadConsolidationStatus() {
+    fetch(memApiUrl('consolidation/status'))
+    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function(d) {
+        var job = memExtractJob(d);
+        if (!job) {
+            if (!memConsolidatePoll) { memRenderJobStatus(null); }
+            return;
+        }
+        memRenderJobStatus(job);
+        if ((job.state === 'running' || job.state === 'queued') && !memConsolidatePoll) {
+            memPollConsolidation(job.job_id, function(doneJob) {
+                setStatus(doneJob.state === 'completed'
+                    ? 'Consolidation job completed'
+                    : 'Consolidation job failed');
+                memLoadStats();
+                if (memLastListUrl) { memRefreshList(); }
+            });
+        }
+    })
+    .catch(function() {
+        // Status surface is best-effort on panel load: leave whatever the
+        // line already shows rather than reporting an error.
+    });
+}
 document.getElementById('mem-consolidate-btn').addEventListener('click', function() {
 var btn = document.getElementById('mem-consolidate-btn');
 var statusEl = document.getElementById('mem-consolidate-status');
 btn.disabled = true;
-statusEl.textContent = 'Running…';
+statusEl.textContent = 'Submitting…';
 statusEl.style.color = 'var(--text-muted)';
 fetch(memApiUrl('consolidate'), { method: 'POST' })
 .then(function(r) { return r.json().then(function(d) { if (!r.ok) throw Object.assign(new Error((d.error && d.error.message) || 'HTTP ' + r.status), { status: r.status, type: d.error && d.error.type }); return d; }); })
-.then(function(counts) {
+.then(function(d) {
+if (memConsolidatePoll) { clearTimeout(memConsolidatePoll); memConsolidatePoll = null; }
+statusEl.textContent = 'Job started (' + (d.job_id || 'unknown id') + ')';
+statusEl.style.color = 'var(--text-muted)';
+setStatus('Consolidation job started');
+showToast('Consolidation job started');
+memPollConsolidation(d.job_id, function(job) {
 btn.disabled = false;
-statusEl.textContent = 'Merged ' + (counts.merged != null ? counts.merged : '?') +
-', superseded ' + (counts.superseded != null ? counts.superseded : '?') +
-', kept ' + (counts.kept != null ? counts.kept : '?') +
-', skipped ' + (counts.skipped_batches != null ? counts.skipped_batches : '?') +
-', errors ' + (counts.provider_errors != null ? counts.provider_errors : '?');
-statusEl.style.color = 'var(--success)';
-setStatus('Consolidation pass completed');
-showToast('Consolidation pass completed');
+if (job.state === 'completed') {
+setStatus('Consolidation job completed');
+showToast('Consolidation job completed');
+} else {
+setStatus('Consolidation job failed');
+showToast('Consolidation job failed', true);
+}
 memLoadStats();
 if (memLastListUrl) { memRefreshList(); }
+});
 })
 .catch(function(err) {
 btn.disabled = false;
-statusEl.textContent = 'Unavailable';
+statusEl.textContent = err.type === 'consolidation_in_progress' ? 'Already running' : 'Unavailable';
 statusEl.style.color = 'var(--danger)';
 statusEl.title = err.message || 'Consolidation unavailable';
 setStatus('Consolidation failed: ' + err.message);
