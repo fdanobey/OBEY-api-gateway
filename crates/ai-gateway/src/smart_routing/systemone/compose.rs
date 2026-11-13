@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 
+use serde_json::Map;
+
 use crate::smart_routing::config::{DimensionWeights, JevFallbackPolicy};
 use crate::smart_routing::tier::{ComplexityScore, TaskType};
 
@@ -163,6 +165,7 @@ pub fn dimension_answer(score: f64, confidence: f64) -> Answer {
         answer_confidence: None,
         probabilities: HashMap::new(),
         legend: HashMap::new(),
+        extra: Map::new(),
     }
 }
 
@@ -179,6 +182,7 @@ pub fn dimension_answer_with_gate_confidence(
         answer_confidence,
         probabilities: HashMap::new(),
         legend: HashMap::new(),
+        extra: Map::new(),
     }
 }
 
@@ -209,6 +213,7 @@ mod tests {
                 probabilities: HashMap::new(),
                 confidence: 0.9,
                 answer_confidence: None,
+                extra: Map::new(),
             },
         );
         answers
@@ -248,6 +253,7 @@ mod tests {
                 probabilities: HashMap::new(),
                 confidence: 0.2,
                 answer_confidence: Some(0.9),
+                extra: Map::new(),
             },
         );
         let result = compose(
@@ -278,6 +284,7 @@ mod tests {
                 probabilities: HashMap::new(),
                 confidence: 0.9,
                 answer_confidence: None,
+                extra: Map::new(),
             },
         );
         let result = compose(
@@ -404,6 +411,7 @@ mod tests {
                 probabilities: HashMap::new(),
                 confidence: 0.9,
                 answer_confidence: None,
+                extra: Map::new(),
             },
         );
         assert_eq!(
@@ -427,6 +435,7 @@ mod tests {
                 probabilities: HashMap::new(),
                 confidence: 0.25,
                 answer_confidence: None,
+                extra: Map::new(),
             },
         );
         let result = compose(
@@ -488,6 +497,7 @@ mod tests {
                     probabilities: HashMap::new(),
                     confidence: 0.9,
                     answer_confidence: None,
+                    extra: Map::new(),
                 },
             );
 

@@ -29,13 +29,23 @@ pub enum SystemOneCallError {
     Transient { status: u16 },
     /// Authentication or permission rejected (401/403); operator action.
     Auth { status: u16 },
-    /// Request rejected as invalid (422); configuration error.
-    BadRequest { status: u16 },
+    /// Request rejected as invalid (422); configuration error. `message`
+    /// is the provider's bounded error body, when one was returned.
+    BadRequest {
+        status: u16,
+        message: Option<String>,
+    },
     /// Request body exceeded the endpoint payload limit (413); the caller
     /// should reduce the state budget.
     PayloadTooLarge,
-    /// Unexpected status or transport failure.
-    Unavailable { reason: String },
+    /// Unexpected status or transport failure. `status` is the upstream
+    /// HTTP status when a response was received (e.g. 400 passthrough);
+    /// `message` is the provider's bounded error body, when present.
+    Unavailable {
+        reason: String,
+        status: Option<u16>,
+        message: Option<String>,
+    },
     /// The call exceeded its timeout budget.
     Timeout,
 }
@@ -59,9 +69,14 @@ impl fmt::Display for SystemOneCallError {
         match self {
             Self::Transient { status } => write!(formatter, "transient failure (HTTP {status})"),
             Self::Auth { status } => write!(formatter, "authentication rejected (HTTP {status})"),
-            Self::BadRequest { status } => write!(formatter, "request rejected (HTTP {status})"),
+            // Prefer the provider's message verbatim; the generic text is
+            // only a fallback for providers that return empty bodies.
+            Self::BadRequest { status, message } => match message {
+                Some(body) => write!(formatter, "{body} (HTTP {status})"),
+                None => write!(formatter, "request rejected (HTTP {status})"),
+            },
             Self::PayloadTooLarge => write!(formatter, "payload exceeded endpoint limit (HTTP 413)"),
-            Self::Unavailable { reason } => write!(formatter, "endpoint unavailable: {reason}"),
+            Self::Unavailable { reason, .. } => write!(formatter, "endpoint unavailable: {reason}"),
             Self::Timeout => write!(formatter, "call timed out"),
         }
     }
@@ -69,15 +84,20 @@ impl fmt::Display for SystemOneCallError {
 
 impl std::error::Error for SystemOneCallError {}
 
-/// Pooled HTTP client bound to one base URL, credential, and family.
+/// Pooled HTTP client bound to one base URL and family.
 pub struct SystemOneClient {
     http: reqwest::Client,
     family: SystemOneFamily,
     base_url: String,
-    authorization_header: String,
+    /// Per-call fallback credential; a per-call key (F5) overrides it.
+    authorization_header: Option<String>,
     timeout: Duration,
     max_attempts: u8,
     backoff: Duration,
+    /// Optional non-blocking charge invoked once per client-internal
+    /// retry (ADR 0002: every retry is a real upstream request).
+    retry_debit:
+        Option<std::sync::Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>>,
 }
 
 impl fmt::Debug for SystemOneClient {
@@ -107,6 +127,22 @@ impl SystemOneClient {
         max_retries: u8,
         backoff: Duration,
     ) -> Result<Self, SystemOneCallError> {
+        let header = (!api_key.is_empty()).then(|| format!("Bearer {api_key}"));
+        Self::with_optional_authorization(family, base_url, header, timeout, max_retries, backoff)
+    }
+
+    /// Build a client whose credential is supplied per call instead of at
+    /// construction (keys rotate per request on the decisions path; the
+    /// classifier path pins the key at construction).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_optional_authorization(
+        family: SystemOneFamily,
+        base_url: &str,
+        authorization_header: Option<String>,
+        timeout: Duration,
+        max_retries: u8,
+        backoff: Duration,
+    ) -> Result<Self, SystemOneCallError> {
         // Defense in depth: the Bearer credential travels on every request, so
         // the transport must be TLS. Configuration validation already rejects
         // non-HTTPS endpoints; enforcing it here keeps the invariant local and
@@ -118,6 +154,8 @@ impl SystemOneClient {
             _ => {
                 return Err(SystemOneCallError::Unavailable {
                     reason: "endpoint base URL must use https (TLS)".to_owned(),
+                    status: None,
+                    message: None,
                 });
             }
         }
@@ -130,18 +168,40 @@ impl SystemOneClient {
             .build()
             .map_err(|error| SystemOneCallError::Unavailable {
                 reason: error.to_string(),
+                status: None,
+                message: None,
             })?;
 
         Ok(Self {
             http,
             family,
             base_url: base_url.trim_end_matches('/').to_string(),
-            authorization_header: format!("Bearer {api_key}"),
+            authorization_header,
             timeout,
             // Initial attempt + bounded retries.
             max_attempts: max_retries.saturating_add(1),
             backoff,
+            retry_debit: None,
         })
+    }
+
+    /// Set the per-retry charge hook (ADR 0002). `None` (the default)
+    /// leaves retries uncharged — the classifier path stays unchanged.
+    pub fn with_retry_debit(
+        mut self,
+        debit: std::sync::Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
+    ) -> Self {
+        self.retry_debit = Some(debit);
+        self
+    }
+
+    /// Resolve the Authorization header for a single call: an explicit
+    /// per-call key wins, then the construction-time header.
+    fn authorization_for_call(&self, per_call_key: Option<&str>) -> Option<String> {
+        per_call_key
+            .filter(|key| !key.is_empty())
+            .map(|key| format!("Bearer {key}"))
+            .or_else(|| self.authorization_header.clone())
     }
 
     /// True when the URL's host is loopback or a private-network address —
@@ -168,36 +228,72 @@ impl SystemOneClient {
         &self,
         request: &SystemOneRequest,
     ) -> Result<SystemOneResponse, SystemOneCallError> {
+        self.evaluate_with(request, None, self.timeout).await
+    }
+
+    /// Evaluate with an explicit per-call API key and deadline (F5: keys
+    /// re-resolve per request; the deadline no longer bakes in the first
+    /// request's model-dependent timeout).
+    pub async fn evaluate_with(
+        &self,
+        request: &SystemOneRequest,
+        api_key: Option<&str>,
+        timeout: Duration,
+    ) -> Result<SystemOneResponse, SystemOneCallError> {
         let url = format!("{}/v1/systemone", self.base_url);
         let body = serde_json::to_vec(request).map_err(|error| SystemOneCallError::Unavailable {
             reason: format!("serialize request: {error}"),
+            status: None,
+            message: None,
         })?;
 
-        let response = self.execute_with_retries(url, body).await?;
+        let response = self
+            .execute_with_retries(url, body, api_key, timeout)
+            .await?;
         let bytes = read_capped_body(response, MAX_RESPONSE_BODY_BYTES).await?;
         serde_json::from_slice(&bytes).map_err(|error| SystemOneCallError::Unavailable {
             reason: format!("decode response: {error}"),
+            status: None,
+            message: None,
         })
     }
 
     /// List models available at the endpoint.
     pub async fn list_models(&self) -> Result<ModelsListing, SystemOneCallError> {
+        self.list_models_with(None, self.timeout).await
+    }
+
+    /// List models with an explicit per-call key and deadline; each
+    /// client-internal retry takes a token via the debit hook when one is
+    /// installed (ADR 0002).
+    pub async fn list_models_with(
+        &self,
+        api_key: Option<&str>,
+        timeout: Duration,
+    ) -> Result<ModelsListing, SystemOneCallError> {
         let url = format!("{}/v1/models", self.base_url);
-        let response = self.execute_with_retries(url, Vec::new()).await?;
+        let response = self
+            .execute_with_retries(url, Vec::new(), api_key, timeout)
+            .await?;
         let bytes = read_capped_body(response, MAX_LISTING_BODY_BYTES).await?;
         serde_json::from_slice(&bytes).map_err(|error| SystemOneCallError::Unavailable {
             reason: format!("decode listing: {error}"),
+            status: None,
+            message: None,
         })
     }
 
     /// One request with retry loop: POST when `body` is non-empty, GET
-    /// otherwise. The whole loop is bounded by the per-call timeout.
+    /// otherwise. The whole loop is bounded by `timeout`.
     async fn execute_with_retries(
         &self,
         url: String,
         body: Vec<u8>,
+        api_key: Option<&str>,
+        timeout: Duration,
     ) -> Result<reqwest::Response, SystemOneCallError> {
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let authorization = self.authorization_for_call(api_key);
 
         for attempt in 0..self.max_attempts.max(1) {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -215,8 +311,10 @@ impl SystemOneClient {
                     },
                     &url,
                 )
-                .timeout(remaining)
-                .header(reqwest::header::AUTHORIZATION, &self.authorization_header);
+                .timeout(remaining);
+            if let Some(header) = authorization.as_deref() {
+                request = request.header(reqwest::header::AUTHORIZATION, header);
+            }
 
             if !body.is_empty() {
                 request = request.header(reqwest::header::CONTENT_TYPE, "application/json");
@@ -230,6 +328,11 @@ impl SystemOneClient {
                     if self.family.retryable_statuses.contains(&status)
                         && attempt + 1 < self.max_attempts
                     {
+                        // ADR 0002: every retry is a real upstream request;
+                        // charge it without ever blocking the retry.
+                        if let Some(debit) = &self.retry_debit {
+                            debit().await;
+                        }
                         let delay = retry_delay(response.headers(), self.backoff, attempt);
                         // Honor Retry-After only within the remaining budget.
                         let wait = delay.min(
@@ -240,13 +343,18 @@ impl SystemOneClient {
                         tokio::time::sleep(wait).await;
                         continue;
                     }
-                    return Self::map_status(&self.family, response, status);
+                    return Self::map_status(&self.family, response, status).await;
                 }
                 Err(error) => {
                     if error.is_timeout() {
                         return Err(SystemOneCallError::Timeout);
                     }
                     if attempt + 1 < self.max_attempts {
+                        // ADR 0002: transport retries are real upstream
+                        // requests too; charge without blocking.
+                        if let Some(debit) = &self.retry_debit {
+                            debit().await;
+                        }
                         let wait = self
                             .backoff
                             .saturating_mul(1 << attempt)
@@ -254,6 +362,8 @@ impl SystemOneClient {
                         if wait.is_zero() {
                             return Err(SystemOneCallError::Unavailable {
                                 reason: "budget exhausted".to_string(),
+                                status: None,
+                                message: None,
                             });
                         }
                         tokio::time::sleep(wait).await;
@@ -261,6 +371,8 @@ impl SystemOneClient {
                     }
                     return Err(SystemOneCallError::Unavailable {
                         reason: error.to_string(),
+                        status: None,
+                        message: None,
                     });
                 }
             }
@@ -268,10 +380,14 @@ impl SystemOneClient {
 
         Err(SystemOneCallError::Unavailable {
             reason: "retry budget exhausted".to_string(),
+            status: None,
+            message: None,
         })
     }
-    /// Map a non-retryable (or final) response status.
-    fn map_status(
+    /// Map a non-retryable (or final) response status. Error bodies are
+    /// read (bounded) so the provider's message can travel to the caller
+    /// verbatim (Req 3.3); they never contain our credentials.
+    async fn map_status(
         family: &SystemOneFamily,
         response: reqwest::Response,
         status: u16,
@@ -280,15 +396,35 @@ impl SystemOneClient {
             200..=299 => Ok(response),
             401 | 403 => Err(SystemOneCallError::Auth { status }),
             413 => Err(SystemOneCallError::PayloadTooLarge),
-            422 => Err(SystemOneCallError::BadRequest { status }),
+            422 => {
+                let message = bounded_error_body(response).await;
+                Err(SystemOneCallError::BadRequest { status, message })
+            }
             _ if family.retryable_statuses.contains(&status) => {
                 Err(SystemOneCallError::Transient { status })
             }
-            _ => Err(SystemOneCallError::Unavailable {
-                reason: format!("HTTP {status}"),
-            }),
+            _ => {
+                let message = bounded_error_body(response).await;
+                Err(SystemOneCallError::Unavailable {
+                    reason: format!("HTTP {status}"),
+                    status: Some(status),
+                    message,
+                })
+            }
         }
     }
+}
+
+/// Read an error response body, truncated to a bounded length so a
+/// hostile endpoint cannot flood logs or client errors.
+async fn bounded_error_body(response: reqwest::Response) -> Option<String> {
+    const MAX_ERROR_BODY_CHARS: usize = 512;
+    let bytes = read_capped_body(response, MAX_RESPONSE_BODY_BYTES).await.ok()?;
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(MAX_ERROR_BODY_CHARS).collect())
 }
 
 /// Compute the retry delay: `Retry-After` seconds when present, else
@@ -318,11 +454,15 @@ async fn read_capped_body(
         .await
         .map_err(|error| SystemOneCallError::Unavailable {
             reason: format!("read body: {error}"),
+            status: None,
+            message: None,
         })?
     {
         if body.len() + chunk.len() > cap {
             return Err(SystemOneCallError::Unavailable {
                 reason: "response body exceeded size cap".to_string(),
+                status: None,
+                message: None,
             });
         }
         body.extend_from_slice(&chunk);
@@ -413,15 +553,24 @@ mod tests {
     fn error_classes_are_content_free() {
         assert_eq!(SystemOneCallError::Transient { status: 429 }.class(), "transient");
         assert_eq!(SystemOneCallError::Auth { status: 401 }.class(), "auth");
-        assert_eq!(
-            SystemOneCallError::BadRequest { status: 422 }.class(),
-            "bad_request"
-        );
-        assert_eq!(SystemOneCallError::PayloadTooLarge.class(), "payload_too_large");
-        assert_eq!(
-            SystemOneCallError::Unavailable { reason: "x".into() }.class(),
-            "unavailable"
-        );
+    assert_eq!(
+        SystemOneCallError::BadRequest {
+            status: 422,
+            message: None
+        }
+        .class(),
+        "bad_request"
+    );
+    assert_eq!(SystemOneCallError::PayloadTooLarge.class(), "payload_too_large");
+    assert_eq!(
+        SystemOneCallError::Unavailable {
+            reason: "x".into(),
+            status: None,
+            message: None
+        }
+        .class(),
+        "unavailable"
+    );
         assert_eq!(SystemOneCallError::Timeout.class(), "timeout");
     }
 }

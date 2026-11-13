@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use serde_json::Map;
+
 use ai_gateway::smart_routing::config::DimensionWeights;
 use ai_gateway::smart_routing::jev::compose::{compose, ComposeResult, JevTrustConfig};
 use ai_gateway::smart_routing::jev::models::Answer;
@@ -20,16 +22,17 @@ use ai_gateway::smart_routing::tier::ComplexityScore;
 fn answers() -> HashMap<String, Answer> {
     let mut answers = HashMap::new();
     for id in DIMENSION_QUESTION_IDS {
-        answers.insert(
-            id.to_string(),
-            Answer::Score {
-                score: 1.5,
-                confidence: 0.9,
-                answer_confidence: None,
-                probabilities: HashMap::new(),
-                legend: HashMap::new(),
-            },
-        );
+    answers.insert(
+        id.to_string(),
+        Answer::Score {
+            score: 1.5,
+            confidence: 0.9,
+            answer_confidence: None,
+            probabilities: HashMap::new(),
+            legend: HashMap::new(),
+            extra: Map::new(),
+        },
+    );
     }
     answers.insert(
         TASK_TYPE_QUESTION_ID.to_string(),
@@ -38,6 +41,7 @@ fn answers() -> HashMap<String, Answer> {
             probabilities: HashMap::new(),
             confidence: 0.9,
             answer_confidence: None,
+            extra: Map::new(),
         },
     );
     answers

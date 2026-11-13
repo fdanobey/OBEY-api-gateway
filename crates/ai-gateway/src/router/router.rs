@@ -36,6 +36,12 @@ use crate::reasoning_compat::{self, AttemptReport};
 use crate::router::retry_budget::RetryBudgetMap;
 use crate::router::retry_policy::{self, RetryDecision};
 use crate::smart_routing::budget_controller::BudgetController;
+use crate::smart_routing::systemone::client::{SystemOneCallError, SystemOneClient};
+use crate::smart_routing::systemone::discovery::{DiscoveryError, ModelDiscovery, ModelsFetcher};
+use crate::smart_routing::systemone::models::{
+    ModelsListing, SystemOneRequest, SystemOneResponse,
+};
+use crate::smart_routing::systemone::{ConfidenceSelection, SystemOneFamily};
 use crate::smart_routing::{
     PinnedRoutingContext, RoutingDiagnostics, RoutingPlanOutcome, RoutingPlanningError,
     SmartRouter, SmartRoutingInput,
@@ -367,6 +373,154 @@ fn is_timeout_class(err: &GatewayError) -> bool {
         | GatewayError::ChunkTimeout(_) => true,
         GatewayError::Provider { status_code, .. } => matches!(status_code, Some(504 | 524)),
         _ => false,
+    }
+}
+
+// -------------------------------------------------------------------
+// Decision routing support (decisions-api spec)
+// -------------------------------------------------------------------
+
+/// Discovery TTL for decision-provider alias resolution. 300 s keeps
+/// listing calls rare while a provider's model rollout still lands
+/// within minutes (mirrors the classifier discovery default).
+const DECISION_DISCOVERY_TTL_SECS: u64 = 300;
+
+/// Family descriptor for generic `type: systemone` providers (design
+/// D10): wire-compatible vendors whose retry semantics are UNVERIFIED,
+/// so they get the conservative union retryable set 429/503/529.
+const GENERIC_SYSTEMONE_FAMILY: SystemOneFamily = SystemOneFamily {
+    name: "systemone",
+    default_base_url: "",
+    default_model: "auto",
+    retryable_statuses: &[429, 503, 529],
+    confidence_selection: ConfidenceSelection::Confidence,
+    model_token: "systemone",
+    missing_listing_default: None,
+};
+
+/// One decision-routing candidate: a configured provider plus the model
+/// it would serve. `pinned_model` is `None` when the request must
+/// resolve through model discovery (`auto`/bare family alias). The
+/// provider is shared (`Arc`) — candidates are built under the config
+/// read lock and cloning the full `Provider` per candidate is waste.
+struct DecisionCandidate {
+    provider: Arc<Provider>,
+    family: SystemOneFamily,
+    pinned_model: Option<String>,
+}
+
+/// Adapter bridging the async `SystemOneClient` listing to the sync
+/// `ModelsFetcher` boundary inside `spawn_blocking` (the same pattern as
+/// the Smart Routing classifier's `ClientFetcher`). Carries the
+/// per-call API key and budget; the client's debit hook charges one
+/// token per client-internal listing retry (ADR 0002) — the initial
+/// listing token is taken by the caller.
+struct DecisionModelsFetcher<'a> {
+    client: Arc<SystemOneClient>,
+    api_key: Option<&'a str>,
+    timeout: Duration,
+}
+
+impl ModelsFetcher for DecisionModelsFetcher<'_> {
+    fn fetch(&self) -> Result<ModelsListing, String> {
+        futures::executor::block_on(
+            self.client
+                .list_models_with(self.api_key, self.timeout),
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+/// Ledger-row status for one failed decision try: the status the caller
+/// sees for that attempt (Auth surfaces as 502 per Req 3.3; the
+/// upstream-400 `Unavailable` surfaces as 400 passthrough).
+fn decision_call_error_status(error: &SystemOneCallError) -> u16 {
+    match error {
+        SystemOneCallError::Transient { status } => *status,
+        SystemOneCallError::Auth { .. } => 502,
+        SystemOneCallError::BadRequest { status, .. } => *status,
+        SystemOneCallError::PayloadTooLarge => 413,
+        SystemOneCallError::Timeout => 504,
+        SystemOneCallError::Unavailable { status, .. } => {
+            if status_is_upstream_bad_request(*status) {
+                400
+            } else {
+                502
+            }
+        }
+    }
+}
+
+/// `true` for the upstream-400 status on the client's `Unavailable`
+/// variant: a deterministic client error that must not fail over.
+fn status_is_upstream_bad_request(status: Option<u16>) -> bool {
+    status == Some(400)
+}
+
+/// Map a deterministic (non-failover) `SystemOneCallError` to its
+/// client-facing `GatewayError` (Req 3.3, design D2). Returns `None` for
+/// transient classes, which fail over to the next candidate.
+///
+/// - `Auth` → 502: bad provider credentials are an operator problem;
+///   the message names the provider and status only, never key material.
+/// - `PayloadTooLarge` (upstream 413) → 413 with resize guidance.
+/// - `BadRequest` (upstream 422) → 422 with the provider's message.
+/// - upstream 400 (client `Unavailable`, reason `"HTTP 400"`) → 400
+///   passthrough: deterministic client error, no retry, no failover.
+fn decision_terminal_error(
+    provider_name: &str,
+    error: &SystemOneCallError,
+) -> Option<GatewayError> {
+    match error {
+        SystemOneCallError::Auth { status } => Some(GatewayError::Provider {
+            provider: provider_name.to_string(),
+            message: format!(
+                "Provider '{provider_name}' rejected the decision credential \
+                 (HTTP {status}); check the provider API key configuration"
+            ),
+            status_code: Some(502),
+        }),
+        SystemOneCallError::PayloadTooLarge => Some(GatewayError::Provider {
+            provider: provider_name.to_string(),
+            message: "The decision request state exceeded the endpoint payload \
+                     limit (HTTP 413); reduce the state size"
+                .to_string(),
+            status_code: Some(413),
+        }),
+        // Req 3.3: the provider's message travels verbatim (bounded in the
+        // client); the status suffix keeps the upstream status identifiable
+        // in the client-visible body, and the generic text only wraps an
+        // empty provider body.
+        SystemOneCallError::BadRequest { status, message } => {
+            let detail = match message {
+                Some(body) => format!("{body} (HTTP {status})"),
+                None => format!(
+                    "Provider '{provider_name}' rejected the decision request (HTTP {status})"
+                ),
+            };
+            Some(GatewayError::Provider {
+                provider: provider_name.to_string(),
+                message: detail,
+                status_code: Some(*status),
+            })
+        }
+        SystemOneCallError::Unavailable { status, message, .. }
+            if status_is_upstream_bad_request(*status) =>
+        {
+            let detail = match message {
+                Some(body) => format!("{body} (HTTP 400)"),
+                None => format!(
+                    "Provider '{provider_name}' rejected the decision request \
+                     (HTTP 400); the request is invalid for this endpoint"
+                ),
+            };
+            Some(GatewayError::Provider {
+                provider: provider_name.to_string(),
+                message: detail,
+                status_code: Some(400),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -721,9 +875,17 @@ sticky_cache: StickyCache,
     /// Copilot model catalog sync (task 8/9): `enabled_models()` feeds the
     /// `/v1/models` aggregation when a `github-copilot` provider exists.
     copilot_catalog: Option<Arc<crate::oauth::github_copilot::catalog::CopilotCatalogSync>>,
-    /// Usage tracker for Copilot `x-ratelimit-*` / premium-request headers
+    /// Copilot usage tracker for `x-ratelimit-*` / premium-request headers
     /// (Req 7.1/7.2). Shared with the adapter dispatch path.
     copilot_usage_tracker: Option<Arc<crate::oauth::usage_tracker::UsageTracker>>,
+    /// Per-provider decision-model clients (decisions-api spec, D2). Keyed by
+    /// provider name; rebuilt on miss from the live config; cleared on
+    /// hot-reload alongside `http_clients` so renamed/removed providers and
+    /// rotated credentials never serve a stale client.
+    decision_clients: Arc<DashMap<String, Arc<SystemOneClient>>>,
+    /// Per-provider model discovery for family decision providers (Req 2.3).
+    /// Keyed by provider name; same lifecycle as `decision_clients`.
+    decision_discovery: Arc<DashMap<String, Arc<ModelDiscovery>>>,
 }
 
 /// Result of [`Router::route_request_streaming`].
@@ -1129,14 +1291,16 @@ impl Router {
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
-            provider_budget_alerts: None,
-            copilot_manager: None,
-            copilot_catalog: None,
-            copilot_usage_tracker: None,
-        }
+        provider_budget_alerts: None,
+        copilot_manager: None,
+        copilot_catalog: None,
+        copilot_usage_tracker: None,
+        decision_clients: Arc::new(DashMap::new()),
+        decision_discovery: Arc::new(DashMap::new()),
     }
+}
 
-    /// Create a new Router with explicit context configuration
+/// Create a new Router with explicit context configuration
     #[allow(dead_code)]
     pub fn with_context_config(
         config: Arc<RwLock<Config>>,
@@ -1180,13 +1344,15 @@ impl Router {
             search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
-            provider_budget_alerts: None,
-            copilot_manager: None,
-            copilot_catalog: None,
-            copilot_usage_tracker: None,
-        }
+        sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
+        provider_budget_alerts: None,
+        copilot_manager: None,
+        copilot_catalog: None,
+        copilot_usage_tracker: None,
+        decision_clients: Arc::new(DashMap::new()),
+        decision_discovery: Arc::new(DashMap::new()),
     }
+}
 
     /// Attach an [`OAuthManager`](crate::oauth::OAuthManager) so providers
     /// configured with `auth_method: oauth` can resolve a Bearer access token
@@ -3693,6 +3859,10 @@ fn provider_active_count(&self, provider_name: &str) -> u64 {
 
     pub fn clear_http_clients(&self) {
         self.http_clients.clear();
+        // Decision-provider caches ride the same hot-reload lifecycle
+        // (decisions-api Req 2.8): cleared wherever pass-through clients are.
+        self.decision_clients.clear();
+        self.decision_discovery.clear();
     }
 
     #[allow(dead_code)] // reserved for future budget enforcement
@@ -11959,6 +12129,475 @@ Ok(StreamingResponse::PassThrough {
         )))
     }
 
+    // -------------------------------------------------------------------
+    // Decision routing (decisions-api spec)
+    // -------------------------------------------------------------------
+
+/// Route a System One decision request (`/v1/decisions`) to the first
+/// healthy decision provider: jev/laya family providers matched by
+/// family token (or `auto`/bare alias), generic systemone providers
+/// matched by exact `manual_models` id. Same-family/same-id failover
+/// only — cross-family substitution never happens (design D4). Single
+/// pass, no streaming (design D8).
+///
+/// Returns the provider's answer envelope with the resolved model id
+/// echoed in `response.model` (Req 2.4) plus the serving provider name,
+/// and carries the accumulated attempt ledger BOTH ways (F1/Req 2.7):
+/// `Ok` returns the prior failed attempts alongside the response (the
+/// caller consumes them for telemetry); `Err` returns every attempt
+/// with the terminal error.
+pub async fn route_decision(
+    &self,
+    request: &SystemOneRequest,
+) -> Result<(SystemOneResponse, String, Vec<ProviderAttempt>), (GatewayError, Vec<ProviderAttempt>)> {
+    let requested_model = request.model.trim().to_string();
+    let candidates = match self.decision_candidates(&requested_model).await {
+        Ok(candidates) => candidates,
+        // No-candidate 404s precede any attempt; empty ledger.
+        Err(error) => return Err((error, Vec::new())),
+    };
+    let mut attempts: Vec<ProviderAttempt> = Vec::new();
+
+    for candidate in &candidates {
+        let provider_name = candidate.provider.name.clone();
+        let started = std::time::Instant::now();
+
+        // Admission 1: provider concurrency slot. A saturated slot
+        // fails over to the next same-family candidate (503 row).
+        let _concurrency_permit = match self
+            .acquire_provider_slot_or_reject(&candidate.provider, &requested_model)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                attempts.push(
+                    ProviderAttempt::new(
+                        provider_name.clone(),
+                        requested_model.clone(),
+                        error.to_string(),
+                        Some(attempt_status_for(&error)),
+                    )
+                    .with_duration(started.elapsed())
+                    .with_error_class("slot_saturated"),
+                );
+                continue;
+            }
+        };
+
+        // Admission 2 (F3a): rate-limit admission happens AFTER client
+        // build and key resolution, immediately before the real upstream
+        // call(s) — one blocking-wait-free token per admitted try (ADR
+        // 0002). A local skip or upstream cooldown fails over (429 row).
+        let rate_limiter = self.get_rate_limiter(&provider_name).await;
+        let client = match self.decision_client_for(candidate).await {
+            Ok(client) => client,
+            Err(error) => {
+                attempts.push(
+                    ProviderAttempt::new(
+                        provider_name.clone(),
+                        requested_model.clone(),
+                        error.to_string(),
+                        Some(attempt_status_for(&error)),
+                    )
+                    .with_duration(started.elapsed())
+                    .with_error_class(&error_class_for(&error)),
+                );
+                continue;
+            }
+        };
+        // F4: a missing API key is a terminal Auth-class attempt — never
+        // send an empty Bearer upstream.
+        let api_key = candidate.provider.resolve_api_key();
+        let api_key_ref = match api_key.as_deref() {
+            Some(key) => Some(key),
+            None => {
+                attempts.push(
+                    ProviderAttempt::new(
+                        provider_name.clone(),
+                        requested_model.clone(),
+                        format!(
+                            "No API key resolved for provider '{provider_name}'; \
+                             check the provider API key configuration"
+                        ),
+                        Some(502),
+                    )
+                    .with_duration(started.elapsed())
+                    .with_error_class("auth"),
+                );
+                continue;
+            }
+        };
+
+        // Model resolution: pinned ids forward verbatim; `auto`/bare
+        // family aliases resolve via the per-provider TTL-cached
+        // discovery (Req 2.3). Resolution failure fails over.
+        //
+        // Per-try timeout budget from the provider timeout config
+        // (Req 3.1), flooring at 1s so a zero config cannot spin.
+        let timeout_seconds = candidate
+            .provider
+            .effective_total_timeout(if let Some(pinned) = &candidate.pinned_model {
+                pinned.as_str()
+            } else {
+                requested_model.as_str()
+            })
+            .max(1);
+        let resolved_model = match &candidate.pinned_model {
+            Some(pinned) => pinned.clone(),
+            None => {
+                // F3b: the discovery listing is a real upstream request —
+                // it takes its own non-blocking token before dispatch.
+                if !rate_limiter.consume().await {
+                    attempts.push(
+                        ProviderAttempt::new(
+                            provider_name.clone(),
+                            requested_model.clone(),
+                            "Rate limit exhausted".to_string(),
+                            Some(429),
+                        )
+                        .with_duration(started.elapsed())
+                        .with_error_class("rate_limit_skip"),
+                    );
+                    continue;
+                }
+                match self
+                    .resolve_decision_model(&client, candidate, api_key_ref, Duration::from_secs(timeout_seconds))
+                    .await
+                {
+                    Ok(model) => model,
+                    Err((message, status, is_timeout)) => {
+                        attempts.push(
+                            ProviderAttempt::new(
+                                provider_name.clone(),
+                                requested_model.clone(),
+                                message,
+                                Some(status),
+                            )
+                            .with_duration(started.elapsed())
+                            .with_error_class(if is_timeout { "timeout" } else { "other" }),
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let outgoing = SystemOneRequest {
+            state: request.state.clone(),
+            model: resolved_model.clone(),
+            questions: request.questions.clone(),
+        };
+        // F3a: consume the evaluate token immediately before the real
+        // upstream call (client-internal retries debit via the hook).
+        if !rate_limiter.consume().await {
+            attempts.push(
+                ProviderAttempt::new(
+                    provider_name.clone(),
+                    resolved_model.clone(),
+                    "Rate limit exhausted".to_string(),
+                    Some(429),
+                )
+                .with_duration(started.elapsed())
+                .with_error_class("rate_limit_skip"),
+            );
+            continue;
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(timeout_seconds),
+            client.evaluate_with(&outgoing, api_key_ref, Duration::from_secs(timeout_seconds)),
+        )
+        .await
+        {
+            Ok(Ok(mut response)) => {
+                // Alias-drift visibility (Req 2.4 vs 1.5/F7): only
+                // auto/bare-alias requests echo the resolved id; pinned
+                // ids return the provider's echo verbatim.
+                if candidate.pinned_model.is_none() {
+                    response.model = resolved_model.clone();
+                }
+                return Ok((response, provider_name, attempts));
+            }
+            Err(_) => {
+                attempts.push(
+                    ProviderAttempt::new(
+                        provider_name.clone(),
+                        resolved_model.clone(),
+                        format!("Decision evaluation timed out after {timeout_seconds}s"),
+                        Some(504),
+                    )
+                    .with_duration(started.elapsed())
+                    .with_error_class("timeout"),
+                );
+                continue;
+            }
+            Ok(Err(call_error)) => {
+                attempts.push(
+                    ProviderAttempt::new(
+                        provider_name.clone(),
+                        resolved_model.clone(),
+                        call_error.to_string(),
+                        Some(decision_call_error_status(&call_error)),
+                    )
+                    .with_duration(started.elapsed())
+                    .with_error_class(call_error.class()),
+                );
+                // Deterministic classes are terminal (Req 3.3): exact
+                // status, no retry, no failover. Transient/timeout/
+                // unavailable fail over to the next candidate.
+                if let Some(error) = decision_terminal_error(&provider_name, &call_error) {
+                    return Err((error, attempts));
+                }
+                continue;
+            }
+        }
+    }
+
+    Err((
+        GatewayError::AllProvidersFailed(AggregatedError::new(attempts)),
+        Vec::new(),
+    ))
+}
+
+    /// Decision-provider candidates for a requested model (Req 2.2), in
+    /// config declaration order — the operator's provider priority for
+    /// decision providers (they do not participate in model groups).
+    ///
+    /// Family providers match when the model carries their family token;
+    /// `auto` binds to the first configured family so the candidate set
+    /// never spans families (D4). Generic systemone providers match only
+    /// an exact `manual_models` id.
+    async fn decision_candidates(
+        &self,
+        requested_model: &str,
+    ) -> Result<Vec<DecisionCandidate>, GatewayError> {
+        let is_auto = requested_model.eq_ignore_ascii_case("auto");
+        let config = self.config.read().await;
+
+        let mut candidates = Vec::new();
+        let mut has_generic_provider = false;
+        let mut auto_family: Option<SystemOneFamily> = None;
+
+        for provider in &config.providers {
+            let family = match provider.provider_type.as_str() {
+                "jev" => SystemOneFamily::JEV,
+                "laya" => SystemOneFamily::LAYA,
+            "systemone" => {
+                has_generic_provider = true;
+                // Req 2.2: exact, case-sensitive id match ("exactly
+                // matches") — no case-folding on manual_models ids.
+                if provider
+                    .manual_models
+                    .iter()
+                    .any(|id| id.trim() == requested_model)
+                {
+                    candidates.push(DecisionCandidate {
+                        provider: Arc::new(provider.clone()),
+                        family: GENERIC_SYSTEMONE_FAMILY,
+                        pinned_model: Some(requested_model.to_string()),
+                    });
+                }
+                continue;
+            }
+                _ => continue,
+            };
+            let serves_request = if is_auto {
+                match auto_family {
+                    None => {
+                        auto_family = Some(family);
+                        true
+                    }
+                    Some(bound) => bound.name == family.name,
+                }
+            } else {
+                family.is_family_model(requested_model)
+            };
+            if !serves_request {
+                continue;
+            }
+        let pinned_model = if Self::is_bare_decision_alias(requested_model, &family) {
+            None
+        } else {
+            Some(requested_model.to_string())
+        };
+        candidates.push(DecisionCandidate {
+            provider: Arc::new(provider.clone()),
+            family,
+            pinned_model,
+        });
+    }
+
+        drop(config);
+
+        if candidates.is_empty() {
+            if is_auto && has_generic_provider {
+                // Req 2.5: `auto` is meaningless for generic systemone
+                // providers — explicit ids are their only routing contract.
+                return Err(GatewayError::InvalidRequest(
+                    "model 'auto' is not supported by generic 'systemone' providers; \
+                     request an explicit model id, or configure a 'jev'/'laya' \
+                     family provider for alias resolution"
+                        .to_string(),
+                ));
+            }
+            // Req 2.2 / 3.5: no decision provider serves this model. The
+            // 404-class `invalid_request_error` body is shaped by the
+            // decisions handler (Task 3); this status carries the class.
+            return Err(GatewayError::Provider {
+                provider: "decisions".to_string(),
+                message: format!("No decision model configured for '{requested_model}'"),
+                status_code: Some(404),
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// `true` for `auto` and bare family aliases (`jev`, `laya`) — ids that
+    /// must resolve through model discovery rather than forward pinned.
+    fn is_bare_decision_alias(model: &str, family: &SystemOneFamily) -> bool {
+        let trimmed = model.trim();
+        trimmed.eq_ignore_ascii_case("auto")
+            || trimmed.eq_ignore_ascii_case(family.model_token)
+    }
+
+/// Cached per-provider decision client (keyed by provider name,
+/// cleared on hot-reload via [`Self::clear_http_clients`]). Only
+/// transport-level state is cached (F5): the API key and per-try
+/// deadline are supplied per call, and retry/backoff settings are read
+/// at build time (hot-reload clears the cache).
+async fn decision_client_for(
+    &self,
+    candidate: &DecisionCandidate,
+) -> Result<Arc<SystemOneClient>, GatewayError> {
+    if let Some(existing) = self.decision_clients.get(&candidate.provider.name) {
+        return Ok(existing.clone());
+    }
+    let provider = &candidate.provider;
+    let provider_name = provider.name.clone();
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| GatewayError::Provider {
+            provider: provider_name.clone(),
+            message: "Provider base URL is not configured".to_string(),
+            status_code: Some(500),
+        })?
+        .to_string();
+    let (max_retries, backoff) = {
+        let config = self.config.read().await;
+        (
+            u8::try_from(config.retry.max_retries_per_provider).unwrap_or(u8::MAX),
+            Duration::from_secs(
+                config
+                    .retry
+                    .backoff_sequence_seconds
+                    .first()
+                    .copied()
+                    .unwrap_or(1),
+            ),
+        )
+    };
+    // Per-retry charge hook (ADR 0002): every client-internal retry is a
+    // real upstream request and takes one token, non-blocking.
+    let limiter = self.get_rate_limiter(&provider_name).await;
+    let client = Arc::new(
+        SystemOneClient::with_optional_authorization(
+            candidate.family,
+            &base_url,
+            // Key and deadline are per-call (F5); None until then.
+            None,
+            // Non-model fallback deadline; the outer per-try timeout in
+            // route_decision governs the real budget.
+            Duration::from_secs(600),
+            max_retries,
+            backoff,
+        )
+        .map_err(|error| GatewayError::Provider {
+            provider: provider_name.clone(),
+            message: format!("Failed to build decision client: {error}"),
+            status_code: Some(502),
+        })?
+        .with_retry_debit(std::sync::Arc::new(move || {
+            let limiter = limiter.clone();
+            Box::pin(async move {
+                limiter.debit().await;
+            })
+        })),
+    );
+    self.decision_clients.insert(provider_name, client.clone());
+    Ok(client)
+}
+
+/// Resolve the concrete model id for an `auto`/alias request via the
+/// per-provider TTL-cached discovery (Req 2.3). Discovery failure
+/// fails over as a transient-class attempt. The listing is a real
+/// upstream request (ADR 0002): `admission` is the already-consumed
+/// listing token, and the spawn_blocking is bounded by `budget` so the
+/// per-candidate worst case stays within one per-try timeout (F6).
+async fn resolve_decision_model(
+    &self,
+    client: &Arc<SystemOneClient>,
+    candidate: &DecisionCandidate,
+    api_key: Option<&str>,
+    budget: Duration,
+) -> Result<String, (String, u16, bool)> {
+    let discovery = self.decision_discovery_for(candidate);
+    let client = Arc::clone(client);
+    let api_key = api_key.map(str::to_string);
+    let bounded = tokio::time::timeout(budget, tokio::task::spawn_blocking(move || {
+        let fetcher = DecisionModelsFetcher {
+            client,
+            api_key: api_key.as_deref(),
+            timeout: budget,
+        };
+        discovery.resolve(&fetcher)
+    }))
+    .await;
+    let outcome = match bounded {
+        // Discovery timed out within the per-try budget (F6).
+        Err(_) => return Err(("Model discovery timed out".to_string(), 504, true)),
+        Ok(outer) => outer.map_err(|error| {
+            (format!("Model discovery task failed: {error}"), 502, false)
+        })?,
+    };
+    match outcome {
+        Ok(resolved) => Ok(resolved.model),
+        Err(DiscoveryError::NoModelAtEndpoint) => Err((
+            "The endpoint's model listing contains no family-capable model".to_string(),
+            502,
+            false,
+        )),
+        Err(DiscoveryError::ModelUnavailable { model }) => Err((
+            format!("Model '{model}' is unavailable at the endpoint"),
+            502,
+            false,
+        )),
+        Err(DiscoveryError::Listing(message)) => Err((
+            format!("Model listing failed: {message}"),
+            502,
+            false,
+        )),
+    }
+}
+
+    /// Cached per-provider model discovery for alias resolution (always
+    /// configured for `auto`, so resolution takes the listing path; TTL
+    /// 300 s keeps listing calls rare).
+    fn decision_discovery_for(&self, candidate: &DecisionCandidate) -> Arc<ModelDiscovery> {
+        if let Some(existing) = self.decision_discovery.get(&candidate.provider.name) {
+            return existing.clone();
+        }
+        let discovery = Arc::new(ModelDiscovery::new(
+            candidate.family,
+            "auto",
+            DECISION_DISCOVERY_TTL_SECS,
+        ));
+        self.decision_discovery
+            .insert(candidate.provider.name.clone(), discovery.clone());
+        discovery
+    }
+
     /// Proxy a fine-tuning API request to the first configured OpenAI-compatible
     /// provider. Returns `GatewayError::Provider` with status 501 when no such
     /// provider exists, letting the handler emit the structured unsupported
@@ -19399,10 +20038,409 @@ fn test_calculate_retry_delay_with_rng_is_deterministic_per_seed() {
                 std::time::Duration::from_millis(10),
                 &usage,
             )
-            .await;
+        .await;
         assert_eq!(unpriced, 0.0);
     }
+
+    // Feature: decisions-api, Task 4: family detection + error mapping.
+
+    fn decision_provider(
+        name: &str,
+        provider_type: &str,
+        manual_models: &[&str],
+    ) -> crate::config::Provider {
+        let mut provider = test_provider(name, "https://decision.example.com".to_string());
+        provider.provider_type = provider_type.to_string();
+        provider.manual_models = manual_models.iter().map(|id| id.to_string()).collect();
+        provider
     }
+
+    fn decision_router(providers: Vec<crate::config::Provider>) -> Router {
+        let mut config = create_test_config();
+        config.providers = providers;
+        Router::new(Arc::new(RwLock::new(config)), test_metrics())
+    }
+
+    #[tokio::test]
+    async fn decision_candidates_pin_versioned_family_model_ids() {
+        let router = decision_router(vec![
+            decision_provider("jev-a", "jev", &[]),
+            decision_provider("laya-a", "laya", &[]),
+        ]);
+
+        for requested in ["jev-1.14.0", "typesafe/jev-1.13", "Jev-1.14.0"] {
+            let candidates = router
+                .decision_candidates(requested)
+                .await
+                .unwrap_or_else(|error| panic!("versioned jev id must match: {error:?}"));
+            assert_eq!(candidates.len(), 1, "only the jev provider serves {requested}");
+            assert_eq!(candidates[0].provider.name, "jev-a");
+            assert_eq!(candidates[0].family.name, "jev");
+            assert_eq!(
+                candidates[0].pinned_model.as_deref(),
+                Some(requested),
+                "versioned ids forward verbatim"
+            );
+        }
+
+        for requested in ["laya-2.0.0", "convai/laya-english"] {
+            let candidates = router
+                .decision_candidates(requested)
+                .await
+                .unwrap_or_else(|error| panic!("versioned laya id must match: {error:?}"));
+            assert_eq!(candidates.len(), 1, "only the laya provider serves {requested}");
+            assert_eq!(candidates[0].provider.name, "laya-a");
+            assert_eq!(candidates[0].family.name, "laya");
+            assert_eq!(candidates[0].pinned_model.as_deref(), Some(requested));
+        }
+    }
+
+    #[tokio::test]
+    async fn decision_candidates_bare_aliases_resolve_through_discovery() {
+        let router = decision_router(vec![
+            decision_provider("jev-a", "jev", &[]),
+            decision_provider("laya-a", "laya", &[]),
+        ]);
+
+        let candidates = router
+            .decision_candidates("jev")
+            .await
+            .expect("bare jev alias must match the jev provider");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].family.name, "jev");
+        assert!(
+            candidates[0].pinned_model.is_none(),
+            "bare alias must resolve through discovery, not pin"
+        );
+
+        let candidates = router
+            .decision_candidates("laya")
+            .await
+            .expect("bare laya alias must match the laya provider");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].family.name, "laya");
+        assert!(candidates[0].pinned_model.is_none());
+    }
+
+    #[tokio::test]
+    async fn decision_candidates_auto_binds_to_first_configured_family_only() {
+        let router = decision_router(vec![
+            decision_provider("jev-a", "jev", &[]),
+            decision_provider("laya-a", "laya", &[]),
+            decision_provider("jev-b", "jev", &[]),
+            decision_provider("sys-a", "systemone", &["drex-2.1"]),
+        ]);
+
+        let candidates = router
+            .decision_candidates("auto")
+            .await
+            .expect("auto must resolve while a family provider is configured");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "auto serves both providers of the first family only"
+        );
+        for candidate in &candidates {
+            assert_eq!(candidate.family.name, "jev");
+            assert!(candidate.pinned_model.is_none());
+        }
+        assert!(
+            candidates.iter().all(|candidate| candidate.provider.name != "laya-a"),
+            "auto must never produce cross-family candidates"
+        );
+
+        // Config order decides the bound family: laya first binds auto to laya.
+        let router = decision_router(vec![
+            decision_provider("laya-a", "laya", &[]),
+            decision_provider("jev-a", "jev", &[]),
+        ]);
+        let candidates = router
+            .decision_candidates("auto")
+            .await
+            .expect("auto must resolve with laya configured first");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].family.name, "laya");
+    }
+
+    #[tokio::test]
+    async fn decision_candidates_generic_systemone_matches_exact_manual_id_only() {
+        let router = decision_router(vec![
+            decision_provider("sys-a", "systemone", &["drex-2.1", "drex-2.2"]),
+            decision_provider("jev-a", "jev", &[]),
+        ]);
+
+        let candidates = router
+            .decision_candidates("drex-2.1")
+            .await
+            .expect("exact manual_models id must match the generic provider");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].provider.name, "sys-a");
+        assert_eq!(candidates[0].family.name, "systemone");
+        assert_eq!(candidates[0].pinned_model.as_deref(), Some("drex-2.1"));
+
+        // Not an exact manual id: no candidate, 404 provider error.
+        let error = router
+            .decision_candidates("drex-2")
+            .await
+            .err()
+            .expect("a non-listed id must not match");
+        match error {
+            GatewayError::Provider {
+                status_code,
+                message,
+                ..
+            } => {
+                assert_eq!(status_code, Some(404));
+                assert!(message.contains("drex-2"), "message must name the model: {message}");
+            }
+            other => panic!("expected 404 provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn decision_candidates_reject_non_family_model_ids() {
+        let router = decision_router(vec![
+            decision_provider("jev-a", "jev", &[]),
+            decision_provider("laya-a", "laya", &[]),
+            decision_provider("sys-a", "systemone", &["drex-2.1"]),
+        ]);
+
+        for requested in [
+            "gpt-4o",
+            "jealous-model",
+            "notjev",
+            "layabout",
+            "relay-a",
+            "drex-2.1.9",
+        ] {
+            let error = router
+                .decision_candidates(requested)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("non-family id {requested} must not resolve"));
+            match error {
+                GatewayError::Provider {
+                    provider,
+                    message,
+                    status_code,
+                } => {
+                    assert_eq!(provider, "decisions", "for {requested}");
+                    assert_eq!(status_code, Some(404), "for {requested}");
+                    assert!(
+                        message.contains(requested),
+                        "message must name the model: {message}"
+                    );
+                }
+                other => panic!("expected decisions 404 for {requested}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decision_candidates_auto_with_only_generic_systemone_is_rejected() {
+        let router = decision_router(vec![decision_provider("sys-a", "systemone", &["drex-2.1"])]);
+
+        let message = match router.decision_candidates("auto").await {
+            Err(GatewayError::InvalidRequest(message)) => message,
+            Err(other) => panic!("expected InvalidRequest, got {other:?}"),
+            Ok(_) => panic!("auto on a generic-only config must not resolve"),
+        };
+        assert!(message.contains("auto"), "{message}");
+        assert!(message.contains("systemone"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn decision_candidates_without_decision_providers_returns_404_naming_model() {
+        let router = decision_router(vec![test_provider("chat", "http://localhost:1/v1".to_string())]);
+
+        let error = router
+            .decision_candidates("jev-9.9.9")
+            .await
+            .err()
+            .expect("a config without decision providers must not resolve");
+        match error {
+            GatewayError::Provider {
+                provider,
+                message,
+                status_code,
+            } => {
+                assert_eq!(provider, "decisions");
+                assert_eq!(status_code, Some(404));
+                assert!(message.contains("jev-9.9.9"), "message must name the model: {message}");
+            }
+            other => panic!("expected decisions 404, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decision_call_error_status_maps_every_variant_to_spec_status() {
+        assert_eq!(
+            decision_call_error_status(&SystemOneCallError::Transient { status: 429 }),
+            429
+        );
+        assert_eq!(
+            decision_call_error_status(&SystemOneCallError::Transient { status: 503 }),
+            503
+        );
+        assert_eq!(
+            decision_call_error_status(&SystemOneCallError::Transient { status: 529 }),
+            529
+        );
+        assert_eq!(
+            decision_call_error_status(&SystemOneCallError::Auth { status: 401 }),
+            502
+        );
+        assert_eq!(
+            decision_call_error_status(&SystemOneCallError::BadRequest {
+                status: 422,
+                message: None
+            }),
+            422
+        );
+        assert_eq!(
+            decision_call_error_status(&SystemOneCallError::PayloadTooLarge),
+            413
+        );
+        assert_eq!(decision_call_error_status(&SystemOneCallError::Timeout), 504);
+        assert_eq!(
+            decision_call_error_status(&SystemOneCallError::Unavailable {
+                reason: "upstream rejected".to_string(),
+                status: Some(400),
+                message: None
+            }),
+            400
+        );
+        assert_eq!(
+            decision_call_error_status(&SystemOneCallError::Unavailable {
+                reason: "connection reset by peer".to_string(),
+                status: None,
+                message: None
+            }),
+            502
+        );
+        // The typed upstream-400 status is exact, not a string rule.
+        assert_eq!(
+            decision_call_error_status(&SystemOneCallError::Unavailable {
+                reason: "HTTP 4000 then dropped".to_string(),
+                status: None,
+                message: None
+            }),
+            502
+        );
+    }
+
+    #[test]
+    fn decision_auth_error_maps_to_terminal_502_without_key_material() {
+        let fake_key = "sk-live-FAKE-KEY-MATERIAL-never-appear-0123456789";
+        let error = SystemOneCallError::Auth { status: 401 };
+
+        assert_eq!(decision_call_error_status(&error), 502);
+        match decision_terminal_error("jev-primary", &error).expect("auth must be terminal") {
+            GatewayError::Provider {
+                provider,
+                message,
+                status_code,
+            } => {
+                assert_eq!(provider, "jev-primary");
+                assert_eq!(status_code, Some(502));
+                assert!(message.contains("HTTP 401"), "{message}");
+                assert!(
+                    !message.contains(fake_key),
+                    "message must never contain key material: {message}"
+                );
+                assert!(!message.contains("Bearer"), "{message}");
+                assert!(!message.contains("sk-"), "{message}");
+            }
+            other => panic!("expected provider 502, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decision_terminal_error_maps_deterministic_classes_to_spec_shapes() {
+        // Upstream 413 → 413 terminal with resize guidance.
+        match decision_terminal_error("laya-a", &SystemOneCallError::PayloadTooLarge)
+            .expect("payload-too-large must be terminal")
+        {
+            GatewayError::Provider {
+                provider,
+                message,
+                status_code,
+            } => {
+                assert_eq!(provider, "laya-a");
+                assert_eq!(status_code, Some(413));
+                assert!(message.contains("413"), "{message}");
+                assert!(message.contains("state"), "{message}");
+            }
+            other => panic!("expected provider 413, got {other:?}"),
+        }
+
+        // Upstream 422 → 422 terminal passthrough with the provider's message.
+        match decision_terminal_error(
+            "laya-a",
+            &SystemOneCallError::BadRequest {
+                status: 422,
+                message: None,
+            },
+        )
+        .expect("bad-request must be terminal")
+        {
+            GatewayError::Provider {
+                provider,
+                message,
+                status_code,
+            } => {
+                assert_eq!(provider, "laya-a");
+                assert_eq!(status_code, Some(422));
+                assert!(message.contains("422"), "{message}");
+            }
+            other => panic!("expected provider 422, got {other:?}"),
+        }
+
+        // Upstream 400 (client Unavailable with the "HTTP 400" marker) →
+        // 400 terminal passthrough.
+        match decision_terminal_error(
+            "sys-a",
+            &SystemOneCallError::Unavailable {
+                reason: "upstream rejected".to_string(),
+                status: Some(400),
+                message: None,
+            },
+        )
+        .expect("upstream-400 must be terminal")
+        {
+            GatewayError::Provider {
+                provider,
+                message,
+                status_code,
+            } => {
+                assert_eq!(provider, "sys-a");
+                assert_eq!(status_code, Some(400));
+                assert!(message.contains("HTTP 400"), "{message}");
+            }
+            other => panic!("expected provider 400, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decision_transient_timeout_and_other_unavailable_errors_fail_over() {
+        for error in [
+            SystemOneCallError::Transient { status: 429 },
+            SystemOneCallError::Transient { status: 503 },
+            SystemOneCallError::Transient { status: 529 },
+            SystemOneCallError::Timeout,
+            SystemOneCallError::Unavailable {
+                reason: "connection reset by peer".to_string(),
+                status: None,
+                message: None,
+            },
+        ] {
+            assert!(
+                decision_terminal_error("jev-a", &error).is_none(),
+                "{error} must fail over to the next candidate, not terminate"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod property_tests {

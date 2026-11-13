@@ -31,6 +31,7 @@ mod context_overflow_routing;
 mod cost_reporting;
 mod cost_reporting_admin;
 mod cost_reporting_query;
+mod decisions_front_door;
 mod failover_effectiveness;
 mod guardrail_custom_http;
 mod guardrail_e2e;

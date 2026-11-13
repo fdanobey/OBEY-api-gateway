@@ -392,12 +392,14 @@ impl SystemOneClassifier {
                     .call_failure_warnings
                     .allow(self.family.name, other.class())
                 {
-                    let status = match &other {
-                        super::client::SystemOneCallError::Transient { status }
-                        | super::client::SystemOneCallError::Auth { status }
-                        | super::client::SystemOneCallError::BadRequest { status } => Some(*status),
-                        _ => None,
-                    };
+                let status = match &other {
+                    super::client::SystemOneCallError::Transient { status }
+                    | super::client::SystemOneCallError::Auth { status }
+                    | super::client::SystemOneCallError::BadRequest { status, .. } => {
+                        Some(*status)
+                    }
+                    _ => None,
+                };
                     tracing::warn!(
                         family = %self.family.name,
                         error_class = %other.class(),

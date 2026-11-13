@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::SystemOneFamily;
 
@@ -56,6 +56,10 @@ pub struct Question {
     pub question_type: &'static str,
     pub instructions: Value,
     pub criteria: Value,
+    /// Unknown caller/provider fields round-trip verbatim (Req 1.3/1.5
+    /// unmodified passthrough).
+    #[serde(default, skip_serializing_if = "Map::is_empty", flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl fmt::Debug for Question {
@@ -70,27 +74,37 @@ impl fmt::Debug for Question {
 }
 
 /// Evaluation response: one answer per question.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemOneResponse {
     pub model: String,
     pub answers: HashMap<String, Answer>,
     #[serde(default)]
     pub usage: Usage,
+    /// Unknown provider fields round-trip verbatim (Req 1.3/1.5).
+    #[serde(default, skip_serializing_if = "Map::is_empty", flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Token usage reported by the endpoint.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Usage {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub output_tokens: u64,
+    /// Unknown usage fields round-trip verbatim.
+    #[serde(default, skip_serializing_if = "Map::is_empty", flatten)]
+    pub extra: Map<String, Value>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// One typed answer: score or choice, each with a probability distribution
 /// and confidence. Laya additionally reports `answer_confidence`; Jev
 /// endpoints omit it harmlessly.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Answer {
     Score {
@@ -100,12 +114,15 @@ pub enum Answer {
         #[serde(default)]
         confidence: f64,
         /// Laya's per-answer confidence; absent on Jev responses.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         answer_confidence: Option<f64>,
         #[serde(default)]
         probabilities: HashMap<String, f64>,
         #[serde(default)]
         legend: HashMap<String, Value>,
+        /// Unknown answer fields round-trip verbatim.
+        #[serde(default, skip_serializing_if = "Map::is_empty", flatten)]
+        extra: Map<String, Value>,
     },
     Choice {
         /// Highest-probability option.
@@ -114,14 +131,20 @@ pub enum Answer {
         probabilities: HashMap<String, f64>,
         #[serde(default)]
         confidence: f64,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         answer_confidence: Option<f64>,
+        /// Unknown answer fields round-trip verbatim.
+        #[serde(default, skip_serializing_if = "Map::is_empty", flatten)]
+        extra: Map<String, Value>,
     },
     /// Yes/no probability; the rubric does not ask noul questions today,
     /// but responses must tolerate them.
     Noul {
         #[serde(default)]
         noul: f64,
+        /// Unknown answer fields round-trip verbatim.
+        #[serde(default, skip_serializing_if = "Map::is_empty", flatten)]
+        extra: Map<String, Value>,
     },
 }
 
@@ -260,28 +283,71 @@ mod tests {
 
     #[test]
     fn laya_gate_confidence_falls_back_to_confidence_when_absent() {
-        let answer = Answer::Score {
-            score: 1.0,
-            confidence: 0.7,
-            answer_confidence: None,
-            probabilities: HashMap::new(),
-            legend: HashMap::new(),
-        };
+    let answer = Answer::Score {
+        score: 1.0,
+        confidence: 0.7,
+        answer_confidence: None,
+        probabilities: HashMap::new(),
+        legend: HashMap::new(),
+        extra: Map::new(),
+    };
         assert_eq!(answer.gate_confidence(&SystemOneFamily::LAYA), Some(0.7));
         assert_eq!(answer.gate_confidence(&SystemOneFamily::JEV), Some(0.7));
     }
 
-    #[test]
-    fn tolerates_missing_usage_and_probabilities() {
-        let payload = serde_json::json!({
-            "model": "laya-english",
-            "answers": {
-                "q": { "type": "score", "score": 2.0, "confidence": 1.0 }
+#[test]
+fn tolerates_missing_usage_and_probabilities() {
+    let payload = serde_json::json!({
+        "model": "laya-english",
+        "answers": {
+            "q": { "type": "score", "score": 2.0, "confidence": 1.0 }
+        }
+    });
+    let response: SystemOneResponse = serde_deserialize(payload);
+    assert_eq!(response.usage.input_tokens, 0);
+}
+
+#[test]
+fn unknown_fields_round_trip_and_nulls_are_omitted() {
+    let payload = serde_json::json!({
+        "model": "jev-1.13.0",
+        "vendor_extra": { "region": "eu-1" },
+        "answers": {
+            "frustration": {
+                "type": "score",
+                "score": 1.05,
+                "confidence": 0.92,
+                "answer_confidence": null,
+                "vendor_note": "keep me"
             }
-        });
-        let response: SystemOneResponse = serde_deserialize(payload);
-        assert_eq!(response.usage.input_tokens, 0);
-    }
+        },
+        "usage": { "input_tokens": 307, "output_tokens": 20, "cost_usd": 0.001 }
+    });
+    let response: SystemOneResponse = serde_deserialize(payload.clone());
+    let serialized = serde_json::to_value(&response).unwrap();
+
+    // Top-level unknown field round-trips.
+    assert_eq!(serialized["vendor_extra"], payload["vendor_extra"]);
+    // Unknown answer field round-trips.
+    assert_eq!(
+        serialized["answers"]["frustration"]["vendor_note"],
+        serde_json::json!("keep me")
+    );
+    // Explicit nulls are omitted, not re-emitted (Req 1.3/1.5).
+    assert!(
+        serialized["answers"]["frustration"]
+            .get("answer_confidence")
+            .is_none()
+    );
+    // Known usage fields and unknown usage fields both survive.
+    assert_eq!(serialized["usage"]["input_tokens"], serde_json::json!(307));
+    assert_eq!(serialized["usage"]["cost_usd"], serde_json::json!(0.001));
+
+    // Round-trip loses nothing observable: deserialize(serialized) equals.
+    let re: SystemOneResponse = serde_json::from_value(serialized).unwrap();
+    assert_eq!(re.model, response.model);
+    assert_eq!(re.usage.input_tokens, 307);
+}
 
     #[test]
     fn deserializes_openai_compatible_models_listing() {
@@ -310,12 +376,13 @@ mod tests {
     fn request_debug_redacts_state_and_questions() {
         let mut questions = HashMap::new();
         questions.insert(
-            "reasoning_depth".to_string(),
-            Question {
-                question_type: "score",
-                instructions: serde_json::json!("secret instructions"),
-                criteria: serde_json::json!(["a", "b"]),
-            },
+        "reasoning_depth".to_string(),
+        Question {
+            question_type: "score",
+            instructions: serde_json::json!("secret instructions"),
+            criteria: serde_json::json!(["a", "b"]),
+            extra: Map::new(),
+        },
         );
         let request = SystemOneRequest {
             state: serde_json::json!({ "messages": [{ "role": "user", "content": "secret" }] }),
@@ -332,12 +399,13 @@ mod tests {
     fn request_serializes_question_type_as_type() {
         let mut questions = HashMap::new();
         questions.insert(
-            "q".to_string(),
-            Question {
-                question_type: "score",
-                instructions: serde_json::json!("i"),
-                criteria: serde_json::json!(["c"]),
-            },
+        "q".to_string(),
+        Question {
+            question_type: "score",
+            instructions: serde_json::json!("i"),
+            criteria: serde_json::json!(["c"]),
+            extra: Map::new(),
+        },
         );
         let request = SystemOneRequest {
             state: serde_json::json!({}),

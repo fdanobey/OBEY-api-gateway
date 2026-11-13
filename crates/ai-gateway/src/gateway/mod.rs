@@ -1,3 +1,4 @@
+pub mod decisions;
 pub mod handlers;
 pub mod models_metadata;
 pub mod telemetry_seam;
@@ -719,9 +720,14 @@ copilot_catalog,
             .route("/v1/embeddings", post(embeddings))
             // Images (Req 2.4)
             .route("/v1/images/generations", post(image_generations))
-            // Audio (Req 2.5)
-            .route("/v1/audio/transcriptions", post(audio_transcriptions))
-            .route("/v1/audio/translations", post(audio_translations))
+// Audio (Req 2.5)
+.route("/v1/audio/transcriptions", post(audio_transcriptions))
+.route("/v1/audio/translations", post(audio_translations))
+// Decisions front door (decisions-api spec, Req 1.1/1.2): typed
+// System One decision requests; `/v1/systemone` is the alias route
+// served by the same handler.
+.route("/v1/decisions", post(decisions::create_decision))
+.route("/v1/systemone", post(decisions::create_decision))
             // Models (Req 2.6, 2.12). Catch-all `{*model_id}` so
             // slash-containing ids (NVIDIA NIM `meta/llama-3.1-70b-instruct`)
             // retrieve correctly; no other `/v1/models/...` subroutes exist.

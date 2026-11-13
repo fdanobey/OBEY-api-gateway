@@ -207,6 +207,33 @@ fn webhook_host_is_private_address(host: &str) -> bool {
     }
 }
 
+/// Whether a decision-provider base URL's transport satisfies the same
+/// rule `SystemOneClient::new` enforces (smart_routing/systemone/
+/// client.rs): HTTPS always; HTTP only on a loopback/private/localhost
+/// host (the documented self-hosted exception — credentials never
+/// leave the machine/network); every other scheme is rejected.
+/// Decisions-api spec, Req 2.1.
+fn decision_base_url_transport_ok(url: &reqwest::Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => {
+            let Some(host) = url.host_str() else {
+                return false;
+            };
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            if host.eq_ignore_ascii_case("localhost") {
+                return true;
+            }
+            match host.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
+                Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
+                Err(_) => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Resolve configuration file path using priority order:
 /// 1. --config CLI flag
 /// 2. CONFIG_PATH environment variable
@@ -439,6 +466,21 @@ impl Config {
             errors.push(ValidationError::NoProviders);
         }
 
+        // Duplicate provider names collide in the router's name-keyed
+        // client/discovery caches (the first entry would silently win and
+        // receive the second provider's misrouted, credentialed traffic),
+        // so uniqueness is enforced for every provider regardless of type.
+        let mut seen_provider_names = std::collections::HashSet::new();
+        for provider in &self.providers {
+            if !seen_provider_names.insert(provider.name.as_str()) {
+                errors.push(ValidationError::InvalidValue {
+                    field: format!("providers[{}].name", provider.name),
+                    value: provider.name.clone(),
+                    expected: "a unique provider name — duplicate names silently collide in the router's per-name client caches".to_string(),
+                });
+            }
+        }
+
         // Validate provider timeouts and env vars
         for provider in &self.providers {
             if let Some(memory) = &provider.memory {
@@ -650,6 +692,121 @@ impl Config {
                         value: "empty".to_string(),
                         expected: "a URL when custom_vpc_endpoint is enabled".to_string(),
                     });
+                }
+            }
+
+            // Decision-provider validation (decisions-api, Req 2.1, 2.2):
+            // `jev` / `laya` family providers and generic wire-compatible
+            // `systemone` providers. base_url is mandatory and its transport must
+            // satisfy the SystemOneClient rule (https always; http only on a
+            // loopback/private host for self-hosted). Query and fragment
+            // components are rejected because the client appends path segments
+            // (`{base}/v1/systemone`) that would land inside the query string.
+            // A resolvable key input is required via the same key-resolution
+            // check other provider types use.
+            if matches!(
+                provider.provider_type.as_str(),
+                "jev" | "laya" | "systemone"
+            ) {
+                let field_base_url = format!("providers.{}.base_url", provider.name);
+                match provider.base_url.as_deref() {
+                    Some(url) if !url.trim().is_empty() => match reqwest::Url::parse(url.trim()) {
+                        Ok(parsed)
+                            if decision_base_url_transport_ok(&parsed)
+                                && parsed.query().is_none_or(|q| q.is_empty())
+                                && parsed.fragment().is_none_or(|f| f.is_empty()) => {}
+                        Ok(_) => {
+                            errors.push(ValidationError::InvalidValue {
+                                field: field_base_url,
+                                value: url.to_string(),
+                                expected: "an https URL without query or fragment (http allowed only on a loopback, private, or localhost host for self-hosted endpoints)".to_string(),
+                            });
+                        }
+                        Err(_) => {
+                            errors.push(ValidationError::InvalidValue {
+                                field: field_base_url,
+                                value: url.to_string(),
+                                expected: "a valid URL".to_string(),
+                            });
+                        }
+                    },
+                    _ => {
+                        errors.push(ValidationError::InvalidValue {
+                            field: field_base_url,
+                            value: "empty".to_string(),
+                            expected: "a required https URL (or loopback/private host) for decision providers".to_string(),
+                        });
+                    }
+                }
+
+                if !provider.has_api_key_configured() {
+                    errors.push(ValidationError::InvalidValue {
+                        field: format!("providers.{}.api_key_env", provider.name),
+                        value: "missing".to_string(),
+                        expected: "a resolvable api_key_env or a stored API key for decision providers".to_string(),
+                    });
+                }
+
+                // Family providers: explicit manual_models entries must contain the
+                // family token (word-delimited, case-insensitive —
+                // SystemOneFamily::is_family_model); cross-family ids are rejected.
+                let family = match provider.provider_type.as_str() {
+                    "jev" => Some(crate::smart_routing::systemone::SystemOneFamily::JEV),
+                    "laya" => Some(crate::smart_routing::systemone::SystemOneFamily::LAYA),
+                    _ => None,
+                };
+
+                if let Some(family) = family {
+                    for id in &provider.manual_models {
+                        if !family.is_family_model(id) {
+                            errors.push(ValidationError::InvalidValue {
+                                field: format!(
+                                    "providers.{}.manual_models",
+                                    provider.name
+                                ),
+                                value: id.clone(),
+                                expected: format!(
+                                    "a manual_models entry containing the '{}' family token",
+                                    family.name
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                // Generic systemone providers: explicit manual_models ids are the
+                // only routing contract — at least one is required, and `auto`
+                // (family-alias style) plus whitespace-only entries are rejected.
+                if provider.provider_type == "systemone" {
+                    if provider.manual_models.is_empty() {
+                        errors.push(ValidationError::InvalidValue {
+                            field: format!("providers.{}.manual_models", provider.name),
+                            value: "empty".to_string(),
+                            expected: "at least one explicit model id for provider_type 'systemone' (explicit ids are the only routing contract)".to_string(),
+                        });
+                    } else {
+                        for id in &provider.manual_models {
+                            if id.trim().eq_ignore_ascii_case("auto") {
+                                errors.push(ValidationError::InvalidValue {
+                                    field: format!(
+                                        "providers.{}.manual_models",
+                                        provider.name
+                                    ),
+                                    value: id.clone(),
+                                    expected: "an explicit model id — 'auto' is not supported for provider_type 'systemone'".to_string(),
+                                });
+                            } else if id.trim().is_empty() {
+                                errors.push(ValidationError::InvalidValue {
+                                    field: format!(
+                                        "providers.{}.manual_models",
+                                        provider.name
+                                    ),
+                                    value: id.clone(),
+                                    expected: "a non-empty model id — whitespace-only manual_models entries can never match a request".to_string(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2811,6 +2968,302 @@ model_groups:
         assert!(
             result.is_ok(),
             "No auth_method should be accepted for any provider: {:?}",
+            result
+        );
+    }
+
+    // Feature: decisions-api, Task 1: validation of decision provider
+    // types (jev / laya / systemone). **Validates: Requirements 2.1, 2.2**
+
+    /// Minimal decision provider on a valid config: https base_url and a
+    /// stored key input (sk- plaintext in api_key_env is lifted into
+    /// resolved_api_key by load_and_validate_config; the fixture mirrors
+    /// that load path so has_api_key_configured sees a stored key).
+    fn decision_config(provider_type: &str, manual_models: &[&str]) -> Config {
+        let mut config = minimal_valid_config();
+        config.providers[0].provider_type = provider_type.to_string();
+        config.providers[0].base_url = Some("https://api.typesafe.ai".to_string());
+        config.providers[0].api_key_env = Some("sk-decision-test-key-0123456789".to_string());
+        config.providers[0].resolved_api_key =
+            Some("sk-decision-test-key-0123456789".to_string());
+        config.providers[0].manual_models =
+            manual_models.iter().map(|id| id.to_string()).collect();
+        config
+    }
+
+    #[test]
+    fn test_valid_jev_laya_systemone_providers_accepted() {
+        for (provider_type, manual_models) in [
+            ("jev", vec!["jev-1.13.0"]),
+            ("laya", vec!["laya-2.0.0"]),
+            ("systemone", vec!["drex-2.1"]),
+        ] {
+            let config = decision_config(provider_type, &manual_models);
+            let result = config.validate();
+            assert!(
+                result.is_ok(),
+                "{provider_type} decision provider should be accepted: {:?}",
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_decision_provider_missing_base_url_rejected() {
+        let mut config = decision_config("jev", &["jev-1.13.0"]);
+        config.providers[0].base_url = None;
+
+        let result = config.validate();
+        assert!(result.is_err(), "missing base_url should be rejected");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, .. }
+                    if field == "providers.test-provider.base_url"
+            )),
+            "Should contain InvalidValue error for base_url, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_decision_provider_http_public_base_url_rejected() {
+        let mut config = decision_config("laya", &["laya-2.0.0"]);
+        config.providers[0].base_url = Some("http://api.laya-ai.com".to_string());
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "http base_url on a public host should be rejected"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, .. }
+                    if field == "providers.test-provider.base_url"
+            )),
+            "Should contain InvalidValue error for base_url, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_decision_provider_private_http_base_url_accepted() {
+        let mut config = decision_config("systemone", &["drex-2.1"]);
+        config.providers[0].base_url = Some("http://127.0.0.1:8080".to_string());
+
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "http on loopback should be accepted for self-hosted: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_decision_provider_https_public_base_url_accepted() {
+        let config = decision_config("systemone", &["drex-2.1"]);
+
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "https on a public host should be accepted: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_decision_provider_non_http_scheme_on_loopback_rejected() {
+        for url in ["ftp://127.0.0.1", "gopher://10.0.0.1"] {
+            let mut config = decision_config("systemone", &["drex-2.1"]);
+            config.providers[0].base_url = Some(url.to_string());
+
+            let result = config.validate();
+            assert!(
+                result.is_err(),
+                "{url} should be rejected — only https (or http on loopback/private hosts) is allowed"
+            );
+            let errors = result.unwrap_err();
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::InvalidValue { field, .. }
+                        if field == "providers.test-provider.base_url"
+                )),
+                "Should contain InvalidValue error for base_url, got: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decision_provider_base_url_with_query_rejected() {
+        let mut config = decision_config("jev", &["jev-1.13.0"]);
+        config.providers[0].base_url = Some("https://api.typesafe.ai?a=b".to_string());
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "base_url with a query component should be rejected"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, .. }
+                    if field == "providers.test-provider.base_url"
+            )),
+            "Should contain InvalidValue error for base_url, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_decision_provider_base_url_with_fragment_rejected() {
+        let mut config = decision_config("jev", &["jev-1.13.0"]);
+        config.providers[0].base_url = Some("https://api.typesafe.ai#frag".to_string());
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "base_url with a fragment component should be rejected"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, .. }
+                    if field == "providers.test-provider.base_url"
+            )),
+            "Should contain InvalidValue error for base_url, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_decision_provider_missing_key_input_rejected() {
+        let mut config = decision_config("jev", &["jev-1.13.0"]);
+        config.providers[0].api_key_env = None;
+        config.providers[0].api_key_encrypted = None;
+        config.providers[0].resolved_api_key = None;
+
+        let result = config.validate();
+        assert!(result.is_err(), "missing key input should be rejected");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, .. }
+                    if field == "providers.test-provider.api_key_env"
+            )),
+            "Should contain InvalidValue error for api_key_env, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_jev_provider_cross_family_manual_models_rejected() {
+        let config = decision_config("jev", &["jev-1.13.0", "laya-2.0.0"]);
+
+        let result = config.validate();
+        assert!(result.is_err(), "cross-family manual_models should be rejected");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, value, .. }
+                    if field == "providers.test-provider.manual_models" && value == "laya-2.0.0"
+            )),
+            "Should contain InvalidValue error naming manual_models and the cross-family id, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_systemone_provider_without_manual_models_rejected() {
+        let config = decision_config("systemone", &[]);
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "systemone without manual_models should be rejected"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, .. }
+                    if field == "providers.test-provider.manual_models"
+            )),
+            "Should contain InvalidValue error for manual_models, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_systemone_provider_auto_manual_models_rejected() {
+        let config = decision_config("systemone", &["auto"]);
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "systemone with 'auto' in manual_models should be rejected"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, value, .. }
+                    if field == "providers.test-provider.manual_models" && value == "auto"
+            )),
+            "Should contain InvalidValue error naming manual_models and 'auto', got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_systemone_provider_whitespace_manual_models_rejected() {
+        let config = decision_config("systemone", &[" "]);
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "systemone with a whitespace-only manual_models id should be rejected"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, value, .. }
+                    if field == "providers.test-provider.manual_models" && value == " "
+            )),
+            "Should contain InvalidValue error naming manual_models and the whitespace-only id, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_provider_names_rejected() {
+        let mut config = minimal_valid_config();
+        let duplicate = config.providers[0].clone();
+        config.providers.push(duplicate.clone());
+
+        let result = config.validate();
+        assert!(result.is_err(), "duplicate provider names should be rejected");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidValue { field, .. }
+                    if field == "providers[test-provider].name"
+            )),
+            "Should contain InvalidValue error naming the duplicate provider, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_unique_provider_names_accepted() {
+        let mut config = minimal_valid_config();
+        let mut second = config.providers[0].clone();
+        second.name = "second-provider".to_string();
+        config.providers.push(second);
+
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "unique provider names should be accepted: {:?}",
             result
         );
     }

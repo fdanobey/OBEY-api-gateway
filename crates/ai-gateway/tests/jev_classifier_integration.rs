@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use ai_gateway::smart_routing::jev::client::{JevCallError, JevClient};
 use ai_gateway::smart_routing::jev::models::{Question, SystemOneRequest};
-use serde_json::json;
+use serde_json::{json, Map};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -29,6 +29,7 @@ fn systemone_request(model: &str) -> SystemOneRequest {
             question_type: "score",
             instructions: json!("complexity"),
             criteria: json!(["low", "high"]),
+            extra: Map::new(),
         },
     );
     SystemOneRequest {
@@ -148,7 +149,13 @@ async fn auth_and_validation_errors_do_not_retry() {
     for (status, expected) in [
         (401, JevCallError::Auth { status: 401 }),
         (403, JevCallError::Auth { status: 403 }),
-        (422, JevCallError::BadRequest { status: 422 }),
+        (
+            422,
+            JevCallError::BadRequest {
+                status: 422,
+                message: None,
+            },
+        ),
     ] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -177,7 +184,9 @@ async fn oversized_response_body_is_rejected() {
         .await;
 
     let error = client(&server, 0).list_models().await.unwrap_err();
-    assert!(matches!(error, JevCallError::Unavailable { reason } if reason.contains("size cap")));
+    assert!(
+        matches!(error, JevCallError::Unavailable { reason, .. } if reason.contains("size cap"))
+    );
 }
 
 #[tokio::test]
@@ -196,7 +205,7 @@ async fn large_model_listing_within_cap_is_accepted() {
     // request succeeds and only JSON decoding fails.
     let error = client(&server, 0).list_models().await.unwrap_err();
     assert!(
-        matches!(error, JevCallError::Unavailable { ref reason } if reason.contains("decode listing")),
+        matches!(error, JevCallError::Unavailable { ref reason, .. } if reason.contains("decode listing")),
         "20 KiB listing must not hit the size cap: {error:?}"
     );
 }

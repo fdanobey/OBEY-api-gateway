@@ -25,7 +25,7 @@ server:
 #   key_path: "./key.pem"
 
 # Providers — at least one required
-# Types: openai | ollama | bedrock | groq | together | vllm | lmstudio | nvidia_nim | github-copilot
+# Types: openai | ollama | bedrock | groq | together | vllm | lmstudio | nvidia_nim | github-copilot | jev | laya | systemone
 providers:
   - name: "openai"
     type: "openai"
@@ -106,11 +106,35 @@ providers:
   # used only when live /v1/models is unavailable or empty. manual_models is
   # optional; any values configured in the Admin UI or config are merged first
   # as explicit overrides (no prefilled list is required here).
-  # - name: "nvidia-nim"
-  #   type: "nvidia_nim"
-  #   base_url: "https://integrate.api.nvidia.com/v1"
-  #   api_key_env: "NVIDIA_API_KEY"
-  #   timeout_seconds: 60
+# - name: "nvidia-nim"
+# type: "nvidia_nim"
+# base_url: "https://integrate.api.nvidia.com/v1"
+# api_key_env: "NVIDIA_API_KEY"
+# timeout_seconds: 60
+
+# Decision providers (System One wire protocol) — served via POST /v1/decisions
+# (see the Decisions API wiki page). Two kinds:
+# - type: jev / laya — family providers (token matching + auto/alias model
+#   resolution via the provider's model listing; the resolved id is echoed in
+#   the response "model" field).
+# - type: systemone — generic wire-compatible providers (Drex, Clef, Decider,
+#   Clairic, self-hosted Jev-compatible servers). Explicit model ids only:
+#   manual_models is REQUIRED and "auto" is rejected with 400.
+# manual_models is optional for family providers; when set, the ids are listed
+# in GET /v1/models.
+# - name: "jev-typesafe"
+# type: "jev"
+# base_url: "https://api.typesafe.ai"
+# api_key_env: "JEV_API_KEY"
+# timeout_seconds: 30
+#
+# - name: "drex-generic"
+# type: "systemone"
+# base_url: "https://api.drex.example.com"
+# api_key_env: "DREX_API_KEY"
+# manual_models:
+# - "drex-2.1"
+# timeout_seconds: 30
 
 # Model groups — equivalent models for failover routing
 model_groups:

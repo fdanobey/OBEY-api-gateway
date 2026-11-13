@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::models::openai::{Message, OpenAIRequest};
 
@@ -53,6 +53,7 @@ pub fn build_questions() -> HashMap<String, Question> {
                 { "what": "Deep, novel reasoning: proofs, intricate causal chains, or problems with no obvious solution path",
                   "examples": ["formal proof", "novel algorithm design", "complex root-cause analysis under uncertainty"] }
             ]),
+             extra: Map::new(),
         },
     );
 
@@ -71,6 +72,7 @@ pub fn build_questions() -> HashMap<String, Question> {
                 { "what": "An agentic loop where many tool results drive subsequent decisions and correctness depends on them",
                   "examples": ["multi-file refactor driven by test output", "research task with iterative search"] }
             ]),
+             extra: Map::new(),
         },
     );
 
@@ -89,6 +91,7 @@ pub fn build_questions() -> HashMap<String, Question> {
                 { "what": "Heavy synthesis across a long conversation or many artifacts, with contradictions or partial information",
                   "examples": ["resolve conflicting statements across a long thread", "cross-reference many documents"] }
             ]),
+             extra: Map::new(),
         },
     );
 
@@ -107,6 +110,7 @@ pub fn build_questions() -> HashMap<String, Question> {
                 { "what": "Zero-tolerance output: legal or financial text, formal proofs, safety-critical instructions",
                   "examples": ["contract clause", "medical dosage wording", "verified proof steps"] }
             ]),
+             extra: Map::new(),
         },
     );
 
@@ -125,6 +129,7 @@ pub fn build_questions() -> HashMap<String, Question> {
                 { "what": "Expert-level or cross-domain depth: advanced algorithms, formal math, rare specialties",
                   "examples": ["compiler optimization", "statistical modeling", "specialized regulatory analysis"] }
             ]),
+             extra: Map::new(),
         },
     );
 
@@ -143,6 +148,7 @@ pub fn build_questions() -> HashMap<String, Question> {
                 { "what": "Deeply ambiguous, contradictory, or requires guessing unstated goals",
                   "examples": ["fix it without saying what is broken", "conflicting instructions in one request"] }
             ]),
+             extra: Map::new(),
         },
     );
 
@@ -160,6 +166,7 @@ pub fn build_questions() -> HashMap<String, Question> {
                 "summarization": "Condensing, rewriting, or restructuring supplied material",
                 "general": "Conversation, advice, mixed or unclassified requests"
             }),
+             extra: Map::new(),
         },
     );
 

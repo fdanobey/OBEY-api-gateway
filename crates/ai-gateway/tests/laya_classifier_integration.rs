@@ -10,7 +10,7 @@ use ai_gateway::smart_routing::laya::{LayaClassifier, FAMILY};
 use ai_gateway::smart_routing::systemone::client::SystemOneClient;
 use ai_gateway::smart_routing::systemone::models::{Question, SystemOneRequest};
 use ai_gateway::smart_routing::OptionalClassifier;
-use serde_json::json;
+use serde_json::{json, Map};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -34,6 +34,7 @@ fn systemone_request(model: &str) -> SystemOneRequest {
             question_type: "score",
             instructions: json!("complexity"),
             criteria: json!(["low", "high"]),
+            extra: Map::new(),
         },
     );
     SystemOneRequest {
