@@ -1,0 +1,7 @@
+{
+  "task_id": "task-glm-ttfb-remediation",
+  "task_description": "Remediate the router-side causes of GLM/Electron Hub unreliability found in .agents/tasks/glm-ttfb-trace/investigation.md. The buffered dispatch must stream upstream (stream:true + internal SSE reassembly) so provider-side non-streaming timeouts (~100 s at Electron Hub) and the header-only TTFB stop killing long generations. Every failed upstream try and every abandoned request must be logged (attempt ledger, error_class, 499/504 abandon rows). Timeout-class errors must fail over without a same-provider retry, and streaming pass-through fallbacks must exclude the provider that just failed. Record an ADR and an AGENTS.md note so the fix is not reintroduced. Pending user decisions D1-D4 are out of scope. Do not commit or push; do not touch the live instance.",
+  "status": "completed",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003"],
+  "blocked_reason": null
+}

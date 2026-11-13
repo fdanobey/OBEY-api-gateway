@@ -303,7 +303,7 @@ impl CodexProviderClient {
         let emit_reasoning = is_reasoning(resolved_model, &self.reasoning_models_allowlist);
         let instructions = self
             .instructions
-            .get(self.instructions_override.as_deref())
+            .get_for_model(self.instructions_override.as_deref(), resolved_model)
             .await;
 
         let translator = ChatToResponsesTranslator {

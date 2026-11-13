@@ -108,21 +108,25 @@ pub enum CostReportValidationError {
     InvalidStart { value: String },
     #[error("missing required query parameter: end (RFC 3339 timestamp)")]
     MissingEnd,
-    #[error("invalid 'end' value '{value}': expected an RFC 3339 timestamp, e.g. 2026-01-01T00:00:00Z")]
+    #[error(
+        "invalid 'end' value '{value}': expected an RFC 3339 timestamp, e.g. 2026-01-01T00:00:00Z"
+    )]
     InvalidEnd { value: String },
     #[error("invalid 'end': must be greater than 'start'")]
     EndNotAfterStart,
-    #[error(
-        "invalid range: start/end span exceeds the {MAX_RANGE_DAYS}-day limit"
-    )]
+    #[error("invalid range: start/end span exceeds the {MAX_RANGE_DAYS}-day limit")]
     RangeTooLarge,
-    #[error("invalid 'group_by' value '{value}': must be one of {}", GroupBy::allowed_values())]
-    InvalidGroupBy { value: String },
-    #[error("invalid 'format' value '{value}': must be one of {}", ReportFormat::allowed_values())]
-    InvalidFormat { value: String },
     #[error(
-        "invalid '{parameter}' value: filter exceeds the {MAX_FILTER_CHARS} character limit"
+        "invalid 'group_by' value '{value}': must be one of {}",
+        GroupBy::allowed_values()
     )]
+    InvalidGroupBy { value: String },
+    #[error(
+        "invalid 'format' value '{value}': must be one of {}",
+        ReportFormat::allowed_values()
+    )]
+    InvalidFormat { value: String },
+    #[error("invalid '{parameter}' value: filter exceeds the {MAX_FILTER_CHARS} character limit")]
     FilterTooLong { parameter: &'static str, len: usize },
 }
 
@@ -197,20 +201,20 @@ pub fn validate_range(
     if start_raw.is_empty() {
         return Err(CostReportValidationError::MissingStart);
     }
-    let start_secs = parse_rfc3339_to_epoch(start_raw)
-        .ok_or_else(|| CostReportValidationError::InvalidStart {
+    let start_secs = parse_rfc3339_to_epoch(start_raw).ok_or_else(|| {
+        CostReportValidationError::InvalidStart {
             value: start_raw.to_string(),
-        })?;
+        }
+    })?;
 
     let end_raw = end.as_deref().map(str::trim).unwrap_or("");
     if end_raw.is_empty() {
         return Err(CostReportValidationError::MissingEnd);
     }
-    let end_secs = parse_rfc3339_to_epoch(end_raw).ok_or_else(|| {
-        CostReportValidationError::InvalidEnd {
+    let end_secs =
+        parse_rfc3339_to_epoch(end_raw).ok_or_else(|| CostReportValidationError::InvalidEnd {
             value: end_raw.to_string(),
-        }
-    })?;
+        })?;
 
     if end_secs <= start_secs {
         return Err(CostReportValidationError::EndNotAfterStart);
@@ -227,28 +231,26 @@ pub fn validate_range(
 impl CostReportParams {
     /// Validate all parameters, applying the defaults `group_by=day` and
     /// `format=json` for omitted values (Requirements 1.2 and 4.2).
-    pub fn validate(
-        &self,
-    ) -> Result<ValidatedCostReportParams, CostReportValidationError> {
+    pub fn validate(&self) -> Result<ValidatedCostReportParams, CostReportValidationError> {
         let range = validate_range(&self.start, &self.end)?;
 
         let group_by = match self.group_by.as_deref().map(str::trim) {
             None | Some("") => GroupBy::Day,
-            Some(raw) => GroupBy::parse(raw).ok_or_else(|| {
-                CostReportValidationError::InvalidGroupBy {
+            Some(raw) => {
+                GroupBy::parse(raw).ok_or_else(|| CostReportValidationError::InvalidGroupBy {
+                    value: raw.to_string(),
+                })?
+            }
+        };
+
+        let format = match self.format.as_deref().map(str::trim) {
+            None | Some("") => ReportFormat::Json,
+            Some(raw) => ReportFormat::parse(raw).ok_or_else(|| {
+                CostReportValidationError::InvalidFormat {
                     value: raw.to_string(),
                 }
             })?,
         };
-
-    let format = match self.format.as_deref().map(str::trim) {
-        None | Some("") => ReportFormat::Json,
-        Some(raw) => ReportFormat::parse(raw).ok_or_else(|| {
-            CostReportValidationError::InvalidFormat {
-                value: raw.to_string(),
-            }
-        })?,
-    };
 
         // Filters normalize exactly like group_by/format: trim, then
         // empty → None so " " cannot silently narrow a report to nothing.
@@ -417,9 +419,7 @@ fn total_row(rows: &[ReportRow], window_start: i64, window_end: i64) -> ReportRo
         totals.cache_creation_tokens = totals
             .cache_creation_tokens
             .saturating_add(row.cache_creation_tokens);
-        totals.reasoning_tokens = totals
-            .reasoning_tokens
-            .saturating_add(row.reasoning_tokens);
+        totals.reasoning_tokens = totals.reasoning_tokens.saturating_add(row.reasoning_tokens);
         totals.cost_micro_usd = totals.cost_micro_usd.saturating_add(row.cost_micro_usd);
         totals.cost_unpriced_requests = totals
             .cost_unpriced_requests
@@ -521,11 +521,11 @@ mod tests {
             output_tokens: 20,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
-        reasoning_tokens: 0,
-        cost_micro_usd,
-        cost_unpriced_requests: 0,
+            reasoning_tokens: 0,
+            cost_micro_usd,
+            cost_unpriced_requests: 0,
+        }
     }
-}
 
     #[test]
     fn validation_missing_start_is_rejected() {
@@ -577,12 +577,9 @@ mod tests {
 
     #[test]
     fn validation_end_equal_to_start_is_rejected() {
-        let err = params(
-            Some("2026-01-01T00:00:00Z"),
-            Some("2026-01-01T00:00:00Z"),
-        )
-        .validate()
-        .unwrap_err();
+        let err = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-01T00:00:00Z"))
+            .validate()
+            .unwrap_err();
         assert_eq!(err, CostReportValidationError::EndNotAfterStart);
         assert_eq!(err.parameter(), "end");
     }
@@ -599,12 +596,9 @@ mod tests {
     fn validation_range_over_366_days_is_rejected_and_names_limit() {
         let start = DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z").unwrap();
         let too_far = start + chrono::Duration::days(MAX_RANGE_DAYS + 1);
-        let err = params(
-            Some("2026-03-01T00:00:00Z"),
-            Some(&too_far.to_rfc3339()),
-        )
-        .validate()
-        .unwrap_err();
+        let err = params(Some("2026-03-01T00:00:00Z"), Some(&too_far.to_rfc3339()))
+            .validate()
+            .unwrap_err();
         assert_eq!(err, CostReportValidationError::RangeTooLarge);
         assert_eq!(err.parameter(), "range");
         assert!(err.to_string().contains("366-day"), "{err}");
@@ -614,12 +608,9 @@ mod tests {
     fn validation_range_of_exactly_366_days_is_allowed() {
         let start = DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z").unwrap();
         let boundary = start + chrono::Duration::days(MAX_RANGE_DAYS);
-        let validated = params(
-            Some("2026-03-01T00:00:00Z"),
-            Some(&boundary.to_rfc3339()),
-        )
-        .validate()
-        .unwrap();
+        let validated = params(Some("2026-03-01T00:00:00Z"), Some(&boundary.to_rfc3339()))
+            .validate()
+            .unwrap();
         assert_eq!(
             validated.range.end_secs - validated.range.start_secs,
             MAX_RANGE_DAYS * SECONDS_PER_DAY
@@ -662,10 +653,9 @@ mod tests {
 
     #[test]
     fn validation_defaults_group_by_day_and_format_json() {
-        let validated =
-            params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"))
-                .validate()
-                .unwrap();
+        let validated = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"))
+            .validate()
+            .unwrap();
         assert_eq!(validated.group_by, GroupBy::Day);
         assert_eq!(validated.format, ReportFormat::Json);
         assert_eq!(validated.provider, None);
@@ -691,81 +681,86 @@ mod tests {
         p.provider = Some("openai".to_string());
         p.key_id = Some("key_42".to_string());
         let validated = p.validate().unwrap();
-    assert_eq!(validated.group_by, GroupBy::VirtualKey);
-    assert_eq!(validated.format, ReportFormat::Csv);
-    assert_eq!(validated.provider.as_deref(), Some("openai"));
-    assert_eq!(validated.key_id.as_deref(), Some("key_42"));
-}
+        assert_eq!(validated.group_by, GroupBy::VirtualKey);
+        assert_eq!(validated.format, ReportFormat::Csv);
+        assert_eq!(validated.provider.as_deref(), Some("openai"));
+        assert_eq!(validated.key_id.as_deref(), Some("key_42"));
+    }
 
-#[test]
-fn validation_rejects_provider_filter_over_256_chars() {
-    let mut p = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
-    p.provider = Some("x".repeat(MAX_FILTER_CHARS + 1));
-    let err = p.validate().unwrap_err();
-    assert_eq!(
-        err,
-        CostReportValidationError::FilterTooLong {
-            parameter: "provider",
-            len: MAX_FILTER_CHARS + 1,
-        }
-    );
-    assert_eq!(err.parameter(), "provider");
-    assert!(err.to_string().contains("provider"), "{err}");
-    assert!(err.to_string().contains("256"), "{err}");
-}
+    #[test]
+    fn validation_rejects_provider_filter_over_256_chars() {
+        let mut p = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
+        p.provider = Some("x".repeat(MAX_FILTER_CHARS + 1));
+        let err = p.validate().unwrap_err();
+        assert_eq!(
+            err,
+            CostReportValidationError::FilterTooLong {
+                parameter: "provider",
+                len: MAX_FILTER_CHARS + 1,
+            }
+        );
+        assert_eq!(err.parameter(), "provider");
+        assert!(err.to_string().contains("provider"), "{err}");
+        assert!(err.to_string().contains("256"), "{err}");
+    }
 
-#[test]
-fn validation_rejects_key_id_filter_over_256_chars() {
-    let mut p = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
-    p.key_id = Some("k".repeat(10_000));
-    let err = p.validate().unwrap_err();
-    assert_eq!(err.parameter(), "key_id");
-    assert!(matches!(
-        err,
-        CostReportValidationError::FilterTooLong {
-            parameter: "key_id",
-            ..
-        }
-    ));
-}
+    #[test]
+    fn validation_rejects_key_id_filter_over_256_chars() {
+        let mut p = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
+        p.key_id = Some("k".repeat(10_000));
+        let err = p.validate().unwrap_err();
+        assert_eq!(err.parameter(), "key_id");
+        assert!(matches!(
+            err,
+            CostReportValidationError::FilterTooLong {
+                parameter: "key_id",
+                ..
+            }
+        ));
+    }
 
-#[test]
-fn validation_accepts_filters_at_exactly_256_chars() {
-    let mut p = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
-    p.provider = Some("p".repeat(MAX_FILTER_CHARS));
-    p.key_id = Some("k".repeat(MAX_FILTER_CHARS));
-    let validated = p.validate().unwrap();
-    assert_eq!(validated.provider.as_deref().map(str::len), Some(MAX_FILTER_CHARS));
-    assert_eq!(validated.key_id.as_deref().map(str::len), Some(MAX_FILTER_CHARS));
-}
+    #[test]
+    fn validation_accepts_filters_at_exactly_256_chars() {
+        let mut p = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
+        p.provider = Some("p".repeat(MAX_FILTER_CHARS));
+        p.key_id = Some("k".repeat(MAX_FILTER_CHARS));
+        let validated = p.validate().unwrap();
+        assert_eq!(
+            validated.provider.as_deref().map(str::len),
+            Some(MAX_FILTER_CHARS)
+        );
+        assert_eq!(
+            validated.key_id.as_deref().map(str::len),
+            Some(MAX_FILTER_CHARS)
+        );
+    }
 
-#[test]
-fn validation_trims_filters_and_whitespace_only_becomes_none() {
-    // A padded filter behaves exactly like its explicit form — " openai"
-    // must not silently produce an empty report.
-    let mut padded = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
-    padded.provider = Some(" openai ".to_string());
-    padded.key_id = Some("\tkey_42\n".to_string());
-    let mut explicit = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
-    explicit.provider = Some("openai".to_string());
-    explicit.key_id = Some("key_42".to_string());
-    assert_eq!(padded.validate().unwrap(), explicit.validate().unwrap());
+    #[test]
+    fn validation_trims_filters_and_whitespace_only_becomes_none() {
+        // A padded filter behaves exactly like its explicit form — " openai"
+        // must not silently produce an empty report.
+        let mut padded = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
+        padded.provider = Some(" openai ".to_string());
+        padded.key_id = Some("\tkey_42\n".to_string());
+        let mut explicit = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
+        explicit.provider = Some("openai".to_string());
+        explicit.key_id = Some("key_42".to_string());
+        assert_eq!(padded.validate().unwrap(), explicit.validate().unwrap());
 
-    // Whitespace-only filters collapse to None (no filtering).
-    let mut blank = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
-    blank.provider = Some("   ".to_string());
-    blank.key_id = Some("\t \n".to_string());
-    let validated = blank.validate().unwrap();
-    assert_eq!(validated.provider, None);
-    assert_eq!(validated.key_id, None);
-}
+        // Whitespace-only filters collapse to None (no filtering).
+        let mut blank = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
+        blank.provider = Some("   ".to_string());
+        blank.key_id = Some("\t \n".to_string());
+        let validated = blank.validate().unwrap();
+        assert_eq!(validated.provider, None);
+        assert_eq!(validated.key_id, None);
+    }
 
     #[test]
     fn validation_parses_rfc3339_to_epoch_seconds() {
-        let validated =
-            params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"))
-                .validate()
-                .unwrap();
+        let validated = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"))
+            .validate()
+            .unwrap();
         assert_eq!(validated.range.start_secs, 1_767_225_600);
         assert_eq!(validated.range.end_secs, 1_767_312_000);
     }
@@ -792,34 +787,31 @@ fn validation_trims_filters_and_whitespace_only_becomes_none() {
         assert_eq!(micro_usd_to_usd_string(999_999), "0.999999");
         assert_eq!(micro_usd_to_usd_string(1_000_000), "1.000000");
         assert_eq!(micro_usd_to_usd_string(1_234_567), "1.234567");
-        assert_eq!(micro_usd_to_usd_string(12_345_678_912_345), "12345678.912345");
+        assert_eq!(
+            micro_usd_to_usd_string(12_345_678_912_345),
+            "12345678.912345"
+        );
     }
 
     #[test]
     fn micro_usd_string_handles_max_i64_and_negatives() {
-        assert_eq!(
-            micro_usd_to_usd_string(i64::MAX),
-            "9223372036854.775807"
-        );
-        assert_eq!(
-            micro_usd_to_usd_string(i64::MIN),
-            "-9223372036854.775808"
-        );
+        assert_eq!(micro_usd_to_usd_string(i64::MAX), "9223372036854.775807");
+        assert_eq!(micro_usd_to_usd_string(i64::MIN), "-9223372036854.775808");
         assert_eq!(micro_usd_to_usd_string(-1), "-0.000001");
         assert_eq!(micro_usd_to_usd_string(-1_500_000), "-1.500000");
     }
 
-#[test]
-fn micro_usd_to_usd_is_a_single_deterministic_conversion() {
-    assert_eq!(micro_usd_to_usd(0), 0.0);
-    assert_eq!(micro_usd_to_usd(1), 0.000001);
-    assert_eq!(micro_usd_to_usd(1_000_000), 1.0);
-    assert_eq!(micro_usd_to_usd(1_234_567), 1.234567);
-    assert_eq!(micro_usd_to_usd(i64::MAX), 9_223_372_036_854.775_4);
-    assert_eq!(micro_usd_to_usd(42), 42.0 / 1_000_000.0);
-    assert_eq!(micro_usd_to_usd(7_777_777), 7.777777);
-    assert_eq!(micro_usd_to_usd(123_456_789), 123.456789);
-}
+    #[test]
+    fn micro_usd_to_usd_is_a_single_deterministic_conversion() {
+        assert_eq!(micro_usd_to_usd(0), 0.0);
+        assert_eq!(micro_usd_to_usd(1), 0.000001);
+        assert_eq!(micro_usd_to_usd(1_000_000), 1.0);
+        assert_eq!(micro_usd_to_usd(1_234_567), 1.234567);
+        assert_eq!(micro_usd_to_usd(i64::MAX), 9_223_372_036_854.775_4);
+        assert_eq!(micro_usd_to_usd(42), 42.0 / 1_000_000.0);
+        assert_eq!(micro_usd_to_usd(7_777_777), 7.777777);
+        assert_eq!(micro_usd_to_usd(123_456_789), 123.456789);
+    }
 
     #[test]
     fn cost_descending_order_breaks_ties_by_dimension_ascending() {
@@ -857,11 +849,7 @@ fn micro_usd_to_usd_is_a_single_deterministic_conversion() {
 
     #[test]
     fn report_totals_sum_integer_micro_usd_across_rows() {
-        let rows = vec![
-            row("a", 1_500_000),
-            row("b", 250_000),
-            row("c", 1),
-        ];
+        let rows = vec![row("a", 1_500_000), row("b", 250_000), row("c", 1)];
         let report = CostReport::new(GroupBy::Provider, rows, 100, 200);
         assert_eq!(report.totals.cost_micro_usd, 1_750_001);
         assert_eq!(report.totals.cost_usd_string(), "1.750001");
@@ -870,8 +858,7 @@ fn micro_usd_to_usd_is_a_single_deterministic_conversion() {
         assert_eq!(report.totals.output_tokens, 60);
         assert_eq!(report.totals.window_start, 100);
         assert_eq!(report.totals.window_end, 200);
-        let dims: Vec<&str> =
-            report.rows.iter().map(|r| r.dimension.as_str()).collect();
+        let dims: Vec<&str> = report.rows.iter().map(|r| r.dimension.as_str()).collect();
         assert_eq!(dims, vec!["a", "b", "c"]);
     }
 
@@ -886,26 +873,29 @@ fn micro_usd_to_usd_is_a_single_deterministic_conversion() {
         assert!(json["rows"][0]["dimension"].is_string());
     }
 
-#[test]
-fn reconciliation_difference_is_ledger_minus_provider_spend() {
-    let report = ReconciliationReport::new(
-        LedgerTotals {
-            requests: 10,
-            cost_micro_usd: 2_000_000,
-        },
-        ProviderSpendTotals {
-            cost_micro_usd: 1_750_000,
-            window_start: 0,
-            window_end: 86_400,
-            caveat: true,
-        },
-        KeyUsageTotals {
-            cost_micro_usd: 1_900_000,
-        },
-        2,
-    );
+    #[test]
+    fn reconciliation_difference_is_ledger_minus_provider_spend() {
+        let report = ReconciliationReport::new(
+            LedgerTotals {
+                requests: 10,
+                cost_micro_usd: 2_000_000,
+            },
+            ProviderSpendTotals {
+                cost_micro_usd: 1_750_000,
+                window_start: 0,
+                window_end: 86_400,
+                caveat: true,
+            },
+            KeyUsageTotals {
+                cost_micro_usd: 1_900_000,
+            },
+            2,
+        );
         assert_eq!(report.difference_micro_usd, 250_000);
-        assert_eq!(micro_usd_to_usd_string(report.difference_micro_usd), "0.250000");
+        assert_eq!(
+            micro_usd_to_usd_string(report.difference_micro_usd),
+            "0.250000"
+        );
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["ledger"]["cost_usd"], serde_json::json!(2.0));
         assert_eq!(json["provider_spend"]["cost_usd"], serde_json::json!(1.75));

@@ -42,8 +42,8 @@
 //! appear in assertion messages — every redaction check is boolean with
 //! a static message.
 
-use std::sync::{Arc, MutexGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, MutexGuard};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -86,7 +86,9 @@ const CANCEL_PATH: &str = "/admin/oauth/github-copilot/cancel";
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Real gateway over an isolated data dir (unique master key + credential
@@ -151,10 +153,7 @@ fn endpoints(server: &MockServer) -> CopilotEndpoints {
 
 // ---- request helpers ------------------------------------------------------
 
-async fn send(
-    app: axum::Router,
-    req: Request<Body>,
-) -> (StatusCode, serde_json::Value, String) {
+async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value, String) {
     let resp = app.oneshot(req).await.expect("oneshot");
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
@@ -290,8 +289,14 @@ async fn mount_models_catalog(server: &MockServer) {
 /// GitHub token prefix, no Copilot bearer prefix, none of the fixture
 /// token/device-code literals. Static messages only.
 fn assert_redacted(context: &str, raw: &str) {
-    assert!(!raw.contains("gho_"), "{context}: gho_ prefix must never appear");
-    assert!(!raw.contains("tid="), "{context}: tid= prefix must never appear");
+    assert!(
+        !raw.contains("gho_"),
+        "{context}: gho_ prefix must never appear"
+    );
+    assert!(
+        !raw.contains("tid="),
+        "{context}: tid= prefix must never appear"
+    );
     assert!(
         !raw.contains(DEVICE_CODE),
         "{context}: device code must never appear"
@@ -338,7 +343,10 @@ fn sorted_keys(json: &serde_json::Value) -> Vec<String> {
 
 async fn wait_authenticated(manager: &CopilotTokenManager) {
     for _ in 0..400 {
-        if matches!(manager.session_state().await, CopilotSessionState::Authenticated { .. }) {
+        if matches!(
+            manager.session_state().await,
+            CopilotSessionState::Authenticated { .. }
+        ) {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -609,7 +617,10 @@ async fn logout_clears_store_state_and_usage_idempotently() {
     wait_authenticated(&manager).await;
 
     let store_path = CopilotTokenStore::default_path(&harness.data_dir);
-    assert!(store_path.exists(), "login must persist the credential store");
+    assert!(
+        store_path.exists(),
+        "login must persist the credential store"
+    );
 
     // Seed cached usage so the logout's clear is observable.
     seed_usage(&tracker).await;

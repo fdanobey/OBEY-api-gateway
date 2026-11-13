@@ -69,11 +69,11 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
     // `budget.reset(admin)` webhook (budget-alerts-unified-webhooks,
     // Task 6, Req 2.2).
     let virtual_keys_api =
-    crate::virtual_keys::admin::routes(std::sync::Arc::clone(&state.virtual_key_manager))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            vk_reset_webhook_layer,
-        ));
+        crate::virtual_keys::admin::routes(std::sync::Arc::clone(&state.virtual_key_manager))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                vk_reset_webhook_layer,
+            ));
 
     let loop_detection_api = crate::loop_detection::admin::routes();
     let memory_api = crate::memory::admin::routes(state.memory_system.clone());
@@ -126,26 +126,11 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/oauth/openai/status", get(oauth_status))
         .route("/oauth/openai/usage", get(oauth_usage))
         .route("/oauth/openai/logout", post(oauth_logout))
-        .route(
-            "/oauth/github-copilot/login",
-            post(copilot_oauth_login),
-        )
-        .route(
-            "/oauth/github-copilot/cancel",
-            post(copilot_oauth_cancel),
-        )
-        .route(
-            "/oauth/github-copilot/logout",
-            post(copilot_oauth_logout),
-        )
-        .route(
-            "/oauth/github-copilot/status",
-            get(copilot_oauth_status),
-        )
-        .route(
-            "/oauth/github-copilot/usage",
-            get(copilot_oauth_usage),
-        )
+        .route("/oauth/github-copilot/login", post(copilot_oauth_login))
+        .route("/oauth/github-copilot/cancel", post(copilot_oauth_cancel))
+        .route("/oauth/github-copilot/logout", post(copilot_oauth_logout))
+        .route("/oauth/github-copilot/status", get(copilot_oauth_status))
+        .route("/oauth/github-copilot/usage", get(copilot_oauth_usage))
         .route("/metrics/reset-active", post(reset_active_requests))
         .route("/circuit-breaker/states", get(get_circuit_breaker_states))
         .route("/circuit-breaker/reset", post(reset_circuit_breakers))
@@ -474,8 +459,9 @@ fn redact_config_for_response(config: &Config) -> serde_json::Value {
                 if let Some(obj) = endpoint.as_object_mut() {
                     if let Some(secret) = obj.get_mut("secret") {
                         if secret.as_str().is_some_and(|s| !s.is_empty()) {
-                            *secret =
-                                serde_json::Value::String(crate::webhooks::admin::SECRET_MASK.to_string());
+                            *secret = serde_json::Value::String(
+                                crate::webhooks::admin::SECRET_MASK.to_string(),
+                            );
                         }
                     }
                 }
@@ -492,7 +478,10 @@ fn redact_config_for_response(config: &Config) -> serde_json::Value {
         .get_mut("opentelemetry")
         .and_then(|v| v.as_object_mut())
     {
-        if let Some(headers) = opentelemetry.get_mut("headers").and_then(|v| v.as_object_mut()) {
+        if let Some(headers) = opentelemetry
+            .get_mut("headers")
+            .and_then(|v| v.as_object_mut())
+        {
             for (_name, value) in headers.iter_mut() {
                 if value.as_str().is_some_and(|s| !s.is_empty()) {
                     *value =
@@ -754,7 +743,13 @@ fn normalize_config_for_storage(
     for endpoint in &mut config.webhooks.endpoints {
         if endpoint.secret.as_deref() == Some(crate::webhooks::admin::SECRET_MASK) {
             endpoint.secret = existing_config
-                .and_then(|existing| existing.webhooks.endpoints.iter().find(|stored| stored.url == endpoint.url))
+                .and_then(|existing| {
+                    existing
+                        .webhooks
+                        .endpoints
+                        .iter()
+                        .find(|stored| stored.url == endpoint.url)
+                })
                 .and_then(|stored| stored.secret.clone())
                 .filter(|secret| !secret.is_empty());
         }
@@ -766,7 +761,10 @@ fn normalize_config_for_storage(
     // stored value for the same header name. A sentinel for a name with
     // no stored value preserves nothing and must not persist the mask —
     // the pair is dropped.
-    preserve_masked_telemetry_headers(&mut config.opentelemetry, existing_config.map(|cfg| &cfg.opentelemetry));
+    preserve_masked_telemetry_headers(
+        &mut config.opentelemetry,
+        existing_config.map(|cfg| &cfg.opentelemetry),
+    );
 
     normalize_smart_routing_credentials(
         &mut config.smart_routing,
@@ -804,7 +802,6 @@ fn preserve_masked_telemetry_headers(
         }
     });
 }
-
 
 /// Normalize Jev classifier credentials for storage, mirroring the provider
 /// api_key handling: plaintext keys are encrypted, encrypted keys are
@@ -1465,7 +1462,7 @@ async fn update_config(State(state): State<AppState>, Json(new_config): Json<Con
             "warnings": warnings
         })),
     )
-    .into_response()
+        .into_response()
 }
 
 /// POST /admin/config/validate — dry-run validation (Req 13.11, 13.16)
@@ -1622,7 +1619,7 @@ async fn security_status_handler(State(state): State<AppState>) -> Response {
             "unauthenticated_non_loopback": unauthenticated_non_loopback,
         })),
     )
-    .into_response()
+        .into_response()
 }
 
 /// Map a cost-report/reconcile validation error to the admin 400 JSON
@@ -1630,17 +1627,17 @@ async fn security_status_handler(State(state): State<AppState>) -> Response {
 /// 4.4). The `message` carries the allowed values for enum parameters;
 /// `parameter` names the query parameter for inline UI errors.
 fn cost_report_validation_error(error: &CostReportValidationError) -> Response {
-(
-StatusCode::BAD_REQUEST,
-Json(json!({
-"error": {
-"type": "validation_error",
-"message": error.to_string(),
-"parameter": error.parameter(),
-}
-})),
-)
-.into_response()
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+        "error": {
+        "type": "validation_error",
+        "message": error.to_string(),
+        "parameter": error.parameter(),
+        }
+        })),
+    )
+        .into_response()
 }
 
 /// Map a cost-report/reconcile query failure to the 500 JSON envelope
@@ -1651,16 +1648,16 @@ Json(json!({
 /// the caller; this helper only shapes the envelope, mirroring
 /// [`cost_report_validation_error`].
 fn cost_report_query_error(message: &'static str) -> Response {
-(
-StatusCode::INTERNAL_SERVER_ERROR,
-Json(json!({
-"error": {
-"type": "cost_report_query_error",
-"message": message,
-}
-})),
-)
-.into_response()
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+        "error": {
+        "type": "cost_report_query_error",
+        "message": message,
+        }
+        })),
+    )
+        .into_response()
 }
 
 /// Resolve a sibling SQLite database path next to the logs database
@@ -1668,11 +1665,11 @@ Json(json!({
 /// `gateway::budgets_db_path`): same parent directory as `logs_path`,
 /// or the working directory when the logs path has no parent component.
 fn sibling_db_path(logs_path: &std::path::Path, name: &str) -> std::path::PathBuf {
-logs_path
-.parent()
-.filter(|parent| !parent.as_os_str().is_empty())
-.unwrap_or_else(|| std::path::Path::new("."))
-.join(name)
+    logs_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(name)
 }
 
 /// GET /admin/cost-reports — aggregated cost report (spec:
@@ -1693,14 +1690,14 @@ async fn get_cost_report(
         Err(error) => return cost_report_validation_error(&error),
     };
 
-let database_path = state.logger.database_path().to_string();
-let rows = match fetch_report_async(database_path, validated.clone()).await {
-Ok(rows) => rows,
-Err(error) => {
-tracing::error!(%error, "cost report query failed");
-return cost_report_query_error("cost report query failed");
-}
-};
+    let database_path = state.logger.database_path().to_string();
+    let rows = match fetch_report_async(database_path, validated.clone()).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(%error, "cost report query failed");
+            return cost_report_query_error("cost report query failed");
+        }
+    };
 
     let report = CostReport::new(
         validated.group_by,
@@ -1736,27 +1733,27 @@ async fn get_cost_reconciliation(
         Err(error) => return cost_report_validation_error(&error),
     };
 
-// Store paths follow the server's placement rules: budgets.db is a
-// sibling of logs.db (see `sibling_db_path`); keys.db is the path the
-// running VirtualKeyManager was built with at startup — hot reload does
-// not rebuild the manager, so re-reading the config here could point at
-// a different database than the one actually receiving usage writes.
-let logs_db_path = state.logger.database_path().to_string();
-let keys_db_path = state
-.virtual_key_manager
-.database_path()
-.to_string_lossy()
-.into_owned();
-let budgets_db_path = sibling_db_path(std::path::Path::new(&logs_db_path), "budgets.db")
-.to_string_lossy()
-.into_owned();
-match fetch_reconciliation_async(logs_db_path, budgets_db_path, keys_db_path, range).await {
-Ok(report) => (StatusCode::OK, Json(report)).into_response(),
-Err(error) => {
-tracing::error!(%error, "cost reconciliation query failed");
-cost_report_query_error("reconciliation query failed")
-}
-}
+    // Store paths follow the server's placement rules: budgets.db is a
+    // sibling of logs.db (see `sibling_db_path`); keys.db is the path the
+    // running VirtualKeyManager was built with at startup — hot reload does
+    // not rebuild the manager, so re-reading the config here could point at
+    // a different database than the one actually receiving usage writes.
+    let logs_db_path = state.logger.database_path().to_string();
+    let keys_db_path = state
+        .virtual_key_manager
+        .database_path()
+        .to_string_lossy()
+        .into_owned();
+    let budgets_db_path = sibling_db_path(std::path::Path::new(&logs_db_path), "budgets.db")
+        .to_string_lossy()
+        .into_owned();
+    match fetch_reconciliation_async(logs_db_path, budgets_db_path, keys_db_path, range).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "cost reconciliation query failed");
+            cost_report_query_error("reconciliation query failed")
+        }
+    }
 }
 
 /// POST /admin/circuit-breaker/reset — reset circuit breaker(s).
@@ -2003,80 +2000,80 @@ async fn reset_provider_budget(
         }
     }
 
-// Durable reset first (CAS on the durable window_start: zeroes the
-// row only when it is still anchored where we read it), on the
-// blocking pool — same discipline as the virtual-key reset. A store
-// error for a provider that HAS a row is fail-closed: durable spend
-// survives and the request errors instead of reporting success.
-let store_reset: Result<
-Option<crate::metrics::provider_budget_store::ResetWindowOutcome>,
-String,
-> = match state.metrics.provider_budget_store() {
-Some(store) => {
-let store_name = name.clone();
-tokio::task::spawn_blocking(move || {
-// Read the durable anchor the CAS reset expects. An error
-// here is treated like a reset error (the row's existence
-// is unknowable — do not claim success).
-let expected = store.get_window_start(&store_name)?;
-match expected {
-Some(expected) => store.reset_window(&store_name, expected),
-// No row yet: nothing durable to zero.
-None => Ok(None),
-}
-})
-.await
-.map_err(|e| e.to_string())
-.and_then(|inner| inner.map_err(|e| e.to_string()))
-}
-// No durable store attached (e.g. degraded startup path): nothing
-// durable to zero; reset the in-memory view only.
-None => Ok(None),
-};
-let (previous_spend_usd, reset_anchor) = match store_reset {
-// Admin resets re-arm unconditionally (Req 2.2) — even a CAS
-// miss (another admin/window reset raced) reports success; the
-// anchor the outcome carries is the freshest durable anchor.
-Ok(Some(outcome)) => (outcome.previous_spend, Some(outcome.new_anchor)),
-Ok(None) => (0.0, None),
-Err(error) => {
-tracing::error!(
-provider = %name,
-error = %error,
-"Failed to reset provider budget window in store; refusing to zero in-memory spend"
-);
-return Err(crate::error::GatewayError::Database(format!(
-"Failed to reset budget window for provider '{name}': {error}"
-)));
-}
-};
-// Metrics atomics + exhaustion marker (budget_skip visibility) only
-// after the durable reset succeeded.
-state.metrics.reset_provider_spend(&name);
-state.metrics.clear_provider_budget_exhausted(&name);
+    // Durable reset first (CAS on the durable window_start: zeroes the
+    // row only when it is still anchored where we read it), on the
+    // blocking pool — same discipline as the virtual-key reset. A store
+    // error for a provider that HAS a row is fail-closed: durable spend
+    // survives and the request errors instead of reporting success.
+    let store_reset: Result<
+        Option<crate::metrics::provider_budget_store::ResetWindowOutcome>,
+        String,
+    > = match state.metrics.provider_budget_store() {
+        Some(store) => {
+            let store_name = name.clone();
+            tokio::task::spawn_blocking(move || {
+                // Read the durable anchor the CAS reset expects. An error
+                // here is treated like a reset error (the row's existence
+                // is unknowable — do not claim success).
+                let expected = store.get_window_start(&store_name)?;
+                match expected {
+                    Some(expected) => store.reset_window(&store_name, expected),
+                    // No row yet: nothing durable to zero.
+                    None => Ok(None),
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|inner| inner.map_err(|e| e.to_string()))
+        }
+        // No durable store attached (e.g. degraded startup path): nothing
+        // durable to zero; reset the in-memory view only.
+        None => Ok(None),
+    };
+    let (previous_spend_usd, reset_anchor) = match store_reset {
+        // Admin resets re-arm unconditionally (Req 2.2) — even a CAS
+        // miss (another admin/window reset raced) reports success; the
+        // anchor the outcome carries is the freshest durable anchor.
+        Ok(Some(outcome)) => (outcome.previous_spend, Some(outcome.new_anchor)),
+        Ok(None) => (0.0, None),
+        Err(error) => {
+            tracing::error!(
+            provider = %name,
+            error = %error,
+            "Failed to reset provider budget window in store; refusing to zero in-memory spend"
+            );
+            return Err(crate::error::GatewayError::Database(format!(
+                "Failed to reset budget window for provider '{name}': {error}"
+            )));
+        }
+    };
+    // Metrics atomics + exhaustion marker (budget_skip visibility) only
+    // after the durable reset succeeded.
+    state.metrics.reset_provider_spend(&name);
+    state.metrics.clear_provider_budget_exhausted(&name);
 
-// Budget-reset webhook (budget-alerts-unified-webhooks, Req 2.2):
-// re-arm the scope's fired state and emit `budget.reset(admin)`
-// with the anchor the store reset just returned (atomic with the
-// zeroing — no read-back that could observe a later rollover).
-// Admin path — not on the request/response hot path; the emit
-// spawns delivery.
-{
-let alerts = state.provider_budget_alerts.clone();
-let config = state.config.clone();
-let provider = name.clone();
-tokio::spawn(async move {
-let new_anchor = reset_anchor.unwrap_or_else(|| chrono::Utc::now().timestamp());
-alerts
-.note_provider_reset(
-&config,
-&provider,
-crate::webhooks::events::ResetSource::Admin,
-new_anchor,
-)
-.await;
-});
-}
+    // Budget-reset webhook (budget-alerts-unified-webhooks, Req 2.2):
+    // re-arm the scope's fired state and emit `budget.reset(admin)`
+    // with the anchor the store reset just returned (atomic with the
+    // zeroing — no read-back that could observe a later rollover).
+    // Admin path — not on the request/response hot path; the emit
+    // spawns delivery.
+    {
+        let alerts = state.provider_budget_alerts.clone();
+        let config = state.config.clone();
+        let provider = name.clone();
+        tokio::spawn(async move {
+            let new_anchor = reset_anchor.unwrap_or_else(|| chrono::Utc::now().timestamp());
+            alerts
+                .note_provider_reset(
+                    &config,
+                    &provider,
+                    crate::webhooks::events::ResetSource::Admin,
+                    new_anchor,
+                )
+                .await;
+        });
+    }
 
     tracing::info!(provider = %name, "Admin endpoint reset provider budget window");
     Ok(Json(json!({
@@ -2604,16 +2601,16 @@ async fn oauth_logout(State(state): State<AppState>) -> Response {
 /// safe-metadata reads like `sku`, never token fields), and the catalog
 /// sync.
 pub struct CopilotAdminState {
-/// Shared credential-lifecycle manager (login/cancel/logout/state).
-pub manager: Arc<CopilotTokenManager>,
-/// Shared usage tracker (short/weekly/premium windows).
-pub usage_tracker: Arc<UsageTracker>,
-/// Clone of the manager's credential store; safe-metadata reads only
-/// (`sku`, `copilot_expires_at`). Token fields are never read through
-/// this handle.
-pub store: CopilotTokenStore,
-/// Catalog sync for the status card's warning flags, when constructed.
-pub catalog: Option<Arc<CopilotCatalogSync>>,
+    /// Shared credential-lifecycle manager (login/cancel/logout/state).
+    pub manager: Arc<CopilotTokenManager>,
+    /// Shared usage tracker (short/weekly/premium windows).
+    pub usage_tracker: Arc<UsageTracker>,
+    /// Clone of the manager's credential store; safe-metadata reads only
+    /// (`sku`, `copilot_expires_at`). Token fields are never read through
+    /// this handle.
+    pub store: CopilotTokenStore,
+    /// Catalog sync for the status card's warning flags, when constructed.
+    pub catalog: Option<Arc<CopilotCatalogSync>>,
 }
 
 /// Resolve the Copilot admin bundle from the gateway wiring (task 9).
@@ -2625,22 +2622,22 @@ pub catalog: Option<Arc<CopilotCatalogSync>>,
 /// Copilot OAuth, leaving the endpoints on their documented
 /// not-configured responses.
 fn copilot_admin_state(state: &AppState) -> Option<CopilotAdminState> {
-let manager = state.copilot_manager.clone()?;
-let usage_tracker = state.copilot_usage_tracker.clone()?;
-// Same store path the manager was built over: default_path(parent of
-// the master key). Kept in sync by construction (task 9 wiring).
-let store = secrets::master_key_path().ok().and_then(|key_path| {
-key_path
-.parent()
-.map(crate::oauth::github_copilot::store::CopilotTokenStore::default_path)
-.map(CopilotTokenStore::new)
-})?;
-Some(CopilotAdminState {
-manager,
-usage_tracker,
-store,
-catalog: state.copilot_catalog.clone(),
-})
+    let manager = state.copilot_manager.clone()?;
+    let usage_tracker = state.copilot_usage_tracker.clone()?;
+    // Same store path the manager was built over: default_path(parent of
+    // the master key). Kept in sync by construction (task 9 wiring).
+    let store = secrets::master_key_path().ok().and_then(|key_path| {
+        key_path
+            .parent()
+            .map(crate::oauth::github_copilot::store::CopilotTokenStore::default_path)
+            .map(CopilotTokenStore::new)
+    })?;
+    Some(CopilotAdminState {
+        manager,
+        usage_tracker,
+        store,
+        catalog: state.copilot_catalog.clone(),
+    })
 }
 
 /// Safe metadata for a started (or deduped) device-flow login.
@@ -2755,33 +2752,33 @@ async fn copilot_cancel_handler(manager: &CopilotTokenManager) -> Response {
 /// (Req 6.2; `complete_logout` does the whole credential side and is
 /// idempotent).
 async fn copilot_oauth_logout(State(state): State<AppState>) -> Response {
-match copilot_admin_state(&state) {
-Some(copilot) => copilot_logout_handler(&copilot.manager, &copilot.usage_tracker).await,
-None => copilot_not_configured(),
-}
+    match copilot_admin_state(&state) {
+        Some(copilot) => copilot_logout_handler(&copilot.manager, &copilot.usage_tracker).await,
+        None => copilot_not_configured(),
+    }
 }
 
 async fn copilot_logout_handler(
-manager: &CopilotTokenManager,
-usage_tracker: &UsageTracker,
+    manager: &CopilotTokenManager,
+    usage_tracker: &UsageTracker,
 ) -> Response {
-match manager.complete_logout().await {
-Ok(()) => {
-// Req 6.2: logout also clears cached usage windows.
-usage_tracker.clear().await;
-(StatusCode::OK, Json(json!({ "status": "logged_out" }))).into_response()
-}
-Err(e) => (
-StatusCode::INTERNAL_SERVER_ERROR,
-Json(json!({
-"error": {
-"message": format!("Failed to logout: {}", e),
-"type": "oauth_error"
-}
-})),
-)
-.into_response(),
-}
+    match manager.complete_logout().await {
+        Ok(()) => {
+            // Req 6.2: logout also clears cached usage windows.
+            usage_tracker.clear().await;
+            (StatusCode::OK, Json(json!({ "status": "logged_out" }))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+            "error": {
+            "message": format!("Failed to logout: {}", e),
+            "type": "oauth_error"
+            }
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /admin/oauth/github-copilot/status` — safe metadata only (Req 6.4):
@@ -2818,11 +2815,7 @@ async fn copilot_status_handler(
 
     // Safe metadata from the encrypted store: sku only. Token fields
     // (`github_access_token`, `copilot_token`) are never read here.
-    let sku = store
-        .load()
-        .ok()
-        .flatten()
-        .and_then(|creds| creds.sku);
+    let sku = store.load().ok().flatten().and_then(|creds| creds.sku);
 
     let catalog_json = match catalog {
         Some(sync) => {
@@ -3368,8 +3361,8 @@ mod tests {
                     reasoning_models_allowlist: Default::default(),
                     codex_search: None,
                     reasoning_compat: Default::default(),
-            webhooks: Default::default(),
-            opentelemetry: Default::default(),
+                    webhooks: Default::default(),
+                    opentelemetry: Default::default(),
                 })
             })
         })
@@ -4113,8 +4106,8 @@ retry:
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
             codex_search: None,
-    webhooks: Default::default(),
-    opentelemetry: Default::default(),
+            webhooks: Default::default(),
+            opentelemetry: Default::default(),
             reasoning_compat: Default::default(),
         };
         config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();
@@ -4832,727 +4825,705 @@ retry:
             );
         }
 
-// Cleanup
-std::env::remove_var(user_env);
-std::env::remove_var(pass_env);
-}
-
-// -----------------------------------------------------------------------
-// Task 10 — GitHub Copilot OAuth admin endpoint tests (spec
-// github-copilot-oauth-provider; Reqs 2.1, 2.6, 6.2, 6.4, 7.1)
-// -----------------------------------------------------------------------
-//
-// The handler bodies (`copilot_login_handler` &co.) take the manager /
-// tracker / store / catalog directly, so these tests drive the full
-// HTTP-response construction against a manager over wiremock — the exact
-// logic the route wrappers run once task 9 wires `AppState`. A companion
-// full-server test pins the route registration + auth + not-configured
-// envelope that is observable before task 9 lands.
-
-/// Wiremock helpers for the Copilot admin tests (same shapes the manager
-/// tests in `oauth/github_copilot/manager.rs` use).
-mod copilot_admin_test_support {
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, ResponseTemplate};
-
-pub fn endpoints(
-server: &wiremock::MockServer,
-) -> crate::oauth::github_copilot::manager::CopilotEndpoints {
-crate::oauth::github_copilot::manager::CopilotEndpoints {
-device_flow: crate::oauth::github_copilot::device_flow::DeviceFlowEndpoints {
-device_code_url: format!("{}/login/device/code", server.uri()),
-token_url: format!("{}/login/oauth/access_token", server.uri()),
-},
-copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
-}
-}
-
-pub fn device_grant_body() -> serde_json::Value {
-serde_json::json!({
-"device_code": "dc-admin-test-1",
-"user_code": "WDJB-MJHT",
-"verification_uri": "https://github.com/login/device",
-"expires_in": 900,
-"interval": 0
-})
-}
-
-pub fn github_token_body() -> serde_json::Value {
-serde_json::json!({
-"access_token": "gho-admin-test-github-token",
-"token_type": "bearer",
-"scope": "read:user"
-})
-}
-
-/// Mount the device-grant issuance leg only (login stays pending — the
-/// poll gets `authorization_pending` forever, interval 0 for speed).
-pub async fn mount_device_grant(server: &wiremock::MockServer) {
-Mock::given(method("POST"))
-.and(path("/login/device/code"))
-.respond_with(ResponseTemplate::new(200).set_body_json(device_grant_body()))
-.expect(1..)
-.mount(server)
-.await;
-Mock::given(method("POST"))
-.and(path("/login/oauth/access_token"))
-.respond_with(
-ResponseTemplate::new(200).set_body_json(
-serde_json::json!({ "error": "authorization_pending" }),
-),
-)
-.expect(0..)
-.mount(server)
-.await;
-}
-
-/// Mount a full happy-path login: grant → GitHub token → exchange, with
-/// the exchange's `endpoints.api` pointing back at the mock server (so a
-/// wired catalog sync fetches `{api_base}/models` from wiremock too).
-pub async fn mount_full_login(server: &wiremock::MockServer, copilot_expires_at: u64) {
-Mock::given(method("POST"))
-.and(path("/login/device/code"))
-.respond_with(ResponseTemplate::new(200).set_body_json(device_grant_body()))
-.expect(1..)
-.mount(server)
-.await;
-Mock::given(method("POST"))
-.and(path("/login/oauth/access_token"))
-.respond_with(ResponseTemplate::new(200).set_body_json(github_token_body()))
-.expect(1..)
-.mount(server)
-.await;
-Mock::given(method("GET"))
-.and(path("/copilot_internal/v2/token"))
-.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-"token": "tid=admin-test-copilot-bearer",
-"expires_at": copilot_expires_at,
-"refresh_in": 1500,
-"endpoints": { "api": server.uri() },
-"sku": "copilot_pro"
-})))
-.expect(1..)
-.mount(server)
-.await;
-}
-}
-
-/// Hermetic secure-storage dir for the Copilot admin tests: the shared
-/// unit-test secrets dir (master key already created). Each test gets a
-/// unique credential file so parallel tests never collide.
-fn copilot_admin_secure_dir() -> &'static std::path::Path {
-crate::secrets::test_support::shared_data_dir()
-}
-
-/// Unique store path for one Copilot admin test.
-fn copilot_admin_unique_store() -> CopilotTokenStore {
-static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-CopilotTokenStore::new(
-copilot_admin_secure_dir().join(format!("admin_copilot_tokens_{n}.enc")),
-)
-}
-
-/// Collect a handler response into (status, JSON, raw body string).
-async fn copilot_response_parts(response: Response) -> (StatusCode, serde_json::Value, String) {
-let status = response.status();
-let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-let raw = String::from_utf8_lossy(&body).into_owned();
-let json = serde_json::from_slice(&body).unwrap();
-(status, json, raw)
-}
-
-fn now_plus(secs: u64) -> u64 {
-std::time::SystemTime::now()
-.duration_since(std::time::UNIX_EPOCH)
-.unwrap()
-.as_secs()
-.saturating_add(secs)
-}
-
-/// POST login (fresh) — shape: `status: "started"`, verification URL,
-/// user code, `expires_in`, and a derived `expires_at`; the response
-/// arrives promptly (device-grant round trip only — Req 2.1's 5 s budget)
-/// and carries no token material (Req 6.4 redaction).
-#[tokio::test]
-async fn copilot_admin_login_fresh_shape_and_redaction() {
-let server = wiremock::MockServer::start().await;
-copilot_admin_test_support::mount_device_grant(&server).await;
-let manager = CopilotTokenManager::with_endpoints(
-copilot_admin_unique_store(),
-reqwest::Client::new(),
-copilot_admin_test_support::endpoints(&server),
-);
-
-let started = std::time::Instant::now();
-let (status, json, raw) = copilot_response_parts(copilot_login_handler(&manager).await).await;
-let elapsed = started.elapsed();
-
-assert_eq!(status, StatusCode::OK);
-assert_eq!(json["status"], "started");
-assert_eq!(json["verification_uri"], "https://github.com/login/device");
-assert_eq!(json["user_code"], "WDJB-MJHT");
-assert_eq!(json["expires_in"], 900);
-assert!(
-json["expires_at"].as_u64().is_some(),
-"derived expiry timestamp must be present"
-);
-// Req 2.1: only the grant round trip is awaited.
-assert!(
-elapsed < std::time::Duration::from_secs(5),
-"login handler must respond well within 5 s, took {elapsed:?}"
-);
-// Req 6.4 redaction: no device code, no token material, no gho_ prefix.
-assert!(!raw.contains("dc-admin-test-1"));
-assert!(!raw.contains("gho_"));
-assert!(!raw.contains("token\"") || !raw.contains("tid="));
-}
-
-/// POST login while in flight — Req 2.6: the SAME verification URL and
-/// user code come back with `status: "in_flight"`, and the grant endpoint
-/// saw exactly ONE device-code request (no second flow started).
-#[tokio::test]
-async fn copilot_admin_login_dedupe_returns_same_prompt() {
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, ResponseTemplate};
-
-let server = wiremock::MockServer::start().await;
-Mock::given(method("POST"))
-.and(path("/login/device/code"))
-.respond_with(
-ResponseTemplate::new(200)
-.set_body_json(copilot_admin_test_support::device_grant_body()),
-)
-// Exactly one issuance across both handler calls (dedupe).
-.expect(1)
-.mount(&server)
-.await;
-Mock::given(method("POST"))
-.and(path("/login/oauth/access_token"))
-.respond_with(
-ResponseTemplate::new(200).set_body_json(
-serde_json::json!({ "error": "authorization_pending" }),
-),
-)
-.expect(0..)
-.mount(&server)
-.await;
-
-let manager = CopilotTokenManager::with_endpoints(
-copilot_admin_unique_store(),
-reqwest::Client::new(),
-copilot_admin_test_support::endpoints(&server),
-);
-
-let (status_a, json_a, _) =
-copilot_response_parts(copilot_login_handler(&manager).await).await;
-let (status_b, json_b, _) =
-copilot_response_parts(copilot_login_handler(&manager).await).await;
-
-assert_eq!(status_a, StatusCode::OK);
-assert_eq!(status_b, StatusCode::OK);
-assert_eq!(json_a["status"], "started");
-assert_eq!(json_b["status"], "in_flight");
-assert_eq!(json_b["verification_uri"], json_a["verification_uri"]);
-assert_eq!(json_b["user_code"], json_a["user_code"]);
-assert_eq!(json_b["expires_in"], json_a["expires_in"]);
-
-server.verify().await;
-}
-
-/// POST cancel — in-flight login is cancelled (Req 2.2): returns
-/// `{ "status": "cancelled" }` and the manager returns to
-/// `Unauthenticated` once the poll task observes the cancel.
-#[tokio::test]
-async fn copilot_admin_cancel_cancels_in_flight_login() {
-let server = wiremock::MockServer::start().await;
-copilot_admin_test_support::mount_device_grant(&server).await;
-let manager = CopilotTokenManager::with_endpoints(
-copilot_admin_unique_store(),
-reqwest::Client::new(),
-copilot_admin_test_support::endpoints(&server),
-);
-
-// Start a login (stays pending).
-let _ = manager.start_login().await.expect("login starts");
-
-// Cancel via the handler.
-let (status, json, raw) = copilot_response_parts(copilot_cancel_handler(&manager).await).await;
-assert_eq!(status, StatusCode::OK);
-assert_eq!(json["status"], "cancelled");
-assert!(!raw.contains("gho_"));
-
-// The poll task restores the pre-login state.
-let mut state = manager.session_state().await;
-for _ in 0..100 {
-if state == CopilotSessionState::Unauthenticated {
-break;
-}
-tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-state = manager.session_state().await;
-}
-assert_eq!(
-state,
-CopilotSessionState::Unauthenticated,
-"cancel must restore the unauthenticated state"
-);
-
-// Idempotent: cancelling again still succeeds.
-let (status, _, _) = copilot_response_parts(copilot_cancel_handler(&manager).await).await;
-assert_eq!(status, StatusCode::OK);
-}
-
-/// GET status after a full login — shape: `state`, `expires_at`, `sku`,
-/// `error`, and the `catalog` object with the task-8 warning flags
-/// (`fetch_failed` / `unknown_configured_models`); no token material
-/// anywhere (Req 6.4).
-#[tokio::test]
-async fn copilot_admin_status_shape_after_login() {
-let copilot_expires_at = now_plus(3600);
-let server = wiremock::MockServer::start().await;
-copilot_admin_test_support::mount_full_login(&server, copilot_expires_at).await;
-
-let store = copilot_admin_unique_store();
-let manager = CopilotTokenManager::with_endpoints(
-store.clone(),
-reqwest::Client::new(),
-copilot_admin_test_support::endpoints(&server),
-);
-manager.start_login().await.expect("login starts");
-
-// Wait for the background poll + exchange to land in Authenticated.
-let mut state = manager.session_state().await;
-for _ in 0..200 {
-if matches!(state, CopilotSessionState::Authenticated { .. }) {
-break;
-}
-tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-state = manager.session_state().await;
-}
-assert!(
-matches!(state, CopilotSessionState::Authenticated { .. }),
-"login must complete, still {state:?}"
-);
-
-let (status, json, raw) =
-copilot_response_parts(copilot_status_handler(&manager, &store, None).await).await;
-
-assert_eq!(status, StatusCode::OK);
-assert_eq!(json["state"], "authenticated");
-assert_eq!(json["expires_at"].as_u64(), Some(copilot_expires_at));
-assert_eq!(json["sku"], "copilot_pro");
-assert!(json.get("error").is_some(), "error field is always present");
-assert!(
-json.get("catalog").is_some(),
-"catalog field is always present"
-);
-assert!(json["catalog"].is_null(), "no catalog wired → null");
-
-    // Req 6.4 redaction: none of the token material that flowed through
-    // the manager may appear.
-    assert!(!raw.contains("gho_"));
-    assert!(!raw.contains("tid=admin-test-copilot-bearer"));
-    assert!(!raw.contains("tid="));
-    assert!(!raw.contains("dc-admin-test-1"));
-    assert!(!raw.contains("github_access_token"));
-    assert!(!raw.contains("copilot_token"));
-}
-
-/// Req 2.3: a terminal device-flow error (denial) settles the session to
-/// `unauthenticated` and the status handler surfaces the manager's
-/// `last_login_error()` as the `error` field — not a generic message.
-#[tokio::test]
-async fn copilot_admin_status_surfaces_terminal_login_error() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, ResponseTemplate};
-
-    let server = wiremock::MockServer::start().await;
-    // Grant issuance + a terminal denial on the first poll (mounted
-    // directly — no pending-poll mock that could shadow the denial).
-    Mock::given(method("POST"))
-        .and(path("/login/device/code"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            copilot_admin_test_support::device_grant_body(),
-        ))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/login/oauth/access_token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({"error": "access_denied"}),
-        ))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let store = copilot_admin_unique_store();
-    let manager = CopilotTokenManager::with_endpoints(
-        store.clone(),
-        reqwest::Client::new(),
-        copilot_admin_test_support::endpoints(&server),
-    );
-    manager.start_login().await.expect("login starts");
-
-    // Wait for the terminal denial to settle the session.
-    let mut state = manager.session_state().await;
-    for _ in 0..200 {
-        if matches!(state, CopilotSessionState::Unauthenticated) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        state = manager.session_state().await;
+        // Cleanup
+        std::env::remove_var(user_env);
+        std::env::remove_var(pass_env);
     }
-    assert!(
-        matches!(state, CopilotSessionState::Unauthenticated),
-        "denial must settle the session, still {state:?}"
-    );
 
-    let (status, json, raw) =
-        copilot_response_parts(copilot_status_handler(&manager, &store, None).await).await;
+    // -----------------------------------------------------------------------
+    // Task 10 — GitHub Copilot OAuth admin endpoint tests (spec
+    // github-copilot-oauth-provider; Reqs 2.1, 2.6, 6.2, 6.4, 7.1)
+    // -----------------------------------------------------------------------
+    //
+    // The handler bodies (`copilot_login_handler` &co.) take the manager /
+    // tracker / store / catalog directly, so these tests drive the full
+    // HTTP-response construction against a manager over wiremock — the exact
+    // logic the route wrappers run once task 9 wires `AppState`. A companion
+    // full-server test pins the route registration + auth + not-configured
+    // envelope that is observable before task 9 lands.
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["state"], "unauthenticated");
-    let error = json["error"]
-        .as_str()
-        .expect("terminal login error must surface as the error field");
-    assert!(
-        error.to_lowercase().contains("denied"),
-        "surfaced error must name the denial, got: {error}"
-    );
-    // Redaction: no token material alongside the surfaced error.
-    assert!(!raw.contains("gho_"));
-    assert!(!raw.contains("tid="));
-    assert!(!raw.contains("dc-admin-test-1"));
-}
+    /// Wiremock helpers for the Copilot admin tests (same shapes the manager
+    /// tests in `oauth/github_copilot/manager.rs` use).
+    mod copilot_admin_test_support {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
 
-/// GET status with the catalog wired — the task-8 `CatalogStatus` flags
-/// surface under `catalog` (Req 6.4: catalog status incl.
-/// `fetch_failed`/`unknown_configured_models`).
-#[tokio::test]
-async fn copilot_admin_status_includes_catalog_flags() {
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, ResponseTemplate};
+        pub fn endpoints(
+            server: &wiremock::MockServer,
+        ) -> crate::oauth::github_copilot::manager::CopilotEndpoints {
+            crate::oauth::github_copilot::manager::CopilotEndpoints {
+                device_flow: crate::oauth::github_copilot::device_flow::DeviceFlowEndpoints {
+                    device_code_url: format!("{}/login/device/code", server.uri()),
+                    token_url: format!("{}/login/oauth/access_token", server.uri()),
+                },
+                copilot_token_url: format!("{}/copilot_internal/v2/token", server.uri()),
+            }
+        }
 
-let copilot_expires_at = now_plus(3600);
-let server = wiremock::MockServer::start().await;
-copilot_admin_test_support::mount_full_login(&server, copilot_expires_at).await;
-// Catalog endpoint: entries with one gated and one unknown-configured.
-Mock::given(method("GET"))
-.and(path("/models"))
-.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-"data": [
-{ "id": "gpt-5-codex", "model_picker_enabled": true },
-{ "id": "gated-off", "model_picker_enabled": false }
-]
-})))
-.expect(1..)
-.mount(&server)
-.await;
+        pub fn device_grant_body() -> serde_json::Value {
+            serde_json::json!({
+            "device_code": "dc-admin-test-1",
+            "user_code": "WDJB-MJHT",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 900,
+            "interval": 0
+            })
+        }
 
-let store = copilot_admin_unique_store();
-let manager = std::sync::Arc::new(CopilotTokenManager::with_endpoints(
-store.clone(),
-reqwest::Client::new(),
-copilot_admin_test_support::endpoints(&server),
-));
-manager.start_login().await.expect("login starts");
-let mut state = manager.session_state().await;
-for _ in 0..200 {
-if matches!(state, CopilotSessionState::Authenticated { .. }) {
-break;
-}
-tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-state = manager.session_state().await;
-}
-assert!(matches!(state, CopilotSessionState::Authenticated { .. }));
+        pub fn github_token_body() -> serde_json::Value {
+            serde_json::json!({
+            "access_token": "gho-admin-test-github-token",
+            "token_type": "bearer",
+            "scope": "read:user"
+            })
+        }
 
-let catalog = std::sync::Arc::new(CopilotCatalogSync::with_owner(
-std::sync::Arc::clone(&manager),
-reqwest::Client::new(),
-"test-copilot".to_string(),
-));
-catalog
-.set_configured_models(vec![
-"gpt-5-codex".to_string(),
-"not-in-catalog".to_string(),
-])
-.await;
-catalog.refresh_now().await;
+        /// Mount the device-grant issuance leg only (login stays pending — the
+        /// poll gets `authorization_pending` forever, interval 0 for speed).
+        pub async fn mount_device_grant(server: &wiremock::MockServer) {
+            Mock::given(method("POST"))
+                .and(path("/login/device/code"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(device_grant_body()))
+                .expect(1..)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/login/oauth/access_token"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "error": "authorization_pending" })),
+                )
+                .expect(0..)
+                .mount(server)
+                .await;
+        }
 
-let (status, json, raw) =
-copilot_response_parts(
-copilot_status_handler(&manager, &store, Some(catalog.as_ref())).await,
-)
-.await;
+        /// Mount a full happy-path login: grant → GitHub token → exchange, with
+        /// the exchange's `endpoints.api` pointing back at the mock server (so a
+        /// wired catalog sync fetches `{api_base}/models` from wiremock too).
+        pub async fn mount_full_login(server: &wiremock::MockServer, copilot_expires_at: u64) {
+            Mock::given(method("POST"))
+                .and(path("/login/device/code"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(device_grant_body()))
+                .expect(1..)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/login/oauth/access_token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(github_token_body()))
+                .expect(1..)
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/copilot_internal/v2/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "tid=admin-test-copilot-bearer",
+                "expires_at": copilot_expires_at,
+                "refresh_in": 1500,
+                "endpoints": { "api": server.uri() },
+                "sku": "copilot_pro"
+                })))
+                .expect(1..)
+                .mount(server)
+                .await;
+        }
+    }
 
-assert_eq!(status, StatusCode::OK);
-assert_eq!(json["catalog"]["model_count"], 1);
-assert_eq!(
-json["catalog"]["unknown_configured_models"],
-serde_json::json!(["not-in-catalog"])
-);
-assert_eq!(json["catalog"]["fetch_failed"], false);
-assert!(
-json["catalog"]["last_success_at"].as_u64().is_some(),
-"successful fetch records its timestamp"
-);
+    /// Hermetic secure-storage dir for the Copilot admin tests: the shared
+    /// unit-test secrets dir (master key already created). Each test gets a
+    /// unique credential file so parallel tests never collide.
+    fn copilot_admin_secure_dir() -> &'static std::path::Path {
+        crate::secrets::test_support::shared_data_dir()
+    }
 
-// Redaction: none of the manager's token material.
-assert!(!raw.contains("gho_"));
-assert!(!raw.contains("tid=admin-test-copilot-bearer"));
-assert!(!raw.contains("tid="));
-assert!(!raw.contains("dc-admin-test-1"));
-}
+    /// Unique store path for one Copilot admin test.
+    fn copilot_admin_unique_store() -> CopilotTokenStore {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        CopilotTokenStore::new(
+            copilot_admin_secure_dir().join(format!("admin_copilot_tokens_{n}.enc")),
+        )
+    }
 
-/// GET usage — shape: the tracker snapshot with the short/weekly window
-/// pairs AND the premium percentage window (task 6), plus updated_at;
-/// no token material.
-#[tokio::test]
-async fn copilot_admin_usage_shape_with_premium_window() {
-let tracker = UsageTracker::new();
+    /// Collect a handler response into (status, JSON, raw body string).
+    async fn copilot_response_parts(response: Response) -> (StatusCode, serde_json::Value, String) {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let raw = String::from_utf8_lossy(&body).into_owned();
+        let json = serde_json::from_slice(&body).unwrap();
+        (status, json, raw)
+    }
 
-// Short window: requests with a 3h reset (< weekly threshold).
-let mut short_headers = reqwest::header::HeaderMap::new();
-short_headers.insert(
-"x-ratelimit-limit-requests",
-"50".parse().unwrap(),
-);
-short_headers.insert(
-"x-ratelimit-remaining-requests",
-"48".parse().unwrap(),
-);
-short_headers.insert(
-"x-ratelimit-reset-requests",
-"3h".parse().unwrap(),
-);
-tracker.update_from_headers(&short_headers).await;
+    fn now_plus(secs: u64) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_add(secs)
+    }
 
-// Weekly window: tokens with a 6d reset (≥ weekly threshold), plus the
-// premium percentage window (Req 7.2).
-let mut weekly_headers = reqwest::header::HeaderMap::new();
-weekly_headers.insert(
-"x-ratelimit-limit-tokens",
-"100000".parse().unwrap(),
-);
-weekly_headers.insert(
-"x-ratelimit-remaining-tokens",
-"99900".parse().unwrap(),
-);
-weekly_headers.insert(
-"x-ratelimit-reset-tokens",
-"6d".parse().unwrap(),
-);
-weekly_headers.insert(
-"x-copilot-premium-requests-used",
-"37".parse().unwrap(),
-);
-weekly_headers.insert(
-"x-copilot-premium-requests-limit",
-"100".parse().unwrap(),
-);
-weekly_headers.insert(
-"x-copilot-premium-requests-reset",
-"1d12h".parse().unwrap(),
-);
-tracker.update_from_headers(&weekly_headers).await;
+    /// POST login (fresh) — shape: `status: "started"`, verification URL,
+    /// user code, `expires_in`, and a derived `expires_at`; the response
+    /// arrives promptly (device-grant round trip only — Req 2.1's 5 s budget)
+    /// and carries no token material (Req 6.4 redaction).
+    #[tokio::test]
+    async fn copilot_admin_login_fresh_shape_and_redaction() {
+        let server = wiremock::MockServer::start().await;
+        copilot_admin_test_support::mount_device_grant(&server).await;
+        let manager = CopilotTokenManager::with_endpoints(
+            copilot_admin_unique_store(),
+            reqwest::Client::new(),
+            copilot_admin_test_support::endpoints(&server),
+        );
 
-let (status, json, raw) = copilot_response_parts(copilot_usage_handler(&tracker).await).await;
+        let started = std::time::Instant::now();
+        let (status, json, raw) =
+            copilot_response_parts(copilot_login_handler(&manager).await).await;
+        let elapsed = started.elapsed();
 
-assert_eq!(status, StatusCode::OK);
-// Short window (3h reset < weekly threshold).
-assert_eq!(json["short"]["requests"]["limit"], 50);
-assert_eq!(json["short"]["requests"]["remaining"], 48);
-// Weekly window (6d reset ≥ weekly threshold).
-assert_eq!(json["weekly"]["tokens"]["limit"], 100000);
-// Premium window (Req 7.2).
-assert_eq!(json["premium"]["limit"], 100);
-assert_eq!(json["premium"]["remaining"], 63);
-assert_eq!(json["premium"]["is_percentage"], true);
-assert!(json["updated_at"].as_u64().is_some_and(|t| t > 0));
-// Redaction.
-assert!(!raw.contains("gho_"));
-assert!(!raw.contains("tid="));
-}
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "started");
+        assert_eq!(json["verification_uri"], "https://github.com/login/device");
+        assert_eq!(json["user_code"], "WDJB-MJHT");
+        assert_eq!(json["expires_in"], 900);
+        assert!(
+            json["expires_at"].as_u64().is_some(),
+            "derived expiry timestamp must be present"
+        );
+        // Req 2.1: only the grant round trip is awaited.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "login handler must respond well within 5 s, took {elapsed:?}"
+        );
+        // Req 6.4 redaction: no device code, no token material, no gho_ prefix.
+        assert!(!raw.contains("dc-admin-test-1"));
+        assert!(!raw.contains("gho_"));
+        assert!(!raw.contains("token\"") || !raw.contains("tid="));
+    }
 
-/// POST logout — clears state (Req 6.2): the persisted store file is
-/// deleted, the session returns to `Unauthenticated`, and the response is
-/// `{ "status": "logged_out" }`.
-#[tokio::test]
-async fn copilot_admin_logout_clears_state() {
-let copilot_expires_at = now_plus(3600);
-let server = wiremock::MockServer::start().await;
-copilot_admin_test_support::mount_full_login(&server, copilot_expires_at).await;
+    /// POST login while in flight — Req 2.6: the SAME verification URL and
+    /// user code come back with `status: "in_flight"`, and the grant endpoint
+    /// saw exactly ONE device-code request (no second flow started).
+    #[tokio::test]
+    async fn copilot_admin_login_dedupe_returns_same_prompt() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
 
-let store = copilot_admin_unique_store();
-let manager = CopilotTokenManager::with_endpoints(
-store.clone(),
-reqwest::Client::new(),
-copilot_admin_test_support::endpoints(&server),
-);
-manager.start_login().await.expect("login starts");
-let mut state = manager.session_state().await;
-for _ in 0..200 {
-if matches!(state, CopilotSessionState::Authenticated { .. }) {
-break;
-}
-tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-state = manager.session_state().await;
-}
-assert!(matches!(state, CopilotSessionState::Authenticated { .. }));
-assert!(store.file_path().exists(), "login persisted the store");
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login/device/code"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(copilot_admin_test_support::device_grant_body()),
+            )
+            // Exactly one issuance across both handler calls (dedupe).
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "error": "authorization_pending" })),
+            )
+            .expect(0..)
+            .mount(&server)
+            .await;
 
-// Seed cached usage so the logout's clear (Req 6.2) is observable.
-let tracker = UsageTracker::new();
-let mut usage_headers = reqwest::header::HeaderMap::new();
-usage_headers.insert("x-ratelimit-limit-requests", "50".parse().unwrap());
-usage_headers.insert("x-ratelimit-remaining-requests", "10".parse().unwrap());
-usage_headers.insert("x-ratelimit-reset-requests", "1h".parse().unwrap());
-tracker.update_from_headers(&usage_headers).await;
-assert!(tracker.snapshot().await.short.requests.limit.is_some());
+        let manager = CopilotTokenManager::with_endpoints(
+            copilot_admin_unique_store(),
+            reqwest::Client::new(),
+            copilot_admin_test_support::endpoints(&server),
+        );
 
-let (status, json, raw) =
-copilot_response_parts(copilot_logout_handler(&manager, &tracker).await).await;
-assert_eq!(status, StatusCode::OK);
-assert_eq!(json["status"], "logged_out");
-assert!(!raw.contains("gho_"));
-assert!(!raw.contains("tid="));
+        let (status_a, json_a, _) =
+            copilot_response_parts(copilot_login_handler(&manager).await).await;
+        let (status_b, json_b, _) =
+            copilot_response_parts(copilot_login_handler(&manager).await).await;
 
-// Req 6.2: deleted tokens, cleared session, cleared cached usage.
-assert!(
-!store.file_path().exists(),
-"logout must delete the persisted credential file"
-);
-assert_eq!(manager.session_state().await, CopilotSessionState::Unauthenticated);
-let cleared = tracker.snapshot().await;
-assert_eq!(cleared.short.requests.limit, None);
-assert_eq!(cleared.updated_at, 0);
+        assert_eq!(status_a, StatusCode::OK);
+        assert_eq!(status_b, StatusCode::OK);
+        assert_eq!(json_a["status"], "started");
+        assert_eq!(json_b["status"], "in_flight");
+        assert_eq!(json_b["verification_uri"], json_a["verification_uri"]);
+        assert_eq!(json_b["user_code"], json_a["user_code"]);
+        assert_eq!(json_b["expires_in"], json_a["expires_in"]);
 
-// Idempotent: logging out again still succeeds.
-let (status, json, _) =
-copilot_response_parts(copilot_logout_handler(&manager, &tracker).await).await;
-assert_eq!(status, StatusCode::OK);
-assert_eq!(json["status"], "logged_out");
-}
+        server.verify().await;
+    }
 
-/// Full-server wiring (task-9 seam): the five routes are REGISTERED under
-/// the admin router's auth layer. Without credentials every copilot route
-/// answers 401 (auth middleware unchanged). With valid credentials the
-/// wired gateway resolves the REAL manager/tracker from `AppState`
-/// (task-9 wiring: same Arcs the router dispatches through): status and
-/// usage answer 200 with the real manager's unauthenticated/snapshot
-/// payloads, and logout completes idempotently — never the
-/// `configuration_error` envelope the pre-task-9 stub served. (POST login
-/// is intentionally not driven here — it would start a real device-flow
-/// round trip; the login shape tests above cover it against wiremock.)
-#[tokio::test]
-async fn copilot_admin_routes_registered_and_require_auth() {
-let user_env = "AUTH_TEST_COPILOT_PROT_USER";
-let pass_env = "AUTH_TEST_COPILOT_PROT_PASS";
-let username = "copilot-admin";
-let password = "copilot-secret";
-std::env::set_var(user_env, username);
-std::env::set_var(pass_env, password);
+    /// POST cancel — in-flight login is cancelled (Req 2.2): returns
+    /// `{ "status": "cancelled" }` and the manager returns to
+    /// `Unauthenticated` once the poll task observes the cancel.
+    #[tokio::test]
+    async fn copilot_admin_cancel_cancels_in_flight_login() {
+        let server = wiremock::MockServer::start().await;
+        copilot_admin_test_support::mount_device_grant(&server).await;
+        let manager = CopilotTokenManager::with_endpoints(
+            copilot_admin_unique_store(),
+            reqwest::Client::new(),
+            copilot_admin_test_support::endpoints(&server),
+        );
 
-// Isolated storage dir with a master key BEFORE the server starts, so
-// the gateway's copilot wiring takes the master-key-gated Some(..)
-// branch (real manager + tracker on AppState) regardless of the host
-// machine's ~/.config state.
-copilot_admin_secure_dir();
+        // Start a login (stays pending).
+        let _ = manager.start_login().await.expect("login starts");
 
-let cfg = test_config_with_auth_env(true, user_env, pass_env);
-let server = crate::gateway::GatewayServer::new(cfg, None).await.unwrap();
+        // Cancel via the handler.
+        let (status, json, raw) =
+            copilot_response_parts(copilot_cancel_handler(&manager).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "cancelled");
+        assert!(!raw.contains("gho_"));
 
-let endpoints: &[(&str, &str)] = &[
-("POST", "/admin/oauth/github-copilot/login"),
-("POST", "/admin/oauth/github-copilot/cancel"),
-("POST", "/admin/oauth/github-copilot/logout"),
-("GET", "/admin/oauth/github-copilot/status"),
-("GET", "/admin/oauth/github-copilot/usage"),
-];
+        // The poll task restores the pre-login state.
+        let mut state = manager.session_state().await;
+        for _ in 0..100 {
+            if state == CopilotSessionState::Unauthenticated {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            state = manager.session_state().await;
+        }
+        assert_eq!(
+            state,
+            CopilotSessionState::Unauthenticated,
+            "cancel must restore the unauthenticated state"
+        );
 
-// Without credentials → 401 for every copilot route (auth middleware
-// unchanged and applied).
-for (method, uri) in endpoints {
-let app = server.build_router();
-let req = axum::http::Request::builder()
-.method(*method)
-.uri(*uri)
-.body(axum::body::Body::empty())
-.unwrap();
-let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
-assert_eq!(
-resp.status(),
-StatusCode::UNAUTHORIZED,
-"{} {} without credentials must return 401",
-method,
-uri
-);
-}
+        // Idempotent: cancelling again still succeeds.
+        let (status, _, _) = copilot_response_parts(copilot_cancel_handler(&manager).await).await;
+        assert_eq!(status, StatusCode::OK);
+    }
 
-// The gateway must have wired the real manager (task-9 seam).
-assert!(
-server.state.copilot_manager.is_some(),
-"GatewayServer must surface the Copilot manager on AppState"
-);
-assert!(
-server.state.copilot_usage_tracker.is_some(),
-"GatewayServer must surface the Copilot usage tracker on AppState"
-);
+    /// GET status after a full login — shape: `state`, `expires_at`, `sku`,
+    /// `error`, and the `catalog` object with the task-8 warning flags
+    /// (`fetch_failed` / `unknown_configured_models`); no token material
+    /// anywhere (Req 6.4).
+    #[tokio::test]
+    async fn copilot_admin_status_shape_after_login() {
+        let copilot_expires_at = now_plus(3600);
+        let server = wiremock::MockServer::start().await;
+        copilot_admin_test_support::mount_full_login(&server, copilot_expires_at).await;
 
-// With valid credentials the read-only routes resolve the REAL
-// manager/tracker (200 handler payloads, not the stub envelope).
-let authed: &[(&str, &str)] = &[
-("GET", "/admin/oauth/github-copilot/status"),
-("GET", "/admin/oauth/github-copilot/usage"),
-("POST", "/admin/oauth/github-copilot/logout"),
-("POST", "/admin/oauth/github-copilot/cancel"),
-];
-for (method, uri) in authed {
-let app = server.build_router();
-let req = axum::http::Request::builder()
-.method(*method)
-.uri(*uri)
-.header("Authorization", basic_auth_header(username, password))
-.body(axum::body::Body::empty())
-.unwrap();
-let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
-assert_eq!(
-resp.status(),
-StatusCode::OK,
-"{} {} with valid credentials must resolve the wired manager",
-method,
-uri
-);
-let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-assert_ne!(
-json.get("error").and_then(|e| e.get("type")),
-Some(&serde_json::json!("configuration_error")),
-"{} {} must not serve the pre-wiring not-configured envelope",
-method,
-uri
-);
-}
+        let store = copilot_admin_unique_store();
+        let manager = CopilotTokenManager::with_endpoints(
+            store.clone(),
+            reqwest::Client::new(),
+            copilot_admin_test_support::endpoints(&server),
+        );
+        manager.start_login().await.expect("login starts");
 
-// Status carries the real manager's unauthenticated session state.
-{
-let app = server.build_router();
-let req = axum::http::Request::builder()
-.method("GET")
-.uri("/admin/oauth/github-copilot/status")
-.header("Authorization", basic_auth_header(username, password))
-.body(axum::body::Body::empty())
-.unwrap();
-let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
-let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-assert_eq!(json["state"], "unauthenticated");
-}
+        // Wait for the background poll + exchange to land in Authenticated.
+        let mut state = manager.session_state().await;
+        for _ in 0..200 {
+            if matches!(state, CopilotSessionState::Authenticated { .. }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            state = manager.session_state().await;
+        }
+        assert!(
+            matches!(state, CopilotSessionState::Authenticated { .. }),
+            "login must complete, still {state:?}"
+        );
 
-std::env::remove_var(user_env);
-std::env::remove_var(pass_env);
-}
+        let (status, json, raw) =
+            copilot_response_parts(copilot_status_handler(&manager, &store, None).await).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["state"], "authenticated");
+        assert_eq!(json["expires_at"].as_u64(), Some(copilot_expires_at));
+        assert_eq!(json["sku"], "copilot_pro");
+        assert!(json.get("error").is_some(), "error field is always present");
+        assert!(
+            json.get("catalog").is_some(),
+            "catalog field is always present"
+        );
+        assert!(json["catalog"].is_null(), "no catalog wired → null");
+
+        // Req 6.4 redaction: none of the token material that flowed through
+        // the manager may appear.
+        assert!(!raw.contains("gho_"));
+        assert!(!raw.contains("tid=admin-test-copilot-bearer"));
+        assert!(!raw.contains("tid="));
+        assert!(!raw.contains("dc-admin-test-1"));
+        assert!(!raw.contains("github_access_token"));
+        assert!(!raw.contains("copilot_token"));
+    }
+
+    /// Req 2.3: a terminal device-flow error (denial) settles the session to
+    /// `unauthenticated` and the status handler surfaces the manager's
+    /// `last_login_error()` as the `error` field — not a generic message.
+    #[tokio::test]
+    async fn copilot_admin_status_surfaces_terminal_login_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        // Grant issuance + a terminal denial on the first poll (mounted
+        // directly — no pending-poll mock that could shadow the denial).
+        Mock::given(method("POST"))
+            .and(path("/login/device/code"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(copilot_admin_test_support::device_grant_body()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"error": "access_denied"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = copilot_admin_unique_store();
+        let manager = CopilotTokenManager::with_endpoints(
+            store.clone(),
+            reqwest::Client::new(),
+            copilot_admin_test_support::endpoints(&server),
+        );
+        manager.start_login().await.expect("login starts");
+
+        // Wait for the terminal denial to settle the session.
+        let mut state = manager.session_state().await;
+        for _ in 0..200 {
+            if matches!(state, CopilotSessionState::Unauthenticated) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            state = manager.session_state().await;
+        }
+        assert!(
+            matches!(state, CopilotSessionState::Unauthenticated),
+            "denial must settle the session, still {state:?}"
+        );
+
+        let (status, json, raw) =
+            copilot_response_parts(copilot_status_handler(&manager, &store, None).await).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["state"], "unauthenticated");
+        let error = json["error"]
+            .as_str()
+            .expect("terminal login error must surface as the error field");
+        assert!(
+            error.to_lowercase().contains("denied"),
+            "surfaced error must name the denial, got: {error}"
+        );
+        // Redaction: no token material alongside the surfaced error.
+        assert!(!raw.contains("gho_"));
+        assert!(!raw.contains("tid="));
+        assert!(!raw.contains("dc-admin-test-1"));
+    }
+
+    /// GET status with the catalog wired — the task-8 `CatalogStatus` flags
+    /// surface under `catalog` (Req 6.4: catalog status incl.
+    /// `fetch_failed`/`unknown_configured_models`).
+    #[tokio::test]
+    async fn copilot_admin_status_includes_catalog_flags() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let copilot_expires_at = now_plus(3600);
+        let server = wiremock::MockServer::start().await;
+        copilot_admin_test_support::mount_full_login(&server, copilot_expires_at).await;
+        // Catalog endpoint: entries with one gated and one unknown-configured.
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+            { "id": "gpt-5-codex", "model_picker_enabled": true },
+            { "id": "gated-off", "model_picker_enabled": false }
+            ]
+            })))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let store = copilot_admin_unique_store();
+        let manager = std::sync::Arc::new(CopilotTokenManager::with_endpoints(
+            store.clone(),
+            reqwest::Client::new(),
+            copilot_admin_test_support::endpoints(&server),
+        ));
+        manager.start_login().await.expect("login starts");
+        let mut state = manager.session_state().await;
+        for _ in 0..200 {
+            if matches!(state, CopilotSessionState::Authenticated { .. }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            state = manager.session_state().await;
+        }
+        assert!(matches!(state, CopilotSessionState::Authenticated { .. }));
+
+        let catalog = std::sync::Arc::new(CopilotCatalogSync::with_owner(
+            std::sync::Arc::clone(&manager),
+            reqwest::Client::new(),
+            "test-copilot".to_string(),
+        ));
+        catalog
+            .set_configured_models(vec![
+                "gpt-5-codex".to_string(),
+                "not-in-catalog".to_string(),
+            ])
+            .await;
+        catalog.refresh_now().await;
+
+        let (status, json, raw) = copilot_response_parts(
+            copilot_status_handler(&manager, &store, Some(catalog.as_ref())).await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["catalog"]["model_count"], 1);
+        assert_eq!(
+            json["catalog"]["unknown_configured_models"],
+            serde_json::json!(["not-in-catalog"])
+        );
+        assert_eq!(json["catalog"]["fetch_failed"], false);
+        assert!(
+            json["catalog"]["last_success_at"].as_u64().is_some(),
+            "successful fetch records its timestamp"
+        );
+
+        // Redaction: none of the manager's token material.
+        assert!(!raw.contains("gho_"));
+        assert!(!raw.contains("tid=admin-test-copilot-bearer"));
+        assert!(!raw.contains("tid="));
+        assert!(!raw.contains("dc-admin-test-1"));
+    }
+
+    /// GET usage — shape: the tracker snapshot with the short/weekly window
+    /// pairs AND the premium percentage window (task 6), plus updated_at;
+    /// no token material.
+    #[tokio::test]
+    async fn copilot_admin_usage_shape_with_premium_window() {
+        let tracker = UsageTracker::new();
+
+        // Short window: requests with a 3h reset (< weekly threshold).
+        let mut short_headers = reqwest::header::HeaderMap::new();
+        short_headers.insert("x-ratelimit-limit-requests", "50".parse().unwrap());
+        short_headers.insert("x-ratelimit-remaining-requests", "48".parse().unwrap());
+        short_headers.insert("x-ratelimit-reset-requests", "3h".parse().unwrap());
+        tracker.update_from_headers(&short_headers).await;
+
+        // Weekly window: tokens with a 6d reset (≥ weekly threshold), plus the
+        // premium percentage window (Req 7.2).
+        let mut weekly_headers = reqwest::header::HeaderMap::new();
+        weekly_headers.insert("x-ratelimit-limit-tokens", "100000".parse().unwrap());
+        weekly_headers.insert("x-ratelimit-remaining-tokens", "99900".parse().unwrap());
+        weekly_headers.insert("x-ratelimit-reset-tokens", "6d".parse().unwrap());
+        weekly_headers.insert("x-copilot-premium-requests-used", "37".parse().unwrap());
+        weekly_headers.insert("x-copilot-premium-requests-limit", "100".parse().unwrap());
+        weekly_headers.insert("x-copilot-premium-requests-reset", "1d12h".parse().unwrap());
+        tracker.update_from_headers(&weekly_headers).await;
+
+        let (status, json, raw) =
+            copilot_response_parts(copilot_usage_handler(&tracker).await).await;
+
+        assert_eq!(status, StatusCode::OK);
+        // Short window (3h reset < weekly threshold).
+        assert_eq!(json["short"]["requests"]["limit"], 50);
+        assert_eq!(json["short"]["requests"]["remaining"], 48);
+        // Weekly window (6d reset ≥ weekly threshold).
+        assert_eq!(json["weekly"]["tokens"]["limit"], 100000);
+        // Premium window (Req 7.2).
+        assert_eq!(json["premium"]["limit"], 100);
+        assert_eq!(json["premium"]["remaining"], 63);
+        assert_eq!(json["premium"]["is_percentage"], true);
+        assert!(json["updated_at"].as_u64().is_some_and(|t| t > 0));
+        // Redaction.
+        assert!(!raw.contains("gho_"));
+        assert!(!raw.contains("tid="));
+    }
+
+    /// POST logout — clears state (Req 6.2): the persisted store file is
+    /// deleted, the session returns to `Unauthenticated`, and the response is
+    /// `{ "status": "logged_out" }`.
+    #[tokio::test]
+    async fn copilot_admin_logout_clears_state() {
+        let copilot_expires_at = now_plus(3600);
+        let server = wiremock::MockServer::start().await;
+        copilot_admin_test_support::mount_full_login(&server, copilot_expires_at).await;
+
+        let store = copilot_admin_unique_store();
+        let manager = CopilotTokenManager::with_endpoints(
+            store.clone(),
+            reqwest::Client::new(),
+            copilot_admin_test_support::endpoints(&server),
+        );
+        manager.start_login().await.expect("login starts");
+        let mut state = manager.session_state().await;
+        for _ in 0..200 {
+            if matches!(state, CopilotSessionState::Authenticated { .. }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            state = manager.session_state().await;
+        }
+        assert!(matches!(state, CopilotSessionState::Authenticated { .. }));
+        assert!(store.file_path().exists(), "login persisted the store");
+
+        // Seed cached usage so the logout's clear (Req 6.2) is observable.
+        let tracker = UsageTracker::new();
+        let mut usage_headers = reqwest::header::HeaderMap::new();
+        usage_headers.insert("x-ratelimit-limit-requests", "50".parse().unwrap());
+        usage_headers.insert("x-ratelimit-remaining-requests", "10".parse().unwrap());
+        usage_headers.insert("x-ratelimit-reset-requests", "1h".parse().unwrap());
+        tracker.update_from_headers(&usage_headers).await;
+        assert!(tracker.snapshot().await.short.requests.limit.is_some());
+
+        let (status, json, raw) =
+            copilot_response_parts(copilot_logout_handler(&manager, &tracker).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "logged_out");
+        assert!(!raw.contains("gho_"));
+        assert!(!raw.contains("tid="));
+
+        // Req 6.2: deleted tokens, cleared session, cleared cached usage.
+        assert!(
+            !store.file_path().exists(),
+            "logout must delete the persisted credential file"
+        );
+        assert_eq!(
+            manager.session_state().await,
+            CopilotSessionState::Unauthenticated
+        );
+        let cleared = tracker.snapshot().await;
+        assert_eq!(cleared.short.requests.limit, None);
+        assert_eq!(cleared.updated_at, 0);
+
+        // Idempotent: logging out again still succeeds.
+        let (status, json, _) =
+            copilot_response_parts(copilot_logout_handler(&manager, &tracker).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "logged_out");
+    }
+
+    /// Full-server wiring (task-9 seam): the five routes are REGISTERED under
+    /// the admin router's auth layer. Without credentials every copilot route
+    /// answers 401 (auth middleware unchanged). With valid credentials the
+    /// wired gateway resolves the REAL manager/tracker from `AppState`
+    /// (task-9 wiring: same Arcs the router dispatches through): status and
+    /// usage answer 200 with the real manager's unauthenticated/snapshot
+    /// payloads, and logout completes idempotently — never the
+    /// `configuration_error` envelope the pre-task-9 stub served. (POST login
+    /// is intentionally not driven here — it would start a real device-flow
+    /// round trip; the login shape tests above cover it against wiremock.)
+    #[tokio::test]
+    async fn copilot_admin_routes_registered_and_require_auth() {
+        let user_env = "AUTH_TEST_COPILOT_PROT_USER";
+        let pass_env = "AUTH_TEST_COPILOT_PROT_PASS";
+        let username = "copilot-admin";
+        let password = "copilot-secret";
+        std::env::set_var(user_env, username);
+        std::env::set_var(pass_env, password);
+
+        // Isolated storage dir with a master key BEFORE the server starts, so
+        // the gateway's copilot wiring takes the master-key-gated Some(..)
+        // branch (real manager + tracker on AppState) regardless of the host
+        // machine's ~/.config state.
+        copilot_admin_secure_dir();
+
+        let cfg = test_config_with_auth_env(true, user_env, pass_env);
+        let server = crate::gateway::GatewayServer::new(cfg, None).await.unwrap();
+
+        let endpoints: &[(&str, &str)] = &[
+            ("POST", "/admin/oauth/github-copilot/login"),
+            ("POST", "/admin/oauth/github-copilot/cancel"),
+            ("POST", "/admin/oauth/github-copilot/logout"),
+            ("GET", "/admin/oauth/github-copilot/status"),
+            ("GET", "/admin/oauth/github-copilot/usage"),
+        ];
+
+        // Without credentials → 401 for every copilot route (auth middleware
+        // unchanged and applied).
+        for (method, uri) in endpoints {
+            let app = server.build_router();
+            let req = axum::http::Request::builder()
+                .method(*method)
+                .uri(*uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} {} without credentials must return 401",
+                method,
+                uri
+            );
+        }
+
+        // The gateway must have wired the real manager (task-9 seam).
+        assert!(
+            server.state.copilot_manager.is_some(),
+            "GatewayServer must surface the Copilot manager on AppState"
+        );
+        assert!(
+            server.state.copilot_usage_tracker.is_some(),
+            "GatewayServer must surface the Copilot usage tracker on AppState"
+        );
+
+        // With valid credentials the read-only routes resolve the REAL
+        // manager/tracker (200 handler payloads, not the stub envelope).
+        let authed: &[(&str, &str)] = &[
+            ("GET", "/admin/oauth/github-copilot/status"),
+            ("GET", "/admin/oauth/github-copilot/usage"),
+            ("POST", "/admin/oauth/github-copilot/logout"),
+            ("POST", "/admin/oauth/github-copilot/cancel"),
+        ];
+        for (method, uri) in authed {
+            let app = server.build_router();
+            let req = axum::http::Request::builder()
+                .method(*method)
+                .uri(*uri)
+                .header("Authorization", basic_auth_header(username, password))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{} {} with valid credentials must resolve the wired manager",
+                method,
+                uri
+            );
+            let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_ne!(
+                json.get("error").and_then(|e| e.get("type")),
+                Some(&serde_json::json!("configuration_error")),
+                "{} {} must not serve the pre-wiring not-configured envelope",
+                method,
+                uri
+            );
+        }
+
+        // Status carries the real manager's unauthenticated session state.
+        {
+            let app = server.build_router();
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/admin/oauth/github-copilot/status")
+                .header("Authorization", basic_auth_header(username, password))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+            let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["state"], "unauthenticated");
+        }
+
+        std::env::remove_var(user_env);
+        std::env::remove_var(pass_env);
+    }
     #[tokio::test]
     async fn admin_config_round_trips_buffered_upstream_streaming() {
         let config_dir = std::env::temp_dir().join(format!(
@@ -5709,7 +5680,10 @@ std::env::remove_var(pass_env);
             .await
             .unwrap();
         let mut config = smart_routing_response_json(response).await;
-        assert_eq!(config["retry"]["upstream_retry_after_max_wait_ms"], json!(0));
+        assert_eq!(
+            config["retry"]["upstream_retry_after_max_wait_ms"],
+            json!(0)
+        );
 
         config["retry"]["upstream_retry_after_max_wait_ms"] = json!(60001);
         let response = tower::ServiceExt::oneshot(
@@ -6457,110 +6431,109 @@ std::env::remove_var(pass_env);
         );
     }
 
-/// S7 (R2): credential-bearing custom header values are redacted in the
-/// config GET response; the header name survives so the pair is visible.
-#[test]
-fn test_redact_config_for_response_redacts_credential_custom_headers() {
-    let mut config = arb_config()
-        .new_tree(&mut proptest::test_runner::TestRunner::default())
-        .unwrap()
-        .current();
-    config.providers[0].custom_headers.insert(
-        "Authorization".to_string(),
-        "Bearer sk-custom-header-secret-abcdef".to_string(),
-    );
-    config.providers[0]
-        .custom_headers
-        .insert("X-Team".to_string(), "obey-core".to_string());
+    /// S7 (R2): credential-bearing custom header values are redacted in the
+    /// config GET response; the header name survives so the pair is visible.
+    #[test]
+    fn test_redact_config_for_response_redacts_credential_custom_headers() {
+        let mut config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
+        config.providers[0].custom_headers.insert(
+            "Authorization".to_string(),
+            "Bearer sk-custom-header-secret-abcdef".to_string(),
+        );
+        config.providers[0]
+            .custom_headers
+            .insert("X-Team".to_string(), "obey-core".to_string());
 
-    let redacted = redact_config_for_response(&config);
-    let headers = &redacted["providers"][0]["custom_headers"];
-    assert_eq!(
-        headers["Authorization"], "[configured]",
-        "credential-bearing value must be redacted"
-    );
-    assert_eq!(headers["X-Team"], "obey-core", "non-secret value must stay");
-    let serialized = serde_json::to_string(&redacted).unwrap();
-    assert!(
-        !serialized.contains("sk-custom-header-secret-abcdef"),
-        "GET response leaked custom header secret: {serialized}"
-    );
-}
+        let redacted = redact_config_for_response(&config);
+        let headers = &redacted["providers"][0]["custom_headers"];
+        assert_eq!(
+            headers["Authorization"], "[configured]",
+            "credential-bearing value must be redacted"
+        );
+        assert_eq!(headers["X-Team"], "obey-core", "non-secret value must stay");
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !serialized.contains("sk-custom-header-secret-abcdef"),
+            "GET response leaked custom header secret: {serialized}"
+        );
+    }
 
-/// Webhook endpoint secrets are masked in the full-config GET with
-/// the same `[configured]` sentinel the dedicated /admin/webhooks GET
-/// uses (Req 3.6 parity: every GET surface).
-#[test]
-fn test_redact_config_for_response_masks_webhook_secrets() {
-    let mut config = arb_config()
-        .new_tree(&mut proptest::test_runner::TestRunner::default())
-        .unwrap()
-        .current();
-    config.webhooks.endpoints = vec![crate::config::WebhookEndpoint {
-        url: "https://hooks.example.com/alerts".to_string(),
-        secret: Some("whsec_full_config_get_secret".to_string()),
-        events: None,
-    }];
+    /// Webhook endpoint secrets are masked in the full-config GET with
+    /// the same `[configured]` sentinel the dedicated /admin/webhooks GET
+    /// uses (Req 3.6 parity: every GET surface).
+    #[test]
+    fn test_redact_config_for_response_masks_webhook_secrets() {
+        let mut config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
+        config.webhooks.endpoints = vec![crate::config::WebhookEndpoint {
+            url: "https://hooks.example.com/alerts".to_string(),
+            secret: Some("whsec_full_config_get_secret".to_string()),
+            events: None,
+        }];
 
-    let redacted = redact_config_for_response(&config);
-    assert_eq!(
-        redacted["webhooks"]["endpoints"][0]["secret"], "[configured]",
-        "webhook secret must be masked in the full-config GET"
-    );
-    assert_eq!(
-        redacted["webhooks"]["endpoints"][0]["url"],
-        "https://hooks.example.com/alerts",
-        "URL survives masking (endpoint identity)"
-    );
-    let serialized = serde_json::to_string(&redacted).unwrap();
-    assert!(
-        !serialized.contains("whsec_full_config_get_secret"),
-        "GET response leaked webhook secret: {serialized}"
-    );
-}
+        let redacted = redact_config_for_response(&config);
+        assert_eq!(
+            redacted["webhooks"]["endpoints"][0]["secret"], "[configured]",
+            "webhook secret must be masked in the full-config GET"
+        );
+        assert_eq!(
+            redacted["webhooks"]["endpoints"][0]["url"], "https://hooks.example.com/alerts",
+            "URL survives masking (endpoint identity)"
+        );
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !serialized.contains("whsec_full_config_get_secret"),
+            "GET response leaked webhook secret: {serialized}"
+        );
+    }
 
-/// Full-config PUT round-trip (Req 3.6): a secret returned unchanged
-/// as the `[configured]` sentinel preserves the stored secret for the
-/// same URL; a sentinel for an unknown URL clears to unsigned (never
-/// persists the mask itself).
-#[test]
-fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
-    let mut config = arb_config()
-        .new_tree(&mut proptest::test_runner::TestRunner::default())
-        .unwrap()
-        .current();
-    config.webhooks.endpoints = vec![crate::config::WebhookEndpoint {
-        url: "https://hooks.example.com/alerts".to_string(),
-        secret: Some("whsec_stored_secret".to_string()),
-        events: None,
-    }];
+    /// Full-config PUT round-trip (Req 3.6): a secret returned unchanged
+    /// as the `[configured]` sentinel preserves the stored secret for the
+    /// same URL; a sentinel for an unknown URL clears to unsigned (never
+    /// persists the mask itself).
+    #[test]
+    fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
+        let mut config = arb_config()
+            .new_tree(&mut proptest::test_runner::TestRunner::default())
+            .unwrap()
+            .current();
+        config.webhooks.endpoints = vec![crate::config::WebhookEndpoint {
+            url: "https://hooks.example.com/alerts".to_string(),
+            secret: Some("whsec_stored_secret".to_string()),
+            events: None,
+        }];
 
-    // Round-trip body: same URL, sentinel secret.
-    let mut incoming = config.clone();
-    incoming.webhooks.endpoints[0].secret =
-        Some(crate::webhooks::admin::SECRET_MASK.to_string());
-    let stored =
-        normalize_config_for_storage(incoming, Some(&config)).expect("normalize must succeed");
-    assert_eq!(
-        stored.webhooks.endpoints[0].secret.as_deref(),
-        Some("whsec_stored_secret"),
-        "sentinel must preserve the stored secret for the same URL"
-    );
+        // Round-trip body: same URL, sentinel secret.
+        let mut incoming = config.clone();
+        incoming.webhooks.endpoints[0].secret =
+            Some(crate::webhooks::admin::SECRET_MASK.to_string());
+        let stored =
+            normalize_config_for_storage(incoming, Some(&config)).expect("normalize must succeed");
+        assert_eq!(
+            stored.webhooks.endpoints[0].secret.as_deref(),
+            Some("whsec_stored_secret"),
+            "sentinel must preserve the stored secret for the same URL"
+        );
 
-    // Sentinel for a URL with no stored endpoint: nothing to
-    // preserve — becomes unsigned, never persists the mask literal.
-    let mut unknown = config.clone();
-    unknown.webhooks.endpoints = vec![crate::config::WebhookEndpoint {
-        url: "https://hooks.example.com/other".to_string(),
-        secret: Some(crate::webhooks::admin::SECRET_MASK.to_string()),
-        events: None,
-    }];
-    let stored = normalize_config_for_storage(unknown, Some(&config)).expect("normalize");
-    assert_eq!(
-        stored.webhooks.endpoints[0].secret, None,
-        "sentinel for unknown URL must not persist the mask"
-    );
-}
+        // Sentinel for a URL with no stored endpoint: nothing to
+        // preserve — becomes unsigned, never persists the mask literal.
+        let mut unknown = config.clone();
+        unknown.webhooks.endpoints = vec![crate::config::WebhookEndpoint {
+            url: "https://hooks.example.com/other".to_string(),
+            secret: Some(crate::webhooks::admin::SECRET_MASK.to_string()),
+            events: None,
+        }];
+        let stored = normalize_config_for_storage(unknown, Some(&config)).expect("normalize");
+        assert_eq!(
+            stored.webhooks.endpoints[0].secret, None,
+            "sentinel for unknown URL must not persist the mask"
+        );
+    }
 
     /// OpenTelemetry header values are masked in the full-config GET with
     /// the same `[configured]` sentinel the webhook secrets use
@@ -6577,10 +6550,10 @@ fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
             "authorization".to_string(),
             "Basic ${OTLP_AUTH}".to_string(),
         );
-        config.opentelemetry.headers.insert(
-            "x-api-key".to_string(),
-            "literal-token-123".to_string(),
-        );
+        config
+            .opentelemetry
+            .headers
+            .insert("x-api-key".to_string(), "literal-token-123".to_string());
 
         let redacted = redact_config_for_response(&config);
         assert_eq!(
@@ -6593,8 +6566,7 @@ fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
         );
         let serialized = serde_json::to_string(&redacted).unwrap();
         assert!(
-            !serialized.contains("literal-token-123")
-                && !serialized.contains("Basic ${OTLP_AUTH}"),
+            !serialized.contains("literal-token-123") && !serialized.contains("Basic ${OTLP_AUTH}"),
             "GET response leaked telemetry header value: {serialized}"
         );
     }
@@ -6624,10 +6596,10 @@ fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
             crate::webhooks::admin::SECRET_MASK.to_string(),
         );
         // Edited value on another name -> replaces whatever was stored.
-        incoming.opentelemetry.headers.insert(
-            "x-api-key".to_string(),
-            "new-literal-token".to_string(),
-        );
+        incoming
+            .opentelemetry
+            .headers
+            .insert("x-api-key".to_string(), "new-literal-token".to_string());
         // Sentinel for a name with no stored value -> dropped entirely.
         incoming.opentelemetry.headers.insert(
             "x-phantom".to_string(),
@@ -6636,12 +6608,20 @@ fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
         let stored =
             normalize_config_for_storage(incoming, Some(&config)).expect("normalize must succeed");
         assert_eq!(
-            stored.opentelemetry.headers.get("authorization").map(String::as_str),
+            stored
+                .opentelemetry
+                .headers
+                .get("authorization")
+                .map(String::as_str),
             Some("Basic stored-secret"),
             "sentinel must preserve the stored value for the same header name"
         );
         assert_eq!(
-            stored.opentelemetry.headers.get("x-api-key").map(String::as_str),
+            stored
+                .opentelemetry
+                .headers
+                .get("x-api-key")
+                .map(String::as_str),
             Some("new-literal-token"),
             "edited value must replace the stored one"
         );
@@ -6666,8 +6646,7 @@ fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
             "authorization".to_string(),
             crate::webhooks::admin::SECRET_MASK.to_string(),
         );
-        let stored =
-            normalize_config_for_storage(incoming, None).expect("normalize must succeed");
+        let stored = normalize_config_for_storage(incoming, None).expect("normalize must succeed");
         assert!(
             !stored.opentelemetry.headers.contains_key("authorization"),
             "mask must never be stored as a literal header value"
@@ -6701,10 +6680,7 @@ fn test_normalize_config_for_storage_preserves_masked_webhook_secrets() {
             "apiUrl('telemetry/status')",
             "OTEL_SECRET_MASK",
         ] {
-            assert!(
-                html.contains(marker),
-                "missing tracing UI marker {marker}"
-            );
+            assert!(html.contains(marker), "missing tracing UI marker {marker}");
         }
     }
 

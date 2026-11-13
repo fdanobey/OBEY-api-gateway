@@ -1,0 +1,12 @@
+{
+  "verdict": "APPROVED",
+  "findings": [
+    {
+      "label": "Mapping test no longer verifies attribute round-trip",
+      "confidence": "likely",
+      "blocking": false,
+      "detail": "fallback_catalog_has_expected_models_and_metadata checks id/owned_by per index but no longer asserts context_window, supports_vision, or max_completion_tokens are mapped from the const into the Model. Consider per-index equality against NVIDIA_NIM_FALLBACK_MODELS[i] for these fields to restore mapping-correctness coverage without reintroducing value-locking."
+    }
+  ],
+  "reviewDoc": "c:\\Fbn_Dev_Apps\\OBEY API Router\\.agents\\tasks\\nvidia-nim-stale-assertions\\review.md"
+}

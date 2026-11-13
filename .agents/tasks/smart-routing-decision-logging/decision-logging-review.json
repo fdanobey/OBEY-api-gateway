@@ -1,0 +1,30 @@
+{
+  "verdict": "APPROVED",
+  "findings": [
+    {
+      "id": 1,
+      "severity": "non-blocking",
+      "confidence": "confirmed",
+      "title": "Diff still over the ~200-line budget",
+      "detail": "About 327 inserted and 51 deleted non-test lines (~378 changed). Pass 1's suggested classify() trim was applied; the remainder is the WarnRateLimiter, the once-per-request claim flag, RoutingDiagnostics threading, and the SmartRoutingDecisionLog builder, all required by the task.",
+      "action": "Accept as is, or drop ClassifierMode::as_str (14 lines) if an existing label helper can be reused."
+    },
+    {
+      "id": 2,
+      "severity": "non-blocking",
+      "confidence": "confirmed",
+      "title": "Wiki wording on streaming timing, failure mapping, and the second WARN",
+      "detail": "'Each completed request' and 'Requests that fail on every provider log no line' only hold for the buffered path; a streaming pass-through logs when the upstream stream is established and stays logged if the relay later fails. 'backend (HTTP/auth/transport)' is inaccurate: System One transport/unexpected-status errors map to unavailable and 422 maps to invalid_output. 'A System One HTTP failure logs a second rate-limited WARN' does not cover gateway-side timeouts, which return before the call-failure arm and log only the router WARN.",
+      "action": "Reword those three phrases in wiki/Routing-and-Failover.md."
+    },
+    {
+      "id": 3,
+      "severity": "non-blocking",
+      "confidence": "confirmed",
+      "title": "No end-to-end dedupe test through a streaming re-plan",
+      "detail": "claim_smart_routing_log is unit-tested and the pass-through test asserts the claim was consumed, but no test drives pass-through -> re-plan -> 429 -> buffered and checks that the second exit skips the line.",
+      "action": "Add one if a mock-provider harness for that path is cheap; otherwise acceptable given no tracing-test helper exists."
+    }
+  ],
+  "reviewDoc": "c:\\Fbn_Dev_Apps\\OBEY API Router\\.agents\\tasks\\smart-routing-decision-logging/decision-logging-review.md"
+}

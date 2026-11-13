@@ -1,0 +1,24 @@
+{
+  "verdict": "ROUTER_BUG",
+  "verdict_detail": "Router-side, not provider. NO token over-consumption: the code consumes exactly 1 Electron Hub token per dispatched candidate entry and under-counts inner requests. Skips come from the live Electron Hub rate_limit_per_minute = 2 (not 8; was 8 on Oct 6) against ~2-4 sequential requests/min, plus the skip-instead-of-wait policy and an Errors tab that renders attempt rows with a blank reason.",
+  "over_consumption_confirmed": false,
+  "root_cause": "live_config_rate_limit_per_minute_2",
+  "live_config": { "provider": "Electron Hub", "rate_limit_per_minute": 2, "max_connections": 2 },
+  "log_replay": { "window": "2026-10-07T00:00Z..18:25Z", "eh_dispatches": 549, "local_skips": 141, "fit_rpm2_k1": "85-97% per window", "fit_rpm8_any_k": "0 of 141 skips explained" },
+  "tokens_per_request_stream": 1,
+  "tokens_per_request_nonstream": 1,
+  "over_consumption_sites": [],
+  "under_count_sites": [
+    "crates/ai-gateway/src/router/router.rs:52-82 - SearchResubmitter (Codex Search rounds) calls attempt_with_retry; real EH request, no token",
+    "crates/ai-gateway/src/router/router.rs:4737 - same-provider retry loop; no token per retry",
+    "crates/ai-gateway/src/router/router.rs:5294 - one-shot stream:false retry; no token",
+    "crates/ai-gateway/src/router/router.rs:7311 - reasoning nudge re-dispatch; no token"
+  ],
+  "router_defects": [
+    "crates/ai-gateway/src/router/router.rs:6303-6321 - skips to a minutes-slower fallback when a token is <=30s away (no bounded wait); message 'Rate limit exhausted' does not say the request was never sent",
+    "crates/ai-gateway/src/dashboard/mod.rs:586-599 - recent_errors filters status>=400 only within newest limit*4 rows",
+    "crates/ai-gateway/src/dashboard/static/index.html:804-817 - renderErrors shows e.error||e.response_body, both null on content-free attempt rows; error_class and attempt/final kind not shown"
+  ],
+  "user_decision_needed": "Confirm whether Electron Hub rate_limit_per_minute should be 2 (current live) or 8 (Oct 6 value).",
+  "investigationDoc": "c:\\Fbn_Dev_Apps\\OBEY API Router\\.agents\\tasks\\eh-rate-limit-overconsumption\\investigation.md"
+}

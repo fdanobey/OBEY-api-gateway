@@ -1,0 +1,12 @@
+{
+  "verdict": "APPROVED",
+  "findings": [
+    { "id": 1, "severity": "non-blocking", "confidence": "confirmed", "label": "Unenforced one-refill wait cap", "detail": "acquire_within/route_with_failover_for_group bound the wait only by rate_limit_max_wait_ms; config doc, ADR 0002 §2 and the admin hint claim it never exceeds one token's refill. Negative balances after debits can exceed it. Clamp max_wait to 60/rpm s at admission or drop the claim in all three places." },
+    { "id": 2, "severity": "non-blocking", "confidence": "likely", "label": "Wait time invisible in logs", "detail": "A primary that waited is only visible via tracing::info!; its outcome-row duration silently includes up to 10-60 s of local wait. Add a metric (rate_limit_wait_ms_by_provider) or ledger/active-phase marker so local wait isn't mistaken for Electron Hub latency." },
+    { "id": 3, "severity": "non-blocking", "confidence": "likely", "label": "Admission token lost when no send follows", "detail": "Prepaid token is taken before compression and acquire_provider_slot_or_reject; slot_saturated or pre-send config errors spend a token with no upstream request (pre-existing ordering, but contradicts ADR 0002 'nothing else is charged'). Refund on pre-send failure or narrow the ADR wording." },
+    { "id": 4, "severity": "non-blocking", "confidence": "possible", "label": "Wall-clock lower bound in wait test", "detail": "rate_limit_skip_waits_briefly_for_primary_token asserts waited >= 400ms vs expected ~500ms on the real clock; ~100 ms slack may flake under load. Use a paused clock or assert only primary-served/no-skip." },
+    { "id": 5, "severity": "non-blocking", "confidence": "confirmed", "label": "Untested continuation paths", "detail": "No test covers the reasoning-nudge Debit, the stream:false retry charge, or MeteredClient charging on Codex/Bedrock paths." },
+    { "id": 6, "severity": "non-blocking", "confidence": "confirmed", "label": "Live Electron Hub limit still 2/min", "detail": "Operational: the diff (correctly) does not change provider limits; live config is 2/min, so with the 10 s default wait and 30 s refill skips continue. Restore the deliberate 8/min in the admin panel, or set rate_limit_max_wait_ms 30000 if 2/min is intended." }
+  ],
+  "reviewDoc": "c:\\Fbn_Dev_Apps\\OBEY API Router\\.agents\\tasks\\eh-rate-limit-overconsumption\\review.md"
+}

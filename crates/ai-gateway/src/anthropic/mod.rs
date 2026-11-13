@@ -7,10 +7,10 @@ pub mod models;
 pub mod translate_request;
 
 pub use translate_request::translate;
-pub mod passthrough;
-pub mod synthesize_response;
 pub mod count_tokens;
 pub mod errors;
+pub mod passthrough;
+pub mod synthesize_response;
 
 pub use count_tokens::count_tokens;
 pub use errors::{from_gateway_error, from_translator_rejection};
@@ -82,7 +82,10 @@ mod tests {
             extra: serde_json::Map::new(),
         };
         let frame = sse_frame(&event).expect("message_stop serializes");
-        assert_eq!(frame, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        assert_eq!(
+            frame,
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
     }
 
     #[test]

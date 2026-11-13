@@ -1,0 +1,32 @@
+{
+  "project_type": "Rust workspace; single crate `ai-gateway` (axum HTTP gateway/LLM router) with an embedded static admin panel (admin/static/index.html) and dashboard",
+  "language": "Rust (edition per workspace); vanilla JS/HTML for the admin panel",
+  "build_system": "cargo workspace at repo root; crate path crates/ai-gateway. reqwest 0.12 with features json+stream (workspace Cargo.toml). wiremock is a dev-dependency. Windows 11 + PowerShell only; long cargo runs need 600-1800 s timeouts.",
+  "test_framework": "cargo test with tokio::test, wiremock MockServer for upstream providers, proptest in places; integration tests in crates/ai-gateway/tests/*.rs call the axum router via tower::ServiceExt::oneshot and isolate SQLite DBs with tests/common::isolate_databases",
+  "build_command": "cargo check -p ai-gateway --all-targets   (must be 0 errors AND 0 warnings; release: cargo build --release -p ai-gateway)",
+  "test_command": "cargo test -p ai-gateway --lib <filter>  |  cargo test -p ai-gateway --test <file_stem>  |  full: cargo test -p ai-gateway (exceeds one terminal timeout: run `cargo test -p ai-gateway --no-run`, then --lib, then integration binaries in batches)",
+  "verification_instructions": "1) cargo check -p ai-gateway --all-targets -> zero warnings (no blanket #[allow]; gate test-only helpers with #[cfg(test)]). 2) Run the FEAT's targeted tests by name filter. 3) Run the integration binaries that mock JSON upstreams to prove no regression: integration, prompt_cache_routing, reasoning_failover_compat, structured_output_integration, guardrail_streaming, guardrail_streaming_refusal, token_compression_e2e, token_compression_observability, virtual_keys_integration. 4) At the end, cargo test -p ai-gateway --lib plus every integration binary. Record command + pass counts in the FEAT `findings`.",
+  "snapshot_or_generated_files": null,
+  "environment_constraints": "Work ONLY in the main working tree c:\\Fbn_Dev_Apps\\OBEY API Router (no worktree); always use absolute paths. Do NOT commit or push (the user approves first). Do NOT call or reconfigure the live instance http://192.168.1.110:8080. Never print API keys or .env values. PowerShell syntax only. Delete any temp files/configs you create.",
+  "contribution_requirements": "AGENTS.md: clean build (zero warnings) after every major change; admin panel parity, so every YAML-configurable option needs a matching control in crates/ai-gateway/src/admin/static/index.html; tests use tower oneshot (no port binding) and isolate_databases; API key resolution and base-URL normalization patterns in router.rs must be preserved. Do not implement pending decisions D1-D4 from investigation.md §7.",
+  "key_patterns": "Provider config struct: crates/ai-gateway/src/config/mod.rs ~400-560 (ttfb_timeout_seconds, total_timeout_seconds, effective_ttfb_timeout/effective_total_timeout). Buffered HTTP dispatch: router.rs dispatch_attempts_under_permit ~4029-5160 (outgoing.stream=false at ~4262-4270, TTFB timeout on send() ~4577-4591, body read ~4614-4642, JSON/SSE parse ~4660-4860, retryable vs 503 ~5100-5126). SSE reassembly: Router::reassemble_sse_response ~5161-5420 (usage.extra currently dropped). Failover loop: route_with_failover_for_group ~5516-6330 (attempts Vec<ProviderAttempt>, Err arm ~6141-6250, gateway_failed_attempts insertions ~6127, ~6280, ~6317). Streaming dispatch: route_request_streaming_excluding ~8594-9165 (Codex Search buffered gate ~8738, passthrough outgoing.stream=true ~8887, TTFB fallback ~9000-9018, 429 exclusion pattern ~9030-9073, non-success fallback ~9156). Handlers: gateway/handlers.rs log_request ~317, ATTEMPT_LOG_PATH/log_failed_attempts ~363-453, RequestCompleteGuard ~1268-1323, build_active_request_info ~1326, chat_completions_non_stream ~1408, chat_completions_stream ~2237 (early-event stream ~2470-3010, failover loop ~2640-2980), classify_stream_error ~4289, test helper stalling_streaming_response ~6931 (reqwest::Response from a delayed stream). In-flight registry: active_requests.rs (ActiveRequestHandle = Arc<Mutex<ActiveRequestInfo>>). Errors: error/mod.rs (GatewayError, ProviderAttempt, AggregatedError serialized into the client 502 body). Logger: logger/mod.rs (LogEntry ~158, schema + ensure_column migrations, INSERT ~821, SELECT ~865, try_send writer thread). Router tests: router.rs #[cfg(test)] mod tests ~9750+ with create_test_config() ~11173, test_provider() ~11214, test_metrics(). Integration log-query pattern: tests/token_compression_observability.rs (server.build_router() + GET /dashboard/logs).",
+  "relevant_files": [
+    "crates/ai-gateway/src/router/router.rs",
+    "crates/ai-gateway/src/gateway/handlers.rs",
+    "crates/ai-gateway/src/config/mod.rs",
+    "crates/ai-gateway/src/error/mod.rs",
+    "crates/ai-gateway/src/active_requests.rs",
+    "crates/ai-gateway/src/logger/mod.rs",
+    "crates/ai-gateway/src/admin/static/index.html",
+    "crates/ai-gateway/src/admin/mod.rs",
+    "crates/ai-gateway/src/runtime_limits.rs",
+    "crates/ai-gateway/tests/common/mod.rs",
+    "crates/ai-gateway/tests/token_compression_observability.rs",
+    "AGENTS.md",
+    "wiki/Streaming.md",
+    "wiki/Providers.md",
+    ".agents/tasks/glm-ttfb-trace/investigation.md",
+    ".agents/tasks/glm-ttfb-trace/plan.md"
+  ],
+  "directory_structure": "crates/ai-gateway/src/{router (routing, failover, dispatch, circuit breaker, rate limiter), gateway (axum handlers + server), config (YAML schema + validation), logger (SQLite request log), admin (admin API + static panel), dashboard, error, active_requests.rs, runtime_limits.rs, codex (OAuth/Codex + search), smart_routing, loop_detection, memory, compression}. crates/ai-gateway/tests = integration tests (tests/common/mod.rs helpers). docs/adr does not exist yet (create docs/adr/0001-...). wiki/ = user docs. .agents/tasks/glm-ttfb-trace = this task's investigation, plan, FEAT files, review.json."
+}

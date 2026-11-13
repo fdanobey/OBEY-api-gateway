@@ -1,0 +1,34 @@
+{
+  "verdict": "APPROVED",
+  "findings": [
+    {
+      "id": 1,
+      "label": "Keep-alive-only reliability never reaches pass-through in chat completions",
+      "confidence": "confirmed",
+      "blocking": false,
+      "detail": "chat_completions_stream calls buffered route_request whenever emit_early_event is false, so with keep-alive-only reliability, SR (and all) chat-completions requests still buffer. This is pre-existing and not caused by Smart Routing. Either document it, or route that branch through route_request_streaming when keepalive_interval_seconds > 0."
+    },
+    {
+      "id": 2,
+      "label": "Full SR re-plan on every pre-content streaming failover",
+      "confidence": "likely",
+      "blocking": false,
+      "detail": "SR pass-through now reaches the handler's pre-content failover loops. Each route_request_streaming_excluding retry re-runs SmartRouter::plan: cache lookup, classifier (an extra LLM call when that classifier is used), budget check and metrics, and observe_plan. Accept it explicitly, or thread the resolved order and decision into the excluding call."
+    },
+    {
+      "id": 3,
+      "label": "Sticky affinity skipped inside overflow",
+      "confidence": "confirmed",
+      "blocking": false,
+      "detail": "promote_sticky_provider applies only to the tier list. When tier candidates are all unhealthy, the overflow model that last served the prefix is not preferred, so cache reuse is lost. Optionally apply promotion within the overflow sub-list; it would still stay after the tier list."
+    },
+    {
+      "id": 4,
+      "label": "No test for other-tier / non-specialist overflow",
+      "confidence": "confirmed",
+      "blocking": false,
+      "detail": "Tests only place untiered models in overflow. Add a plan test asserting that other-tier tagged models, and same-tier non-specialists dropped by specialization filtering, appear in CandidatePlan::overflow."
+    }
+  ],
+  "reviewDoc": "c:\\Fbn_Dev_Apps\\OBEY API Router\\.agents\\tasks\\smart-routing-overflow-streaming-gate\\review.md"
+}

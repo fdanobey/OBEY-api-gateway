@@ -744,42 +744,46 @@ impl SmartRouter {
 
         match policy.classifier {
             ClassifierMode::Heuristic => heuristic_classification,
-            ClassifierMode::Ml => self
-                .classify_optional(
+            ClassifierMode::Ml => {
+                self.classify_optional(
                     self.ml.as_deref(),
                     ClassifierUsed::Ml,
                     input,
                     heuristic_classification,
                     policy,
                 )
-                .await,
-            ClassifierMode::Llm => self
-                .classify_optional(
+                .await
+            }
+            ClassifierMode::Llm => {
+                self.classify_optional(
                     self.llm.as_deref(),
                     ClassifierUsed::Llm,
                     input,
                     heuristic_classification,
                     policy,
                 )
-                .await,
-        ClassifierMode::Jev => self
-            .classify_optional(
-                self.systemone.as_deref(),
-                ClassifierUsed::Jev,
-                input,
-                heuristic_classification,
-                policy,
-            )
-            .await,
-        ClassifierMode::Laya => self
-            .classify_optional(
-                self.systemone.as_deref(),
-                ClassifierUsed::Laya,
-                input,
-                heuristic_classification,
-                policy,
-            )
-            .await,
+                .await
+            }
+            ClassifierMode::Jev => {
+                self.classify_optional(
+                    self.systemone.as_deref(),
+                    ClassifierUsed::Jev,
+                    input,
+                    heuristic_classification,
+                    policy,
+                )
+                .await
+            }
+            ClassifierMode::Laya => {
+                self.classify_optional(
+                    self.systemone.as_deref(),
+                    ClassifierUsed::Laya,
+                    input,
+                    heuristic_classification,
+                    policy,
+                )
+                .await
+            }
             ClassifierMode::Composite => {
                 let ml = self
                     .classify_optional(

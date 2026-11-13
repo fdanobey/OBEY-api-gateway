@@ -10,7 +10,6 @@ mod provider_attempt;
 use provider_attempt::ProviderAttemptFailureMetrics;
 pub mod provider_budget_store;
 pub mod telemetry;
-pub use telemetry::TelemetryMetrics;
 use dashmap::DashMap;
 pub use provider_budget_store::{ProviderBudgetStore, ProviderBudgetStoreError};
 use serde::{Deserialize, Serialize};
@@ -18,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+pub use telemetry::TelemetryMetrics;
 
 /// Number of one-second buckets in the rolling request-rate window.
 const REQUEST_RATE_WINDOW_SECONDS: usize = 60;
@@ -154,12 +154,12 @@ pub struct Metrics {
     guardrail_stego_detections: Arc<DashMap<(String, String), AtomicU64>>,
     /// Structured output validation, retry, and latency metrics.
     structured_output: Arc<StructuredOutputMetrics>,
- /// Failed provider attempts keyed by (provider, model, status_code),
- /// including attempts masked by a successful retry/fallback.
- provider_attempt_failures: Arc<ProviderAttemptFailureMetrics>,
- /// OTLP trace-export counters shared with the telemetry exporter
- /// (opentelemetry-trace-export spec, Req 7.1/7.2).
- otlp_telemetry: Arc<TelemetryMetrics>,
+    /// Failed provider attempts keyed by (provider, model, status_code),
+    /// including attempts masked by a successful retry/fallback.
+    provider_attempt_failures: Arc<ProviderAttemptFailureMetrics>,
+    /// OTLP trace-export counters shared with the telemetry exporter
+    /// (opentelemetry-trace-export spec, Req 7.1/7.2).
+    otlp_telemetry: Arc<TelemetryMetrics>,
     /// Compression tokens saved counter, keyed by bounded (level, provider).
     compression_tokens_saved: Arc<DashMap<CompressionMetricKey, AtomicU64>>,
     /// Compression ratio histogram, keyed by bounded (level, provider).
@@ -201,21 +201,21 @@ pub struct Metrics {
             HashMap<String, crate::metrics::provider_budget_store::ProviderBudgetRow>,
         )>,
     >,
-/// In-memory next-boundary cache for the lazy budget-window rollover
-/// (hot-path remediation, finding B1): provider -> (policy at seed
-/// time, durable `window_start`, next boundary epoch). Seeded from the
-/// store + policy once per provider per window; every later rollover
-/// check is a pure `now >= next_boundary_epoch` comparison with no
-/// SQL. A policy change (config hot-reload) re-seeds via the cached
-/// policy mismatch check.
-budget_window_boundaries: Mutex<HashMap<String, (crate::config::BudgetResetPolicy, i64, i64)>>,
-/// Post-persist alert hook (budget-alerts-unified-webhooks, Task 5):
-/// invoked INSIDE the off-path spend-write task after a successful
-/// `add_spend`, with (provider, durable total USD, window anchor).
-/// Set once during gateway startup; the closure itself spawns the
-/// async alert evaluation. Metrics never imports the webhooks module
-/// (no module cycle) — the closure is injected by the gateway wiring.
-provider_spend_hook: Mutex<Option<ProviderSpendHook>>,
+    /// In-memory next-boundary cache for the lazy budget-window rollover
+    /// (hot-path remediation, finding B1): provider -> (policy at seed
+    /// time, durable `window_start`, next boundary epoch). Seeded from the
+    /// store + policy once per provider per window; every later rollover
+    /// check is a pure `now >= next_boundary_epoch` comparison with no
+    /// SQL. A policy change (config hot-reload) re-seeds via the cached
+    /// policy mismatch check.
+    budget_window_boundaries: Mutex<HashMap<String, (crate::config::BudgetResetPolicy, i64, i64)>>,
+    /// Post-persist alert hook (budget-alerts-unified-webhooks, Task 5):
+    /// invoked INSIDE the off-path spend-write task after a successful
+    /// `add_spend`, with (provider, durable total USD, window anchor).
+    /// Set once during gateway startup; the closure itself spawns the
+    /// async alert evaluation. Metrics never imports the webhooks module
+    /// (no module cycle) — the closure is injected by the gateway wiring.
+    provider_spend_hook: Mutex<Option<ProviderSpendHook>>,
 }
 
 /// The post-persist alert hook signature (budget-alerts-unified-
@@ -1017,7 +1017,7 @@ impl Metrics {
             guardrail_stego_detections: Arc::new(DashMap::new()),
             structured_output: Arc::new(StructuredOutputMetrics::new()),
             provider_attempt_failures: Arc::new(ProviderAttemptFailureMetrics::new()),
- otlp_telemetry: Arc::new(TelemetryMetrics::new()),
+            otlp_telemetry: Arc::new(TelemetryMetrics::new()),
             compression_tokens_saved: Arc::new(DashMap::new()),
             compression_ratio: Arc::new(DashMap::new()),
             compression_duration_seconds: Arc::new(DashMap::new()),
@@ -2934,10 +2934,10 @@ Total unicode_stego provider detections by category and phase\n",
             retry_delay_ms_by_provider,
             budget_limit_by_provider,
             budget_exhaustions_by_provider,
-        unknown_cost_by_provider,
-        rate_limit_exhaustions_by_provider,
-        cache_hit_rate,
-        sticky_repins_total: self.sticky_repins_total.load(Ordering::Relaxed),
+            unknown_cost_by_provider,
+            rate_limit_exhaustions_by_provider,
+            cache_hit_rate,
+            sticky_repins_total: self.sticky_repins_total.load(Ordering::Relaxed),
             circuit_breaker_states: Vec::new(),
             active_requests_list: Vec::new(),
             budget_status_by_provider: self.budget_status_by_provider(),

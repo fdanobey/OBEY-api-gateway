@@ -17,9 +17,11 @@
 //! * `maybe_refresh()` performs a conditional GET against
 //!   `self.github_url` with a 24-hour gate (Req 7.2, 7.3, 7.4, 7.5, 7.8).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::config::Config;
@@ -29,6 +31,17 @@ use crate::secrets;
 /// [`Config::codex_instructions_url`] is `None`.
 pub const DEFAULT_CODEX_INSTRUCTIONS_URL: &str =
     "https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/gpt_5_1_prompt.md";
+
+/// Upstream model catalog shipped with the Codex CLI. Each entry carries the
+/// per-model system prompt (`model_messages.instructions_template`), which is
+/// how newer models (gpt-5.5, gpt-6.x, ...) get their instructions; there is
+/// no standalone `.md` file for them.
+pub const DEFAULT_CODEX_MODELS_URL: &str =
+    "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json";
+
+/// Filenames of the cached per-model prompts and their etag side-car.
+const CODEX_MODELS_FILENAME: &str = "codex_models.json";
+const CODEX_MODELS_ETAG_FILENAME: &str = "codex_models.etag";
 
 /// Refresh gate: skip the conditional GET when the in-memory cache is
 /// younger than 24 hours (Req 7.8). `fetched_at == 0` is a sentinel
@@ -62,11 +75,42 @@ pub(crate) struct CachedPrompt {
     pub(crate) fetched_at: u64,
 }
 
+/// One model's system prompt from the upstream catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ModelPrompt {
+    pub(crate) instructions: String,
+    /// `true` for models the Codex CLI lists to users. Hidden entries
+    /// (internal review/experimental models) only match by exact slug and
+    /// are never chosen as a "closest" fallback.
+    #[serde(default)]
+    pub(crate) visible: bool,
+}
+
+/// In-memory per-model prompt catalog plus refresh metadata.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ModelCatalog {
+    pub(crate) prompts: BTreeMap<String, ModelPrompt>,
+    pub(crate) etag: Option<String>,
+    pub(crate) fetched_at: u64,
+}
+
 /// Codex system-prompt store. One instance per gateway; shared across the
 /// router via `Arc<InstructionsStore>`.
+///
+/// Resolution order in [`Self::get_for_model`]: per-provider override, then
+/// the per-model catalog (exact slug, then closest slug), then the single
+/// legacy prompt in `cache`.
 #[derive(Debug)]
 pub struct InstructionsStore {
     cache: RwLock<CachedPrompt>,
+    /// Per-model prompts from the upstream `models.json`. `None` until a
+    /// disk cache or a successful fetch provides one.
+    models: RwLock<Option<ModelCatalog>>,
+    models_path: PathBuf,
+    models_etag_path: PathBuf,
+    /// `None` disables the catalog fetch (operator pinned a custom
+    /// `codex_instructions_url`, or a test constructor).
+    models_url: Option<String>,
     /// Persistent copy of the prompt body
     /// (`<secrets_dir>/codex_instructions.md`).
     disk_path: PathBuf,
@@ -116,13 +160,58 @@ impl InstructionsStore {
             },
         };
 
+        // A custom `codex_instructions_url` means the operator pinned the
+        // prompt source; do not override it with per-model catalog prompts.
+        let models_url = cfg
+            .codex_instructions_url
+            .is_none()
+            .then(|| DEFAULT_CODEX_MODELS_URL.to_string());
+        let models_path = storage_dir.join(CODEX_MODELS_FILENAME);
+        let models_etag_path = storage_dir.join(CODEX_MODELS_ETAG_FILENAME);
+        let models = if models_url.is_some() {
+            load_models_cache(&models_path, &models_etag_path).await
+        } else {
+            None
+        };
+
         Ok(Self {
             cache: RwLock::new(cached),
+            models: RwLock::new(models),
+            models_path,
+            models_etag_path,
+            models_url,
             disk_path,
             etag_path,
             github_url,
             http: reqwest::Client::new(),
         })
+    }
+
+    /// Resolve the instructions for `model`.
+    ///
+    /// `override_` wins when set. Otherwise the per-model catalog is
+    /// consulted: an exact slug match, else the closest slug (see
+    /// [`pick_model_slug`]). When the catalog is unavailable or no slug is
+    /// close enough, the legacy single prompt is returned.
+    pub async fn get_for_model(&self, override_: Option<&str>, model: &str) -> String {
+        if let Some(value) = override_ {
+            return value.to_string();
+        }
+        if let Some(catalog) = self.models.read().await.as_ref() {
+            if let Some(slug) = pick_model_slug(&catalog.prompts, model) {
+                if let Some(p) = catalog.prompts.get(slug) {
+                    if !slug.eq_ignore_ascii_case(model) {
+                        tracing::debug!(
+                            model = %model,
+                            matched = %slug,
+                            "codex instructions: no exact match; using closest model prompt",
+                        );
+                    }
+                    return p.instructions.clone();
+                }
+            }
+        }
+        self.cache.read().await.body.clone()
     }
 
     /// Resolve the instructions string for a single request.
@@ -218,6 +307,120 @@ impl InstructionsStore {
     /// Logs never include the response body, the request body, or any
     /// header value.
     pub async fn maybe_refresh(&self) {
+        self.refresh_prompt().await;
+        self.refresh_models().await;
+    }
+
+    /// Same conditional-GET + 24-hour gate as [`Self::refresh_prompt`], for
+    /// the per-model catalog. No-op when `models_url` is `None`. A `200`
+    /// whose body yields no usable prompts is ignored so a malformed
+    /// upstream file never wipes a good cache.
+    async fn refresh_models(&self) {
+        let Some(url) = self.models_url.as_deref() else {
+            return;
+        };
+        let (fetched_at, etag) = {
+            let guard = self.models.read().await;
+            guard
+                .as_ref()
+                .map(|c| (c.fetched_at, c.etag.clone()))
+                .unwrap_or((0, None))
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        if fetched_at != 0 && now.saturating_sub(fetched_at) < REFRESH_INTERVAL_SECS {
+            return;
+        }
+
+        let host = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "<unparsable-url>".to_string());
+
+        let mut req = self.http.get(url);
+        if let Some(tag) = etag.as_deref() {
+            req = req.header(reqwest::header::IF_NONE_MATCH, tag);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    host = %host,
+                    error_kind = ?e.without_url(),
+                    "codex models refresh: network error; keeping current cache",
+                );
+                return;
+            }
+        };
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_MODIFIED {
+            let prompts = self.models.read().await.as_ref().map(|c| c.prompts.clone());
+            if let Some(prompts) = prompts {
+                if let Err(e) = self.save_models(prompts, etag, now).await {
+                    tracing::warn!(host = %host, error = %e, "codex models refresh: 304 received but failed to persist timestamp");
+                }
+            }
+            return;
+        }
+        if !status.is_success() {
+            tracing::warn!(
+                host = %host,
+                status = %status.as_u16(),
+                "codex models refresh: non-2xx response; keeping current cache",
+            );
+            return;
+        }
+
+        let new_etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(host = %host, error = %e, "codex models refresh: failed to read response body; keeping current cache");
+                return;
+            }
+        };
+        let Some(prompts) = parse_models_catalog(&body) else {
+            tracing::warn!(host = %host, "codex models refresh: no usable model prompts in response; keeping current cache");
+            return;
+        };
+        if let Err(e) = self.save_models(prompts, new_etag, now).await {
+            tracing::warn!(host = %host, error = %e, "codex models refresh: failed to persist cache; keeping current cache");
+        }
+    }
+
+    /// Persist the per-model prompts + etag/timestamp and swap the in-memory
+    /// catalog.
+    async fn save_models(
+        &self,
+        prompts: BTreeMap<String, ModelPrompt>,
+        etag: Option<String>,
+        fetched_at: u64,
+    ) -> anyhow::Result<()> {
+        if let Some(parent) = self.models_path.parent() {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!("create codex models cache dir at {}", parent.display())
+            })?;
+        }
+        let json = serde_json::to_vec(&prompts).context("serialize codex model prompts")?;
+        atomic_write_with_owner_only(&self.models_path, &json).await?;
+        let etag_blob = format!("{}\n{}", etag.as_deref().unwrap_or(""), fetched_at);
+        atomic_write_with_owner_only(&self.models_etag_path, etag_blob.as_bytes()).await?;
+        *self.models.write().await = Some(ModelCatalog {
+            prompts,
+            etag,
+            fetched_at,
+        });
+        Ok(())
+    }
+
+    async fn refresh_prompt(&self) {
         // Snapshot the gate inputs under a short read lock so we never hold
         // the lock across network I/O.
         let (fetched_at, etag) = {
@@ -321,6 +524,10 @@ impl InstructionsStore {
                 etag: None,
                 fetched_at: 0,
             }),
+            models: RwLock::new(None),
+            models_path: disk_path.with_file_name(CODEX_MODELS_FILENAME),
+            models_etag_path: disk_path.with_file_name(CODEX_MODELS_ETAG_FILENAME),
+            models_url: None,
             disk_path,
             etag_path,
             github_url,
@@ -341,6 +548,143 @@ impl InstructionsStore {
             DEFAULT_CODEX_INSTRUCTIONS_URL.to_string(),
         )
     }
+}
+
+/// Extract per-model prompts from the upstream `models.json`.
+///
+/// Uses `model_messages.instructions_template` (what current models ship)
+/// and falls back to a non-empty `base_instructions`. Entries with neither
+/// are skipped. Returns `None` when the body is not the expected shape or
+/// yields no prompts.
+pub(crate) fn parse_models_catalog(body: &str) -> Option<BTreeMap<String, ModelPrompt>> {
+    let root: serde_json::Value = serde_json::from_str(body).ok()?;
+    let mut out = BTreeMap::new();
+    for m in root.get("models")?.as_array()? {
+        let Some(slug) = m.get("slug").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let non_empty = |v: Option<&serde_json::Value>| {
+            v.and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+        };
+        let instructions = non_empty(
+            m.get("model_messages")
+                .and_then(|mm| mm.get("instructions_template")),
+        )
+        .or_else(|| non_empty(m.get("base_instructions")));
+        let Some(instructions) = instructions else {
+            continue;
+        };
+        let visible = m.get("visibility").and_then(|v| v.as_str()) == Some("list");
+        out.insert(
+            slug.to_ascii_lowercase(),
+            ModelPrompt {
+                instructions,
+                visible,
+            },
+        );
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Load the cached per-model catalog; `None` when missing or malformed.
+async fn load_models_cache(path: &Path, etag_path: &Path) -> Option<ModelCatalog> {
+    let raw = tokio::fs::read(path).await.ok()?;
+    let prompts: BTreeMap<String, ModelPrompt> = match serde_json::from_slice(&raw) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "codex models cache is malformed; ignoring");
+            return None;
+        }
+    };
+    if prompts.is_empty() {
+        return None;
+    }
+    // A missing/garbled side-car only forces a refresh; the body stays usable.
+    let (etag, fetched_at) = tokio::fs::read_to_string(etag_path)
+        .await
+        .ok()
+        .and_then(|s| parse_etag_file(&s))
+        .unwrap_or((None, 0));
+    Some(ModelCatalog {
+        prompts,
+        etag,
+        fetched_at,
+    })
+}
+
+/// Split `gpt-6.1-sol` into a comparable version key (`6001`) and the first
+/// remaining token as the tier (`sol`). `None` for ids that are not
+/// `gpt-<version>[-tier...]`.
+fn parse_model_id(id: &str) -> Option<(u32, Option<String>)> {
+    let rest = id.strip_prefix("gpt-")?;
+    let mut parts = rest.split('-');
+    let version = parts.next()?;
+    let mut nums = version.split('.');
+    let major: u32 = nums.next()?.parse().ok()?;
+    let minor: u32 = match nums.next() {
+        Some(m) => m.parse().ok()?,
+        None => 0,
+    };
+    let tier = parts.next().map(str::to_string);
+    Some((major * 1000 + minor, tier))
+}
+
+/// Choose the catalog slug whose prompt best fits `model`.
+///
+/// 1. Exact slug (case-insensitive, provider prefix like `openai/` dropped).
+/// 2. Longest slug the model extends at a `-` boundary
+///    (`gpt-6.1-sol-high`, `gpt-5.5-2026-04-01`, `gpt-6-sol-latest`).
+/// 3. For `gpt-<version>[-tier]` ids: among visible slugs, prefer the same
+///    tier when any has it, then the nearest version (ties go to the newer).
+///
+/// `None` for ids that are not `gpt-*` (e.g. `o3`, `codex-mini-latest`) so
+/// the caller falls back to the legacy prompt.
+pub(crate) fn pick_model_slug<'a>(
+    prompts: &'a BTreeMap<String, ModelPrompt>,
+    model: &str,
+) -> Option<&'a str> {
+    let lowered = model.trim().to_ascii_lowercase();
+    let name = lowered.rsplit('/').next().unwrap_or(&lowered);
+
+    if let Some((slug, _)) = prompts.get_key_value(name) {
+        return Some(slug.as_str());
+    }
+
+    let prefix_hit = prompts
+        .keys()
+        .filter(|s| {
+            name.strip_prefix(s.as_str())
+                .is_some_and(|rest| rest.starts_with('-'))
+        })
+        .max_by_key(|s| s.len());
+    if let Some(slug) = prefix_hit {
+        return Some(slug.as_str());
+    }
+
+    let (want_key, want_tier) = parse_model_id(name)?;
+    let candidates: Vec<(&String, u32, Option<String>)> = prompts
+        .iter()
+        .filter(|(_, p)| p.visible)
+        .filter_map(|(s, _)| parse_model_id(s).map(|(k, t)| (s, k, t)))
+        .collect();
+    let same_tier: Vec<_> = match want_tier.as_deref() {
+        Some(t) => candidates
+            .iter()
+            .filter(|(_, _, ct)| ct.as_deref() == Some(t))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+    let pool = if same_tier.is_empty() {
+        candidates
+    } else {
+        same_tier
+    };
+    pool.into_iter()
+        .min_by_key(|(_, k, _)| (k.abs_diff(want_key), u32::MAX - k))
+        .map(|(s, _, _)| s.as_str())
 }
 
 /// Attempt to load the prompt body and its etag/timestamp side-car from
@@ -481,6 +825,171 @@ mod tests {
             dir.path().join("codex_instructions.etag"),
         );
         assert_eq!(store.get(None).await, BUNDLED_PROMPT);
+    }
+
+    fn catalog(entries: &[(&str, bool)]) -> BTreeMap<String, ModelPrompt> {
+        entries
+            .iter()
+            .map(|(s, v)| {
+                (
+                    s.to_string(),
+                    ModelPrompt {
+                        instructions: format!("prompt:{s}"),
+                        visible: *v,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn sample_catalog() -> BTreeMap<String, ModelPrompt> {
+        catalog(&[
+            ("gpt-6-astra", true),
+            ("gpt-6-sol", true),
+            ("gpt-6-luna", true),
+            ("gpt-6.1-sol", true),
+            ("gpt-6.1-terra", true),
+            ("gpt-5.6-sol", true),
+            ("gpt-5.5", true),
+            ("gpt-daybreak-blue-latest", false),
+            ("codex-auto-review", false),
+        ])
+    }
+
+    #[test]
+    fn pick_slug_exact_and_normalised() {
+        let c = sample_catalog();
+        assert_eq!(pick_model_slug(&c, "gpt-6.1-sol"), Some("gpt-6.1-sol"));
+        assert_eq!(pick_model_slug(&c, "GPT-6.1-Sol"), Some("gpt-6.1-sol"));
+        assert_eq!(pick_model_slug(&c, "openai/gpt-5.5"), Some("gpt-5.5"));
+        // Hidden entries still match exactly.
+        assert_eq!(
+            pick_model_slug(&c, "codex-auto-review"),
+            Some("codex-auto-review")
+        );
+    }
+
+    #[test]
+    fn pick_slug_prefers_longest_dash_prefix() {
+        let c = sample_catalog();
+        assert_eq!(pick_model_slug(&c, "gpt-6.1-sol-high"), Some("gpt-6.1-sol"));
+        assert_eq!(
+            pick_model_slug(&c, "gpt-6-sol-2026-09-22"),
+            Some("gpt-6-sol")
+        );
+        assert_eq!(pick_model_slug(&c, "gpt-5.5-codex"), Some("gpt-5.5"));
+        // `gpt-6` must not prefix-match `gpt-6.1-...` ids by plain starts_with.
+        assert_ne!(pick_model_slug(&c, "gpt-6.2-sol"), Some("gpt-6-sol"));
+    }
+
+    #[test]
+    fn pick_slug_closest_same_tier_then_nearest_version() {
+        let c = sample_catalog();
+        assert_eq!(pick_model_slug(&c, "gpt-6.2-sol"), Some("gpt-6.1-sol"));
+        assert_eq!(pick_model_slug(&c, "gpt-6.2-terra"), Some("gpt-6.1-terra"));
+        assert_eq!(pick_model_slug(&c, "gpt-6.2-astra"), Some("gpt-6-astra"));
+        // Unknown tier: nearest visible version regardless of tier.
+        assert_eq!(pick_model_slug(&c, "gpt-6.1-mini"), Some("gpt-6.1-sol"));
+        // Tier-less id picks the nearest version; tie goes to the newer.
+        assert_eq!(pick_model_slug(&c, "gpt-5.1"), Some("gpt-5.5"));
+        assert_eq!(pick_model_slug(&c, "gpt-7"), Some("gpt-6.1-sol"));
+    }
+
+    #[test]
+    fn pick_slug_ignores_hidden_for_fuzzy_and_non_gpt() {
+        let c = catalog(&[("gpt-daybreak-blue-latest", false), ("gpt-5.5", true)]);
+        assert_eq!(pick_model_slug(&c, "gpt-5.9"), Some("gpt-5.5"));
+        let only_hidden = catalog(&[("gpt-5.5", false)]);
+        assert_eq!(pick_model_slug(&only_hidden, "gpt-5.9"), None);
+        assert_eq!(pick_model_slug(&c, "o3"), None);
+        assert_eq!(pick_model_slug(&c, "codex-mini-latest"), None);
+    }
+
+    #[test]
+    fn parse_models_catalog_extracts_template_and_visibility() {
+        let body = r#"{"models":[
+            {"slug":"gpt-6.1-sol","visibility":"list","base_instructions":"",
+             "model_messages":{"instructions_template":"TEMPLATE"}},
+            {"slug":"old","visibility":"hide","base_instructions":"BASE"},
+            {"slug":"empty","visibility":"list","base_instructions":""}
+        ]}"#;
+        let m = parse_models_catalog(body).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["gpt-6.1-sol"].instructions, "TEMPLATE");
+        assert!(m["gpt-6.1-sol"].visible);
+        assert_eq!(m["old"].instructions, "BASE");
+        assert!(!m["old"].visible);
+        assert!(parse_models_catalog("not json").is_none());
+        assert!(parse_models_catalog(r#"{"models":[]}"#).is_none());
+    }
+
+    #[tokio::test]
+    async fn get_for_model_uses_catalog_then_legacy() {
+        let dir = tempdir().unwrap();
+        let store = InstructionsStore::new_for_test_with_paths(
+            dir.path().join("codex_instructions.md"),
+            dir.path().join("codex_instructions.etag"),
+        );
+        // No catalog yet: legacy prompt.
+        assert_eq!(
+            store.get_for_model(None, "gpt-6.1-sol").await,
+            BUNDLED_PROMPT
+        );
+
+        *store.models.write().await = Some(ModelCatalog {
+            prompts: sample_catalog(),
+            etag: None,
+            fetched_at: 0,
+        });
+        assert_eq!(
+            store.get_for_model(None, "gpt-6.1-sol").await,
+            "prompt:gpt-6.1-sol"
+        );
+        assert_eq!(
+            store.get_for_model(None, "gpt-6.2-sol").await,
+            "prompt:gpt-6.1-sol"
+        );
+        assert_eq!(store.get_for_model(None, "o3").await, BUNDLED_PROMPT);
+        assert_eq!(
+            store.get_for_model(Some("custom"), "gpt-6.1-sol").await,
+            "custom"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_models_fetches_and_persists_catalog() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "W/\"m1\"")
+                    .set_body_string(
+                        r#"{"models":[{"slug":"gpt-6.1-sol","visibility":"list","model_messages":{"instructions_template":"T61"}}]}"#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut store = InstructionsStore::new_for_test_with_paths(
+            dir.path().join("codex_instructions.md"),
+            dir.path().join("codex_instructions.etag"),
+        );
+        store.models_url = Some(format!("{}/models.json", server.uri()));
+        store.refresh_models().await;
+
+        assert_eq!(store.get_for_model(None, "gpt-6.1-sol-high").await, "T61");
+        let reloaded = load_models_cache(&store.models_path, &store.models_etag_path)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.etag.as_deref(), Some("W/\"m1\""));
+        assert!(reloaded.fetched_at > 0);
+        assert_eq!(reloaded.prompts["gpt-6.1-sol"].instructions, "T61");
     }
 
     #[test]

@@ -6608,7 +6608,7 @@ fn heartbeat_chunk_placeholder_reasoning(
         delta.insert(
             "reasoning".to_string(),
             serde_json::json!(format!(
-                "{}?\n",
+                "{}.\n",
                 placeholder_reasoning_text(step)
             )),
         );
@@ -10941,6 +10941,10 @@ async fn responses_guard_complete_then_drop_does_not_double_emit() {
             assert_eq!(delta.len(), 1, "delta must carry only reasoning, got {delta:?}");
             let text = delta.get("reasoning").and_then(|v| v.as_str()).unwrap();
             assert!(!text.trim().is_empty(), "placeholder text must be non-empty");
+            assert!(
+                text.ends_with(".\n") && !text.contains('?'),
+                "placeholder line must end with a period, got {text:?}"
+            );
             assert!(!text.contains("tool"), "placeholder must not invent model output");
             seen_texts.insert(text.to_string());
         }
