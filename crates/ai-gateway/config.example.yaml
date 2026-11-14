@@ -265,6 +265,13 @@ compression:
     model_path: "./models/perplexity_scorer.onnx"
   custom_pipelines: {}
 
+# Tool-definition compression (optional; disabled by default with zero overhead).
+# disabled_providers skips the pipeline for named providers, e.g. github-copilot, ollama-local:
+# tool_compression:
+#   enabled: true
+#   level: medium # low | medium | high | max
+#   # disabled_providers: ["github-copilot", "ollama-local"]
+
 # Tier-1 in-memory exact-match response cache.
 # Caches deterministic chat completions across stream and non-stream calls.
 # Eligibility: temperature <= temperature_threshold AND n == 1.

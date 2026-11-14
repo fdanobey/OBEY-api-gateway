@@ -182,6 +182,14 @@ pub struct Metrics {
     tool_compression_feedback_error_rate: Arc<DashMap<String, AtomicU64>>,
     /// Tool compression feedback adjustments counter, keyed by model_group.
     tool_compression_feedback_adjustments: Arc<DashMap<String, AtomicU64>>,
+    /// Tool compression pre-dispatch skips because every serving provider
+    /// of the model group is disabled, keyed by model_group
+    /// (per-provider-tool-compression-toggle, Task 3).
+    tool_compression_skipped_disabled_total: Arc<DashMap<String, AtomicU64>>,
+    /// Tool compression per-attempt restores of the original tools when
+    /// routing to a disabled provider, keyed by provider
+    /// (per-provider-tool-compression-toggle, Task 3).
+    tool_compression_tools_restored_total: Arc<DashMap<String, AtomicU64>>,
     /// Lazily allocated Smart Routing metrics. Disabled gateways retain no
     /// Smart Routing metric maps or counters.
     smart_routing: Mutex<Option<Arc<SmartRoutingMetricState>>>,
@@ -1029,6 +1037,8 @@ impl Metrics {
             tool_compression_feedback_level: Arc::new(DashMap::new()),
             tool_compression_feedback_error_rate: Arc::new(DashMap::new()),
             tool_compression_feedback_adjustments: Arc::new(DashMap::new()),
+            tool_compression_skipped_disabled_total: Arc::new(DashMap::new()),
+            tool_compression_tools_restored_total: Arc::new(DashMap::new()),
             smart_routing: Mutex::new(None),
             provider_budget_store: Mutex::new(None),
             budget_store_rows_cache: Mutex::new(None),
@@ -2347,6 +2357,28 @@ Total unicode_stego provider detections by category and phase\n",
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the counter of pre-dispatch skips because every serving
+    /// provider of the model group has tool compression disabled.
+    #[allow(dead_code)]
+    pub fn record_tool_compression_skipped_disabled(&self, model_group: &str) {
+        let key = bounded_label(model_group, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
+        self.tool_compression_skipped_disabled_total
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the counter of per-attempt restores of the original tools
+    /// when routing to a provider with tool compression disabled.
+    #[allow(dead_code)]
+    pub fn record_tool_compression_tools_restored(&self, provider: &str) {
+        let key = bounded_label(provider, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
+        self.tool_compression_tools_restored_total
+            .entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Append tool compression metrics in Prometheus text exposition format.
     pub fn write_tool_compression_prometheus(&self, out: &mut String) {
         // Counter: obey_tool_compression_requests_total
@@ -2479,6 +2511,44 @@ Total unicode_stego provider detections by category and phase\n",
                 out.push_str(&format!(
                     "obey_tool_compression_feedback_adjustments_total{{model_group=\"{}\"}} {}\n",
                     escape_prometheus_label(model_group),
+                    value
+                ));
+            }
+        }
+
+        // Counter: obey_tool_compression_skipped_disabled_total
+        if !self.tool_compression_skipped_disabled_total.is_empty() {
+            let mut rows: Vec<(String, u64)> = self
+                .tool_compression_skipped_disabled_total
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push_str("# HELP obey_tool_compression_skipped_disabled_total Tool compression skips because every serving provider of the model group is disabled\n");
+            out.push_str("# TYPE obey_tool_compression_skipped_disabled_total counter\n");
+            for (model_group, value) in &rows {
+                out.push_str(&format!(
+                    "obey_tool_compression_skipped_disabled_total{{model_group=\"{}\"}} {}\n",
+                    escape_prometheus_label(model_group),
+                    value
+                ));
+            }
+        }
+
+        // Counter: obey_tool_compression_tools_restored_total
+        if !self.tool_compression_tools_restored_total.is_empty() {
+            let mut rows: Vec<(String, u64)> = self
+                .tool_compression_tools_restored_total
+                .iter()
+                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push_str("# HELP obey_tool_compression_tools_restored_total Tool compression restores of original tools when routing to a disabled provider\n");
+            out.push_str("# TYPE obey_tool_compression_tools_restored_total counter\n");
+            for (provider, value) in &rows {
+                out.push_str(&format!(
+                    "obey_tool_compression_tools_restored_total{{provider=\"{}\"}} {}\n",
+                    escape_prometheus_label(provider),
                     value
                 ));
             }
@@ -4325,5 +4395,66 @@ mod tests {
                 .contains_key(provider),
             "re-check must re-seed the cache entry"
         );
+    }
+
+    #[test]
+    fn test_tool_compression_disabled_counters_record_and_render() {
+        let metrics = Metrics::new();
+
+        metrics.record_tool_compression_skipped_disabled("safety-group");
+        metrics.record_tool_compression_skipped_disabled("safety-group");
+        metrics.record_tool_compression_skipped_disabled("other-group");
+        metrics.record_tool_compression_tools_restored("strict-provider");
+        metrics.record_tool_compression_tools_restored("strict-provider");
+
+        let mut out = String::new();
+        metrics.write_tool_compression_prometheus(&mut out);
+
+        assert!(out.contains("# TYPE obey_tool_compression_skipped_disabled_total counter"));
+        assert!(out.contains(
+            "obey_tool_compression_skipped_disabled_total{model_group=\"safety-group\"} 2"
+        ));
+        assert!(out.contains(
+            "obey_tool_compression_skipped_disabled_total{model_group=\"other-group\"} 1"
+        ));
+        assert!(out.contains("# TYPE obey_tool_compression_tools_restored_total counter"));
+        assert!(out.contains(
+            "obey_tool_compression_tools_restored_total{provider=\"strict-provider\"} 2"
+        ));
+    }
+
+    #[test]
+    fn test_tool_compression_disabled_counters_bound_long_labels() {
+        let metrics = Metrics::new();
+
+        let long_group = "g".repeat(MAX_COMPRESSION_PROVIDER_LABEL_LEN + 20);
+        let long_provider = "p".repeat(MAX_COMPRESSION_PROVIDER_LABEL_LEN + 20);
+        metrics.record_tool_compression_skipped_disabled(&long_group);
+        metrics.record_tool_compression_tools_restored(&long_provider);
+
+        let mut out = String::new();
+        metrics.write_tool_compression_prometheus(&mut out);
+
+        let bounded = "g".repeat(MAX_COMPRESSION_PROVIDER_LABEL_LEN);
+        assert!(out.contains(&format!(
+            "obey_tool_compression_skipped_disabled_total{{model_group=\"{bounded}\"}} 1"
+        )));
+        let bounded = "p".repeat(MAX_COMPRESSION_PROVIDER_LABEL_LEN);
+        assert!(out.contains(&format!(
+            "obey_tool_compression_tools_restored_total{{provider=\"{bounded}\"}} 1"
+        )));
+    }
+
+    #[test]
+    fn test_tool_compression_disabled_counters_empty_when_unused() {
+        let metrics = Metrics::new();
+
+        assert!(metrics.tool_compression_skipped_disabled_total.is_empty());
+        assert!(metrics.tool_compression_tools_restored_total.is_empty());
+
+        let mut out = String::new();
+        metrics.write_tool_compression_prometheus(&mut out);
+        assert!(!out.contains("skipped_disabled"));
+        assert!(!out.contains("tools_restored"));
     }
 }

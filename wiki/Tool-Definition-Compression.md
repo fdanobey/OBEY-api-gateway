@@ -93,9 +93,10 @@ tool_compression:
     method: tfidf            # tfidf | manual | model
     descriptions: {}         # tool_name → compressed text
 
-  model_group_overrides: {}  # Per-group partial overrides
-  provider_overrides: {}     # Per-provider capability settings
-  debug_validation: false
+model_group_overrides: {} # Per-group partial overrides
+provider_overrides: {} # Per-provider capability settings
+disabled_providers: [] # Provider instance names where compression is off
+debug_validation: false
 ```
 
 ---
@@ -208,6 +209,40 @@ tool_compression:
 
 ---
 
+## Per-Provider Disable
+
+Some providers degrade or reject compressed tool definitions (weak instruction following, strict schema validation). `disabled_providers` turns compression off for those provider instances while keeping it everywhere else.
+
+```yaml
+tool_compression:
+ enabled: true
+ disabled_providers:
+ - github-copilot # provider *instance* name from the providers list, not provider_type
+ - ollama-local
+```
+
+Entries are provider instance names — the `name:` of a provider in your `providers:` list, not its `provider_type`. Unknown names log a warning on config load and hot-reload (never a validation failure).
+
+Two behaviors follow from the list:
+
+1. **Pre-dispatch skip (all-serving rule).** Before dispatch, the gateway resolves the request's model to its model group. If *every* provider serving that group is in `disabled_providers`, the compression pipeline is skipped entirely and the original tools are forwarded unchanged. Mixed groups (at least one enabled serving provider) compress as usual — the disabled member is handled per attempt instead.
+2. **Strict per-attempt restore.** For mixed groups, the compressed body stays the durable base. When an individual attempt (including retries, failover, and Codex Search rounds) targets a disabled provider, that attempt's `tools` are swapped back to the originals before sending. Attempts against enabled providers keep the compressed body, so cache-friendly payloads are preserved wherever possible.
+
+Unknown models (no matching group) fail open: they compress as before. An empty `disabled_providers` list adds no scanning overhead. The `x-tool-compression-disable` request header bypass is unchanged and still takes precedence.
+
+The list is stateless policy: it hot-reloads, and changes take effect on the next request without a gateway restart or any state reset.
+
+New Prometheus counters distinguish skips from restores:
+
+```
+obey_tool_compression_skipped_disabled_total{model_group}
+obey_tool_compression_tools_restored_total{provider}
+```
+
+The admin panel's Tool Compression section has a "Disabled Providers" field (comma-separated instance names) that round-trips through the config API.
+
+---
+
 ## Dashboard
 
 The Compression tab in the dashboard shows live tool compression metrics:
@@ -240,6 +275,8 @@ obey_tool_compression_tools_pruned{model_group}
 obey_tool_compression_feedback_level{model_group}
 obey_tool_compression_feedback_error_rate{model_group}
 obey_tool_compression_feedback_adjustments_total{model_group}
+obey_tool_compression_skipped_disabled_total{model_group}
+obey_tool_compression_tools_restored_total{provider}
 ```
 
 ---

@@ -367,7 +367,7 @@ async fn non_streaming_dispatch_carries_mandatory_headers_and_copilot_bearer() {
     router.set_copilot_manager(manager);
 
     let response = router
-        .route_request(&chat_request(false), Some(ledger_handle()))
+        .route_request(&chat_request(false), Some(ledger_handle()), ai_gateway::router::router::ToolCompressionRestore::default())
         .await
         .expect("copilot dispatch succeeds");
     assert_eq!(
@@ -425,7 +425,7 @@ async fn streaming_request_rides_buffered_dispatch_and_reassembles() {
     router.set_copilot_manager(manager);
 
     let streamed = router
-        .route_request_streaming(&chat_request(true), Some(ledger_handle()))
+        .route_request_streaming(&chat_request(true), Some(ledger_handle()), ai_gateway::router::router::ToolCompressionRestore::default())
         .await
         .expect("streaming copilot request succeeds");
 
@@ -551,7 +551,7 @@ async fn upstream_401_refreshes_once_and_succeeds_on_second_dispatch() {
     router.set_copilot_manager(Arc::new(manager));
 
     let response = router
-        .route_request(&chat_request(false), Some(ledger_handle()))
+        .route_request(&chat_request(false), Some(ledger_handle()), ai_gateway::router::router::ToolCompressionRestore::default())
         .await
         .expect("auth rescue succeeds on the re-dispatch");
     assert_eq!(
@@ -639,7 +639,7 @@ async fn upstream_401_exhausted_fails_over_to_fallback() {
     router.set_copilot_manager(Arc::new(manager));
 
     let response = router
-        .route_request(&chat_request(false), Some(ledger_handle()))
+        .route_request(&chat_request(false), Some(ledger_handle()), ai_gateway::router::router::ToolCompressionRestore::default())
         .await
         .expect("fails over after the single auth rescue");
     assert_eq!(
@@ -696,7 +696,7 @@ async fn rate_limited_429_fails_over_and_feeds_usage_tracker() {
     router.set_copilot_usage_tracker(tracker.clone());
 
     let response = router
-        .route_request(&chat_request(false), Some(ledger_handle()))
+        .route_request(&chat_request(false), Some(ledger_handle()), ai_gateway::router::router::ToolCompressionRestore::default())
         .await
         .expect("429 fails over to the fallback provider");
     assert_eq!(
@@ -757,7 +757,7 @@ async fn unauthenticated_session_skips_with_ledger_row_and_fallback_serves() {
 
     let handle = ledger_handle();
     let response = router
-        .route_request(&chat_request(false), Some(handle.clone()))
+        .route_request(&chat_request(false), Some(handle.clone()), ai_gateway::router::router::ToolCompressionRestore::default())
         .await
         .expect("fails over to the fallback provider");
     assert_eq!(
@@ -806,7 +806,7 @@ async fn successful_dispatch_records_zero_cost_usage_with_attribution() {
 
 let handle = ledger_handle();
 let response = router
-.route_request(&chat_request(false), Some(handle.clone()))
+.route_request(&chat_request(false), Some(handle.clone()), ai_gateway::router::router::ToolCompressionRestore::default())
 .await
 .expect("copilot dispatch succeeds");
     // Usage preserved…
@@ -860,7 +860,7 @@ router.set_copilot_manager(seeded_manager("patnoop", "http://oauth.invalid".into
 // it for the bearer (Req 8.3) — asserted via the ghp_ bearer below.
 
     let response = router
-        .route_request(&chat_request(false), Some(ledger_handle()))
+        .route_request(&chat_request(false), Some(ledger_handle()), ai_gateway::router::router::ToolCompressionRestore::default())
         .await
         .expect("PAT dispatch succeeds");
     assert_eq!(
@@ -916,7 +916,7 @@ async fn pat_auth_missing_pat_is_actionable_error_without_oauth_fallback() {
 
     let handle = ledger_handle();
     let error = router
-        .route_request(&chat_request(false), Some(handle))
+        .route_request(&chat_request(false), Some(handle), ai_gateway::router::router::ToolCompressionRestore::default())
         .await
         .expect_err("missing PAT must fail");
 
@@ -972,7 +972,7 @@ async fn pat_auth_env_var_name_resolves_through_real_dispatch() {
     router.set_copilot_manager(seeded_manager("patenv", "http://oauth.invalid".into()).await);
 
     let response = router
-        .route_request(&chat_request(false), Some(ledger_handle()))
+        .route_request(&chat_request(false), Some(ledger_handle()), ai_gateway::router::router::ToolCompressionRestore::default())
         .await
         .expect("PAT dispatch succeeds via env var");
     assert_eq!(

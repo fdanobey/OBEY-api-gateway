@@ -1679,9 +1679,10 @@ body.sec-banner-active{padding-top:3.2rem}
 
     <fieldset><legend>Global Behavior</legend>
       <div class="form-check"><input type="checkbox" id="tc-cfg-enabled"><label for="tc-cfg-enabled">Enable tool compression globally</label></div>
-      <div class="form-row">
-        <div class="form-group"><label for="tc-cfg-level">Compression Level</label><select id="tc-cfg-level"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></div>
-      </div>
+<div class="form-row">
+<div class="form-group"><label for="tc-cfg-level">Compression Level</label><select id="tc-cfg-level"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></div>
+<div class="form-group"><label for="tc-cfg-disabled-providers">Disabled Providers (comma-separated)</label><input type="text" id="tc-cfg-disabled-providers" placeholder="openrouter, github-copilot" autocomplete="off"><div class="hint">Tool compression is skipped for these providers. When every provider serving a model group is listed, compression is bypassed entirely.</div></div>
+</div>
     </fieldset>
 
     <fieldset><legend>Strategies</legend>
@@ -7412,8 +7413,9 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
 
   function populateToolCompression(tc) {
     tc = tc || {};
-    document.getElementById('tc-cfg-enabled').checked = !!tc.enabled;
-    document.getElementById('tc-cfg-level').value = tc.level || 'medium';
+document.getElementById('tc-cfg-enabled').checked = !!tc.enabled;
+document.getElementById('tc-cfg-level').value = tc.level || 'medium';
+document.getElementById('tc-cfg-disabled-providers').value = (tc.disabled_providers || []).join(', ');
 
     var minif = tc.minification || {};
     document.getElementById('tc-cfg-minification').checked = minif.remove_titles !== false && minif.collapse_single_unions !== false && minif.remove_additional_properties !== false && minif.remove_empty_descriptions !== false;
@@ -7457,10 +7459,11 @@ if (!rule.value || !ruleNames[rule.value]) { showError(rule, 'Choose an existing
   }
 
   function collectToolCompression() {
-    return {
-      enabled: document.getElementById('tc-cfg-enabled').checked,
-      level: document.getElementById('tc-cfg-level').value,
-      deduplication: document.getElementById('tc-cfg-deduplication').checked,
+return {
+enabled: document.getElementById('tc-cfg-enabled').checked,
+level: document.getElementById('tc-cfg-level').value,
+disabled_providers: document.getElementById('tc-cfg-disabled-providers').value.split(',').map(function(s) { return s.trim(); }).filter(Boolean),
+deduplication: document.getElementById('tc-cfg-deduplication').checked,
       progressive_disclosure: document.getElementById('tc-cfg-progressive-disclosure').checked,
       cache_placement: document.getElementById('tc-cfg-cache-placement').checked,
       minification: {

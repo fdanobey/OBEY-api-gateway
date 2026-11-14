@@ -213,11 +213,11 @@ where
             return Box::pin(async move { inner.call(request).await });
         }
 
-        let mut inner = self.inner.clone();
-        let config = Arc::clone(&self.config);
-        let state = Arc::clone(&self.state);
-        let _metrics = Arc::clone(&self.metrics);
-        let compression_events = Arc::clone(&self.compression_events);
+		let mut inner = self.inner.clone();
+		let config = Arc::clone(&self.config);
+		let state = Arc::clone(&self.state);
+		let metrics = Arc::clone(&self.metrics);
+		let compression_events = Arc::clone(&self.compression_events);
         let pipeline = Arc::clone(&self.pipeline);
         let feedback_loop = Arc::clone(&self.feedback_loop);
         let auto_tuner = Arc::clone(&self.auto_tuner);
@@ -377,10 +377,51 @@ where
                 })
                 .collect();
 
-            // Store original tools for later resolution (progressive disclosure).
-            let original_tools = tools.clone();
-            let original_token_estimate_tool_count = original_tools.len();
-            let original_token_estimate = estimate_tokens(&json_body["tools"]);
+	// Store original tools for later resolution (progressive disclosure).
+	let original_tools = tools.clone();
+	let original_token_estimate_tool_count = original_tools.len();
+	let original_token_estimate = estimate_tokens(&json_body["tools"]);
+
+	// Pre-dispatch skip: when every provider serving the request's model group
+	// has tool compression disabled, skip the pipeline entirely. The disabled
+	// list lives in `ToolCompressionConfig`, but group membership requires the
+	// full `Config`, so take a separate snapshot here. Lock contention fails
+	// open (compress) — never block the hot path on this resolution.
+	let disabled_providers: Vec<String> = config_snapshot
+		.as_ref()
+		.map(|c| c.disabled_providers.clone())
+		.unwrap_or_default();
+	let all_disabled_group = if disabled_providers.is_empty() {
+		// Fast path: nothing disabled → zero scan overhead.
+		None
+	} else {
+		config
+			.try_read()
+			.map(|full| {
+				all_serving_providers_disabled(&full, &model, &disabled_providers)
+			})
+			// Contended lock → fail open to compression.
+			.unwrap_or(None)
+	};
+	if let Some(resolved_group) = all_disabled_group {
+		metrics
+			.record_tool_compression_skipped_disabled(&resolved_group);
+		tracing::debug!(
+			model = %model,
+			model_group = %resolved_group,
+			providers = ?disabled_providers,
+			"All serving providers of the model group have tool compression disabled; passing tools through uncompressed"
+		);
+		// Skip pipeline — passthrough with extension flags set.
+		let mut passthrough_request = Request::from_parts(parts, Body::from(bytes));
+		passthrough_request
+			.extensions_mut()
+			.insert(OriginalToolsExtension(Arc::new(original_tools)));
+		passthrough_request
+			.extensions_mut()
+			.insert(ToolCompressionApplied(false));
+		return inner.call(passthrough_request).await;
+	}
 
             // Build compression context.
             let mut ctx = CompressionContext {
@@ -1039,6 +1080,42 @@ pub struct ToolCompressionApplied(pub bool);
 pub struct ToolDisclosureResubmit(pub bool);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Check if every provider serving the model's group has tool compression
+/// disabled.
+///
+/// Mirrors `find_model_group` (router.rs): a group matches when its `name`
+/// equals the requested model (checked first) or any `ProviderModel.model`
+/// equals it. Returns the matched group's name only when a matching group
+/// exists AND every provider in its `models` list appears in `disabled`.
+/// Unknown models and empty `disabled` lists return `None` (fail open to
+/// compression).
+fn all_serving_providers_disabled(
+	config: &crate::config::Config,
+	model: &str,
+	disabled: &[String],
+) -> Option<String> {
+	if disabled.is_empty() {
+		return None;
+	}
+	for group in &config.model_groups {
+		// Match by group name first, then by provider model name — same order
+		// as the router's `find_model_group`.
+		let matches = group.name == model || group.models.iter().any(|m| m.model == model);
+		if !matches {
+			continue;
+		}
+		if group
+			.models
+			.iter()
+			.all(|m| disabled.iter().any(|d| d == &m.provider))
+		{
+			return Some(group.name.clone());
+		}
+		return None;
+	}
+	None
+}
 
 /// Check if a request is a POST with JSON content type (chat completions).
 fn is_compressible_request(request: &Request<Body>) -> bool {
@@ -1753,37 +1830,47 @@ mod service_tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Mock inner service. Returns a scripted response per call, recording the
-    /// request bodies it saw so we can assert what the provider was actually sent.
-    #[derive(Clone)]
-    struct MockInner {
-        /// Responses returned in order; the last is repeated once exhausted.
-        responses: Arc<Vec<(String, &'static str)>>,
-        calls: Arc<AtomicUsize>,
-        seen_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-    }
+	/// Mock inner service. Returns a scripted response per call, recording the
+	/// request bodies it saw so we can assert what the provider was actually sent.
+	#[derive(Clone)]
+	struct MockInner {
+		/// Responses returned in order; the last is repeated once exhausted.
+		responses: Arc<Vec<(String, &'static str)>>,
+		calls: Arc<AtomicUsize>,
+		seen_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+		/// Per inner call: (original-tools count from `OriginalToolsExtension`,
+		/// value of `ToolCompressionApplied`) — `None` when absent.
+		seen_exts: Arc<std::sync::Mutex<Vec<(Option<usize>, Option<bool>)>>>,
+	}
 
-    impl Service<Request<Body>> for MockInner {
-        type Response = Response<Body>;
-        type Error = std::convert::Infallible;
-        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+	impl Service<Request<Body>> for MockInner {
+		type Response = Response<Body>;
+		type Error = std::convert::Infallible;
+		type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
+		fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+			Poll::Ready(Ok(()))
+		}
 
-        fn call(&mut self, req: Request<Body>) -> Self::Future {
-            let responses = Arc::clone(&self.responses);
-            let calls = Arc::clone(&self.calls);
-            let seen = Arc::clone(&self.seen_bodies);
-            Box::pin(async move {
-                let body = to_bytes(req.into_body(), 64 * 1024 * 1024)
-                    .await
-                    .unwrap_or_default();
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
-                    seen.lock().unwrap().push(v);
-                }
-                let idx = calls.fetch_add(1, Ordering::SeqCst);
+		fn call(&mut self, req: Request<Body>) -> Self::Future {
+			let responses = Arc::clone(&self.responses);
+			let calls = Arc::clone(&self.calls);
+			let seen = Arc::clone(&self.seen_bodies);
+			let seen_exts = Arc::clone(&self.seen_exts);
+			Box::pin(async move {
+				let (parts, body) = req.into_parts();
+				let exts = (
+					parts.extensions.get::<OriginalToolsExtension>().map(|e| e.0.len()),
+					parts.extensions.get::<ToolCompressionApplied>().map(|e| e.0),
+				);
+				seen_exts.lock().unwrap().push(exts);
+				let body = to_bytes(body, 64 * 1024 * 1024)
+					.await
+					.unwrap_or_default();
+				if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+					seen.lock().unwrap().push(v);
+				}
+				let idx = calls.fetch_add(1, Ordering::SeqCst);
                 let (body, ctype) = responses
                     .get(idx)
                     .cloned()
@@ -1816,20 +1903,21 @@ mod service_tests {
         Arc::new(RwLock::new(cfg))
     }
 
-    fn build_service(
-        responses: Vec<(String, &'static str)>,
-    ) -> (ToolCompressionService<MockInner>, MockInner) {
-        let config = test_config();
-        let tc = config
-            .try_read()
-            .map(|c| c.tool_compression.clone())
-            .unwrap();
-        let state = Arc::new(ToolCompressionState::new(&tc));
-        let inner = MockInner {
-            responses: Arc::new(responses),
-            calls: Arc::new(AtomicUsize::new(0)),
-            seen_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
-        };
+	fn build_service(
+		responses: Vec<(String, &'static str)>,
+	) -> (ToolCompressionService<MockInner>, MockInner) {
+		let config = test_config();
+		let tc = config
+			.try_read()
+			.map(|c| c.tool_compression.clone())
+			.unwrap();
+		let state = Arc::new(ToolCompressionState::new(&tc));
+		let inner = MockInner {
+			responses: Arc::new(responses),
+			calls: Arc::new(AtomicUsize::new(0)),
+			seen_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+			seen_exts: Arc::new(std::sync::Mutex::new(Vec::new())),
+		};
         let layer = ToolCompressionLayer::new(
             Arc::clone(&config),
             state,
@@ -2361,11 +2449,12 @@ mod service_tests {
                 ),
                 // The re-drill is resolved and resubmitted; this is the turn the
                 // model gets to actually continue on.
-                (json_text("continuing"), "application/json"),
-            ]),
-            calls: Arc::new(AtomicUsize::new(0)),
-            seen_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
-        };
+			(json_text("continuing"), "application/json"),
+		]),
+		calls: Arc::new(AtomicUsize::new(0)),
+		seen_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+		seen_exts: Arc::new(std::sync::Mutex::new(Vec::new())),
+	};
         let layer = ToolCompressionLayer::new(
             Arc::clone(&config),
             Arc::clone(&state),
@@ -2451,12 +2540,13 @@ mod service_tests {
                 drill(),
                 drill(),
                 drill(),
-                drill(),
-                (json_text("done"), "application/json"),
-            ]),
-            calls: Arc::new(AtomicUsize::new(0)),
-            seen_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
-        };
+			drill(),
+			(json_text("done"), "application/json"),
+		]),
+		calls: Arc::new(AtomicUsize::new(0)),
+		seen_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+		seen_exts: Arc::new(std::sync::Mutex::new(Vec::new())),
+	};
         let layer = ToolCompressionLayer::new(
             Arc::clone(&config),
             Arc::clone(&state),
@@ -2545,11 +2635,527 @@ mod service_tests {
                 })
             }))
             .collect();
-        json!({
-            "model": "gpt-4o",
-            "stream": stream,
-            "messages": [{"role":"user","content":"do something"}],
-            "tools": tools
-        })
-    }
+	json!({
+		"model": "gpt-4o",
+		"stream": stream,
+		"messages": [{"role":"user","content":"do something"}],
+		"tools": tools
+	})
+}
+
+// ─── Pre-dispatch disabled-provider skip (per-provider-tool-compression-toggle) ──
+
+fn config_with_group_and_disabled(
+	group_name: &str,
+	provider: &str,
+	model: &str,
+	disabled: Vec<String>,
+) -> Arc<RwLock<crate::config::Config>> {
+	let cfg: crate::config::Config = serde_json::from_value(json!({
+		"server": {"host": "127.0.0.1", "port": 8080},
+		"providers": [],
+		"model_groups": [{
+			"name": group_name,
+			"models": [{"provider": provider, "model": model}]
+		}],
+		"tool_compression": {
+			"enabled": true,
+			"level": "high",
+			"namespace_grouping": {
+				"enabled": true,
+				"min_tools_for_grouping": 5
+			},
+			"disabled_providers": disabled
+		}
+	}))
+	.expect("grouped test config must deserialize");
+	Arc::new(RwLock::new(cfg))
+}
+
+/// Like [`config_with_group_and_disabled`], but the group has TWO serving
+/// providers (`first` and `second`) for the same model, so a fixture can put
+/// exactly one of them in the disabled list and exercise the mixed case.
+fn config_with_two_provider_group_and_disabled(
+	group_name: &str,
+	first: &str,
+	second: &str,
+	model: &str,
+	disabled: Vec<String>,
+) -> Arc<RwLock<crate::config::Config>> {
+	let cfg: crate::config::Config = serde_json::from_value(json!({
+		"server": {"host": "127.0.0.1", "port": 8080},
+		"providers": [],
+		"model_groups": [{
+			"name": group_name,
+			"models": [
+				{"provider": first, "model": model},
+				{"provider": second, "model": model}
+			]
+		}],
+		"tool_compression": {
+			"enabled": true,
+			"level": "high",
+			"namespace_grouping": {
+				"enabled": true,
+				"min_tools_for_grouping": 5
+			},
+			"disabled_providers": disabled
+		}
+	}))
+	.expect("two-provider test config must deserialize");
+	Arc::new(RwLock::new(cfg))
+}
+
+fn build_service_with_config(
+	config: Arc<RwLock<crate::config::Config>>,
+	responses: Vec<(String, &'static str)>,
+) -> (ToolCompressionService<MockInner>, MockInner, Arc<Metrics>) {
+	let tc = config
+		.try_read()
+		.map(|c| c.tool_compression.clone())
+		.unwrap();
+	let state = Arc::new(ToolCompressionState::new(&tc));
+	let inner = MockInner {
+		responses: Arc::new(responses),
+		calls: Arc::new(AtomicUsize::new(0)),
+		seen_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+		seen_exts: Arc::new(std::sync::Mutex::new(Vec::new())),
+	};
+	let metrics = Arc::new(Metrics::new());
+	let layer = ToolCompressionLayer::new(
+		Arc::clone(&config),
+		state,
+		Arc::clone(&metrics),
+		Arc::new(CompressionEventHub::new()),
+	);
+	let svc = layer.layer(inner.clone());
+	(svc, inner, metrics)
+}
+
+fn skipped_disabled_count(metrics: &Metrics, group: &str) -> u64 {
+	let mut out = String::new();
+	metrics.write_tool_compression_prometheus(&mut out);
+	let marker = "obey_tool_compression_skipped_disabled_total{model_group=\"";
+	out.lines()
+		.filter_map(|l| {
+			let l = l.trim();
+			l.starts_with(marker).then(|| {
+				let rest = &l[marker.len()..];
+				let end = rest.find("\"} ")?;
+				let g = &rest[..end];
+				let v = rest[end + 3..].trim().parse::<u64>().ok()?;
+				Some((g, v))
+			})?
+		})
+		.find(|(g, _)| *g == group)
+		.map(|(_, v)| v)
+		.unwrap_or(0)
+}
+
+/// All serving providers disabled → passthrough: originals in the extension,
+/// `ToolCompressionApplied(false)`, skip metric incremented, and the outbound
+/// body keeps the original (uncompressed) tools.
+#[tokio::test]
+async fn all_disabled_group_passes_tools_through_uncompressed() {
+	let config = config_with_group_and_disabled(
+		"strict-group",
+		"github-copilot",
+		"gpt-4o-copilot",
+		vec!["github-copilot".to_string()],
+	);
+	let (mut svc, inner, metrics) = build_service_with_config(
+		config,
+		vec![(json_text("ok"), "application/json")],
+	);
+
+	let mut req = request_with_many_tools(false);
+	let body: serde_json::Value = serde_json::from_slice(
+		&to_bytes(std::mem::replace(req.body_mut(), Body::empty()), 1024 * 1024)
+			.await
+			.unwrap(),
+	)
+	.unwrap();
+	// Point the request at the group's provider model.
+	let body = json!({
+		"model": "gpt-4o-copilot",
+		"messages": [{"role":"user","content":"do something"}],
+		"tools": body["tools"].clone()
+	});
+	*req.body_mut() = Body::from(serde_json::to_vec(&body).unwrap());
+
+	let resp = svc.call(req).await.unwrap();
+	let _ = body_string(resp).await;
+
+	// Extensions: originals present, compression not applied.
+	let exts = inner.seen_exts.lock().unwrap().clone();
+	assert_eq!(exts.len(), 1, "exactly one inner call expected");
+	assert_eq!(
+		exts[0],
+		(Some(20), Some(false)),
+		"passthrough must carry the 20 original tools and ToolCompressionApplied(false)"
+	);
+
+	// Outbound body: still the full original tool list, no synthetic grouper tools.
+	let bodies = inner.seen_bodies.lock().unwrap().clone();
+	let names: Vec<String> = bodies[0]["tools"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.filter_map(|t| {
+			t.pointer("/function/name")
+				.and_then(|n| n.as_str())
+				.map(String::from)
+		})
+		.collect();
+	assert_eq!(names.len(), 20, "all original tools must be forwarded");
+	assert!(
+		!names.contains(&resolver::GET_TOOLS_IN_NAMESPACE.to_string()),
+		"no synthetic namespace tool may be injected on skip"
+	);
+
+	// Skip metric incremented for the resolved group name.
+	assert_eq!(
+		skipped_disabled_count(&metrics, "strict-group"),
+		1,
+		"skip metric must be recorded once for the group"
+	);
+}
+
+/// A group where only some serving providers are disabled keeps compressing:
+/// the outbound tools collapse and the skip metric stays zero. The disabled
+/// entry is a real serving provider of the group, so any regression that skips
+/// on ANY disabled serving provider fails here.
+#[tokio::test]
+async fn mixed_group_with_some_enabled_providers_still_compresses() {
+	let config = config_with_two_provider_group_and_disabled(
+		"mixed-group",
+		"openai",
+		"anthropic",
+		"gpt-4o",
+		vec!["anthropic".to_string()], // one of the two serving providers
+	);
+	let (mut svc, inner, metrics) = build_service_with_config(
+		config,
+		vec![(json_text("ok"), "application/json")],
+	);
+
+	let resp = svc.call(request_with_many_tools(false)).await.unwrap();
+	let _ = body_string(resp).await;
+
+	let bodies = inner.seen_bodies.lock().unwrap().clone();
+	let offered = bodies[0]["tools"].as_array().unwrap().len();
+	assert!(
+		offered < 20,
+		"compression must still collapse the tool list (got {offered} tools)"
+	);
+	assert_eq!(
+		skipped_disabled_count(&metrics, "mixed-group"),
+		0,
+		"no skip may be recorded when a serving provider is enabled"
+	);
+}
+
+/// The complementary case: when BOTH serving providers of the two-provider
+/// group are disabled, the pre-dispatch skip fires (resolved group name in the
+/// metric, originals passed through).
+#[tokio::test]
+async fn two_provider_group_with_both_disabled_skips_compression() {
+	let config = config_with_two_provider_group_and_disabled(
+		"strict-group",
+		"openai",
+		"anthropic",
+		"gpt-4o",
+		vec!["openai".to_string(), "anthropic".to_string()],
+	);
+	let (mut svc, inner, metrics) = build_service_with_config(
+		config,
+		vec![(json_text("ok"), "application/json")],
+	);
+
+	let resp = svc.call(request_with_many_tools(false)).await.unwrap();
+	let _ = body_string(resp).await;
+
+	let exts = inner.seen_exts.lock().unwrap().clone();
+	assert_eq!(
+		exts[0],
+		(Some(20), Some(false)),
+		"all-disabled two-provider group must pass the 20 originals through"
+	);
+	assert_eq!(
+		skipped_disabled_count(&metrics, "strict-group"),
+		1,
+		"skip metric must be recorded once for the resolved group name"
+	);
+}
+
+/// Unknown model (no matching group) fails open: compress as before.
+#[tokio::test]
+async fn unknown_model_fails_open_to_compression() {
+	let config = config_with_group_and_disabled(
+		"some-group",
+		"openai",
+		"known-model",
+		vec!["openai".to_string()],
+	);
+	let (mut svc, inner, metrics) = build_service_with_config(
+		config,
+		vec![(json_text("ok"), "application/json")],
+	);
+
+	// Request a model that no group names or serves.
+	let resp = svc.call(request_with_many_tools(false)).await.unwrap();
+	let _ = body_string(resp).await;
+
+	let bodies = inner.seen_bodies.lock().unwrap().clone();
+	let offered = bodies[0]["tools"].as_array().unwrap().len();
+	assert!(
+		offered < 20,
+		"unknown model must fail open to compression (got {offered} tools)"
+	);
+	assert_eq!(
+		skipped_disabled_count(&metrics, "some-group"),
+		0,
+		"unknown model must not record a skip"
+	);
+}
+
+/// Empty disabled list → zero scan, request compressed as before.
+#[tokio::test]
+async fn empty_disabled_list_compresses() {
+	let config = config_with_group_and_disabled(
+		"plain-group",
+		"openai",
+		"gpt-4o",
+		vec![],
+	);
+	let (mut svc, inner, metrics) = build_service_with_config(
+		config,
+		vec![(json_text("ok"), "application/json")],
+	);
+
+	let resp = svc.call(request_with_many_tools(false)).await.unwrap();
+	let _ = body_string(resp).await;
+
+	let bodies = inner.seen_bodies.lock().unwrap().clone();
+	let offered = bodies[0]["tools"].as_array().unwrap().len();
+	assert!(
+		offered < 20,
+		"empty disabled list must compress as before (got {offered} tools)"
+	);
+	assert_eq!(
+		skipped_disabled_count(&metrics, "plain-group"),
+		0,
+		"empty disabled list must not record a skip"
+	);
+}
+
+/// The bypass header wins over an all-disabled group: no skip is recorded and
+/// no tool-compression extensions are set (plain passthrough branch).
+#[tokio::test]
+async fn header_bypass_wins_over_all_disabled_group() {
+	let config = config_with_group_and_disabled(
+		"strict-group",
+		"github-copilot",
+		"gpt-4o-copilot",
+		vec!["github-copilot".to_string()],
+	);
+	let (mut svc, inner, metrics) = build_service_with_config(
+		config,
+		vec![(json_text("ok"), "application/json")],
+	);
+
+	let mut req = request_with_many_tools(false);
+	let body: serde_json::Value = serde_json::from_slice(
+		&to_bytes(std::mem::replace(req.body_mut(), Body::empty()), 1024 * 1024)
+			.await
+			.unwrap(),
+	)
+	.unwrap();
+	let body = json!({
+		"model": "gpt-4o-copilot",
+		"messages": [{"role":"user","content":"do something"}],
+		"tools": body["tools"].clone()
+	});
+	*req.body_mut() = Body::from(serde_json::to_vec(&body).unwrap());
+	let headers = req.headers_mut();
+	headers.insert(HEADER_DISABLE, HeaderValue::from_static("true"));
+
+ let resp = svc.call(req).await.unwrap();
+ let _ = body_string(resp).await;
+
+ let exts = inner.seen_exts.lock().unwrap().clone();
+ assert_eq!(exts.len(), 1);
+ assert_eq!(
+ exts[0],
+ (None, None),
+ "header bypass takes the plain passthrough branch — no compression extensions"
+ );
+ assert_eq!(
+ skipped_disabled_count(&metrics, "strict-group"),
+ 0,
+ "header bypass must not record a disabled-skip"
+ );
+}
+
+/// Build a fresh copy of the standard 20-tool request, retargeted at `model`.
+///
+/// Mirrors the inline body rewrite of the all-disabled tests so hot-reload
+/// tests can send byte-identical requests before and after a config mutation.
+async fn request_targeting(model: &str) -> Request<Body> {
+	let mut req = request_with_many_tools(false);
+	let body: serde_json::Value = serde_json::from_slice(
+	&to_bytes(std::mem::replace(req.body_mut(), Body::empty()), 1024 * 1024)
+	.await
+	.unwrap(),
+	)
+	.unwrap();
+	let body = json!({
+	"model": model,
+	"messages": body["messages"].clone(),
+	"tools": body["tools"].clone()
+	});
+	*req.body_mut() = Body::from(serde_json::to_vec(&body).unwrap());
+	req
+}
+
+/// Hot-reload, disable→enable direction: a request against an all-disabled
+/// group passes through uncompressed; after clearing `disabled_providers` on
+/// the SAME shared config (no gateway restart, no layer rebuild), the next
+/// identical request takes the compressed path.
+#[tokio::test]
+async fn hot_reload_from_all_disabled_to_enabled_compresses_next_request() {
+	let config = config_with_group_and_disabled(
+	"strict-group",
+	"github-copilot",
+	"gpt-4o-copilot",
+	vec!["github-copilot".to_string()],
+	);
+	let (mut svc, inner, metrics) = build_service_with_config(
+	Arc::clone(&config),
+	vec![(json_text("ok"), "application/json")],
+	);
+
+	// Before reload: all-disabled group → passthrough.
+	let resp = svc
+	.call(request_targeting("gpt-4o-copilot").await)
+	.await
+	.unwrap();
+	let _ = body_string(resp).await;
+	let exts = inner.seen_exts.lock().unwrap().clone();
+	assert_eq!(exts.len(), 1);
+	assert_eq!(
+	exts[0],
+	(Some(20), Some(false)),
+	"all-disabled group must pass tools through before reload"
+	);
+
+	// Hot-reload: clear the disabled list through the shared RwLock.
+	config
+	.write()
+	.await
+	.tool_compression
+	.disabled_providers
+	.clear();
+
+	// After reload: identical request → compressed path on the SAME service.
+	let resp = svc
+	.call(request_targeting("gpt-4o-copilot").await)
+	.await
+	.unwrap();
+	let _ = body_string(resp).await;
+
+	let exts = inner.seen_exts.lock().unwrap().clone();
+	assert_eq!(exts.len(), 2, "one inner call per request");
+	assert_eq!(
+	exts[1],
+	(Some(20), Some(true)),
+	"disabled-list change must take effect on the next request without restart"
+	);
+
+	let bodies = inner.seen_bodies.lock().unwrap().clone();
+	let offered = bodies[1]["tools"].as_array().unwrap().len();
+	assert!(
+	offered < 20,
+	"post-reload request must be compressed (got {offered} tools)"
+	);
+	assert_eq!(
+		skipped_disabled_count(&metrics, "strict-group"),
+		1,
+		"skip metric keeps only the pre-reload skip"
+	);
+}
+
+/// Hot-reload, enable→disable direction: an initially enabled group compresses;
+/// after adding its provider to `disabled_providers` on the SAME shared config,
+/// the next identical request passes tools through uncompressed.
+#[tokio::test]
+async fn hot_reload_from_enabled_to_all_disabled_skips_next_request() {
+	let config = config_with_group_and_disabled(
+	"hot-group",
+	"openai",
+	"gpt-4o",
+	vec![], // initially nothing disabled
+	);
+	let (mut svc, inner, metrics) = build_service_with_config(
+	Arc::clone(&config),
+	vec![(json_text("ok"), "application/json")],
+	);
+
+	// Before reload: compression applies.
+	let resp = svc
+	.call(request_targeting("gpt-4o").await)
+	.await
+	.unwrap();
+	let _ = body_string(resp).await;
+	let exts = inner.seen_exts.lock().unwrap().clone();
+	assert_eq!(exts.len(), 1);
+	assert_eq!(
+	exts[0],
+	(Some(20), Some(true)),
+	"enabled group must compress before reload"
+	);
+
+	// Hot-reload: disable the group's only serving provider.
+	config.write().await.tool_compression.disabled_providers =
+	vec!["openai".to_string()];
+
+	// After reload: identical request → pre-dispatch skip, no restart.
+	let resp = svc
+	.call(request_targeting("gpt-4o").await)
+	.await
+	.unwrap();
+	let _ = body_string(resp).await;
+
+	let exts = inner.seen_exts.lock().unwrap().clone();
+	assert_eq!(exts.len(), 2, "one inner call per request");
+	assert_eq!(
+	exts[1],
+	(Some(20), Some(false)),
+	"newly disabled provider must skip compression on the next request"
+	);
+
+	// Outbound body: full original tool list, no synthetic grouper tools.
+	let bodies = inner.seen_bodies.lock().unwrap().clone();
+	let names: Vec<String> = bodies[1]["tools"]
+	.as_array()
+	.unwrap()
+	.iter()
+	.filter_map(|t| {
+	t.pointer("/function/name")
+	.and_then(|n| n.as_str())
+	.map(String::from)
+	})
+	.collect();
+	assert_eq!(names.len(), 20, "all original tools must be forwarded");
+	assert!(
+	!names.contains(&resolver::GET_TOOLS_IN_NAMESPACE.to_string()),
+	"no synthetic namespace tool may be injected after reload to disabled"
+	);
+
+	assert_eq!(
+		skipped_disabled_count(&metrics, "hot-group"),
+		1,
+		"post-reload skip must be recorded exactly once"
+	);
+}
 }

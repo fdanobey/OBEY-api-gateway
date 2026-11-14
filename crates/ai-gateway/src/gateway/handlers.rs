@@ -2498,6 +2498,8 @@ pub async fn chat_completions(
     headers: HeaderMap,
     authenticated_key: Option<Extension<AuthenticatedKey>>,
     disclosure_resubmit: Option<Extension<crate::tool_compression::ToolDisclosureResubmit>>,
+    original_tools_ext: Option<Extension<crate::tool_compression::OriginalToolsExtension>>,
+    compression_applied_ext: Option<Extension<crate::tool_compression::ToolCompressionApplied>>,
     Json(request): Json<OpenAIRequest>,
 ) -> Response {
     tracing::info!(model = %request.model, stream = request.stream, "Received chat completion request");
@@ -2511,6 +2513,17 @@ pub async fn chat_completions(
     let tool_disclosure = disclosure_resubmit
         .map(|Extension(flag)| flag.0)
         .unwrap_or(false);
+    // Tool-compression restore context (spec per-provider-tool-compression-
+    // toggle, Task 5): the middleware stashes the original tools and an
+    // applied flag in request extensions, which the typed `Json` body does
+    // not carry — extract them here and thread them into the dispatch seam
+    // so attempts to providers with compression disabled send the originals.
+    let compression_restore = crate::router::router::ToolCompressionRestore {
+        original_tools: original_tools_ext.map(|Extension(tools)| tools.0),
+        applied: compression_applied_ext
+            .map(|Extension(flag)| flag.0)
+            .unwrap_or(false),
+    };
     // Inbound W3C context (Req 4): the header is only read when
     // telemetry is enabled; invalid values are ignored above.
     let inbound_telemetry =
@@ -2523,6 +2536,7 @@ pub async fn chat_completions(
             virtual_key_id,
             mode,
             tool_disclosure,
+            compression_restore,
             inbound_telemetry,
         )
         .await
@@ -2534,6 +2548,7 @@ pub async fn chat_completions(
             virtual_key_id,
             mode,
             tool_disclosure,
+            compression_restore,
             inbound_telemetry,
         )
         .await
@@ -2547,6 +2562,7 @@ async fn chat_completions_non_stream(
     virtual_key_id: Option<String>,
     memory_mode: MemoryMode,
     tool_disclosure: bool,
+    compression_restore: crate::router::router::ToolCompressionRestore,
     inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
 ) -> Response {
     state.metrics.start_request();
@@ -2758,7 +2774,7 @@ drop(memory_stall);
 
 match state
     .router
-    .route_request(&request, Some(active_handle.clone()))
+    .route_request(&request, Some(active_handle.clone()), compression_restore.clone())
     .await
     {
         Ok(mut response) => {
@@ -2908,7 +2924,7 @@ match engine
                             // single target via route_with_failover (Req 12.5).
                             let attempt_result = state
                                 .router
-                                .route_with_failover(&request, vec![target.clone()], None)
+                                .route_with_failover(&request, vec![target.clone()], None, compression_restore.clone())
                                 .await;
 
                             match attempt_result {
@@ -3155,14 +3171,15 @@ match engine
                                         gateway_processing_ms +=
                                             prompt_started.elapsed().as_secs_f64() * 1_000.0;
 
-                                        let retry_result = state
-                                            .router
-                                            .route_with_failover(
-                                                &retry_request,
-                                                vec![target.clone()],
-                                                None,
-                                            )
-                                            .await;
+        let retry_result = state
+            .router
+            .route_with_failover(
+                &retry_request,
+                vec![target.clone()],
+                None,
+                compression_restore.clone(),
+            )
+            .await;
                                         match retry_result {
                                             Ok(mut retry_response) => {
                                                 successful_retry_count += 1;
@@ -3456,6 +3473,7 @@ async fn chat_completions_stream(
     virtual_key_id: Option<String>,
     memory_mode: MemoryMode,
     tool_disclosure: bool,
+    compression_restore: crate::router::router::ToolCompressionRestore,
     inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
 ) -> Response {
     state.metrics.start_request();
@@ -3681,6 +3699,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                 guardrail_ctx,
                 request_guard,
                 Some(active_handle.clone()),
+                compression_restore,
             )
             .await;
         }
@@ -3703,6 +3722,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
             guardrail_ctx,
             request_guard,
             Some(active_handle.clone()),
+            compression_restore,
         )
         .await;
     }
@@ -3759,13 +3779,14 @@ let early_attempt_rows = active_handle.attempt_rows_total();
         let (routing_result, relayed_frames, dropped_frames) = if streaming_config_relay.relay_reasoning_progress {
                 let (relay_handle, mut relay_rx) = RelayHandle::new();
                 active_handle_stream.attach_reasoning_relay(relay_handle.clone());
-                        let router = Arc::clone(&state.router);
-                        let routed_request = request.clone();
-                        let active_for_routing = active_handle_stream.clone();
+        let router = Arc::clone(&state.router);
+        let routed_request = request.clone();
+        let active_for_routing = active_handle_stream.clone();
+        let routing_restore = compression_restore.clone();
         let mut routing_task = AbortRoutingOnDrop(Some(tokio::spawn(async move {
-        router
-        .route_request_streaming(&routed_request, Some(active_for_routing))
-        .await
+            router
+                .route_request_streaming(&routed_request, Some(active_for_routing), routing_restore)
+                .await
         })));
         // Once the sender side is dropped, `recv()` resolves to `None`
         // immediately; the `if relay_open` guard disables that branch so
@@ -3887,7 +3908,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
         } else {
         (
         state.router
-        .route_request_streaming(&request, Some(active_handle_stream.clone()))
+        .route_request_streaming(&request, Some(active_handle_stream.clone()), compression_restore.clone())
         .await,
         0,
         0,
@@ -4261,7 +4282,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
         active_handle_stream.detach_reasoning_relay();
         match state
         .router
-        .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
+        .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()), compression_restore.clone())
         .await
         {
         Ok(StreamingResponse::PassThrough { byte_stream, provider, model, compression, concurrency_permit, .. }) => {
@@ -4359,7 +4380,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
         active_handle_stream.detach_reasoning_relay();
         match state
         .router
-        .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()))
+        .route_request_streaming_excluding(&request, &tried_providers, Some(active_handle.clone()), compression_restore.clone())
         .await
         {
         // Another eligible provider — relay it,
@@ -4511,7 +4532,7 @@ return sse;
     let response = if !relay_enabled_fallback {
         match state
             .router
-            .route_request(&request, Some(active_handle.clone()))
+            .route_request(&request, Some(active_handle.clone()), compression_restore.clone())
             .await
         {
             Ok(resp) => resp,
@@ -4560,7 +4581,7 @@ return sse;
         let active_for_routing = active_handle_stream.clone();
         let mut routing_task = AbortRoutingOnDrop(Some(tokio::spawn(async move {
             router
-                .route_request(&routed_request, Some(active_for_routing))
+                .route_request(&routed_request, Some(active_for_routing), compression_restore.clone())
                 .await
         })));
 
@@ -5015,6 +5036,7 @@ async fn finalize_single_eager_post_call(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_eager_post_call(
     state: &AppState,
     request: &OpenAIRequest,
@@ -5024,6 +5046,7 @@ async fn finalize_eager_post_call(
     guardrail_ctx: &mut GuardrailContext,
     trace_id: &str,
     active: Option<&crate::active_requests::ActiveRequestHandle>,
+    compression_restore: crate::router::router::ToolCompressionRestore,
 ) -> EagerPostCallResult {
     let Some(engine) = guardrail_engine else {
         return EagerPostCallResult::Response(response);
@@ -5087,11 +5110,16 @@ async fn finalize_eager_post_call(
                 }
                 tried.push(target.provider.clone());
 
-                let Ok(candidate) = state
-                    .router
-                    .route_with_failover(request, vec![target.clone()], None)
-                    .await
-                else {
+        let Ok(candidate) = state
+            .router
+            .route_with_failover(
+                request,
+                vec![target.clone()],
+                None,
+                compression_restore.clone(),
+            )
+            .await
+        else {
                     tracing::debug!(
                         trace_id,
                         provider = %target.provider,
@@ -5150,6 +5178,7 @@ async fn validate_eager_structured_response(
     guardrail_ctx: &mut GuardrailContext,
     trace_id: &str,
     active: Option<&crate::active_requests::ActiveRequestHandle>,
+    compression_restore: crate::router::router::ToolCompressionRestore,
 ) -> Result<(OpenAIResponse, ValidationResponseStatus), EagerPostCallResult> {
     let Some(engine) = engine else {
         tracing::warn!(
@@ -5264,11 +5293,16 @@ async fn validate_eager_structured_response(
                         gateway_processing_ms += prompt_started.elapsed().as_secs_f64() * 1_000.0;
                         debug_assert!(!retry_request.stream);
 
-                        match state
-                            .router
-                            .route_with_failover(&retry_request, vec![target.clone()], None)
-                            .await
-                        {
+                    match state
+                        .router
+                        .route_with_failover(
+                            &retry_request,
+                            vec![target.clone()],
+                            None,
+                            compression_restore.clone(),
+                        )
+                        .await
+                    {
                             Ok(retry_response) => {
                                 successful_retry_count += 1;
                                 remaining_attempts -= 1;
@@ -5425,10 +5459,11 @@ async fn stream_eager_structured_output(
     mut guardrail_ctx: GuardrailContext,
     mut request_guard: RequestCompleteGuard,
     active: Option<crate::active_requests::ActiveRequestHandle>,
+    compression_restore: crate::router::router::ToolCompressionRestore,
 ) -> Response {
     let mut response = match state
         .router
-        .route_request_streaming(&request, active.clone())
+        .route_request_streaming(&request, active.clone(), compression_restore.clone())
         .await
     {
         Ok(StreamingResponse::Buffered(response)) => response,
@@ -5634,18 +5669,19 @@ if !assembled.complete {
 }
 };
 
-response = match finalize_eager_post_call(
-        &state,
-        &request,
-        response,
-        guardrail_engine.as_ref(),
-        &selector,
-        &mut guardrail_ctx,
-        &trace_id,
-        request_guard.active_handle(),
-    )
-    .await
-    {
+        response = match finalize_eager_post_call(
+            &state,
+            &request,
+            response,
+            guardrail_engine.as_ref(),
+            &selector,
+            &mut guardrail_ctx,
+            &trace_id,
+            request_guard.active_handle(),
+            compression_restore.clone(),
+        )
+        .await
+        {
         EagerPostCallResult::Response(response) => response,
         EagerPostCallResult::Terminal { events, error } => {
             let duration_ms = request_guard.complete();
@@ -5672,19 +5708,20 @@ response = match finalize_eager_post_call(
 }
 };
 
-let (response, validation_status) = match validate_eager_structured_response(
-    &state,
-    &request,
-    response,
-    structured_output_engine.as_ref(),
-    guardrail_engine.as_ref(),
-    &selector,
-    &mut guardrail_ctx,
-    &trace_id,
-    request_guard.active_handle(),
-)
-.await
-{
+    let (response, validation_status) = match validate_eager_structured_response(
+        &state,
+        &request,
+        response,
+        structured_output_engine.as_ref(),
+        guardrail_engine.as_ref(),
+        &selector,
+        &mut guardrail_ctx,
+        &trace_id,
+        request_guard.active_handle(),
+        compression_restore,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(EagerPostCallResult::Terminal { events, error }) => {
             let duration_ms = request_guard.complete();
@@ -5788,6 +5825,7 @@ async fn stream_buffered_with_post_call(
     mut guardrail_ctx: GuardrailContext,
     request_guard: RequestCompleteGuard,
     active: Option<crate::active_requests::ActiveRequestHandle>,
+    compression_restore: crate::router::router::ToolCompressionRestore,
 ) -> Response {
     let emit_early = streaming_config.emit_early_event;
     // Task 7 — buffered reasoning progress relay (Component 4, site 3):
@@ -5850,17 +5888,18 @@ async fn stream_buffered_with_post_call(
     }
     let (relay_handle, mut relay_rx) = RelayHandle::new();
     let routed: Result<StreamingResponse, GatewayError> = if relay_enabled {
-    if let Some(active) = active_stream.as_ref() {
-    active.attach_reasoning_relay(relay_handle.clone());
-    }
-    let router = Arc::clone(&state.router);
-    let routed_request = request.clone();
-    let active_for_routing = active_stream.clone();
-    let mut routing_task = AbortRoutingOnDrop(Some(tokio::spawn(async move {
-    router
-    .route_request_streaming(&routed_request, active_for_routing)
-    .await
-    })));
+        if let Some(active) = active_stream.as_ref() {
+            active.attach_reasoning_relay(relay_handle.clone());
+        }
+        let router = Arc::clone(&state.router);
+        let routed_request = request.clone();
+        let active_for_routing = active_stream.clone();
+        let routing_restore = compression_restore.clone();
+        let mut routing_task = AbortRoutingOnDrop(Some(tokio::spawn(async move {
+            router
+                .route_request_streaming(&routed_request, active_for_routing, routing_restore)
+                .await
+        })));
     let mut relay_open = true;
     let result = loop {
     let step = tokio::select! {
@@ -5945,7 +5984,7 @@ async fn stream_buffered_with_post_call(
     relay_dropped = relay_handle.dropped();
     result
     } else {
-    state.router.route_request_streaming(&request, active_stream.clone()).await
+    state.router.route_request_streaming(&request, active_stream.clone(), compression_restore.clone()).await
     };
     match routed {
                 Ok(StreamingResponse::Buffered(response)) => {
@@ -6291,7 +6330,7 @@ assembled = Some(a.response);
                         // target (Req 12.5). Buffer the response for detection.
                         let attempt_result = state
                             .router
-                            .route_with_failover(&request, vec![target.clone()], None)
+                            .route_with_failover(&request, vec![target.clone()], None, compression_restore.clone())
                             .await;
 
                         match attempt_result {
@@ -8484,7 +8523,7 @@ let result = passthrough_scope
     .scope(async {
         state
             .router
-            .route_request(&chat_request, Some(active_handle.clone()))
+            .route_request(&chat_request, Some(active_handle.clone()), crate::router::router::ToolCompressionRestore::default())
             .await
     })
     .await;
@@ -8829,7 +8868,7 @@ drop(memory_stall);
             .scope(async {
                 state
                     .router
-                    .route_request(&chat_request, Some(active_handle.clone()))
+                    .route_request(&chat_request, Some(active_handle.clone()), crate::router::router::ToolCompressionRestore::default())
                     .await
                     .map(StreamingResponse::Buffered)
             })
@@ -8839,7 +8878,7 @@ drop(memory_stall);
             .scope(async {
                 state
                     .router
-                    .route_request_streaming(&chat_request, Some(active_handle.clone()))
+                    .route_request_streaming(&chat_request, Some(active_handle.clone()), crate::router::router::ToolCompressionRestore::default())
                     .await
             })
             .await
@@ -12292,6 +12331,7 @@ pub async fn completions(
         virtual_key_id,
         memory_mode,
         false,
+        crate::router::router::ToolCompressionRestore::default(),
         inbound_telemetry,
     )
     .await
@@ -12907,7 +12947,7 @@ pub async fn create_run(
 
     let router = Arc::clone(&state.router);
     let request = execution.request.clone();
-    let route_future = router.route_request(&request, None);
+    let route_future = router.route_request(&request, None, crate::router::router::ToolCompressionRestore::default());
 
     tokio::pin!(route_future);
 
@@ -14506,7 +14546,7 @@ async fn responses_create_buffered(
 ) -> Response {
 let result = state
     .router
-    .route_request(&chat_request, Some(active_handle.clone()))
+    .route_request(&chat_request, Some(active_handle.clone()), crate::router::router::ToolCompressionRestore::default())
     .await;
 
 match result {
@@ -15160,7 +15200,7 @@ async fn responses_create_stream(
 
     let result = state
         .router
-        .route_request_streaming(&chat_request, Some(active_handle.clone()))
+        .route_request_streaming(&chat_request, Some(active_handle.clone()), crate::router::router::ToolCompressionRestore::default())
         .await;
 
     match result {

@@ -461,6 +461,8 @@ impl Config {
             );
         }
 
+        self.warn_for_unknown_tool_compression_disabled_providers(&configured_provider_names);
+
         // Validate at least one provider (21.7)
         if self.providers.is_empty() {
             errors.push(ValidationError::NoProviders);
@@ -1175,6 +1177,20 @@ prefix stickiness is disabled and routing uses normal priority/cost/latency sort
                     scope,
                     provider = %provider_name,
                     "Structured-output passthrough provider does not match a configured provider"
+                );
+            }
+        }
+    }
+
+    fn warn_for_unknown_tool_compression_disabled_providers(
+        &self,
+        configured_provider_names: &std::collections::HashSet<&str>,
+    ) {
+        for provider_name in &self.tool_compression.disabled_providers {
+            if !configured_provider_names.contains(provider_name.as_str()) {
+                tracing::warn!(
+                    provider = %provider_name,
+                    "Tool-compression disabled provider does not match a configured provider"
                 );
             }
         }
@@ -2842,21 +2858,72 @@ model_groups:
                 ..Default::default()
             });
 
-        assert!(with_default(subscriber, || config.validate()).is_ok());
+    assert!(with_default(subscriber, || config.validate()).is_ok());
 
-        let warnings = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        assert_eq!(
-            warnings
-                .matches(
-                    "Structured-output passthrough provider does not match a configured provider"
-                )
-                .count(),
-            2
-        );
-        assert!(warnings.contains("not-configured"));
-        assert!(warnings.contains("also-not-configured"));
-        assert!(!warnings.contains("schema"));
-    }
+    let warnings = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        warnings
+            .matches(
+                "Structured-output passthrough provider does not match a configured provider"
+            )
+            .count(),
+        2
+    );
+    assert!(warnings.contains("not-configured"));
+    assert!(warnings.contains("also-not-configured"));
+    assert!(!warnings.contains("schema"));
+}
+
+#[test]
+fn unknown_tool_compression_disabled_provider_warns_without_failing_validation() {
+    use tracing::subscriber::with_default;
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer({
+            let output = Arc::clone(&output);
+            move || CapturedWriter(Arc::clone(&output))
+        })
+        .finish();
+
+    let mut config = minimal_valid_config();
+    config.tool_compression.disabled_providers = vec!["not-configured".to_string()];
+
+    assert!(with_default(subscriber, || config.validate()).is_ok());
+
+    let warnings = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(warnings.contains(
+        "Tool-compression disabled provider does not match a configured provider"
+    ));
+    assert!(warnings.contains("not-configured"));
+}
+
+#[test]
+fn known_tool_compression_disabled_providers_do_not_warn() {
+    use tracing::subscriber::with_default;
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer({
+            let output = Arc::clone(&output);
+            move || CapturedWriter(Arc::clone(&output))
+        })
+        .finish();
+
+    let mut config = minimal_valid_config();
+    config.tool_compression.disabled_providers = vec!["test-provider".to_string()];
+
+    assert!(with_default(subscriber, || config.validate()).is_ok());
+
+    let warnings = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(!warnings.contains(
+        "Tool-compression disabled provider does not match a configured provider"
+    ));
+}
 
     #[test]
     fn test_streaming_keepalive_at_max_accepted() {

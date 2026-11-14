@@ -151,6 +151,14 @@ pub struct ToolCompressionConfig {
     /// Merged on top of built-in defaults when constructing `ToolCompressionState`.
     #[serde(default)]
     pub provider_overrides: HashMap<String, crate::tool_compression::types::ProviderCapsOverlay>,
+
+    /// Providers for which tool compression is skipped entirely. When every
+    /// provider serving the request's model group is listed here, the
+    /// tool-compression pipeline is skipped pre-dispatch; on per-attempt
+    /// routing to a listed provider with compression applied, the original
+    /// tools are restored for that attempt.
+    #[serde(default)]
+    pub disabled_providers: Vec<String>,
 }
 
 impl Default for ToolCompressionConfig {
@@ -174,6 +182,7 @@ impl Default for ToolCompressionConfig {
             model_group_overrides: HashMap::new(),
             debug_validation: false,
             provider_overrides: HashMap::new(),
+            disabled_providers: Vec::new(),
         }
     }
 }
@@ -509,6 +518,7 @@ mod tests {
         assert!(cfg.cache_placement);
         assert!(cfg.deduplication);
         assert!(cfg.model_group_overrides.is_empty());
+        assert!(cfg.disabled_providers.is_empty());
     }
 
     #[test]
@@ -639,5 +649,59 @@ level: low
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let restored: ToolCompressionConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(cfg, restored);
+    }
+
+    #[test]
+    fn deserialize_absent_disabled_providers_is_empty() {
+        let yaml = r#"
+enabled: true
+"#;
+        let cfg: ToolCompressionConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.disabled_providers.is_empty());
+    }
+
+    #[test]
+    fn deserialize_disabled_providers_parses_exact_strings() {
+        let yaml = r#"
+enabled: true
+disabled_providers:
+- github-copilot
+- ollama-local
+"#;
+        let cfg: ToolCompressionConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.disabled_providers, vec!["github-copilot", "ollama-local"]);
+    }
+
+    #[test]
+    fn roundtrip_serialize_deserialize_disabled_providers() {
+        let cfg = ToolCompressionConfig {
+            disabled_providers: vec!["openai".to_string(), "ollama-local".to_string()],
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let restored: ToolCompressionConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(cfg, restored);
+        assert_eq!(restored.disabled_providers, vec!["openai", "ollama-local"]);
+    }
+
+    #[test]
+    fn deserialize_disabled_providers_coexists_with_overrides() {
+        let yaml = r#"
+enabled: true
+disabled_providers:
+- github-copilot
+model_group_overrides:
+  coding-group:
+    level: high
+provider_overrides:
+  openai:
+    supports_ref: true
+"#;
+        let cfg: ToolCompressionConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.disabled_providers, vec!["github-copilot"]);
+        let coding = cfg.model_group_overrides.get("coding-group").unwrap();
+        assert_eq!(coding.level, Some(CompressionLevel::High));
+        let caps = cfg.provider_overrides.get("openai").unwrap();
+        assert_eq!(caps.supports_ref, Some(true));
     }
 }

@@ -56,6 +56,60 @@ use tracing::{debug, info, warn};
 const PRECOMPRESSED_CACHE_MARKER_KEY: &str = "cache_control";
 const PRECOMPRESSED_CACHE_MARKER_TYPE: &str = "obey_precompressed_context";
 
+/// Per-request tool-compression restore context threaded from the HTTP
+/// handler into the dispatch seam (spec per-provider-tool-compression-toggle,
+/// Task 5). The compression middleware stores the originals in request
+/// extensions, which do not reach the router, so the handler extracts them
+/// and passes this struct down instead. `applied == true` means the body the
+/// router received carries compressed tools; a per-attempt dispatch to a
+/// provider listed in `tool_compression.disabled_providers` must then swap
+/// the originals back in.
+#[derive(Clone, Default)]
+pub struct ToolCompressionRestore {
+    /// Original (uncompressed) tool definitions from the middleware.
+    pub original_tools: Option<Arc<Vec<crate::tool_compression::ToolDefinition>>>,
+    /// Whether the compression pipeline actually rewrote the body's tools.
+    pub applied: bool,
+}
+
+impl ToolCompressionRestore {
+    /// Swap `outgoing.tools` back to the original definitions when this
+    /// attempt targets a provider with tool compression disabled. Called on
+    /// the per-attempt clone only — failover to an enabled provider re-clones
+    /// the compressed tools from the original request. `disabled_providers`
+    /// must be snapshotted by the caller while a config guard is held; this
+    /// helper never takes a lock itself.
+    fn restore_tools_for_disabled_provider(
+        &self,
+        outgoing: &mut OpenAIRequest,
+        provider_name: &str,
+        disabled_providers: &[String],
+        metrics: &crate::metrics::Metrics,
+    ) {
+        let Some(originals) = self.original_tools.as_ref() else {
+            return;
+        };
+        if !self.applied || disabled_providers.is_empty() {
+            return;
+        }
+        if !disabled_providers.iter().any(|p| p == provider_name) {
+            return;
+        }
+        let restored: Vec<serde_json::Value> =
+            originals.iter().map(|t| t.raw.clone()).collect();
+        outgoing.extra.insert(
+            "tools".to_string(),
+            serde_json::Value::Array(restored),
+        );
+        metrics.record_tool_compression_tools_restored(provider_name);
+        debug!(
+            provider = provider_name,
+            tools = originals.len(),
+            "Tool compression disabled for provider; restored original tool definitions for this attempt"
+        );
+    }
+}
+
 /// Adapter that lets the Codex Search agent loop resubmit through the
 /// normal dispatch pipeline (`attempt_with_retry`) for any provider.
 /// Resubmissions reuse the same model rewrite, retry, and translation
@@ -67,6 +121,7 @@ struct SearchResubmitter<'a> {
     provider_model: &'a ProviderModel,
     active: Option<ActiveRequestHandle>,
     base_attempt: usize,
+    compression_restore: ToolCompressionRestore,
 }
 
 #[async_trait::async_trait]
@@ -87,6 +142,7 @@ impl ProviderClient for SearchResubmitter<'_> {
                 self.base_attempt,
                 FirstSendToken::Debit,
                 false,
+                self.compression_restore.clone(),
             )
             .await?;
         Ok(ProviderResponse {
@@ -4805,6 +4861,7 @@ impl Router {
         base_attempt: usize,
         first_send: FirstSendToken,
         is_primary_candidate: bool,
+        compression_restore: ToolCompressionRestore,
     ) -> Result<OpenAIResponse, GatewayError> {
         self.attempt_with_retry_with_permit(
             provider_name,
@@ -4816,6 +4873,7 @@ impl Router {
             first_send,
             false,
             is_primary_candidate,
+            compression_restore,
         )
         .await
     }
@@ -4834,6 +4892,7 @@ impl Router {
         base_attempt: usize,
         first_send: FirstSendToken,
         is_primary_candidate: bool,
+        compression_restore: ToolCompressionRestore,
     ) -> Result<OpenAIResponse, GatewayError> {
         self.attempt_with_retry_with_permit(
             provider_name,
@@ -4845,6 +4904,7 @@ impl Router {
             first_send,
             true,
             is_primary_candidate,
+            compression_restore,
         )
         .await
     }
@@ -4860,6 +4920,7 @@ impl Router {
         first_send: FirstSendToken,
         force_context_reduce: bool,
         is_primary_candidate: bool,
+        compression_restore: ToolCompressionRestore,
     ) -> Result<OpenAIResponse, GatewayError> {
         let provider_cfg = {
             let config = self.config.read().await;
@@ -4893,6 +4954,7 @@ impl Router {
             force_context_reduce,
             is_primary_candidate,
             _concurrency_permit,
+            compression_restore,
         )
         .await
     }
@@ -4943,6 +5005,7 @@ impl Router {
         mut response: OpenAIResponse,
         active: Option<ActiveRequestHandle>,
         base_attempt: usize,
+        compression_restore: ToolCompressionRestore,
     ) -> Result<OpenAIResponse, GatewayError> {
         // XML-prone models (GLM, Kimi, Qwen, DeepSeek) emit tool calls as
         // XML text rather than native tool_calls. Translate first so
@@ -5045,6 +5108,7 @@ impl Router {
             provider_model,
             active: active.clone(),
             base_attempt,
+            compression_restore: compression_restore.clone(),
         };
         // The search loop runs extra upstream rounds the client never sees;
         // mark the request so the dashboard can say why it is busy. The RAII
@@ -5266,6 +5330,7 @@ impl Router {
         force_context_reduce: bool,
         is_primary_candidate: bool,
         mut concurrency_permit: ProviderConcurrencyPermit,
+        compression_restore: ToolCompressionRestore,
     ) -> Result<OpenAIResponse, GatewayError> {
         // Fetched before the config guard below: `get_rate_limiter` may read
         // the config itself. Sends after the first one are debited here; the
@@ -5277,6 +5342,17 @@ impl Router {
         let max_retries = config.retry.max_retries_per_provider;
         let backoff_sequence = config.retry.backoff_sequence_seconds.clone();
         let context_config = config.context.clone();
+        // Per-provider tool-compression toggle (spec
+        // per-provider-tool-compression-toggle, Task 5): providers listed in
+        // `tool_compression.disabled_providers` must receive the original
+        // (uncompressed) tools on every attempt of this request. Snapshotted
+        // under the config guard already held here; the restore itself runs
+        // on the per-attempt clone only, so failover to an enabled provider
+        // keeps the compressed body.
+        let compression_disabled_providers: Vec<String> = config
+            .tool_compression
+            .disabled_providers
+            .clone();
         // Bounded Retry-After wait (retry-failover-core-overhaul, Req 3.1-3.9),
         // snapshotted here so the wait never runs under the config guard.
         let retry_after_max_wait_ms = config.retry.upstream_retry_after_max_wait_ms;
@@ -5347,9 +5423,15 @@ impl Router {
             // values needed here were cloned above.
             drop(config);
 
-            let mut codex_request = request.clone();
-            // Rewrite the model from the group name to the actual provider model ID
-            codex_request.model = provider_model.model.clone();
+        let mut codex_request = request.clone();
+        // Rewrite the model from the group name to the actual provider model ID
+        codex_request.model = provider_model.model.clone();
+        compression_restore.restore_tools_for_disabled_provider(
+            &mut codex_request,
+            provider_name,
+            &compression_disabled_providers,
+            &self.metrics,
+        );
 
             let search_enabled = codex_search_config.effective_enabled(true);
             let oauth_active = oauth.get_access_token().await.is_some();
@@ -5437,9 +5519,15 @@ impl Router {
         let is_bedrock_api_key = provider_cfg.provider_type == "bedrock" && !api_key.is_empty();
         if is_bedrock_api_key {
             let mut bedrock_request = request.clone();
-            bedrock_request.model = provider_model.model.clone();
-            bedrock_request.stream = false;
-            drop(config);
+        bedrock_request.model = provider_model.model.clone();
+        bedrock_request.stream = false;
+        compression_restore.restore_tools_for_disabled_provider(
+            &mut bedrock_request,
+            provider_name,
+            &compression_disabled_providers,
+            &self.metrics,
+        );
+        drop(config);
             let context_reduction = match self
                 .enforce_context_budget(
                     &bedrock_request,
@@ -5515,8 +5603,14 @@ impl Router {
 
             // Model rewrite + context gate on the dispatch copy, same as
             // the Codex/Bedrock arms.
-            let mut copilot_request = request.clone();
-            copilot_request.model = provider_model.model.clone();
+        let mut copilot_request = request.clone();
+        copilot_request.model = provider_model.model.clone();
+        compression_restore.restore_tools_for_disabled_provider(
+            &mut copilot_request,
+            provider_name,
+            &compression_disabled_providers,
+            &self.metrics,
+        );
             // Copilot rides stream:false buffered dispatch (Bedrock arm
             // precedent): this arm delegates to the adapter, which has no
             // upstream-streaming SSE reassembly, so a client stream:true
@@ -5714,6 +5808,12 @@ impl Router {
         // `stream:false`.
         let mut outgoing = request.clone();
         outgoing.model = provider_model.model.clone();
+        compression_restore.restore_tools_for_disabled_provider(
+            &mut outgoing,
+            provider_name,
+            &compression_disabled_providers,
+            &self.metrics,
+        );
         let mut stream_upstream = provider_cfg.effective_buffered_upstream_streaming()
             && !requires_non_streaming(&outgoing);
         outgoing.stream = stream_upstream;
@@ -7112,6 +7212,7 @@ impl Router {
         active: Option<ActiveRequestHandle>,
         provider_model: &ProviderModel,
         failure: GatewayError,
+        compression_restore: ToolCompressionRestore,
     ) -> Result<StreamingResponse, GatewayError> {
         let reason = match &failure {
             GatewayError::Provider {
@@ -7136,7 +7237,12 @@ impl Router {
             excluded.push(failed_key);
         }
         match self
-            .route_request_with_exclusions(request, active, &excluded)
+            .route_request_with_exclusions(
+                request,
+                active,
+                &excluded,
+                compression_restore,
+            )
             .await
         {
             Ok(response) => Ok(StreamingResponse::Buffered(response)),
@@ -7685,6 +7791,7 @@ impl Router {
         request: &OpenAIRequest,
         providers: Vec<ProviderModel>,
         active: Option<ActiveRequestHandle>,
+        compression_restore: ToolCompressionRestore,
     ) -> Result<OpenAIResponse, GatewayError> {
         let model_group = self.find_model_group(&request.model).await?;
         self.route_with_failover_for_group(
@@ -7693,6 +7800,7 @@ impl Router {
             providers,
             active,
             ActivePhase::Primary,
+            compression_restore,
         )
         .await
     }
@@ -7705,6 +7813,7 @@ impl Router {
         providers: Vec<ProviderModel>,
         active: Option<ActiveRequestHandle>,
         initial_phase: ActivePhase,
+        compression_restore: ToolCompressionRestore,
     ) -> Result<OpenAIResponse, GatewayError> {
         let mut attempts = Vec::new();
         // Running count of provider attempts across the whole request, surfaced
@@ -8072,29 +8181,31 @@ impl Router {
             // usize::MAX) re-dispatches an already-tried candidate, never a
             // fresh primary, so it never qualifies either.
             let is_primary_candidate = candidate_index == 0;
-            let dispatch_result = if force_context_reduce {
-                self.attempt_with_retry_forced_reduce(
-                    &provider_model.provider,
-                    &prepared_request,
-                    &provider_model,
-                    active.clone(),
-                    attempt_counter,
-                    FirstSendToken::Prepaid,
-                    is_primary_candidate,
-                )
-                .await
-            } else {
-                self.attempt_with_retry(
-                    &provider_model.provider,
-                    &prepared_request,
-                    &provider_model,
-                    active.clone(),
-                    attempt_counter,
-                    FirstSendToken::Prepaid,
-                    is_primary_candidate,
-                )
-                .await
-            };
+        let dispatch_result = if force_context_reduce {
+            self.attempt_with_retry_forced_reduce(
+                &provider_model.provider,
+                &prepared_request,
+                &provider_model,
+                active.clone(),
+                attempt_counter,
+                FirstSendToken::Prepaid,
+                is_primary_candidate,
+                compression_restore.clone(),
+            )
+            .await
+        } else {
+            self.attempt_with_retry(
+                &provider_model.provider,
+                &prepared_request,
+                &provider_model,
+                active.clone(),
+                attempt_counter,
+                FirstSendToken::Prepaid,
+                is_primary_candidate,
+                compression_restore.clone(),
+            )
+            .await
+        };
             match dispatch_result {
                 Ok(mut response) => {
                     // ---- Repair the turn before judging it ----------------
@@ -8160,15 +8271,16 @@ impl Router {
                                     active.as_ref(),
                                     crate::active_requests::StallReason::ReasoningNudge,
                                 );
-                            let nudged = self
-                                .nudge_reasoning_continuation(
-                                    &provider_model,
-                                    &prepared_request,
-                                    &response,
-                                    active.clone(),
-                                    attempt_counter,
-                                )
-                                .await;
+        let nudged = self
+            .nudge_reasoning_continuation(
+                &provider_model,
+                &prepared_request,
+                &response,
+                active.clone(),
+                attempt_counter,
+                compression_restore.clone(),
+            )
+            .await;
                             drop(_nudge_stall);
                             nudged
                         } else {
@@ -8309,15 +8421,16 @@ impl Router {
                     // the normal dispatch pipeline until the model produces a
                     // final answer. No-ops for Codex providers (intercepted during
                     // Codex dispatch) and for responses without search tool calls.
-                    response = self
-                        .maybe_intercept_search_tools(
-                            &provider_model,
-                            &prepared_request,
-                            response,
-                            active.clone(),
-                            attempt_counter,
-                        )
-                        .await?;
+            response = self
+                .maybe_intercept_search_tools(
+                    &provider_model,
+                    &prepared_request,
+                    response,
+                    active.clone(),
+                    attempt_counter,
+                    compression_restore.clone(),
+                )
+                .await?;
 
                     // --- Truncation detection and retry (Req 6.1, 6.3, 6.4) ---
                     // A provider can return HTTP 200 with finish_reason="length"
@@ -9137,6 +9250,7 @@ visible content. Do not restate your plan and do not end your turn without doing
         reasoning_only: &OpenAIResponse,
         active: Option<ActiveRequestHandle>,
         attempt_counter: usize,
+        compression_restore: ToolCompressionRestore,
     ) -> Option<OpenAIResponse> {
         let mut nudged = prepared_request.clone();
         if let Some(choice) = reasoning_only.choices.first() {
@@ -9176,6 +9290,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 // The nudge is a second upstream request: debit its token.
                 FirstSendToken::Debit,
                 false,
+                compression_restore.clone(),
             )
             .await
         {
@@ -10891,14 +11006,15 @@ visible content. Do not restate your plan and do not end your turn without doing
     /// Integrates provider selection, retry, failover, and cost calculation
     ///
     /// Requirements: 2.1, 30.1, 30.2
-    pub async fn route_request(
-        &self,
-        request: &OpenAIRequest,
-        active: Option<ActiveRequestHandle>,
-    ) -> Result<OpenAIResponse, GatewayError> {
-        self.route_request_with_exclusions(request, active, &[])
-            .await
-    }
+pub async fn route_request(
+    &self,
+    request: &OpenAIRequest,
+    active: Option<ActiveRequestHandle>,
+    compression_restore: ToolCompressionRestore,
+) -> Result<OpenAIResponse, GatewayError> {
+    self.route_request_with_exclusions(request, active, &[], compression_restore)
+        .await
+}
 
     /// Like [`Self::route_request`], but removes any `provider:model` entry
     /// listed in `exclude` from the initial failover chain. Used by the
@@ -10908,12 +11024,13 @@ visible content. Do not restate your plan and do not end your turn without doing
     /// exclusion makes the guarantee airtight even when the parsed cooldown
     /// window is near zero. Smart-routing cascade escalation re-derives its
     /// own candidates and is not filtered.
-    pub(crate) async fn route_request_with_exclusions(
-        &self,
-        request: &OpenAIRequest,
-        active: Option<ActiveRequestHandle>,
-        exclude: &[String],
-    ) -> Result<OpenAIResponse, GatewayError> {
+pub(crate) async fn route_request_with_exclusions(
+    &self,
+    request: &OpenAIRequest,
+    active: Option<ActiveRequestHandle>,
+    exclude: &[String],
+    compression_restore: ToolCompressionRestore,
+) -> Result<OpenAIResponse, GatewayError> {
         let prepared_request = request.clone();
 
         // Find model group
@@ -10966,6 +11083,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 providers,
                 active.clone(),
                 ActivePhase::Primary,
+                compression_restore.clone(),
             )
             .await?;
         if let (Some(smart_router), Some(decision)) =
@@ -11009,15 +11127,16 @@ visible content. Do not restate your plan and do not end your turn without doing
                 if escalated_providers.is_empty() {
                     break;
                 }
-                response = self
-                    .route_with_failover_for_group(
-                        &original_request,
-                        &next.model_group,
-                        escalated_providers,
-                        active.clone(),
-                        ActivePhase::Cascade,
-                    )
-                    .await?;
+        response = self
+            .route_with_failover_for_group(
+                &original_request,
+                &next.model_group,
+                escalated_providers,
+                active.clone(),
+                ActivePhase::Cascade,
+                compression_restore.clone(),
+            )
+            .await?;
                 self.metrics.record_smart_routing_cascade_transition(
                     smart_routing_tier_name(decision.tier),
                     smart_routing_tier_name(next_tier),
@@ -11106,14 +11225,15 @@ visible content. Do not restate your plan and do not end your turn without doing
     ///
     /// Requirements: 3.1, 3.8, 3.9
     // Wired into the streaming handler by task 5.5.
-    pub async fn route_request_streaming(
-        &self,
-        request: &OpenAIRequest,
-        active: Option<ActiveRequestHandle>,
-    ) -> Result<StreamingResponse, GatewayError> {
-        self.route_request_streaming_excluding(request, &[], active)
-            .await
-    }
+pub async fn route_request_streaming(
+    &self,
+    request: &OpenAIRequest,
+    active: Option<ActiveRequestHandle>,
+    compression_restore: ToolCompressionRestore,
+) -> Result<StreamingResponse, GatewayError> {
+    self.route_request_streaming_excluding(request, &[], active, compression_restore)
+        .await
+}
 
     /// Like [`Self::route_request_streaming`], but skips any `provider:model`
     /// entry listed in `exclude` when picking the first eligible pass-through
@@ -11131,22 +11251,33 @@ visible content. Do not restate your plan and do not end your turn without doing
     /// failover limits and aggregated-error reporting.
     ///
     /// Requirements: 3.1, 3.8, 3.9, 4.1
-    pub async fn route_request_streaming_excluding(
-        &self,
-        request: &OpenAIRequest,
-        exclude: &[String],
-        active: Option<ActiveRequestHandle>,
-    ) -> Result<StreamingResponse, GatewayError> {
-        let prepared_request = request.clone();
+pub async fn route_request_streaming_excluding(
+    &self,
+    request: &OpenAIRequest,
+    exclude: &[String],
+    active: Option<ActiveRequestHandle>,
+    compression_restore: ToolCompressionRestore,
+) -> Result<StreamingResponse, GatewayError> {
+    let prepared_request = request.clone();
 
-        // Effective streaming configuration (defaults when section absent).
-        let streaming_config = self
-            .config
-            .read()
-            .await
-            .streaming
-            .clone()
-            .unwrap_or_default();
+    // Effective streaming configuration (defaults when section absent).
+    let streaming_config = self
+        .config
+        .read()
+        .await
+        .streaming
+        .clone()
+        .unwrap_or_default();
+    // Per-provider tool-compression toggle snapshot (spec
+    // per-provider-tool-compression-toggle, Task 5): read once here so
+    // the pass-through restore below never takes a new lock.
+    let compression_disabled_providers: Vec<String> = self
+        .config
+        .read()
+        .await
+        .tool_compression
+        .disabled_providers
+        .clone();
 
         // Model group + provider order (same selection path as route_request).
         let model_group = self.find_model_group(&prepared_request.model).await?;
@@ -11179,7 +11310,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 "Streaming pass-through disabled or Smart Routing without Streaming Reliability, using buffered path"
             );
             return Ok(StreamingResponse::Buffered(
-                self.route_request(request, active.clone()).await?,
+                self.route_request(request, active.clone(), compression_restore.clone()).await?,
             ));
         }
 
@@ -11249,13 +11380,13 @@ visible content. Do not restate your plan and do not end your turn without doing
                 let Some((provider_model, provider_cfg)) = chosen_without_capacity else {
                     debug!("No eligible pass-through provider, using buffered path");
                     return Ok(StreamingResponse::Buffered(
-                        self.route_request(request, active.clone()).await?,
+                        self.route_request(request, active.clone(), compression_restore.clone()).await?,
                     ));
                 };
                 debug!(provider = %provider_model.provider, model = %provider_model.model, "Waiting for provider concurrency before buffered dispatch");
                 drop(provider_cfg);
                 return Ok(StreamingResponse::Buffered(
-                    self.route_request(request, active.clone()).await?,
+                    self.route_request(request, active.clone(), compression_restore.clone()).await?,
                 ));
             }
         };
@@ -11287,7 +11418,7 @@ visible content. Do not restate your plan and do not end your turn without doing
             );
             drop(concurrency_permit.take());
             return Ok(StreamingResponse::Buffered(
-                self.route_request(request, active.clone()).await?,
+                self.route_request(request, active.clone(), compression_restore.clone()).await?,
             ));
         }
 
@@ -11366,7 +11497,7 @@ visible content. Do not restate your plan and do not end your turn without doing
             debug!(provider = %provider_model.provider, "Provider needs transformation or is Codex, using buffered path with full failover");
             drop(concurrency_permit.take());
             return Ok(StreamingResponse::Buffered(
-                self.route_request(request, active.clone()).await?,
+                self.route_request(request, active.clone(), compression_restore.clone()).await?,
             ));
         }
 
@@ -11395,7 +11526,7 @@ visible content. Do not restate your plan and do not end your turn without doing
             debug!(provider = %provider_model.provider, "OAuth session unusable, using buffered path");
             drop(concurrency_permit.take());
             return Ok(StreamingResponse::Buffered(
-                self.route_request(request, active.clone()).await?,
+                self.route_request(request, active.clone(), compression_restore.clone()).await?,
             ));
         }
 
@@ -11417,6 +11548,12 @@ visible content. Do not restate your plan and do not end your turn without doing
         let mut outgoing = compressed_request;
         outgoing.model = provider_model.model.clone();
         outgoing.stream = true;
+        compression_restore.restore_tools_for_disabled_provider(
+            &mut outgoing,
+            &provider_model.provider,
+            &compression_disabled_providers,
+            &self.metrics,
+        );
         // Reasoning-compat per-attempt stage (reasoning-failover-compat
         // spec, Req 6.1/6.2), mirroring the buffered dispatch path: detect
         // carriers on the original request, strip/preserve for this
@@ -11521,13 +11658,13 @@ visible content. Do not restate your plan and do not end your turn without doing
                     && u64::from(check.estimate) * 100
                         > u64::from(check.budget)
                             * u64::from(context_config.summarize_trigger_percent);
-                if !check.fits || summarize {
-                    drop(concurrency_permit.take());
-                    return Ok(StreamingResponse::Buffered(
-                        self.route_request_with_exclusions(request, active, exclude)
-                            .await?,
-                    ));
-                }
+        if !check.fits || summarize {
+            drop(concurrency_permit.take());
+            return Ok(StreamingResponse::Buffered(
+                self.route_request_with_exclusions(request, active, exclude, compression_restore.clone())
+                    .await?,
+            ));
+        }
             }
         }
         let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
@@ -11537,7 +11674,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 .record_provider_rate_limit_exhausted(&provider_model.provider);
             drop(concurrency_permit.take());
             return Ok(StreamingResponse::Buffered(
-                self.route_request_with_exclusions(request, active, exclude)
+                self.route_request_with_exclusions(request, active, exclude, compression_restore.clone())
                     .await?,
             ));
         }
@@ -11763,19 +11900,20 @@ visible content. Do not restate your plan and do not end your turn without doing
                         None,
                         request_start,
                     );
-                    return self
-                        .passthrough_fallback_excluding(
-                            request,
-                            exclude,
-                            active,
-                            &provider_model,
-                            err,
-                        )
-                        .await;
-                }
-            };
+        return self
+            .passthrough_fallback_excluding(
+                request,
+                exclude,
+                active,
+                &provider_model,
+                err,
+                compression_restore.clone(),
+            )
+            .await;
+    }
+    };
 
-            let status = resp.status();
+    let status = resp.status();
             if !status.is_success() {
                 let status_code = status.as_u16();
                 // Capture headers before draining so Retry-After style signals
@@ -11924,7 +12062,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                         excluded.push(failed_key);
                     }
                     return Ok(StreamingResponse::Buffered(
-                        self.route_request_with_exclusions(request, active.clone(), &excluded)
+                        self.route_request_with_exclusions(request, active.clone(), &excluded, compression_restore.clone())
                             .await?,
                     ));
                 }
@@ -11950,7 +12088,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                             );
                             drop(concurrency_permit.take());
                             return Ok(StreamingResponse::Buffered(
-                                self.route_request(&truncated_request, active.clone())
+                                self.route_request(&truncated_request, active.clone(), compression_restore.clone())
                                     .await?,
                             ));
                         }
@@ -12007,7 +12145,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                         );
                         drop(concurrency_permit.take());
                         return Ok(StreamingResponse::Buffered(
-                            self.route_request(&stripped_request, active.clone())
+                            self.route_request(&stripped_request, active.clone(), compression_restore.clone())
                                 .await?,
                         ));
                     }
@@ -12030,23 +12168,24 @@ visible content. Do not restate your plan and do not end your turn without doing
                     );
                     continue;
                 }
-                if status.is_server_error() {
-                    warn!(provider = %provider_model.provider, status = status_code, "Provider returned server error (streaming), falling back to buffered path without this provider");
-                    drop(concurrency_permit.take());
-                    return self
-                        .passthrough_fallback_excluding(
-                            request,
-                            exclude,
-                            active,
-                            &provider_model,
-                            err,
-                        )
-                        .await;
-                }
+        if status.is_server_error() {
+            warn!(provider = %provider_model.provider, status = status_code, "Provider returned server error (streaming), falling back to buffered path without this provider");
+            drop(concurrency_permit.take());
+            return self
+                .passthrough_fallback_excluding(
+                    request,
+                    exclude,
+                    active,
+                    &provider_model,
+                    err,
+                    compression_restore.clone(),
+                )
+                .await;
+        }
                 warn!(provider = %provider_model.provider, status = status_code, "Provider returned non-success status (streaming), falling back to buffered path with full failover");
                 drop(concurrency_permit.take());
                 return Ok(StreamingResponse::Buffered(
-                    self.route_request(request, active.clone()).await?,
+                    self.route_request(request, active.clone(), compression_restore.clone()).await?,
                 ));
             }
 
@@ -12071,7 +12210,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 );
                 drop(concurrency_permit.take());
                 return self
-                    .passthrough_fallback_excluding(request, exclude, active, &provider_model, err)
+                    .passthrough_fallback_excluding(request, exclude, active, &provider_model, err, compression_restore.clone())
                     .await;
             }
         };
@@ -14249,7 +14388,7 @@ mod tests {
             }]),
         );
 
-        let response = router.route_request(&request, None).await.unwrap();
+        let response = router.route_request(&request, None, ToolCompressionRestore::default()).await.unwrap();
 
         // The nudge revived the turn into a real tool call.
         let tool_calls = response
@@ -15177,7 +15316,7 @@ mod tests {
         let replay_before = hub.subscribe().replay.len();
 
         let response = router
-            .route_request(&compression_request(false), None)
+            .route_request(&compression_request(false), None, ToolCompressionRestore::default())
             .await
             .unwrap();
         assert!(response.extra.contains_key("gateway_compression"));
@@ -15218,7 +15357,7 @@ mod tests {
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
         let response = router
-            .route_request_streaming(&compression_request(true), None)
+            .route_request_streaming(&compression_request(true), None, ToolCompressionRestore::default())
             .await
             .unwrap();
         assert!(matches!(response, StreamingResponse::PassThrough { .. }));
@@ -15320,7 +15459,7 @@ mod tests {
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
         let err = router
-            .route_request(&compression_request(false), None)
+            .route_request(&compression_request(false), None, ToolCompressionRestore::default())
             .await
             .unwrap_err();
         assert!(
@@ -15713,7 +15852,7 @@ mod tests {
             let (relay, _rx) = RelayHandle::new();
             handle.attach_reasoning_relay(relay.clone());
             router
-                .route_request(&compression_request(false), Some(handle.clone()))
+                .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
                 .await
                 .unwrap();
             (handle, relay)
@@ -15765,7 +15904,7 @@ mod tests {
 
         // Client asked for a non-streaming response.
         let response = router
-            .route_request(&compression_request(false), None)
+            .route_request(&compression_request(false), None, ToolCompressionRestore::default())
             .await
             .unwrap();
         let choice = &response.choices[0];
@@ -15850,7 +15989,7 @@ mod tests {
         let handle = ledger_handle();
 
         let result = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await;
         let Err(GatewayError::AllProvidersFailed(agg)) = result else {
             panic!("expected AllProvidersFailed");
@@ -15901,7 +16040,7 @@ mod tests {
         let handle = ledger_handle();
 
         let response = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .expect("retry rescues the request");
         assert!(response.extra.get("gateway_failed_attempts").is_none());
@@ -15972,7 +16111,7 @@ mod tests {
         let handle = ledger_handle();
 
         router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .expect("provider b answers after a times out");
 
@@ -16001,17 +16140,331 @@ mod tests {
         let handle = ledger_handle();
 
         router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .expect("provider b answers after a returns 504");
 
-        let ledger = handle.take_failed_attempts();
-        assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
-        assert_eq!(ledger[0].status_code, Some(504));
-        assert_eq!(ledger[0].error_class.as_deref(), Some("upstream_http_504"));
+    let ledger = handle.take_failed_attempts();
+    assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+    assert_eq!(ledger[0].status_code, Some(504));
+    assert_eq!(ledger[0].error_class.as_deref(), Some("upstream_http_504"));
+    a.verify().await;
+    b.verify().await;
+}
+
+    // ------------------------------------------------------------------
+    // Spec per-provider-tool-compression-toggle, Task 5 — strict
+    // per-attempt original-tools restore in the dispatch loop.
+    // ------------------------------------------------------------------
+
+    fn original_tools_fixture() -> Arc<Vec<crate::tool_compression::ToolDefinition>> {
+        Arc::new(vec![
+            crate::tool_compression::ToolDefinition {
+                raw: serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "FULL ORIGINAL get_weather description",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }),
+                name: "get_weather".to_string(),
+                content_hash: 1,
+            },
+            crate::tool_compression::ToolDefinition {
+                raw: serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": "get_time",
+                        "description": "FULL ORIGINAL get_time description",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }),
+                name: "get_time".to_string(),
+                content_hash: 2,
+            },
+        ])
+    }
+
+    fn compressed_tools_request() -> OpenAIRequest {
+        OpenAIRequest {
+            model: "test-group".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("use the tools"),
+                extra: Default::default(),
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra: [
+                (
+                    "tools".to_string(),
+                    serde_json::json!([{
+                        "type": "function",
+                        "function": {
+                            "name": "compressed_proxy",
+                            "description": "COMPRESSED",
+                            "parameters": {"type": "object", "properties": {}}
+                        }
+                    }]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    fn restore_metrics_router(
+        server: &MockServer,
+        disabled_providers: Vec<String>,
+    ) -> (Router, Arc<crate::metrics::Metrics>) {
+        let metrics = test_metrics();
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.tool_compression.disabled_providers = disabled_providers;
+        config.providers = vec![test_provider("provider", server.uri())];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), metrics.clone());
+        (router, metrics)
+    }
+
+    fn restored_prometheus_count(metrics: &crate::metrics::Metrics, provider: &str) -> String {
+        let mut out = String::new();
+        metrics.write_tool_compression_prometheus(&mut out);
+        let needle = format!(
+            "obey_tool_compression_tools_restored_total{{provider=\"{provider}\"}}"
+        );
+        out.lines()
+            .find(|line| line.starts_with(&needle))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+/// Applied=true + provider disabled → the upstream body carries the
+/// ORIGINAL tools and the restore metric increments.
+#[tokio::test]
+async fn disabled_provider_attempt_restores_original_tools_and_counts_metric() {
+    let server = MockServer::start().await;
+        mount_streamed_turn(&server).await;
+        let (router, metrics) =
+            restore_metrics_router(&server, vec!["provider".to_string()]);
+
+        let restore = ToolCompressionRestore {
+            original_tools: Some(original_tools_fixture()),
+            applied: true,
+        };
+        router
+            .route_request(&compressed_tools_request(), None, restore)
+            .await
+            .expect("disabled provider still serves the request");
+
+        let bodies = received_chat_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        let tools = bodies[0].get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(tools.len(), 2, "both original tools restored");
+        assert_eq!(
+            tools[0]["function"]["description"],
+            "FULL ORIGINAL get_weather description"
+        );
+        assert_eq!(
+            tools[1]["function"]["name"], "get_time",
+            "original second tool present"
+        );
+        assert!(
+            restored_prometheus_count(&metrics, "provider")
+                .ends_with(" 1"),
+            "restore metric must be 1 for provider, got: {}",
+            restored_prometheus_count(&metrics, "provider")
+        );
+        server.verify().await;
+    }
+
+    /// Failover: disabled provider gets originals; the enabled fallback
+    /// attempt still receives the COMPRESSED body.
+    #[tokio::test]
+    async fn failover_from_disabled_provider_keeps_compressed_tools_on_enabled_fallback() {
+        use wiremock::matchers::{method, path};
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(504).set_body_string("error code: 504"))
+            .expect(1)
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        mount_streamed_turn(&b).await;
+
+        let metrics = test_metrics();
+        let mut config = failover_pair_config(&a, &b);
+        config.tool_compression.disabled_providers = vec!["a".to_string()];
+        let router = Router::new(Arc::new(RwLock::new(config)), metrics.clone());
+        let handle = ledger_handle();
+
+        let restore = ToolCompressionRestore {
+            original_tools: Some(original_tools_fixture()),
+            applied: true,
+        };
+        router
+            .route_request(&compressed_tools_request(), Some(handle), restore)
+            .await
+            .expect("provider b answers after a returns 504");
+
+        // First attempt (disabled provider a): ORIGINAL tools.
+        let a_bodies = received_chat_bodies(&a).await;
+        assert_eq!(a_bodies.len(), 1);
+        let a_tools = a_bodies[0].get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(a_tools.len(), 2, "provider a (disabled) sees originals");
+        assert_eq!(a_tools[0]["function"]["name"], "get_weather");
+        // Restore counted exactly once, for a only.
+        assert!(restored_prometheus_count(&metrics, "a").ends_with(" 1"));
+        assert_eq!(restored_prometheus_count(&metrics, "b"), "");
+
+        // Second attempt (enabled provider b): COMPRESSED tools.
+        let b_bodies = received_chat_bodies(&b).await;
+        assert_eq!(b_bodies.len(), 1);
+        let b_tools = b_bodies[0].get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(b_tools.len(), 1, "provider b (enabled) sees compressed body");
+        assert_eq!(b_tools[0]["function"]["name"], "compressed_proxy");
         a.verify().await;
         b.verify().await;
     }
+
+    /// Applied=false (middleware skip path) → never restored even for a
+    /// disabled provider; the body already holds the originals.
+    #[tokio::test]
+    async fn skip_path_requests_are_never_restored() {
+        let server = MockServer::start().await;
+        mount_streamed_turn(&server).await;
+        let (router, metrics) =
+            restore_metrics_router(&server, vec!["provider".to_string()]);
+
+        let restore = ToolCompressionRestore {
+            original_tools: Some(original_tools_fixture()),
+            applied: false,
+        };
+        router
+            .route_request(&compressed_tools_request(), None, restore)
+            .await
+            .expect("request still routes");
+
+        let bodies = received_chat_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        let tools = bodies[0].get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(
+            tools[0]["function"]["name"], "compressed_proxy",
+            "body must be forwarded untouched on the skip path"
+        );
+        assert_eq!(
+            restored_prometheus_count(&metrics, "provider"),
+            "",
+            "no restore recorded when compression was not applied"
+        );
+    }
+
+    /// Empty disabled_providers → no change, no metric.
+    #[tokio::test]
+    async fn empty_disabled_providers_leaves_tools_untouched() {
+        let server = MockServer::start().await;
+        mount_streamed_turn(&server).await;
+        let (router, metrics) = restore_metrics_router(&server, vec![]);
+
+        let restore = ToolCompressionRestore {
+            original_tools: Some(original_tools_fixture()),
+            applied: true,
+        };
+        router
+            .route_request(&compressed_tools_request(), None, restore)
+            .await
+            .expect("request still routes");
+
+        let bodies = received_chat_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        let tools = bodies[0].get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(
+            tools[0]["function"]["name"], "compressed_proxy",
+            "no disabled providers → compressed body forwarded"
+        );
+    assert_eq!(restored_prometheus_count(&metrics, "provider"), "");
+}
+
+/// Codex Search rounds must carry the caller's restore context: a
+/// disabled provider gets the ORIGINAL tools on the search round's
+/// extra upstream request too, and the restore metric counts both.
+#[tokio::test]
+async fn codex_search_round_restores_original_tools_on_disabled_provider() {
+    use wiremock::matchers::{method, path};
+
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&primary)
+        .await;
+    // First round: the model calls the gateway-injected codex_search
+    // tool (empty query → rejected locally, no search HTTP call).
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(search_call_response()))
+        .up_to_n_times(1)
+        .mount(&primary)
+        .await;
+    // Search-round resubmission: final answer.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+        .mount(&primary)
+        .await;
+
+    let mut config = create_test_config();
+    config.retry.max_retries_per_provider = 0;
+    config.tool_compression.disabled_providers = vec!["provider".to_string()];
+    config.providers = vec![test_provider("provider", primary.uri())];
+    config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+    let (router, token_path) = codex_search_router(config, &primary).await;
+
+    let restore = ToolCompressionRestore {
+        original_tools: Some(original_tools_fixture()),
+        applied: true,
+    };
+    router
+        .route_request(&compressed_tools_request(), None, restore)
+        .await
+        .expect("search round completes on the disabled provider");
+
+    let bodies = received_chat_bodies(&primary).await;
+    assert_eq!(bodies.len(), 2, "first attempt + one search round");
+    let tool_names = |body: &serde_json::Value| -> Vec<String> {
+        body.get("tools")
+            .and_then(|t| t.as_array())
+            .unwrap()
+            .iter()
+            .map(|t| {
+                t["function"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    };
+    // Search round (second upstream request): ORIGINAL tools.
+    assert_eq!(
+        tool_names(&bodies[1]),
+        vec!["get_weather".to_string(), "get_time".to_string()],
+        "search round must restore original tools for the disabled provider"
+    );
+    // Both attempts restored → metric counts 2.
+    assert!(
+        restored_prometheus_count(&router.metrics, "provider").ends_with(" 2"),
+        "restore metric must be 2 (first attempt + search round), got: {}",
+        restored_prometheus_count(&router.metrics, "provider")
+    );
+    primary.verify().await;
+    let _ = std::fs::remove_file(&token_path);
+}
+
+
 
     /// 500 is not timeout-class: it keeps `max_retries_per_provider`.
     #[tokio::test]
@@ -16031,7 +16484,7 @@ mod tests {
         let handle = ledger_handle();
 
         router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .expect("provider b answers after a's retries");
 
@@ -16106,7 +16559,7 @@ mod tests {
             let handle = handle.clone();
             tasks.push(tokio::spawn(async move {
                 router
-                    .route_request(&compression_request(false), Some(handle))
+                    .route_request(&compression_request(false), Some(handle), ToolCompressionRestore::default())
                     .await
                     .expect("fallback provider must answer")
             }));
@@ -16294,7 +16747,7 @@ extra: Default::default(),
             test_metrics(),
         );
         let request = overflow_review_request();
-        let response = router.route_request(&request, None).await.unwrap();
+        let response = router.route_request(&request, None, ToolCompressionRestore::default()).await.unwrap();
         let choice = &response.choices[0];
         assert!(!choice.message.content_as_text().is_empty());
         assert!(!choice
@@ -16342,7 +16795,7 @@ extra: Default::default(),
         request.messages[0].content = serde_json::json!("unremovable instructions ".repeat(10_000));
         let handle = ledger_handle();
         let error = router
-            .route_request(&request, Some(handle.clone()))
+            .route_request(&request, Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap_err();
         assert!(matches!(
@@ -16361,7 +16814,7 @@ extra: Default::default(),
             == Some(CONTEXT_WINDOW_EXCEEDED_CLASS)
             && attempt.status_code == Some(413)));
         router
-            .route_request(&compression_request(false), None)
+            .route_request(&compression_request(false), None, ToolCompressionRestore::default())
             .await
             .unwrap();
         assert_eq!(chat_requests(&upstream).await, 1);
@@ -16385,7 +16838,7 @@ extra: Default::default(),
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
         let mut request = overflow_review_request();
         request.stream = true;
-        let error = match router.route_request_streaming(&request, None).await {
+        let error = match router.route_request_streaming(&request, None, ToolCompressionRestore::default()).await {
             Err(error) => error,
             Ok(_) => panic!("oversized pass-through must be rejected"),
         };
@@ -16413,7 +16866,11 @@ extra: Default::default(),
         let handle = ledger_handle();
         assert!(matches!(
             router
-                .route_request(&overflow_review_request(), Some(handle.clone()))
+                .route_request(
+            &overflow_review_request(),
+            Some(handle.clone()),
+            ToolCompressionRestore::default(),
+        )
                 .await,
             Err(GatewayError::ContextCapacityExceeded { .. })
         ));
@@ -16482,7 +16939,12 @@ extra: Default::default(),
         config.providers[0].resolved_api_key = Some("test-key".to_string());
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
         assert!(matches!(
-            router.route_request(&overflow_review_request(), None).await,
+            router.route_request(
+            &overflow_review_request(),
+            None,
+            ToolCompressionRestore::default(),
+        )
+        .await,
             Err(GatewayError::ContextCapacityExceeded { .. })
         ));
         assert_eq!(tokens_left(&router, "primary").await, 1.0);
@@ -16534,7 +16996,7 @@ extra: Default::default(),
         let bare_estimate =
             crate::compression::token_counter::TokenCounter::new().count_request(&request) as u64;
 
-        let error = router.route_request(&request, None).await.unwrap_err();
+        let error = router.route_request(&request, None, ToolCompressionRestore::default()).await.unwrap_err();
         let GatewayError::ContextCapacityExceeded {
             estimated_requirement,
             largest_supported_context,
@@ -16628,7 +17090,7 @@ extra: Default::default(),
             let request = compression_request(stream);
             let response = if stream {
                 match router
-                    .route_request_streaming(&request, Some(handle.clone()))
+                    .route_request_streaming(&request, Some(handle.clone()), ToolCompressionRestore::default())
                     .await
                     .unwrap_or_else(|e| panic!("{label}: {e}"))
                 {
@@ -16637,7 +17099,7 @@ extra: Default::default(),
                 }
             } else {
                 router
-                    .route_request(&request, Some(handle.clone()))
+                    .route_request(&request, Some(handle.clone()), ToolCompressionRestore::default())
                     .await
                     .unwrap_or_else(|e| panic!("{label}: {e}"))
             };
@@ -16686,7 +17148,7 @@ extra: Default::default(),
             let request = compression_request(i % 2 == 1);
             let response = if request.stream {
                 match router
-                    .route_request_streaming(&request, Some(handle.clone()))
+                    .route_request_streaming(&request, Some(handle.clone()), ToolCompressionRestore::default())
                     .await
                     .unwrap()
                 {
@@ -16695,7 +17157,7 @@ extra: Default::default(),
                 }
             } else {
                 router
-                    .route_request(&request, Some(handle.clone()))
+                    .route_request(&request, Some(handle.clone()), ToolCompressionRestore::default())
                     .await
                     .unwrap()
             };
@@ -16743,7 +17205,7 @@ extra: Default::default(),
         let handle = ledger_handle();
         let started = std::time::Instant::now();
         let response = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         let waited = started.elapsed();
@@ -16772,7 +17234,7 @@ extra: Default::default(),
         while limiter.consume().await {}
         let handle = ledger_handle();
         let response = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         assert_eq!(
@@ -16810,7 +17272,7 @@ extra: Default::default(),
 
         let handle = ledger_handle();
         router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         let ledger = handle.take_failed_attempts();
@@ -16900,7 +17362,7 @@ extra: Default::default(),
 
         let started = std::time::Instant::now();
         let response = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -16954,7 +17416,7 @@ extra: Default::default(),
 
         let started = std::time::Instant::now();
         let response = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -17013,7 +17475,7 @@ extra: Default::default(),
 
         let started = std::time::Instant::now();
         let response = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -17079,7 +17541,7 @@ extra: Default::default(),
 
         let started = std::time::Instant::now();
         let response = router
-            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .route_request_streaming(&compression_request(true), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -17131,7 +17593,7 @@ extra: Default::default(),
 
         let started = std::time::Instant::now();
         let response = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -17175,7 +17637,7 @@ extra: Default::default(),
         let handle = ledger_handle();
 
         let response = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
 
@@ -17218,7 +17680,7 @@ extra: Default::default(),
 
         let started = std::time::Instant::now();
         let response = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -17265,7 +17727,7 @@ extra: Default::default(),
 
         let started = std::time::Instant::now();
         let response = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -17314,7 +17776,7 @@ extra: Default::default(),
 
         let started = std::time::Instant::now();
         let response = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -17373,7 +17835,7 @@ extra: Default::default(),
 
         let started = std::time::Instant::now();
         let response = router
-            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .route_request_streaming(&compression_request(true), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .expect("waited pass-through retry succeeds");
         let elapsed = started.elapsed();
@@ -17430,7 +17892,7 @@ extra: Default::default(),
         let handle = ledger_handle();
 
         let response = router
-            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .route_request_streaming(&compression_request(true), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .expect("buffered fallback is served by b");
         assert!(
@@ -17480,7 +17942,7 @@ extra: Default::default(),
         let handle = ledger_handle();
 
         router
-            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .route_request_streaming(&compression_request(true), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .expect("buffered fallback is served by b");
 
@@ -17531,7 +17993,7 @@ extra: Default::default(),
         let handle = ledger_handle();
 
         let response = router
-            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .route_request_streaming(&compression_request(true), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .expect("a succeeds on its same-provider retry");
 
@@ -17572,7 +18034,7 @@ extra: Default::default(),
         let handle = ledger_handle();
 
         router
-            .route_request_streaming(&compression_request(true), Some(handle.clone()))
+            .route_request_streaming(&compression_request(true), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .expect("buffered fallback is served by b");
 
@@ -17621,7 +18083,7 @@ extra: Default::default(),
 
         for _ in 0..2 {
             router
-                .route_request(&compression_request(false), Some(handle.clone()))
+                .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
                 .await
                 .expect("healthy provider serves the request");
         }
@@ -17651,7 +18113,7 @@ extra: Default::default(),
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
         let response = router
-            .route_request(&compression_request(false), None)
+            .route_request(&compression_request(false), None, ToolCompressionRestore::default())
             .await
             .unwrap();
         assert_eq!(response.choices[0].message.content, serde_json::json!("ok"));
@@ -17680,7 +18142,7 @@ extra: Default::default(),
 
         // Even a streaming client request is fetched with stream:false.
         let response = router
-            .route_request(&compression_request(true), None)
+            .route_request(&compression_request(true), None, ToolCompressionRestore::default())
             .await
             .unwrap();
         assert_eq!(response.choices[0].message.content, serde_json::json!("ok"));
@@ -17724,7 +18186,7 @@ extra: Default::default(),
             .extra
             .insert("logprobs".to_string(), serde_json::json!(true));
         for request in [multi_choice, logprobs] {
-            router.route_request(&request, None).await.unwrap();
+            router.route_request(&request, None, ToolCompressionRestore::default()).await.unwrap();
         }
         for body in received_chat_bodies(&server).await {
             assert!(body.get("stream_options").is_none());
@@ -17761,7 +18223,7 @@ extra: Default::default(),
 
         let started = std::time::Instant::now();
         let response = router
-            .route_request(&compression_request(false), None)
+            .route_request(&compression_request(false), None, ToolCompressionRestore::default())
             .await
             .unwrap();
         assert_eq!(response.choices[0].message.content, serde_json::json!("ok"));
@@ -17811,25 +18273,26 @@ extra: Default::default(),
         config.model_groups = vec![test_group(vec![provider_model])];
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
-        let response = router
-            .route_request(
-                &OpenAIRequest {
-                    model: "test-group".to_string(),
-                    messages: vec![Message {
-                        role: "user".to_string(),
-                        content: serde_json::json!("hi"),
-                        extra: Default::default(),
-                    }],
-                    stream: false,
-                    temperature: None,
-                    max_tokens: None,
+    let response = router
+        .route_request(
+            &OpenAIRequest {
+                model: "test-group".to_string(),
+                messages: vec![Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("hi"),
                     extra: Default::default(),
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.choices.len(), 1);
+                }],
+                stream: false,
+                temperature: None,
+                max_tokens: None,
+                extra: Default::default(),
+            },
+            None,
+            ToolCompressionRestore::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.choices.len(), 1);
         // wiremock `expect(1)` verifies both headers arrived on the single call.
     }
 
@@ -17937,7 +18400,7 @@ extra: Default::default(),
             extra: Default::default(),
         };
 
-        let outcome = router.route_request_streaming(&request, None).await;
+        let outcome = router.route_request_streaming(&request, None, ToolCompressionRestore::default()).await;
         // The buffered gate fired: the result is either a Buffered response (if
         // the upstream somehow answered) or an Err from the buffered route — but
         // NEVER a pass-through relay.
@@ -18003,7 +18466,7 @@ extra: Default::default(),
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
         router
-            .route_request(&compression_request(false), None)
+            .route_request(&compression_request(false), None, ToolCompressionRestore::default())
             .await
             .unwrap();
     }
@@ -18060,7 +18523,7 @@ extra: Default::default(),
             reasoning_relay: None,
         })));
         let result = router
-            .route_request(&compression_request(false), Some(handle.clone()))
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
             .await;
         assert!(
             result.is_ok(),
@@ -18643,7 +19106,7 @@ extra: Default::default(),
             .await;
 
         let response = router
-            .route_request(&smart_routing_request(false), None)
+            .route_request(&smart_routing_request(false), None, ToolCompressionRestore::default())
             .await
             .unwrap();
         assert_eq!(
@@ -18700,7 +19163,7 @@ extra: Default::default(),
         );
 
         let response = router
-            .route_request_streaming(&smart_routing_request(true), Some(handle.clone()))
+            .route_request_streaming(&smart_routing_request(true), Some(handle.clone()), ToolCompressionRestore::default())
             .await
             .unwrap();
         let StreamingResponse::PassThrough {
@@ -18740,7 +19203,7 @@ extra: Default::default(),
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
         let response = router
-            .route_request_streaming(&smart_routing_request(true), None)
+            .route_request_streaming(&smart_routing_request(true), None, ToolCompressionRestore::default())
             .await
             .unwrap();
         let StreamingResponse::Buffered(response) = response else {
@@ -18779,7 +19242,7 @@ extra: Default::default(),
         metrics.set_provider_cooldown("tier-cooled", "rate limited".to_string(), now_secs + 300);
 
         let response = router
-            .route_request_streaming(&smart_routing_request(true), None)
+            .route_request_streaming(&smart_routing_request(true), None, ToolCompressionRestore::default())
             .await
             .unwrap();
         let StreamingResponse::PassThrough {
@@ -19073,7 +19536,14 @@ extra: Default::default(),
             extra: Default::default(),
         };
 
-        let result = router.route_with_failover(&request, providers, None).await;
+        let result = router
+            .route_with_failover(
+                &request,
+                providers,
+                None,
+                ToolCompressionRestore::default(),
+            )
+            .await;
         assert!(matches!(result, Err(GatewayError::AllProvidersFailed(_))));
 
         let snapshot = router_metrics.snapshot();
@@ -21763,7 +22233,7 @@ mod property_tests {
 
             let handle = ledger_handle();
             let response = router
-                .route_request(&compression_request(false), Some(handle.clone()))
+                .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
                 .await
                 .expect("fails over to the fallback provider");
             assert_eq!(
@@ -21829,7 +22299,7 @@ mod property_tests {
 
             let handle = ledger_handle();
             let response = router
-                .route_request(&compression_request(false), Some(handle.clone()))
+                .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
                 .await
                 .unwrap();
             assert_eq!(
@@ -21901,7 +22371,7 @@ mod property_tests {
 
             let handle = ledger_handle();
             let response = router
-                .route_request(&compression_request(false), Some(handle.clone()))
+                .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
                 .await
                 .expect("copilot dispatch succeeds");
             assert_eq!(
@@ -21991,7 +22461,7 @@ mod property_tests {
 
             let handle = ledger_handle();
             let response = router
-                .route_request(&compression_request(false), Some(handle.clone()))
+                .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
                 .await
                 .expect("fails over after the single auth rescue");
             assert_eq!(
@@ -22109,7 +22579,7 @@ mod property_tests {
             // Behavioral proof: a post-reload dispatch through the renamed
             // provider still authenticates with the seeded session and serves.
             let response = router
-                .route_request(&compression_request(false), Some(ledger_handle()))
+                .route_request(&compression_request(false), Some(ledger_handle()), ToolCompressionRestore::default())
                 .await
                 .expect("post-reload dispatch succeeds");
             assert_eq!(
