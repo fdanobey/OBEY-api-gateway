@@ -110,6 +110,7 @@ mod tests {
         // Mirrors the minimal_config in gateway::mod::tests but kept local to
         // avoid depending on private test helpers.
         Config {
+            prompt_library: Default::default(),
             security: Default::default(),
             cache_aware_routing: Default::default(),
             server: ServerConfig {

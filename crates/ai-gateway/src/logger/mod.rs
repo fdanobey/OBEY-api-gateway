@@ -295,6 +295,20 @@ pub struct LogEntry {
     /// traffic (reported as `unattributed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_key_id: Option<String>,
+    /// Prompt-library id of the template that seeded this request
+    /// (prompt-library-versioning spec, Req 4.4). NULL for ordinary
+    /// calls; never carries template content or variable values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    /// Prompt-library version resolved for this request (Req 4.4).
+    /// NULL whenever `prompt_id` is NULL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_version: Option<i64>,
+    /// Content-free prompt label at resolution time (Req 4.4); the
+    /// label may have drifted since the row was written, so this is a
+    /// point-in-time snapshot, not a join key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_label: Option<String>,
 }
 
 impl LogEntry {
@@ -405,6 +419,13 @@ pub struct LogFilter {
     pub client_protocol: Option<String>,
     /// Exact-match Claude session/agent identifier filter (Req 5.5).
     pub claude_session_id: Option<String>,
+    /// Exact-match prompt-library id filter (prompt-library-versioning
+    /// spec, Req 4.4). Rows written before prompt attribution (and all
+    /// ordinary calls) have a NULL `prompt_id` and never match, per SQL
+    /// NULL semantics.
+    pub prompt_id: Option<String>,
+    /// Exact-match prompt-library version filter (Req 4.4).
+    pub prompt_version: Option<i64>,
     pub limit: Option<usize>,
 }
 
@@ -577,10 +598,13 @@ impl RequestLogger {
         context_reduction TEXT,
         client_protocol TEXT,
         claude_session_id TEXT,
-        input_tokens INTEGER,
-        output_tokens INTEGER,
-        key_id TEXT
-        )",
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    key_id TEXT,
+    prompt_id TEXT,
+    prompt_version INTEGER,
+    prompt_label TEXT
+)",
             [],
         )?;
 
@@ -604,6 +628,9 @@ impl RequestLogger {
         Self::ensure_column(conn, "input_tokens", "INTEGER")?;
         Self::ensure_column(conn, "output_tokens", "INTEGER")?;
         Self::ensure_column(conn, "key_id", "TEXT")?;
+        Self::ensure_column(conn, "prompt_id", "TEXT")?;
+        Self::ensure_column(conn, "prompt_version", "INTEGER")?;
+        Self::ensure_column(conn, "prompt_label", "TEXT")?;
 
         // Create indexes for common query patterns
         conn.execute(
@@ -988,19 +1015,21 @@ fn insert_entry(
         .transpose()?;
 
     conn.execute(
-        "INSERT INTO requests (
-        trace_id, timestamp, method, path, model, provider,
-        status_code, duration_ms, cost, request_body, response_body,
-        requested_model, responded_model, compression_metadata, compression_level,
-        memories_injected, memories_stored, injection_tokens, detected_project,
-        cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
-        reasoning_tokens, reasoning_compat_actions, error_class, reasoning_relayed_frames,
-        context_reduction, client_protocol, claude_session_id,
-        input_tokens, output_tokens, key_id
+"INSERT INTO requests (
+            trace_id, timestamp, method, path, model, provider,
+            status_code, duration_ms, cost, request_body, response_body,
+            requested_model, responded_model, compression_metadata, compression_level,
+            memories_injected, memories_stored, injection_tokens, detected_project,
+            cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
+            reasoning_tokens, reasoning_compat_actions, error_class, reasoning_relayed_frames,
+            context_reduction, client_protocol, claude_session_id,
+            input_tokens, output_tokens, key_id,
+            prompt_id, prompt_version, prompt_label
         ) VALUES (
-        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-        ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-        ?29, ?30, ?31, ?32, ?33
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+            ?29, ?30, ?31, ?32, ?33,
+            ?34, ?35, ?36
         )",
         params![
             entry.trace_id,
@@ -1033,10 +1062,13 @@ fn insert_entry(
             context_reduction,
             entry.client_protocol,
             entry.claude_session_id,
-            entry.input_tokens,
-            entry.output_tokens,
-            entry.virtual_key_id,
-        ],
+entry.input_tokens,
+        entry.output_tokens,
+        entry.virtual_key_id,
+        entry.prompt_id,
+        entry.prompt_version,
+        entry.prompt_label,
+    ],
     )?;
 
     Ok(())
@@ -1044,7 +1076,7 @@ fn insert_entry(
 
 /// Query log entries with optional filtering. Runs on the writer thread.
 fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
-    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class, context_reduction, client_protocol, claude_session_id, input_tokens, output_tokens, key_id FROM requests WHERE 1=1");
+    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class, context_reduction, client_protocol, claude_session_id, input_tokens, output_tokens, key_id, prompt_id, prompt_version, prompt_label FROM requests WHERE 1=1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     if let Some(ref trace_id) = filter.trace_id {
@@ -1095,6 +1127,16 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
     if let Some(ref claude_session_id) = filter.claude_session_id {
         query.push_str(" AND claude_session_id = ?");
         params.push(Box::new(claude_session_id.clone()));
+    }
+
+    if let Some(ref prompt_id) = filter.prompt_id {
+        query.push_str(" AND prompt_id = ?");
+        params.push(Box::new(prompt_id.clone()));
+    }
+
+    if let Some(prompt_version) = filter.prompt_version {
+        query.push_str(" AND prompt_version = ?");
+        params.push(Box::new(prompt_version));
     }
 
     query.push_str(" ORDER BY timestamp DESC");
@@ -1148,12 +1190,15 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
                 context_reduction,
         client_protocol: row.get(26)?,
         claude_session_id: row.get(27)?,
-        input_tokens: row.get(28)?,
-        output_tokens: row.get(29)?,
-        virtual_key_id: row.get(30)?,
-    })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+            input_tokens: row.get(28)?,
+            output_tokens: row.get(29)?,
+            virtual_key_id: row.get(30)?,
+            prompt_id: row.get(31)?,
+            prompt_version: row.get(32)?,
+            prompt_label: row.get(33)?,
+        })
+    })?
+    .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(entries)
 }
@@ -1258,13 +1303,16 @@ mod tests {
             context_reduction: None,
             client_protocol: None,
             claude_session_id: None,
-            input_tokens: None,
-            output_tokens: None,
-            virtual_key_id: None,
-        }
+input_tokens: None,
+        output_tokens: None,
+        virtual_key_id: None,
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
     }
+}
 
-    fn sample_compression(level: CompressionLevel) -> CompressionLogMetadata {
+fn sample_compression(level: CompressionLevel) -> CompressionLogMetadata {
         CompressionLogMetadata {
             compression_level: compression_level_label(level).to_owned(),
             original_tokens: 1_000,
@@ -1591,6 +1639,232 @@ fn migrates_pre_usage_schema_and_preserves_rows() {
     assert!(input.is_none());
     assert!(output.is_none());
     assert!(key.is_none());
+}
+
+/// Prompt-library attribution columns (prompt-library-versioning spec,
+/// Req 4.4): a fresh schema carries `prompt_id`/`prompt_version`/
+/// `prompt_label`; a prompt-resolved row round-trips all three, an
+/// ordinary row keeps NULLs across a reopen, and the API payload omits
+/// the keys entirely for prompt-free requests.
+#[test]
+fn prompt_columns_round_trip_and_default_null() {
+    let (logger, temp) = create_test_logger();
+
+    let mut resolved = sample_entry("prompt-resolved", None);
+    resolved.prompt_id = Some("welcome-email".to_owned());
+    resolved.prompt_version = Some(3);
+    resolved.prompt_label = Some("Welcome email v3".to_owned());
+    logger.log(resolved).unwrap();
+
+    let plain = sample_entry("prompt-free", None);
+    logger.log(plain).unwrap();
+    logger.flush();
+    drop(logger);
+
+    // NULL defaults survive a reopen (fresh connection, same file).
+    let logger = RequestLogger::new(LoggingConfig {
+        database_path: temp.path().to_string_lossy().into_owned(),
+        ..Default::default()
+    })
+    .unwrap();
+    let attributed = logger
+        .query(LogFilter {
+            trace_id: Some("prompt-resolved".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(attributed.len(), 1);
+    assert_eq!(attributed[0].prompt_id.as_deref(), Some("welcome-email"));
+    assert_eq!(attributed[0].prompt_version, Some(3));
+    assert_eq!(attributed[0].prompt_label.as_deref(), Some("Welcome email v3"));
+
+    let ordinary = logger
+        .query(LogFilter {
+            trace_id: Some("prompt-free".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ordinary.len(), 1);
+    assert!(ordinary[0].prompt_id.is_none());
+    assert!(ordinary[0].prompt_version.is_none());
+    assert!(ordinary[0].prompt_label.is_none());
+
+    let json = serde_json::to_value(&ordinary[0]).unwrap();
+    assert!(json.get("prompt_id").is_none());
+    assert!(json.get("prompt_version").is_none());
+    assert!(json.get("prompt_label").is_none());
+
+    let conn = Connection::open(temp.path()).unwrap();
+    let columns = conn
+        .prepare("PRAGMA table_info(requests)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.contains(&"prompt_id".to_owned()));
+    assert!(columns.contains(&"prompt_version".to_owned()));
+    assert!(columns.contains(&"prompt_label".to_owned()));
+}
+
+/// Prompt attribution migration (Req 4.4): a pre-prompt-attribution
+/// database (schema already carrying the usage/key columns but none of
+/// the prompt columns) gains the three columns via `ensure_column` on
+/// open, and rows written before the migration survive with NULL
+/// prompt attribution — no data loss.
+#[test]
+fn migrates_pre_prompt_schema_and_preserves_rows() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let conn = Connection::open(temp_file.path()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE requests (
+        id INTEGER PRIMARY KEY,
+        trace_id TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        method TEXT NOT NULL,
+        path TEXT NOT NULL,
+        model TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        status_code INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        cost REAL NOT NULL,
+        request_body TEXT,
+        response_body TEXT,
+        requested_model TEXT,
+        responded_model TEXT,
+        compression_metadata TEXT,
+        compression_level TEXT,
+        memories_injected INTEGER NOT NULL DEFAULT 0,
+        memories_stored INTEGER NOT NULL DEFAULT 0,
+        injection_tokens INTEGER NOT NULL DEFAULT 0,
+        detected_project TEXT,
+        cache_read_tokens INTEGER,
+        cache_creation_tokens INTEGER,
+        cache_savings_cents INTEGER,
+        prefix_hash TEXT,
+        reasoning_tokens INTEGER,
+        reasoning_compat_actions TEXT,
+        error_class TEXT,
+        reasoning_relayed_frames INTEGER,
+        context_reduction TEXT,
+        client_protocol TEXT,
+        claude_session_id TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        key_id TEXT
+    );
+    INSERT INTO requests (
+        trace_id, timestamp, method, path, model, provider, status_code,
+        duration_ms, cost, request_body, response_body, requested_model,
+        responded_model, input_tokens, output_tokens, key_id
+    ) VALUES (
+        'pre-prompt', 1700000000, 'POST', '/v1/chat/completions', 'gpt-4',
+        'openai', 200, 10, 0.0, NULL, NULL, NULL, NULL, 120, 340, 'vk-legacy'
+    );",
+    )
+    .unwrap();
+    drop(conn);
+
+    let config = LoggingConfig {
+        database_path: temp_file.path().to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let logger = RequestLogger::new(config).unwrap();
+    let legacy = logger
+        .query(LogFilter {
+            trace_id: Some("pre-prompt".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(legacy.len(), 1);
+    // Pre-migration attribution survives; prompt fields stay NULL.
+    assert_eq!(legacy[0].input_tokens, Some(120));
+    assert_eq!(legacy[0].output_tokens, Some(340));
+    assert_eq!(legacy[0].virtual_key_id.as_deref(), Some("vk-legacy"));
+    assert!(legacy[0].prompt_id.is_none());
+    assert!(legacy[0].prompt_version.is_none());
+    assert!(legacy[0].prompt_label.is_none());
+    drop(logger);
+
+    let conn = Connection::open(temp_file.path()).unwrap();
+    let columns = conn
+        .prepare("PRAGMA table_info(requests)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.contains(&"prompt_id".to_owned()));
+    assert!(columns.contains(&"prompt_version".to_owned()));
+    assert!(columns.contains(&"prompt_label".to_owned()));
+    let (prompt_id, prompt_version, prompt_label): (Option<String>, Option<i64>, Option<String>) =
+        conn.query_row(
+            "SELECT prompt_id, prompt_version, prompt_label FROM requests WHERE trace_id = 'pre-prompt'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(prompt_id.is_none());
+    assert!(prompt_version.is_none());
+    assert!(prompt_label.is_none());
+}
+
+/// The logs query filters by prompt attribution (Req 4.4): `prompt_id`
+/// and `prompt_version` narrow to the attributed rows, and ordinary
+/// (NULL prompt) rows never match either filter per SQL NULL semantics.
+#[test]
+fn logs_query_filters_by_prompt_attribution() {
+    let (logger, _temp) = create_test_logger();
+
+    let mut resolved = sample_entry("prompt-a", None);
+    resolved.prompt_id = Some("code-review".to_owned());
+    resolved.prompt_version = Some(2);
+    resolved.prompt_label = Some("Code review".to_owned());
+    logger.log(resolved).unwrap();
+
+    let mut newer_version = sample_entry("prompt-b", None);
+    newer_version.prompt_id = Some("code-review".to_owned());
+    newer_version.prompt_version = Some(5);
+    logger.log(newer_version).unwrap();
+
+    let mut other_prompt = sample_entry("prompt-c", None);
+    other_prompt.prompt_id = Some("summarize".to_owned());
+    other_prompt.prompt_version = Some(1);
+    logger.log(other_prompt).unwrap();
+
+    logger.log(sample_entry("prompt-none", None)).unwrap();
+    logger.flush();
+
+    let by_id = logger
+        .query(LogFilter {
+            prompt_id: Some("code-review".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(by_id.len(), 2);
+    assert!(by_id.iter().all(|row| row.prompt_id.as_deref() == Some("code-review")));
+
+    let by_id_and_version = logger
+        .query(LogFilter {
+            prompt_id: Some("code-review".to_owned()),
+            prompt_version: Some(5),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(by_id_and_version.len(), 1);
+    assert_eq!(by_id_and_version[0].trace_id, "prompt-b");
+    assert_eq!(by_id_and_version[0].prompt_version, Some(5));
+    assert_eq!(by_id_and_version[0].prompt_label, None);
+
+    // A NULL-prompt row never matches a prompt filter.
+    let by_version_alone = logger
+        .query(LogFilter {
+            prompt_version: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(by_version_alone.len(), 1);
+    assert_eq!(by_version_alone[0].trace_id, "prompt-a");
 }
 
     #[test]
@@ -2375,6 +2649,9 @@ fn migrates_pre_usage_schema_and_preserves_rows() {
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
         };
 
         logger.log(entry.clone()).unwrap();
@@ -2556,6 +2833,9 @@ fn migrates_pre_usage_schema_and_preserves_rows() {
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
         };
 
         logger.log(old_entry).unwrap();
@@ -2593,6 +2873,9 @@ fn migrates_pre_usage_schema_and_preserves_rows() {
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
         };
 
         logger.log(recent_entry).unwrap();
@@ -2680,10 +2963,13 @@ mod property_tests {
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
-            }
-                },
-            )
-    }
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
+        }
+    },
+    )
+}
 
     fn create_test_logger_with_config(config: LoggingConfig) -> (RequestLogger, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
@@ -2787,6 +3073,9 @@ mod property_tests {
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
         };
 
             logger.log(entry.clone()).unwrap();
@@ -2869,6 +3158,9 @@ mod property_tests {
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
         };
 
             logger.log(entry).unwrap();
@@ -2948,6 +3240,9 @@ mod property_tests {
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
         };
 
             logger.log(entry).unwrap();
@@ -3025,6 +3320,9 @@ mod property_tests {
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
         };
 
             logger.log(entry).unwrap();
@@ -3111,6 +3409,9 @@ mod property_tests {
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
         };
 
             logger.log(entry).unwrap();

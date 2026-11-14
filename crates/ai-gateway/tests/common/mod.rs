@@ -63,6 +63,7 @@ pub fn budget_test_config(
     budget: Option<ProviderBudgetConfig>,
 ) -> Config {
     let mut config = Config {
+        prompt_library: Default::default(),
         security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {
@@ -260,6 +261,9 @@ pub fn sample_log_entry(
         input_tokens: overrides.input_tokens,
         output_tokens: overrides.output_tokens,
         virtual_key_id: overrides.virtual_key_id,
+    prompt_id: None,
+    prompt_version: None,
+    prompt_label: None,
     }
 }
 

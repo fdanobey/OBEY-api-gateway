@@ -157,6 +157,7 @@ fn test_group(models: Vec<ProviderModel>) -> ModelGroup {
 
 fn base_config() -> Config {
     Config {
+        prompt_library: Default::default(),
         security: Default::default(),
         server: ai_gateway::config::ServerConfig {
             host: "0.0.0.0".to_string(),

@@ -22,6 +22,7 @@ use crate::common;
 /// Build a minimal valid Config with the given cache-aware routing settings.
 fn cache_config(cache: CacheAwareRouting) -> Config {
     Config {
+        prompt_library: Default::default(),
         security: Default::default(),
         cache_aware_routing: cache,
         server: ServerConfig {

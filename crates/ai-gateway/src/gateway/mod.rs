@@ -29,6 +29,7 @@ use crate::logger::RequestLogger;
 use crate::memory::{GatewayExtractionAdapter, MemoryExtractionProvider, MemorySystem};
 use crate::metrics::{Metrics, ProviderBudgetStore, ProviderBudgetStoreError};
 use crate::oauth::{OAuthManager, OAuthTokenStore};
+use crate::prompt_library::{build_prompt_library, PromptLibrary};
 use crate::responses::ResponsesStore;
 use crate::router::router::Router as RequestRouter;
 use crate::structured_output::StructuredOutputEngine;
@@ -95,6 +96,11 @@ pub struct AppState {
     /// Hot-reloadable persistent-memory snapshot. Initialization failures leave
     /// this empty so the gateway remains available without memory.
     pub memory_system: Arc<RwLock<Option<Arc<MemorySystem>>>>,
+    /// Hot-reloadable prompt-library snapshot (prompt-library-versioning,
+    /// Task 5). Built from the resolved `prompt_library` config at startup;
+    /// store-open failures log an error and leave this empty so the gateway
+    /// remains available without the prompt library.
+    pub prompt_library: Arc<RwLock<Option<Arc<PromptLibrary>>>>,
     /// Shared agent-loop detection state and middleware configuration.
     pub loop_detector: Arc<crate::loop_detection::middleware::LoopDetectorState>,
     /// Shared replay/live stream for content-free compression statistics.
@@ -250,6 +256,19 @@ impl GatewayServer {
         let memory_events = Arc::new(crate::dashboard::MemoryEventHub::new());
         let memory_system = Arc::new(RwLock::new(
             build_memory_system(&config, config_arc.clone(), memory_events.clone()).await,
+        ));
+        // Prompt-library snapshot (prompt-library-versioning, Req 6.4 / 7.3):
+        // open-or-create the store at startup; a failure degrades the feature
+        // (error logged, `None` stored) instead of blocking the boot. Schema
+        // init only — the library stays dormant until a prompt exists.
+        let prompt_library = Arc::new(RwLock::new(
+            match build_prompt_library(&config.prompt_library) {
+                Ok(library) => Some(library),
+                Err(error) => {
+                    tracing::error!(error = %error, "Prompt library initialization failed; gateway will continue without the prompt library");
+                    None
+                }
+            },
         ));
         let mut router = RequestRouter::new(config_arc.clone(), metrics.clone());
         router.set_memory_system(memory_system.clone());
@@ -638,6 +657,7 @@ impl GatewayServer {
             guardrail_engine: Arc::new(RwLock::new(guardrail_engine)),
             structured_output_engine: Arc::new(RwLock::new(structured_output_engine)),
             memory_system,
+            prompt_library,
             loop_detector,
             compression_events,
             memory_events,
@@ -1483,11 +1503,31 @@ fn copilot_catalog_owner(config: &Config) -> String {
         .unwrap_or_else(|| "github-copilot".to_string())
 }
 
+/// Log a prompt-library hot-reload failure with the message the
+/// situation deserves: a same-path rebuild failure, a failed open at a
+/// new path, or an enable failure from a previously dormant library.
+async fn warn_prompt_library_reload_failure(
+    state: &AppState,
+    requested: &crate::prompt_library::PromptLibraryConfig,
+    error: &str,
+) {
+    if let Some(current) = state.prompt_library.read().await.as_ref() {
+        if current.database_path() == requested.database_path {
+            tracing::warn!(error = %error, "Failed to reload prompt library; retaining previous snapshot");
+        } else {
+            tracing::warn!(error = %error, "Failed to open prompt library at the new database_path on hot-reload; retaining previous snapshot");
+        }
+    } else {
+        tracing::warn!(error = %error, "Failed to enable prompt library on hot-reload; prompt library remains disabled");
+    }
+}
+
 pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     let loop_detection = new_config.loop_detection.clone();
     let compression = new_config.compression.clone();
     let smart_routing = new_config.smart_routing.clone();
     let requested_memory = new_config.memory.clone();
+    let requested_prompt_library = new_config.prompt_library.clone();
     let current_memory_snapshot = state.memory_system.read().await.clone();
     let current_memory_config = match &current_memory_snapshot {
         Some(system) => Some(system.config.read().await.clone()),
@@ -1654,6 +1694,46 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     };
     if let Some(replacement) = replacement_memory {
         *state.memory_system.write().await = replacement;
+    }
+
+    // Prompt-library hot-reload (prompt-library-versioning, Req 6.4):
+    // rebuild the snapshot from the new config. A changed
+    // `database_path` reopens the new file - neither database is
+    // dropped; the old snapshot is simply replaced, and in-flight
+    // requests holding the previous `Arc` finish on it. A build
+    // failure retains the previous snapshot (memory-system
+    // degradation discipline). The store open is synchronous SQLite
+    // work, so it runs on the blocking pool; a slow or locked
+    // database cannot stall the async reload task. An unchanged
+    // database_path skips the rebuild entirely (memory-system
+    // pattern): reopening the same file would only churn the
+    // snapshot the live requests are holding.
+    let replacement_prompt_library = {
+        let unchanged_path = state
+            .prompt_library
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| current.database_path() == requested_prompt_library.database_path);
+        if unchanged_path {
+            None
+        } else {
+            let requested = requested_prompt_library.clone();
+            match tokio::task::spawn_blocking(move || build_prompt_library(&requested)).await {
+                Ok(Ok(library)) => Some(library),
+                Ok(Err(error)) => {
+                    warn_prompt_library_reload_failure(&state, &requested_prompt_library, &error).await;
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "Prompt library reload task failed; retaining previous snapshot");
+                    None
+                }
+            }
+        }
+    };
+    if let Some(replacement) = replacement_prompt_library {
+        *state.prompt_library.write().await = Some(replacement);
     }
 
     // --- Rebuild the guardrail engine snapshot (Req 1.8) ---
@@ -1937,6 +2017,7 @@ mod tests {
 
     fn minimal_config() -> Config {
         Config {
+            prompt_library: Default::default(),
             security: Default::default(),
             cache_aware_routing: Default::default(),
             server: ServerConfig {
@@ -3043,6 +3124,7 @@ mod tests {
                        }
 
                        let cfg = Config {
+                           prompt_library: Default::default(),
                            security: Default::default(),
                            cache_aware_routing: Default::default(),
                            server: ServerConfig {
@@ -3589,6 +3671,7 @@ mod tests {
                        // 3. Build a NEW valid config with different settings
                        let new_provider_name = format!("prov-{}", provider_suffix);
                        let new_cfg = Config {
+                           prompt_library: Default::default(),
                            security: Default::default(),
                            cache_aware_routing: Default::default(),
                            server: ServerConfig {

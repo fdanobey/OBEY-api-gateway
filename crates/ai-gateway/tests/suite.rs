@@ -68,6 +68,8 @@ mod models_context_metadata;
 mod pass_through_routes;
 mod performance;
 mod prompt_cache_routing;
+mod prompt_library_admin;
+mod prompt_library_api;
 mod rate_history;
 mod reasoning_compat_property;
 mod reasoning_failover_compat;

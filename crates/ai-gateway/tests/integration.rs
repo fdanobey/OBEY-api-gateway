@@ -16,6 +16,7 @@ use crate::common;
 /// Build a minimal valid Config for integration tests.
 fn test_config() -> Config {
     Config {
+        prompt_library: Default::default(),
         security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {

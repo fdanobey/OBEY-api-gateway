@@ -57,7 +57,10 @@ fn log_entry(trace_id: &str, timestamp: DateTime<Utc>) -> LogEntry {
         input_tokens: None,
         output_tokens: None,
         virtual_key_id: None,
-    }
+    prompt_id: None,
+    prompt_version: None,
+    prompt_label: None,
+}
 }
 
 async fn fetch_rate_history(server: &GatewayServer) -> Value {

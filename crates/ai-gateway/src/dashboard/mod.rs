@@ -260,15 +260,21 @@ struct DashboardAssets;
 /// Query parameters for the GET /logs endpoint (Req 16.13, 33.6).
 #[derive(Debug, Deserialize)]
 struct LogQueryParams {
-    from: Option<String>,
-    to: Option<String>,
-    provider: Option<String>,
-    model: Option<String>,
-    status_code: Option<u16>,
-    trace_id: Option<String>,
-    compression_level: Option<String>,
-    limit: Option<usize>,
+from: Option<String>,
+to: Option<String>,
+provider: Option<String>,
+model: Option<String>,
+status_code: Option<u16>,
+trace_id: Option<String>,
+compression_level: Option<String>,
+/// Exact-match prompt-library id filter (prompt-library-versioning
+/// spec, Req 4.4).
+prompt_id: Option<String>,
+/// Exact-match prompt-library version filter (Req 4.4).
+prompt_version: Option<i64>,
+limit: Option<usize>,
 }
+
 
 pub fn dashboard_routes(state: AppState) -> Router<AppState> {
     let _ = state;
@@ -520,6 +526,8 @@ async fn logs_handler(
         compression_level: params.compression_level,
         client_protocol: None,
         claude_session_id: None,
+        prompt_id: params.prompt_id,
+        prompt_version: params.prompt_version,
         limit: params.limit,
     };
 
@@ -1085,6 +1093,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            prompt_library: Default::default(),
             security: Default::default(),
             cache_aware_routing: Default::default(),
             server: ServerConfig {
@@ -1507,6 +1516,9 @@ mod tests {
                     input_tokens: None,
                     output_tokens: None,
                     virtual_key_id: None,
+                prompt_id: None,
+                prompt_version: None,
+                prompt_label: None,
                 })
                 .unwrap();
         }
@@ -1570,14 +1582,17 @@ mod tests {
                 error_class: None,
                 context_reduction: None,
                 client_protocol: None,
-                claude_session_id: None,
-                input_tokens: None,
-                output_tokens: None,
-                virtual_key_id: None,
-            })
-            .unwrap();
+            claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
+        })
+        .unwrap();
 
-        let app = server.build_router();
+    let app = server.build_router();
         let response = app
             .oneshot(
                 Request::get("/dashboard/errors")
@@ -1631,12 +1646,15 @@ mod tests {
             error_class: error_class.map(str::to_owned),
             context_reduction: None,
             client_protocol: None,
-            claude_session_id: None,
-            input_tokens: None,
-            output_tokens: None,
-            virtual_key_id: None,
-        }
+    claude_session_id: None,
+    input_tokens: None,
+    output_tokens: None,
+    virtual_key_id: None,
+    prompt_id: None,
+    prompt_version: None,
+    prompt_label: None,
     }
+}
 
     /// ADR 0002 guard: failed attempts of a request that later succeeded
     /// (local skips, timeouts, upstream errors) stay on the Errors tab no

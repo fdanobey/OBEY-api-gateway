@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod models;
 pub mod oauth;
 pub mod providers;
+pub mod prompt_library;
 pub mod reasoning_compat;
 pub mod reasoning_relay;
 pub mod request_body_limit;

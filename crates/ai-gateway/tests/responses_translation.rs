@@ -100,6 +100,7 @@ async fn build_app(provider_uri: &str) -> TestApp {
 
 fn base_config(provider_uri: &str) -> Config {
     Config {
+        prompt_library: Default::default(),
         security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {

@@ -445,6 +445,9 @@ fn write_decision_log(state: &AppState, trace_id: &str, row: DecisionLogRow) {
         input_tokens: row.input_tokens,
         output_tokens: row.output_tokens,
         virtual_key_id: row.virtual_key_id,
+    prompt_id: None,
+    prompt_version: None,
+    prompt_label: None,
     };
     if let Err(error) = state.logger.log(entry) {
         tracing::warn!(%error, trace_id = %trace_id, "Failed to write request log entry");
@@ -533,6 +536,9 @@ fn log_decision_attempts(state: &AppState, trace_id: &str, attempts: &[ProviderA
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
             error_class: Some(
                 attempt
                     .error_class

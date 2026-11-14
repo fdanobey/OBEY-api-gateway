@@ -43,6 +43,7 @@ use crate::common;
 /// the same sticky cache) is live.
 fn compat_config(compat: ReasoningCompatConfig, max_retries: u32) -> Config {
     Config {
+        prompt_library: Default::default(),
         security: Default::default(),
         cache_aware_routing: CacheAwareRouting {
             enabled: false,

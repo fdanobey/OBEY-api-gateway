@@ -340,6 +340,31 @@ table.cr-table tfoot td{font-weight:700;border-top:2px solid var(--border)}
 .cr-loading{padding:1rem;text-align:center;color:var(--text-muted);font-size:.85rem}
 .cr-error{border:1px solid rgba(220,53,69,.35);background:rgba(220,53,69,.06);color:var(--danger);border-radius:var(--radius);padding:.6rem .75rem;font-size:.8rem;margin-bottom:.75rem}
 @media(max-width:700px){.compression-rule-grid,.compression-pre-row,.compression-pipeline-row{grid-template-columns:1fr}}
+/* Prompts panel (prompt-library-versioning, Req 1, 2, 3, 6.3) */
+.pl-controls{display:flex;flex-wrap:wrap;gap:.5rem;align-items:end;margin-bottom:1rem}
+.pl-controls .form-group{margin:0;flex:1;min-width:200px}
+.pl-table-wrap{overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
+table.pl-table{width:100%;border-collapse:collapse;font-size:.8rem}
+table.pl-table th,table.pl-table td{padding:.5rem .6rem;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+table.pl-table th{white-space:nowrap;background:var(--bg);font-weight:600}
+table.pl-table tbody tr:hover{background:rgba(13,110,253,.04)}
+.pl-empty{padding:1rem;text-align:center;color:var(--text-muted);font-size:.85rem}
+.pl-error{border:1px solid rgba(220,53,69,.35);background:rgba(220,53,69,.06);color:var(--danger);border-radius:var(--radius);padding:.6rem .75rem;font-size:.8rem;margin-bottom:.75rem}
+.pl-monospace{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
+.pl-var-chip{display:inline-block;font-size:.7rem;padding:.1rem .5rem;border-radius:999px;font-weight:600;background:rgba(13,110,253,.08);color:var(--primary);border:1px solid rgba(13,110,253,.2);margin:0 .15rem .15rem 0;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.pl-label-badge{display:inline-block;font-size:.7rem;padding:.1rem .45rem;border-radius:999px;font-weight:600;margin:0 .15rem .15rem 0;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:rgba(108,117,125,.08);color:var(--text-muted);border:1px solid rgba(108,117,125,.25)}
+.pl-label-badge.pl-label-current{background:rgba(25,135,84,.1);color:var(--success);border-color:rgba(25,135,84,.35)}
+.pl-label-badge.pl-label-latest{background:rgba(13,110,253,.08);color:var(--primary);border-color:rgba(13,110,253,.25)}
+.pl-diff-grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}
+@media(max-width:700px){.pl-diff-grid{grid-template-columns:1fr}}
+.pl-diff-side{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.pl-diff-side h4{font-size:.75rem;padding:.4rem .6rem;background:var(--bg);border-bottom:1px solid var(--border);margin:0}
+.pl-diff-lines{max-height:420px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.75rem;line-height:1.45}
+.pl-diff-line{padding:.05rem .6rem;white-space:pre-wrap;overflow-wrap:anywhere}
+.pl-diff-added{background:rgba(25,135,84,.12);color:var(--success)}
+.pl-diff-removed{background:rgba(220,53,69,.1);color:var(--danger)}
+.pl-diff-unchanged{color:var(--text-muted)}
+.pl-back{margin-bottom:.75rem}
 /* Security exposure banner (Req 1.8) */
 .sec-banner{position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;color:#fff;padding:.6rem 1rem;display:flex;align-items:center;gap:1rem;font-size:.9rem;box-shadow:var(--shadow)}
 .sec-banner .sec-banner-msg{flex:1}
@@ -372,6 +397,7 @@ body.sec-banner-active{padding-top:3.2rem}
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="webhooks" id="tab-webhooks" aria-controls="page-webhooks">Webhooks</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="tracing" id="tab-tracing" aria-controls="page-tracing">Tracing</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="cost-reports" id="tab-cost-reports" aria-controls="page-cost-reports">Cost Reports</button></li>
+<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="prompts" id="tab-prompts" aria-controls="page-prompts">Prompts</button></li>
 </ul>
   <div class="nav-footer">
     <a href="/dashboard" id="dashboard-link">Open Dashboard &rarr;</a>
@@ -1495,20 +1521,54 @@ body.sec-banner-active{padding-top:3.2rem}
         <input type="text" id="log-excluded-fields" placeholder="api_key, password">
       </div>
     </fieldset>
-    <fieldset><legend>Retention</legend>
-      <div class="form-row">
-        <div class="form-group">
-          <label for="log-retention">Retention Period (days, 0=disabled)</label>
-          <input type="number" id="log-retention" value="30" min="0" aria-describedby="log-retention-error">
-          <div class="error" id="log-retention-error" role="alert"></div>
-        </div>
-        <div class="form-group">
-          <label for="log-cleanup">Cleanup Interval (hours)</label>
-          <input type="number" id="log-cleanup" value="24" min="1" aria-describedby="log-cleanup-error">
-          <div class="error" id="log-cleanup-error" role="alert"></div>
-        </div>
-      </div>
-    </fieldset>
+<fieldset><legend>Retention</legend>
+<div class="form-row">
+<div class="form-group">
+<label for="log-retention">Retention Period (days, 0=disabled)</label>
+<input type="number" id="log-retention" value="30" min="0" aria-describedby="log-retention-error">
+<div class="error" id="log-retention-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="log-cleanup">Cleanup Interval (hours)</label>
+<input type="number" id="log-cleanup" value="24" min="1" aria-describedby="log-cleanup-error">
+<div class="error" id="log-cleanup-error" role="alert"></div>
+</div>
+</div>
+</fieldset>
+<fieldset><legend>Prompt Filter (prompt-library-versioning, Req 4.4)</legend>
+<p class="hint" style="margin-bottom:.75rem">Search request logs for prompt-resolved requests by exact prompt id and version (the dashboard logs endpoint's <code>prompt_id</code>/<code>prompt_version</code> query params). Empty fields match everything.</p>
+<div class="form-row">
+<div class="form-group">
+<label for="log-prompt-id">Prompt ID</label>
+<input type="text" id="log-prompt-id" placeholder="prompt uuid or name" autocomplete="off">
+<div class="hint">Exact match against the request-log prompt_id column</div>
+</div>
+<div class="form-group">
+<label for="log-prompt-version">Prompt Version</label>
+<input type="number" id="log-prompt-version" placeholder="e.g. 2" min="1" step="1">
+<div class="hint">Exact match against the request-log prompt_version column</div>
+</div>
+</div>
+<button type="button" class="btn btn-primary btn-sm" id="log-prompt-search">Search Logs</button>
+<div class="pl-error" id="log-prompt-error" role="alert" hidden style="margin-top:.75rem"></div>
+<div class="pl-table-wrap" id="log-prompt-results-wrap" hidden style="margin-top:.75rem">
+<table class="pl-table" id="log-prompt-results-table">
+<caption class="sr-only">Request logs for the selected prompt filter</caption>
+<thead>
+<tr>
+<th scope="col">Time</th>
+<th scope="col">Trace ID</th>
+<th scope="col">Provider</th>
+<th scope="col">Model</th>
+<th scope="col">Status</th>
+<th scope="col">Prompt</th>
+</tr>
+</thead>
+<tbody id="log-prompt-results-tbody"></tbody>
+</table>
+</div>
+<div class="pl-empty" id="log-prompt-results-empty" hidden></div>
+</fieldset>
     <div class="actions">
       <button class="btn btn-primary" data-action="save">Save</button>
       <button class="btn btn-secondary" data-action="reset">Reset</button>
@@ -2799,6 +2859,184 @@ body.sec-banner-active{padding-top:3.2rem}
 <p class="hint" id="cr-unpriced-note"><span class="cr-badge-unpriced" id="cr-unpriced-badge" hidden></span> <span id="cr-unpriced-text" hidden></span></p>
 </fieldset>
 </section>
+
+<!-- Prompts (prompt-library-versioning, Req 1, 2, 3, 6.3) -->
+<section class="page" id="page-prompts" role="tabpanel" aria-labelledby="tab-prompts">
+<h2>Prompts</h2>
+<p class="hint" style="margin-bottom:1.5rem">Named, versioned chat prompt templates. Every save creates a new immutable version with a change note; environment labels (production/staging/development) move between versions. Call prompts from any OpenAI SDK via the <code>prompt</code> body field.</p>
+
+<fieldset><legend>Prompt Library Configuration</legend>
+<div class="form-row">
+<div class="form-group">
+<label for="pl-cfg-db-path">Database Path</label>
+<input type="text" id="pl-cfg-db-path" value="./prompts.db" autocomplete="off" aria-describedby="pl-cfg-db-path-error">
+<div class="hint">SQLite file for prompt persistence. Saving validates, persists, and hot-reloads the running gateway (Req 6.4).</div>
+<div class="error" id="pl-cfg-db-path-error" role="alert"></div>
+</div>
+<div class="form-group" style="display:flex;align-items:flex-end">
+<button type="button" class="btn btn-secondary btn-sm" id="pl-cfg-refresh">Refresh</button>
+<button type="button" class="btn btn-primary btn-sm" id="pl-cfg-save" style="margin-left:.5rem">Save Database Path</button>
+</div>
+</div>
+</fieldset>
+
+<div id="pl-list-view">
+<fieldset><legend>Prompts</legend>
+<div class="pl-controls">
+<div class="form-group">
+<label for="pl-search">Search</label>
+<input type="search" id="pl-search" placeholder="Filter prompts by name or id (client-side)" autocomplete="off">
+</div>
+<button type="button" class="btn btn-primary btn-sm" id="pl-new-btn">+ New Prompt</button>
+<button type="button" class="btn btn-secondary btn-sm" id="pl-refresh-btn">Refresh</button>
+</div>
+<div class="pl-error" id="pl-list-error" role="alert" hidden></div>
+<div class="pl-table-wrap">
+<table class="pl-table" id="pl-prompts-table">
+<caption class="sr-only">Configured prompts</caption>
+<thead>
+<tr>
+<th scope="col">Name</th>
+<th scope="col">ID</th>
+<th scope="col">Labels</th>
+<th scope="col">Latest</th>
+<th scope="col">Versions</th>
+<th scope="col">Updated</th>
+<th scope="col">Actions</th>
+</tr>
+</thead>
+<tbody id="pl-prompts-tbody"></tbody>
+</table>
+</div>
+<div class="pl-empty" id="pl-prompts-empty">No prompts yet. Create one to get started.</div>
+<div class="hint" id="pl-prompts-info" style="margin-top:.5rem"></div>
+</fieldset>
+</div>
+
+<div id="pl-editor-view" hidden>
+<fieldset><legend id="pl-editor-legend">New Prompt</legend>
+<div class="form-group">
+<label for="pl-f-name">Name</label>
+<input type="text" id="pl-f-name" placeholder="lowercase-kebab-name" autocomplete="off" aria-describedby="pl-f-name-error">
+<div class="hint">Lowercase kebab-case, 1-100 characters, unique. Changing the name on edit renames the prompt with the new version.</div>
+<div class="error" id="pl-f-name-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="pl-f-content">Template Content</label>
+<textarea id="pl-f-content" rows="10" placeholder="You are a helpful assistant. Greet {{name}} and answer about {{topic}}." aria-describedby="pl-f-content-error"></textarea>
+<div class="hint">Use <code>{{variable}}</code> placeholders; values are supplied per request via the <code>prompt.variables</code> body field. 1–100,000 bytes.</div>
+<div class="error" id="pl-f-content-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label>Detected Variables (live preview)</label>
+<div id="pl-f-vars"><span class="hint">No variables detected</span></div>
+</div>
+<div class="form-group" id="pl-f-note-group" hidden>
+<label for="pl-f-note">Change Note (required on edit)</label>
+<input type="text" id="pl-f-note" placeholder="What changed and why (1–500 characters)" autocomplete="off" aria-describedby="pl-f-note-error">
+<div class="hint">Stored immutably with the new version; existing versions are never modified.</div>
+<div class="error" id="pl-f-note-error" role="alert"></div>
+</div>
+<div class="actions" style="border-top:none;padding-top:0;margin-top:.5rem">
+<button type="button" class="btn btn-primary" id="pl-f-save">Create Prompt</button>
+<button type="button" class="btn btn-secondary" id="pl-f-cancel">Cancel</button>
+<span id="pl-f-status" style="font-size:.8rem;align-self:center"></span>
+</div>
+</fieldset>
+</div>
+
+<div id="pl-detail-view" hidden>
+<fieldset><legend id="pl-detail-legend">Prompt</legend>
+<div class="pl-back"><button type="button" class="btn btn-secondary btn-sm" id="pl-back-btn">&larr; Back to Prompts</button></div>
+<div class="pl-error" id="pl-detail-error" role="alert" hidden></div>
+
+<h3 style="font-size:.95rem;margin-bottom:.75rem" id="pl-detail-title">Prompt</h3>
+
+<div class="form-row" style="margin-bottom:1rem">
+<div class="form-group" style="margin:0">
+<label>Labels</label>
+<div id="pl-detail-labels"></div>
+</div>
+<div class="form-group" style="margin:0">
+<label for="pl-promote-version">Promote Version</label>
+<div class="pl-controls" style="margin:0">
+<input type="number" id="pl-promote-version" min="1" step="1" placeholder="version #" style="max-width:110px" aria-describedby="pl-promote-hint">
+<select id="pl-promote-label" style="max-width:150px" aria-label="Promotion label">
+<option value="production">production</option>
+<option value="staging">staging</option>
+<option value="development">development</option>
+</select>
+<button type="button" class="btn btn-secondary btn-sm" id="pl-promote-btn">Promote</button>
+</div>
+<div class="hint" id="pl-promote-hint">Moves the label to the chosen version. <code>latest</code> is virtual (always the newest version) and can never be promoted.</div>
+</div>
+</div>
+
+<h3 style="font-size:.9rem;margin-bottom:.5rem">Version History</h3>
+<div class="pl-table-wrap">
+<table class="pl-table" id="pl-versions-table">
+<caption class="sr-only">Prompt versions, newest first</caption>
+<thead>
+<tr>
+<th scope="col">Version</th>
+<th scope="col">Change Note</th>
+<th scope="col">Variables</th>
+<th scope="col">Created By</th>
+<th scope="col">Created At</th>
+<th scope="col">Actions</th>
+</tr>
+</thead>
+<tbody id="pl-versions-tbody"></tbody>
+</table>
+</div>
+<div class="pl-empty" id="pl-versions-empty" hidden>No versions.</div>
+
+<h3 style="font-size:.9rem;margin:1.25rem 0 .5rem">Diff Between Versions</h3>
+<div class="pl-controls">
+<div class="form-group" style="flex:none;min-width:110px">
+<label for="pl-diff-from">From</label>
+<input type="number" id="pl-diff-from" min="1" step="1" placeholder="v#">
+</div>
+<div class="form-group" style="flex:none;min-width:110px">
+<label for="pl-diff-to">To</label>
+<input type="number" id="pl-diff-to" min="1" step="1" placeholder="v#">
+</div>
+<button type="button" class="btn btn-secondary btn-sm" id="pl-diff-btn">Show Diff</button>
+</div>
+<div id="pl-diff-result" hidden>
+<div class="pl-diff-grid">
+<div class="pl-diff-side">
+<h4 id="pl-diff-from-title">From</h4>
+<div class="pl-diff-lines" id="pl-diff-from-lines"></div>
+</div>
+<div class="pl-diff-side">
+<h4 id="pl-diff-to-title">To</h4>
+<div class="pl-diff-lines" id="pl-diff-to-lines"></div>
+</div>
+</div>
+</div>
+<div class="pl-error" id="pl-diff-error" role="alert" hidden style="margin-top:.75rem"></div>
+
+<h3 style="font-size:.9rem;margin:1.25rem 0 .5rem">Promotion History</h3>
+<div class="pl-table-wrap">
+<table class="pl-table" id="pl-promotions-table">
+<caption class="sr-only">Label promotion audit rows, newest first</caption>
+<thead>
+<tr>
+<th scope="col">Time</th>
+<th scope="col">Label</th>
+<th scope="col">From</th>
+<th scope="col">To</th>
+<th scope="col">Actor</th>
+</tr>
+</thead>
+<tbody id="pl-promotions-tbody"></tbody>
+</table>
+</div>
+<div class="pl-empty" id="pl-promotions-empty" hidden>No promotions recorded.</div>
+</fieldset>
+</div>
+</section>
 </main>
 
 <div class="status-bar" role="status" aria-live="polite">
@@ -2898,6 +3136,7 @@ if (pageId === 'virtual-keys') { vkOnOpen(); }
  if (pageId === 'webhooks') { whOnOpen(); }
 if (pageId === 'tracing') { otelStatusLoad(); }
 if (pageId === 'cost-reports') { crOnOpen(); }
+if (pageId === 'prompts') { plOnOpen(); }
  if (pageId === 'circuit-breaker') { loadCircuitBreakerStates(); }
  if (pageId === 'providers') { refreshProvBudgetsBulk(); refreshCopilotStatuses(); }
 }
@@ -8562,8 +8801,12 @@ if (config) populateTelemetry(config.opentelemetry);
 // cleared field removes it. Stored secrets are never displayed.
 var whState = { endpoints: [], allowlist: [], editingIndex: -1 };
 
-function whReq(path, options) {
- return fetch(apiUrl('webhooks' + path), options || {})
+/* Shared admin fetch wrapper: parses both JSON and non-JSON bodies,
+* extracting the nested {"error": {message}} envelope. The optional base
+* argument overrides the default 'webhooks' URL prefix (e.g. plReq passes
+* 'prompt-library/' + path); omitting it keeps webhook behavior unchanged. */
+function whReq(path, options, base) {
+ return fetch(apiUrl((base != null ? base : 'webhooks') + path), options || {})
  .then(function(response) {
  return response.text().then(function(text) {
  var body = null;
@@ -9210,6 +9453,615 @@ document.getElementById('cr-export-csv').addEventListener('click', function() { 
 document.getElementById('cr-export-json').addEventListener('click', function() { crExport('json'); });
 document.getElementById('cr-start').addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); crRunReport(); } });
 document.getElementById('cr-end').addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); crRunReport(); } });
+})();
+
+// --- Prompts UI Logic (prompt-library-versioning, Req 1, 2, 3, 6.3) ---
+function plApiUrl(path) { return apiUrl('prompt-library/' + path); }
+
+/* Fetch wrapper following the whReq convention: parses both JSON and
+* non-JSON bodies, extracting the nested {"error": {message}} envelope.
+* Delegates to whReq with the prompt-library base prefix. */
+function plReq(path, options) {
+ return whReq(path, options, plApiUrl(''));
+}
+
+function plReqJson(path, payload, method) {
+return plReq(path, {
+method: method || 'POST',
+headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify(payload)
+});
+}
+
+/* Extract sorted, de-duplicated {{variable}} names; mirrors the server's
+* resolver::extract_variables (trim, skip empty, sort, dedup). */
+function plExtractVariables(content) {
+var names = [];
+var rest = String(content || '');
+var start, end, name;
+while ((start = rest.indexOf('{{')) !== -1) {
+rest = rest.slice(start + 2);
+end = rest.indexOf('}}');
+if (end === -1) break;
+name = rest.slice(0, end).trim();
+if (name) names.push(name);
+rest = rest.slice(end + 2);
+}
+names.sort();
+return names.filter(function(n, i) { return i === 0 || n !== names[i - 1]; });
+}
+
+function plFmtTime(epochSeconds) {
+var n = Number(epochSeconds);
+if (!isFinite(n) || n <= 0) return '—';
+return new Date(n * 1000).toLocaleString();
+}
+
+function plTd(text, cls) {
+var td = document.createElement('td');
+if (cls) td.className = cls;
+td.textContent = text;
+return td;
+}
+
+// Editor state: null = create mode; otherwise the prompt object being edited.
+var plEditing = null;
+// Detail state: the prompt whose versions/labels/promotions are shown.
+var plDetail = null;
+// Last fetched list (OpenAI-style {object:"list", data:[...]}) for client-side search.
+var plList = [];
+
+function plSetView(view) {
+document.getElementById('pl-list-view').hidden = view !== 'list';
+document.getElementById('pl-editor-view').hidden = view !== 'editor';
+document.getElementById('pl-detail-view').hidden = view !== 'detail';
+}
+
+function plShowListError(message) {
+var el = document.getElementById('pl-list-error');
+if (!message) { el.hidden = true; el.textContent = ''; return; }
+el.textContent = message;
+el.hidden = false;
+}
+
+function plLoad() {
+plShowListError('');
+plReq('prompts?limit=100')
+.then(function(body) {
+plList = (body && Array.isArray(body.data)) ? body.data : [];
+if (body && body.has_more) {
+document.getElementById('pl-prompts-info').textContent = 'Showing ' + plList.length + ' prompts — more exist (server-capped listing)';
+} else {
+document.getElementById('pl-prompts-info').textContent = plList.length ? ('Showing ' + plList.length + ' prompt' + (plList.length === 1 ? '' : 's')) : '';
+}
+plRenderList();
+})
+.catch(function(err) { plShowListError(err.message); });
+}
+
+function plRenderList() {
+var q = document.getElementById('pl-search').value.trim().toLowerCase();
+var items = plList.filter(function(p) {
+if (!q) return true;
+return (p.name || '').toLowerCase().indexOf(q) !== -1 || (p.id || '').toLowerCase().indexOf(q) !== -1;
+});
+var tbody = document.getElementById('pl-prompts-tbody');
+var empty = document.getElementById('pl-prompts-empty');
+tbody.innerHTML = ''; /* xss-audit: static */
+empty.hidden = items.length > 0;
+if (!items.length && q) empty.textContent = 'No prompts match "' + document.getElementById('pl-search').value.trim() + '"';
+else if (!items.length) empty.textContent = 'No prompts yet. Create one to get started.';
+else empty.textContent = '';
+items.forEach(function(p) {
+var tr = document.createElement('tr');
+tr.appendChild(plTd(p.name || '', 'pl-monospace'));
+tr.appendChild(plTd(p.id || '', 'pl-monospace'));
+var labelsTd = document.createElement('td');
+['production', 'staging', 'development'].forEach(function(label) {
+if (p.labels && p.labels[label] != null) {
+var badge = document.createElement('span');
+badge.className = 'pl-label-badge pl-label-current';
+badge.textContent = label + '@v' + p.labels[label];
+labelsTd.appendChild(badge);
+}
+});
+if (p.latest_version != null) {
+var latestBadge = document.createElement('span');
+latestBadge.className = 'pl-label-badge pl-label-latest';
+latestBadge.textContent = 'latest@v' + p.latest_version;
+latestBadge.title = 'latest is virtual: it always tracks the newest version';
+labelsTd.appendChild(latestBadge);
+}
+tr.appendChild(labelsTd);
+tr.appendChild(plTd(p.latest_version != null ? ('v' + p.latest_version) : '—'));
+tr.appendChild(plTd(p.version_count != null ? p.version_count : '—'));
+tr.appendChild(plTd(plFmtTime(p.updated_at)));
+var act = document.createElement('td');
+act.style.whiteSpace = 'nowrap';
+var editBtn = document.createElement('button');
+editBtn.type = 'button';
+editBtn.className = 'btn btn-secondary btn-sm';
+editBtn.textContent = 'Edit';
+editBtn.addEventListener('click', function() { plOpenEditor(p); });
+var viewBtn = document.createElement('button');
+viewBtn.type = 'button';
+viewBtn.className = 'btn btn-secondary btn-sm';
+viewBtn.textContent = 'Versions';
+viewBtn.style.marginLeft = '.25rem';
+viewBtn.addEventListener('click', function() { plOpenDetail(p.id); });
+var logsBtn = document.createElement('button');
+logsBtn.type = 'button';
+logsBtn.className = 'btn btn-secondary btn-sm';
+logsBtn.textContent = 'Logs';
+logsBtn.title = 'Filter the dashboard Log Viewer by this prompt';
+logsBtn.style.marginLeft = '.25rem';
+logsBtn.addEventListener('click', function() { switchPage('logging'); document.getElementById('log-prompt-id').value = p.id || ''; document.getElementById('log-prompt-version').value = ''; plLogSearch(p.id, null); });
+var delBtn = document.createElement('button');
+delBtn.type = 'button';
+delBtn.className = 'btn btn-danger btn-sm';
+delBtn.textContent = 'Delete';
+delBtn.style.marginLeft = '.25rem';
+delBtn.addEventListener('click', function() { plDelete(p); });
+act.appendChild(editBtn);
+act.appendChild(viewBtn);
+act.appendChild(logsBtn);
+act.appendChild(delBtn);
+tr.appendChild(act);
+tbody.appendChild(tr);
+});
+}
+
+/* Called whenever the Prompts section is opened: refresh list + config. */
+var plLoaded = false;
+function plOnOpen() {
+plLoad();
+plLoadConfig();
+plLoaded = true;
+}
+
+function plOpenEditor(prompt) {
+plEditing = prompt || null;
+var legend = document.getElementById('pl-editor-legend');
+var nameIn = document.getElementById('pl-f-name');
+var contentIn = document.getElementById('pl-f-content');
+var noteGroup = document.getElementById('pl-f-note-group');
+var noteIn = document.getElementById('pl-f-note');
+var saveBtn = document.getElementById('pl-f-save');
+clearError(nameIn);
+clearError(contentIn);
+clearError(noteIn);
+document.getElementById('pl-f-status').textContent = '';
+ if (plEditing) {
+ legend.textContent = 'Edit Prompt — ' + (plEditing.name || plEditing.id || '');
+ nameIn.value = plEditing.name || '';
+ nameIn.disabled = false;
+ contentIn.value = '';
+noteGroup.hidden = false;
+noteIn.value = '';
+saveBtn.textContent = 'Save New Version';
+plReq('prompts/' + encodeURIComponent(plEditing.id) + '/versions')
+.then(function(versions) {
+var list = Array.isArray(versions) ? versions : [];
+if (list.length && typeof list[0].content === 'string') contentIn.value = list[0].content;
+plUpdateVarPreview();
+})
+.catch(function() { /* keep the editor usable; latest content stays empty */ });
+} else {
+legend.textContent = 'New Prompt';
+nameIn.value = '';
+nameIn.disabled = false;
+contentIn.value = '';
+noteGroup.hidden = true;
+noteIn.value = '';
+saveBtn.textContent = 'Create Prompt';
+}
+plUpdateVarPreview();
+plSetView('editor');
+nameIn.focus();
+}
+
+function plUpdateVarPreview() {
+var names = plExtractVariables(document.getElementById('pl-f-content').value);
+var wrap = document.getElementById('pl-f-vars');
+wrap.innerHTML = ''; /* xss-audit: static */
+if (!names.length) {
+var hint = document.createElement('span');
+hint.className = 'hint';
+hint.textContent = 'No variables detected';
+wrap.appendChild(hint);
+return;
+}
+names.forEach(function(n) {
+var chip = document.createElement('span');
+chip.className = 'pl-var-chip';
+chip.textContent = n;
+wrap.appendChild(chip);
+});
+}
+
+function plSaveEditor() {
+var nameIn = document.getElementById('pl-f-name');
+var contentIn = document.getElementById('pl-f-content');
+var noteIn = document.getElementById('pl-f-note');
+var ok = true;
+var name = nameIn.value.trim();
+var content = contentIn.value;
+var note = noteIn.value.trim();
+ if (!plEditing) {
+ if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(name)) { showError(nameIn, 'Name must be lowercase kebab-case (letters/digits separated by single hyphens)'); ok = false; }
+ else if (name.length > 100) { showError(nameIn, 'Name must be at most 100 characters'); ok = false; }
+ else clearError(nameIn);
+ } else if (name !== (plEditing.name || '')) {
+ if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(name)) { showError(nameIn, 'Name must be lowercase kebab-case (letters/digits separated by single hyphens)'); ok = false; }
+ else if (name.length > 100) { showError(nameIn, 'Name must be at most 100 characters'); ok = false; }
+ else clearError(nameIn);
+ }
+if (!content) { showError(contentIn, 'Template content is required'); ok = false; }
+else clearError(contentIn);
+if (plEditing && !note) { showError(noteIn, 'A change note is required when saving a new version'); ok = false; }
+else if (plEditing && note.length > 500) { showError(noteIn, 'Change note must be at most 500 characters'); ok = false; }
+else if (plEditing) clearError(noteIn);
+if (!ok) return;
+var status = document.getElementById('pl-f-status');
+var request;
+ if (plEditing) {
+ status.textContent = 'Saving new version…';
+ var payload = { content: content, change_note: note };
+ if (name !== (plEditing.name || '')) payload.name = name;
+ request = plReqJson('prompts/' + encodeURIComponent(plEditing.id) + '/versions', payload);
+ } else {
+status.textContent = 'Creating prompt…';
+request = plReqJson('prompts', { name: name, content: content });
+}
+request
+.then(function() {
+status.textContent = '';
+showToast(plEditing ? 'New version saved' : 'Prompt created');
+plEditing = null;
+plSetView('list');
+plLoad();
+})
+.catch(function(err) {
+status.textContent = '';
+showToast('Save failed: ' + err.message, true);
+});
+}
+
+function plDelete(prompt) {
+var label = prompt.name || prompt.id;
+vkConfirm({
+title: 'Delete prompt',
+message: 'Delete prompt "' + label + '" and ALL of its versions? Requests referencing it will fail afterward. This cannot be undone.',
+confirmLabel: 'Delete', danger: true,
+onConfirm: function() {
+setStatus('Deleting prompt ' + label + '\u2026');
+plReq('prompts/' + encodeURIComponent(prompt.id), { method: 'DELETE' })
+.then(function() {
+setStatus('Prompt deleted');
+showToast('Prompt "' + label + '" deleted');
+if (plDetail && plDetail.id === prompt.id) { plDetail = null; plSetView('list'); }
+plLoad();
+})
+.catch(function(err) {
+setStatus('Failed to delete prompt: ' + err.message);
+showToast('Failed to delete prompt: ' + err.message, true);
+});
+}
+});
+}
+
+function plShowDetailError(message) {
+var el = document.getElementById('pl-detail-error');
+if (!message) { el.hidden = true; el.textContent = ''; return; }
+el.textContent = message;
+el.hidden = false;
+}
+
+/* Labels row: production/staging/development badges plus the virtual
+* latest badge; latest is never offered for promotion (Req 3.2). */
+function plRenderLabels(labels) {
+var wrap = document.getElementById('pl-detail-labels');
+wrap.innerHTML = ''; /* xss-audit: static */
+(Array.isArray(labels) ? labels : []).forEach(function(l) {
+if (!l || typeof l.label !== 'string') return;
+var badge = document.createElement('span');
+if (l.virtual) {
+badge.className = 'pl-label-badge pl-label-latest';
+badge.textContent = l.label + (l.version != null ? ('@v' + l.version) : '@—');
+badge.title = 'Virtual label: always the newest version; cannot be promoted';
+} else {
+badge.className = 'pl-label-badge pl-label-current';
+badge.textContent = l.label + (l.version != null ? ('@v' + l.version) : '@—');
+}
+wrap.appendChild(badge);
+});
+}
+
+function plRenderVersions(versions) {
+var tbody = document.getElementById('pl-versions-tbody');
+var empty = document.getElementById('pl-versions-empty');
+var list = Array.isArray(versions) ? versions : [];
+tbody.innerHTML = ''; /* xss-audit: static */
+empty.hidden = list.length > 0;
+var maxVersion = list.length ? Number(list[0].version || 0) : 0;
+list.forEach(function(v) {
+var tr = document.createElement('tr');
+tr.appendChild(plTd('v' + (v.version != null ? v.version : '—')));
+tr.appendChild(plTd(v.change_note || '', 'pl-monospace'));
+var varsTd = document.createElement('td');
+(Array.isArray(v.variables) ? v.variables : []).forEach(function(n) {
+var chip = document.createElement('span');
+chip.className = 'pl-var-chip';
+chip.textContent = n;
+varsTd.appendChild(chip);
+});
+tr.appendChild(varsTd);
+tr.appendChild(plTd(v.created_by || '—'));
+tr.appendChild(plTd(plFmtTime(v.created_at)));
+var act = document.createElement('td');
+act.style.whiteSpace = 'nowrap';
+['production', 'staging', 'development'].forEach(function(label) {
+var btn = document.createElement('button');
+btn.type = 'button';
+btn.className = 'btn btn-secondary btn-sm';
+btn.textContent = '→ ' + label;
+btn.title = 'Promote ' + label + ' to v' + v.version;
+btn.style.marginRight = '.25rem';
+btn.addEventListener('click', function() { plPromote(v.version, label); });
+act.appendChild(btn);
+});
+tr.appendChild(act);
+tbody.appendChild(tr);
+});
+// Default the diff controls to the two newest distinct versions.
+if (list.length >= 2 && Number(list[0].version) !== Number(list[list.length - 1].version)) {
+document.getElementById('pl-diff-from').value = list[1].version;
+document.getElementById('pl-diff-to').value = list[0].version;
+} else if (list.length) {
+document.getElementById('pl-diff-from').value = list[0].version;
+document.getElementById('pl-diff-to').value = list[0].version;
+}
+if (maxVersion) {
+var promoteIn = document.getElementById('pl-promote-version');
+if (!promoteIn.value) promoteIn.value = maxVersion;
+}
+}
+
+function plRenderPromotions(body) {
+var tbody = document.getElementById('pl-promotions-tbody');
+var empty = document.getElementById('pl-promotions-empty');
+var list = (body && Array.isArray(body.data)) ? body.data : [];
+tbody.innerHTML = ''; /* xss-audit: static */
+empty.hidden = list.length > 0;
+list.forEach(function(m) {
+var tr = document.createElement('tr');
+tr.appendChild(plTd(plFmtTime(m.created_at)));
+tr.appendChild(plTd(m.label || '', 'pl-monospace'));
+tr.appendChild(plTd(m.from_version != null ? ('v' + m.from_version) : '—'));
+tr.appendChild(plTd(m.to_version != null ? ('v' + m.to_version) : '—'));
+tr.appendChild(plTd(m.actor || '—'));
+tbody.appendChild(tr);
+});
+}
+
+function plOpenDetail(id) {
+plDetail = { id: id };
+plShowDetailError('');
+plSetView('detail');
+document.getElementById('pl-diff-result').hidden = true;
+var diffErr = document.getElementById('pl-diff-error');
+diffErr.hidden = true;
+diffErr.textContent = '';
+document.getElementById('pl-promote-version').value = '';
+plReq('prompts/' + encodeURIComponent(id) + '/versions')
+.then(function(versions) {
+plRenderVersions(versions);
+var list = Array.isArray(versions) ? versions : [];
+var prompt = plList.filter(function(p) { return p.id === id; })[0];
+var name = (prompt && prompt.name) || (list.length && list[0].prompt_id) || id;
+document.getElementById('pl-detail-title').textContent = name + ' — ' + id;
+})
+.catch(function(err) { plShowDetailError('Failed to load versions: ' + err.message); });
+plReq('prompts/' + encodeURIComponent(id) + '/labels')
+.then(plRenderLabels)
+.catch(function() { /* labels are supplementary; the version table still renders */ });
+plReq('prompts/' + encodeURIComponent(id) + '/promotions')
+.then(plRenderPromotions)
+.catch(function() { /* promotions are supplementary */ });
+}
+
+function plPromote(version, label) {
+if (!plDetail || !plDetail.id) return;
+if (label === 'latest') return; // virtual; can never be promoted
+var v = parseInt(version, 10);
+if (!isFinite(v) || v < 1) { showToast('Enter a version number to promote', true); return; }
+setStatus('Promoting ' + label + ' to v' + v + '\u2026');
+plReqJson('prompts/' + encodeURIComponent(plDetail.id) + '/promote', { label: label, to_version: v })
+.then(function() {
+setStatus('Label ' + label + ' promoted to v' + v);
+showToast('Label ' + label + ' promoted to v' + v);
+plOpenDetail(plDetail.id);
+plLoad();
+})
+.catch(function(err) {
+setStatus('Promotion failed: ' + err.message);
+showToast('Promotion failed: ' + err.message, true);
+});
+}
+
+/* Server diff rows are [{kind: added|removed|unchanged, text}] in order.
+* Side-by-side: removed lines belong to the From side, added lines to the
+* To side; unchanged lines appear on both. */
+function plRenderDiff(fromVersion, toVersion, lines) {
+document.getElementById('pl-diff-from-title').textContent = 'From v' + fromVersion;
+document.getElementById('pl-diff-to-title').textContent = 'To v' + toVersion;
+var fromLines = document.getElementById('pl-diff-from-lines');
+var toLines = document.getElementById('pl-diff-to-lines');
+fromLines.innerHTML = ''; /* xss-audit: static */
+toLines.innerHTML = ''; /* xss-audit: static */
+(Array.isArray(lines) ? lines : []).forEach(function(line) {
+var kind = line && line.kind;
+var text = line ? String(line.text != null ? line.text : '') : '';
+function row(cls) {
+var div = document.createElement('div');
+div.className = 'pl-diff-line ' + cls;
+div.textContent = text;
+return div;
+}
+if (kind === 'removed') {
+fromLines.appendChild(row('pl-diff-removed'));
+} else if (kind === 'added') {
+toLines.appendChild(row('pl-diff-added'));
+} else {
+fromLines.appendChild(row('pl-diff-unchanged'));
+toLines.appendChild(row('pl-diff-unchanged'));
+}
+});
+document.getElementById('pl-diff-result').hidden = false;
+}
+
+function plRunDiff() {
+if (!plDetail || !plDetail.id) return;
+var fromIn = document.getElementById('pl-diff-from');
+var toIn = document.getElementById('pl-diff-to');
+var errEl = document.getElementById('pl-diff-error');
+errEl.hidden = true;
+errEl.textContent = '';
+var from = parseInt(fromIn.value, 10);
+var to = parseInt(toIn.value, 10);
+if (!isFinite(from) || from < 1) { errEl.textContent = 'From version must be a positive integer'; errEl.hidden = false; return; }
+if (!isFinite(to) || to < 1) { errEl.textContent = 'To version must be a positive integer'; errEl.hidden = false; return; }
+if (from === to) { errEl.textContent = 'From and to versions must differ'; errEl.hidden = false; return; }
+plReqJson('prompts/' + encodeURIComponent(plDetail.id) + '/diff', { from_version: from, to_version: to })
+.then(function(lines) {
+plRenderDiff(from, to, Array.isArray(lines) ? lines : []);
+})
+.catch(function(err) {
+errEl.textContent = err.message;
+errEl.hidden = false;
+});
+}
+
+/* database_path config control: GET reflects the running library's path
+* (or the default when dormant); PUT validates, persists, and hot-reloads. */
+function plLoadConfig() {
+plReq('config')
+.then(function(cfg) {
+document.getElementById('pl-cfg-db-path').value = (cfg && cfg.database_path) || './prompts.db';
+clearError(document.getElementById('pl-cfg-db-path'));
+})
+.catch(function() { /* dormant library still returns the default; leave the field as-is */ });
+}
+
+function plSaveConfig() {
+var input = document.getElementById('pl-cfg-db-path');
+var value = input.value.trim();
+if (!value) { showError(input, 'Database path must not be empty'); return; }
+clearError(input);
+setStatus('Saving prompt library config\u2026');
+plReq('config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ database_path: value }) })
+.then(function() {
+setStatus('Prompt library config saved and applied');
+showToast('Prompt library database path saved — store reopened without restart');
+plLoad();
+})
+.catch(function(err) {
+setStatus('Prompt library config save failed');
+showError(input, err.message);
+});
+}
+
+/* Logs-view prompt/version filter (Req 4.4): queries the dashboard logs
+* endpoint's prompt_id/prompt_version params and renders rows inline. */
+function plLogSearch(promptId, promptVersion) {
+var dashLink = document.getElementById('dashboard-link');
+var dashBase = dashLink ? dashLink.getAttribute('href') : '/dashboard';
+if (!dashBase) dashBase = '/dashboard';
+dashBase = dashBase.replace(/\/+$/, '');
+var params = new URLSearchParams();
+if (promptId) params.set('prompt_id', promptId);
+if (promptVersion != null && promptVersion !== '') params.set('prompt_version', String(promptVersion));
+params.set('limit', '50');
+var errEl = document.getElementById('log-prompt-error');
+errEl.hidden = true;
+errEl.textContent = '';
+var emptyEl = document.getElementById('log-prompt-results-empty');
+emptyEl.hidden = true;
+emptyEl.textContent = 'Loading logs…';
+emptyEl.hidden = false;
+setStatus('Searching request logs…');
+fetch(dashBase + '/logs?' + params.toString())
+.then(function(r) {
+if (!r.ok) return r.json().catch(function() { return null; }).then(function(body) {
+throw new Error((body && body.error && body.error.message) || ('HTTP ' + r.status));
+});
+return r.json();
+})
+.then(function(data) {
+var logs = Array.isArray(data) ? data : (data.logs || []);
+var tbody = document.getElementById('log-prompt-results-tbody');
+tbody.innerHTML = ''; /* xss-audit: static */
+document.getElementById('log-prompt-results-wrap').hidden = logs.length === 0;
+if (!logs.length) {
+emptyEl.textContent = 'No logs match the selected prompt filter';
+emptyEl.hidden = false;
+} else {
+emptyEl.hidden = true;
+}
+logs.forEach(function(log) {
+var tr = document.createElement('tr');
+var ts = Number(log.timestamp);
+tr.appendChild(plTd(isFinite(ts) && ts > 0 ? new Date(ts * 1000).toLocaleString() : '—'));
+tr.appendChild(plTd(String(log.trace_id || ''), 'pl-monospace'));
+tr.appendChild(plTd(String(log.provider || '—')));
+tr.appendChild(plTd(String(log.model || '—')));
+tr.appendChild(plTd(log.status_code != null ? String(log.status_code) : '—'));
+var promptCell = plTd('', 'pl-monospace');
+promptCell.textContent = (log.prompt_id ? String(log.prompt_id) : '—') + (log.prompt_version != null ? ('@v' + log.prompt_version) : '');
+tr.appendChild(promptCell);
+tbody.appendChild(tr);
+});
+setStatus('Prompt log search returned ' + logs.length + ' row' + (logs.length === 1 ? '' : 's'));
+})
+.catch(function(err) {
+document.getElementById('log-prompt-results-wrap').hidden = true;
+emptyEl.textContent = 'Failed to fetch logs: ' + err.message;
+emptyEl.hidden = false;
+setStatus('Prompt log search failed: ' + err.message);
+});
+}
+
+// Wire up controls (elements exist: script runs at end of body).
+(function plWire() {
+var search = document.getElementById('pl-search');
+if (search) { search.addEventListener('input', plRenderList); }
+var refresh = document.getElementById('pl-refresh-btn');
+if (refresh) { refresh.addEventListener('click', plLoad); }
+var newBtn = document.getElementById('pl-new-btn');
+if (newBtn) { newBtn.addEventListener('click', function() { plOpenEditor(null); }); }
+var content = document.getElementById('pl-f-content');
+if (content) { content.addEventListener('input', plUpdateVarPreview); }
+var save = document.getElementById('pl-f-save');
+if (save) { save.addEventListener('click', plSaveEditor); }
+var cancel = document.getElementById('pl-f-cancel');
+if (cancel) { cancel.addEventListener('click', function() { plEditing = null; plSetView('list'); }); }
+var back = document.getElementById('pl-back-btn');
+if (back) { back.addEventListener('click', function() { plDetail = null; plSetView('list'); }); }
+var promote = document.getElementById('pl-promote-btn');
+if (promote) { promote.addEventListener('click', function() {
+plPromote(document.getElementById('pl-promote-version').value, document.getElementById('pl-promote-label').value);
+}); }
+var diff = document.getElementById('pl-diff-btn');
+if (diff) { diff.addEventListener('click', plRunDiff); }
+var cfgRefresh = document.getElementById('pl-cfg-refresh');
+if (cfgRefresh) { cfgRefresh.addEventListener('click', plLoadConfig); }
+var cfgSave = document.getElementById('pl-cfg-save');
+if (cfgSave) { cfgSave.addEventListener('click', plSaveConfig); }
+var logPromptSearch = document.getElementById('log-prompt-search');
+if (logPromptSearch) { logPromptSearch.addEventListener('click', function() {
+var versionRaw = document.getElementById('log-prompt-version').value.trim();
+plLogSearch(document.getElementById('log-prompt-id').value.trim() || null, versionRaw === '' ? null : parseInt(versionRaw, 10));
+}); }
 })();
 
 

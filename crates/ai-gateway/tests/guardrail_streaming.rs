@@ -94,6 +94,7 @@ fn provider(base_url: &str) -> Provider {
 /// Base config with one provider/model group and no guardrails yet.
 fn base_config(base_url: &str) -> Config {
     Config {
+        prompt_library: Default::default(),
         security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {

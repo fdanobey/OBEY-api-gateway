@@ -14719,6 +14719,7 @@ mod tests {
 
     pub(super) fn create_test_config() -> Config {
         Config {
+            prompt_library: Default::default(),
             security: Default::default(),
             server: crate::config::ServerConfig {
                 host: "0.0.0.0".to_string(),

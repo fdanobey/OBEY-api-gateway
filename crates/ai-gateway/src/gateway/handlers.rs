@@ -37,7 +37,7 @@ use crate::memory::{
     ExtractionMessage, ExtractionRole, InjectionResult, MemoryRequestResult, ResolvedNamespace,
 };
 use crate::metrics::Metrics;
-use crate::models::openai::{Choice, OpenAIRequest, OpenAIResponse, Usage};
+use crate::models::openai::{Choice, Message, OpenAIRequest, OpenAIResponse, Usage};
 use crate::providers::Model;
 use crate::reasoning_relay::{
 classify_reasoning_frame, sse_data_payload, RelayFrame, RelayHandle,
@@ -153,12 +153,19 @@ struct RequestLogContext {
     /// Virtual key id that authenticated the request (cost-reporting
     /// spec, Req 2.1/2.2); `None` for anonymous traffic.
     virtual_key_id: Option<String>,
-    /// Assistant completion text for telemetry content capture
-    /// (opentelemetry-trace-export spec, Req 3.6). Populated by the
-    /// completion seams ONLY when `capture_content` is on — the
-    /// disabled path stays allocation-free (Req 3.5). Never contains
-    /// authorization material; extracted from the response choices.
-    completion_text: Option<String>,
+/// Assistant completion text for telemetry content capture
+/// (opentelemetry-trace-export spec, Req 3.6). Populated by the
+/// completion seams ONLY when `capture_content` is on — the
+/// disabled path stays allocation-free (Req 3.5). Never contains
+/// authorization material; extracted from the response choices.
+completion_text: Option<String>,
+/// Content-free prompt-library attribution (prompt-library-
+/// versioning spec, Req 4.4): the resolved template id/version/
+/// label for prompt-seeded requests; `None` for ordinary calls.
+/// Never carries template content or variable values.
+prompt_id: Option<String>,
+prompt_version: Option<i64>,
+prompt_label: Option<String>,
 }
 
 impl RequestLogContext {
@@ -217,10 +224,28 @@ fn with_memory(
     /// capture (Req 3.6). Callers pass the extracted text ONLY when
     /// the snapshot's `capture_content` is on, keeping the disabled
     /// path allocation-free (Req 3.5).
-    fn with_completion_text(mut self, text: Option<String>) -> Self {
-        self.completion_text = text;
-        self
+ fn with_completion_text(mut self, text: Option<String>) -> Self {
+ self.completion_text = text;
+ self
+ }
+
+/// Builder-style setter for the prompt-library attribution
+/// columns (prompt-library-versioning spec, Req 4.4): the chat
+/// front door applies it right after prompt resolution so every
+/// outcome row (success, error, and abandoned) carries the
+/// resolved template identity. `None` keeps ordinary requests
+/// unattributed with zero allocation.
+fn with_prompt_meta(mut self, meta: Option<&PromptResolutionMeta>) -> Self {
+    match meta {
+        Some(meta) => {
+            self.prompt_id = Some(meta.prompt_id.clone());
+            self.prompt_version = Some(meta.prompt_version);
+            self.prompt_label = meta.prompt_label.clone();
+        }
+        None => {}
     }
+    self
+}
 
     /// Builder-style setter for the cost-reporting cost column
     /// (cost-reporting spec, Req 1.1/2.1): the pass-through success
@@ -357,8 +382,11 @@ fn with_memory(
             .then(|| i64::from(response.usage.prompt_tokens)),
         output_tokens: (response.usage.completion_tokens > 0)
             .then(|| i64::from(response.usage.completion_tokens)),
-        virtual_key_id: None,
-        completion_text: None,
+            virtual_key_id: None,
+            completion_text: None,
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
         }
     }
 
@@ -401,11 +429,14 @@ fn with_memory(
         error_class: None,
         client_protocol: None,
         claude_session_id: None,
-        log_path: "/v1/chat/completions",
-        input_tokens: None,
-        output_tokens: None,
-        virtual_key_id: None,
-        completion_text: None,
+            log_path: "/v1/chat/completions",
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
+            completion_text: None,
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
         }
     }
 
@@ -465,13 +496,16 @@ fn with_memory(
         input_tokens: None,
         output_tokens: None,
         virtual_key_id: None,
-        completion_text: None,
-        error_class: Some(crate::error::error_class_for(error)),
-        client_protocol: None,
-        claude_session_id: None,
-        log_path: "/v1/chat/completions",
+            completion_text: None,
+            error_class: Some(crate::error::error_class_for(error)),
+            client_protocol: None,
+            claude_session_id: None,
+            log_path: "/v1/chat/completions",
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
+        }
     }
-}
 
     /// Tag this log context as originating from the Anthropic Messages
     /// front door (`/v1/messages`): sets `client_protocol = "anthropic"`
@@ -498,6 +532,7 @@ fn log_outcome(
     context: &RequestLogContext,
     handle: Option<&crate::active_requests::ActiveRequestHandle>,
     inbound_telemetry: Option<&crate::telemetry::propagation::W3cContext>,
+    prompt_meta: Option<&PromptResolutionMeta>,
 ) {
     log_outcome_with_emission(
         state,
@@ -506,6 +541,7 @@ fn log_outcome(
         handle,
         inbound_telemetry,
         None,
+        prompt_meta,
     )
 }
 
@@ -519,6 +555,7 @@ fn log_outcome_with_emission(
     handle: Option<&crate::active_requests::ActiveRequestHandle>,
     inbound_telemetry: Option<&crate::telemetry::propagation::W3cContext>,
     emission: Option<super::telemetry_seam::EmissionConfig>,
+    prompt_meta: Option<&PromptResolutionMeta>,
 ) {
     let mut telemetry_attempts = Vec::new();
     if let Some(handle) = handle {
@@ -540,7 +577,8 @@ fn log_outcome_with_emission(
     let context = context
         .clone()
         .with_reasoning_relay(relay.as_ref())
-        .with_virtual_key(key.as_deref());
+        .with_virtual_key(key.as_deref())
+        .with_prompt_meta(prompt_meta);
     // Disabled fast path (NFR perf): a single atomic load; no clones,
     // no allocation. Only after enabled do the cheap Arc/config clones.
     if state.telemetry_snapshot.enabled() {
@@ -604,7 +642,10 @@ fn emit_telemetry_spans(
     // are not part of either string. Strings stay UNTRUNCATED here —
     // spans.rs applies the bounded truncation with the explicit
     // `... [truncated by N bytes]` marker (Req 3.6); pre-truncating
-    // here would silently drop the marker.
+    // here would double-bound the value and silently drop the marker.
+    // Prompt-resolved requests are exempt too (Req 4.4): the merged
+    // body carries the rendered template, so OTLP content capture
+    // must never see it - same gate the SQLite request log applies.
     let content = build_telemetry_content(state, request, context);
     let args = super::telemetry_seam::TelemetryEmitArgs {
         request_id: context.trace_id.clone(),
@@ -638,12 +679,16 @@ fn emit_telemetry_spans(
 /// the single bounding point and appends the explicit
 /// `... [truncated by N bytes]` marker (Req 3.6). Truncating here as
 /// well would double-bound the value and silently drop the marker.
+/// Prompt-resolved requests never capture the merged body (Req 4.4):
+/// it carries the rendered template and variable values, so it is
+/// dropped before the prompt string is ever built - same rule the
+/// SQLite request log applies to `request_body`.
 fn build_telemetry_content(
     state: &super::AppState,
     request: &OpenAIRequest,
     context: &RequestLogContext,
 ) -> Option<crate::telemetry::spans::ContentCtx> {
-    if !state.telemetry_snapshot.capture_content() {
+    if !state.telemetry_snapshot.capture_content() || context.prompt_id.is_some() {
         return None;
     }
     let prompt = serde_json::to_string(request).ok()?;
@@ -709,7 +754,17 @@ fn write_request_log(
         status_code: context.status_code,
         duration_ms: context.duration_ms,
         cost: context.cost,
-        request_body: serde_json::to_string(request).ok(),
+        // Prompt-resolved requests never persist the merged body: the
+        // rendered template messages and variable values must not land
+        // in the request log (prompt-library-versioning spec, Req 4.4:
+        // "template content and variable values SHALL NOT be stored").
+        // `None` wins even when request-body logging is enabled;
+        // attribution lives in the prompt_* columns.
+        request_body: if context.prompt_id.is_some() {
+            None
+        } else {
+            serde_json::to_string(request).ok()
+        },
         response_body: context.error_message.clone(),
         requested_model: Some(request.model.clone()),
         responded_model: context.responded_model.clone(),
@@ -734,6 +789,9 @@ fn write_request_log(
         input_tokens: context.input_tokens,
         output_tokens: context.output_tokens,
         virtual_key_id: context.virtual_key_id.clone(),
+        prompt_id: context.prompt_id.clone(),
+        prompt_version: context.prompt_version,
+        prompt_label: context.prompt_label.clone(),
     };
     logger.log_with_reasoning_relay(entry, context.reasoning_relayed_frames)
 }
@@ -809,16 +867,19 @@ fn log_failed_attempts(
             claude_session_id: None,
         // Attempt rows never carry usage; they are excluded from cost
         // reports by the `#attempt` path filter.
-        input_tokens: None,
-        output_tokens: None,
-        virtual_key_id: None,
-        error_class: Some(
-            attempt
-                .error_class
-                .clone()
-                .unwrap_or_else(|| "other".to_string()),
-        ),
-    };
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
+            error_class: Some(
+                attempt
+                    .error_class
+                    .clone()
+                    .unwrap_or_else(|| "other".to_string()),
+            ),
+        };
         if let Err(e) = logger.log(entry) {
             tracing::warn!(
                 error = %e,
@@ -1670,6 +1731,7 @@ fn guardrail_error_response(
         request_guard.active_handle(),
         request_guard.inbound_telemetry(),
         request_guard.entry_emission(),
+        request_guard.prompt_meta(),
     );
     let mut response = error.into_response();
     attach_trace_id_header(&mut response, trace_id);
@@ -1837,6 +1899,11 @@ struct RequestCompleteGuard {
     /// still set, the request was abandoned mid-stream and Drop emits
     /// root-only 499/504 spans.
     responses_emit: Option<ResponsesEmission>,
+    /// Content-free prompt attribution (prompt-library-versioning
+    /// spec, Req 4.4) carried from request entry to every outcome
+    /// site: the abandon logger's 499/504 row and completion seams
+    /// that build their own log context.
+    prompt_meta: Option<PromptResolutionMeta>,
 }
 
 /// Emission inputs the responses family (`/v1/responses`, incl. codex
@@ -1875,6 +1942,10 @@ struct AbandonLogger {
     kind: crate::active_requests::RequestKind,
     /// Global request deadline in seconds (0 = disabled).
     deadline_secs: u64,
+    /// Content-free prompt attribution (prompt-library-versioning
+    /// spec, Req 4.4) for the 499/504 outcome row; `None` for
+    /// ordinary requests.
+    prompt_meta: Option<PromptResolutionMeta>,
 }
 
 impl AbandonLogger {
@@ -1890,7 +1961,15 @@ impl AbandonLogger {
             requested_model,
             kind,
             deadline_secs: state.runtime_limits.request_timeout_seconds(),
+            prompt_meta: None,
         }
+    }
+
+    /// Attach prompt-library attribution (Req 4.4) so abandoned
+    /// prompt-seeded requests stay attributed.
+    fn with_prompt_meta(mut self, meta: Option<PromptResolutionMeta>) -> Self {
+        self.prompt_meta = meta;
+        self
     }
 
     /// Write the content-free 499/504 outcome row, then drain the ledger.
@@ -1975,8 +2054,17 @@ impl AbandonLogger {
         input_tokens: None,
         output_tokens: None,
         virtual_key_id: virtual_key_id.clone(),
+        prompt_id: self
+            .prompt_meta
+            .as_ref()
+            .map(|meta| meta.prompt_id.clone()),
+        prompt_version: self.prompt_meta.as_ref().map(|meta| meta.prompt_version),
+        prompt_label: self
+            .prompt_meta
+            .as_ref()
+            .and_then(|meta| meta.prompt_label.clone()),
         error_class: Some(error_class.to_string()),
-        };
+    };
         tracing::info!(
             trace_id = %trace_id,
             status_code,
@@ -2064,7 +2152,22 @@ impl RequestCompleteGuard {
             telemetry_snapshot: None,
             telemetry_emission: None,
             responses_emit: None,
+            prompt_meta: None,
         }
+    }
+
+    /// Attach prompt-library attribution (prompt-library-versioning
+    /// spec, Req 4.4) resolved at request entry; read back by the
+    /// completion seams via [`Self::prompt_meta`] and forwarded to
+    /// the abandon logger for 499/504 rows.
+    fn with_prompt_meta(mut self, meta: Option<PromptResolutionMeta>) -> Self {
+        self.prompt_meta = meta;
+        self
+    }
+
+    /// The prompt attribution resolved at entry (Req 4.4), if any.
+    fn prompt_meta(&self) -> Option<&PromptResolutionMeta> {
+        self.prompt_meta.as_ref()
     }
 
     /// Attach telemetry emission handles (request scopes only). The
@@ -2483,8 +2586,150 @@ pub async fn ping() -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/chat/completions  (Req 2.1)
+// POST /v1/chat/completions (Req 2.1)
 // ---------------------------------------------------------------------------
+
+/// The `prompt` body field is consumed only by /v1/chat/completions; the
+/// other front doors reject it with this 400 message instead of
+/// forwarding it upstream.
+const PROMPT_FIELD_CHAT_ONLY_MESSAGE: &str = "prompt field is only supported on /v1/chat/completions";
+
+/// Content-free prompt attribution (prompt-library-versioning spec,
+/// Req 4.4): the resolved template identity threaded from the chat
+/// front door into the request log row. Never carries template
+/// content or variable values. Template text and values are kept out
+/// of every log by the request-body logging gate: prompt-resolved
+/// rows store `None` for `request_body` (and telemetry content
+/// capture is skipped) even when body logging is enabled.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PromptResolutionMeta {
+    pub prompt_id: String,
+    pub prompt_version: i64,
+    pub prompt_label: Option<String>,
+}
+
+/// The chat handler's request after prompt-field consumption: the
+/// (possibly merged) request body plus the prompt attribution when a
+/// `prompt` field resolved, or the body untouched when it did not.
+struct PromptApplied {
+    body: OpenAIRequest,
+    prompt_meta: Option<PromptResolutionMeta>,
+}
+
+/// Resolve and merge the request-body `prompt` field (prompt-library-
+/// versioning spec, Req 4.1). The zero-overhead skip comes first: no
+/// `prompt` key returns the request untouched before any lock. A
+/// present-but-malformed field is a 400 naming the offending sub-field;
+/// an unresolvable reference is a 404 invalid_request_error naming the
+/// prompt and label; a missing library or failing store is a 503
+/// api_error. Never contacts a provider.
+async fn apply_prompt_template(
+    state: &AppState,
+    request: OpenAIRequest,
+) -> Result<PromptApplied, Response> {
+    // Zero-overhead skip (Req 4.1): requests without the `prompt`
+    // field take no lock, no clone, no allocation.
+    let Some(prompt_field) = request.extra.get("prompt") else {
+        return Ok(PromptApplied {
+            body: request,
+            prompt_meta: None,
+        });
+    };
+
+    let reference = crate::prompt_library::parse_prompt_field(prompt_field).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!("invalid prompt field '{}': {}", e.field(), e),
+                    "type": "invalid_request_error"
+                }
+            })),
+        )
+            .into_response()
+    })?;
+
+    let Some(library) = state.prompt_library.read().await.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "prompt library unavailable",
+                    "type": "api_error"
+                }
+            })),
+        )
+            .into_response());
+    };
+
+    let variables = reference.variables.clone().unwrap_or_default();
+    let resolution = tokio::task::spawn_blocking(move || {
+        crate::prompt_library::resolve_reference(library.store(), &reference)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!("prompt library resolution failed: {e}"),
+                    "type": "api_error"
+                }
+            })),
+        )
+            .into_response()
+    })?;
+
+    let resolved = match resolution {
+        Ok(resolved) => resolved,
+        Err(error @ crate::prompt_library::ResolveError::NotFound { .. }) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": error.to_string(),
+                        "type": "invalid_request_error"
+                    }
+                })),
+            )
+                .into_response())
+        }
+        Err(error) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": error.to_string(),
+                        "type": "api_error"
+                    }
+                })),
+            )
+                .into_response())
+        }
+    };
+
+    let rendered = crate::prompt_library::render_messages(&resolved.messages, &variables);
+    let prompt_meta = PromptResolutionMeta {
+        prompt_id: resolved.prompt_id.clone(),
+        prompt_version: resolved.version,
+        prompt_label: resolved.label.clone(),
+    };
+    Ok(PromptApplied {
+        body: merge_prompt_into_request(request, rendered),
+        prompt_meta: Some(prompt_meta),
+    })
+}
+
+/// Merge rendered template messages ahead of the client's own
+/// messages (Req 4.2) and strip the `prompt` field so it never
+/// reaches a provider.
+fn merge_prompt_into_request(mut request: OpenAIRequest, rendered: Vec<Message>) -> OpenAIRequest {
+    let mut messages = rendered;
+    messages.append(&mut request.messages);
+    request.messages = messages;
+    request.extra.remove("prompt");
+    request
+}
 
 /// Chat completions handler — streaming and non-streaming.
 ///
@@ -2502,6 +2747,17 @@ pub async fn chat_completions(
     compression_applied_ext: Option<Extension<crate::tool_compression::ToolCompressionApplied>>,
     Json(request): Json<OpenAIRequest>,
 ) -> Response {
+    // Prompt-field consumption (prompt-library-versioning spec,
+    // Req 4.1) comes FIRST, before any lock or tracing, so the
+    // zero-overhead skip for prompt-free requests costs one map
+    // lookup and rejected references never touch a provider.
+    let PromptApplied {
+        body: request,
+        prompt_meta,
+    } = match apply_prompt_template(&state, request).await {
+        Ok(applied) => applied,
+        Err(response) => return response,
+    };
     tracing::info!(model = %request.model, stream = request.stream, "Received chat completion request");
     let trace_id = trace_id_from_headers(&headers);
     let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
@@ -2538,6 +2794,7 @@ pub async fn chat_completions(
             tool_disclosure,
             compression_restore,
             inbound_telemetry,
+            prompt_meta,
         )
         .await
     } else {
@@ -2550,11 +2807,13 @@ pub async fn chat_completions(
             tool_disclosure,
             compression_restore,
             inbound_telemetry,
+            prompt_meta,
         )
         .await
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn chat_completions_non_stream(
     state: AppState,
     mut request: OpenAIRequest,
@@ -2564,6 +2823,7 @@ async fn chat_completions_non_stream(
     tool_disclosure: bool,
     compression_restore: crate::router::router::ToolCompressionRestore,
     inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
+    prompt_meta: Option<PromptResolutionMeta>,
 ) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
@@ -2587,7 +2847,10 @@ async fn chat_completions_non_stream(
         start,
         Some((state.active_requests.clone(), trace_id.clone())),
     )
-    .with_abandon_logger(AbandonLogger::new(&state, &active_handle))
+    .with_abandon_logger(
+        AbandonLogger::new(&state, &active_handle).with_prompt_meta(prompt_meta.clone()),
+    )
+    .with_prompt_meta(prompt_meta.clone())
     .with_inbound_telemetry(inbound_telemetry.clone())
     .with_telemetry(
         state.telemetry_exporter.clone(),
@@ -2877,7 +3140,7 @@ match engine
                 .map(|memory| (&memory.context, &memory.injection)),
             None,
         );
-        log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry());
+        log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry(), request_guard.prompt_meta());
         let mut http_response = openai_json_response(&response);
         attach_trace_id_header(&mut http_response, &trace_id);
         return http_response;
@@ -3424,7 +3687,7 @@ match engine
             );
     // Log any failed provider attempts masked by this success BEFORE
     // the response's gateway extras are stripped for the client.
-    log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry());
+    log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry(), request_guard.prompt_meta());
     let mut http_response = openai_json_response(&response);
     attach_validation_status_header(
         &mut http_response,
@@ -3449,7 +3712,7 @@ Err(e) => {
     let duration_ms = request_guard.complete();
     let log_context =
         RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
-    log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry());
+    log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry(), request_guard.prompt_meta());
     let mut response = e.into_response();
     attach_trace_id_header(&mut response, &trace_id);
     // Error path: every failed upstream send is already a ledger row,
@@ -3466,6 +3729,7 @@ Err(e) => {
 }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn chat_completions_stream(
     state: AppState,
     mut request: OpenAIRequest,
@@ -3475,6 +3739,7 @@ async fn chat_completions_stream(
     tool_disclosure: bool,
     compression_restore: crate::router::router::ToolCompressionRestore,
     inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
+    prompt_meta: Option<PromptResolutionMeta>,
 ) -> Response {
     state.metrics.start_request();
     let start = Instant::now();
@@ -3498,7 +3763,10 @@ async fn chat_completions_stream(
         start,
         Some((state.active_requests.clone(), trace_id.clone())),
     )
-    .with_abandon_logger(AbandonLogger::new(&state, &active_handle))
+    .with_abandon_logger(
+        AbandonLogger::new(&state, &active_handle).with_prompt_meta(prompt_meta.clone()),
+    )
+    .with_prompt_meta(prompt_meta.clone())
     .with_inbound_telemetry(inbound_telemetry.clone())
     .with_telemetry(
         state.telemetry_exporter.clone(),
@@ -3937,7 +4205,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
 .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
-                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
 
                                     // Non-blocking memory extraction now that the full
                                     // response content is known (parity with the
@@ -4076,7 +4344,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                             );
                                             let duration_ms = start.elapsed().as_millis() as u64;
                                             let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-                                            log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                                            log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                             let (error_type, message) = classify_stream_error(&aggregated);
                                             for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                                                 yield Ok(event);
@@ -4182,7 +4450,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                 .with_usage(usage.prompt_tokens, usage.completion_tokens);
                                 // Streaming attempts that failed before this success are
                                 // in the ledger; log_outcome writes them as #attempt rows.
-                                log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                                log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                 break 'failover;
                             }
                                             // Post-content failure (Req 4.2): the relay already
@@ -4206,7 +4474,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                                     &reason,
                                                     relay_start.elapsed(),
                                                 ));
-                                                log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                                                log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                                 state
                                                     .router
                                                     .record_streaming_failure(
@@ -4309,7 +4577,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                                             let duration_ms = start.elapsed().as_millis() as u64;
                                                             let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
 .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
-                                                            log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                                                            log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                                             if let Some(memory) = memory_context.as_ref() {
                                                                 let response_content = response
                                                                     .choices
@@ -4345,7 +4613,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
         );
         let duration_ms = start.elapsed().as_millis() as u64;
         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
         let (error_type, message) = classify_stream_error(&aggregated);
         for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
         yield Ok(event);
@@ -4407,7 +4675,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                                         let duration_ms = start.elapsed().as_millis() as u64;
                                                         let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
 .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
-                                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                                         if let Some(memory) = memory_context.as_ref() {
                                                             let response_content = response
                                                                 .choices
@@ -4449,7 +4717,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                                         );
                                                         let duration_ms = start.elapsed().as_millis() as u64;
                                                         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
-                                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                                         let (error_type, message) = classify_stream_error(&aggregated);
                                                         for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                                                             yield Ok(event);
@@ -4468,7 +4736,7 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                     // before the stream terminates (Req 5.1, 5.2, 5.4).
                                     let duration_ms = start.elapsed().as_millis() as u64;
                                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
-                                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
 
                                     // Map the error variant to an SSE error frame. emit_sse_error_event
                                     // already appends [DONE], so we must NOT yield a separate one.
@@ -4546,6 +4814,7 @@ return sse;
                     &log_context,
                     request_guard.active_handle(),
                     request_guard.inbound_telemetry(),
+                request_guard.prompt_meta(),
                 );
     let mut response = e.into_response();
     attach_trace_id_header(&mut response, &trace_id);
@@ -4647,6 +4916,7 @@ let first_step = loop {
                     &log_context,
                     request_guard.active_handle(),
                     request_guard.inbound_telemetry(),
+                request_guard.prompt_meta(),
                 );
             let mut response = e.into_response();
             attach_trace_id_header(&mut response, &trace_id);
@@ -4806,7 +5076,7 @@ duration_ms,
 &response,
 )
 .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
-log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
 
 // Non-blocking memory extraction now that the full
 // response content is known.
@@ -4861,7 +5131,7 @@ log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbou
                             duration_ms,
                             &e,
                         );
-                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                         let (error_type, message) = classify_stream_error(&e);
                         for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                             yield Ok(event);
@@ -4908,6 +5178,7 @@ log_outcome(
 &log_context,
 request_guard.active_handle(),
 request_guard.inbound_telemetry(),
+request_guard.prompt_meta(),
 );
 
 // Non-blocking memory extraction now that the full response is known.
@@ -5507,6 +5778,7 @@ async fn stream_eager_structured_output(
                             &log_context,
                             request_guard.active_handle(),
                             request_guard.inbound_telemetry(),
+                        request_guard.prompt_meta(),
                         );
         return eager_sse_response(
             structured_stream_overflow_events(&trace_id),
@@ -5537,6 +5809,7 @@ async fn stream_eager_structured_output(
                             &log_context,
                             request_guard.active_handle(),
                             request_guard.inbound_telemetry(),
+                        request_guard.prompt_meta(),
                         );
         return eager_sse_response(
             emit_sse_error_event(
@@ -5575,6 +5848,7 @@ async fn stream_eager_structured_output(
                         &log_context,
                         request_guard.active_handle(),
                         request_guard.inbound_telemetry(),
+                    request_guard.prompt_meta(),
                     );
         return eager_sse_response(
             emit_sse_error_event("stream_error", &gateway_error.to_string(), &trace_id),
@@ -5605,6 +5879,7 @@ if !assembled.complete {
                     &log_context,
                     request_guard.active_handle(),
                     request_guard.inbound_telemetry(),
+                request_guard.prompt_meta(),
                 );
         return eager_sse_response(
             emit_sse_error_event("stream_error", message, &trace_id),
@@ -5653,6 +5928,7 @@ if !assembled.complete {
                 &log_context,
                 request_guard.active_handle(),
                 request_guard.inbound_telemetry(),
+            request_guard.prompt_meta(),
             );
     let (error_type, message) = classify_stream_error(&error);
     return eager_sse_response(
@@ -5693,6 +5969,7 @@ if !assembled.complete {
                 &log_context,
                 request_guard.active_handle(),
     request_guard.inbound_telemetry(),
+    request_guard.prompt_meta(),
     );
     return eager_sse_response(
         events,
@@ -5733,6 +6010,7 @@ if !assembled.complete {
                 &log_context,
                 request_guard.active_handle(),
         request_guard.inbound_telemetry(),
+    request_guard.prompt_meta(),
     );
     return eager_sse_response(
         events,
@@ -5780,6 +6058,7 @@ RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &respo
         &log_context,
         request_guard.active_handle(),
         request_guard.inbound_telemetry(),
+    request_guard.prompt_meta(),
     );
     eager_sse_response(
         events,
@@ -6122,7 +6401,7 @@ async fn stream_buffered_with_post_call(
                         let duration_ms = start.elapsed().as_millis() as u64;
                         let err = GatewayError::GuardrailUnavailable(msg.clone());
                         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                         for event in emit_sse_error_event("guardrail_buffer_overflow", &msg, &stream_trace_id) {
                             yield Ok(event);
                         }
@@ -6148,7 +6427,7 @@ assembled = Some(a.response);
                     // Routing failed before any streaming — graceful SSE error frame.
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
-                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                     let (error_type, message) = classify_stream_error(&e);
                     for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
                         yield Ok(event);
@@ -6165,7 +6444,7 @@ assembled = Some(a.response);
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let err = GatewayError::GuardrailUnavailable(msg.clone());
                 let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                 for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                     yield Ok(event);
                 }
@@ -6247,7 +6526,7 @@ assembled = Some(a.response);
     let duration_ms = start.elapsed().as_millis() as u64;
     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
 .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
-    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
     for chunk in chunks {
         yield Ok(Event::default().data(chunk.to_string()));
     }
@@ -6282,7 +6561,7 @@ assembled = Some(a.response);
             let duration_ms = start.elapsed().as_millis() as u64;
             let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
 .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
-            log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+            log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
             for chunk in chunks {
                 yield Ok(Event::default().data(chunk.to_string()));
             }
@@ -6360,7 +6639,7 @@ assembled = Some(a.response);
                                         let duration_ms = start.elapsed().as_millis() as u64;
                                         let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
                                         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                         yield Ok(Event::default().data(payload.to_string()));
                                         yield Ok(Event::default().data("[DONE]"));
                                         _guard.complete();
@@ -6371,7 +6650,7 @@ assembled = Some(a.response);
                                         let duration_ms = start.elapsed().as_millis() as u64;
                                         let err = GatewayError::GuardrailUnavailable(msg.clone());
                                         let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                                        log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                         for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                                             yield Ok(event);
                                         }
@@ -6435,7 +6714,7 @@ assembled = Some(a.response);
         let duration_ms = start.elapsed().as_millis() as u64;
                     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &last_response)
 .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &last_response));
-                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                     for chunk in chunks {
                         yield Ok(Event::default().data(chunk.to_string()));
                     }
@@ -6447,7 +6726,7 @@ assembled = Some(a.response);
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                     yield Ok(Event::default().data(payload.to_string()));
                     yield Ok(Event::default().data("[DONE]"));
                 }
@@ -6457,7 +6736,7 @@ assembled = Some(a.response);
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let err = GatewayError::GuardrailUnavailable(msg.clone());
                     let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
-                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry());
+                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                     for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                         yield Ok(event);
                     }
@@ -8076,7 +8355,7 @@ fn anthropic_guardrail_error_response(
         &err,
     )
     .with_anthropic_protocol(claude_session_id.clone());
-    log_outcome(state, chat_request, &log_context, Some(active_handle), request_guard.inbound_telemetry());
+    log_outcome(state, chat_request, &log_context, Some(active_handle), request_guard.inbound_telemetry(), None);
     tracing::warn!(
         trace_id = %trace_id,
         error = %err,
@@ -8252,15 +8531,18 @@ pub async fn anthropic_create(
     } else {
         return anthropic_invalid_request("anthropic-version header is required");
     }
-	let request: AnthropicRequest = match serde_json::from_slice(&body) {
-		Ok(r) => r,
-		Err(e) => {
-			return anthropic_invalid_request(format!("invalid JSON body: {e}"));
-		}
-	};
-	if let Some(rejection) = anthropic_request_rejection(&request) {
-		return anthropic_invalid_request(rejection);
-	}
+ let request: AnthropicRequest = match serde_json::from_slice(&body) {
+ Ok(r) => r,
+ Err(e) => {
+ return anthropic_invalid_request(format!("invalid JSON body: {e}"));
+ }
+ };
+ if request.extra.contains_key("prompt") {
+ return anthropic_invalid_request(PROMPT_FIELD_CHAT_ONLY_MESSAGE);
+ }
+ if let Some(rejection) = anthropic_request_rejection(&request) {
+ return anthropic_invalid_request(rejection);
+ }
     let trace_id = trace_id_from_headers(&headers);
     let claude_session_id = claude_session_id_from(&headers, &request);
     let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
@@ -8398,7 +8680,7 @@ duration_ms,
 )
 .with_anthropic_protocol(claude_session_id)
 .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &cached_chat));
- log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
+ log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry(), None);
  request_guard.complete();
  let synthesis_ctx = AnthropicSynthesisContext {
  request_model: &request.model,
@@ -8612,7 +8894,7 @@ match result {
                     .map(|memory| (&memory.context, &memory.injection)),
                 None,
             );
-            log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
+            log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry(), None);
             request_guard.complete();
 
             // Verbatim relay (decision D2, Req 2.1): a stashed upstream
@@ -8672,7 +8954,7 @@ match result {
             &err,
         )
         .with_anthropic_protocol(claude_session_id);
-        log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
+        log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry(), None);
         request_guard.complete();
         let mut response = anthropic_gateway_error_response(&err);
         // Routing error: every failed send is already a ledger row
@@ -8978,7 +9260,7 @@ memory_context
 .map(|memory| (&memory.context, &memory.injection)),
 None,
 );
-log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry(), None);
 request_guard.complete();
 
 let text = raw_sse.to_string();
@@ -9032,7 +9314,7 @@ memory_context
 .map(|memory| (&memory.context, &memory.injection)),
 None,
 );
-log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry());
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry(), None);
 request_guard.complete();
 
         let stream = anthropic_replay_stream(
@@ -9273,7 +9555,7 @@ duration_ms,
 &err,
 )
 .with_anthropic_protocol(claude_session_id.clone());
-log_outcome(&state, &chat_request, &log_context, Some(&active_handle), stream_inbound_telemetry.as_ref());
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle), stream_inbound_telemetry.as_ref(), None);
 } else {
 // Estimate output tokens when the provider never sent a
 // usage frame (pass-through dispatch does not inject
@@ -9312,7 +9594,7 @@ let log_context = RequestLogContext::from_streaming_success(
 )
 .with_anthropic_protocol(claude_session_id.clone())
 .with_usage(input_tokens, output_tokens);
-log_outcome(&state, &chat_request, &log_context, Some(&active_handle), stream_inbound_telemetry.as_ref());
+log_outcome(&state, &chat_request, &log_context, Some(&active_handle), stream_inbound_telemetry.as_ref(), None);
 }
 };
     let mut sse = Sse::new(stream)
@@ -9338,7 +9620,7 @@ Err(err) => {
         &err,
     )
     .with_anthropic_protocol(claude_session_id);
-    log_outcome(&state, &chat_request, &log_context, Some(&active_handle), inbound_telemetry.as_ref());
+    log_outcome(&state, &chat_request, &log_context, Some(&active_handle), inbound_telemetry.as_ref(), None);
     request_guard.complete();
     let mut response = anthropic_gateway_error_response(&err);
     // Streaming routing error: ledger rows as-is (Req 5.3).
@@ -9424,13 +9706,16 @@ pub async fn anthropic_count_tokens(
     if headers.get("anthropic-version").is_none() {
         return anthropic_invalid_request("anthropic-version header is required");
     }
-    let request: AnthropicRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => {
-            return anthropic_invalid_request(format!("invalid JSON body: {e}"));
-        }
-    };
-    let _ = authenticated_key;
+ let request: AnthropicRequest = match serde_json::from_slice(&body) {
+ Ok(r) => r,
+ Err(e) => {
+ return anthropic_invalid_request(format!("invalid JSON body: {e}"));
+ }
+ };
+ if request.extra.contains_key("prompt") {
+ return anthropic_invalid_request(PROMPT_FIELD_CHAT_ONLY_MESSAGE);
+ }
+ let _ = authenticated_key;
     let trace_id = trace_id_from_headers(&headers);
 
     // Model-group resolution mirrors anthropic_create: unknown model → 404
@@ -9470,7 +9755,8 @@ mod tests {
         classify_relay_line, classify_stream_error, collect_structured_output_failure,
         eager_sse_response, early_event_chunk, emit_sse_error_event, force_eager_structured_stream,
             heartbeat_chunk, heartbeat_chunk_placeholder_reasoning, is_tool_call_turn, is_transient_stream_truncation, json_model,
-    memory_feedback_chunk, memory_mode, multipart_model, openai_json_response,
+        memory_feedback_chunk, memory_mode, merge_prompt_into_request, multipart_model,
+        openai_json_response,
     prepare_response_for_client,
         provider_pass_through_response, reasoning_relay_chunk, reasoning_relay_chunk_with_role,
         rechunk_structured_response, relay_passthrough_stream, requests_structured_output,
@@ -9501,8 +9787,48 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-	#[test]
-	fn memory_mode_parses_off_read_only_absent_unrecognized_and_case_variants() {
+    #[test]
+    fn merge_prompt_into_request_orders_template_first_and_strips_prompt_field() {
+        let request: OpenAIRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4",
+            "messages": [
+                { "role": "user", "content": "client tail" },
+                { "role": "assistant", "content": "prior turn" }
+            ],
+            "prompt": { "id": "greeting", "variables": { "name": "Ada" } },
+            "temperature": 0.2
+        }))
+        .unwrap();
+        let template = vec![
+            crate::models::openai::Message {
+                role: "system".to_string(),
+                content: serde_json::Value::String("TEMPLATE SYSTEM VOICE".to_string()),
+                extra: serde_json::Map::new(),
+            },
+            crate::models::openai::Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("Hello Ada".to_string()),
+                extra: serde_json::Map::new(),
+            },
+        ];
+
+        let merged = merge_prompt_into_request(request, template);
+
+        assert_eq!(merged.messages.len(), 4);
+        assert_eq!(merged.messages[0].role, "system");
+        assert_eq!(merged.messages[0].content_as_text(), "TEMPLATE SYSTEM VOICE");
+        assert_eq!(merged.messages[1].content_as_text(), "Hello Ada");
+        assert_eq!(merged.messages[2].content_as_text(), "client tail");
+        assert_eq!(merged.messages[3].content_as_text(), "prior turn");
+        assert!(
+            !merged.extra.contains_key("prompt"),
+            "the prompt field must be stripped before provider dispatch"
+        );
+        assert_eq!(merged.temperature, Some(0.2));
+    }
+
+    #[test]
+    fn memory_mode_parses_off_read_only_absent_unrecognized_and_case_variants() {
 		let mut headers = axum::http::HeaderMap::new();
 		// Absent header → configured behavior (Req 8.3).
 		assert_eq!(memory_mode(&headers), MemoryMode::Configured);
@@ -11076,10 +11402,74 @@ async fn responses_guard_complete_then_drop_does_not_double_emit() {
                     expected_class.clone()
                 }
             );
-            assert!(row.3.is_none());
-            assert!(row.4.is_none());
-        }
+        assert!(row.3.is_none());
+        assert!(row.4.is_none());
     }
+}
+
+/// Prompt-resolved requests never persist the merged body even when
+/// request-body logging is enabled: the rendered template messages and
+/// variable values must stay out of the request log (Req 4.4), while a
+/// plain request logged through the same logger still stores its body.
+#[test]
+fn prompt_resolved_request_body_is_not_logged_even_with_body_logging_on() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let logger = crate::logger::RequestLogger::new(crate::config::LoggingConfig {
+        database_path: temp.path().to_string_lossy().into_owned(),
+        request_body_logging: true,
+        response_body_logging: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let request = serde_json::from_str(
+        r#"{"model":"test-model","messages":[
+            {"role":"system","content":"TEMPLATE SYSTEM VOICE"},
+            {"role":"user","content":"TEMPLATE TASK with variable-value-sentinel"}]}"#,
+    )
+    .unwrap();
+    let response = base_response(Message {
+        role: "assistant".to_owned(),
+        content: serde_json::json!("ok"),
+        extra: Default::default(),
+    });
+
+    let plain = RequestLogContext::from_response(&request, "plain".to_owned(), 10, &response);
+    super::write_request_log(&logger, &request, &plain).unwrap();
+
+    let mut prompt_seeded =
+        RequestLogContext::from_response(&request, "prompt-seeded".to_owned(), 10, &response);
+    prompt_seeded.prompt_id = Some("prompt-123".to_owned());
+    prompt_seeded.prompt_version = Some(1);
+    prompt_seeded.prompt_label = Some("production".to_owned());
+    super::write_request_log(&logger, &request, &prompt_seeded).unwrap();
+
+    logger.flush();
+    let conn = rusqlite::Connection::open(temp.path()).unwrap();
+    let plain_body: Option<String> = conn
+        .query_row(
+            "SELECT request_body FROM requests WHERE trace_id = 'plain'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let prompt_body: Option<String> = conn
+        .query_row(
+            "SELECT request_body FROM requests WHERE trace_id = 'prompt-seeded'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        plain_body
+            .as_ref()
+            .is_some_and(|body| body.contains("test-model")),
+        "plain requests keep their logged body: {plain_body:?}"
+    );
+    assert!(
+        prompt_body.is_none(),
+        "prompt-resolved rows must not store the merged body: {prompt_body:?}"
+    );
+}
 
     #[test]
     fn reasoning_relay_traces_first_forwarded_frame_only() {
@@ -12333,6 +12723,8 @@ pub async fn completions(
         false,
         crate::router::router::ToolCompressionRestore::default(),
         inbound_telemetry,
+        // Legacy completions bodies carry no prompt-library field.
+        None,
     )
     .await
 }
@@ -14251,12 +14643,19 @@ fn codex_event_to_responses_sse(event: &CodexResponsesEvent) -> Vec<ResponsesSse
 
 /// POST /v1/responses — create a model response (buffered or streaming).
 pub async fn responses_create(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    authenticated_key: Option<Extension<AuthenticatedKey>>,
-    Json(request): Json<ResponsesRequest>,
+ State(state): State<AppState>,
+ headers: HeaderMap,
+ authenticated_key: Option<Extension<AuthenticatedKey>>,
+ Json(request): Json<ResponsesRequest>,
 ) -> Response {
-    tracing::info!(
+ if request.extra.contains_key("prompt") {
+ return responses_error(
+ StatusCode::BAD_REQUEST,
+ PROMPT_FIELD_CHAT_ONLY_MESSAGE,
+ "invalid_request_error",
+ );
+ }
+ tracing::info!(
         model = %request.model,
         stream = request.stream,
         "Received responses API request"

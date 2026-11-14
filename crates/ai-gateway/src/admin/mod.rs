@@ -77,6 +77,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
 
     let loop_detection_api = crate::loop_detection::admin::routes();
     let memory_api = crate::memory::admin::routes(state.memory_system.clone());
+    let prompt_library_api = crate::prompt_library::admin::routes(state.clone());
 
     let onnx_api = Router::new()
         .route("/status", get(onnx_status))
@@ -110,6 +111,7 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .nest("/onnx", onnx_api)
         .nest("/loop-detection", loop_detection_api)
         .nest("/memory", memory_api)
+        .nest("/prompt-library", prompt_library_api)
         .nest("/tool-compression", tool_compression::routes())
         .nest("/smart-routing", smart_routing_api)
         .nest("/webhooks", crate::webhooks::admin::routes())
@@ -3329,6 +3331,7 @@ mod tests {
                 let server = server.clone();
                 let provider = provider.clone();
                 arb_model_group(pname).prop_map(move |group| Config {
+                    prompt_library: Default::default(),
                     security: Default::default(),
                     cache_aware_routing: Default::default(),
                     server: server.clone(),
@@ -4000,6 +4003,7 @@ retry:
             std::env::temp_dir().join(format!("obey-admin-test-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&storage_dir).unwrap();
         let mut config = Config {
+            prompt_library: Default::default(),
             security: Default::default(),
             cache_aware_routing: Default::default(),
             server: ServerConfig {

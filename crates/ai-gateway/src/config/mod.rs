@@ -7,6 +7,7 @@ use crate::compression::config::{
 };
 use crate::guardrail::GuardrailConfig;
 use crate::memory::{MemoryConfig, ModelGroupMemoryOverride, ProviderMemoryOverride};
+use crate::prompt_library::PromptLibraryConfig;
 use crate::reasoning_compat::config::{ReasoningFamily, ReasoningParamShape};
 use crate::reasoning_compat::ReasoningCompatConfig;
 use crate::secrets;
@@ -81,6 +82,10 @@ pub struct Config {
     /// unconfigured for backward compatibility.
     #[serde(default)]
     pub memory: Option<MemoryConfig>,
+    /// Versioned prompt-library settings. Absent section applies
+    /// [PromptLibraryConfig::default].
+    #[serde(default)]
+    pub prompt_library: PromptLibraryConfig,
     #[serde(default)]
     pub first_launch_completed: bool,
     #[serde(default)]

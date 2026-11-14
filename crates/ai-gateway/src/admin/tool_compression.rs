@@ -248,6 +248,7 @@ mod disabled_providers_config_tests {
 
     fn test_config() -> Config {
         Config {
+            prompt_library: Default::default(),
             security: Default::default(),
             cache_aware_routing: Default::default(),
             server: ServerConfig {

@@ -17,6 +17,7 @@ use crate::common;
 /// Build a minimal valid Config with a Codex-style provider (oauth + openai).
 fn codex_test_config() -> Config {
     Config {
+        prompt_library: Default::default(),
         security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {

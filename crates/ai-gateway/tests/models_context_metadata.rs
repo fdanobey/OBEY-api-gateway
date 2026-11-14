@@ -107,6 +107,7 @@ fn group_model(model: &str, context_window: u32) -> ProviderModel {
 
 fn base_config(enforcement: EnforcementMode) -> Config {
     let mut config = Config {
+        prompt_library: Default::default(),
         security: Default::default(),
         cache_aware_routing: Default::default(),
         server: ServerConfig {

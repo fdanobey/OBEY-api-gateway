@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::guardrail::GuardrailConfig;
 use crate::memory::MemoryConfigError;
+use crate::prompt_library::config::PromptLibraryConfigError;
 use crate::secrets;
 use crate::smart_routing::config::MAX_CONTEXT_WINDOW_TOKENS;
 use crate::structured_output::config::StructuredOutputConfigError;
@@ -447,6 +448,14 @@ impl Config {
                 }
             }
         }
+
+        // Validate the versioned prompt library (prompt-library-versioning,
+        // Req 6.1): path type and bounds on load and hot-reload.
+        self.validate_prompt_library_config(
+            "prompt_library",
+            self.prompt_library.validate(),
+            &mut errors,
+        );
 
         if let Some(structured_output) = &self.structured_output {
             self.validate_structured_output_config(
@@ -1136,6 +1145,25 @@ prefix stickiness is disabled and routing uses normal priority/cost/latency sort
         }
     }
 
+    fn validate_prompt_library_config(
+        &self,
+        scope: &str,
+        result: Result<(), Vec<PromptLibraryConfigError>>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        if let Err(prompt_library_errors) = result {
+            errors.extend(
+                prompt_library_errors
+                    .into_iter()
+                    .map(|error| ValidationError::InvalidValue {
+                        field: format!("{scope}.{}", error.field),
+                        value: error.message,
+                        expected: "a valid prompt library configuration".to_string(),
+                    }),
+            );
+        }
+    }
+
     fn validate_structured_output_config(
         &self,
         scope: &str,
@@ -1659,6 +1687,7 @@ mod property_tests {
             context: ContextConfig::default(),
             compression: Default::default(),
             memory: None,
+            prompt_library: Default::default(),
             first_launch_completed: false,
             tray: TrayConfig::default(),
             codex_instructions_url: None,
