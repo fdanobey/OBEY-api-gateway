@@ -146,6 +146,9 @@ model_groups:
         cost_per_million_input_tokens: 10.0
         cost_per_million_output_tokens: 30.0
         priority: 100                   # Lower = higher priority
+        # deprecation_date: "2026-12-20" # optional operator override (ISO 8601);
+        # wins over provider-sourced metadata and feeds model-deprecation alerts
+        # replacement_model: "gpt-4.1" # optional successor reported in the alert payload
 
   - name: "local-llama"
     version_fallback_enabled: false
@@ -403,3 +406,13 @@ tray:
 #       secret: "whsec_example" # Standard Webhooks HMAC key; omit for unsigned
 #       events: ["budget.warning", "budget.exhausted", "budget.reset"] # omit = all
 #   allowed_private_hosts: [] # e.g. ["hooks.lan.local"]
+
+
+# Model deprecation alerts (optional). Providers' model listings are scanned
+# every 24h for deprecation metadata (shutdown/expiration/deprecation dates),
+# combined with the per-model operator overrides shown in model_groups above,
+# and - when webhook endpoints exist and the model had recent traffic -
+# delivered as model.deprecated events. Documented at
+# https://github.com/fdanobey/OBEY-api-gateway/wiki/Model-Deprecation-Alerts.
+# model_deprecations:
+#  warn_days_before: 30 # days before retirement to alert; 1..=365, default 30

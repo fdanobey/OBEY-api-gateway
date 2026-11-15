@@ -7,9 +7,12 @@ use axum::{
     Router,
 };
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use rust_embed::Embed;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 
 use crate::config::{load_and_validate_config, save_config, AdminSecurityMode, Config};
@@ -114,8 +117,10 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .nest("/prompt-library", prompt_library_api)
         .nest("/tool-compression", tool_compression::routes())
         .nest("/smart-routing", smart_routing_api)
-        .nest("/webhooks", crate::webhooks::admin::routes())
-        .nest_service("/keys", virtual_keys_api)
+ .nest("/webhooks", crate::webhooks::admin::routes())
+ .route("/model-deprecations", get(get_model_deprecations))
+ .route("/model-deprecations/scan", post(post_model_deprecation_scan))
+ .nest_service("/keys", virtual_keys_api)
         .route("/providers/models", post(proxy_provider_models))
         .route("/providers/{name}/budget", get(get_provider_budget))
         .route(
@@ -1614,14 +1619,257 @@ async fn security_status_handler(State(state): State<AppState>) -> Response {
         mode,
         AdminSecurityMode::OpenWarnedLegacy | AdminSecurityMode::OpenOptIn
     );
-    (
-        StatusCode::OK,
-        Json(json!({
-            "mode": mode.wire_name(),
-            "unauthenticated_non_loopback": unauthenticated_non_loopback,
-        })),
-    )
-        .into_response()
+ (
+ StatusCode::OK,
+ Json(json!({
+ "mode": mode.wire_name(),
+ "unauthenticated_non_loopback": unauthenticated_non_loopback,
+ })),
+ )
+ .into_response()
+}
+
+/// Process-wide single-flight gate for the manual deprecation-scan
+/// trigger (model-deprecation-alerts, Req 1.5): `true` while a
+/// manually triggered `scan_all` is running. The scanner's own
+/// in-flight claim remains the authoritative guard; this gate lets
+/// the admin route answer `already_running` without spawning.
+static DEPRECATION_SCAN_GATE: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// GET /admin/model-deprecations — deprecation status rows
+/// (model-deprecation-alerts spec, Task 7; Reqs 1.4, 7.1, 7.2).
+///
+/// Response shape decision: a BARE top-level JSON array of status
+/// rows. Each row carries the [`StatusRow`] fields plus a flat
+/// `last_scanned_at` RFC 3339 string derived from the scanner's
+/// `last_scan_info()` for that row's provider — the admin UI's
+/// staleness cell reads `row.provider_scan.last_scanned_at` OR the
+/// flat `row.last_scanned_at` fallback, so the flat field serves it
+/// without wrapping the array in an envelope. Rows for providers
+/// never successfully scanned omit the field (UI renders "never
+/// scanned").
+///
+/// Usage evidence (`requests_7d`/`last_used_at`) aggregates the
+/// shared requests ledger on the blocking pool (spawn_blocking —
+/// the read connection is a synchronous SQLite handle). One
+/// aggregated GROUP BY query over the logs database (the
+/// cost-reporting read-connection pattern): no request/response
+/// bodies are ever materialized. A ledger failure degrades to
+/// `requests_7d: 0` per the `status_rows` contract. No secrets
+/// appear: rows carry model ids, dates, and counts only.
+async fn get_model_deprecations(State(state): State<AppState>) -> Response {
+ // Config snapshot (overrides + warn window + ledger path) under
+ // the read lock; the guard drops at the end of this block —
+ // never held across the usage await (scanner.rs discipline).
+ let (overrides, warn_days, ledger_path) = {
+ let config = state.config.read().await;
+ let overrides = deprecation_overrides(&config);
+ let warn_days = config.model_deprecations.warn_days_before;
+ (overrides, warn_days, config.logging.database_path.clone())
+ };
+
+ // Usage evidence per (provider, model) key, aggregated off the
+ // async worker (spawn_blocking: opening and querying the SQLite
+ // read connection is blocking work).
+ let usage: HashMap<(String, String), (u64, Option<DateTime<Utc>>)> =
+ match tokio::task::spawn_blocking(move || -> Result<_, Box<dyn std::error::Error + Send + Sync>> {
+ // Read-only connection against the same database path
+ // (WAL mode allows concurrent readers — logger/mod.rs
+ // discipline); SUM + GROUP BY aggregates in SQL so request
+ // bodies never leave the database.
+ let connection = rusqlite::Connection::open_with_flags(
+ &ledger_path,
+ rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+ )?;
+ let cutoff = (Utc::now() - chrono::Duration::hours(168)).timestamp();
+ let mut statement = connection.prepare(
+ "SELECT provider, model, COUNT(*), MAX(timestamp) \
+ FROM requests \
+ WHERE timestamp >= ?1 AND provider IS NOT NULL AND model IS NOT NULL \
+ GROUP BY provider, model",
+ )?;
+ let mut usage = HashMap::new();
+ let rows = statement.query_map(rusqlite::params![cutoff], |row| {
+ Ok((
+ (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+ (
+ row.get::<_, i64>(2)?.max(0) as u64,
+ chrono::DateTime::from_timestamp(row.get::<_, i64>(3)?, 0)
+ .map(|datetime| datetime.with_timezone(&Utc)),
+ ),
+ ))
+ })?;
+ for row in rows {
+ let (key, value) = row?;
+ usage.insert(key, value);
+ }
+ Ok(usage)
+ })
+ .await
+ {
+ Ok(Ok(usage)) => usage,
+ Ok(Err(error)) => {
+ tracing::warn!(
+ error = %error,
+ "model deprecations: usage lookup failed; rows carry requests_7d: 0"
+ );
+ HashMap::new()
+ }
+ Err(error) => {
+ tracing::warn!(
+ error = %error,
+ "model deprecations: usage lookup task failed; rows carry requests_7d: 0"
+ );
+ HashMap::new()
+ }
+ };
+
+ let scan_times = state.deprecation_scanner.last_scan_info();
+ let now = Utc::now();
+ let rows: Vec<serde_json::Value> = state
+ .deprecation_state
+ // Keys absent from the usage map → None → the row survives with
+ // requests_7d: 0 (state.rs contract: failed lookup never kills
+ // a row).
+ .status_rows(
+ &overrides,
+ |provider, model| {
+ usage
+ .get(&(provider.to_string(), model.to_string()))
+ .copied()
+ },
+ warn_days,
+ now,
+ )
+ .into_iter()
+ .map(|row| {
+ let mut value = serde_json::to_value(&row).unwrap_or_else(|_| serde_json::json!({}));
+ if let Some(object) = value.as_object_mut() {
+ if let Some(scanned_at) = scan_times.get(&row.provider) {
+ object.insert(
+ "last_scanned_at".to_string(),
+ json!(scanned_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+ );
+ }
+ }
+ value
+ })
+ .collect();
+
+ (StatusCode::OK, Json(json!(rows))).into_response()
+}
+
+/// Project operator deprecation overrides from the live config's
+/// model groups (Req 2.1/2.2): one [`OverrideSpec`] per configured
+/// `(provider, model)` pair carrying a `deprecation_date` or
+/// `replacement_model`, plus the names of the groups referencing it.
+/// Pairs listed in several groups merge by FIRST-SEEN semantics
+/// (config order: the first non-None date/replacement wins —
+/// validation does NOT reject diverging duplicates) and accumulate
+/// every referencing group's name.
+fn deprecation_overrides(config: &Config) -> Vec<crate::model_deprecations::state::OverrideSpec> {
+ use std::collections::BTreeMap;
+
+ let mut by_key: BTreeMap<(String, String), crate::model_deprecations::state::OverrideSpec> =
+ BTreeMap::new();
+ for group in &config.model_groups {
+ for model in &group.models {
+ if model.deprecation_date.is_none() && model.replacement_model.is_none() {
+ continue;
+ }
+ let key = (model.provider.clone(), model.model.clone());
+ let entry = by_key.entry(key).or_insert_with(|| {
+ crate::model_deprecations::state::OverrideSpec {
+ provider: model.provider.clone(),
+ model: model.model.clone(),
+ deprecation_date: None,
+ replacement_model: None,
+ model_groups: Vec::new(),
+ }
+ });
+ if entry.deprecation_date.is_none() {
+ entry.deprecation_date = model.deprecation_date.clone();
+ }
+ if entry.replacement_model.is_none() {
+ entry.replacement_model = model.replacement_model.clone();
+ }
+ entry.model_groups.push(group.name.clone());
+ }
+ }
+ by_key.into_values().collect()
+}
+
+/// POST /admin/model-deprecations/scan — manual scan trigger
+/// (model-deprecation-alerts, Task 7; Reqs 1.5, 7.2).
+///
+/// Fire-and-forget: the scan runs in a spawned task and NEVER
+/// blocks the response. The response body is `{"result":"started"}`
+/// or `{"result":"already_running"}` — the two shapes the admin
+/// UI's `mdScan` handler reads.
+///
+/// Concurrency discipline: an admin-module process-wide gate
+/// (OnceLock'd atomic, same pattern as the AB-test manager handle)
+/// decides `started` vs `already_running` BEFORE spawning, and the
+/// spawned task releases the gate when `scan_all` returns — the
+/// scanner's own internal in-flight claim stays the authoritative
+/// second line of defense (a racing double-start reports
+/// `already_running` in its [`ScanSummary`] and the background
+/// loop's log reflects it).
+async fn post_model_deprecation_scan(State(state): State<AppState>) -> Response {
+    // Scanner first: a BACKGROUND scan (startup/cadence loop) holds
+    // only the scanner's own claim — the admin gate below is free —
+    // so check the scanner's in-flight flag BEFORE spawning and
+    // answer `already_running` immediately.
+    if state.deprecation_scanner.scan_in_flight() {
+        return (
+            StatusCode::OK,
+            Json(json!({ "result": "already_running" })),
+        )
+            .into_response();
+    }
+    let gate = DEPRECATION_SCAN_GATE.get_or_init(|| Arc::new(AtomicBool::new(false)));
+ // Acquire: only one manual trigger spawns a scan; a second
+ // trigger while held reports already_running without starting.
+ if gate
+ .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+ .is_err()
+ {
+ return (
+ StatusCode::OK,
+ Json(json!({ "result": "already_running" })),
+ )
+ .into_response();
+ }
+    let scanner = std::sync::Arc::clone(&state.deprecation_scanner);
+    tokio::spawn(async move {
+        // Panic/abort-safe release: the guard's Drop covers every
+        // path out of this task — completion, panic, AND runtime
+        // abort at an await point (a plain post-await `store` never
+        // runs on abort, which would wedge the process-wide gate
+        // shut).
+        struct GateRelease<'a>(&'a AtomicBool);
+        impl Drop for GateRelease<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _release = GateRelease(
+            DEPRECATION_SCAN_GATE
+                .get()
+                .expect("gate initialized above"),
+        );
+        let summary = scanner.scan_all().await;
+        tracing::info!(
+            already_running = summary.already_running,
+            providers = summary.providers.len(),
+            "manual model deprecation scan complete"
+        );
+    });
+ (
+ StatusCode::OK,
+ Json(json!({ "result": "started" })),
+ )
+ .into_response()
 }
 
 /// Map a cost-report/reconcile validation error to the admin 400 JSON
@@ -3305,6 +3553,8 @@ mod tests {
                 cost_per_million_reasoning_tokens: None,
                 reasoning_family: None,
                 reasoning_parameter: None,
+                deprecation_date: None,
+                replacement_model: None,
             })
     }
 
@@ -3366,6 +3616,7 @@ mod tests {
                     reasoning_compat: Default::default(),
                     webhooks: Default::default(),
                     opentelemetry: Default::default(),
+                    model_deprecations: Default::default(),
                 })
             })
         })
@@ -4086,6 +4337,8 @@ retry:
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -4112,6 +4365,7 @@ retry:
             codex_search: None,
             webhooks: Default::default(),
             opentelemetry: Default::default(),
+            model_deprecations: Default::default(),
             reasoning_compat: Default::default(),
         };
         config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();

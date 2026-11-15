@@ -164,6 +164,30 @@ pub struct Config {
     /// activity). See the `opentelemetry-trace-export` spec.
     #[serde(default)]
     pub opentelemetry: TelemetryConfig,
+    /// Model deprecation detection and alerting. Absent section applies
+    /// [`ModelDeprecationsConfig::default`] (30-day warning window). See
+    /// the `model-deprecation-alerts` spec.
+    #[serde(default)]
+    pub model_deprecations: ModelDeprecationsConfig,
+}
+
+/// `model_deprecations:` configuration section root
+/// (model-deprecation-alerts, Req 2.2). Absent section applies defaults;
+/// detection with zero configured overrides is fully dormant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelDeprecationsConfig {
+    /// Days before a deprecated model's retirement date to start emitting
+    /// warning alerts. Valid range 1..=365.
+    pub warn_days_before: u32,
+}
+
+impl Default for ModelDeprecationsConfig {
+    fn default() -> Self {
+        Self {
+            warn_days_before: 30,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,7 +221,9 @@ impl Default for SecurityConfig {
 /// (budget-alerts-unified-webhooks, Req 3.2). Serialized exactly as the
 /// event `type` strings receivers match on. The `webhook.test` type used
 /// for admin test sends is synthesized by the webhooks module and is not
-/// a configurable event filter value.
+/// a configurable event filter value. `model.deprecated`
+/// (model-deprecation-alerts spec) rides the same filter; unset
+/// endpoint filters are default-on for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BudgetEventType {
     #[serde(rename = "budget.warning")]
@@ -206,6 +232,8 @@ pub enum BudgetEventType {
     BudgetExhausted,
     #[serde(rename = "budget.reset")]
     BudgetReset,
+    #[serde(rename = "model.deprecated")]
+    ModelDeprecated,
 }
 
 /// A single webhook receiver (budget-alerts-unified-webhooks, Req 3.1).
@@ -1038,6 +1066,15 @@ pub struct ProviderModel {
     /// family-based defaults during normalization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_parameter: Option<ReasoningParamShape>,
+    /// Operator-declared deprecation date (ISO 8601 `YYYY-MM-DD` or full
+    /// datetime) for this provider model. `None` = not deprecated by
+    /// config (model-deprecation-alerts, Req 2.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation_date: Option<String>,
+    /// Replacement model identifier suggested to callers of a deprecated
+    /// model. `None` = no replacement declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_model: Option<String>,
 }
 
 fn default_priority() -> u32 {

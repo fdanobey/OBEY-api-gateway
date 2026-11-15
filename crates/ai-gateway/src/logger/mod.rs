@@ -749,6 +749,51 @@ impl RequestLogger {
         })?
     }
 
+    /// Usage evidence for one `(provider, model)` pair over a lookback
+    /// window (model-deprecation-alerts, Reqs 3.1/3.2): the request
+    /// count since `since` plus the most recent request timestamp.
+    /// Returns `None` on any query error — a failed lookup suppresses
+    /// emission rather than alerting on zero evidence, and never
+    /// blocks the caller (the deprecation orchestrator runs this on
+    /// the blocking pool).
+    ///
+/// Reader-side query on a fresh connection against
+/// [`RequestLogger::database_path`] (the `cost_reporting::query`
+/// discipline: the writer thread owns the only write connection;
+/// WAL mode permits concurrent readers). READ_ONLY flags so a
+/// bad path can never create a stray database — a missing file
+/// fails the open and surfaces as `None`. No new tables or
+/// indexes — plain scan over the existing `timestamp`-filtered
+/// rows.
+pub fn usage_since(
+&self,
+provider: &str,
+model: &str,
+since: DateTime<Utc>,
+) -> Option<(u64, Option<DateTime<Utc>>)> {
+let conn = Connection::open_with_flags(
+&self.database_path,
+rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+)
+.ok()?;
+        let (count, last) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(timestamp) FROM requests
+                WHERE provider = ?1 AND model = ?2 AND timestamp >= ?3",
+                params![provider, model, since.timestamp()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0).unwrap_or(0),
+                        row.get::<_, Option<i64>>(1).ok().flatten(),
+                    ))
+                },
+            )
+            .ok()?;
+        let count = u64::try_from(count).unwrap_or(0);
+        let last_used = last.and_then(|secs| DateTime::from_timestamp(secs, 0));
+        Some((count, last_used))
+    }
+
     /// Flush pending writes and checkpoint the WAL (Req 18.3).
     /// Called during graceful shutdown to ensure all data is persisted.
     pub fn flush(&self) {

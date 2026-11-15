@@ -17,6 +17,7 @@ pub mod logger;
 pub mod loop_detection;
 pub mod memory;
 pub mod metrics;
+pub mod model_deprecations;
 pub mod models;
 pub mod oauth;
 pub mod providers;

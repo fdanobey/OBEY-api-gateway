@@ -19,6 +19,11 @@ use crate::context::summarizer::GatewaySummarizer;
 use crate::context::ContextManager;
 use crate::dashboard::CompressionEventHub;
 use crate::error::{error_class_for, AggregatedError, GatewayError, ProviderAttempt};
+use crate::model_deprecations::emission::spawn_deprecation_emission;
+use crate::model_deprecations::hook::{
+    is_model_not_found, note_runtime_gone, MODEL_NOT_FOUND_CLASS,
+};
+use crate::model_deprecations::state::DeprecationState;
 use crate::memory::{
     CompressionExtractionInput, CompressionMessageSnapshot, CompressionRemovalReport,
     ExtractionPolicy, MemorySystem, ResolvedNamespace,
@@ -937,6 +942,26 @@ pub struct Router {
     /// Per-provider model discovery for family decision providers (Req 2.3).
     /// Keyed by provider name; same lifecycle as `decision_clients`.
     decision_discovery: Arc<DashMap<String, Arc<ModelDiscovery>>>,
+    /// Model-deprecation runtime-detection state
+    /// (model-deprecation-alerts spec, Task 5): the shared
+    /// `Arc<DeprecationState>` built once in `GatewayServer::new`
+    /// (the `ProviderBudgetAlerts` pattern). The error-classification
+    /// sites record runtime-gone marks; candidate selection skips a
+    /// gone `(provider, model)` until reload / a re-arming scan / the
+    /// 24-hour bound clears it. `None` leaves the hook dormant (tests
+    /// building bare routers).
+    deprecation_state: Option<Arc<DeprecationState>>,
+    /// Runtime-gone emission dependencies (Task 9): when present,
+    /// the two `note_runtime_gone` call sites also fire
+    /// `spawn_deprecation_emission` (fire-and-forget) so a runtime
+    /// 404 model_not_found escalation emits its `model.deprecated`
+    /// event without waiting for the next scan pass. Set once in
+    /// `GatewayServer::new` alongside `deprecation_state`; `None`
+    /// keeps bare-router tests emission-free.
+    deprecation_emission: Option<(
+        Arc<crate::logger::RequestLogger>,
+        Arc<crate::webhooks::delivery::WebhookNotifier>,
+    )>,
 }
 
 /// Result of [`Router::route_request_streaming`].
@@ -1348,6 +1373,8 @@ impl Router {
             copilot_usage_tracker: None,
             decision_clients: Arc::new(DashMap::new()),
             decision_discovery: Arc::new(DashMap::new()),
+            deprecation_state: None,
+            deprecation_emission: None,
         }
     }
 
@@ -1402,6 +1429,8 @@ impl Router {
             copilot_usage_tracker: None,
             decision_clients: Arc::new(DashMap::new()),
             decision_discovery: Arc::new(DashMap::new()),
+            deprecation_state: None,
+            deprecation_emission: None,
         }
     }
 
@@ -1464,6 +1493,76 @@ impl Router {
     ) {
         self.provider_budget_alerts = Some(alerts);
     }
+
+    /// Attach the shared model-deprecation state
+    /// (model-deprecation-alerts spec, Task 5). Called once at
+    /// gateway startup (same lifetime discipline as
+    /// [`Self::set_provider_budget_alerts`]); hot-reload never
+    /// reconstructs it, only sweeps it
+    /// ([`Self::clear_deprecations_for_reload`]).
+    pub fn set_deprecation_state(&mut self, state: Arc<DeprecationState>) {
+        self.deprecation_state = Some(state);
+    }
+
+    /// Attach the runtime-gone emission dependencies
+    /// (model-deprecation-alerts spec, Task 9): the shared logger
+    /// (usage evidence) and notifier (event fan-out) Arcs. Called
+    /// once at gateway startup next to
+    /// [`Self::set_deprecation_state`]; the `note_runtime_gone`
+    /// call sites fire `spawn_deprecation_emission` only when BOTH
+    /// are present. `None` (bare routers) keeps runtime emission
+    /// dormant.
+    pub fn set_deprecation_emission(
+        &mut self,
+        logger: Arc<crate::logger::RequestLogger>,
+        notifier: Arc<crate::webhooks::delivery::WebhookNotifier>,
+    ) {
+        self.deprecation_emission = Some((logger, notifier));
+    }
+
+/// Fire-and-forget runtime-gone emission (Task 9): evaluates
+/// episodes against the shared state and emits any resulting
+/// `model.deprecated` events. Called right after
+/// [`note_runtime_gone`] at the error-classification sites; a
+/// bare router (no deps) skips it.
+fn emit_deprecation_events(&self, state: &Arc<DeprecationState>) {
+if let Some((logger, notifier)) = &self.deprecation_emission {
+spawn_deprecation_emission(
+Arc::clone(&self.config),
+Arc::clone(state),
+Arc::clone(logger),
+Arc::clone(notifier),
+);
+}
+}
+
+/// Success-side re-arm (model-deprecation-alerts spec, Req 4.4):
+/// a successful dispatch proves the `(provider, model)` serves, so
+/// any stale runtime-gone mark clears and the model re-enters the
+/// candidate chain. Deterministic, DashMap-cheap, no spawn — the
+/// mirror of [`note_runtime_gone`] at the failure sites.
+fn note_runtime_present(&self, provider: &str, model: &str) {
+if let Some(state) = &self.deprecation_state {
+state.record_runtime_present(provider, model);
+}
+}
+
+/// Config hot-reload sweep for the deprecation state (Req 5.2):
+/// drop every registry entry for providers no longer in
+/// `provider_names` (state API `retain_providers`), and clear
+/// runtime-gone marks for still-configured providers — the skip
+/// lasts until reload, a re-arming scan, or the 24-hour bound.
+/// Scan data and open episodes for kept providers survive (a full
+/// clear would wipe alerting state the reloaded config still
+/// references).
+pub fn clear_deprecations_for_reload(&self, provider_names: &[String]) {
+if let Some(state) = &self.deprecation_state {
+state.retain_providers(provider_names);
+for provider in provider_names {
+state.clear_runtime_gone(provider);
+}
+}
+}
 
     /// Get the Codex Search metrics handle for Prometheus exposition.
     pub fn search_metrics(&self) -> Arc<crate::codex::search::metrics::SearchMetrics> {
@@ -2370,21 +2469,37 @@ impl Router {
             // in the UI, producing a fresh 429 within seconds.
             // Same guard discipline as the CB check above: clone the Arc out
             // of the DashMap and drop the shard guard before awaiting.
-            let rl = self
-                .rate_limiters
-                .get(&m.provider)
-                .map(|entry| entry.value().clone());
-            let cooldown_ok = match rl {
-                Some(rl) => rl.cooldown_remaining().await.is_none(),
-                None => true,
-            } && self
-                .metrics
-                .provider_cooldown_remaining_secs(&m.provider)
-                .is_none();
+        let rl = self
+            .rate_limiters
+            .get(&m.provider)
+            .map(|entry| entry.value().clone());
+        let cooldown_ok = match rl {
+            Some(rl) => rl.cooldown_remaining().await.is_none(),
+            None => true,
+        } && self
+            .metrics
+            .provider_cooldown_remaining_secs(&m.provider)
+            .is_none();
 
-            if cb_ok && cooldown_ok {
-                filtered.push(m.clone());
-            }
+// Runtime deprecation skip (model-deprecation-alerts spec, Req
+// 5.2): a `provider:model` marked runtime-gone (404/410
+// model-not-found signature) stays out of the candidate chain
+// while the flag holds — cleared by reload (provider removed or
+// runtime-gone sweep), a re-arming scan seeing the model present
+// again, or the 24-hour unconfirmed bound. `is_gone_at` enforces
+// that bound AT QUERY TIME regardless of eviction cadence, so a
+// mark past 24h can never wedge a candidate out. Same skip shape
+// as the cooldown gate above; keyed per provider:model, so other
+// models from the same provider stay eligible.
+let deprecation_ok = self
+.deprecation_state
+.as_ref()
+.map(|state| !state.is_gone_at(&m.provider, &m.model, chrono::Utc::now()))
+.unwrap_or(true);
+
+        if cb_ok && cooldown_ok && deprecation_ok {
+            filtered.push(m.clone());
+        }
         }
         let mut candidates = filtered;
 
@@ -4727,9 +4842,17 @@ impl Router {
         // seam and retry the same provider once. Guarded so it fires at most once
         // and only for this specific rejection (clause 3.9).
         let mut duplicate_trigger_retry_done = false;
-        loop {
-            match client.chat_completion(request.clone()).await {
-                Ok(response) => return Ok(response),
+loop {
+match client.chat_completion(request.clone()).await {
+Ok(response) => {
+// Success-side re-arm (model-deprecation-alerts, Req
+// 4.4): a served dispatch proves the model lives, so
+// any stale runtime-gone mark clears. The dispatch
+// copy's model is the real provider model id (the
+// arms rewrite it from the group name).
+self.note_runtime_present(client.provider_name(), &request.model);
+return Ok(response);
+}
                 Err(GatewayError::Provider {
                     provider,
                     message,
@@ -6572,17 +6695,20 @@ impl Router {
                             // gate's reduction outcome where it exists; the handler
                             // persists it on the request log entry and strips the key
                             // before the client sees the response.
-                            if let Some(outcome) = &context_reduction {
-                                openai_response.extra.insert(
-                                    "gateway_context_reduction".to_string(),
-                                    serde_json::to_value(crate::logger::ContextReductionLog::from(
-                                        outcome,
-                                    ))
-                                    .expect("ContextReductionLog serialization must succeed"),
-                                );
-                            }
-                            return Ok(openai_response);
-                        }
+if let Some(outcome) = &context_reduction {
+openai_response.extra.insert(
+"gateway_context_reduction".to_string(),
+serde_json::to_value(crate::logger::ContextReductionLog::from(
+outcome,
+))
+.expect("ContextReductionLog serialization must succeed"),
+);
+}
+// Success-side re-arm (Req 4.4): a parsed 2xx body proves
+// the attempted provider:model serves.
+self.note_runtime_present(provider_name, &provider_model.model);
+return Ok(openai_response);
+}
 
                         // SSE body: the requested upstream stream, or a provider
                         // that ignored stream:false. Reconstruct a single OpenAIResponse.
@@ -6666,19 +6792,22 @@ impl Router {
                                             serde_json::Value::String(actions),
                                         );
                                     }
-                                    if let Some(outcome) = &context_reduction {
-                                        response.extra.insert(
-                                            "gateway_context_reduction".to_string(),
-                                            serde_json::to_value(
-                                                crate::logger::ContextReductionLog::from(outcome),
-                                            )
-                                            .expect(
-                                                "ContextReductionLog serialization must succeed",
-                                            ),
-                                        );
-                                    }
-                                    return Ok(response);
-                                }
+if let Some(outcome) = &context_reduction {
+response.extra.insert(
+"gateway_context_reduction".to_string(),
+serde_json::to_value(
+crate::logger::ContextReductionLog::from(outcome),
+)
+.expect(
+"ContextReductionLog serialization must succeed",
+),
+);
+}
+// Success-side re-arm (Req 4.4): a completed SSE
+// reassembly proves the attempted provider:model serves.
+self.note_runtime_present(provider_name, &provider_model.model);
+return Ok(response);
+}
                                 Err(e) => {
                                     tracing::error!(provider = provider_name, error = %e, body = %body_text.chars().take(500).collect::<String>(), "Failed to reassemble SSE response");
                                     let err = GatewayError::Provider {
@@ -6765,11 +6894,39 @@ impl Router {
                         }
                     }
 
-                    let err = GatewayError::Provider {
-                        provider: provider_name.to_string(),
-                        message: format!("HTTP {}: {}", status_code, body_text),
-                        status_code: Some(status_code),
-                    };
+        let err = GatewayError::Provider {
+            provider: provider_name.to_string(),
+            message: format!("HTTP {}: {}", status_code, body_text),
+            status_code: Some(status_code),
+        };
+
+        // Runtime model-not-found detection (model-deprecation-alerts
+        // spec, Req 5.1/6.1): a 404/410 with the model-not-found /
+        // "does not exist" / "deprecat" signature means the model is
+        // gone, not merely misconfigured for this request. Record the
+        // runtime-gone mark (DashMap-cheap, off the response path) and
+        // fail over exactly like the timeout class — no same-provider
+        // retry; the failover layer excludes this candidate. A plain
+        // 404 keeps today's terminal behavior below. The ledger row
+        // carries the `model_not_found` class (Req 6.3) instead of the
+        // generic `upstream_http_<code>`.
+        if is_model_not_found(status_code, &body_text) {
+            warn!(
+                provider = provider_name,
+                model = %provider_model.model,
+                status = status_code,
+                "Model not found / deprecated at provider — recording runtime-gone and failing over"
+            );
+            if let Some(state) = &self.deprecation_state {
+                note_runtime_gone(state, provider_name, &provider_model.model);
+                // Task 9: evaluate + emit right at the detection site
+                // (fire-and-forget; no-op on bare routers).
+                self.emit_deprecation_events(state);
+            }
+            record_try(&err, Some(MODEL_NOT_FOUND_CLASS), None, request_start);
+            return Err(err);
+        }
+
 
                     // Req 6.4 (openai-oauth-login): when an OAuth provider
                     // returns HTTP 401, force an immediate token refresh
@@ -11930,21 +12087,55 @@ pub async fn route_request_streaming_excluding(
                     message: format!("HTTP {}: {}", status_code, body_text),
                     status_code: Some(status_code),
                 };
-                let try_class = if self.is_context_length_error(status_code, &body_text) {
-                    Some(CONTEXT_WINDOW_EXCEEDED_CLASS)
-                } else {
-                    None
-                };
-                Self::record_try_failure(
-                    active.as_ref(),
-                    &provider_model.provider,
-                    &provider_model.model,
-                    &err,
-                    try_class,
-                    None,
-                    request_start,
-                );
-                if Self::is_rate_limited(status_code, &body_text) {
+        let try_class = if self.is_context_length_error(status_code, &body_text) {
+            Some(CONTEXT_WINDOW_EXCEEDED_CLASS)
+        } else if is_model_not_found(status_code, &body_text) {
+            Some(MODEL_NOT_FOUND_CLASS)
+        } else {
+            None
+        };
+        Self::record_try_failure(
+            active.as_ref(),
+            &provider_model.provider,
+            &provider_model.model,
+            &err,
+            try_class,
+            None,
+            request_start,
+        );
+        // Runtime model-not-found (model-deprecation-alerts spec, Req
+        // 5.1/6.1, streaming arm): the model is gone — record the
+        // runtime-gone mark and fall back to the buffered path with
+        // this provider:model excluded (the same sink the 429/5xx
+        // arms use), so the fallback dispatches the next candidate
+        // instead of re-sending to the dead model. The ledger row was
+        // recorded above with the `model_not_found` class.
+        if is_model_not_found(status_code, &body_text) {
+            warn!(
+                provider = %provider_model.provider,
+                model = %provider_model.model,
+                status = status_code,
+                "Model not found / deprecated at provider (streaming pass-through) — recording runtime-gone and falling back without this provider"
+            );
+            if let Some(state) = &self.deprecation_state {
+                note_runtime_gone(state, &provider_model.provider, &provider_model.model);
+                // Task 9: evaluate + emit right at the detection site
+                // (fire-and-forget; no-op on bare routers).
+                self.emit_deprecation_events(state);
+            }
+            drop(concurrency_permit.take());
+            return self
+                .passthrough_fallback_excluding(
+                    request,
+                    exclude,
+                    active,
+                    &provider_model,
+                    err,
+                    compression_restore.clone(),
+                )
+                .await;
+        }
+        if Self::is_rate_limited(status_code, &body_text) {
                     // Rate-limit response on the streaming pass-through: apply
                     // the dedicated upstream cooldown (RateLimiter + durable
                     // metrics store, both consulted by the routing gates) and
@@ -12215,19 +12406,22 @@ pub async fn route_request_streaming_excluding(
             }
         };
 
-        // Success — hand the live streaming body and permit to the caller.
-        // The handler keeps both alive until the relay finishes or is dropped.
-        // The Smart Routing metric is recorded only on the primary attempt so
-        // pre-content failover re-plans do not double count.
-        let smart_routing = routing_decision.filter(|_| !routing_bypassed);
-        if exclude.is_empty() {
-            if let Some(decision) = smart_routing.as_ref() {
-                self.record_smart_routing_decision_metric(&model_group.name, decision);
-                SmartRoutingDecisionLog::new(decision, &routing_diagnostics)
-                    .emit(&model_group.name, active.as_ref());
-            }
-        }
-        Ok(StreamingResponse::PassThrough {
+// Success — hand the live streaming body and permit to the caller.
+// The handler keeps both alive until the relay finishes or is dropped.
+// The Smart Routing metric is recorded only on the primary attempt so
+// pre-content failover re-plans do not double count.
+let smart_routing = routing_decision.filter(|_| !routing_bypassed);
+if exclude.is_empty() {
+if let Some(decision) = smart_routing.as_ref() {
+self.record_smart_routing_decision_metric(&model_group.name, decision);
+SmartRoutingDecisionLog::new(decision, &routing_diagnostics)
+.emit(&model_group.name, active.as_ref());
+}
+}
+// Success-side re-arm (Req 4.4): a 2xx pass-through head
+// proves the attempted provider:model serves.
+self.note_runtime_present(&provider_model.provider, &provider_model.model);
+Ok(StreamingResponse::PassThrough {
     byte_stream: response,
     provider: provider_model.provider.clone(),
     model: provider_model.model.clone(),
@@ -14759,6 +14953,7 @@ mod tests {
             reasoning_compat: Default::default(),
             webhooks: Default::default(),
             opentelemetry: Default::default(),
+            model_deprecations: Default::default(),
         }
     }
 
@@ -14823,6 +15018,8 @@ mod tests {
             cost_per_million_reasoning_tokens: None,
             reasoning_family: None,
             reasoning_parameter: None,
+            deprecation_date: None,
+            replacement_model: None,
         }
     }
 
@@ -16152,6 +16349,128 @@ mod tests {
     a.verify().await;
     b.verify().await;
 }
+
+// ------------------------------------------------------------------
+// Spec model-deprecation-alerts, Task 5 — runtime model-not-found
+// detection + failover classification guard tests.
+// ------------------------------------------------------------------
+
+/// Guard (Req 6.1/6.3): a 404 model_not_found from the primary
+/// fails over to the healthy second provider — exactly one request to
+/// the dead model (no same-provider retry), a `model_not_found`
+/// ledger row, and a runtime-gone mark recorded for later candidate
+// selection.
+#[tokio::test]
+async fn model_not_found_404_fails_over_with_gone_mark() {
+    use wiremock::matchers::{method, path};
+
+    let a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            r#"{"error":{"code":"model_not_found","message":"The model 'x' does not exist"}}"#,
+        ))
+        .expect(1)
+        .mount(&a)
+        .await;
+    let b = MockServer::start().await;
+    mount_streamed_turn(&b).await;
+    let mut router = failover_pair_router(&a, &b);
+    let deprecations = Arc::new(DeprecationState::default());
+    router.set_deprecation_state(deprecations.clone());
+    let handle = ledger_handle();
+
+    router
+        .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
+        .await
+        .expect("provider b answers after a reports the model gone");
+
+    let ledger = handle.take_failed_attempts();
+    assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+    assert_eq!(ledger[0].provider, "a");
+    assert_eq!(ledger[0].status_code, Some(404));
+    assert_eq!(
+        ledger[0].error_class.as_deref(),
+        Some("model_not_found"),
+        "ledger: {ledger:?}"
+    );
+    assert!(deprecations.is_gone("a", "upstream-model"));
+    assert!(!deprecations.is_gone("b", "upstream-model"));
+    a.verify().await;
+    b.verify().await;
+}
+
+/// Guard (Req 6.1 negative): a plain 404 without the model-not-found
+/// signature keeps today's terminal 4xx behavior — failover loop
+/// advance (that is the existing non-retryable 4xx semantics) but NO
+/// runtime-gone mark and NO `model_not_found` ledger class.
+#[tokio::test]
+async fn plain_404_stays_terminally_classified_and_marks_nothing() {
+    use wiremock::matchers::{method, path};
+
+    let a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("no route"))
+        .expect(1)
+        .mount(&a)
+        .await;
+    let b = MockServer::start().await;
+    mount_streamed_turn(&b).await;
+    let mut router = failover_pair_router(&a, &b);
+    let deprecations = Arc::new(DeprecationState::default());
+    router.set_deprecation_state(deprecations.clone());
+    let handle = ledger_handle();
+
+    router
+        .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
+        .await
+        .expect("provider b answers after a's plain 404 fails over per the 4xx policy");
+
+    let ledger = handle.take_failed_attempts();
+    assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+    assert_eq!(ledger[0].error_class.as_deref(), Some("upstream_http_404"));
+    assert!(
+        !deprecations.is_gone("a", "upstream-model"),
+        "a plain 404 must not mark the model gone"
+    );
+    a.verify().await;
+    b.verify().await;
+}
+
+/// Guard (Req 5.2): a `provider:model` marked runtime-gone is
+/// excluded from candidate selection for a subsequent request — the
+/// group's healthy second provider serves it without any request to
+/// the gone entry.
+#[tokio::test]
+async fn gone_marked_model_is_skipped_for_subsequent_requests() {
+    use wiremock::matchers::{method, path};
+
+    let a = MockServer::start().await;
+    // Zero hits expected: the gone mark must keep this candidate out
+    // of the chain entirely.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("must not be reached"))
+        .expect(0)
+        .mount(&a)
+        .await;
+    let b = MockServer::start().await;
+    mount_streamed_turn(&b).await;
+    let mut router = failover_pair_router(&a, &b);
+    let deprecations = Arc::new(DeprecationState::default());
+    note_runtime_gone(&deprecations, "a", "upstream-model");
+    router.set_deprecation_state(deprecations.clone());
+
+    router
+        .route_request(&compression_request(false), None, ToolCompressionRestore::default())
+        .await
+        .expect("provider b serves while a's model is marked gone");
+
+    a.verify().await;
+    b.verify().await;
+}
+
 
     // ------------------------------------------------------------------
     // Spec per-provider-tool-compression-toggle, Task 5 — strict
@@ -18663,6 +18982,8 @@ extra: Default::default(),
                 cost_per_million_reasoning_tokens: None,
                 reasoning_family: None,
                 reasoning_parameter: None,
+                deprecation_date: None,
+                replacement_model: None,
             }],
         }];
 
@@ -18709,6 +19030,8 @@ extra: Default::default(),
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
                 ProviderModel {
                     provider: "provider-high-priority".to_string(),
@@ -18727,6 +19050,8 @@ extra: Default::default(),
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
             ],
         }];
@@ -18767,6 +19092,8 @@ extra: Default::default(),
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
                 ProviderModel {
                     provider: "cheap-provider".to_string(),
@@ -18785,6 +19112,8 @@ extra: Default::default(),
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
             ],
         }];
@@ -18825,6 +19154,8 @@ extra: Default::default(),
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
                 ProviderModel {
                     provider: "fast-provider".to_string(),
@@ -18843,6 +19174,8 @@ extra: Default::default(),
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
             ],
         }];
@@ -19299,6 +19632,8 @@ extra: Default::default(),
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
                 ProviderModel {
                     provider: "provider-2".to_string(),
@@ -19317,6 +19652,8 @@ extra: Default::default(),
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
                 ProviderModel {
                     provider: "provider-3".to_string(),
@@ -19338,6 +19675,8 @@ extra: Default::default(),
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
             ],
         }];
@@ -19515,6 +19854,8 @@ extra: Default::default(),
             cost_per_million_reasoning_tokens: None,
             reasoning_family: None,
             reasoning_parameter: None,
+            deprecation_date: None,
+            replacement_model: None,
         }];
         config.model_groups = vec![ModelGroup {
             name: "test-group".to_string(),
@@ -21077,6 +21418,8 @@ mod property_tests {
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 }
             })
     }
@@ -21256,6 +21599,8 @@ mod property_tests {
                 cost_per_million_reasoning_tokens: None,
                 reasoning_family: None,
                 reasoning_parameter: None,
+                deprecation_date: None,
+                replacement_model: None,
             }],
         };
 
@@ -21290,6 +21635,8 @@ mod property_tests {
                 cost_per_million_reasoning_tokens: None,
                 reasoning_family: None,
                 reasoning_parameter: None,
+                deprecation_date: None,
+                replacement_model: None,
             }],
         };
 
@@ -21839,6 +22186,8 @@ mod property_tests {
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
                 ProviderModel {
                     provider: "backup".to_string(),
@@ -21857,6 +22206,8 @@ mod property_tests {
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
             ],
         };

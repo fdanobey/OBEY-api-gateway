@@ -23,6 +23,7 @@
 ### Access Control
 - [Virtual Keys](Virtual-Keys)
 - [Budgets & Alerts](Budgets-and-Alerts)
+- [Model Deprecation Alerts](Model-Deprecation-Alerts)
 - [Cost Reports](Cost-Reports)
 - [Guardrail Pipelines](Guardrail-Pipelines)
 - [Agent Loop Detection](Agent-Loop-Detection)

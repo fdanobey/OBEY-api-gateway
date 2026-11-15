@@ -102,6 +102,8 @@ fn group_model(model: &str, context_window: u32) -> ProviderModel {
         cost_per_million_reasoning_tokens: None,
         reasoning_family: None,
         reasoning_parameter: None,
+        deprecation_date: None,
+        replacement_model: None,
     }
 }
 
@@ -177,6 +179,7 @@ fn base_config(enforcement: EnforcementMode) -> Config {
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
         opentelemetry: Default::default(),
+        model_deprecations: Default::default(),
     };
     common::isolate_databases(&mut config);
     config

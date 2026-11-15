@@ -183,6 +183,8 @@ mod tests {
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -209,6 +211,7 @@ mod tests {
             reasoning_compat: Default::default(),
             webhooks: Default::default(),
             opentelemetry: Default::default(),
+            model_deprecations: Default::default(),
         }
     }
 

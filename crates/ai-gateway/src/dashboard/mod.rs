@@ -1165,6 +1165,8 @@ mod tests {
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -1185,6 +1187,7 @@ mod tests {
             guardrails: None,
         webhooks: Default::default(),
         opentelemetry: Default::default(),
+        model_deprecations: Default::default(),
             tool_compression: Default::default(),
             smart_routing: Default::default(),
             memory: None,
@@ -1729,5 +1732,68 @@ mod tests {
             assert!(row.request_body.is_none() && row.response_body.is_none());
         }
         assert!(entries.iter().all(|e| e.status_code >= 400));
+    }
+
+    /// Model-deprecation rows in the recent-alerts feed
+    /// (model-deprecation-alerts spec, Task 9): a `model.deprecated`
+    /// ledger row must surface in the dashboard snapshot's
+    /// `recent_budget_alerts` (the `webhook.test`-only filter does
+    /// NOT exclude it) with `threshold_percent: None` (no
+    /// `data.percent` key in a deprecation payload — design,
+    /// AlertSummary.threshold_percent is None for deprecation rows).
+    #[tokio::test]
+    async fn dashboard_snapshot_feed_includes_model_deprecated_rows() {
+        let mut config = test_config();
+        let database = tempfile::NamedTempFile::new().unwrap();
+        config.logging.database_path = database.path().to_string_lossy().into_owned();
+        let server = GatewayServer::new(config, None).await.unwrap();
+
+        // Seed the alert ledger with one model.deprecated row (the
+        // D9 seam shape: payload = the serialized event envelope).
+        // Fresh UUID: the sibling webhooks.db derivation can collide
+        // across parallel dashboard tests sharing one temp dir.
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let payload = serde_json::json!({
+            "id": event_id,
+            "type": "model.deprecated",
+            "created_at": "2026-11-14T19:00:00Z",
+            "signed": false,
+            "data": {
+                "provider": "test-provider",
+                "model": "gpt-4",
+                "evidence_source": "provider_metadata",
+                "requests_7d": 3,
+                "runtime_gone": false
+            }
+        });
+server
+.state
+.webhook_ledger
+.insert_event(
+&event_id,
+"model.deprecated",
+"model",
+"model:test-provider/gpt-4",
+&payload.to_string(),
+chrono::Utc::now().timestamp(),
+)
+.unwrap();
+
+let snapshot = build_dashboard_snapshot(&server.state).await;
+let row = snapshot
+.recent_budget_alerts
+.iter()
+.find(|alert| alert.event_type == "model.deprecated")
+.unwrap_or_else(|| {
+panic!(
+"model.deprecated missing from recent-alerts feed: {:?}",
+snapshot.recent_budget_alerts
+)
+});
+assert_eq!(row.scope_label, "model:test-provider/gpt-4");
+        assert!(
+            row.threshold_percent.is_none(),
+            "deprecation rows carry no percent — threshold_percent must tolerate None"
+        );
     }
 }

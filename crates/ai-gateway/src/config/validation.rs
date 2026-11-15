@@ -159,6 +159,18 @@ pub fn unknown_copilot_models<'a>(
         .collect()
 }
 
+/// Parses a `deprecation_date` config value (model-deprecation-alerts,
+/// Req 2.2): an ISO 8601 calendar date (`YYYY-MM-DD`) or a full ISO 8601
+/// datetime (RFC 3339). `None` = unparseable.
+pub(crate) fn parse_deprecation_date(value: &str) -> Option<chrono::NaiveDate> {
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return Some(date);
+    }
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|datetime| datetime.date_naive())
+}
+
 /// Returns the offending credential channel when wildcard CORS origins are
 /// combined with Authorization-header exposure (black-october-security-
 /// hardening, Req 4.2). `None` when the combination is safe.
@@ -1019,21 +1031,62 @@ prefix stickiness is disabled and routing uses normal priority/cost/latency sort
                     }
                 }
 
-                let mut specializations = std::collections::HashSet::new();
-                for specialization in &model.specializations {
-                    if !specializations.insert(*specialization) {
-                        errors.push(ValidationError::InvalidValue {
-                            field: format!(
-                                "model_groups.{}.models.{}.specializations",
-                                group.name, model.model
-                            ),
-                            value: format!("duplicate {specialization:?}"),
-                            expected: "each task type at most once".to_string(),
-                        });
-                    }
+            let mut specializations = std::collections::HashSet::new();
+            for specialization in &model.specializations {
+                if !specializations.insert(*specialization) {
+                    errors.push(ValidationError::InvalidValue {
+                        field: format!(
+                            "model_groups.{}.models.{}.specializations",
+                            group.name, model.model
+                        ),
+                        value: format!("duplicate {specialization:?}"),
+                        expected: "each task type at most once".to_string(),
+                    });
+                }
+            }
+
+            // Validate deprecation fields (model-deprecation-alerts,
+            // Req 2.2, 7.4): dates must parse as ISO 8601, replacements
+            // must be non-blank when present.
+            if let Some(deprecation_date) = &model.deprecation_date {
+                if parse_deprecation_date(deprecation_date).is_none() {
+                    errors.push(ValidationError::InvalidValue {
+                        field: format!(
+                            "model_groups.{}.models.{}.deprecation_date (provider: {})",
+                            group.name, model.model, model.provider
+                        ),
+                        value: deprecation_date.clone(),
+                        expected: "an ISO 8601 date (YYYY-MM-DD) or full ISO 8601 datetime"
+                            .to_string(),
+                    });
+                }
+            }
+            if let Some(replacement_model) = &model.replacement_model {
+                if replacement_model.trim().is_empty() {
+                    errors.push(ValidationError::InvalidValue {
+                        field: format!(
+                            "model_groups.{}.models.{}.replacement_model (provider: {})",
+                            group.name, model.model, model.provider
+                        ),
+                        value: replacement_model.clone(),
+                        expected: "a non-blank model identifier".to_string(),
+                    });
                 }
             }
         }
+    }
+
+    // Validate model deprecations section (model-deprecation-alerts,
+    // Req 2.2): warning window must cover at least one day and at most
+    // a year; validated even when the section is absent so a broken
+    // dormant value is reported.
+    if !(1..=365).contains(&self.model_deprecations.warn_days_before) {
+        errors.push(ValidationError::InvalidValue {
+            field: "model_deprecations.warn_days_before".to_string(),
+            value: self.model_deprecations.warn_days_before.to_string(),
+            expected: "a value between 1 and 365".to_string(),
+        });
+    }
 
         // Validate guardrail pipelines (Req 1.1, 1.2, 1.9, 1.10, 6.3, 6.6, 7.6, 8.7).
         // Runs only when the opt-in `guardrails` section is present; an absent
@@ -1673,10 +1726,12 @@ mod property_tests {
                     cost_per_million_cache_creation_input_tokens: None,
                     cache_min_tokens: None,
                     cache_support: None,
-                    cost_per_million_reasoning_tokens: None,
-                    reasoning_family: None,
-                    reasoning_parameter: None,
-                }],
+        cost_per_million_reasoning_tokens: None,
+        reasoning_family: None,
+        reasoning_parameter: None,
+        deprecation_date: None,
+        replacement_model: None,
+    }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
             retry: RetryConfig::default(),
@@ -1703,10 +1758,11 @@ mod property_tests {
             codex_search: None,
             cache_aware_routing: Default::default(),
             reasoning_compat: Default::default(),
-            webhooks: Default::default(),
-            opentelemetry: Default::default(),
-        }
+        webhooks: Default::default(),
+        opentelemetry: Default::default(),
+        model_deprecations: Default::default(),
     }
+}
 
     #[test]
     fn smart_routing_unknown_group_keys_are_rejected() {
@@ -5045,11 +5101,141 @@ model_groups:
         )));
     }
 
-    #[test]
-    fn opentelemetry_disabled_missing_endpoint_is_valid() {
-        // No endpoint requirement while dormant (only ratio/URL validity
-        // apply when disabled).
-        let config = telemetry_config(false, None, 1.0);
-        assert!(config.validate().is_ok());
+#[test]
+fn opentelemetry_disabled_missing_endpoint_is_valid() {
+    // No endpoint requirement while dormant (only ratio/URL validity
+    // apply when disabled).
+    let config = telemetry_config(false, None, 1.0);
+    assert!(config.validate().is_ok());
+}
+
+// --- Model deprecations config validation (model-deprecation-alerts,
+// Req 2.2, 7.4) ---
+
+#[test]
+fn model_deprecations_absent_section_applies_defaults_and_validates() {
+    // Dormant-default pattern: minimal_valid_config has no
+    // `model_deprecations:` source section — the struct default applies
+    // (30-day warning window) and the config still validates.
+    let config = minimal_valid_config();
+    assert_eq!(config.model_deprecations.warn_days_before, 30);
+    assert!(config.validate().is_ok());
+
+    // Same via YAML: a config without the `model_deprecations:` key
+    // deserializes with the default section.
+    let yaml = r#"
+warn_days_before: 45
+"#;
+    let with_section: ModelDeprecationsConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(with_section.warn_days_before, 45);
+}
+
+#[test]
+fn model_deprecations_section_serde_round_trips_with_model_fields() {
+    // Section-level round-trip: serialize → deserialize is identity.
+    let section = ModelDeprecationsConfig { warn_days_before: 14 };
+    let serialized = serde_yaml::to_string(&section).unwrap();
+    let reparsed: ModelDeprecationsConfig = serde_yaml::from_str(&serialized).unwrap();
+    assert_eq!(reparsed, section);
+
+    // Per-model fields round-trip through a model group and keep the
+    // exact wire strings receivers match on.
+    let mut config = minimal_valid_config();
+    config.model_deprecations = section;
+    config.model_groups[0].models[0].deprecation_date =
+        Some("2027-01-15".to_string());
+    config.model_groups[0].models[0].replacement_model =
+        Some("gpt-4-successor".to_string());
+    let serialized_group = serde_yaml::to_string(&config.model_groups).unwrap();
+    assert!(serialized_group.contains("deprecation_date: 2027-01-15"));
+    assert!(serialized_group.contains("replacement_model: gpt-4-successor"));
+    let reparsed_groups: Vec<ModelGroup> =
+        serde_yaml::from_str(&serialized_group).unwrap();
+    assert_eq!(reparsed_groups, config.model_groups);
+    assert_eq!(
+        reparsed_groups[0].models[0].deprecation_date.as_deref(),
+        Some("2027-01-15")
+    );
+    assert_eq!(
+        reparsed_groups[0].models[0].replacement_model.as_deref(),
+        Some("gpt-4-successor")
+    );
+
+    // Absent per-model keys deserialize to None (backward compatible).
+    let legacy_yaml = r#"
+name: legacy-group
+models:
+- provider: test-provider
+  model: legacy-model
+"#;
+    let legacy_group: ModelGroup = serde_yaml::from_str(legacy_yaml).unwrap();
+    assert_eq!(legacy_group.models[0].deprecation_date, None);
+    assert_eq!(legacy_group.models[0].replacement_model, None);
+}
+
+#[test]
+fn model_deprecations_invalid_date_rejected_with_group_provider_model() {
+    let mut config = minimal_valid_config();
+    config.model_groups[0].models[0].deprecation_date = Some("15.01.2027".to_string());
+    let errors = config.validate().unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, value, .. }
+        if field == "model_groups.test-group.models.gpt-4.deprecation_date (provider: test-provider)"
+            && value == "15.01.2027"
+    )));
+}
+
+#[test]
+fn model_deprecations_valid_iso8601_date_and_datetime_accepted() {
+    for date in ["2027-01-15", "2027-01-15T00:00:00Z"] {
+        let mut config = minimal_valid_config();
+        config.model_groups[0].models[0].deprecation_date = Some(date.to_string());
+        assert!(
+            config.validate().is_ok(),
+            "deprecation_date {date} should be valid"
+        );
     }
+}
+
+#[test]
+fn model_deprecations_blank_replacement_model_rejected() {
+    let mut config = minimal_valid_config();
+    config.model_groups[0].models[0].replacement_model = Some("   ".to_string());
+    let errors = config.validate().unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, .. }
+        if field == "model_groups.test-group.models.gpt-4.replacement_model (provider: test-provider)"
+    )));
+}
+
+#[test]
+fn model_deprecations_warn_days_before_bounds_validated() {
+    // 0 and 366 rejected (0 would disable warnings entirely; 366 exceeds
+    // a year of lead time).
+    for warn_days_before in [0u32, 366] {
+        let mut config = minimal_valid_config();
+        config.model_deprecations.warn_days_before = warn_days_before;
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidValue { field, value, .. }
+                if field == "model_deprecations.warn_days_before"
+                    && value == &warn_days_before.to_string()
+            )),
+            "warn_days_before {warn_days_before} should be rejected"
+        );
+    }
+    // 1 and 365 accepted (boundary values).
+    for warn_days_before in [1u32, 365] {
+        let mut config = minimal_valid_config();
+        config.model_deprecations.warn_days_before = warn_days_before;
+        assert!(
+            config.validate().is_ok(),
+            "warn_days_before {warn_days_before} should be valid"
+        );
+    }
+}
 }

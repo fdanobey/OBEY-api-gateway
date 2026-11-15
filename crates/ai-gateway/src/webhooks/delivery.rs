@@ -1,14 +1,19 @@
 //! Webhook delivery engine (budget-alerts-unified-webhooks spec,
-//! design "Component 2").
+//! design "Component 2"; generalized emit seam per
+//! model-deprecation-alerts design D9).
 //!
-//! [`WebhookNotifier`] fans each [`BudgetAlertEvent`] out to the
-//! endpoints subscribed to its type: Standard Webhooks HMAC signing
-//! for endpoints with a secret (Req 3.4), unsigned `"signed": false`
+//! [`WebhookNotifier`] fans each event out to the endpoints
+//! subscribed to its type: Standard Webhooks HMAC signing for
+//! endpoints with a secret (Req 3.4), unsigned `"signed": false`
 //! envelopes for the rest (Req 3.5), bounded retries at 0 s/30 s/2
 //! m/10 m (Req 4.2), per-attempt SSRF re-validation with fresh DNS
 //! (Req 3.5/4.5 NFR Security), and one ledger row per attempt through
 //! the blocking pool (Req 4.3). Redirects are disabled: receivers
 //! must answer directly with 200-299 (a 3xx fails the attempt).
+//! Typed [`BudgetAlertEvent`]s serialize straight from the struct
+//! (budget wire bytes stay byte-identical, the D9 regression
+//! guard); other subsystems emit `(type_str, serde_json::Value)`
+//! envelopes through [`WebhookNotifier::emit_value`].
 //!
 //! Config-read discipline (design "Component 2"): every delivery path
 //! clones its endpoint/allowlist snapshot under the config read lock
@@ -179,18 +184,46 @@ impl WebhookNotifier {
     /// (Req 4.1: asynchronous, never blocking request handling).
     /// Callers only invoke this while the subsystem is active (at
     /// least one endpoint configured; dormancy contract).
+    ///
+    /// The typed envelope serializes directly from the struct — never
+    /// through a [`serde_json::Value`] round-trip — so budget wire
+    /// bytes stay byte-identical (design D9 regression guard).
     pub async fn emit(&self, event: BudgetAlertEvent) {
         let notifier = self.clone();
         tokio::spawn(async move {
-            notifier.fan_out(event).await;
+            notifier.fan_out(PreparedEvent::budget(event)).await;
         });
     }
+
+/// Generalized emit seam (model-deprecation-alerts design D9):
+/// `type_str` is the wire event type (ledger row + subscription
+/// filter key) and `envelope` the FULL JSON envelope
+/// `{"id","type","created_at","signed","data"}` produced by its
+/// owner's typed constructor. Per-endpoint `signed` variants are
+/// built by rewriting the envelope's `signed` key. A malformed
+/// envelope (not an object, or missing/empty `id`) is dropped
+/// with a single warn; a missing or unparseable `created_at`
+/// silently falls back to the emit clock — emit never panics and
+/// never blocks.
+pub async fn emit_value(&self, type_str: &str, envelope: serde_json::Value) {
+let Some(prepared) = PreparedEvent::value(type_str, envelope, (self.clock)()) else {
+tracing::warn!(
+event_type = %type_str,
+"webhook envelope malformed (missing/empty id); event dropped"
+);
+return;
+};
+let notifier = self.clone();
+tokio::spawn(async move {
+notifier.fan_out(prepared).await;
+});
+}
 
     /// Spawned fan-out body: snapshot endpoints under the read lock
     /// (lock dropped before any I/O), record the event row, then either
     /// record `skipped_no_endpoints` (Req 4.7) or spawn one
     /// delivery chain per subscribed endpoint.
-    async fn fan_out(&self, event: BudgetAlertEvent) {
+    async fn fan_out(&self, event: PreparedEvent) {
         // Endpoint snapshot under the read lock; the guard drops at
         // the end of this block, before any signing or network I/O
         // (design "Config-read discipline").
@@ -213,7 +246,7 @@ impl WebhookNotifier {
             // Active subsystem, no subscriber for this type (Req 4.7):
             // one `skipped_no_endpoints` row, no delivery attempts.
             let ledger = Arc::clone(&self.ledger);
-            let event_id = event.id.to_string();
+            let event_id = event.id.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 ledger.record_undelivered(&event_id)
             })
@@ -230,9 +263,7 @@ impl WebhookNotifier {
             // refers to the payload template. `signed` is a field of
             // the body itself (Req 3.5), so each endpoint gets its
             // own serialization with the flag set from its secret.
-            let mut variant = event.clone();
-            variant.signed = effective_secret(&endpoint).is_some();
-            let body = match serde_json::to_vec(&variant) {
+            let body = match event.body_for_endpoint(&endpoint) {
                 Ok(body) => body,
                 Err(error) => {
                     tracing::warn!(
@@ -247,7 +278,7 @@ impl WebhookNotifier {
             // permit WITHOUT blocking — a full semaphore records a
             // failed ledger row instead of queueing work emit can
             // never await (Req 4.1) and never silently dropping.
-            let event_id = event.id.to_string();
+            let event_id = event.id.clone();
             match Arc::clone(&self.chain_permits).try_acquire_owned() {
                 Ok(permit) => {
                     let notifier = self.clone();
@@ -657,19 +688,18 @@ Some(class.to_string()),
     /// Record the alert-event row (unsigned template payload — the
     /// per-endpoint `signed` variants are delivery-time only) through
     /// the blocking pool.
-    async fn insert_alert_event_row(&self, event: &BudgetAlertEvent) {
-        let id = event.id.to_string();
-        let event_type = budget_event_type_name(&event.event_type).to_string();
-        let scope = match event.data.scope {
-            Scope::Provider => "provider".to_string(),
-            Scope::VirtualKey => "virtual_key".to_string(),
-        };
-        let scope_label = alert_scope_label(event);
-        let payload_json = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
-        let created_at = event.created_at.timestamp();
+    async fn insert_alert_event_row(&self, event: &PreparedEvent) {
         let ledger = Arc::clone(&self.ledger);
+        let event = event.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            ledger.insert_event(&id, &event_type, &scope, &scope_label, &payload_json, created_at)
+            ledger.insert_event(
+                &event.id,
+                &event.event_type,
+                &event.scope,
+                &event.scope_label,
+                &event.payload_json,
+                event.created_at,
+            )
         })
         .await;
     }
@@ -759,13 +789,22 @@ validate_delivery_url(url, allowed_private_hosts).await
 }
 }
 
-/// Whether `endpoint` subscribes to `event_type` (Req 3.2): `events`
-/// absent = all types; otherwise the type must be listed.
-fn endpoint_subscribes(endpoint: &WebhookEndpoint, event_type: &BudgetEventType) -> bool {
-match &endpoint.events {
-None => true,
-Some(events) => events.contains(event_type),
-}
+/// Whether `endpoint` subscribes to an event type (Req 3.2): `events`
+/// absent = all types; otherwise the type must be listed. Typed budget
+/// filtering converts through [`BudgetEventType`]'s serde name — the
+/// `model.deprecated` variant (model-deprecation-alerts) rides the
+/// same filter; unset endpoint filters are default-on for it.
+fn endpoint_subscribes(endpoint: &WebhookEndpoint, event_type: &str) -> bool {
+    match &endpoint.events {
+        None => true,
+        Some(events) => {
+            // Budget filters store the typed enum; string event types
+            // match through the serde rename (the wire name).
+            events
+                .iter()
+                .any(|candidate| budget_event_type_name(candidate) == event_type)
+        }
+    }
 }
 
 /// Wire name of a budget event type (ledger rows + tracing).
@@ -774,6 +813,7 @@ fn budget_event_type_name(event_type: &BudgetEventType) -> &'static str {
         BudgetEventType::BudgetWarning => "budget.warning",
         BudgetEventType::BudgetExhausted => "budget.exhausted",
         BudgetEventType::BudgetReset => "budget.reset",
+        BudgetEventType::ModelDeprecated => "model.deprecated",
     }
 }
 
@@ -792,6 +832,131 @@ fn alert_scope_label(event: &BudgetAlertEvent) -> String {
             (None, Some(name)) => name.clone(),
             (None, None) => "virtual_key".to_string(),
         },
+    }
+}
+
+/// Delivery-neutral prepared event (design D9 generalization): the
+/// ledger-row fields plus a body builder. Budget events keep their
+/// TYPED serialization path (the struct serializes directly —
+/// byte-identical wire bytes, the D9 regression guard); value events
+/// serialize the owner-supplied envelope with the per-endpoint
+/// `signed` key rewritten.
+#[derive(Debug, Clone)]
+struct PreparedEvent {
+    /// Event id (uuid string) — `webhook-id` header + ledger row.
+    id: String,
+    /// Wire event type (e.g. `budget.warning`, `model.deprecated`).
+    event_type: String,
+    /// Ledger scope (`provider` | `virtual_key` | `model`).
+    scope: String,
+    /// Ledger scope label (provider name / `key:...` / model id).
+    scope_label: String,
+    /// Unsigned template payload (ledger row).
+    payload_json: String,
+    /// Ledger `created_at` (UTC epoch seconds).
+    created_at: i64,
+    /// Body builder: `Ok(bytes)` per endpoint, or an error string.
+    body: PreparedBody,
+}
+
+/// Per-endpoint body source for a [`PreparedEvent`].
+#[derive(Debug, Clone)]
+enum PreparedBody {
+    /// Typed budget envelope: per-endpoint clone + `signed` flag set
+    /// from the secret, then `serde_json::to_vec` — the ORIGINAL
+    /// delivery path, unchanged (byte-identity guarantee).
+    Budget(BudgetAlertEvent),
+    /// Full JSON envelope from the owning subsystem: the `signed` key
+    /// is rewritten in the object before serialization.
+    Value(serde_json::Value),
+}
+
+impl PreparedEvent {
+    /// Prepare a typed budget event (original path, byte-identical).
+    fn budget(event: BudgetAlertEvent) -> Self {
+        let id = event.id.to_string();
+        let event_type = budget_event_type_name(&event.event_type).to_string();
+        let scope = match event.data.scope {
+            Scope::Provider => "provider".to_string(),
+            Scope::VirtualKey => "virtual_key".to_string(),
+        };
+        let scope_label = alert_scope_label(&event);
+        let payload_json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+        let created_at = event.created_at.timestamp();
+        Self {
+            id,
+            event_type,
+            scope,
+            scope_label,
+            payload_json,
+            created_at,
+            body: PreparedBody::Budget(event),
+        }
+    }
+
+    /// Prepare a value-envelope event (D9 seam): validates the shape
+    /// (`id` string + RFC 3339 `created_at` + object), extracts the
+    /// ledger fields, and stores the envelope for per-endpoint
+    /// serialization. Returns `None` (caller drops with a warn) when
+    /// the envelope is malformed.
+fn value(type_str: &str, envelope: serde_json::Value, now_secs: i64) -> Option<Self> {
+let object = envelope.as_object()?;
+let id = object.get("id")?.as_str()?.to_string();
+if id.is_empty() {
+return None;
+}
+// Ledger scope label derived from the envelope's own data
+// fields (D9: the envelope is the source of truth):
+// `model:{provider}/{model}` for model events carrying both,
+// with the event-type fallback for envelopes without them.
+let scope_label = object
+.get("data")
+.and_then(|data| data.as_object())
+.and_then(|data| {
+let provider = data.get("provider")?.as_str()?;
+let model = data.get("model")?.as_str()?;
+Some(format!("model:{provider}/{model}"))
+})
+.unwrap_or_else(|| type_str.to_string());
+let created_at = object
+.get("created_at")
+.and_then(|value| value.as_str())
+.and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+.map(|parsed| parsed.timestamp())
+// Missing/unparseable created_at: fall back to the emit
+// clock so the ledger row stays sane.
+.unwrap_or(now_secs);
+let payload_json = serde_json::to_string(&envelope).ok()?;
+Some(Self {
+id,
+event_type: type_str.to_string(),
+scope: "model".to_string(),
+scope_label,
+payload_json,
+created_at,
+body: PreparedBody::Value(envelope),
+})
+}
+
+    /// Serialize this endpoint's body variant: budget events clone
+    /// the typed struct and set `signed`; value events rewrite the
+    /// `signed` object key. Signature input is the exact bytes sent.
+    fn body_for_endpoint(&self, endpoint: &WebhookEndpoint) -> Result<Vec<u8>, String> {
+        let signed = effective_secret(endpoint).is_some();
+        match &self.body {
+            PreparedBody::Budget(event) => {
+                let mut variant = event.clone();
+                variant.signed = signed;
+                serde_json::to_vec(&variant).map_err(|error| error.to_string())
+            }
+            PreparedBody::Value(envelope) => {
+                let mut variant = envelope.clone();
+                if let Some(object) = variant.as_object_mut() {
+                    object.insert("signed".to_string(), serde_json::Value::Bool(signed));
+                }
+                serde_json::to_vec(&variant).map_err(|error| error.to_string())
+            }
+        }
     }
 }
 

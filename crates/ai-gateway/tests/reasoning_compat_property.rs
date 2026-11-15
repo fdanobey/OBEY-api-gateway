@@ -325,6 +325,8 @@ fn make_provider_model(model: &str, family: ReasoningFamily) -> ProviderModel {
         cost_per_million_reasoning_tokens: None,
         reasoning_family: Some(family),
         reasoning_parameter: None,
+        deprecation_date: None,
+        replacement_model: None,
     }
 }
 
@@ -351,6 +353,8 @@ fn make_provider_model_with_reasoning_price(
         cost_per_million_reasoning_tokens: reasoning_price,
         reasoning_family: Some(family),
         reasoning_parameter: None,
+        deprecation_date: None,
+        replacement_model: None,
     }
 }
 
@@ -849,6 +853,8 @@ fn cost_uses_output_price_when_reasoning_unset() {
         cache_support: None,
         reasoning_family: None,
         reasoning_parameter: None,
+        deprecation_date: None,
+        replacement_model: None,
     };
 
     let cost = reasoning_cost(&model, 1_000_000);

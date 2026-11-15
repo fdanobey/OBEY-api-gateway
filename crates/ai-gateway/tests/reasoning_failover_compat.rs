@@ -91,6 +91,7 @@ fn compat_config(compat: ReasoningCompatConfig, max_retries: u32) -> Config {
         codex_search: None,
     webhooks: Default::default(),
     opentelemetry: Default::default(),
+    model_deprecations: Default::default(),
     }
 }
 
@@ -170,6 +171,8 @@ fn reasoning_model(
         cost_per_million_reasoning_tokens: reasoning_price,
         reasoning_family: family,
         reasoning_parameter: None,
+        deprecation_date: None,
+        replacement_model: None,
     }
 }
 

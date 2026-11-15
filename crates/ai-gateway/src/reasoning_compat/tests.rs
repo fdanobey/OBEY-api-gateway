@@ -102,6 +102,8 @@ fn pm(
         cost_per_million_reasoning_tokens: None,
         reasoning_family: family,
         reasoning_parameter: shape,
+        deprecation_date: None,
+        replacement_model: None,
     }
 }
 

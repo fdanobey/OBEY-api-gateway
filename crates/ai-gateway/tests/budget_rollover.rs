@@ -78,6 +78,7 @@ fn base_config() -> Config {
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
         opentelemetry: Default::default(),
+        model_deprecations: Default::default(),
     }
 }
 
@@ -139,6 +140,8 @@ fn expensive_model() -> ProviderModel {
         cost_per_million_reasoning_tokens: None,
         reasoning_family: None,
         reasoning_parameter: None,
+        deprecation_date: None,
+        replacement_model: None,
     }
 }
 

@@ -173,6 +173,8 @@ impl ProviderSelectionFixture {
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 }
             })
             .collect();
@@ -295,6 +297,7 @@ fn build_router_from_fixture(fixture: &ProviderSelectionFixture) -> Router {
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
         opentelemetry: Default::default(),
+        model_deprecations: Default::default(),
     };
     common::isolate_databases(&mut config);
     Router::new(Arc::new(RwLock::new(config)), test_metrics())
@@ -475,6 +478,8 @@ async fn provider_order_matches_reference_policy_fixed_scenarios() {
         cost_per_million_reasoning_tokens: None,
         reasoning_family: None,
         reasoning_parameter: None,
+        deprecation_date: None,
+        replacement_model: None,
     };
 
     let scenarios = vec![
@@ -630,6 +635,8 @@ async fn provider_order_matches_reference_policy_generated_scenarios() {
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 }
             })
             .collect();
@@ -740,6 +747,8 @@ fn test_config() -> Config {
                 cost_per_million_reasoning_tokens: None,
                 reasoning_family: None,
                 reasoning_parameter: None,
+                deprecation_date: None,
+                replacement_model: None,
             }],
         }],
         circuit_breaker: CircuitBreakerConfig::default(),
@@ -767,6 +776,7 @@ fn test_config() -> Config {
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
         opentelemetry: Default::default(),
+        model_deprecations: Default::default(),
     }
 }
 
@@ -1518,6 +1528,8 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 })
                 .collect();
             ModelGroup {
@@ -1572,6 +1584,7 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
         opentelemetry: Default::default(),
+        model_deprecations: Default::default(),
     };
     common::isolate_databases(&mut config);
     let shared = Arc::new(RwLock::new(config));

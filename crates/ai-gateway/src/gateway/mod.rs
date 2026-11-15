@@ -131,7 +131,21 @@ pub struct AppState {
     /// `None`-free handle to the provider alert hook; methods internally
     /// no-op while `config.webhooks.endpoints` is empty (Req 3.3).
     pub provider_budget_alerts: Arc<ProviderBudgetAlerts>,
-    /// The shared notifier behind `provider_budget_alerts` (same
+    /// Model-deprecation runtime-detection state
+    /// (model-deprecation-alerts spec, Task 5): the SAME `Arc` the
+    /// router's error-classification sites and candidate selector use,
+    /// surfaced here for later admin/scanner tasks. Wire-only in this
+    /// task — no scanner loop, no event emission.
+pub deprecation_state: Arc<crate::model_deprecations::state::DeprecationState>,
+/// Model-deprecation metadata scanner (model-deprecation-alerts,
+/// Task 7): built once in `GatewayServer::new` on the same config
+/// and state Arcs the router holds. The admin manual-trigger
+/// route and the background cadence loop (spawned in
+/// [`GatewayServer::start_with_shutdown`]) share this single
+/// instance — one built-once HTTP client, one single-flight
+/// guard, one last-scan view.
+pub deprecation_scanner: Arc<crate::model_deprecations::scanner::ModelMetadataScanner>,
+/// The shared notifier behind `provider_budget_alerts` (same
     /// construction, same Arc) — held separately so the admin
     /// test-send route reuses the built-once client instead of
     /// constructing a new notifier per request.
@@ -270,9 +284,37 @@ impl GatewayServer {
                 }
             },
         ));
-        let mut router = RequestRouter::new(config_arc.clone(), metrics.clone());
-        router.set_memory_system(memory_system.clone());
-        router.set_compression_event_hub(compression_events.clone());
+    let mut router = RequestRouter::new(config_arc.clone(), metrics.clone());
+    router.set_memory_system(memory_system.clone());
+    router.set_compression_event_hub(compression_events.clone());
+    // Model-deprecation state (model-deprecation-alerts, Task 5):
+    // constructed once, shared between the router (runtime-gone
+    // recording + candidate skip) and AppState (admin/scanner tasks
+    // 6-8). Wire-only here — the scanner loop and event emission are
+    // later tasks.
+ let deprecation_state = Arc::new(crate::model_deprecations::state::DeprecationState::default());
+ router.set_deprecation_state(deprecation_state.clone());
+        // Scanner (Task 7 + Task 9 emission wiring): same config +
+        // state Arcs as the router, plus the shared logger/notifier
+        // Arcs so every completed scan pass fires
+        // `spawn_deprecation_emission` (fire-and-forget inside
+        // `scan_all`); the background loop is spawned in
+        // `start_with_shutdown`, never here — `GatewayServer::new`
+        // must stay test-safe (no timers firing 15 s after
+        // construction in oneshot tests).
+        let logger_arc = Arc::new(logger);
+        let deprecation_scanner =
+            Arc::new(crate::model_deprecations::scanner::ModelMetadataScanner::with_emission(
+                config_arc.clone(),
+                deprecation_state.clone(),
+                Some((logger_arc.clone(), webhook_notifier.clone())),
+            ));
+        // Runtime-gone emission deps (Task 9): the router's two
+        // `note_runtime_gone` call sites fire
+        // `spawn_deprecation_emission` through this per-instance
+        // handle (fire-and-forget; bare routers built without it
+        // stay dormant).
+        router.set_deprecation_emission(logger_arc.clone(), webhook_notifier.clone());
         let precompressed_manager = build_precompressed_manager(&config, config_path.as_deref());
         router.set_precompressed_manager(precompressed_manager);
 
@@ -639,8 +681,8 @@ impl GatewayServer {
             config_path: Arc::new(
                 config_path.unwrap_or_else(|| std::path::PathBuf::from("./config.yaml")),
             ),
-            router: Arc::new(router),
-            logger: Arc::new(logger),
+        router: Arc::new(router),
+        logger: logger_arc,
             assistants_store: Arc::new(assistants_store),
             cache,
             exact_cache: Arc::new(ExactCache::new(&config.exact_cache)),
@@ -677,9 +719,11 @@ impl GatewayServer {
             )),
             responses_store: Arc::new(responses_store),
             runtime_limits: Arc::new(crate::runtime_limits::RuntimeLimits::from_config(&config)),
-            webhook_ledger,
-            provider_budget_alerts,
-            webhook_notifier,
+ webhook_ledger,
+ provider_budget_alerts,
+ deprecation_state,
+ deprecation_scanner,
+ webhook_notifier,
             telemetry_exporter: telemetry_exporter.clone(),
             telemetry_snapshot: telemetry_snapshot.clone(),
         };
@@ -1104,16 +1148,38 @@ impl GatewayServer {
         let logger = self.state.logger.clone();
         let metrics = self.state.metrics.clone();
 
-        // Sweep expired prompt-cache sticky entries every 60s (lazy
-        // eviction already covers lookups; this bounds memory growth).
-        let sticky_router = self.state.router.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                sticky_router.evict_expired_sticky_entries();
-            }
-        });
+ // Sweep expired prompt-cache sticky entries every 60s (lazy
+ // eviction already covers lookups; this bounds memory growth).
+ let sticky_router = self.state.router.clone();
+ tokio::spawn(async move {
+ let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+ loop {
+ interval.tick().await;
+ sticky_router.evict_expired_sticky_entries();
+ }
+ });
+
+ // Shared shutdown fan-out (model-deprecation-alerts, Task 7): one
+ // bridge task owns the user shutdown future and signals every
+ // consumer — the serve graceful-shutdown handlers below and the
+ // deprecation-scanner background loop — through a watch channel
+ // (the memory decay-scheduler pattern). A dropped sender (bridge
+ // task aborted with the server) also wakes every receiver, so the
+ // loop is shutdown-safe by construction.
+ let (shutdown_signal_tx, shutdown_signal_rx) = tokio::sync::watch::channel(false);
+ tokio::spawn(async move {
+ shutdown.await;
+ let _ = shutdown_signal_tx.send(true);
+ });
+ let scanner_shutdown_rx = shutdown_signal_rx.clone();
+ let https_shutdown_rx = shutdown_signal_rx.clone();
+ let http_shutdown_rx = shutdown_signal_rx;
+ // Model-deprecation scanner background loop (Req 1.1/1.1a):
+ // startup scan after 15 s, then every 24 h, stopping with the
+ // shutdown signal above.
+ self.state
+ .deprecation_scanner
+ .spawn_background(scanner_shutdown_rx);
 
         if let Some(rustls_config) = rustls_config {
             // Req 36.1: HTTPS only when TLS enabled
@@ -1123,14 +1189,15 @@ impl GatewayServer {
 
             tracing::info!("OBEY-API listening on {} (HTTPS)", addr);
 
-            let handle = axum_server::Handle::new();
-            let handle_clone = handle.clone();
+ let handle = axum_server::Handle::new();
+ let handle_clone = handle.clone();
+ let mut https_shutdown_rx = https_shutdown_rx;
 
-            tokio::spawn(async move {
-                shutdown.await;
-                shutting_down.store(true, Ordering::Relaxed);
-                handle_clone.graceful_shutdown(None);
-            });
+ tokio::spawn(async move {
+ https_shutdown_rx.changed().await.ok();
+ shutting_down.store(true, Ordering::Relaxed);
+ handle_clone.graceful_shutdown(None);
+ });
 
             axum_server::bind_rustls(addr_parsed, rustls_config)
                 .handle(handle)
@@ -1145,13 +1212,15 @@ impl GatewayServer {
 
             tracing::info!("OBEY-API listening on {} (HTTP)", addr);
 
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    shutdown.await;
-                    shutting_down.store(true, Ordering::Relaxed);
-                })
-                .await
-                .map_err(|e| GatewayError::Http(format!("Server error: {}", e)))?;
+ axum::serve(listener, router)
+ .with_graceful_shutdown(async move {
+ let mut http_shutdown_rx = http_shutdown_rx;
+ // Resolves on the signal OR on sender drop (server aborted).
+ http_shutdown_rx.changed().await.ok();
+ shutting_down.store(true, Ordering::Relaxed);
+ })
+ .await
+ .map_err(|e| GatewayError::Http(format!("Server error: {}", e)))?;
         }
 
         // Server has stopped — all in-flight requests are complete.
@@ -1636,6 +1705,20 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     state.router.clear_sticky_cache();
     state.router.clear_http_clients();
     state.router.clear_model_capabilities();
+// Model-deprecation reload sweep (model-deprecation-alerts,
+// Req 5.2): drop deprecation registry entries for providers
+// removed from the config AND clear runtime-gone marks for
+// still-configured providers (the candidate skip lasts until
+// reload, a re-arming scan, or the 24-hour bound). Scan data
+// and open episodes for kept providers persist (see
+// `Router::clear_deprecations_for_reload`).
+{
+let cfg = state.config.read().await;
+let provider_names: Vec<String> =
+cfg.providers.iter().map(|p| p.name.clone()).collect();
+drop(cfg);
+state.router.clear_deprecations_for_reload(&provider_names);
+}
 
     // Reset tool compression state on config reload (feedback loops, descriptions, etc.)
     {
@@ -2090,6 +2173,8 @@ mod tests {
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 }],
             }],
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -2116,6 +2201,7 @@ mod tests {
             reasoning_compat: Default::default(),
             webhooks: Default::default(),
             opentelemetry: Default::default(),
+            model_deprecations: Default::default(),
         }
     }
 
@@ -3110,6 +3196,8 @@ mod tests {
                                cost_per_million_reasoning_tokens: None,
                                reasoning_family: None,
                                reasoning_parameter: None,
+                               deprecation_date: None,
+                               replacement_model: None,
                                });
                            }
 
@@ -3164,6 +3252,7 @@ mod tests {
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
         opentelemetry: Default::default(),
+        model_deprecations: Default::default(),
     };
 
     let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -3744,6 +3833,8 @@ mod tests {
                                cost_per_million_reasoning_tokens: None,
                                reasoning_family: None,
                                reasoning_parameter: None,
+                               deprecation_date: None,
+                               replacement_model: None,
                                }],
                            }],
                            circuit_breaker: CircuitBreakerConfig::default(),
@@ -3770,6 +3861,7 @@ mod tests {
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
         opentelemetry: Default::default(),
+        model_deprecations: Default::default(),
     };
 
     // Write new config to disk

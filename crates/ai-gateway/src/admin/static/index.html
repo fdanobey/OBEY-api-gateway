@@ -93,6 +93,7 @@ font-size:.875rem;font-weight:500;cursor:pointer;transition:background .15s}
 .models-container .form-row .mdl-smart-routing-details{grid-column:1 / -1}
 .models-container .form-row .mdl-smart-routing-details .mdl-tier{min-width:200px}
 .models-container .form-row .mdl-smart-routing-details .mdl-context-window{min-width:160px}
+.models-container .form-row .mdl-deprecation-details{grid-column:1 / -1}
 .models-container .form-row > .remove-model{grid-column:7;grid-row:1}
 .mdl-cache-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.5rem;margin-top:.5rem}
 .mdl-cache-bp-group[hidden]{display:none}
@@ -321,6 +322,11 @@ table.wh-table tbody tr:hover{background:rgba(13,110,253,.04)}
 .wh-test-result{margin-top:.5rem;font-size:.75rem}
 .wh-form .error{font-size:.75rem;color:var(--danger);margin-top:.15rem;display:none}
 .wh-form .error.visible{display:block}
+/* Model Deprecations (model-deprecation-alerts, Req 2.3, 7.3, 7.4) */
+.md-controls{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-bottom:.75rem}
+.md-scan-status{font-size:.8rem;color:var(--text-muted)}
+.md-monospace{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
+.md-stale{color:#8a6d0b;font-size:.75rem}
 /* Cost Reports (billing-grade-cost-reporting, Req 5) */
 .cr-controls{margin-bottom:.75rem}
 .cr-presets{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.75rem}
@@ -395,6 +401,7 @@ body.sec-banner-active{padding-top:3.2rem}
     <li role="presentation"><button class="nav-btn" role="tab" type="button" data-page="structured-output" id="tab-structured-output" aria-controls="page-structured-output">Structured Output</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="memory" id="tab-memory" aria-controls="page-memory">Persistent Memory</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="webhooks" id="tab-webhooks" aria-controls="page-webhooks">Webhooks</button></li>
+<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="model-deprecations" id="tab-model-deprecations" aria-controls="page-model-deprecations">Model Deprecations</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="tracing" id="tab-tracing" aria-controls="page-tracing">Tracing</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="cost-reports" id="tab-cost-reports" aria-controls="page-cost-reports">Cost Reports</button></li>
 <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="prompts" id="tab-prompts" aria-controls="page-prompts">Prompts</button></li>
@@ -1078,6 +1085,21 @@ body.sec-banner-active{padding-top:3.2rem}
 <label class="form-check" style="margin:0"><input type="checkbox" class="mdl-spec" value="tool_use"> Tool use</label>
 <label class="form-check" style="margin:0"><input type="checkbox" class="mdl-spec" value="summarization"> Summarization</label>
 <label class="form-check" style="margin:0"><input type="checkbox" class="mdl-spec" value="general"> General</label>
+</div>
+</div>
+</details>
+<details class="mdl-deprecation-details">
+<summary>Deprecation Overrides</summary>
+<div class="hint" style="margin:.4rem 0 .7rem">Optional operator overrides that take precedence over provider-sourced metadata (Model Deprecations feature). Leave blank to inherit scan data.</div>
+<div class="form-row" style="flex-wrap:wrap;gap:.5rem 1rem">
+<div class="form-group" style="margin:0">
+<label>Deprecation Date</label>
+<input type="date" class="mdl-deprecation-date" placeholder="YYYY-MM-DD">
+<div class="hint" style="margin:0">ISO 8601 date (YYYY-MM-DD).</div>
+</div>
+<div class="form-group" style="margin:0">
+<label>Replacement Model</label>
+<input type="text" class="mdl-replacement-model" placeholder="successor-model-id" autocomplete="off">
 </div>
 </div>
 </details>
@@ -2640,6 +2662,7 @@ body.sec-banner-active{padding-top:3.2rem}
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-warning" value="budget.warning" disabled><label for="wh-f-event-warning">budget.warning</label></div>
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-exhausted" value="budget.exhausted" disabled><label for="wh-f-event-exhausted">budget.exhausted</label></div>
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-reset" value="budget.reset" disabled><label for="wh-f-event-reset">budget.reset</label></div>
+<div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-model-deprecated" value="model.deprecated" disabled><label for="wh-f-event-model-deprecated">model.deprecated</label></div>
 </div>
 </div>
 <div class="hint">Unchecking "All" enables per-event filtering. At least one event must be selected.</div>
@@ -2702,6 +2725,52 @@ body.sec-banner-active{padding-top:3.2rem}
 <button class="btn btn-primary" id="wh-save">Save Webhooks</button>
 <button class="btn btn-secondary" id="wh-reset">Reset</button>
 </div>
+</section>
+
+<!-- Model Deprecations (model-deprecation-alerts, Req 1.4, 2.3, 7.1-7.4) -->
+<section class="page" id="page-model-deprecations" role="tabpanel" aria-labelledby="tab-model-deprecations">
+<h2>Model Deprecations</h2>
+<p class="hint" style="margin-bottom:1.5rem">Deprecation status per configured provider model, combining provider metadata scans, operator overrides (set per model in Model Groups), and runtime detection. Events fire through webhooks only for models with recent traffic.</p>
+
+<fieldset><legend>Deprecation Status</legend>
+<div class="md-controls">
+<button type="button" class="btn btn-primary btn-sm" id="md-scan-btn">Scan Now</button>
+<button type="button" class="btn btn-secondary btn-sm" id="md-refresh-btn">Refresh</button>
+<span class="md-scan-status" id="md-scan-status" role="status"></span>
+</div>
+<div class="wh-table-wrap">
+<table class="wh-table" id="md-status-table">
+<caption class="sr-only">Model deprecation status rows</caption>
+<thead>
+<tr>
+<th scope="col">Provider</th>
+<th scope="col">Model</th>
+<th scope="col">Retirement Date</th>
+<th scope="col">Days Remaining</th>
+<th scope="col">Replacement</th>
+<th scope="col">Evidence</th>
+<th scope="col">Requests (7d)</th>
+<th scope="col">Last Used</th>
+<th scope="col">Status</th>
+<th scope="col">Scan Staleness</th>
+</tr>
+</thead>
+<tbody id="md-status-tbody"></tbody>
+</table>
+</div>
+<div class="wh-empty" id="md-status-empty">No deprecation status rows. Trigger a scan, or set an override in Model Groups.</div>
+</fieldset>
+
+<fieldset><legend>Settings</legend>
+<div class="form-row">
+<div class="form-group">
+<label for="md-warn-days">Warn Days Before</label>
+<input type="number" id="md-warn-days" value="30" min="1" max="365" step="1" aria-describedby="md-warn-days-error">
+<div class="hint">Emit the deprecation warning this many days before retirement (1&ndash;365). Saved with the main config Save button.</div>
+<div class="error" id="md-warn-days-error" role="alert"></div>
+</div>
+</div>
+</fieldset>
 </section>
 
 <!-- Tracing (opentelemetry-trace-export, Req 8.1, 8.2, 7.3) -->
@@ -3134,6 +3203,7 @@ if (pageId === 'smart-routing') { populateSmartRouting((config && config.smart_r
 if (pageId === 'virtual-keys') { vkOnOpen(); }
     if (pageId === 'guardrails') { loadGuardrailVirtualKeys(); }
  if (pageId === 'webhooks') { whOnOpen(); }
+if (pageId === 'model-deprecations') { mdLoad(); }
 if (pageId === 'tracing') { otelStatusLoad(); }
 if (pageId === 'cost-reports') { crOnOpen(); }
 if (pageId === 'prompts') { plOnOpen(); }
@@ -3789,7 +3859,8 @@ if (!validatePositiveInt(ct, 'Chunk timeout')) ok = false;
 'page-loop-detection': validateLoopDetectionPage,
 'page-guardrails': validateGuardrailsPage,
 'page-structured-output': validateStructuredOutputPage,
-'page-tracing': validateTracingPage
+'page-tracing': validateTracingPage,
+'page-model-deprecations': validateModelDeprecationsPage
 };
 
   /** Validate the currently active page. Returns true if valid. */
@@ -4538,8 +4609,10 @@ models.forEach(function(m) {
  row.querySelector('.mdl-reasoning-family').value = data.reasoning_family || '';
  row.querySelector('.mdl-reasoning-param').value = data.reasoning_parameter || '';
  row.querySelector('.mdl-reasoning-cost').value = data.cost_per_million_reasoning_tokens != null ? data.cost_per_million_reasoning_tokens : '';
- row.querySelector('.mdl-tier').value = data.tier || '';
- row.querySelector('.mdl-context-window').value = data.context_window ? data.context_window : '';
+row.querySelector('.mdl-tier').value = data.tier || '';
+row.querySelector('.mdl-context-window').value = data.context_window ? data.context_window : '';
+row.querySelector('.mdl-deprecation-date').value = data.deprecation_date || '';
+row.querySelector('.mdl-replacement-model').value = data.replacement_model || '';
  var specs = Array.isArray(data.specializations) ? data.specializations : [];
  row.querySelectorAll('.mdl-spec').forEach(function(cb) { cb.checked = specs.indexOf(cb.value) !== -1; });
 		var cacheSupport = data.cache_support;
@@ -5018,6 +5091,8 @@ if(cfg.cors){document.getElementById('cors-enabled').checked=!!cfg.cors.enabled;
 populateToolCompression(cfg.tool_compression);
 populateMemory(cfg.memory);
 populateTelemetry(cfg.opentelemetry);
+var mdCfg=cfg.model_deprecations||{};
+populateNonNegativeInt('md-warn-days',mdCfg.warn_days_before,30);
 }
 
   function populateSmartRouting(value){
@@ -5173,7 +5248,7 @@ cfg.codex_search=csSearch;
     var originalProviders = (config && config.providers) || [];
     cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,buffered_upstream_streaming:card.querySelector('.prov-buffered-upstream-streaming').checked,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),rate_limit_max_wait_ms:(function(v){return v?parseInt(v,10):null;})(card.querySelector('.prov-rate-max-wait').value.trim()),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};var budgetThreshold=card.querySelector('.prov-budget-threshold').value.trim();if(budgetThreshold)p.budget.alert_threshold_percent=parseInt(budgetThreshold,10);}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}if(p.type==='github-copilot'){p.auth_method=card.querySelector('.prov-copilot-auth-method')?card.querySelector('.prov-copilot-auth-method').value:'device-oauth';if(p.auth_method==='device-oauth'){p.api_key_env=null;}if(!p.base_url)p.base_url=null;}var uaVal=card.querySelector('.prov-user-agent').value.trim();if(uaVal)p.user_agent=uaVal;else delete p.user_agent;var hdrMap={};card.querySelectorAll('.prov-header-row').forEach(function(row){var hk=row.querySelector('.prov-header-name').value.trim();var hv=row.querySelector('.prov-header-value').value;if(hk)hdrMap[hk]=hv;});if(Object.keys(hdrMap).length)p.custom_headers=hdrMap;else delete p.custom_headers;p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
     var originalGroups = (config && config.model_groups) || [];
-    cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container > .form-row').forEach(function(row,modelIndex){var originalModel=(originalGroup&&originalGroup.models&&originalGroup.models[modelIndex])||{};var m=JSON.parse(JSON.stringify(originalModel));Object.assign(m,{provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});var mdlCacheReadVal=(row.querySelector('.mdl-cache-read')||{}).value;var mdlCacheWriteVal=(row.querySelector('.mdl-cache-write')||{}).value;var mdlCacheMinVal=(row.querySelector('.mdl-cache-min-tokens')||{}).value;var mdlCacheSupportVal=(row.querySelector('.mdl-cache-support')||{}).value||'none';m.cost_per_million_cache_read_input_tokens=mdlCacheReadVal!==''?parseFloat(mdlCacheReadVal):null;m.cost_per_million_cache_creation_input_tokens=mdlCacheWriteVal!==''?parseFloat(mdlCacheWriteVal):null;m.cache_min_tokens=mdlCacheMinVal!==''?parseInt(mdlCacheMinVal,10):null;m.cache_support=mdlCacheSupportVal==='explicit'?{type:'explicit',max_breakpoints:parseInt((row.querySelector('.mdl-cache-max-bp')||{}).value||'4',10)}:(mdlCacheSupportVal==='automatic'?{type:'automatic'}:null);var mdlReasoningFamilyVal=(row.querySelector('.mdl-reasoning-family')||{}).value||'';var mdlReasoningParamVal=(row.querySelector('.mdl-reasoning-param')||{}).value||'';var mdlReasoningCostVal=(row.querySelector('.mdl-reasoning-cost')||{}).value;m.reasoning_family=mdlReasoningFamilyVal!==''?mdlReasoningFamilyVal:null;m.reasoning_parameter=mdlReasoningParamVal!==''?mdlReasoningParamVal:null;m.cost_per_million_reasoning_tokens=mdlReasoningCostVal!==''?parseFloat(mdlReasoningCostVal):null;var mdlTierVal=(row.querySelector('.mdl-tier')||{}).value||'';m.tier=mdlTierVal!==''?mdlTierVal:null;var mdlContextVal=(row.querySelector('.mdl-context-window')||{}).value;m.context_window=mdlContextVal!==''&&mdlContextVal!=null?parseInt(mdlContextVal,10):0;m.specializations=Array.prototype.map.call(row.querySelectorAll('.mdl-spec:checked'),function(cb){return cb.value;});g.models.push(m);});cfg.model_groups.push(g);});
+    cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container > .form-row').forEach(function(row,modelIndex){var originalModel=(originalGroup&&originalGroup.models&&originalGroup.models[modelIndex])||{};var m=JSON.parse(JSON.stringify(originalModel));Object.assign(m,{provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});var mdlDepDateVal=(row.querySelector('.mdl-deprecation-date')||{}).value;var mdlReplacementVal=(row.querySelector('.mdl-replacement-model')||{}).value;m.deprecation_date=mdlDepDateVal&&mdlDepDateVal.trim()!==''?mdlDepDateVal.trim():null;m.replacement_model=mdlReplacementVal&&mdlReplacementVal.trim()!==''?mdlReplacementVal.trim():null;var mdlCacheReadVal=(row.querySelector('.mdl-cache-read')||{}).value;var mdlCacheWriteVal=(row.querySelector('.mdl-cache-write')||{}).value;var mdlCacheMinVal=(row.querySelector('.mdl-cache-min-tokens')||{}).value;var mdlCacheSupportVal=(row.querySelector('.mdl-cache-support')||{}).value||'none';m.cost_per_million_cache_read_input_tokens=mdlCacheReadVal!==''?parseFloat(mdlCacheReadVal):null;m.cost_per_million_cache_creation_input_tokens=mdlCacheWriteVal!==''?parseFloat(mdlCacheWriteVal):null;m.cache_min_tokens=mdlCacheMinVal!==''?parseInt(mdlCacheMinVal,10):null;m.cache_support=mdlCacheSupportVal==='explicit'?{type:'explicit',max_breakpoints:parseInt((row.querySelector('.mdl-cache-max-bp')||{}).value||'4',10)}:(mdlCacheSupportVal==='automatic'?{type:'automatic'}:null);var mdlReasoningFamilyVal=(row.querySelector('.mdl-reasoning-family')||{}).value||'';var mdlReasoningParamVal=(row.querySelector('.mdl-reasoning-param')||{}).value||'';var mdlReasoningCostVal=(row.querySelector('.mdl-reasoning-cost')||{}).value;m.reasoning_family=mdlReasoningFamilyVal!==''?mdlReasoningFamilyVal:null;m.reasoning_parameter=mdlReasoningParamVal!==''?mdlReasoningParamVal:null;m.cost_per_million_reasoning_tokens=mdlReasoningCostVal!==''?parseFloat(mdlReasoningCostVal):null;var mdlTierVal=(row.querySelector('.mdl-tier')||{}).value||'';m.tier=mdlTierVal!==''?mdlTierVal:null;var mdlContextVal=(row.querySelector('.mdl-context-window')||{}).value;m.context_window=mdlContextVal!==''&&mdlContextVal!=null?parseInt(mdlContextVal,10):0;m.specializations=Array.prototype.map.call(row.querySelectorAll('.mdl-spec:checked'),function(cb){return cb.value;});g.models.push(m);});cfg.model_groups.push(g);});
     var retryMax=parseInt(document.getElementById('retry-max').value,10);
     var retryBackoff=parseFloat(document.getElementById('retry-backoff').value);
     var retryMultiplier=parseFloat(document.getElementById('retry-multiplier').value);
@@ -5193,8 +5268,10 @@ cfg.reasoning_compat=collectReasoningCompat();
     cfg.loop_detection=collectLoopDetection();
     cfg.guardrails=collectGuardrails();
     if(document.getElementById('so-enabled').checked || (config && config.structured_output)){cfg.structured_output=collectStructuredOutput();}else{delete cfg.structured_output;}
-    cfg.opentelemetry=collectTelemetry();
-    return cfg;
+cfg.opentelemetry=collectTelemetry();
+var mdWarnDays=parseInt(document.getElementById('md-warn-days').value,10);
+cfg.model_deprecations={warn_days_before:(Number.isFinite(mdWarnDays)&&mdWarnDays>=1&&mdWarnDays<=365)?mdWarnDays:30};
+return cfg;
   }
 
   // --- Save Config ---
@@ -8579,7 +8656,7 @@ document.getElementById('mem-qdrant-recreate').addEventListener('click', functio
   });
 
   // --- Webhooks UI Logic (budget-alerts-unified-webhooks, Req 5.1, 5.2, 5.5) ---
-var WH_EVENTS = ['budget.warning', 'budget.exhausted', 'budget.reset'];
+var WH_EVENTS = ['budget.warning', 'budget.exhausted', 'budget.reset', 'model.deprecated'];
 
 // --- Tracing UI Logic (opentelemetry-trace-export, Req 8.1, 8.2, 7.3) ---
 // otelState.headers holds editor rows; a value left equal to the
@@ -8731,6 +8808,15 @@ return ok;
 function otelStatusRow(tr, label, value) {
 tr.appendChild(otelTd(label));
 tr.appendChild(otelTd(value));
+}
+
+/** Validate the Model Deprecations page (warn_days_before range 1..=365). */
+function validateModelDeprecationsPage() {
+var warnIn = document.getElementById('md-warn-days');
+var v = parseInt(warnIn.value, 10);
+if (isNaN(v) || v < 1 || v > 365) { showError(warnIn, 'Warn days must be between 1 and 365'); return false; }
+clearError(warnIn);
+return true;
 }
 
 function otelStatusLoad() {
@@ -9211,6 +9297,163 @@ document.getElementById('wh-delivery-endpoint').addEventListener('change', whLoa
 document.getElementById('wh-delivery-refresh').addEventListener('click', whLoadDeliveries);
 document.getElementById('wh-save').addEventListener('click', whSave);
 document.getElementById('wh-reset').addEventListener('click', whLoad);
+})();
+
+// --- Model Deprecations UI Logic (model-deprecation-alerts, Req 1.4, 2.3, 7.1-7.4) ---
+/* Fetch wrapper following the whReq convention; the base prefix targets the
+ * model-deprecations admin endpoints (GET '' = status rows, POST /scan). */
+function mdReq(path, options) {
+return whReq(path, options, 'model-deprecations');
+}
+
+function mdTd(text, cls) {
+var td = document.createElement('td');
+if (cls) td.className = cls;
+td.textContent = text;
+return td;
+}
+
+function mdFmtTime(value) {
+if (value == null || value === '') return '—';
+var d = new Date(value);
+if (isNaN(d.getTime())) return String(value);
+return d.toLocaleString();
+}
+
+function mdFmtRetirement(row) {
+if (row.retirement_date == null || row.retirement_date === '') return '—';
+var raw = String(row.retirement_date);
+var d = new Date(raw);
+if (isNaN(d.getTime())) return raw;
+return d.toISOString().slice(0, 10);
+}
+
+function mdBadge(text, cls, title) {
+var b = document.createElement('span');
+b.className = 'wh-badge ' + cls;
+if (title) b.title = title;
+b.textContent = text;
+return b;
+}
+
+function mdEvidenceChip(source) {
+var known = { provider_metadata: 1, operator_override: 1, runtime_detection: 1, none: 1 };
+var s = known[source] ? source : 'none';
+var chip = document.createElement('span');
+chip.className = 'wh-chip' + (s === 'none' ? ' wh-chip-muted' : '');
+chip.textContent = s;
+return chip;
+}
+
+function mdScanStalenessCell(row) {
+var td = document.createElement('td');
+// The design pins StatusRow fields but not the staleness key; accept the
+// plausible shapes (nested provider_scan object or flat timestamps/age).
+var ps = row.provider_scan || {};
+var scannedAt = ps.last_scanned_at != null ? ps.last_scanned_at : row.last_scanned_at;
+var ageHours = null;
+if (ps.age_seconds != null) ageHours = Number(ps.age_seconds) / 3600;
+else if (row.scan_age_seconds != null) ageHours = Number(row.scan_age_seconds) / 3600;
+if (scannedAt == null || scannedAt === '') {
+if (ageHours == null || !isFinite(ageHours)) {
+td.appendChild(mdBadge('never scanned', 'wh-badge-unsigned', 'No successful scan recorded for this provider'));
+return td;
+}
+} else {
+var ms = Date.parse(scannedAt);
+if (isFinite(ms)) ageHours = (Date.now() - ms) / 3600000;
+}
+if (ageHours == null || !isFinite(ageHours)) {
+td.appendChild(mdBadge('unknown', 'wh-badge-unsigned'));
+return td;
+}
+var hours = Math.max(0, Math.floor(ageHours));
+if (hours >= 24) {
+td.appendChild(mdBadge('stale', 'wh-badge-failing', 'Last scan ' + hours + 'h ago'));
+} else {
+td.appendChild(mdBadge('fresh', 'wh-badge-ok', 'Last scan ' + hours + 'h ago'));
+}
+var when = document.createElement('div');
+when.className = 'md-stale';
+when.textContent = (scannedAt != null && scannedAt !== '') ? mdFmtTime(scannedAt) : (hours + 'h ago');
+td.appendChild(when);
+return td;
+}
+
+function mdRenderRows(rows) {
+var tbody = document.getElementById('md-status-tbody');
+var empty = document.getElementById('md-status-empty');
+var list = Array.isArray(rows) ? rows : [];
+tbody.innerHTML = ''; /* xss-audit: static */
+empty.hidden = list.length > 0;
+list.forEach(function(row) {
+var tr = document.createElement('tr');
+tr.appendChild(mdTd(row.provider || '', 'md-monospace'));
+tr.appendChild(mdTd(row.model || '', 'md-monospace'));
+tr.appendChild(mdTd(mdFmtRetirement(row)));
+tr.appendChild(mdTd(row.days_remaining != null ? String(row.days_remaining) : '—'));
+tr.appendChild(mdTd(row.replacement_model || '—', 'md-monospace'));
+var evTd = document.createElement('td');
+evTd.appendChild(mdEvidenceChip(row.evidence_source));
+tr.appendChild(evTd);
+tr.appendChild(mdTd(row.requests_7d != null ? String(row.requests_7d) : '—'));
+tr.appendChild(mdTd(mdFmtTime(row.last_used_at)));
+var stTd = document.createElement('td');
+if (row.runtime_gone) {
+stTd.appendChild(mdBadge('runtime-gone', 'wh-badge-failing', 'Upstream reported this model missing/not found at request time'));
+} else if (row.requests_7d === 0) {
+stTd.appendChild(mdBadge('unused', 'wh-badge-unsigned', 'No routed requests in the last 7 days — no alerts will fire'));
+} else {
+stTd.appendChild(mdBadge('in use', 'wh-badge-ok'));
+}
+tr.appendChild(stTd);
+tr.appendChild(mdScanStalenessCell(row));
+tbody.appendChild(tr);
+});
+}
+
+function mdLoad() {
+setStatus('Loading model deprecations…');
+mdReq('')
+.then(function(body) {
+// The endpoint returns a bare StatusRow[] (design D: status_rows shape);
+// tolerate an envelope just in case it ever grows one.
+var rows = Array.isArray(body) ? body : ((body && body.rows) || []);
+mdRenderRows(rows);
+setStatus('Model deprecations loaded');
+})
+.catch(function(err) {
+mdRenderRows([]);
+setStatus('Failed to load model deprecations: ' + err.message);
+});
+}
+
+function mdScan() {
+var btn = document.getElementById('md-scan-btn');
+var statusEl = document.getElementById('md-scan-status');
+btn.disabled = true;
+setStatus('Triggering model deprecation scan…');
+mdReq('/scan', { method: 'POST' })
+.then(function(body) {
+body = body || {};
+var started = body.result === 'started' || body.started === true;
+var already = body.result === 'already_running' || body.already_running === true;
+statusEl.textContent = started ? 'Scan started — refresh in a moment for results.'
+: already ? 'A scan is already running.'
+: JSON.stringify(body);
+setStatus(started ? 'Model deprecation scan started' : (already ? 'Scan already running' : 'Scan response received'));
+mdLoad();
+})
+.catch(function(err) {
+statusEl.textContent = 'Scan failed: ' + err.message;
+setStatus('Model deprecation scan failed: ' + err.message);
+})
+.finally(function() { btn.disabled = false; });
+}
+
+(function mdWire() {
+document.getElementById('md-scan-btn').addEventListener('click', mdScan);
+document.getElementById('md-refresh-btn').addEventListener('click', mdLoad);
 })();
 
 // --- Cost Reports (billing-grade-cost-reporting, Req 5) ---

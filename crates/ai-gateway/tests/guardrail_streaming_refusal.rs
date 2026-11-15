@@ -123,6 +123,8 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
                 ProviderModel {
                     cache_support: None,
@@ -141,6 +143,8 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
                     cost_per_million_reasoning_tokens: None,
                     reasoning_family: None,
                     reasoning_parameter: None,
+                    deprecation_date: None,
+                    replacement_model: None,
                 },
             ],
         }],
@@ -173,6 +177,7 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
         opentelemetry: Default::default(),
+        model_deprecations: Default::default(),
     }
 }
 

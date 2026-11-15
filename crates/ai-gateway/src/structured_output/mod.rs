@@ -497,6 +497,8 @@ structured_output:
         cost_per_million_reasoning_tokens: None,
         reasoning_family: None,
         reasoning_parameter: None,
+        deprecation_date: None,
+        replacement_model: None,
         });
 
         StructuredOutputEngine::from_config(&config).unwrap()
