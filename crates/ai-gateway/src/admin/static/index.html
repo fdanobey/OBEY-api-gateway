@@ -18,7 +18,10 @@ a:hover{text-decoration:underline}
 nav{width:220px;background:var(--nav-bg);color:var(--nav-text);padding:1rem 0;flex-shrink:0;display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
 nav h1{font-size:1rem;padding:0 1rem 1rem;border-bottom:1px solid rgba(255,255,255,.1);margin-bottom:.5rem;display:flex;align-items:center;gap:.5rem}
 nav h1 img{width:24px;height:24px;border-radius:4px}
-nav ul{list-style:none}
+nav ul{list-style:none;flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.25) transparent;padding-bottom:.5rem}
+nav ul::-webkit-scrollbar{width:6px}
+nav ul::-webkit-scrollbar-thumb{background:rgba(255,255,255,.25);border-radius:3px}
+nav ul::-webkit-scrollbar-track{background:transparent}
 nav li{margin:0}
 nav button.nav-btn{display:block;width:100%;text-align:left;background:none;border:none;color:var(--nav-text);
 padding:.6rem 1rem;font-size:.875rem;cursor:pointer;transition:background .15s}
