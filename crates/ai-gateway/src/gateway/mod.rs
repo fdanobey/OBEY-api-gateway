@@ -1699,12 +1699,13 @@ pub async fn apply_runtime_config_update(state: &AppState, new_config: Config) {
     state
         .router
         .reload_compression_runtime(compression, precompressed_manager);
-    state.router.clear_circuit_breakers();
-    state.router.clear_rate_limiters();
-    state.router.clear_retry_budgets();
-    state.router.clear_sticky_cache();
-    state.router.clear_http_clients();
-    state.router.clear_model_capabilities();
+state.router.clear_circuit_breakers();
+state.router.clear_rate_limiters();
+state.router.clear_retry_budgets();
+state.router.clear_sticky_cache();
+state.router.clear_http_clients();
+state.router.reset_web_search_coordinator().await;
+state.router.clear_model_capabilities();
 // Model-deprecation reload sweep (model-deprecation-alerts,
 // Req 5.2): drop deprecation registry entries for providers
 // removed from the config AND clear runtime-gone marks for
@@ -2198,6 +2199,7 @@ mod tests {
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
             codex_search: None,
+            web_search: None,
             reasoning_compat: Default::default(),
             webhooks: Default::default(),
             opentelemetry: Default::default(),
@@ -3249,6 +3251,7 @@ mod tests {
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
         codex_search: None,
+        web_search: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
         opentelemetry: Default::default(),
@@ -3858,6 +3861,7 @@ mod tests {
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
         codex_search: None,
+        web_search: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
         opentelemetry: Default::default(),

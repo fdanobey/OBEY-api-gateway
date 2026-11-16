@@ -168,12 +168,41 @@ reasoning_models_allowlist: []
 # the OAuth token; the completion itself is served by the routed provider,
 # so Codex completion quota is not consumed for the chat itself.
 codex_search:
-  enabled: true                  # default: enabled when a valid OAuth token exists
-  output_to_chat: true           # append search results to assistant message content so they
-                                 # survive context/tool compression (models remember the search)
-  timeout_seconds: 15            # 1..120
-  max_iterations: 5              # 1..20 agent-loop resubmissions
-  # base_url: "https://chatgpt.com/backend-api/codex/alpha/search"  # optional override
+ enabled: true # default: enabled when a valid OAuth token exists
+ output_to_chat: true # append search results to assistant message content so they
+ # survive context/tool compression (models remember the search)
+ timeout_seconds: 15 # 1..120
+ max_iterations: 5 # 1..20 agent-loop resubmissions
+ # base_url: "https://chatgpt.com/backend-api/codex/alpha/search" # optional override
+
+# Provider-agnostic web search (optional). Injects a single `web_search`
+# tool into chat requests and executes it server-side against the chosen
+# backend. The client never sees the tool; the model may search
+# iteratively within max_iterations, all inside one client request.
+# Results are normalized to title/url/snippet and appended to the
+# assistant content (output_to_chat) so they survive context compression.
+# Tool args: q (required, max 2000 chars), domains (max 10), recency
+# (days, 1-365), max_results (1-10, default 5).
+# Precedence: enabling web_search suppresses codex_search/codex_web above;
+# with only codex_search configured, behavior is unchanged.
+# web_search:
+# backend: "tavily" # tavily | brave | exa | searxng | codex
+# api_key_env: "TAVILY_API_KEY" # env var NAME first, literal fallback;
+# # required for tavily, brave, exa
+# # enabled: true # implicit when a backend is set; explicit false disables
+# # timeout_seconds: 15 # 1..120 per search call (default 15)
+# # max_iterations: 5 # 1..20 searches per request (default 5)
+# # output_to_chat: true # append results to assistant content (default true)
+# # base_url: "https://api.tavily.com/search" # optional endpoint override
+# # on tavily/brave/exa (proxies, relays); REQUIRED for searxng
+#
+# # SearXNG: self-hosted, no API key; enable JSON format in the instance's
+# # settings.yml. domains is not supported on this backend.
+# # backend: "searxng"
+# # base_url: "http://localhost:8888/search"
+#
+# # Codex: uses the active OpenAI OAuth session, zero additional config.
+# # backend: "codex"
 
 circuit_breaker:
   failure_threshold: 3

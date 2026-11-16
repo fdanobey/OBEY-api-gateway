@@ -327,6 +327,36 @@ The dashboard supports:
 
 For custom paths, the embedded UIs automatically use the configured admin/dashboard route prefixes for links and API calls.
 
+## Web Search
+
+Optional server-side web search for chat requests. The gateway injects a single `web_search` tool (the client never sees it), the model may call it iteratively within `max_iterations`, and results are normalized to title/url/snippet and appended to the assistant content (`output_to_chat`, default on) so they survive context compression. Everything happens inside one client request.
+
+```yaml
+web_search:
+ backend: "tavily" # tavily | brave | exa | searxng | codex
+ api_key_env: "TAVILY_API_KEY" # required for tavily/brave/exa (env var name, literal fallback)
+ # base_url: ... # optional endpoint override; required for searxng
+ # timeout_seconds: 15 # 1..120
+ # max_iterations: 5 # 1..20
+ # output_to_chat: true
+```
+
+Setting a backend enables the feature; `enabled: false` disables it explicitly.
+
+Tool arguments: `q` (required, up to 2000 chars), `domains` (up to 10), `recency` (days, 1-365), `max_results` (1-10, default 5). Backends map what they support and silently drop the rest:
+
+| Backend | domains | recency | max_results | Notes |
+|---|---|---|---|---|
+| tavily | include_domains | dropped | yes | API key required |
+| brave | dropped | freshness buckets (pd/pw/pm/py) | count | API key required |
+| exa | includeDomains | startPublishedDate | numResults | API key required |
+| searxng | dropped | time_range buckets (day/week/month/year) | sliced | `base_url` required; enable JSON format in the instance's settings.yml; no API key |
+| codex | yes | yes | sliced locally | requires an active OpenAI OAuth session |
+
+Precedence: when `web_search` is enabled, the older `codex_search`/`codex_web` injection is suppressed; with only `codex_search` configured, behavior is unchanged.
+
+If the backend errors, the tool returns an honest "no search ran this turn" result and the request still completes. A not-ready backend (missing key, no OAuth session) injects nothing and logs a warning; readiness is visible in the admin panel's Web Search tab and via `GET /admin/web-search/status`. Executions are counted in `obey_web_search_tool_executions_total{backend}` and `obey_web_search_latency_ms{backend}`, and each attempt lands in the request log (`web_search_success` / `web_search_error` / `web_search_validation_error` / `web_search_budget_exhausted`) with a truncated query.
+
 ## Provider Budgets
 
 Each provider accepts a persistent USD budget. When cumulative spend meets or exceeds `limit_usd`, the gateway skips that provider (error class `budget_skip`) until the window resets:

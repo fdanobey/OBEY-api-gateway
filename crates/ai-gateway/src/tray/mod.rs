@@ -335,6 +335,7 @@ mod tests {
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
  codex_search: None,
+ web_search: None,
             cache_aware_routing: Default::default(),
             reasoning_compat: Default::default(),
             webhooks: Default::default(),

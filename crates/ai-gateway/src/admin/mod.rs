@@ -138,9 +138,10 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/oauth/github-copilot/logout", post(copilot_oauth_logout))
         .route("/oauth/github-copilot/status", get(copilot_oauth_status))
         .route("/oauth/github-copilot/usage", get(copilot_oauth_usage))
-        .route("/metrics/reset-active", post(reset_active_requests))
-        .route("/circuit-breaker/states", get(get_circuit_breaker_states))
-        .route("/circuit-breaker/reset", post(reset_circuit_breakers))
+ .route("/metrics/reset-active", post(reset_active_requests))
+ .route("/circuit-breaker/states", get(get_circuit_breaker_states))
+ .route("/circuit-breaker/reset", post(reset_circuit_breakers))
+ .route("/web-search/status", get(get_web_search_status))
         .route("/cost-reports", get(get_cost_report))
         .route("/cost-reports/reconcile", get(get_cost_reconciliation))
         .route("/telemetry/status", get(get_telemetry_status))
@@ -447,13 +448,32 @@ fn redact_config_for_response(config: &Config) -> serde_json::Value {
         }
     }
 
-    if let Some(smart_routing) = body
-        .get_mut("smart_routing")
-        .and_then(|v| v.as_object_mut())
-    {
-        redact_jev_credentials(smart_routing, config.smart_routing.jev.as_ref());
-        redact_laya_credentials(smart_routing, config.smart_routing.laya.as_ref());
+ if let Some(smart_routing) = body
+ .get_mut("smart_routing")
+ .and_then(|v| v.as_object_mut())
+ {
+ redact_jev_credentials(smart_routing, config.smart_routing.jev.as_ref());
+ redact_laya_credentials(smart_routing, config.smart_routing.laya.as_ref());
+ }
+
+// Web-search API key (spec provider-agnostic-web-search-injection):
+// classified deterministically, not by secret-shape heuristics. A value
+// matching the env-var-name pattern is a reference (the field resolves
+// env names first) and is safe to echo back; ANY other non-empty value
+// is a literal key and is masked with the `[configured]` sentinel the
+// webhooks GET uses. The PUT path preserves the stored key when the mask
+// comes back unchanged (see `preserve_masked_web_search_key`).
+if let Some(web_search) = body.get_mut("web_search").and_then(|v| v.as_object_mut()) {
+    if let Some(api_key_env) = web_search.get_mut("api_key_env") {
+        let stored_literal = api_key_env.as_str().is_some_and(|value| {
+            !value.trim().is_empty() && !secrets::is_env_var_reference(value)
+        });
+        if stored_literal {
+            *api_key_env =
+                serde_json::Value::String(crate::webhooks::admin::SECRET_MASK.to_string());
+        }
     }
+}
 
     // Webhook endpoint secrets are masked with the same sentinel the
     // dedicated /admin/webhooks GET uses (Req 3.6): the full-config
@@ -762,16 +782,27 @@ fn normalize_config_for_storage(
         }
     }
 
-    // OpenTelemetry header values (opentelemetry-trace-export Req 8.2
-    // round-trip rule, same convention as webhook secrets): a value
-    // returned unchanged as the `[configured]` sentinel preserves the
-    // stored value for the same header name. A sentinel for a name with
-    // no stored value preserves nothing and must not persist the mask —
-    // the pair is dropped.
-    preserve_masked_telemetry_headers(
-        &mut config.opentelemetry,
-        existing_config.map(|cfg| &cfg.opentelemetry),
-    );
+ // OpenTelemetry header values (opentelemetry-trace-export Req 8.2
+ // round-trip rule, same convention as webhook secrets): a value
+ // returned unchanged as the `[configured]` sentinel preserves the
+ // stored value for the same header name. A sentinel for a name with
+ // no stored value preserves nothing and must not persist the mask —
+ // the pair is dropped.
+ preserve_masked_telemetry_headers(
+ &mut config.opentelemetry,
+ existing_config.map(|cfg| &cfg.opentelemetry),
+ );
+
+// Web-search API key (round-trip rule, same convention as the webhook
+// secret mask). `preserve_masked_web_search_key` classifies the incoming
+// `web_search.api_key_env` value explicitly: (a) the `[configured]`
+// sentinel keeps the stored value unchanged; (b) an env-var-name pattern
+// is stored as an env reference; (c) any other non-empty value is a
+// literal key stored in plaintext — the same convention as provider
+// `api_key_env` literals (no encryption change). Because the GET path
+// masks literals deterministically, plaintext keys never round-trip to
+// the UI.
+preserve_masked_web_search_key(&mut config.web_search, existing_config);
 
     normalize_smart_routing_credentials(
         &mut config.smart_routing,
@@ -796,18 +827,48 @@ fn preserve_masked_telemetry_headers(
             .retain(|_, value| value != crate::webhooks::admin::SECRET_MASK);
         return;
     };
-    incoming.headers.retain(|name, value| {
-        if value != crate::webhooks::admin::SECRET_MASK {
-            return true;
-        }
-        match stored.headers.get(name).filter(|stored| !stored.is_empty()) {
-            Some(stored_value) => {
-                *value = stored_value.clone();
-                true
-            }
-            None => false,
-        }
-    });
+ incoming.headers.retain(|name, value| {
+ if value != crate::webhooks::admin::SECRET_MASK {
+ return true;
+ }
+ match stored.headers.get(name).filter(|stored| !stored.is_empty()) {
+ Some(stored_value) => {
+ *value = stored_value.clone();
+ true
+ }
+ None => false,
+ }
+ });
+ }
+
+/// Classification rule for `web_search.api_key_env` on PUT, mirroring the
+/// deterministic GET mask: (a) the `[configured]` sentinel keeps the stored
+/// value; (b) a value matching the env-var-name pattern is stored as an env
+/// reference; (c) any other non-empty value is a literal key, stored in
+/// plaintext like provider `api_key_env` literals. Empty values and a
+/// sentinel with no stored value clear the field — the mask literal must
+/// never reach the YAML file.
+fn preserve_masked_web_search_key(
+    incoming: &mut Option<crate::web_search::config::WebSearchConfig>,
+    existing: Option<&Config>,
+) {
+    let Some(web_search) = incoming else { return };
+    let incoming_value = web_search.api_key_env.as_deref().map(str::trim);
+    let Some(value) = incoming_value else { return };
+    if value == crate::webhooks::admin::SECRET_MASK {
+        let stored = existing
+            .and_then(|config| config.web_search.as_ref())
+            .and_then(|stored| stored.api_key_env.as_deref())
+            .map(str::trim)
+            .filter(|stored| !stored.is_empty());
+        web_search.api_key_env = stored.map(|stored| stored.to_string());
+        return;
+    }
+    if value.is_empty() {
+        web_search.api_key_env = None;
+        return;
+    }
+    web_search.api_key_env = Some(value.to_string());
 }
 
 /// Normalize Jev classifier credentials for storage, mirroring the provider
@@ -1593,13 +1654,68 @@ async fn reset_active_requests(State(state): State<AppState>) -> Response {
 ///
 /// Returns the set of provider keys that currently have circuit breaker
 /// entries along with their state label ("closed", "open", or "half_open").
-async fn get_circuit_breaker_states(State(state): State<AppState>) -> Response {
-    let cb_states = state.router.get_circuit_breaker_states().await;
-    let entries: Vec<serde_json::Value> = cb_states
-        .iter()
-        .map(|(key, st)| json!({ "provider": key, "state": st }))
-        .collect();
-    (StatusCode::OK, Json(json!({ "states": entries }))).into_response()
+ async fn get_circuit_breaker_states(State(state): State<AppState>) -> Response {
+ let cb_states = state.router.get_circuit_breaker_states().await;
+ let entries: Vec<serde_json::Value> = cb_states
+ .iter()
+ .map(|(key, st)| json!({ "provider": key, "state": st }))
+ .collect();
+ (StatusCode::OK, Json(json!({ "states": entries }))).into_response()
+ }
+
+/// GET /admin/web-search/status — provider-agnostic web search readiness
+/// (spec provider-agnostic-web-search-injection, Req 6.2).
+///
+/// Reports whether the configured `web_search` backend is ready: enabled
+/// flag, backend name, ready boolean, and a human-facing reason. Never
+/// includes API key material — readiness is probed through backend
+/// `ready()` checks only (missing key, OAuth inactive, disabled).
+async fn get_web_search_status(State(state): State<AppState>) -> Response {
+ let (config, oauth_manager) = {
+ let config = state.config.read().await;
+ (
+ config.web_search.clone(),
+ state.oauth_manager.clone(),
+ )
+ };
+
+ let (enabled, backend, ready, reason) = match &config {
+ None => (false, None, false, "disabled".to_string()),
+ Some(cfg) => {
+ if !cfg.effective_enabled() {
+ (false, cfg.backend.clone(), false, "disabled".to_string())
+ } else {
+ let probe = crate::web_search::coordinator::WebSearchCoordinator::new();
+ let backend_name = cfg.backend.clone();
+ match probe.readiness(cfg, oauth_manager.as_ref()).await {
+ Some((_name, true)) => (true, backend_name, true, "ready".to_string()),
+ Some((_name, false)) => (
+ true,
+ backend_name,
+ false,
+ "missing key or OAuth session".to_string(),
+ ),
+ None => (
+ true,
+ backend_name,
+ false,
+ "no backend configured".to_string(),
+ ),
+ }
+ }
+ }
+ };
+
+ (
+ StatusCode::OK,
+ Json(json!({
+ "enabled": enabled,
+ "backend": backend,
+ "ready": ready,
+ "reason": reason,
+ })),
+ )
+ .into_response()
 }
 
 /// GET /admin/security-status — current admin security posture for the
@@ -3613,6 +3729,7 @@ mod tests {
                     xhigh_models_allowlist: Default::default(),
                     reasoning_models_allowlist: Default::default(),
                     codex_search: None,
+                    web_search: None,
                     reasoning_compat: Default::default(),
                     webhooks: Default::default(),
                     opentelemetry: Default::default(),
@@ -3694,7 +3811,7 @@ mod tests {
         assert!(html.contains("new AbortController()"));
         assert!(html.contains("request timed out after 15 seconds"));
         assert!(html.contains("data.error.details"));
-        assert!(html.contains("config=cfg;setStatus('Configuration saved')"));
+        assert!(html.contains("config=cfg;populateFromConfig(cfg);setStatus('Configuration saved')"));
     }
 
     #[test]
@@ -4363,6 +4480,7 @@ retry:
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
             codex_search: None,
+            web_search: None,
             webhooks: Default::default(),
             opentelemetry: Default::default(),
             model_deprecations: Default::default(),
@@ -5971,17 +6089,225 @@ retry:
             serde_yaml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(saved.retry.upstream_retry_after_max_wait_ms, 15000);
 
-        let response = tower::ServiceExt::oneshot(server.build_router(), get())
-            .await
-            .unwrap();
-        let config = smart_routing_response_json(response).await;
-        assert_eq!(
-            config["retry"]["upstream_retry_after_max_wait_ms"],
-            json!(15000)
-        );
+ let response = tower::ServiceExt::oneshot(server.build_router(), get())
+ .await
+ .unwrap();
+ let config = smart_routing_response_json(response).await;
+ assert_eq!(
+ config["retry"]["upstream_retry_after_max_wait_ms"],
+ json!(15000)
+ );
 
-        let _ = std::fs::remove_dir_all(&config_dir);
-    }
+ let _ = std::fs::remove_dir_all(&config_dir);
+ }
+
+/// Admin-panel parity (provider-agnostic-web-search-injection,
+/// Req 6.2/6.3): a `web_search` section saved through PUT /admin/config
+/// persists to YAML, round-trips through GET, invalid sections are
+/// rejected with the loader's field-level error string, and a stored
+/// literal key survives a GET → PUT round trip masked.
+#[tokio::test]
+async fn admin_config_round_trips_web_search_section() {
+ let config_dir = std::env::temp_dir().join(format!(
+ "obey-admin-web-search-{}",
+ uuid::Uuid::new_v4().simple()
+ ));
+ std::fs::create_dir_all(&config_dir).unwrap();
+ let config_path = config_dir.join("config.yaml");
+ let mut initial = test_config_with_auth(false);
+ initial.server.port = 8080;
+ let server = crate::gateway::GatewayServer::new(initial, Some(config_path.clone()))
+ .await
+ .unwrap();
+
+ let get = || {
+ axum::http::Request::builder()
+ .method("GET")
+ .uri("/admin/config")
+ .body(axum::body::Body::empty())
+ .unwrap()
+ };
+ let response = tower::ServiceExt::oneshot(server.build_router(), get())
+ .await
+ .unwrap();
+ let mut config = smart_routing_response_json(response).await;
+ assert!(
+ config.get("web_search").map_or(true, serde_json::Value::is_null),
+ "fresh config must not carry a web_search section"
+ );
+
+ // Invalid section: keyed backend without a key must be rejected with
+ // the SAME field-level string the loader produces.
+ config["web_search"] = json!({
+ "enabled": true,
+ "backend": "tavily",
+ });
+ let response = tower::ServiceExt::oneshot(
+ server.build_router(),
+ smart_routing_json_request("PUT", "/admin/config", config.clone()),
+ )
+ .await
+ .unwrap();
+ assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+ let body = smart_routing_response_json(response).await;
+ let details: String = body["error"]["details"]
+ .as_array()
+ .unwrap()
+ .iter()
+ .map(|value| value.as_str().unwrap_or_default().to_string())
+ .collect::<Vec<_>>()
+ .join(" ");
+ assert!(
+ details.contains(
+ "web_search.api_key_env is required when web_search.backend is 'tavily'"
+ ),
+ "expected the loader's field-level error, got: {details}"
+ );
+
+ // Valid section round-trips: env var name stays verbatim, every field
+ // survives GET → PUT → YAML → GET.
+ config["web_search"] = json!({
+ "enabled": true,
+ "backend": "tavily",
+ "api_key_env": "TAVILY_API_KEY",
+ "base_url": "https://api.tavily.com/search",
+ "timeout_seconds": 20,
+ "max_iterations": 7,
+ "output_to_chat": false,
+ });
+ let response = tower::ServiceExt::oneshot(
+ server.build_router(),
+ smart_routing_json_request("PUT", "/admin/config", config),
+ )
+ .await
+ .unwrap();
+ let status = response.status();
+ let body = smart_routing_response_json(response).await;
+ assert_eq!(status, StatusCode::OK, "PUT /admin/config failed: {body}");
+
+ let saved: Config =
+ serde_yaml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+ let saved_ws = saved.web_search.expect("web_search persisted to YAML");
+ assert_eq!(saved_ws.backend.as_deref(), Some("tavily"));
+ assert_eq!(saved_ws.api_key_env.as_deref(), Some("TAVILY_API_KEY"));
+ assert_eq!(saved_ws.timeout_seconds, Some(20));
+ assert_eq!(saved_ws.max_iterations, Some(7));
+ assert_eq!(saved_ws.output_to_chat, Some(false));
+
+ let response = tower::ServiceExt::oneshot(server.build_router(), get())
+ .await
+ .unwrap();
+ let config = smart_routing_response_json(response).await;
+ assert_eq!(config["web_search"]["backend"], json!("tavily"));
+ assert_eq!(config["web_search"]["api_key_env"], json!("TAVILY_API_KEY"));
+
+ // Literal key: GET masks it with the [configured] sentinel, and a
+ // GET → PUT round trip of the masked body preserves the stored literal.
+ {
+ let mut live = server.state.config.write().await;
+ let ws = live.web_search.get_or_insert_with(Default::default);
+ ws.api_key_env = Some("sk-web-search-literal-round-trip".to_string());
+ }
+ let response = tower::ServiceExt::oneshot(server.build_router(), get())
+ .await
+ .unwrap();
+ let masked = smart_routing_response_json(response).await;
+ assert_eq!(
+ masked["web_search"]["api_key_env"],
+ json!(crate::webhooks::admin::SECRET_MASK),
+ "literal web_search key must be masked in GET /admin/config"
+ );
+
+ let response = tower::ServiceExt::oneshot(
+ server.build_router(),
+ smart_routing_json_request("PUT", "/admin/config", masked),
+ )
+ .await
+ .unwrap();
+ let status = response.status();
+ let body = smart_routing_response_json(response).await;
+ assert_eq!(status, StatusCode::OK, "masked PUT failed: {body}");
+ let live = server.state.config.read().await;
+ assert_eq!(
+ live.web_search.as_ref().unwrap().api_key_env.as_deref(),
+ Some("sk-web-search-literal-round-trip"),
+ "masked round trip must preserve the stored literal key"
+ );
+
+ let _ = std::fs::remove_dir_all(&config_dir);
+ }
+
+/// Readiness endpoint (provider-agnostic-web-search-injection, Req 6.2):
+/// disabled when the section is absent, ready when a keyed backend's
+/// env var resolves, missing-key when it does not.
+#[tokio::test]
+async fn web_search_status_reports_readiness() {
+ let mut config = test_config_with_auth(false);
+ config.web_search = Some(crate::web_search::config::WebSearchConfig {
+ backend: Some("tavily".to_string()),
+ api_key_env: Some("WEB_SEARCH_STATUS_TEST_KEY".to_string()),
+ ..Default::default()
+ });
+ let server = crate::gateway::GatewayServer::new(config, None)
+ .await
+ .unwrap();
+
+ let get_status = || {
+ axum::http::Request::builder()
+ .method("GET")
+ .uri("/admin/web-search/status")
+ .body(axum::body::Body::empty())
+ .unwrap()
+ };
+
+ // Env var set: backend ready. The drop guard restores the process-global
+ // env on every exit path, including assertion-failure unwinds, so a
+ // failing assertion never leaks the var into the shared test process.
+ struct WebSearchStatusEnvGuard;
+ impl Drop for WebSearchStatusEnvGuard {
+     fn drop(&mut self) {
+         std::env::remove_var("WEB_SEARCH_STATUS_TEST_KEY");
+     }
+ }
+ let _env_guard = WebSearchStatusEnvGuard;
+ std::env::set_var("WEB_SEARCH_STATUS_TEST_KEY", "test-key-value");
+ let response =
+     tower::ServiceExt::oneshot(server.build_router(), get_status()).await.unwrap();
+ assert_eq!(response.status(), StatusCode::OK);
+ let body = smart_routing_response_json(response).await;
+ assert_eq!(body["enabled"], json!(true));
+ assert_eq!(body["backend"], json!("tavily"));
+ assert_eq!(body["ready"], json!(true));
+ assert_eq!(body["reason"], json!("ready"));
+
+ // No key configured: enabled but not ready (missing key).
+ let mut config = test_config_with_auth(false);
+ config.web_search = Some(crate::web_search::config::WebSearchConfig {
+ backend: Some("tavily".to_string()),
+ ..Default::default()
+ });
+ let server = crate::gateway::GatewayServer::new(config, None)
+ .await
+ .unwrap();
+ let response =
+ tower::ServiceExt::oneshot(server.build_router(), get_status()).await.unwrap();
+ let body = smart_routing_response_json(response).await;
+ assert_eq!(body["enabled"], json!(true));
+ assert_eq!(body["ready"], json!(false));
+ assert_eq!(body["reason"], json!("missing key or OAuth session"));
+
+ // Section absent: disabled.
+ let config = test_config_with_auth(false);
+ let server = crate::gateway::GatewayServer::new(config, None)
+ .await
+ .unwrap();
+ let response =
+ tower::ServiceExt::oneshot(server.build_router(), get_status()).await.unwrap();
+ let body = smart_routing_response_json(response).await;
+ assert_eq!(body["enabled"], json!(false));
+ assert_eq!(body["ready"], json!(false));
+ assert_eq!(body["reason"], json!("disabled"));
+}
 
     fn smart_routing_json_request(
         method: &str,

@@ -349,6 +349,7 @@ mod disabled_providers_config_tests {
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
             codex_search: None,
+            web_search: None,
             reasoning_compat: Default::default(),
         }
     }

@@ -136,6 +136,11 @@ pub struct Config {
     /// See [`crate::codex::search::config::CodexSearchConfig`].
     #[serde(default)]
     pub codex_search: Option<crate::codex::search::config::CodexSearchConfig>,
+    /// Provider-agnostic web search tool injection (tavily/brave/exa/
+    /// searxng/codex backends). Absent section leaves the feature
+    /// disabled. See [`crate::web_search::config::WebSearchConfig`].
+    #[serde(default)]
+    pub web_search: Option<crate::web_search::config::WebSearchConfig>,
     /// Prompt-cache-aware routing (sticky provider selection, cache-control
     /// breakpoint injection, cached-token-aware cost sorting). Absent section
     /// applies [`CacheAwareRouting::default`] (disabled). See the

@@ -91,40 +91,36 @@ impl SearchExecutor {
         }
     }
 
-    /// Execute a `codex_search` tool call.
-    pub async fn execute_search(&self, args: CodexSearchArgs) -> ToolResult {
-        if let Err(e) = Self::validate_search_args(&args) {
-            self.metrics.record_execution("codex_search");
-            return e;
-        }
+/// Execute a `codex_search` tool call.
+pub async fn execute_search(&self, args: CodexSearchArgs) -> ToolResult {
+    if let Err(e) = Self::validate_search_args(&args) {
+        self.metrics.record_execution("codex_search");
+        return e;
+    }
 
-    let session_id = Uuid::new_v4().to_string();
-    let commands = CodexSearchRequestCommands {
-        search_query: Some(vec![crate::codex::search::models::SearchQueryCommand {
-            q: args.q,
-            domains: args.domains,
-            recency: args.recency,
-        }]),
-        open: None,
-        find: None,
-        click: None,
-        response_length: Some(
-            args.response_length.unwrap_or_else(ResponseLength::short),
-        ),
-        extra: serde_json::Map::new(),
-    };
-
-    let request = CodexSearchRequest {
-        id: session_id,
-        model: SEARCH_MODEL.to_string(),
-        commands,
-        extra: serde_json::Map::new(),
-    };
+    let request = Self::build_search_request(args);
 
     let result = self.dispatch_upstream("codex_search", &request).await;
+    self.metrics.record_execution("codex_search");
+    result
+}
+
+/// Execute a `codex_search` tool call with exactly one upstream attempt: no
+/// auth-refresh retry and no server-error retry. For callers that own their
+/// own retry policy (the web-search backend contract is single-attempt; the
+/// model's re-calls are the retry loop).
+pub async fn execute_search_once(&self, args: CodexSearchArgs) -> ToolResult {
+    if let Err(e) = Self::validate_search_args(&args) {
         self.metrics.record_execution("codex_search");
-        result
+        return e;
     }
+
+    let request = Self::build_search_request(args);
+
+    let result = self.dispatch_upstream_once("codex_search", &request).await;
+    self.metrics.record_execution("codex_search");
+    result
+}
 
     /// Execute a `codex_web` tool call.
     pub async fn execute_web(&self, args: CodexWebArgs) -> ToolResult {
@@ -173,21 +169,43 @@ impl SearchExecutor {
         result
     }
 
-    async fn dispatch_upstream(&self, tool: &str, request: &CodexSearchRequest) -> ToolResult {
-        let body = match serde_json::to_value(request) {
-            Ok(v) => v,
-            Err(_) => return Self::error_tool_result("Search request serialization failed"),
-        };
+fn build_search_request(args: CodexSearchArgs) -> CodexSearchRequest {
+    let commands = CodexSearchRequestCommands {
+        search_query: Some(vec![crate::codex::search::models::SearchQueryCommand {
+            q: args.q,
+            domains: args.domains,
+            recency: args.recency,
+        }]),
+        open: None,
+        find: None,
+        click: None,
+        response_length: Some(args.response_length.unwrap_or_else(ResponseLength::short)),
+        extra: serde_json::Map::new(),
+    };
 
-        let access_token = match self.oauth.get_access_token().await {
-            Some(t) => t,
-            None => return Self::error_tool_result("Search authentication unavailable."),
-        };
+    CodexSearchRequest {
+        id: Uuid::new_v4().to_string(),
+        model: SEARCH_MODEL.to_string(),
+        commands,
+        extra: serde_json::Map::new(),
+    }
+}
 
-        let account_id = match extract_chatgpt_account_id(&access_token) {
-            Ok(id) => id,
-            Err(_) => return Self::error_tool_result("Search authentication configuration error."),
-        };
+async fn dispatch_upstream(&self, tool: &str, request: &CodexSearchRequest) -> ToolResult {
+    let body = match serde_json::to_value(request) {
+        Ok(v) => v,
+        Err(_) => return Self::error_tool_result("Search request serialization failed"),
+    };
+
+    let access_token = match self.oauth.get_access_token().await {
+        Some(t) => t,
+        None => return Self::error_tool_result("Search authentication unavailable."),
+    };
+
+    let account_id = match extract_chatgpt_account_id(&access_token) {
+        Ok(id) => id,
+        Err(_) => return Self::error_tool_result("Search authentication configuration error."),
+    };
 
     match self
         .send_with_retry(tool, &access_token, &account_id, &body)
@@ -203,7 +221,80 @@ impl SearchExecutor {
         }
         Err(tool_err) => tool_err,
     }
+}
+
+/// Single-attempt dispatch: same auth resolution as `dispatch_upstream` but
+/// wraps `send_once` directly, bypassing the 401-refresh loop and the
+/// server-error retry loop.
+async fn dispatch_upstream_once(&self, tool: &str, request: &CodexSearchRequest) -> ToolResult {
+    let body = match serde_json::to_value(request) {
+        Ok(v) => v,
+        Err(_) => return Self::error_tool_result("Search request serialization failed"),
+    };
+
+    let access_token = match self.oauth.get_access_token().await {
+        Some(t) => t,
+        None => return Self::error_tool_result("Search authentication unavailable."),
+    };
+
+    let account_id = match extract_chatgpt_account_id(&access_token) {
+        Ok(id) => id,
+        Err(_) => return Self::error_tool_result("Search authentication configuration error."),
+    };
+
+    match self
+        .send_once(tool, &access_token, &account_id, &body)
+        .await
+    {
+        SendOutcome::Success(content, latency_ms, headers) => {
+            self.metrics.record_latency(tool, latency_ms);
+            self.usage_tracker.update_from_headers(&headers).await;
+            let normalized = normalize_search_response(&content);
+            ToolResult {
+                content: truncate_content(&normalized),
+                is_error: false,
+                session_id: None,
+            }
+        }
+        SendOutcome::AuthError(_status, latency_ms, headers) => {
+            self.metrics.record_latency(tool, latency_ms);
+            self.usage_tracker.update_from_headers(&headers).await;
+            Self::error_tool_result("Search authentication failed.")
+        }
+        SendOutcome::RateLimited(retry_after, latency_ms, headers) => {
+            self.metrics.record_latency(tool, latency_ms);
+            self.usage_tracker.update_from_headers(&headers).await;
+            let msg = if let Some(ra) = retry_after {
+                format!("Search request was rate limited. Retry-After: {ra}.")
+            } else {
+                "Search request was rate limited.".to_string()
+            };
+            Self::error_tool_result(&msg)
+        }
+        SendOutcome::ServerError(status, latency_ms, headers) => {
+            self.metrics.record_latency(tool, latency_ms);
+            if let Some(h) = headers {
+                self.usage_tracker.update_from_headers(&h).await;
+            }
+            Self::error_tool_result(&format!(
+                "Search service is temporarily unavailable (HTTP {status})."
+            ))
+        }
+        SendOutcome::NonRetryableError(msg) => Self::error_tool_result(&msg),
+        SendOutcome::Timeout => {
+            let secs = self.timeout.as_secs();
+            Self::error_tool_result(&format!(
+                "Search request timed out after {secs} seconds."
+            ))
+        }
+        SendOutcome::ConnectionError => Self::error_tool_result(
+            "Search service is temporarily unavailable.",
+        ),
+        SendOutcome::InvalidRefId => {
+            Self::error_tool_result("Search reference was not found.")
+        }
     }
+}
 
     async fn send_with_retry(
         &self,

@@ -184,6 +184,7 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
+        web_search: None,
         structured_output: None,
         memory: None,
         reasoning_compat: Default::default(),

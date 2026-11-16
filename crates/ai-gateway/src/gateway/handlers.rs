@@ -14161,6 +14161,10 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> Response {
         .metrics
         .write_prometheus(&mut out, state.loop_detector.sessions.len());
     state.router.search_metrics().write_prometheus(&mut out);
+    state
+        .router
+        .web_search_metrics()
+        .write_prometheus(&mut out);
     if let Some(memory) = state.memory_system.read().await.clone() {
         memory.metrics.write_prometheus(&mut out);
     }

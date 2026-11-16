@@ -80,7 +80,7 @@ pub struct ToolCompressionRestore {
 impl ToolCompressionRestore {
     /// Swap `outgoing.tools` back to the original definitions when this
     /// attempt targets a provider with tool compression disabled. Called on
-    /// the per-attempt clone only — failover to an enabled provider re-clones
+    /// the per-attempt clone only � failover to an enabled provider re-clones
     /// the compressed tools from the original request. `disabled_providers`
     /// must be snapshotted by the caller while a config guard is held; this
     /// helper never takes a lock itself.
@@ -408,6 +408,14 @@ const CONTEXT_WINDOW_EXCEEDED_CLASS: &str = "context_window_exceeded";
 
 const SSE_TRUNCATED_ERROR: &str = "Upstream stream ended before completion";
 
+const WEB_SEARCH_ITERATION_LIMIT_MESSAGE: &str = "Web search agent loop iteration limit reached. \
+Answer with the information already gathered in the conversation above; do not attempt \
+another web_search call.";
+
+const WEB_SEARCH_WALL_CLOCK_EXHAUSTED_MESSAGE: &str = "The gateway's web-search round ran out of \
+request budget, so no search ran this turn. Answer with the information already gathered in the \
+conversation above.";
+
 /// Attempt-row status for a failed try (DD8): the upstream HTTP status when
 /// one was received, 504 for router timeouts, 502 for network errors.
 fn attempt_status_for(err: &GatewayError) -> u16 {
@@ -460,7 +468,7 @@ const GENERIC_SYSTEMONE_FAMILY: SystemOneFamily = SystemOneFamily {
 /// One decision-routing candidate: a configured provider plus the model
 /// it would serve. `pinned_model` is `None` when the request must
 /// resolve through model discovery (`auto`/bare family alias). The
-/// provider is shared (`Arc`) — candidates are built under the config
+/// provider is shared (`Arc`) � candidates are built under the config
 /// read lock and cloning the full `Provider` per candidate is waste.
 struct DecisionCandidate {
     provider: Arc<Provider>,
@@ -472,7 +480,7 @@ struct DecisionCandidate {
 /// `ModelsFetcher` boundary inside `spawn_blocking` (the same pattern as
 /// the Smart Routing classifier's `ClientFetcher`). Carries the
 /// per-call API key and budget; the client's debit hook charges one
-/// token per client-internal listing retry (ADR 0002) — the initial
+/// token per client-internal listing retry (ADR 0002) � the initial
 /// listing token is taken by the caller.
 struct DecisionModelsFetcher<'a> {
     client: Arc<SystemOneClient>,
@@ -517,11 +525,11 @@ fn status_is_upstream_bad_request(status: Option<u16>) -> bool {
 /// client-facing `GatewayError` (Req 3.3, design D2). Returns `None` for
 /// transient classes, which fail over to the next candidate.
 ///
-/// - `Auth` → 502: bad provider credentials are an operator problem;
+/// - `Auth` ? 502: bad provider credentials are an operator problem;
 ///   the message names the provider and status only, never key material.
-/// - `PayloadTooLarge` (upstream 413) → 413 with resize guidance.
-/// - `BadRequest` (upstream 422) → 422 with the provider's message.
-/// - upstream 400 (client `Unavailable`, reason `"HTTP 400"`) → 400
+/// - `PayloadTooLarge` (upstream 413) ? 413 with resize guidance.
+/// - `BadRequest` (upstream 422) ? 422 with the provider's message.
+/// - upstream 400 (client `Unavailable`, reason `"HTTP 400"`) ? 400
 ///   passthrough: deterministic client error, no retry, no failover.
 fn decision_terminal_error(
     provider_name: &str,
@@ -654,12 +662,12 @@ fn requires_non_streaming(request: &OpenAIRequest) -> bool {
 
 /// Deadlines for reading a streamed upstream body in the buffered dispatch.
 struct UpstreamBodyLimits {
-    /// No body chunk by this instant → `TtfbTimeout(ttfb_secs)`.
+    /// No body chunk by this instant ? `TtfbTimeout(ttfb_secs)`.
     first_byte_deadline: tokio::time::Instant,
     ttfb_secs: u64,
-    /// Max gap between chunks once the first one arrived → `ChunkTimeout`.
+    /// Max gap between chunks once the first one arrived ? `ChunkTimeout`.
     idle: Option<Duration>,
-    /// Past this instant → `TotalTimeout(total_secs)`.
+    /// Past this instant ? `TotalTimeout(total_secs)`.
     total_deadline: tokio::time::Instant,
     total_secs: u64,
 }
@@ -702,7 +710,7 @@ async fn read_upstream_body(
             let line = String::from_utf8_lossy(line);
             if let Some(payload) = crate::reasoning_relay::sse_data_payload(&line) {
                 if payload != "[DONE]" {
-                    // NFR: cheap pre-gate before the full JSON parse — only
+                    // NFR: cheap pre-gate before the full JSON parse � only
                     // lines containing `"reasoning` (covers both field
                     // spellings; JSON keys are quoted) reach the classifier.
                     if payload.contains("\"reasoning") {
@@ -787,7 +795,7 @@ async fn read_upstream_body(
 /// whole cents versus its uncached baseline (Req 4.2). `actual_cost`
 /// is the cache-aware dollar cost from [`compute_actual_cost`]; the
 /// baseline prices every prompt token at the model's base input rate
-/// and every completion token at the output rate — i.e. what the
+/// and every completion token at the output rate � i.e. what the
 /// request would have cost with zero cache. Can be negative when a
 /// cache-creation premium exceeds the read discount.
 fn cache_savings_cents(model: &ProviderModel, usage: &Usage, actual_cost: f64) -> i64 {
@@ -882,7 +890,7 @@ pub struct Router {
     memory_system: Option<Arc<RwLock<Option<Arc<MemorySystem>>>>>,
     /// OAuth session manager used when a provider is configured with
     /// `auth_method: oauth`. `None` while OAuth is not wired up (pre-task
-    /// 14.1) — in that state OAuth bearer resolution is silently skipped and
+    /// 14.1) � in that state OAuth bearer resolution is silently skipped and
     /// providers fall back to their configured api_key. Req 6.2
     /// (`openai-oauth-login` spec).
     oauth_manager: Option<Arc<crate::oauth::OAuthManager>>,
@@ -895,6 +903,12 @@ pub struct Router {
     oauth_usage_tracker: Option<Arc<crate::oauth::UsageTracker>>,
     /// Codex Search Prometheus metrics (tool executions + latency).
     search_metrics: Arc<crate::codex::search::metrics::SearchMetrics>,
+    /// Provider-agnostic web search Prometheus metrics (tool executions + latency).
+    web_search_metrics: Arc<crate::web_search::metrics::WebSearchMetrics>,
+    /// Provider-agnostic web search coordinator: resolves generic-vs-legacy
+    /// search activation per request and caches the backend per config
+    /// epoch (cleared on hot-reload with `clear_http_clients`).
+    web_search_coordinator: Arc<crate::web_search::coordinator::WebSearchCoordinator>,
     /// Adaptively learned set of `provider::model` combinations whose model
     /// emits XML-style tool calls (instead of native `tool_calls`). Populated
     /// at runtime when a response is detected to contain XML tool use.
@@ -902,30 +916,30 @@ pub struct Router {
     /// translate path and receive the tool-calling hint. Entries are sticky
     /// for the process lifetime: un-marking a combo mid-session would make
     /// the hint appear and disappear between turns, which models flag as a
-    /// prompt-injection pattern. In-memory only — resets on process restart.
+    /// prompt-injection pattern. In-memory only � resets on process restart.
     xml_tool_combos: Arc<std::sync::RwLock<HashSet<String>>>,
 
     /// `provider::model` combos observed ending a *streamed* turn with reasoning
-    /// only — no answer text and no tool call. These take the buffered path for
+    /// only � no answer text and no tool call. These take the buffered path for
     /// tools-bearing requests so the degenerate-turn failover in
     /// [`Self::route_with_failover_for_group`] can actually run: during a live
     /// relay the provider's terminal chunk has already reached the client by the
     /// time the shortfall is detectable, so there is nothing left to retry.
-    /// In-memory only — resets on process restart.
+    /// In-memory only � resets on process restart.
     degenerate_stream_combos: Arc<std::sync::RwLock<HashSet<String>>>,
-    /// Prompt-cache sticky routing affinity (prefix hash → last successful
+    /// Prompt-cache sticky routing affinity (prefix hash ? last successful
     /// provider/model, TTL-bounded). Zero-TTL when cache-aware routing is
     /// disabled, so lookups always miss (Req 1.4, prompt-cache-routing spec).
     sticky_cache: StickyCache,
     /// Provider-budget alert hook (budget-alerts-unified-webhooks, Task 5):
     /// threshold evaluation + `budget.reset` events for provider scopes.
     /// `None` until gateway startup wires it (built-once notifier); every
-    /// call rides an existing off-path spawn (Req 1.10 — zero synchronous
+    /// call rides an existing off-path spawn (Req 1.10 � zero synchronous
     /// work on the request/response path).
     provider_budget_alerts: Option<Arc<crate::webhooks::ProviderBudgetAlerts>>,
     /// GitHub Copilot token manager (github-copilot-oauth-provider spec,
     /// task 9). Attached once at gateway startup, master-key gated; config
-    /// hot-reload never reconstructs or clears it (NFR Reliability) — same
+    /// hot-reload never reconstructs or clears it (NFR Reliability) � same
     /// lifetime discipline as `oauth_manager` above.
     copilot_manager: Option<Arc<crate::oauth::github_copilot::manager::CopilotTokenManager>>,
     /// Copilot model catalog sync (task 8/9): `enabled_models()` feeds the
@@ -1302,7 +1316,7 @@ impl Router {
     /// routing config. A disabled feature (or a zero stickiness TTL)
     /// produces a zero-TTL cache whose lookups always miss (Req 1.4).
     /// The reasoning-compat conversation-model-affinity feature (Task 6)
-    /// rides the same prefix→provider entries, so it also needs a live
+    /// rides the same prefix?provider entries, so it also needs a live
     /// TTL; `stickiness_ttl_seconds` (default 300) is the shared knob.
     fn sticky_cache_from_config(
         cache_aware_routing: &CacheAwareRouting,
@@ -1364,6 +1378,8 @@ impl Router {
             instructions_store: None,
             oauth_usage_tracker: None,
             search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
+            web_search_metrics: Arc::new(crate::web_search::metrics::WebSearchMetrics::new()),
+            web_search_coordinator: Arc::new(crate::web_search::coordinator::WebSearchCoordinator::new()),
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
@@ -1420,6 +1436,8 @@ impl Router {
             instructions_store: None,
             oauth_usage_tracker: None,
             search_metrics: Arc::new(crate::codex::search::metrics::SearchMetrics::new()),
+            web_search_metrics: Arc::new(crate::web_search::metrics::WebSearchMetrics::new()),
+            web_search_coordinator: Arc::new(crate::web_search::coordinator::WebSearchCoordinator::new()),
             xml_tool_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             degenerate_stream_combos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             sticky_cache: Self::sticky_cache_from_config(&cache_aware_routing, &reasoning_compat),
@@ -1539,7 +1557,7 @@ Arc::clone(notifier),
 /// Success-side re-arm (model-deprecation-alerts spec, Req 4.4):
 /// a successful dispatch proves the `(provider, model)` serves, so
 /// any stale runtime-gone mark clears and the model re-enters the
-/// candidate chain. Deterministic, DashMap-cheap, no spawn — the
+/// candidate chain. Deterministic, DashMap-cheap, no spawn � the
 /// mirror of [`note_runtime_gone`] at the failure sites.
 fn note_runtime_present(&self, provider: &str, model: &str) {
 if let Some(state) = &self.deprecation_state {
@@ -1550,7 +1568,7 @@ state.record_runtime_present(provider, model);
 /// Config hot-reload sweep for the deprecation state (Req 5.2):
 /// drop every registry entry for providers no longer in
 /// `provider_names` (state API `retain_providers`), and clear
-/// runtime-gone marks for still-configured providers — the skip
+/// runtime-gone marks for still-configured providers � the skip
 /// lasts until reload, a re-arming scan, or the 24-hour bound.
 /// Scan data and open episodes for kept providers survive (a full
 /// clear would wipe alerting state the reloaded config still
@@ -1569,7 +1587,30 @@ state.clear_runtime_gone(provider);
         self.search_metrics.clone()
     }
 
-    /// Get the context manager
+/// Get the provider-agnostic web search metrics handle for Prometheus exposition.
+pub fn web_search_metrics(&self) -> Arc<crate::web_search::metrics::WebSearchMetrics> {
+    self.web_search_metrics.clone()
+}
+
+/// Drop the cached generic web-search backend so the next request
+/// rebuilds it from the live config (config hot-reload path, next to
+/// `clear_http_clients`).
+pub async fn reset_web_search_coordinator(&self) {
+    self.web_search_coordinator.reset().await;
+}
+
+/// Test seam: install a stub generic web-search backend, bypassing
+/// config-driven construction (integration tests only).
+pub async fn set_web_search_test_backend(
+    &self,
+    backend: Arc<dyn crate::web_search::SearchBackend>,
+) {
+    self.web_search_coordinator
+        .set_test_backend(backend)
+        .await;
+}
+
+/// Get the context manager
     #[allow(dead_code)]
     pub fn context_manager(&self) -> Arc<ContextManager> {
         self.context_manager.clone()
@@ -2336,7 +2377,7 @@ state.clear_runtime_gone(provider);
         // Proactive context routing (US-2/US-7, task 4.3): when a
         // reduction-tolerant policy is active, models the smart-routing
         // capacity filter dropped are re-attached as reduce-candidates at
-        // the tail — fitting candidates stay first, the gate decides at
+        // the tail � fitting candidates stay first, the gate decides at
         // dispatch. `reject` / `route_larger_context` / disabled keep the
         // hard exclusion. Only meaningful when Smart Routing actually
         // filtered; plain ordering never drops over-budget models.
@@ -2416,14 +2457,14 @@ state.clear_runtime_gone(provider);
     /// 1. Filter out providers whose circuit breaker is open
     /// 2. Filter out providers in an upstream-driven rate-limit cooldown
     ///    (set by a recent 429 / `Retry-After`). Internal token-bucket
-    ///    exhaustion is *not* used as a pre-filter — `route_with_failover`
+    ///    exhaustion is *not* used as a pre-filter � `route_with_failover`
     ///    handles that with proper attempt logging so failover is visible.
     /// 3. Sort by priority (ascending - lower priority value = higher priority)
     /// 4. Within same priority, sort by cost (ascending - lower cost first).
     ///    When `cache_aware_routing.enabled` and `cost_sort_hit_rate > 0.0`,
     ///    the cost key blends cache-read and uncached input prices at that
     ///    assumed hit rate (Req 3.1); otherwise it is the uncached cost.
-    /// 5. Within similar costs (±10%), sort by latency (ascending - lower latency first)
+    /// 5. Within similar costs (�10%), sort by latency (ascending - lower latency first)
     /// 6. If version_fallback_enabled, re-sort the whole candidate list by
     ///    version date (descending - newer first). This is intentionally the
     ///    DOMINANT key, overriding priority/cost/latency: the newest dated
@@ -2435,7 +2476,7 @@ state.clear_runtime_gone(provider);
         for m in &model_group.models {
             // CB keys are "provider:model" (per-model circuit breakers).
             // Clone the Arc out of the DashMap guard and drop the guard
-            // before awaiting — holding a shard guard across `.await`
+            // before awaiting � holding a shard guard across `.await`
             // blocks every other operation on the same shard (spec task 4).
             let cb_key = format!("{}:{}", m.provider, m.model);
             let cb = self
@@ -2454,9 +2495,9 @@ state.clear_runtime_gone(provider);
             // (see `route_with_failover`).
             //
             // We consult two stores:
-            //   1. `RateLimiter::cooldown_until` — the per-`Router` source
+            //   1. `RateLimiter::cooldown_until` � the per-`Router` source
             //      of truth, populated when a 429/Retry-After lands.
-            //   2. `Metrics::provider_cooldown_remaining_secs` — the
+            //   2. `Metrics::provider_cooldown_remaining_secs` � the
             //      durable epoch-seconds copy that backs the dashboard.
             //
             // Both must agree that the provider is eligible. The metrics
@@ -2484,7 +2525,7 @@ state.clear_runtime_gone(provider);
 // Runtime deprecation skip (model-deprecation-alerts spec, Req
 // 5.2): a `provider:model` marked runtime-gone (404/410
 // model-not-found signature) stays out of the candidate chain
-// while the flag holds — cleared by reload (provider removed or
+// while the flag holds � cleared by reload (provider removed or
 // runtime-gone sweep), a re-arming scan seeing the model present
 // again, or the 24-hour unconfirmed bound. `is_gone_at` enforces
 // that bound AT QUERY TIME regardless of eviction cadence, so a
@@ -2577,7 +2618,7 @@ let deprecation_ok = self
     /// feature flag must be enabled with a positive stickiness TTL
     /// (`stickiness_ttl_seconds: 0` disables stickiness, Req 1.4), OR the
     /// reasoning-compat conversation-model-affinity feature must be on
-    /// (Task 6) — it records and consults the same prefix→provider entries
+    /// (Task 6) � it records and consults the same prefix?provider entries
     /// for source-model attribution in strip/preserve decisions.
     async fn sticky_routing_enabled(&self) -> bool {
         let config = self.config.read().await;
@@ -2590,8 +2631,8 @@ let deprecation_ok = self
     /// Promotes the sticky provider for `request`'s conversation prefix to
     /// the head of `candidates` (Req 1.2).
     ///
-    /// MUST be applied to the output of [`Self::select_provider_order`] —
-    /// after the circuit-breaker and cooldown gates have filtered the list —
+    /// MUST be applied to the output of [`Self::select_provider_order`] �
+    /// after the circuit-breaker and cooldown gates have filtered the list �
     /// so a sticky entry for an unhealthy provider is simply not promoted
     /// and normal priority/cost/latency routing serves the request
     /// (Req 1.3). The entry is deliberately left in the cache (never
@@ -2648,8 +2689,8 @@ let deprecation_ok = self
     /// Re-pin on failover (retry-failover-core-overhaul spec, Req 6.1):
     /// when a fresh entry for this prefix points at a DIFFERENT provider
     /// than the one that just succeeded, the entry moves to the new
-    /// provider (TTL refreshed exactly like a fresh pin — no new state
-    /// machine), emits a `sticky_repin` debug log (old —— new provider +
+    /// provider (TTL refreshed exactly like a fresh pin � no new state
+    /// machine), emits a `sticky_repin` debug log (old �� new provider +
     /// prefix hash, hash only) and increments the `sticky_repins_total`
     /// counter. No ledger rows. If the original provider later recovers,
     /// existing sticky/TTL rules apply on subsequent successes.
@@ -2693,7 +2734,7 @@ let deprecation_ok = self
     /// Returns `None` when the affinity feature is off (zero overhead: no
     /// prefix hash, no lookup) or when no fresh affinity entry exists for
     /// this prefix (first turn, TTL expired, or config hot-reload cleared
-    /// the cache) — the policy then falls back to family matching.
+    /// the cache) � the policy then falls back to family matching.
     /// Synchronous and lock-free: a single DashMap read.
     fn model_affinity_source(
         &self,
@@ -2733,7 +2774,7 @@ let deprecation_ok = self
         let prefix_hash = StickyCache::compute_prefix_hash(request);
         if is_openrouter {
             // Deterministic session id from the prefix hash: same
-            // conversation prefix → same OpenRouter affinity bucket.
+            // conversation prefix ? same OpenRouter affinity bucket.
             let session_id = format!("obey-{:016x}", prefix_hash);
             outgoing
                 .extra
@@ -2769,7 +2810,7 @@ let deprecation_ok = self
                 }
                 Err(err) => {
                     // Injection failing its own post-condition must never
-                    // fail the request — send without markers.
+                    // fail the request � send without markers.
                     warn!(
                         provider = %provider_model.provider,
                         error = %err,
@@ -2905,7 +2946,7 @@ let deprecation_ok = self
     ///
     /// The pass-through path in [`Self::route_request_streaming_excluding`]
     /// hands the live body to the handler without observing mid-stream
-    /// failures, so the handler calls this when the relay fails — either before
+    /// failures, so the handler calls this when the relay fails � either before
     /// any content was forwarded (task 6.1, transparent failover) or after
     /// content was already sent (task 6.2, error event + close). In both cases
     /// the breaker must account for the failed attempt. The circuit-breaker key
@@ -2928,7 +2969,7 @@ let deprecation_ok = self
             .record_provider_failure_with_reason(provider, reason, None);
     }
 
-    /// Record a successful true-streaming pass-through relay — the mirror of
+    /// Record a successful true-streaming pass-through relay � the mirror of
     /// [`Self::record_streaming_failure`] for the success path.
     ///
     /// The buffered success path (`route_with_failover_for_group`) closes the
@@ -2945,8 +2986,8 @@ let deprecation_ok = self
     /// buffered path's `usage_known` handling.
     ///
     /// Returns the cost accrued from the reassembled usage at the
-    /// configured per-model rates — 0.0 when usage was unknown or the
-    /// provider:model has no rate entry — so the handler can thread the
+    /// configured per-model rates � 0.0 when usage was unknown or the
+    /// provider:model has no rate entry � so the handler can thread the
     /// real figure into the request ledger row via `with_cost` instead
     /// of logging a fake zero.
     ///
@@ -2969,7 +3010,7 @@ let deprecation_ok = self
         self.latency_tracker.update_latency(provider, duration);
         self.metrics.record_provider_success(provider, duration_ms);
 
-        // Provider recovered — clear the upstream-driven cooldown in both
+        // Provider recovered � clear the upstream-driven cooldown in both
         // stores so it stops being filtered out (mirrors the buffered
         // success path).
         let rate_limiter = self.get_rate_limiter(provider).await;
@@ -3016,7 +3057,7 @@ let deprecation_ok = self
                     // provider's reasoning-token field; price it at the
                     // dedicated (or output-fallback) rate when attribution is
                     // enabled. No response object exists here, so there are no
-                    // gateway_* extras to attach — metrics only.
+                    // gateway_* extras to attach � metrics only.
                     let reasoning_usage = reasoning_compat::cost::extract_reasoning_usage(usage);
                     if reasoning_usage.reasoning_tokens > 0
                         && config.reasoning_compat.attribute_reasoning_cost
@@ -3036,7 +3077,7 @@ let deprecation_ok = self
             }
         }
 
-        // Cache-aware sticky routing (Req 1.1): upsert the prefix→provider
+        // Cache-aware sticky routing (Req 1.1): upsert the prefix?provider
         // affinity from the original client request so the next turn of
         // this conversation prefers this provider.
         self.record_sticky_success(request, provider, model, usage)
@@ -3055,7 +3096,7 @@ let deprecation_ok = self
     ///
     /// Window-boundary math is the virtual-key `window_expired` logic
     /// reused verbatim (daily 00:00 UTC, Monday 00:00 UTC, first of month
-    /// 00:00 UTC) — not a fork. The durable `window_start` from the store
+    /// 00:00 UTC) � not a fork. The durable `window_start` from the store
     /// is the boundary anchor; when the store has no row yet there is
     /// nothing accrued to roll and the first spend creates the row.
     ///
@@ -3083,7 +3124,7 @@ let deprecation_ok = self
             return false;
         };
         // Hot-path boundary check (finding B1): the common case is a
-        // cached, not-yet-reached next-boundary epoch — a pure in-memory
+        // cached, not-yet-reached next-boundary epoch � a pure in-memory
         // comparison with no SQL on the tokio worker. Only a cache miss
         // (once per provider per window; one sync store read, acceptable)
         // or a passed boundary reaches the durable path below. No config
@@ -3131,7 +3172,7 @@ let deprecation_ok = self
                 // Req 2.1): a prior window at/over the limit (the
                 // provider had been budget-skipped) emits
                 // `budget.reset(window_rollover)` with the NEW anchor.
-                // Rides a spawned task — this method is on the request
+                // Rides a spawned task � this method is on the request
                 // path, so nothing synchronous is added (Req 1.10).
                 // Only the CAS WINNER emits: `reset_window` returns
                 // did_reset atomically with the anchor it stamped, so a
@@ -3159,7 +3200,7 @@ let deprecation_ok = self
             }
             Ok(None) => {
                 // No durable row: nothing was rolled durably, but the
-                // in-memory window check above passed — roll the metrics
+                // in-memory window check above passed � roll the metrics
                 // atomics so the hot path still sees a fresh window.
                 self.metrics.reset_provider_spend(provider);
             }
@@ -3184,7 +3225,7 @@ let deprecation_ok = self
     ///
     /// Recognizes the common image part type spellings across client
     /// libraries (`image_url`, `image`, `input_image`, `image_file`,
-    /// `input_image_url`) at every nesting depth — including image parts
+    /// `input_image_url`) at every nesting depth � including image parts
     /// inside a `tool_result` part's own `content` array, which clients send
     /// when a tool returned an image. It also catches shapes that carry no
     /// recognized `type` but still embed an image (an `image_url`/`source`
@@ -3282,8 +3323,8 @@ let deprecation_ok = self
 
     /// Strip image parts from a message whose `content` is a STRING that is
     /// actually a JSON-serialized content structure (an array or object of
-    /// content parts). Tool results frequently carry their payload this way —
-    /// e.g. `content: "[{\"type\":\"image_url\",\"image_url\":{...}}]"` — which
+    /// content parts). Tool results frequently carry their payload this way �
+    /// e.g. `content: "[{\"type\":\"image_url\",\"image_url\":{...}}]"` � which
     /// the array/object branches never see because the value is a string.
     ///
     /// Behavior:
@@ -3372,7 +3413,7 @@ let deprecation_ok = self
     /// while preserving all surrounding text.
     ///
     /// This is the catch-all for image bytes that are neither a structured
-    /// content part nor valid JSON — e.g. a tool result that read a source
+    /// content part nor valid JSON � e.g. a tool result that read a source
     /// file which literally contains a base64 image on some line. Aggregators
     /// that scan the whole request body reject these as "image inputs" even
     /// though the enclosing content is legitimate text, so the surrounding
@@ -3510,7 +3551,7 @@ let deprecation_ok = self
     ];
 
     /// Whether the outgoing `tools` array contains any image-input marker.
-    /// Used only for diagnostics — it does not mutate the request. Scans the
+    /// Used only for diagnostics � it does not mutate the request. Scans the
     /// serialized form so it catches markers regardless of nesting depth or
     /// whitespace.
     fn tools_contain_image_marker(request: &OpenAIRequest) -> bool {
@@ -3623,8 +3664,8 @@ let deprecation_ok = self
     ///
     /// Some clients define tools whose parameter schemas mention image inputs
     /// (a property literally named `image_url`, or a `{"type":"image"}`
-    /// enum/const). Aggregators that scan the whole request body — not just
-    /// message content — can reject these as "image inputs" even on a
+    /// enum/const). Aggregators that scan the whole request body � not just
+    /// message content � can reject these as "image inputs" even on a
     /// text-only turn. This removes object properties keyed by an image
     /// marker and array/enum entries whose `type` is in the image family,
     /// recursively across the `tools` array. Returns the number of nodes
@@ -3632,7 +3673,7 @@ let deprecation_ok = self
     ///
     /// This deliberately alters the tool contract (the offending parameter
     /// disappears), which is why it is gated behind an actual provider
-    /// rejection and bounded to one shot per request — it is strictly better
+    /// rejection and bounded to one shot per request � it is strictly better
     /// than failing the turn over to another provider with the same body.
     fn strip_image_fields_from_tools(request: &mut OpenAIRequest) -> usize {
         let Some(tools) = request.extra.get_mut("tools") else {
@@ -3775,7 +3816,7 @@ let deprecation_ok = self
     ///
     /// Providers phrase this differently ("This model does not support
     /// image inputs", "invalid content type: image", "does not support
-    /// vision", …) and always with a 4xx status. A case-insensitive
+    /// vision", �) and always with a 4xx status. A case-insensitive
     /// substring check over the body keeps the detection tolerant of the
     /// varied error envelopes.
     fn is_unsupported_image_error(status_code: u16, body: &str) -> bool {
@@ -3877,7 +3918,7 @@ let deprecation_ok = self
 
     /// Clear all per-provider retry budget entries (used during config
     /// reload, mirroring the circuit-breaker / rate-limiter / sticky-cache
-    /// resets — renamed/removed providers must not leak budget entries).
+    /// resets � renamed/removed providers must not leak budget entries).
     pub fn clear_retry_budgets(&self) {
         self.retry_budgets.clear();
     }
@@ -3934,7 +3975,7 @@ let deprecation_ok = self
     /// concurrency registry (retry-failover-core-overhaul Req 4.5: the retry
     /// budget follows live active counts, not accumulated state).
     ///
-    /// Source: `ProviderConcurrencyLimiter::in_flight` — requests currently
+    /// Source: `ProviderConcurrencyLimiter::in_flight` � requests currently
     /// holding a provider slot (active). The limiter does not track queue
     /// depth (pending waiters) separately, so the active count is the live
     /// approximation used for budget admission. Sync std mutex lock, taken
@@ -3953,7 +3994,7 @@ let deprecation_ok = self
     /// for the whole window; callers must surface that as a 503 rather than
     /// continuing to wait.
     ///
-    /// The bound matters because a permit is held for the entire upstream call —
+    /// The bound matters because a permit is held for the entire upstream call �
     /// including the full duration of a streaming relay. With a small
     /// `max_connections` and a large `total_timeout_seconds`, an unbounded wait
     /// let requests queue behind saturated slots indefinitely with no response
@@ -4173,11 +4214,11 @@ let deprecation_ok = self
 
         match status_code {
             Some(code) if Self::is_rate_limited(code, body_or_message) => {
-                "Rate limited by provider — pausing until the limit resets".to_string()
+                "Rate limited by provider � pausing until the limit resets".to_string()
             }
-            Some(401) => "Authentication failed — check the provider's API key".to_string(),
+            Some(401) => "Authentication failed � check the provider's API key".to_string(),
             Some(403) => {
-                "Provider refused the request (forbidden) — check account permissions".to_string()
+                "Provider refused the request (forbidden) � check account permissions".to_string()
             }
             Some(402) => "Billing issue at the provider (payment required)".to_string(),
             Some(404) => "Provider could not find the requested model or endpoint".to_string(),
@@ -4220,7 +4261,7 @@ let deprecation_ok = self
             Some(code) if (200..300).contains(&code) => {
                 // A 2xx status here means the provider returned an error
                 // payload (or an unparseable body) inside a success
-                // envelope. The caller-supplied text carries the detail —
+                // envelope. The caller-supplied text carries the detail �
                 // "Error in 200 response: <provider message>" from the
                 // error-in-200 detection, or "Failed to parse response:
                 // <reason>" from SSE/JSON parse failures. Surface that
@@ -4264,7 +4305,7 @@ let deprecation_ok = self
             .take(MAX)
             .collect();
         if one_line.chars().count() == MAX {
-            format!("{}—…", one_line)
+            format!("{}��", one_line)
         } else {
             one_line
         }
@@ -4276,7 +4317,7 @@ let deprecation_ok = self
     /// `None` when today's behavior (cooldown + failover) must run.
     ///
     /// Eligibility (Req 3.1-3.5): primary candidate, parseable Retry-After
-    /// (`cooldown`, already parsed by the caller — never parsed twice),
+    /// (`cooldown`, already parsed by the caller � never parsed twice),
     /// `upstream_retry_after_max_wait_ms > 0`, Retry-After within the cap,
     /// and the request has not waited before (caller-tracked flag). The
     /// cooldown must also be a real upstream signal (R4: the fabricated
@@ -4286,7 +4327,7 @@ let deprecation_ok = self
     ///
     /// Request-scoped gates (review findings R1/R2):
     /// - `has_prior_attempts`: primary-ness belongs to the REQUEST, not
-    ///   the dispatch. A failover re-entry (streaming → buffered
+    ///   the dispatch. A failover re-entry (streaming ? buffered
     ///   `route_request_with_exclusions`) starts a fresh candidate list
     ///   whose index 0 is a fallback; any attempt-ledger row (upstream
     ///   sends + skips) proves the request already left its primary, so a
@@ -4313,7 +4354,7 @@ let deprecation_ok = self
         // hint-less 429s is not a waitable upstream signal.
         || !cooldown_from_upstream
         // R3: an explicit `Retry-After: 0` / `retry-after-ms: 0` is a
-        // zero-second wait — sleep-free immediate retry is not what
+        // zero-second wait � sleep-free immediate retry is not what
         // the knob promises. Run today's cooldown + failover instead.
         || cooldown.is_zero()
         {
@@ -4354,7 +4395,7 @@ let deprecation_ok = self
                 provider,
                 retry_after_ms = retry_after.as_millis() as u64,
                 deadline_ms,
-                "Retry-After wait would pass the gateway request deadline — failing over instead"
+                "Retry-After wait would pass the gateway request deadline � failing over instead"
             );
                 return false;
             }
@@ -4395,7 +4436,7 @@ let deprecation_ok = self
                 provider,
                 waited_ms = waited.as_millis() as u64,
                 deadline_ms,
-                "Gateway request deadline fired during the Retry-After wait — abandoning the retry"
+                "Gateway request deadline fired during the Retry-After wait � abandoning the retry"
             );
                 return false;
             }
@@ -4413,9 +4454,9 @@ let deprecation_ok = self
     /// Looks at, in order of preference:
     /// 1. `Retry-After` HTTP header (seconds, or HTTP-date)
     /// 2. `retry-after-ms` HTTP header
-    /// 3. `X-RateLimit-Reset` HTTP header (Unix epoch seconds — OpenAI,
+    /// 3. `X-RateLimit-Reset` HTTP header (Unix epoch seconds � OpenAI,
     ///    Nano-GPT, OpenRouter, etc.) and `X-RateLimit-Reset-After`
-    ///    (relative seconds — GitHub-style)
+    ///    (relative seconds � GitHub-style)
     /// 4. Anthropic-style `anthropic-ratelimit-*-reset` headers (RFC 3339)
     /// 5. `error.retry_after` / `error.retry_after_ms` body fields
     /// 6. `error.reset_at` / `error.reset` body fields (epoch seconds
@@ -4464,7 +4505,7 @@ let deprecation_ok = self
     /// the configured default cooldown (R4, retry-failover-core-overhaul:
     /// Req 3.1 lets only a parseable hint drive the bounded wait).
     ///
-    /// Mirrors the header → body → period-marker preference of
+    /// Mirrors the header ? body ? period-marker preference of
     /// [`Self::compute_rate_limit_cooldown`] without re-parsing text:
     /// each stage's parser is already pure and cheap.
     async fn upstream_rate_limit_cooldown_hint(
@@ -4477,7 +4518,7 @@ let deprecation_ok = self
             || Self::cooldown_from_period_marker(body).is_some()
     }
 
-    /// Pure cooldown computation — no I/O. Exposed for unit testing the
+    /// Pure cooldown computation � no I/O. Exposed for unit testing the
     /// header / body / period-marker parsing without spinning up a router.
     pub(crate) fn compute_rate_limit_cooldown(
         headers: Option<&reqwest::header::HeaderMap>,
@@ -4637,7 +4678,7 @@ let deprecation_ok = self
                 current_num.push(c);
                 i += 1;
             } else if c == 'm' && i + 1 < chars.len() && chars[i + 1] == 's' {
-                // milliseconds — round up to at least 1s
+                // milliseconds � round up to at least 1s
                 if let Ok(ms) = current_num.parse::<f64>() {
                     total_secs += (ms / 1000.0).ceil().max(1.0) as u64;
                 }
@@ -4833,7 +4874,7 @@ let deprecation_ok = self
         // strip pass in `dispatch_attempts_under_permit`. When the provider
         // rejects with an "image inputs not supported" error (stale or
         // absent capabilities cache), strip the image parts and retry the
-        // same provider once — mirroring the standard buffered retry loop.
+        // same provider once � mirroring the standard buffered retry loop.
         let mut image_strip_retry_done = false;
         // One-shot backstop for the Bedrock Mantle single-trigger invariant: the
         // `normalize_mantle_compaction_triggers` seam already de-dupes on every
@@ -4879,7 +4920,7 @@ return Ok(response);
                                 model = %model,
                                 status = status_code,
                                 tool_schema_fields_removed = tools_removed,
-                                "Provider rejected image inputs with no image content in messages — scrubbed image references from tool schemas and retrying same provider"
+                                "Provider rejected image inputs with no image content in messages � scrubbed image references from tool schemas and retrying same provider"
                             );
                         }
                         removed += tools_removed;
@@ -4891,7 +4932,7 @@ return Ok(response);
                             model = %model,
                             status = status_code,
                             images_removed = removed,
-                            "Provider rejected image inputs — stripped images and retrying same provider"
+                            "Provider rejected image inputs � stripped images and retrying same provider"
                         );
                         continue;
                     }
@@ -4919,7 +4960,7 @@ return Ok(response);
                             model = %request.model,
                             status = status_code,
                             triggers_removed = normalization.removed,
-                            "Provider rejected duplicate compaction_trigger — normalized and retrying same provider"
+                            "Provider rejected duplicate compaction_trigger � normalized and retrying same provider"
                         );
                         continue;
                     }
@@ -5108,14 +5149,67 @@ return Ok(response);
         }
     }
 
-    /// Inject `codex_search`/`codex_web` tool definitions into a prepared
-    /// request when the search feature is active. Runs after tool
-    /// compression so the injected definitions are never compressed away.
-    async fn maybe_inject_search_tools(&self, request: &mut OpenAIRequest) {
-        if self.codex_search_ready().await.is_some() {
-            crate::codex::search::injector::ToolInjector::inject(request, true, true);
+/// Inject `codex_search`/`odex_web`-or-`web_search` tool definitions into a
+/// prepared request when a search feature is active. Runs after tool
+/// compression so the injected definitions are never compressed away.
+/// When the generic `web_search` feature is active it wins exclusively:
+/// only the `web_search` tool is injected (plus client tools) and the
+/// legacy Codex tools are suppressed.
+async fn maybe_inject_search_tools(&self, request: &mut OpenAIRequest) {
+        match self.active_search_config().await {
+            crate::web_search::coordinator::ActiveSearchConfig::Generic { .. } => {
+                let tools = request.extra.entry("tools".to_string()).or_insert_with(|| {
+                    serde_json::Value::Array(Vec::new())
+                });
+                if let serde_json::Value::Array(arr) = tools {
+                    crate::web_search::injector::inject_web_search_tool(arr);
+                }
+            }
+            crate::web_search::coordinator::ActiveSearchConfig::LegacyCodex(_) => {
+                crate::codex::search::injector::ToolInjector::inject(request, true, true);
+            }
+            crate::web_search::coordinator::ActiveSearchConfig::GenericNotReady
+            | crate::web_search::coordinator::ActiveSearchConfig::None => {}
         }
+}
+
+/// Resolve which search feature is active for the current request:
+/// generic `web_search` (config effective-enabled AND backend ready)
+/// takes precedence over the legacy Codex path; otherwise legacy Codex
+/// behaves exactly as today; both absent ? `None`. The config lock is
+/// dropped before the readiness probe, which may await OAuth refresh.
+async fn active_search_config(&self) -> crate::web_search::coordinator::ActiveSearchConfig {
+    let web_search_cfg = self
+        .config
+        .read()
+        .await
+        .web_search
+        .clone()
+        .unwrap_or_default();
+    if web_search_cfg.effective_enabled() {
+        if let Some(backend) = self
+            .web_search_coordinator
+            .resolve_backend(&web_search_cfg, self.oauth_manager.as_ref())
+            .await
+        {
+            return crate::web_search::coordinator::ActiveSearchConfig::Generic {
+                backend,
+                config: web_search_cfg,
+            };
+        }
+        // Enabled-but-not-ready never falls through to legacy (Req 6.2:
+        // operator intent wins): the admin explicitly chose the generic
+        // feature; silently swapping in the Codex backend would surprise
+        // both model and billing expectations. The distinct arm lets the
+        // Codex dispatch branch suppress legacy injection in this case
+        // while injection sites treat it like `None`.
+        return crate::web_search::coordinator::ActiveSearchConfig::GenericNotReady;
     }
+    match self.codex_search_ready().await {
+        Some(cfg) => crate::web_search::coordinator::ActiveSearchConfig::LegacyCodex(cfg),
+        None => crate::web_search::coordinator::ActiveSearchConfig::None,
+    }
+}
 
     /// Run the Codex Search agent loop when a buffered provider response
     /// contains gateway-injected search tool calls. No-ops for Codex
@@ -5130,58 +5224,636 @@ return Ok(response);
         base_attempt: usize,
         compression_restore: ToolCompressionRestore,
     ) -> Result<OpenAIResponse, GatewayError> {
-        // XML-prone models (GLM, Kimi, Qwen, DeepSeek) emit tool calls as
-        // XML text rather than native tool_calls. Translate first so
-        // gateway search calls become detectable; otherwise they slip past
-        // this hook and leak to the client (which doesn't know codex_search).
-        Self::translate_xml_tool_calls(&mut response, request);
+// XML-prone models (GLM, Kimi, Qwen, DeepSeek) emit tool calls as
+// XML text rather than native tool_calls. Translate first so
+// gateway search calls become detectable; otherwise they slip past
+// this hook and leak to the client (which doesn't know codex_search).
+Self::translate_xml_tool_calls(&mut response, request);
 
-        let has_gateway_call = response
-            .choices
-            .first()
-            .and_then(|c| c.message.extra.get("tool_calls"))
+let has_codex_call = response
+    .choices
+    .first()
+    .and_then(|c| c.message.extra.get("tool_calls"))
+    .and_then(|v| v.as_array())
+    .map(|calls| {
+        calls.iter().any(|tc| {
+            tc.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|n| n == "codex_search" || n == "codex_web")
+                .unwrap_or(false)
+        })
+    })
+    .unwrap_or(false);
+let has_web_search_call = response
+    .choices
+    .first()
+    .and_then(|c| c.message.extra.get("tool_calls"))
+    .and_then(|v| v.as_array())
+    .map(|calls| {
+        calls.iter().any(|tc| {
+            tc.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|n| n == crate::web_search::injector::WEB_SEARCH_TOOL_NAME)
+                .unwrap_or(false)
+        })
+    })
+    .unwrap_or(false);
+    if !has_codex_call && !has_web_search_call {
+        return Ok(response);
+    }
+
+    // Client-declared `web_search` collision: the injector's
+    // collision-safe inject is a no-op when the client already declared
+    // a tool with this name, so a `web_search` call here belongs to the
+    // client's own tool. Distinguish by definition identity — the
+    // gateway's injected definition is a static constant, so any
+    // web_search entry that is not value-equal to it is the client's.
+    // Do not intercept; return the call untouched.
+    let client_declared_web_search = has_web_search_call
+        && !request
+            .extra
+            .get("tools")
             .and_then(|v| v.as_array())
-            .map(|calls| {
-                calls.iter().any(|tc| {
-                    tc.get("function")
+            .map(|tools| {
+                tools.iter().any(|t| {
+                    t.get("function")
                         .and_then(|f| f.get("name"))
                         .and_then(|n| n.as_str())
-                        .map(|n| n == "codex_search" || n == "codex_web")
-                        .unwrap_or(false)
+                        == Some(crate::web_search::injector::WEB_SEARCH_TOOL_NAME)
+                        && t == crate::web_search::injector::web_search_definition()
                 })
             })
             .unwrap_or(false);
-        if !has_gateway_call {
-            return Ok(response);
-        }
+    if client_declared_web_search && !has_codex_call {
+        return Ok(response);
+    }
 
-        // Past this point the response carries a gateway-injected search call the
-        // client never declared, so EVERY exit path must strip it. A client that
-        // receives `codex_search` cannot execute it and cannot produce the
-        // matching `role: tool` reply, so its agent loop deadlocks with no error
-        // to show — the request just stops.
-        //
-        // These two bail-outs are reachable in normal operation because readiness
-        // is evaluated independently at injection time and again here: an OAuth
-        // token that expires or starts refreshing during the provider round trip,
-        // or an `/admin/config/reload` that disables the feature mid-request,
-        // lands exactly here holding a call that was legitimately injected.
-        let Some(search_cfg) = self.codex_search_ready().await else {
-            warn!(
-                provider = %provider_model.provider,
-                "Codex search became unavailable between tool injection and interception; stripping the gateway tool call the client cannot execute"
-            );
-            Self::discard_unexecutable_search_call(&mut response);
-            return Ok(response);
+    // Resolve the active feature once for this interception (readiness is
+    // re-evaluated here because an OAuth token can expire or a hot-reload
+    // can disable the feature mid-request), but route each call by the
+    // tool the model actually invoked rather than by the currently
+    // resolved feature: a hot-reload between injection and interception
+    // can swap the active feature while the in-flight turn still calls
+    // the injected tool. `web_search` calls belong to the generic loop,
+    // codex_search/codex_web calls to the legacy loop; whichever type its
+    // feature can no longer execute is stripped with an honest message
+    // instead of leaking to the client, and a (hot-reload-only) turn
+    // carrying both types runs each through its own interceptor.
+    let active_config = self.active_search_config().await;
+    let generic_ready = match &active_config {
+        crate::web_search::coordinator::ActiveSearchConfig::Generic { backend, config } => {
+            Some((backend.clone(), config.clone()))
+        }
+        _ => None,
+    };
+    let legacy_ready = match &active_config {
+        crate::web_search::coordinator::ActiveSearchConfig::LegacyCodex(cfg) => Some(cfg.clone()),
+        _ => None,
+    };
+    let route_generic = has_web_search_call && !client_declared_web_search;
+    let route_legacy = has_codex_call;
+    if route_generic {
+        match generic_ready {
+            Some((backend, config)) => {
+                let resubmitter = SearchResubmitter {
+                    router: self,
+                    provider_name: provider_model.provider.as_str(),
+                    provider_model,
+                    active: active.clone(),
+                    base_attempt,
+                    compression_restore: compression_restore.clone(),
+                };
+                response = self
+                    .intercept_web_search_rounds(
+                        provider_model,
+                        &resubmitter,
+                        request,
+                        response,
+                        active.clone(),
+                        backend,
+                        config,
+                    )
+                    .await?;
+            }
+            None => {
+                warn!(
+                    provider = %provider_model.provider,
+                    "web_search became unavailable between tool injection and interception; stripping the gateway tool call the client cannot execute"
+                );
+                Self::discard_unexecutable_web_search_call(&mut response);
+            }
+        }
+    }
+    if route_legacy {
+        match legacy_ready {
+            Some(search_cfg) => {
+                response = self
+                    .intercept_codex_search(
+                        provider_model,
+                        request,
+                        response,
+                        active.clone(),
+                        base_attempt,
+                        compression_restore.clone(),
+                        search_cfg,
+                    )
+                    .await?;
+            }
+            None => {
+                warn!(
+                    provider = %provider_model.provider,
+                    "Codex search became unavailable between tool injection and interception; stripping the gateway tool call the client cannot execute"
+                );
+                Self::discard_unexecutable_search_call(&mut response);
+            }
+        }
+    }
+    Ok(response)
+}
+
+/// Generic `web_search` agent loop: execute `web_search` tool calls via
+/// the coordinator backend (single attempt, no retry), feed rendered
+/// results back as tool messages, and resubmit through the supplied
+/// provider client until the model answers or a budget is spent. The
+/// failover layer passes the `SearchResubmitter` (ADR-0002 debits via
+/// `attempt_with_retry`); the Codex dispatch arm passes its metered
+/// Codex client. Every exit path strips the injected tool
+/// calls/definitions so the client never sees gateway artifacts.
+#[allow(clippy::too_many_arguments)]
+async fn intercept_web_search_rounds(
+    &self,
+    provider_model: &ProviderModel,
+    provider: &dyn ProviderClient,
+    request: &OpenAIRequest,
+    mut response: OpenAIResponse,
+    active: Option<ActiveRequestHandle>,
+    backend: Arc<dyn crate::web_search::SearchBackend>,
+    config: crate::web_search::config::WebSearchConfig,
+    ) -> Result<OpenAIResponse, GatewayError> {
+        let mut round_request = request.clone();
+        let max_iterations = config.effective_max_iterations();
+        let budget_secs = {
+            let cfg = self.config.read().await;
+            crate::runtime_limits::effective_request_timeout_seconds(&cfg)
         };
-        let Some(oauth) = self.oauth_manager.clone() else {
-            warn!(
-                provider = %provider_model.provider,
-                "No OAuth manager attached to execute the gateway search call; stripping it rather than leaking it to the client"
+        let budget = Duration::from_secs(budget_secs);
+        // The wall-clock budget anchors on the ACTIVE REQUEST deadline —
+        // arrival + effective request timeout, the same source the Req 1.6
+        // retry-cap reads — not on when this loop happened to start, so
+        // search rounds can never overshoot the request's own budget.
+        // Without an active handle (internal calls) fall back to loop start.
+        let request_started = active
+            .as_ref()
+            .map(|h| std::time::Instant::now() - std::time::Duration::from_millis(h.elapsed_ms().max(0) as u64));
+        let started = request_started.unwrap_or_else(std::time::Instant::now);
+        // Search rounds are extra upstream calls invisible to the client;
+        // surface the stall reason while the loop runs. RAII: the previous
+        // marker is restored even when `?` propagates an error.
+        let _search_stall = crate::active_requests::ActiveRequestHandle::begin_stall_opt(
+            active.as_ref(),
+            crate::active_requests::StallReason::WebSearch,
+        );
+        let mut all_results: Vec<serde_json::Value> = Vec::new();
+        let mut iterations: u32 = 0;
+        loop {
+            let tool_calls: Vec<serde_json::Value> = response
+                .choices
+                .first()
+                .and_then(|c| c.message.extra.get("tool_calls"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let (gateway_calls, client_calls): (Vec<serde_json::Value>, Vec<serde_json::Value>) =
+                tool_calls
+                    .into_iter()
+                    .partition(|tc| {
+                        tc.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            == Some(crate::web_search::injector::WEB_SEARCH_TOOL_NAME)
+                    });
+
+            if gateway_calls.is_empty() {
+                if config.effective_output_to_chat() && !all_results.is_empty() {
+                    Self::append_web_search_results_to_chat(&mut response, &all_results);
+                }
+                crate::web_search::injector::strip_web_search_tool_calls(&mut response);
+                _search_stall.end();
+                return Ok(response);
+            }
+
+            // Mixed client + gateway calls: execute the gateway's web_search
+            // calls so their results ride the response (output_to_chat /
+            // metadata), strip them, and return the client's own calls
+            // untouched — the client executes those itself (same contract as
+            // the legacy Codex interceptor's pending_client_tool_calls arm).
+            let has_client_calls = !client_calls.is_empty();
+
+            // Stop looping when either budget is spent. The iteration limit
+            // gets one final resubmit so the model can answer with what it
+            // already has; a spent wall-clock budget does not, because
+            // another round trip is precisely what there is no time left for.
+            let iterations_spent = iterations >= max_iterations;
+            let time_spent = started.elapsed() >= budget;
+            if !has_client_calls && (iterations_spent || time_spent) {
+                let mut final_response = if iterations_spent {
+                    // Conversation discipline: the budget-exhausted tool
+                    // messages reference the tool_call IDs this assistant
+                    // turn declared, so the assistant message must be
+                    // appended first (with its gateway-owned calls stripped
+                    // per the standard discipline) to avoid dangling tool
+                    // references strict providers reject.
+                    Self::append_round_assistant_message(&mut round_request, &response);
+                    // Budget-exhausted tool result: every executed gateway
+                    // call in this turn gets a synthetic tool reply stating
+                    // the budget ran out, then one final resubmit (with the
+                    // gateway tool definition stripped so the model cannot
+                    // emit another search call) lets the model answer with
+                    // what it already has.
+                    for tc in &gateway_calls {
+                        let call_id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let query = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                            .and_then(|args| {
+                                crate::web_search::models::parse_web_search_args(args)
+                                    .ok()
+                                    .map(|parsed| parsed.q)
+                            });
+                        Self::record_web_search_round(
+                            active.as_ref(),
+                            backend.name(),
+                            "budget-exhausted",
+                            query.as_deref(),
+                            std::time::Duration::ZERO,
+                        );
+                        // Req 5.1: budget exhaustion is a spent round —
+                        // count the execution against the configured
+                        // backend (no latency: no backend call happened).
+                        self.web_search_metrics
+                            .record_execution(backend.name());
+                        let mut extra = serde_json::Map::new();
+                        extra.insert(
+                            "tool_call_id".to_string(),
+                            serde_json::Value::String(call_id),
+                        );
+                        round_request.messages.push(Message {
+                            role: "tool".to_string(),
+                            content: serde_json::Value::String(
+                                WEB_SEARCH_ITERATION_LIMIT_MESSAGE.to_string(),
+                            ),
+                            extra,
+                        });
+                    }
+                    crate::web_search::injector::strip_web_search_tool_definition(
+                        &mut round_request,
+                    );
+                    // Race the final resubmission against the remaining
+                    // request deadline so a hung provider cannot overshoot
+                    // the request budget; the request deadline machinery
+                    // stays authoritative.
+                    let remaining = budget.checked_sub(started.elapsed());
+                    match remaining {
+                        Some(left) => {
+                            let ProviderResponse { response: next, .. } = tokio::time::timeout(
+                                left,
+                                provider.chat_completion(round_request.clone()),
+                            )
+                            .await
+                            .map_err(|_| {
+                                GatewayError::TotalTimeout(budget.as_secs())
+                            })??;
+                            next
+                        }
+                        None => response,
+                    }
+                } else {
+                    warn!(
+                        provider = %provider_model.provider,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        budget_ms = budget.as_millis() as u64,
+                        iterations,
+                        "web_search loop exceeded its wall-clock budget; returning current turn without another model round trip"
+                    );
+                    response
+                };
+                if config.effective_output_to_chat() && !all_results.is_empty() {
+                    Self::append_web_search_results_to_chat(&mut final_response, &all_results);
+                }
+                crate::web_search::injector::strip_web_search_tool_calls(&mut final_response);
+                // A stripped terminal turn must never be an empty assistant
+                // message with finish_reason "tool_calls": repair it into a
+                // valid nonempty answer turn with finish_reason "stop".
+                Self::finalize_stripped_terminal_turn(
+                    &mut final_response,
+                    WEB_SEARCH_WALL_CLOCK_EXHAUSTED_MESSAGE,
+                );
+                _search_stall.end();
+                return Ok(final_response);
+            }
+
+            // Assistant turn with the tool calls, then one tool message per
+            // executed call — the standard agent-loop shape.
+            Self::append_round_assistant_message(&mut round_request, &response);
+            for tc in &gateway_calls {
+                let call_id = tc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let args_str = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("{}");
+                let (content, is_error) =
+                    match crate::web_search::models::parse_web_search_args(args_str) {
+                        Err(validation) => {
+                            Self::record_web_search_round(
+                                active.as_ref(),
+                                backend.name(),
+                                "validation-error",
+                                None,
+                                std::time::Duration::ZERO,
+                            );
+                            // Req 5.1: failures count too — a validation
+                            // error spends the round without a backend call,
+                            // so the execution is recorded without latency.
+                            self.web_search_metrics
+                                .record_execution(backend.name());
+                            (validation, true)
+                        }
+                        Ok(query) => {
+                            let backend_name = backend.name();
+                            let execution_started = std::time::Instant::now();
+                            // Race the backend execution against the
+                            // remaining request deadline so a hung search
+                            // backend cannot overshoot the request budget;
+                            // the request deadline machinery stays
+                            // authoritative.
+                            let remaining = budget.checked_sub(started.elapsed());
+                            let outcome = match remaining {
+                                Some(left) => {
+                                    match tokio::time::timeout(
+                                        left,
+                                        backend.execute(&query),
+                                    )
+                                    .await
+                                    {
+                                        Ok(outcome) => outcome,
+                                        Err(_) => Err(crate::web_search::BackendError::new(
+                                            format!(
+                                                "web search timed out after {}s of the request budget",
+                                                left.as_secs()
+                                            ),
+                                        )),
+                                    }
+                                }
+                                None => Err(crate::web_search::BackendError::new(
+                                    "web search timed out: the request budget was already spent".to_string(),
+                                )),
+                            };
+                            let elapsed_ms = execution_started.elapsed().as_millis() as u64;
+                            self.web_search_metrics.record_execution(backend_name);
+                            self.web_search_metrics
+                                .record_latency_ms(backend_name, elapsed_ms);
+                            Self::record_web_search_round(
+                                active.as_ref(),
+                                backend_name,
+                                if outcome.is_ok() { "success" } else { "error" },
+                                Some(&query.q),
+                                execution_started.elapsed(),
+                            );
+                            match outcome {
+                                Ok(results) => (
+                                    crate::web_search::models::render_tool_results(
+                                        &results,
+                                        crate::web_search::models::DEFAULT_RESULT_BUDGET_BYTES,
+                                    ),
+                                    false,
+                                ),
+                                // Req 2.5: the honest failure statement must
+                                // also tell the model no search ran this
+                                // turn — verbatim per the requirement.
+                                Err(err) => (
+                                    format!("web search failed: {err}. No search ran this turn."),
+                                    true,
+                                ),
+                            }
+                        }
+                    };
+                all_results.push(serde_json::json!({
+                    "tool_call_id": call_id,
+                    "name": crate::web_search::injector::WEB_SEARCH_TOOL_NAME,
+                    "content": content,
+                    "is_error": is_error,
+                }));
+                let mut extra = serde_json::Map::new();
+                extra.insert(
+                    "tool_call_id".to_string(),
+                    serde_json::Value::String(call_id),
+                );
+                round_request.messages.push(Message {
+                    role: "tool".to_string(),
+                    content: serde_json::Value::String(content),
+                    extra,
+                });
+            }
+
+            if has_client_calls {
+                if config.effective_output_to_chat() && !all_results.is_empty() {
+                    Self::append_web_search_results_to_chat(&mut response, &all_results);
+                }
+                crate::web_search::injector::strip_web_search_tool_calls(&mut response);
+                _search_stall.end();
+                return Ok(response);
+            }
+
+            iterations += 1;
+            // Race the resubmission against the remaining request deadline
+            // (finding: elapsed-time checks before the call could overshoot
+            // the request budget; the deadline stays authoritative).
+            let remaining = budget.checked_sub(started.elapsed());
+            let ProviderResponse { response: next, .. } = match remaining {
+                Some(left) => {
+                    match tokio::time::timeout(
+                        left,
+                        provider.chat_completion(round_request.clone()),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            warn!(
+                                provider = %provider_model.provider,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                budget_ms = budget.as_millis() as u64,
+                                iterations,
+                                "web_search round resubmission exceeded the request budget; continuing with the current turn"
+                            );
+                            // Budget race lost: keep the current turn (with
+                            // its executed results) rather than failing the
+                            // whole request; the strip + finalize below
+                            // produces a valid terminal answer turn.
+                            if config.effective_output_to_chat() && !all_results.is_empty() {
+                                Self::append_web_search_results_to_chat(
+                                    &mut response,
+                                    &all_results,
+                                );
+                            }
+                            crate::web_search::injector::strip_web_search_tool_calls(&mut response);
+                            Self::finalize_stripped_terminal_turn(
+                                &mut response,
+                                WEB_SEARCH_WALL_CLOCK_EXHAUSTED_MESSAGE,
+                            );
+                            _search_stall.end();
+                            return Ok(response);
+                        }
+                    }
+                }
+                None => {
+                    warn!(
+                        provider = %provider_model.provider,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        budget_ms = budget.as_millis() as u64,
+                        iterations,
+                        "web_search loop exceeded its wall-clock budget; returning current turn without another model round trip"
+                    );
+                    if config.effective_output_to_chat() && !all_results.is_empty() {
+                        Self::append_web_search_results_to_chat(&mut response, &all_results);
+                    }
+                    crate::web_search::injector::strip_web_search_tool_calls(&mut response);
+                    Self::finalize_stripped_terminal_turn(
+                        &mut response,
+                        WEB_SEARCH_WALL_CLOCK_EXHAUSTED_MESSAGE,
+                    );
+                    _search_stall.end();
+                    return Ok(response);
+                }
+            };
+            response = next;
+        }
+    }
+
+    /// Req 5.2: record one informational attempt-ledger row for an
+    /// executed `web_search` round (tool name, backend, status,
+    /// duration_ms, size-truncated query) via the standard
+    /// `#attempt` machinery. No-ops without an active-request handle
+    /// (e.g. internally invoked routing calls).
+    fn record_web_search_round(
+        active: Option<&ActiveRequestHandle>,
+        backend_name: &'static str,
+        status: &str,
+        query: Option<&str>,
+        elapsed: std::time::Duration,
+    ) {
+        if let Some(handle) = active {
+            handle.record_failed_attempt(
+                crate::web_search::coordinator::web_search_round_attempt(
+                    backend_name, status, query, elapsed,
+                ),
             );
-            Self::discard_unexecutable_search_call(&mut response);
-            return Ok(response);
+        }
+    }
+
+    /// Terminal-turn repair for a response whose gateway-owned tool calls
+    /// were just stripped: guarantees a valid nonempty assistant message
+    /// with finish_reason "stop". An empty turn gets the honest note as
+    /// content; a turn that kept client tool calls alone would contradict
+    /// "terminal", but if stripping emptied it the note fills it; a turn
+    /// with content but a stale finish_reason "tool_calls" (its search
+    /// calls were executed and removed) is re-aligned to "stop" so clients
+    /// do not wait for tool results that will never come.
+    fn finalize_stripped_terminal_turn(response: &mut OpenAIResponse, note: &str) {
+        Self::backfill_empty_turn(response, note);
+        if let Some(choice) = response.choices.first_mut() {
+            let has_tool_calls = choice
+                .message
+                .extra
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|calls| !calls.is_empty());
+            if !has_tool_calls && choice.finish_reason.as_deref() == Some("tool_calls") {
+                choice.finish_reason = Some("stop".to_string());
+            }
+        }
+    }
+
+    /// Append the response's assistant turn to the round request with its
+    /// tool_calls intact, mirroring the legacy Codex interceptor's
+    /// `append_assistant_message` discipline: the round-trip assistant
+    /// message must declare the call IDs the following tool messages
+    /// answer (stripping gateway calls here would dangle the references),
+    /// while the client-visible response is where gateway calls get
+    /// stripped. Must run BEFORE any tool message append.
+    fn append_round_assistant_message(
+        round_request: &mut OpenAIRequest,
+        response: &OpenAIResponse,
+    ) {
+        if let Some(choice) = response.choices.first() {
+            round_request.messages.push(Message {
+                role: "assistant".to_string(),
+                content: choice.message.content.clone(),
+                extra: choice.message.extra.clone(),
+            });
+        }
+    }
+
+    fn append_web_search_results_to_chat(
+    response: &mut OpenAIResponse,
+    all_results: &[serde_json::Value],
+) {
+    if let Some(choice) = response.choices.first_mut() {
+        let mut lines = vec!["--- web search results ---".to_string()];
+        for result in all_results {
+            lines.push(
+                result
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        lines.push("--- end web search results ---".to_string());
+        let block = lines.join("\n");
+        let existing = choice.message.content_as_text();
+        let combined = if existing.trim().is_empty() {
+            block
+        } else {
+            format!("{}\n\n{}", existing, block)
         };
+        choice.message.content = serde_json::Value::String(combined);
+    }
+}
+
+/// Legacy Codex Search agent loop, byte-identical to the pre-generic
+/// interception path.
+#[allow(clippy::too_many_arguments)]
+async fn intercept_codex_search(
+    &self,
+    provider_model: &ProviderModel,
+    request: &OpenAIRequest,
+    mut response: OpenAIResponse,
+    active: Option<ActiveRequestHandle>,
+    base_attempt: usize,
+    compression_restore: ToolCompressionRestore,
+    search_cfg: crate::codex::search::CodexSearchConfig,
+) -> Result<OpenAIResponse, GatewayError> {
+    let Some(oauth) = self.oauth_manager.clone() else {
+        warn!(
+            provider = %provider_model.provider,
+            "No OAuth manager attached to execute the gateway search call; stripping it rather than leaking it to the client"
+        );
+        Self::discard_unexecutable_search_call(&mut response);
+        return Ok(response);
+    };
         let (pool_config, budget) = {
             let config = self.config.read().await;
             let pool = config
@@ -5192,7 +5864,7 @@ return Ok(response);
             // The search loop is a single request as far as the client is
             // concerned, so it gets the same ceiling the gateway applies to any
             // one request. It needs its own copy because on streaming requests
-            // the global deadline middleware does not cover this work at all —
+            // the global deadline middleware does not cover this work at all �
             // that middleware only bounds producing response headers, and the SSE
             // handler returns its body handle before the router is ever called.
             let budget = Duration::from_secs(
@@ -5250,7 +5922,7 @@ return Ok(response);
         // which can empty the `tool_calls` array and leave a turn with no content
         // either. `response_has_content` already ran *before* interception, so
         // nothing downstream catches it, and the SSE synthesizer renders such a
-        // turn as a bare `finish_reason` chunk — which a harness reads as a
+        // turn as a bare `finish_reason` chunk � which a harness reads as a
         // finished, empty turn and stops on.
         if Self::backfill_empty_turn(
             &mut final_response,
@@ -5276,18 +5948,18 @@ return Ok(response);
 
     /// Proactive context-budget gate (US-1/US-2, task 4.1): compare the final
     /// outgoing body against the target model's effective input budget
-    /// (`context_window − max_tokens − safety margin`, mirroring the reactive
+    /// (`context_window - max_tokens - safety margin`, mirroring the reactive
     /// [`ContextManager`] math via [`ContextBudgetGate::input_budget`]) and
     /// apply the configured overflow policy.
     ///
     /// Returns `Ok(None)` when the request fits (or the gate is disabled, or
-    /// the target's capacity is unknown — today's behavior), `Ok(Some((body`
+    /// the target's capacity is unknown � today's behavior), `Ok(Some((body`
     /// `, outcome))` with the reduced copy to send and the reduction
     /// outcome for logging, or `Err`:
     /// - [`GatewayError::ContextCapacityExceeded`] (HTTP 413, class
     ///   `context_window_exceeded`) for the `reject` policy, and for
     ///   `route_larger_context` / `route_then_reduce` / `reduce` candidates
-    ///   that cannot be reduced to fit — the caller excludes the candidate
+    ///   that cannot be reduced to fit � the caller excludes the candidate
     ///   and continues the failover loop.
     ///
     /// The context window comes from the same capability source the reactive
@@ -5414,7 +6086,7 @@ return Ok(response);
     ///
     /// `estimated_requirement` describes the **total context requirement**
     /// (prompt estimate + reserved output + safety margin), matching how the
-    /// smart-routing capacity filter and the HTTP 413 body report it — not the
+    /// smart-routing capacity filter and the HTTP 413 body report it � not the
     /// bare prompt count.
     fn context_capacity_skip(provider_model: &ProviderModel, check: BudgetCheck) -> GatewayError {
         GatewayError::ContextCapacityExceeded {
@@ -5486,7 +6158,7 @@ return Ok(response);
             (secs > 0).then(|| secs as i64 * 1000)
         };
 
-        // ─── Codex dispatch (Req 10.1, 10.2) ────────────────────────────────
+        // --- Codex dispatch (Req 10.1, 10.2) --------------------------------
         let is_codex = provider_cfg.auth_method.as_deref() == Some("oauth")
             && provider_cfg.provider_type == "openai";
 
@@ -5532,7 +6204,7 @@ return Ok(response);
             );
 
             let codex_search_config = config.codex_search.clone().unwrap_or_default();
-            // Wall-clock ceiling for the search agent loop — the same one the
+            // Wall-clock ceiling for the search agent loop � the same one the
             // failover-layer interception uses. Read here while the config guard
             // is still held, since the loop itself runs after it is dropped.
             let codex_search_budget = Duration::from_secs(
@@ -5556,13 +6228,43 @@ return Ok(response);
             &self.metrics,
         );
 
-            let search_enabled = codex_search_config.effective_enabled(true);
-            let oauth_active = oauth.get_access_token().await.is_some();
-            crate::codex::search::injector::ToolInjector::inject(
-                &mut codex_request,
-                oauth_active,
-                search_enabled,
-            );
+let search_enabled = codex_search_config.effective_enabled(true);
+let oauth_active = oauth.get_access_token().await.is_some();
+    // Generic web_search takes precedence over the legacy Codex injection
+    // (spec provider-agnostic-web-search-injection): when active, only the
+    // `web_search` tool is offered and the legacy loop below is skipped.
+    // Enabled-but-not-ready also suppresses the legacy injection (Req 6.2:
+    // operator intent wins) — only a fully inactive config falls back.
+    let active_search = self.active_search_config().await;
+    let generic_search = match &active_search {
+        crate::web_search::coordinator::ActiveSearchConfig::Generic { backend, config } => {
+            Some((backend.clone(), config.clone()))
+        }
+        _ => None,
+    };
+    let suppress_legacy_injection = !matches!(
+        active_search,
+        crate::web_search::coordinator::ActiveSearchConfig::None
+    );
+        match &generic_search {
+            Some(_) => {
+                // The failover layer already injected `web_search` into the
+                // prepared request that flows through here; injecting again
+                // would be a no-op (collision-safe), so only ensure the legacy
+                // codex_search/codex_web tools are NOT added on top.
+            }
+            None if suppress_legacy_injection => {
+                // Enabled-but-not-ready (Req 6.2): operator intent wins,
+                // no search tool is offered at all.
+            }
+            None => {
+                crate::codex::search::injector::ToolInjector::inject(
+                    &mut codex_request,
+                    oauth_active,
+                    search_enabled,
+                );
+            }
+        }
 
             // Every Codex call (first send, repair retries, search rounds)
             // is one upstream request and is charged one token.
@@ -5582,12 +6284,36 @@ return Ok(response);
                 None => None,
             };
 
-            let codex_client = MeteredClient::new(&codex_client, rate_limiter.clone(), first_send);
-            let result = self
-                .dispatch_buffered_with_context_retry(&codex_client, codex_request.clone())
-                .await?;
+let codex_client = MeteredClient::new(&codex_client, rate_limiter.clone(), first_send);
+let result = self
+.dispatch_buffered_with_context_retry(&codex_client, codex_request.clone())
+.await?;
 
-            if search_enabled && oauth_active {
+// Generic web_search active: run the generic round loop against this
+// same metered Codex client (each search round debits one token,
+// ADR-0002) instead of the legacy interceptor.
+if let Some((backend, generic_config)) = generic_search {
+    let mut final_response = self
+        .intercept_web_search_rounds(
+            provider_model,
+            &codex_client,
+            &codex_request,
+            result.response,
+            active.clone(),
+            backend,
+            generic_config,
+        )
+        .await?;
+    Self::backfill_empty_turn(
+        &mut final_response,
+        "The gateway ran your web search, but this turn produced no answer text and no tool call. \
+Continue the task with your own tools, or say what information you still need.",
+    );
+    Self::attach_context_reduction(&mut final_response, context_reduction.as_ref());
+    return Ok(final_response);
+}
+
+if search_enabled && oauth_active {
                 let usage_tracker = self
                     .oauth_usage_tracker
                     .clone()
@@ -5634,7 +6360,7 @@ return Ok(response);
             Self::attach_context_reduction(&mut response, context_reduction.as_ref());
             return Ok(response);
         }
-        // ─── End Codex dispatch ──────────────────────────────────────────────
+        // --- End Codex dispatch ----------------------------------------------
 
         // Resolve API key: try as env var first, fall back to using the value directly
         let api_key = provider_cfg.resolve_api_key().unwrap_or_default();
@@ -5688,8 +6414,8 @@ return Ok(response);
             return Ok(response);
         }
 
-        // ─── GitHub Copilot dispatch (github-copilot-oauth-provider,
-        // task 9 / Req 4.3, 9.1) ───────────────────────────────────────────
+        // --- GitHub Copilot dispatch (github-copilot-oauth-provider,
+        // task 9 / Req 4.3, 9.1) -------------------------------------------
         // Delegates end-to-end to the GitHubCopilotProvider adapter (task 7),
         // mirroring the Codex arm: MeteredClient wraps the adapter so ADR
         // 0002 (one token per real upstream request) holds, and
@@ -5737,7 +6463,7 @@ return Ok(response);
             // Copilot rides stream:false buffered dispatch (Bedrock arm
             // precedent): this arm delegates to the adapter, which has no
             // upstream-streaming SSE reassembly, so a client stream:true
-            // must never reach the upstream request body — an SSE body
+            // must never reach the upstream request body � an SSE body
             // would hit the adapter's JSON parser and fail guaranteed.
             // Copilot hereby joins ADR 0001's enumerated stream:false
             // exceptions (arms without upstream-streaming reassembly),
@@ -5763,12 +6489,12 @@ return Ok(response);
             // Req 4.3 (router side): on an upstream 401/403 auth-class
             // failure, force ONE token refresh + ONE re-dispatch before
             // giving up on this provider. force_refresh() invalidates the
-            // cached bearer and exchanges a fresh one single-flight — even
+            // cached bearer and exchanges a fresh one single-flight � even
             // when the cache still holds a live-but-revoked token (unlike
             // get_copilot_token, which would serve that token again); a
             // 401/403 exchange rejection flips the session to Expired so
             // the re-dispatch surfaces the auth-class error for standard
-            // failover. PAT (`api-key`) mode is gated out — there is no
+            // failover. PAT (`api-key`) mode is gated out � there is no
             // OAuth token to refresh, so the rescue would waste an
             // exchange + re-dispatch.
             let result = match self
@@ -5808,7 +6534,7 @@ return Ok(response);
             Self::attach_context_reduction(&mut response, context_reduction.as_ref());
             return Ok(response);
         }
-        // ─── End GitHub Copilot dispatch ───────────────────────────────────
+        // --- End GitHub Copilot dispatch -----------------------------------
 
         // OAuth bearer override (Req 6.2): when the provider declares
         // `auth_method: oauth` and the OAuth manager has a live,
@@ -5843,7 +6569,7 @@ return Ok(response);
             });
         }
 
-        // Build base URL — strip trailing slash, append /v1 if not present
+        // Build base URL � strip trailing slash, append /v1 if not present
         // For Bedrock with API key, use the Bedrock Mantle endpoint (unless custom VPC endpoint)
         let mut base_url = if provider_cfg.provider_type == "bedrock"
             && !api_key.is_empty()
@@ -5891,7 +6617,7 @@ return Ok(response);
         let cache_aware_routing_cfg = config.cache_aware_routing.clone();
         let configured_base_url = provider_cfg.base_url.clone();
         // Proactive context-overflow enforcement snapshot (context-overflow
-        // spec, task 4): per-request read of the `context` knobs — hot-reload
+        // spec, task 4): per-request read of the `context` knobs � hot-reload
         // applies without a ContextManager rebuild (pattern: check_and_truncate_context).
         // Inter-chunk idle window for streamed upstream bodies; the streaming
         // relay's default applies when the `streaming` section is absent.
@@ -5922,7 +6648,7 @@ return Ok(response);
 
         let http_client = self.get_or_create_http_client(provider_name, &pool_config)?;
 
-        // Build the outgoing request body — override model to the actual provider model name.
+        // Build the outgoing request body � override model to the actual provider model name.
         // The gateway buffers the full provider response here either way. By
         // default it asks the provider for an SSE stream and reassembles it, so
         // bytes keep flowing during long generations (an idle `stream:false`
@@ -5963,7 +6689,7 @@ return Ok(response);
         // Reasoning-compat per-attempt stage (reasoning-failover-compat
         // spec, Req 6.1/6.2): detect reasoning carriers on the ORIGINAL
         // request (they live in prior assistant turns, pre-transform),
-        // strip/preserve per source→target transition, and normalize the
+        // strip/preserve per source?target transition, and normalize the
         // client's reasoning parameter into the target family's accepted
         // shape. Runs inside the per-provider dispatch so every failover
         // attempt is transformed against its own target. `enabled: false`
@@ -5973,7 +6699,7 @@ return Ok(response);
         if reasoning_compat_cfg.enabled {
             // Source-model attribution (Task 6): the provider + model that
             // last served this conversation prefix, from the sticky cache.
-            // None on a miss — the policy then falls back to family matching.
+            // None on a miss � the policy then falls back to family matching.
             let source_ref = self.model_affinity_source(request, &reasoning_compat_cfg);
             let report = reasoning_compat::prepare_attempt(
                 &mut outgoing,
@@ -6096,12 +6822,12 @@ return Ok(response);
 
         // Reverse-translate tool_calls history for models that use XML-style tool use.
         //
-        // When the gateway previously translated XML tool use → native tool_calls,
+        // When the gateway previously translated XML tool use ? native tool_calls,
         // the client (Roo Code) sends back the conversation with:
         //   - assistant messages containing tool_calls [{id:"call_xlat_0",...}]
         //   - tool result messages with role:"tool", tool_call_id:"call_xlat_0"
         //
-        // The model never generated those IDs or that format — it thinks in XML.
+        // The model never generated those IDs or that format � it thinks in XML.
         // If we send these back as-is, the model gets confused and loops.
         //
         // Solution: detect gateway-translated tool_calls (by the "call_xlat_" prefix)
@@ -6136,17 +6862,17 @@ return Ok(response);
         // Conditionally inject the tool-calling guide.
         //
         // Goal: make native OpenAI-style tool use clear for models that were
-        // primarily trained on XML/pseudo-XML agent formats — without taxing
+        // primarily trained on XML/pseudo-XML agent formats � without taxing
         // every capable model with uncached prompt tokens (and guidance that
         // conflicts with parallel tool calling).
         //
-        // Injection targets **learned XML combos only** — models actually
-        // observed emitting XML-style tool use — so models that call tools
+        // Injection targets **learned XML combos only** � models actually
+        // observed emitting XML-style tool use � so models that call tools
         // natively never see unexplained instructions. Learned combos keep the
         // hint for the process lifetime; toggling it mid-session is the context
         // mutation that models flag as prompt injection. The hint is inserted
         // directly after the client's system prompt (see
-        // [`Self::insert_tool_calling_hint`]) — not appended at the tail, where
+        // [`Self::insert_tool_calling_hint`]) � not appended at the tail, where
         // a system message after user/tool content reads as an injection
         // attempt.
         let inject_tool_hint =
@@ -6177,7 +6903,7 @@ return Ok(response);
             &cache_aware_routing_cfg,
         );
 
-        // ─── Proactive context-overflow gate (US-1, task 4.1) ───────────────
+        // --- Proactive context-overflow gate (US-1, task 4.1) ---------------
         // The final buffered HTTP body is checked here; Codex and Bedrock
         // check their dispatch copies in their dedicated arms. Streaming checks
         // its final pass-through body and delegates overflow to buffered routing.
@@ -6226,9 +6952,9 @@ return Ok(response);
         let mut retry_after_waited = active
             .as_ref()
             .is_some_and(|h| h.has_recorded_rate_limit_wait());
-        // R1: request-scoped primary-ness — snapshot the ledger row count at
+        // R1: request-scoped primary-ness � snapshot the ledger row count at
         // dispatch entry. Rows recorded BEFORE this dispatch (a failed try or
-        // skip on an earlier candidate, e.g. the streaming→buffered failover
+        // skip on an earlier candidate, e.g. the streaming?buffered failover
         // hop) prove the request already left its primary; rows this loop
         // records for its own same-provider retries do not.
         let attempt_rows_at_dispatch = active.as_ref().map_or(0, |h| h.attempt_rows_total());
@@ -6253,11 +6979,11 @@ return Ok(response);
             let skip_backoff_this_attempt = skip_next_backoff;
             skip_next_backoff = false;
             // Concurrent-retry budget (retry-failover-core-overhaul, Req
-            // 4.1-4.5): every retry iteration (≥11, including mechanism
+            // 4.1-4.5): every retry iteration (=11, including mechanism
             // one-shots with skipped backoff) must be admitted before it
             // is scheduled; first attempts (attempt 0) never consult the
             // budget and are never delayed (Req 4.3). The slot is held
-            // for the whole iteration — covering the retry send — and
+            // for the whole iteration � covering the retry send � and
             // released on drop at the end of the iteration (Req 4.4),
             // on any exit path (success, failover, break, panic).
             // Exhaustion fails over immediately with a
@@ -6272,7 +6998,7 @@ return Ok(response);
                             attempt,
                             active,
                             in_flight = self.retry_budgets.in_flight(provider_name),
-                            "Retry budget exhausted — failing over instead of scheduling same-provider retry"
+                            "Retry budget exhausted � failing over instead of scheduling same-provider retry"
                         );
                         let budget_err = GatewayError::Provider {
                             provider: provider_name.to_string(),
@@ -6325,7 +7051,7 @@ return Ok(response);
                 // value the deadline middleware enforces) and the
                 // ActiveRequestInfo clock (elapsed_ms, the same source
                 // pre_dispatch_ms reads): if waiting out this backoff would wake
-                // past the deadline, do not schedule — advance to the next
+                // past the deadline, do not schedule � advance to the next
                 // candidate / return now.
                 if let (Some(handle), Some(deadline_ms)) = (&active, request_deadline_ms) {
                     let wake_at_ms = handle.elapsed_ms() + retry_delay.as_millis() as i64;
@@ -6335,7 +7061,7 @@ return Ok(response);
 					attempt,
 					delay_ms = retry_delay.as_millis() as u64,
 					deadline_ms,
-					"Retry backoff would pass the gateway request deadline — failing over instead of scheduling"
+					"Retry backoff would pass the gateway request deadline � failing over instead of scheduling"
 				);
                         break;
                     }
@@ -6402,12 +7128,12 @@ return Ok(response);
             let send_result = match result {
                 Ok(inner) => inner,
                 Err(_) => {
-                    // TTFB timeout — provider didn't start responding in time
+                    // TTFB timeout � provider didn't start responding in time
                     warn!(
                         provider = provider_name,
                         attempt,
                         ttfb_timeout_secs,
-                        "TTFB timeout — provider did not respond in time, failing over"
+                        "TTFB timeout � provider did not respond in time, failing over"
                     );
                     let err = GatewayError::TtfbTimeout(ttfb_timeout_secs);
                     record_try(&err, None, None, request_start);
@@ -6451,7 +7177,7 @@ return Ok(response);
                         };
                         // Buffered dispatch: the upstream SSE is reassembled before
                         // any client byte is emitted, which the client experiences as
-                        // a silent wait — say so on the dashboard while it runs.
+                        // a silent wait � say so on the dashboard while it runs.
                         let _buffering_stall =
                             crate::active_requests::ActiveRequestHandle::begin_stall_opt(
                                 active.as_ref(),
@@ -6513,7 +7239,7 @@ return Ok(response);
                                 provider = provider_name,
                                 attempt,
                                 total_timeout_secs,
-                                "Total timeout — response body read exceeded round-trip limit"
+                                "Total timeout � response body read exceeded round-trip limit"
                             );
                             let err = GatewayError::TotalTimeout(total_timeout_secs);
                             record_try(&err, None, None, request_start);
@@ -6563,7 +7289,7 @@ return Ok(response);
                                 }
 
                                 // Image-input rejection inside a 200 envelope: same rescue
-                                // as the 4xx branch below — strip image parts (including
+                                // as the 4xx branch below � strip image parts (including
                                 // nested ones) and retry the same provider once instead of
                                 // failing over with images still attached.
                                 if !image_strip_retry_done
@@ -6583,7 +7309,7 @@ return Ok(response);
                                                 provider = provider_name,
                                                 model = %provider_model.model,
                                                 tool_schema_fields_removed = tools_removed,
-                                                "Provider rejected image inputs (HTTP 200 envelope) with no image content in messages — scrubbed image references from tool schemas and retrying same provider"
+                                                "Provider rejected image inputs (HTTP 200 envelope) with no image content in messages � scrubbed image references from tool schemas and retrying same provider"
                                             );
                                         }
                                         removed += tools_removed;
@@ -6595,7 +7321,7 @@ return Ok(response);
                                             provider = provider_name,
                                             model = %provider_model.model,
                                             images_removed = removed,
-                                            "Provider rejected image inputs (in HTTP 200 envelope) — stripped images and retrying same provider"
+                                            "Provider rejected image inputs (in HTTP 200 envelope) � stripped images and retrying same provider"
                                         );
                                         record_try(
                                             &GatewayError::Provider {
@@ -6618,7 +7344,7 @@ return Ok(response);
                                     provider = provider_name,
                                     attempt,
                                     error = %err_msg,
-                                    "Provider returned error inside HTTP 200 — treating as retryable"
+                                    "Provider returned error inside HTTP 200 � treating as retryable"
                                 );
                                 let err = GatewayError::Provider {
                                     provider: provider_name.to_string(),
@@ -6639,7 +7365,7 @@ return Ok(response);
                             // or fell back to XML-style tool use in plain text content.
                             // This is the buffered-path feed of the same adaptive signal the
                             // streaming relay uses: XML output marks the combo (hint +
-                            // buffer-and-translate). Native tool_calls need no action —
+                            // buffer-and-translate). Native tool_calls need no action �
                             // learned combos are intentionally sticky so the injected hint
                             // never appears/disappears between turns of a conversation.
                             if let Some(choice) = openai_response.choices.first() {
@@ -6726,7 +7452,7 @@ return Ok(openai_response);
                                         provider = provider_name,
                                         attempt,
                                         body_len = body_text.len(),
-                                        "Upstream SSE stream ended before completion — treating as retryable"
+                                        "Upstream SSE stream ended before completion � treating as retryable"
                                     );
                                     let err = GatewayError::Provider {
                                         provider: provider_name.to_string(),
@@ -6766,7 +7492,7 @@ return Ok(openai_response);
                                         provider = provider_name,
                                         attempt,
                                         error = %e,
-                                        "Provider sent an error inside the SSE stream — treating as retryable"
+                                        "Provider sent an error inside the SSE stream � treating as retryable"
                                     );
                                     let err = GatewayError::Provider {
                                         provider: provider_name.to_string(),
@@ -6821,7 +7547,7 @@ return Ok(response);
                             }
                         }
 
-                        // Neither JSON nor SSE — log and fail
+                        // Neither JSON nor SSE � log and fail
                         tracing::error!(provider = provider_name, body = %body_text.chars().take(500).collect::<String>(), "Failed to parse provider response");
                         let err = GatewayError::Provider {
                             provider: provider_name.to_string(),
@@ -6905,7 +7631,7 @@ return Ok(response);
         // "does not exist" / "deprecat" signature means the model is
         // gone, not merely misconfigured for this request. Record the
         // runtime-gone mark (DashMap-cheap, off the response path) and
-        // fail over exactly like the timeout class — no same-provider
+        // fail over exactly like the timeout class � no same-provider
         // retry; the failover layer excludes this candidate. A plain
         // 404 keeps today's terminal behavior below. The ledger row
         // carries the `model_not_found` class (Req 6.3) instead of the
@@ -6915,7 +7641,7 @@ return Ok(response);
                 provider = provider_name,
                 model = %provider_model.model,
                 status = status_code,
-                "Model not found / deprecated at provider — recording runtime-gone and failing over"
+                "Model not found / deprecated at provider � recording runtime-gone and failing over"
             );
             if let Some(state) = &self.deprecation_state {
                 note_runtime_gone(state, provider_name, &provider_model.model);
@@ -6966,7 +7692,7 @@ return Ok(response);
 
                     // Don't retry 4xx errors except 408 (timeout)
                     // 429 (rate limit) should fail over to next provider, not retry same one
-                    // 503 (service unavailable) signals provider is down — fail over immediately
+                    // 503 (service unavailable) signals provider is down � fail over immediately
                     if status_code >= 400 && status_code < 500 && status_code != 408 {
                         // The provider rejected the upstream stream request
                         // (`stream` / `stream_options`). Retry the same provider
@@ -6988,7 +7714,7 @@ return Ok(response);
                                 model = %provider_model.model,
                                 status = status_code,
                                 provider_error = %body_text.chars().take(300).collect::<String>(),
-                                "Provider rejected the upstream stream request — retrying once with stream:false. Set buffered_upstream_streaming: false for this provider if this repeats"
+                                "Provider rejected the upstream stream request � retrying once with stream:false. Set buffered_upstream_streaming: false for this provider if this repeats"
                             );
                             record_try(&err, None, None, request_start);
                             last_error = Some(err);
@@ -6998,7 +7724,7 @@ return Ok(response);
                         // Image-input rejection: the provider refused image content even
                         // though the proactive strip pass believed it safe (stale or
                         // incorrect capabilities cache). Strip every image part and retry
-                        // the same provider immediately — bounded to one shot per request.
+                        // the same provider immediately � bounded to one shot per request.
                         if !image_strip_retry_done
                             && Self::is_unsupported_image_error(status_code, &body_text)
                         {
@@ -7022,7 +7748,7 @@ return Ok(response);
                                         model = %provider_model.model,
                                         status = status_code,
                                         tool_schema_fields_removed = tools_removed,
-                                        "Provider rejected image inputs with no image content in messages — scrubbed image references from tool schemas and retrying same provider"
+                                        "Provider rejected image inputs with no image content in messages � scrubbed image references from tool schemas and retrying same provider"
                                     );
                                 } else {
                                     // Neither messages nor tool schemas carried a
@@ -7042,7 +7768,7 @@ return Ok(response);
                                         tools_had_image_marker = tools_had_marker,
                                         image_marker_locations = ?marker_locations,
                                         provider_error = %body_text.chars().take(300).collect::<String>(),
-                                        "Provider rejected image inputs but nothing image-shaped was found in messages or tool schemas — unable to auto-remediate"
+                                        "Provider rejected image inputs but nothing image-shaped was found in messages or tool schemas � unable to auto-remediate"
                                     );
                                 }
                                 removed += tools_removed;
@@ -7055,7 +7781,7 @@ return Ok(response);
                                     model = %provider_model.model,
                                     status = status_code,
                                     images_removed = removed,
-                                    "Provider rejected image inputs — stripped images and retrying same provider"
+                                    "Provider rejected image inputs � stripped images and retrying same provider"
                                 );
                                 record_try(&err, None, None, request_start);
                                 last_error = Some(err);
@@ -7089,7 +7815,7 @@ return Ok(response);
                                     thinking_blocks = strip_report.thinking_blocks,
                                     redacted_thinking_blocks = strip_report.redacted_thinking_blocks,
                                     fields_removed = strip_report.fields_removed,
-                                    "[reasoning_compat] thinking validation 400 — aggressively stripped reasoning carriers, retrying same provider"
+                                    "[reasoning_compat] thinking validation 400 � aggressively stripped reasoning carriers, retrying same provider"
                                 );
                                 let strip_err = GatewayError::Provider {
                                     provider: provider_name.to_string(),
@@ -7132,7 +7858,7 @@ return Ok(response);
                             // qualifying 429 may wait out the provider's own
                             // Retry-After and retry the same provider through
                             // normal admission (the retry send below re-enters
-                            // the debit gate — exactly one token per send, ADR
+                            // the debit gate � exactly one token per send, ADR
                             // 0002). The parsed cooldown IS the Retry-After;
                             // it is reused, never parsed twice. The provider
                             // permit is dropped before the wait (Req 3.9 wait
@@ -7188,7 +7914,7 @@ return Ok(response);
                                     continue;
                                 }
                                 // Deadline fired (or loomed) during the wait: run
-                                // today's cooldown + failover path below — no
+                                // today's cooldown + failover path below � no
                                 // retry was sent, no rate token consumed.
                             }
                             let rate_limiter = self.get_rate_limiter(provider_name).await;
@@ -7416,7 +8142,7 @@ return Ok(response);
 
     /// DD12: record a `circuit_open_skip` ledger attempt for every group member
     /// that provider selection dropped because its breaker is open. Runs once
-    /// per request (the streaming→buffered hop does not record twice).
+    /// per request (the streaming?buffered hop does not record twice).
     /// Entries in `exclude` were removed by the caller (their failed try is
     /// already in the ledger), not by the breaker, so they are not recorded.
     async fn record_breaker_skips(
@@ -7880,8 +8606,8 @@ return Ok(response);
     /// parallel calls into one unparseable string and silently dropped all but
     /// the first call.
     ///
-    /// A delta that identifies a different call than the one in progress — by
-    /// `id`, or by `function.name` when no id is supplied — opens the next slot.
+    /// A delta that identifies a different call than the one in progress � by
+    /// `id`, or by `function.name` when no id is supplied � opens the next slot.
     /// Anything else (a bare `arguments` fragment, or a repeat of the same
     /// identity) continues the call in progress. Parallel calls to the *same*
     /// tool with neither indices nor ids are genuinely indistinguishable on the
@@ -7980,7 +8706,7 @@ return Ok(response);
         // well below max_tokens). Task 7.2 returns the longest of these instead
         // of an error when every provider truncates (Req 6.2).
         let mut truncated_candidates: Vec<OpenAIResponse> = Vec::new();
-        // Turns that carried only reasoning — no answer text, no tool call.
+        // Turns that carried only reasoning � no answer text, no tool call.
         // These fail over (see the success arm below) because a tool-using
         // client cannot act on them, but they are kept so a request where every
         // provider stops after thinking still returns something rather than a
@@ -8080,7 +8806,7 @@ return Ok(response);
                     .set_provider_budget_limit(&provider_model.provider, budget_limit_usd);
                 // Lazy window rollover (persistent budgets, Task 4): for a
                 // Daily/Weekly/Monthly policy whose window has expired, roll the
-                // window BEFORE the skip decision — zero the in-memory spend
+                // window BEFORE the skip decision � zero the in-memory spend
                 // atomics and the durable store row. Manual/unset policy
                 // accumulates forever (no rollover, no background timers). Uses
                 // the same UTC boundary math as the virtual-key budgets
@@ -8179,13 +8905,13 @@ return Ok(response);
 
             // GitHub Copilot eligibility gate (Req 9.2): a device-oauth
             // candidate whose session is Unauthenticated/Expired is
-            // ineligible — SKIP, not error — so the request fails over to
+            // ineligible � SKIP, not error � so the request fails over to
             // the next provider without a spurious upstream attempt. Same
             // observability shape as the rate-limit/budget skips above (one
             // ledger row via push_attempt, error_class `copilot_auth_skip`).
             // `api-key` (PAT) candidates have no session state and stay
             // eligible; a missing manager (no master key at startup) also
-            // skips — there is no credential to dispatch with.
+            // skips � there is no credential to dispatch with.
             {
                 let device_oauth = {
                     let config = self.config.read().await;
@@ -8371,7 +9097,7 @@ return Ok(response);
                     // emptiness first is how real tool calls get discarded.
                     let tools_present = prepared_request.extra.contains_key("tools");
 
-                    // An inline `<think>…</think>` prefix becomes a proper
+                    // An inline `<think>�</think>` prefix becomes a proper
                     // reasoning carrier, so deliberation is never mistaken for
                     // the model's answer.
                     if Self::split_think_tags(&mut response) {
@@ -8409,7 +9135,7 @@ return Ok(response);
                         // before emitting it. Retry the same provider once
                         // with the stalled turn echoed back plus a user-role
                         // instruction to act, before failing over. The nudge
-                        // exists only in the resubmitted request — the
+                        // exists only in the resubmitted request � the
                         // client never sees it.
                         let revived = if !reasoning_nudge_done
                             && Self::reasoning_states_intent(&response)
@@ -8481,7 +9207,7 @@ return Ok(response);
                             self.metrics.record_provider_failure_with_reason(
                                 &provider_model.provider,
                                 Some(
-                                    "Provider stopped after its reasoning block — no answer text and no tool call"
+                                    "Provider stopped after its reasoning block � no answer text and no tool call"
                                         .to_string(),
                                 ),
                                 None,
@@ -8538,7 +9264,7 @@ return Ok(response);
                     }
                     // Validate that the response actually contains usable content.
                     // Some overwhelmed providers return 200 with empty choices or
-                    // null content and no tool_calls — treat these as failures so
+                    // null content and no tool_calls � treat these as failures so
                     // failover can try the next provider.
                     if !Self::response_has_content(&response) {
                         warn!(
@@ -8550,7 +9276,7 @@ return Ok(response);
                         self.metrics.record_provider_failure_with_reason(
                             &provider_model.provider,
                             Some(
-                                "Provider returned an empty response — no answer text or tool calls"
+                                "Provider returned an empty response � no answer text or tool calls"
                                     .to_string(),
                             ),
                             None,
@@ -8571,27 +9297,73 @@ return Ok(response);
                         continue;
                     }
 
-                    // --- Codex Search agent loop (any provider) ---
-                    // When the buffered response contains gateway-injected search
-                    // tool calls, execute them against the Codex search endpoint
-                    // with the gateway's OpenAI OAuth token and resubmit through
-                    // the normal dispatch pipeline until the model produces a
-                    // final answer. No-ops for Codex providers (intercepted during
-                    // Codex dispatch) and for responses without search tool calls.
-            response = self
-                .maybe_intercept_search_tools(
-                    &provider_model,
-                    &prepared_request,
-                    response,
-                    active.clone(),
-                    attempt_counter,
-                    compression_restore.clone(),
-                )
-                .await?;
+        // --- Codex Search agent loop (any provider) ---
+        // When the buffered response contains gateway-injected search
+        // tool calls, execute them against the Codex search endpoint
+        // with the gateway's OpenAI OAuth token and resubmit through
+        // the normal dispatch pipeline until the model produces a
+        // final answer. No-ops for Codex providers (intercepted during
+        // Codex dispatch) and for responses without search tool calls.
+        // A search-round failure (backend/resubmission error) is a
+        // failed ATTEMPT, not a failed request: the loop below fails
+        // over to the next provider with the augmented request
+        // (injected tools + accumulated tool messages) preserved.
+        match self
+            .maybe_intercept_search_tools(
+                &provider_model,
+                &prepared_request,
+                response,
+                active.clone(),
+                attempt_counter,
+                compression_restore.clone(),
+            )
+            .await
+        {
+            Ok(intercepted) => response = intercepted,
+            Err(search_err) => {
+                warn!(
+                    provider = %provider_model.provider,
+                    model = %provider_model.model,
+                    error = %search_err,
+                    "Search-round interception failed; treating as a failed attempt and failing over with the augmented request"
+                );
+                if !Self::is_rate_limit_class_error(&search_err) {
+                    cb.record_failure().await;
+                }
+                if let Some(handle) = &active {
+                    handle.set_last_error(&search_err.to_string());
+                }
+                let _attempt_status = match &search_err {
+                    GatewayError::Provider { status_code, .. } => *status_code,
+                    _ => None,
+                };
+                self.metrics.record_provider_failure_with_reason(
+                    &provider_model.provider,
+                    Some(Self::friendly_failure_reason(
+                        _attempt_status,
+                        &search_err.to_string(),
+                    )),
+                    None,
+                );
+                Self::push_attempt(
+                    &mut attempts,
+                    active.as_ref(),
+                    ProviderAttempt::new(
+                        provider_model.provider.clone(),
+                        provider_model.model.clone(),
+                        format!("Search round failed: {search_err}"),
+                        Some(attempt_status_for(&search_err)),
+                    )
+                    .with_duration(start.elapsed())
+                    .with_error_class(&error_class_for(&search_err)),
+                );
+                continue;
+            }
+        }
 
                     // --- Truncation detection and retry (Req 6.1, 6.3, 6.4) ---
                     // A provider can return HTTP 200 with finish_reason="length"
-                    // yet stop well short of the client's requested max_tokens —
+                    // yet stop well short of the client's requested max_tokens �
                     // a sign it hit an internal cap rather than the legitimate
                     // limit. When `retry_on_truncation` is enabled, treat this as
                     // a failure and fail over to the next provider, keeping the
@@ -8678,7 +9450,7 @@ return Ok(response);
 
                     cb.record_success().await;
 
-                    // Provider recovered — clear any upstream-driven cooldown
+                    // Provider recovered � clear any upstream-driven cooldown
                     // so we don't keep skipping it after it has come back.
                     let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
                     rate_limiter.clear_cooldown().await;
@@ -8690,7 +9462,7 @@ return Ok(response);
                     // provider stops being filtered out and the UI
                     // reflects recovery immediately. (record_provider_success
                     // also clears it, but only when we actually report a
-                    // success — keep this explicit for readability.)
+                    // success � keep this explicit for readability.)
                     self.metrics
                         .clear_provider_cooldown(&provider_model.provider);
 
@@ -8703,7 +9475,7 @@ return Ok(response);
                         || response.usage.prompt_tokens > 0
                         || response.usage.completion_tokens > 0;
                     // Req 9.3 (github-copilot-oauth-provider): Copilot models are
-                    // subscription-included — token usage IS recorded (usage rows
+                    // subscription-included � token usage IS recorded (usage rows
                     // below carry the model name + provider attribution), but the
                     // computed cost is forced to zero so per-token rates never
                     // bill a subscription-included model, even when the operator
@@ -8721,7 +9493,7 @@ return Ok(response);
                         if cost > 0.0 {
                             self.metrics.add_cost(&provider_model.provider, cost);
                             // Durable budget accrual (persistent budgets, Task 4):
-                            // persist for every provider — limits are metadata in
+                            // persist for every provider � limits are metadata in
                             // the store; off-path write, never blocks the response.
                             self.metrics
                                 .persist_provider_spend(&provider_model.provider, cost);
@@ -8856,7 +9628,7 @@ return Ok(response);
                     // budget cannot fit the request. No token was consumed
                     // for it (refunded below, ADR 0002: one token per real
                     // upstream request), no breaker failure (the provider is
-                    // not unhealthy — the request is too large), and no
+                    // not unhealthy � the request is too large), and no
                     // provider-failure metric (nothing was sent). Continue to
                     // the next candidate.
                     if let GatewayError::ContextCapacityExceeded {
@@ -8918,7 +9690,7 @@ return Ok(response);
                             largest_skipped_context.max(largest_supported_context.unwrap_or(0));
                         continue;
                     }
-                    // Record failure — except rate-limit-class errors (HTTP 429
+                    // Record failure � except rate-limit-class errors (HTTP 429
                     // and rate-limit-shaped error-in-200 envelopes). Those are
                     // governed exclusively by the dedicated upstream cooldown
                     // applied below (and enforced as a routing gate by
@@ -9008,7 +9780,7 @@ return Ok(response);
                         }
                     }
 
-                    // Don't overwrite a fresh "Pausing until …" message
+                    // Don't overwrite a fresh "Pausing until �" message
                     // that the rate-limit path just set: when this branch
                     // sees the same 429 the rate-limit code already wrote
                     // the friendlier countdown text.
@@ -9060,7 +9832,7 @@ return Ok(response);
                     .iter()
                     .min()
                     .expect("non-empty checked above"),
-                // The largest window actually offered by any skipped candidate —
+                // The largest window actually offered by any skipped candidate �
                 // truthful even when the first skip was a small window and larger
                 // ones were skipped after it.
                 largest_supported_context: if largest_skipped_context > 0 {
@@ -9097,7 +9869,7 @@ return Ok(response);
             return Ok(longest);
         }
         // Every provider stopped after its reasoning block. Failing over was
-        // worth trying — usually another provider completes the turn — but once
+        // worth trying � usually another provider completes the turn � but once
         // the chain is exhausted, surfacing the model's thinking beats returning
         // a hard error, which is what the client saw before this fallback
         // existed. The reasoning is promoted into `content` so the harness has
@@ -9154,10 +9926,10 @@ return Ok(response);
         None
     }
 
-    /// Split a leading `<think>…</think>` block out of assistant content into
+    /// Split a leading `<think>�</think>` block out of assistant content into
     /// the `reasoning_content` carrier. Returns `true` when content was rewritten.
     ///
-    /// Some reasoning models — the GLM family in particular — inline their chain
+    /// Some reasoning models � the GLM family in particular � inline their chain
     /// of thought in `content` rather than using a dedicated reasoning field.
     /// Left in place it reads as the assistant's answer, so a turn that only
     /// thought and never acted looks like a finished reply and an agentic client
@@ -9165,8 +9937,8 @@ return Ok(response);
     /// turn for what it is, and lets the XML tool-call extractors work on the
     /// model's real output instead of its deliberation.
     ///
-    /// Only a block at the very start of the content counts as thinking — that
-    /// is where these models emit it — so prose or code that merely mentions
+    /// Only a block at the very start of the content counts as thinking � that
+    /// is where these models emit it � so prose or code that merely mentions
     /// `<think>` further in is left alone. An unclosed `<think>` (the model was
     /// cut off mid-thought) makes the whole remainder reasoning.
     fn split_think_tags(response: &mut OpenAIResponse) -> bool {
@@ -9223,7 +9995,7 @@ return Ok(response);
     /// when a provider omits it (common on OpenAI-compatible gateways, and the
     /// streamed-delta merge in [`Self::reassemble_sse_response`] seeds it empty)
     /// the gateway can mint one safely. Before this, a missing id failed
-    /// validation and the entire turn — tool call included — was discarded and
+    /// validation and the entire turn � tool call included � was discarded and
     /// failed over, which is one of the ways an agent loop stalls with no
     /// visible error.
     ///
@@ -9233,7 +10005,7 @@ return Ok(response);
     /// Also normalizes `finish_reason` to `tool_calls` when the provider
     /// reported `stop` or omitted it entirely, because clients branch on
     /// `finish_reason` to decide whether to run a tool. `length` and
-    /// `content_filter` are preserved — those carry information this function
+    /// `content_filter` are preserved � those carry information this function
     /// must not erase (truncation detection reads `length`).
     fn repair_tool_calls(response: &mut OpenAIResponse) -> bool {
         let Some(choice) = response.choices.first_mut() else {
@@ -9476,7 +10248,21 @@ visible content. Do not restate your plan and do not end your turn without doing
         Self::backfill_empty_turn(
             response,
             "The gateway's web-search tool was requested but is currently unavailable, so no search ran this turn. \
-             Continue the task with your own tools, or say what information you still need.",
+            Continue the task with your own tools, or say what information you still need.",
+        );
+    }
+
+    /// Same discipline as [`Self::discard_unexecutable_search_call`] for the
+    /// generic `web_search` tool: strip the gateway-owned call(s) the client
+    /// cannot execute and leave an honest, nonempty assistant turn. Used when
+    /// the generic feature became unavailable between injection and
+    /// interception (hot-reload / token loss mid-request).
+    fn discard_unexecutable_web_search_call(response: &mut OpenAIResponse) {
+        crate::web_search::injector::strip_web_search_tool_calls(response);
+        Self::backfill_empty_turn(
+            response,
+            "The gateway's web-search tool was requested but is currently unavailable, so no search ran this turn. \
+            Continue the task with your own tools, or say what information you still need.",
         );
     }
 
@@ -9485,7 +10271,7 @@ visible content. Do not restate your plan and do not end your turn without doing
     ///
     /// A turn with neither content nor tool calls is rendered by the SSE
     /// synthesizer as a lone terminal `finish_reason` chunk. Clients read that as
-    /// a completed but empty reply and stop — indistinguishable from the task
+    /// a completed but empty reply and stop � indistinguishable from the task
     /// actually being finished. An explanation keeps the agent able to proceed.
     fn backfill_empty_turn(response: &mut OpenAIResponse, note: &str) -> bool {
         let Some(choice) = response.choices.first_mut() else {
@@ -9521,7 +10307,7 @@ visible content. Do not restate your plan and do not end your turn without doing
         };
 
         // Server-side compaction turn: a Bedrock Mantle compaction_trigger
-        // request can return a successful COMPACTION-ONLY response — a summary
+        // request can return a successful COMPACTION-ONLY response � a summary
         // block (carried in `message.extra["compaction"]`) with no answer text.
         // This is a real, useful turn the client must replay to continue with
         // compacted context, so it counts as content and must NOT fail over.
@@ -9535,7 +10321,7 @@ visible content. Do not restate your plan and do not end your turn without doing
             return true;
         }
 
-        // tool_calls present → validate structure before accepting
+        // tool_calls present ? validate structure before accepting
         if let Some(tool_calls) = choice.message.extra.get("tool_calls") {
             if let Some(arr) = tool_calls.as_array() {
                 if arr.is_empty() {
@@ -9564,7 +10350,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 }
                 return true;
             }
-            // tool_calls is not an array — malformed
+            // tool_calls is not an array � malformed
             warn!("tool_calls field is not an array in provider response");
             return false;
         }
@@ -9581,7 +10367,7 @@ visible content. Do not restate your plan and do not end your turn without doing
     ///   `<use_tool name="execute_command">{"command":"npm run build"}</use_tool>`
     ///   `<tool_call>{"name":"read_file","arguments":{...}}</tool_call>`
     ///
-    // ── Known Roo Code / Kilo Code tool names ──
+    // -- Known Roo Code / Kilo Code tool names --
     // Hardcoded so we can match XML tool tags even when the tools array is
     // absent or incomplete.  Kept as a static slice for zero-alloc lookup.
     const KNOWN_TOOL_NAMES: &'static [&'static str] = &[
@@ -9674,7 +10460,7 @@ visible content. Do not restate your plan and do not end your turn without doing
         let mut tool_calls: Vec<serde_json::Value> = Vec::new();
         let mut remaining_text = combined_text.clone();
 
-        // ── Collect all tool names to try ──
+        // -- Collect all tool names to try --
         // Start with known Roo/Kilo Code tools, then add any from the request's
         // tools array (covers MCP tools and custom tools the client defines).
         let mut tool_names: Vec<String> = Self::KNOWN_TOOL_NAMES
@@ -9871,10 +10657,10 @@ visible content. Do not restate your plan and do not end your turn without doing
             };
 
             // Find the close tag after the open tag.
-            // Greedy (rfind): finds the LAST occurrence — critical for tags like
+            // Greedy (rfind): finds the LAST occurrence � critical for tags like
             // <attempt_completion> where the <result> parameter value can be very
             // long and might contain text that looks like XML.
-            // Non-greedy (find): finds the FIRST occurrence — correct for wrapper
+            // Non-greedy (find): finds the FIRST occurrence � correct for wrapper
             // tags like <use_tool> where the body is JSON and multiple sequential
             // tool calls must each match their own close tag.
             let search_region = &text[start..];
@@ -9886,7 +10672,7 @@ visible content. Do not restate your plan and do not end your turn without doing
             let (close_start_rel, close_end, dangling) = if let Some(rel) = close_finder {
                 (rel, start + rel + close_tag.len(), false)
             } else {
-                // No closing tag — the model likely got truncated.
+                // No closing tag � the model likely got truncated.
                 // Treat everything from the open tag to end-of-text as the body
                 // so we can still attempt to salvage the tool call.
                 warn!(
@@ -9902,7 +10688,7 @@ visible content. Do not restate your plan and do not end your turn without doing
 
             // Find the end of the opening tag (the '>' after attributes)
             let Some(open_end) = full_tag.find('>') else {
-                // Malformed — remove this occurrence and continue looking
+                // Malformed � remove this occurrence and continue looking
                 text.replace_range(start..close_end, "");
                 if dangling {
                     break;
@@ -9931,21 +10717,21 @@ visible content. Do not restate your plan and do not end your turn without doing
                 // Pattern: <use_tool name="X">{args}</use_tool>
                 // Validate the body is proper JSON. If it is, use it directly.
                 // If not, try to salvage: for known tools with a single primary
-                // parameter (e.g. attempt_completion → result), wrap the body
+                // parameter (e.g. attempt_completion ? result), wrap the body
                 // as that parameter's value.
                 if parsed.is_some() {
                     (tag_n.clone(), body_trimmed.to_string())
                 } else if body_trimmed.starts_with('{') {
                     // Looks like JSON but failed to parse (unescaped chars, truncated, etc.)
                     // Try to extract the first key's value as a best-effort recovery.
-                    // e.g. {"result":"some broken text..."} → extract "result" key
+                    // e.g. {"result":"some broken text..."} ? extract "result" key
                     debug!(
                         tool = %tag_n,
                         body_preview = %body_trimmed.chars().take(200).collect::<String>(),
                         "Body looks like JSON but failed to parse, attempting recovery"
                     );
 
-                    // ── Attempt 1: fix common JSON issues (unescaped control chars) ──
+                    // -- Attempt 1: fix common JSON issues (unescaped control chars) --
                     // Models often emit JSON with literal newlines, tabs, or other
                     // control characters inside string values. Escape them and retry.
                     let sanitized = body_trimmed
@@ -9971,7 +10757,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                         );
                         (tag_n.clone(), repaired.to_string())
                     } else {
-                        // ── Attempt 2: naive key extraction (last resort) ──
+                        // -- Attempt 2: naive key extraction (last resort) --
                         // Strip outer braces and try to find "key":"value" pattern
                         let inner = body_trimmed
                             .trim_start_matches('{')
@@ -10007,7 +10793,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                     }
                 } else {
                     // Body is plain text, not JSON. Wrap it as the primary parameter.
-                    // For attempt_completion → result, for others → input
+                    // For attempt_completion ? result, for others ? input
                     let param_name = match tag_n.as_str() {
                         "attempt_completion" => "result",
                         "ask_followup_question" => "question",
@@ -10091,7 +10877,7 @@ visible content. Do not restate your plan and do not end your turn without doing
     }
 
     /// Extract an attribute value from an XML opening tag.
-    /// e.g. `<use_tool name="execute_command">` → Some("execute_command")
+    /// e.g. `<use_tool name="execute_command">` ? Some("execute_command")
     fn extract_xml_attribute(tag: &str, attr_name: &str) -> Option<String> {
         // Look for: attr_name="value" or attr_name='value'
         let pattern_dq = format!("{}=\"", attr_name);
@@ -10133,7 +10919,7 @@ visible content. Do not restate your plan and do not end your turn without doing
 
         match tool_name {
             "read_file" => {
-                // {"files":[{"path":"a"},{"path":"b"}]} → {"path":"a\nb"}
+                // {"files":[{"path":"a"},{"path":"b"}]} ? {"path":"a\nb"}
                 if let Some(files_val) = obj.remove("files") {
                     if let Some(files_arr) = files_val.as_array() {
                         let paths: Vec<&str> = files_arr
@@ -10149,7 +10935,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                         }
                     }
                 }
-                // {"file_path":"a"} → {"path":"a"}
+                // {"file_path":"a"} ? {"path":"a"}
                 if !obj.contains_key("path") {
                     if let Some(fp) = obj.remove("file_path") {
                         obj.insert("path".to_string(), fp);
@@ -10158,7 +10944,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 }
             }
             "list_files" => {
-                // {"directory":"x"} → {"path":"x"}
+                // {"directory":"x"} ? {"path":"x"}
                 if !obj.contains_key("path") {
                     if let Some(d) = obj.remove("directory") {
                         obj.insert("path".to_string(), d);
@@ -10167,7 +10953,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 }
             }
             "search_files" => {
-                // {"search_term":"x"} → {"regex":"x"}
+                // {"search_term":"x"} ? {"regex":"x"}
                 if !obj.contains_key("regex") {
                     if let Some(st) = obj.remove("search_term") {
                         obj.insert("regex".to_string(), st);
@@ -10176,7 +10962,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 }
             }
             "execute_command" => {
-                // {"cmd":"x"} → {"command":"x"}
+                // {"cmd":"x"} ? {"command":"x"}
                 if !obj.contains_key("command") {
                     if let Some(c) = obj.remove("cmd") {
                         obj.insert("command".to_string(), c);
@@ -10202,11 +10988,11 @@ visible content. Do not restate your plan and do not end your turn without doing
     ///
     /// Handles the Roo/Kilo Code tool parameter format:
     ///   `<command>npm run build</command><cwd>/path</cwd>`
-    /// → `{"command":"npm run build","cwd":"/path"}`
+    /// ? `{"command":"npm run build","cwd":"/path"}`
     ///
     /// For `attempt_completion`:
     ///   `<result>I've fixed the bug...</result><command>npm test</command>`
-    /// → `{"result":"I've fixed the bug...","command":"npm test"}`
+    /// ? `{"result":"I've fixed the bug...","command":"npm test"}`
     ///
     /// Uses rfind for closing tags to handle values containing angle brackets.
     /// Also handles `null` text values by emitting JSON null.
@@ -10274,7 +11060,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 map.insert(tag_name, json_value);
                 remaining = &remaining[value_start + close_pos + close_tag.len()..];
             } else {
-                // No matching close tag — try to recover by looking for any close tag
+                // No matching close tag � try to recover by looking for any close tag
                 // (handles malformed XML like <cwd>null</command>)
                 if let Some(any_close) = remaining[value_start..].find("</") {
                     let value = &remaining[value_start..value_start + any_close];
@@ -10291,7 +11077,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                         break;
                     }
                 } else {
-                    // No close tag at all — treat rest of body as the value
+                    // No close tag at all � treat rest of body as the value
                     let value = &remaining[value_start..];
                     if !value.trim().is_empty() {
                         let json_value = if value.trim() == "null" {
@@ -10331,7 +11117,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 }
                 text.replace_range(wrapper_start..wrapper_end, "");
             } else {
-                // No closing tag — parse what we have and remove the dangling open
+                // No closing tag � parse what we have and remove the dangling open
                 let inner = text[after_open..].to_string();
                 let inner_trimmed = inner.trim();
                 if inner_trimmed.starts_with('[') || inner_trimmed.starts_with('{') {
@@ -10355,7 +11141,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 Self::parse_invoke_blocks(&block, tool_calls);
                 text.replace_range(start..block_end, "");
             } else {
-                // No closing tag — try to parse what's there, then remove
+                // No closing tag � try to parse what's there, then remove
                 let block = text[start..].to_string();
                 Self::parse_invoke_blocks(&block, tool_calls);
                 text.replace_range(start.., "");
@@ -10482,7 +11268,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                 let Some(start) = text.find(&pattern) else {
                     break;
                 };
-                // Find the end — could be </tool_call> or end of text
+                // Find the end � could be </tool_call> or end of text
                 let search_from = start + pattern.len();
                 let block_end = text[search_from..]
                     .find("</tool_call>")
@@ -10592,7 +11378,7 @@ visible content. Do not restate your plan and do not end your turn without doing
 
                     // Normalize function name: strip "functions_" prefix and
                     // trailing _N suffix that Kimi sometimes adds
-                    // e.g. "functions_list_files_6" → "list_files"
+                    // e.g. "functions_list_files_6" ? "list_files"
                     let func_name = Self::normalize_kimi_function_name(raw_name);
 
                     // Validate args as JSON; use as-is if valid, wrap as string otherwise
@@ -10670,7 +11456,7 @@ visible content. Do not restate your plan and do not end your turn without doing
     ///
     /// Kimi K2.6 sometimes prefixes tool names with `functions_` and appends
     /// a numeric suffix like `_6`. Strip both to recover the real tool name.
-    /// e.g. "functions_list_files_6" → "list_files"
+    /// e.g. "functions_list_files_6" ? "list_files"
     fn normalize_kimi_function_name(raw: &str) -> String {
         let mut name = raw.to_string();
 
@@ -10898,9 +11684,9 @@ visible content. Do not restate your plan and do not end your turn without doing
     /// this with `"assistant.tool_calls must be an array when provided"`.
     ///
     /// Rules:
-    ///   - Already an array → keep as-is.
-    ///   - Single object with `id`+`function` → wrap in a one-element array.
-    ///   - Null / other → remove the key entirely.
+    ///   - Already an array ? keep as-is.
+    ///   - Single object with `id`+`function` ? wrap in a one-element array.
+    ///   - Null / other ? remove the key entirely.
     fn normalize_message_tool_calls(messages: &mut [Message]) {
         for (idx, msg) in messages.iter_mut().enumerate() {
             let Some(tc_val) = msg.extra.remove("tool_calls") else {
@@ -10921,15 +11707,15 @@ visible content. Do not restate your plan and do not end your turn without doing
             );
             match tc_val {
                 serde_json::Value::Array(arr) => {
-                    // Already correct shape — put it back.
+                    // Already correct shape � put it back.
                     if !arr.is_empty() {
                         msg.extra
                             .insert("tool_calls".to_string(), serde_json::Value::Array(arr));
                     }
-                    // Empty array → drop it to avoid confusing providers.
+                    // Empty array ? drop it to avoid confusing providers.
                 }
                 serde_json::Value::Object(obj) => {
-                    // Single tool_call object → wrap in array.
+                    // Single tool_call object ? wrap in array.
                     // Accept any object shape that looks like a tool_call
                     // (has id, function, type, or name keys).
                     let looks_like_tool_call = obj.contains_key("id")
@@ -10946,7 +11732,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                             serde_json::Value::Array(vec![serde_json::Value::Object(obj)]),
                         );
                     } else if !obj.is_empty() {
-                        // Non-empty object without recognized keys — could be
+                        // Non-empty object without recognized keys � could be
                         // an indexed map like {"0": {...}, "1": {...}}. Try to
                         // convert numeric-keyed objects into an array ordered
                         // by key.
@@ -10978,10 +11764,10 @@ visible content. Do not restate your plan and do not end your turn without doing
                             );
                         }
                     }
-                    // Empty object → drop silently.
+                    // Empty object ? drop silently.
                 }
                 serde_json::Value::Null => {
-                    // Null → just drop it.
+                    // Null ? just drop it.
                 }
                 serde_json::Value::String(s) => {
                     // Some clients serialize tool_calls as a JSON string.
@@ -11018,7 +11804,7 @@ visible content. Do not restate your plan and do not end your turn without doing
                         value_type = %other,
                         "Dropping malformed tool_calls (not an array, object, or string)"
                     );
-                    // Drop it — better to omit than send garbage.
+                    // Drop it � better to omit than send garbage.
                 }
             }
         }
@@ -11029,7 +11815,7 @@ visible content. Do not restate your plan and do not end your turn without doing
             return false;
         };
 
-        // Never cache tool_calls responses — they're part of a multi-turn
+        // Never cache tool_calls responses � they're part of a multi-turn
         // tool-use flow and replaying them from cache would break the loop
         if choice.message.extra.contains_key("tool_calls") {
             return false;
@@ -11037,7 +11823,7 @@ visible content. Do not restate your plan and do not end your turn without doing
 
         // Never cache a turn with no answer text. A provider that stopped after
         // its reasoning block produces exactly this shape, and caching it would
-        // replay that dead end for every identical prefix — turning a transient
+        // replay that dead end for every identical prefix � turning a transient
         // provider hiccup into a permanent one.
         if Self::content_is_empty(&choice.message.content) {
             return false;
@@ -11051,7 +11837,7 @@ visible content. Do not restate your plan and do not end your turn without doing
             Some("length") => false,
             Some("content_filter") => false,
             None => true,     // some providers omit finish_reason on success
-            Some(_) => false, // unknown finish_reason — don't cache
+            Some(_) => false, // unknown finish_reason � don't cache
         }
     }
 
@@ -11070,7 +11856,7 @@ visible content. Do not restate your plan and do not end your turn without doing
     /// Requirements: 3.8
     // Wired into the streaming pass-through path by task 5.2.
     fn provider_needs_transformation(&self, provider: &Provider, _request: &OpenAIRequest) -> bool {
-        // Bedrock requires format translation — cannot pass-through stream.
+        // Bedrock requires format translation � cannot pass-through stream.
         if provider.provider_type == "bedrock" {
             return true;
         }
@@ -11102,7 +11888,7 @@ visible content. Do not restate your plan and do not end your turn without doing
     /// Record a `provider`/`model` combo as one that emits XML-style tool calls.
     /// Idempotent. Called from the streaming relay and the buffered-response
     /// diagnostic when XML tool use is detected. Combos are sticky for the
-    /// process lifetime — see [`Self::is_xml_tool_combo`].
+    /// process lifetime � see [`Self::is_xml_tool_combo`].
     pub fn mark_xml_tool_combo(&self, provider: &str, model: &str) {
         if let Ok(mut set) = self.xml_tool_combos.write() {
             set.insert(Self::xml_combo_key(provider, model));
@@ -11111,7 +11897,7 @@ visible content. Do not restate your plan and do not end your turn without doing
 
     /// True if this `provider`/`model` combo has been observed ending a streamed
     /// turn with reasoning only. Such combos take the buffer-and-retry path when
-    /// the request carries `tools` — see [`Self::degenerate_stream_combos`].
+    /// the request carries `tools` � see [`Self::degenerate_stream_combos`].
     pub fn is_degenerate_stream_combo(&self, provider: &str, model: &str) -> bool {
         self.degenerate_stream_combos
             .read()
@@ -11132,8 +11918,8 @@ visible content. Do not restate your plan and do not end your turn without doing
     /// True when the tool-calling system hint should be injected for a
     /// tools-bearing request to this combo.
     ///
-    /// Only **learned combos** — combos observed emitting XML-style tool use
-    /// (streaming relay or buffered diagnostic) — get the hint, and it stays
+    /// Only **learned combos** � combos observed emitting XML-style tool use
+    /// (streaming relay or buffered diagnostic) � get the hint, and it stays
     /// enabled for the process lifetime: toggling guidance on and off
     /// mid-conversation is exactly the context mutation that makes models
     /// flag injected instructions as a prompt-injection attack in their
@@ -11209,7 +11995,7 @@ pub(crate) async fn route_request_with_exclusions(
             .resolve_routed_providers(&prepared_request, model_group, active.as_ref())
             .await?;
         // Drop explicitly excluded provider:model entries (streaming 429
-        // fallback — see `route_request_streaming_excluding`).
+        // fallback � see `route_request_streaming_excluding`).
         let providers = if exclude.is_empty() {
             providers
         } else {
@@ -11324,8 +12110,8 @@ pub(crate) async fn route_request_with_exclusions(
     ///
     /// The text is deliberately short, attributed (`[gateway]`), and
     /// positively framed, and it contains no XML tag examples: long
-    /// anonymous imperative blocks — especially ones enumerating forbidden
-    /// markup — match the fingerprints models associate with prompt-injection
+    /// anonymous imperative blocks � especially ones enumerating forbidden
+    /// markup � match the fingerprints models associate with prompt-injection
     /// payloads and get flagged in reasoning output, eroding user trust.
     fn tool_calling_system_hint() -> Message {
         Message {
@@ -11344,8 +12130,8 @@ pub(crate) async fn route_request_with_exclusions(
 
     /// Insert the tool-calling hint directly after the last system message
     /// so it reads as operator guidance in the trusted system region of the
-    /// prompt. A system message appended at the tail — after user and tool
-    /// content, immediately before generation — is the canonical
+    /// prompt. A system message appended at the tail � after user and tool
+    /// content, immediately before generation � is the canonical
     /// prompt-injection position and is what reasoning models flag as
     /// suspicious. When the conversation has no system message, the hint
     /// becomes the first message. Positioning right after the system block
@@ -11364,21 +12150,21 @@ pub(crate) async fn route_request_with_exclusions(
     /// Follows the same provider selection / circuit-breaker / cooldown path as
     /// [`Self::route_request`], but prefers true streaming pass-through:
     ///
-    /// - When `streaming.passthrough_enabled` is false → buffer the whole
+    /// - When `streaming.passthrough_enabled` is false ? buffer the whole
     ///   request via [`Self::route_request`] (`Buffered`).
     /// - When Smart Routing applies (not bypassed) and Streaming Reliability
-    ///   (early event / keep-alive) is disabled → buffer (`Buffered`). With
+    ///   (early event / keep-alive) is disabled ? buffer (`Buffered`). With
     ///   Streaming Reliability enabled, pass-through walks the Smart Routing
     ///   order (tier candidates, then context-safe overflow).
     /// - When the first eligible provider needs response transformation
     ///   (Bedrock / XML-tool rewrite / Kimi-Nano sanitization) or is a Codex
-    ///   OAuth provider → buffer the whole request (`Buffered`).
-    /// - Otherwise → send the request upstream with `stream: true`, apply the
+    ///   OAuth provider ? buffer the whole request (`Buffered`).
+    /// - Otherwise ? send the request upstream with `stream: true`, apply the
     ///   TTFB timeout to the initial response headers, and hand the live body
     ///   to the caller (`PassThrough`) without consuming it.
     ///
     /// Mid-stream relay, inter-chunk timeouts, accumulation, and failover are
-    /// the responsibility of the streaming handler (tasks 5.3–5.6).
+    /// the responsibility of the streaming handler (tasks 5.3�5.6).
     ///
     /// Requirements: 3.1, 3.8, 3.9
     // Wired into the streaming handler by task 5.5.
@@ -11397,7 +12183,7 @@ pub async fn route_request_streaming(
     /// provider. Used by the streaming handler's pre-content failover loop
     /// (task 6.1, Req 4.1) to retry the next provider after one disconnects or
     /// errors before any content was forwarded. Exclusion is keyed per
-    /// `provider:model` — matching the circuit-breaker key — so a provider
+    /// `provider:model` � matching the circuit-breaker key � so a provider
     /// that offers several models in the group remains eligible via its other
     /// models after one of them failed.
     ///
@@ -11459,7 +12245,7 @@ pub async fn route_request_streaming_excluding(
         }
 
         // Pass-through disabled globally, or Smart Routing applied without
-        // Streaming Reliability → buffer the whole request.
+        // Streaming Reliability ? buffer the whole request.
         let smart_routing_applied = routing_decision.is_some() && !routing_bypassed;
         if streaming_requires_buffering(&streaming_config, smart_routing_applied) {
             debug!(
@@ -11560,24 +12346,29 @@ pub async fn route_request_streaming_excluding(
             handle.set_target(&provider_model.provider, &provider_model.model, phase);
         }
 
-        // Codex Search is active → route to the buffered path BEFORE running
-        // compression. Streaming pass-through cannot intercept tool calls to
-        // execute search server-side, and without injection the model never
-        // sees the codex_search/codex_web tools. The buffered path injects the
-        // tool definitions after its own compression and intercepts/executes
-        // any search tool calls before returning the final response. Checking
-        // here avoids burning a compression pass that the buffered path will
-        // redo anyway.
-        if self.codex_search_ready().await.is_some() {
-            debug!(
-                provider = %provider_model.provider,
-                "Codex search active — routing streaming request through buffered path for tool-call interception"
-            );
-            drop(concurrency_permit.take());
-            return Ok(StreamingResponse::Buffered(
-                self.route_request(request, active.clone(), compression_restore.clone()).await?,
-            ));
-        }
+// Codex Search or the generic web_search feature is active — route to
+// the buffered path BEFORE running compression. Streaming pass-through
+// cannot intercept tool calls to execute search server-side, and
+// without injection the model never sees the codex_search/codex_web or
+// web_search tools. The buffered path injects the tool definitions
+// after its own compression and intercepts/executes any search tool
+// calls before returning the final response. Checking here avoids
+// burning a compression pass that the buffered path will redo anyway.
+let search_routing_active = !matches!(
+    self.active_search_config().await,
+    crate::web_search::coordinator::ActiveSearchConfig::GenericNotReady
+        | crate::web_search::coordinator::ActiveSearchConfig::None
+);
+if search_routing_active {
+    debug!(
+        provider = %provider_model.provider,
+        "Search tool injection active; routing streaming request through buffered path for tool-call interception"
+    );
+    drop(concurrency_permit.take());
+    return Ok(StreamingResponse::Buffered(
+        self.route_request(request, active.clone(), compression_restore.clone()).await?,
+    ));
+}
 
         // Compression is provider-specific and completes before model rewrite,
         // sanitization, or the upstream streaming request starts.
@@ -11592,7 +12383,7 @@ pub async fn route_request_streaming_excluding(
             .await;
 
         // Inspect the chosen provider config. Clone every field needed for the
-        // outgoing request before dropping the config guard — the guard must
+        // outgoing request before dropping the config guard � the guard must
         // not be held across the network `.await`.
         let provider_cfg = {
             let config = self.config.read().await;
@@ -11617,7 +12408,7 @@ pub async fn route_request_streaming_excluding(
         // GitHub Copilot is dispatched end-to-end by the
         // GitHubCopilotProvider adapter (mandatory Copilot headers +
         // bearer resolution per auth_method), so streaming requests
-        // take the buffered route where that arm lives — same
+        // take the buffered route where that arm lives � same
         // discipline as Bedrock below.
         let is_copilot = provider_cfg.provider_type == "github-copilot";
         // INVARIANT: a Bedrock request must never be dispatched from the
@@ -11677,7 +12468,7 @@ pub async fn route_request_streaming_excluding(
         } else {
             None
         };
-        // OAuth provider without a usable token → fall back to the buffered
+        // OAuth provider without a usable token ? fall back to the buffered
         // path so the auth failure surfaces consistently via failover.
         if is_oauth_provider && oauth_bearer.is_none() {
             debug!(provider = %provider_model.provider, "OAuth session unusable, using buffered path");
@@ -11687,7 +12478,7 @@ pub async fn route_request_streaming_excluding(
             ));
         }
 
-        // Base URL normalization — strip trailing '/', ensure '/v1'. Bedrock
+        // Base URL normalization � strip trailing '/', ensure '/v1'. Bedrock
         // never reaches this pass-through path (it takes the buffered gate
         // above via `|| is_bedrock`), so no Mantle special-case is needed here.
         let mut base_url = configured_base_url
@@ -11877,7 +12668,7 @@ pub async fn route_request_streaming_excluding(
         let mut skip_next_backoff = false;
 
         let pre_dispatch_ms = active.as_ref().map_or(0, ActiveRequestHandle::elapsed_ms);
-        // R1: request-scoped primary-ness — rows recorded before this
+        // R1: request-scoped primary-ness � rows recorded before this
         // dispatch (e.g. a buffered failover re-entry after an earlier
         // candidate failed) prove the request already left its primary;
         // this loop's own rows must not count.
@@ -11888,8 +12679,8 @@ pub async fn route_request_streaming_excluding(
         for attempt in 0..=max_retries {
             // Concurrent-retry budget (retry-failover-core-overhaul, Req
             // 4.1-4.5), mirroring the buffered loop: retry iterations
-            // (≥11) are admitted before scheduling — before the backoff
-            // sleep and the rate-limit re-entry — while first attempts
+            // (=11) are admitted before scheduling � before the backoff
+            // sleep and the rate-limit re-entry � while first attempts
             // never consult the budget (Req 4.3). The slot covers the
             // retry send and is released at iteration end (Req 4.4).
             // Exhaustion breaks to the pass-through fallback sink
@@ -11908,7 +12699,7 @@ pub async fn route_request_streaming_excluding(
                             attempt,
                             active = active_count,
                             in_flight = self.retry_budgets.in_flight(&provider_model.provider),
-                            "Retry budget exhausted (streaming) — failing over instead of scheduling same-provider retry"
+                            "Retry budget exhausted (streaming) � failing over instead of scheduling same-provider retry"
                         );
                         let budget_err = GatewayError::Provider {
                             provider: provider_model.provider.clone(),
@@ -11942,7 +12733,7 @@ pub async fn route_request_streaming_excluding(
                     jitter_ratio,
                 );
                 // Req 1.6 (retry-failover-core-overhaul): same cap as the
-                // buffered loop — waking past the gateway request deadline
+                // buffered loop � waking past the gateway request deadline
                 // means failing over now instead of scheduling the sleep.
                 if let (Some(handle), Some(deadline_ms)) = (&active, request_deadline_ms) {
                     let wake_at_ms = handle.elapsed_ms() + retry_delay.as_millis() as i64;
@@ -11952,7 +12743,7 @@ pub async fn route_request_streaming_excluding(
                             attempt,
                             delay_ms = retry_delay.as_millis() as u64,
                             deadline_ms,
-                            "Streaming retry backoff would pass the gateway request deadline — failing over instead of scheduling"
+                            "Streaming retry backoff would pass the gateway request deadline � failing over instead of scheduling"
                         );
                         break;
                     }
@@ -11974,7 +12765,7 @@ pub async fn route_request_streaming_excluding(
                 );
                 tokio::time::sleep(retry_delay).await;
                 _backoff_stall.end();
-                // ADR 0002: one token per real upstream request — every
+                // ADR 0002: one token per real upstream request � every
                 // re-send re-enters the admission gate.
                 let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
                 if !rate_limiter.consume().await {
@@ -11985,7 +12776,7 @@ pub async fn route_request_streaming_excluding(
                 }
             } else if attempt > 0 {
                 // Backoff skipped (Retry-After waited retry): the wait was
-                // the delay, but the admission gate is NOT skipped — one
+                // the delay, but the admission gate is NOT skipped � one
                 // token per real upstream send (ADR 0002).
                 skip_next_backoff = false;
                 let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
@@ -12045,7 +12836,7 @@ pub async fn route_request_streaming_excluding(
                     continue;
                 }
                 Err(_) => {
-                    warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) — falling back to buffered path without this provider");
+                    warn!(provider = %provider_model.provider, ttfb_timeout_secs, "TTFB timeout (streaming) � falling back to buffered path without this provider");
                     drop(concurrency_permit.take());
                     let err = GatewayError::TtfbTimeout(ttfb_timeout_secs);
                     Self::record_try_failure(
@@ -12104,7 +12895,7 @@ pub async fn route_request_streaming_excluding(
             request_start,
         );
         // Runtime model-not-found (model-deprecation-alerts spec, Req
-        // 5.1/6.1, streaming arm): the model is gone — record the
+        // 5.1/6.1, streaming arm): the model is gone � record the
         // runtime-gone mark and fall back to the buffered path with
         // this provider:model excluded (the same sink the 429/5xx
         // arms use), so the fallback dispatches the next candidate
@@ -12115,7 +12906,7 @@ pub async fn route_request_streaming_excluding(
                 provider = %provider_model.provider,
                 model = %provider_model.model,
                 status = status_code,
-                "Model not found / deprecated at provider (streaming pass-through) — recording runtime-gone and falling back without this provider"
+                "Model not found / deprecated at provider (streaming pass-through) � recording runtime-gone and falling back without this provider"
             );
             if let Some(state) = &self.deprecation_state {
                 note_runtime_gone(state, &provider_model.provider, &provider_model.model);
@@ -12141,7 +12932,7 @@ pub async fn route_request_streaming_excluding(
                     // metrics store, both consulted by the routing gates) and
                     // exclude this provider:model from the buffered fallback so
                     // it is not immediately retried while the cooldown is
-                    // active. No circuit-breaker failure is recorded — a
+                    // active. No circuit-breaker failure is recorded � a
                     // rate-limited provider is paused, not unhealthy.
                     let cooldown = self
                         .parse_rate_limit_cooldown(
@@ -12163,7 +12954,7 @@ pub async fn route_request_streaming_excluding(
                     // The parsed cooldown IS the Retry-After (never parsed
                     // twice); the permit is dropped before the wait and
                     // re-acquired after; the retry re-enters `consume()` at the
-                    // top of the loop — one token per real send (ADR 0002).
+                    // top of the loop � one token per real send (ADR 0002).
                     // `exclude.is_empty()` marks this dispatch as the
                     // request's primary candidate; the monotonic wait-done
                     // marker makes the one-shot wait cross-stack (a buffered
@@ -12211,7 +13002,7 @@ pub async fn route_request_streaming_excluding(
                                 None => {
                                     warn!(
                                         provider = %provider_model.provider,
-                                        "Provider saturated after Retry-After wait — falling back to buffered path"
+                                        "Provider saturated after Retry-After wait � falling back to buffered path"
                                     );
                                     last_error = Some(err);
                                     break;
@@ -12222,7 +13013,7 @@ pub async fn route_request_streaming_excluding(
                             continue;
                         }
                         // Deadline fired during the wait: fall through to the
-                        // cooldown + failover below — no retry sent, no token
+                        // cooldown + failover below � no retry sent, no token
                         // consumed for it.
                     }
                     let rate_limiter = self.get_rate_limiter(&provider_model.provider).await;
@@ -12321,7 +13112,7 @@ pub async fn route_request_streaming_excluding(
                                 model = %provider_model.model,
                                 status = status_code,
                                 tool_schema_fields_removed = tools_removed,
-                                "Provider rejected image inputs (streaming) with no image content in messages — scrubbed image references from tool schemas and retrying via buffered path"
+                                "Provider rejected image inputs (streaming) with no image content in messages � scrubbed image references from tool schemas and retrying via buffered path"
                             );
                         }
                         removed += tools_removed;
@@ -12332,7 +13123,7 @@ pub async fn route_request_streaming_excluding(
                             model = %provider_model.model,
                             status = status_code,
                             images_removed = removed,
-                            "Provider rejected image inputs (streaming) — stripped images and retrying via buffered path"
+                            "Provider rejected image inputs (streaming) � stripped images and retrying via buffered path"
                         );
                         drop(concurrency_permit.take());
                         return Ok(StreamingResponse::Buffered(
@@ -12355,7 +13146,7 @@ pub async fn route_request_streaming_excluding(
                         provider = %provider_model.provider,
                         status = status_code,
                         attempt,
-                        "Streaming pass-through error classified RetrySameProvider — retrying same provider"
+                        "Streaming pass-through error classified RetrySameProvider � retrying same provider"
                     );
                     continue;
                 }
@@ -12406,7 +13197,7 @@ pub async fn route_request_streaming_excluding(
             }
         };
 
-// Success — hand the live streaming body and permit to the caller.
+// Success � hand the live streaming body and permit to the caller.
 // The handler keeps both alive until the relay finishes or is dropped.
 // The Smart Routing metric is recorded only on the primary attempt so
 // pre-content failover re-plans do not double count.
@@ -12495,7 +13286,7 @@ Ok(StreamingResponse::PassThrough {
     /// healthy decision provider: jev/laya family providers matched by
     /// family token (or `auto`/bare alias), generic systemone providers
     /// matched by exact `manual_models` id. Same-family/same-id failover
-    /// only — cross-family substitution never happens (design D4). Single
+    /// only � cross-family substitution never happens (design D4). Single
     /// pass, no streaming (design D8).
     ///
     /// Returns the provider's answer envelope with the resolved model id
@@ -12547,7 +13338,7 @@ Ok(StreamingResponse::PassThrough {
 
             // Admission 2 (F3a): rate-limit admission happens AFTER client
             // build and key resolution, immediately before the real upstream
-            // call(s) — one blocking-wait-free token per admitted try (ADR
+            // call(s) � one blocking-wait-free token per admitted try (ADR
             // 0002). A local skip or upstream cooldown fails over (429 row).
             let rate_limiter = self.get_rate_limiter(&provider_name).await;
             let client = match self.decision_client_for(candidate).await {
@@ -12566,7 +13357,7 @@ Ok(StreamingResponse::PassThrough {
                     continue;
                 }
             };
-            // F4: a missing API key is a terminal Auth-class attempt — never
+            // F4: a missing API key is a terminal Auth-class attempt � never
             // send an empty Bearer upstream.
             let api_key = candidate.provider.resolve_api_key();
             let api_key_ref = match api_key.as_deref() {
@@ -12606,7 +13397,7 @@ Ok(StreamingResponse::PassThrough {
             let resolved_model = match &candidate.pinned_model {
                 Some(pinned) => pinned.clone(),
                 None => {
-                    // F3b: the discovery listing is a real upstream request —
+                    // F3b: the discovery listing is a real upstream request �
                     // it takes its own non-blocking token before dispatch.
                     if !rate_limiter.consume().await {
                         attempts.push(
@@ -12725,7 +13516,7 @@ Ok(StreamingResponse::PassThrough {
     }
 
     /// Decision-provider candidates for a requested model (Req 2.2), in
-    /// config declaration order — the operator's provider priority for
+    /// config declaration order � the operator's provider priority for
     /// decision providers (they do not participate in model groups).
     ///
     /// Family providers match when the model carries their family token;
@@ -12750,7 +13541,7 @@ Ok(StreamingResponse::PassThrough {
                 "systemone" => {
                     has_generic_provider = true;
                     // Req 2.2: exact, case-sensitive id match ("exactly
-                    // matches") — no case-folding on manual_models ids.
+                    // matches") � no case-folding on manual_models ids.
                     if provider
                         .manual_models
                         .iter()
@@ -12797,7 +13588,7 @@ Ok(StreamingResponse::PassThrough {
         if candidates.is_empty() {
             if is_auto && has_generic_provider {
                 // Req 2.5: `auto` is meaningless for generic systemone
-                // providers — explicit ids are their only routing contract.
+                // providers � explicit ids are their only routing contract.
                 return Err(GatewayError::InvalidRequest(
                     "model 'auto' is not supported by generic 'systemone' providers; \
                      request an explicit model id, or configure a 'jev'/'laya' \
@@ -12817,7 +13608,7 @@ Ok(StreamingResponse::PassThrough {
         Ok(candidates)
     }
 
-    /// `true` for `auto` and bare family aliases (`jev`, `laya`) — ids that
+    /// `true` for `auto` and bare family aliases (`jev`, `laya`) � ids that
     /// must resolve through model discovery rather than forward pinned.
     fn is_bare_decision_alias(model: &str, family: &SystemOneFamily) -> bool {
         let trimmed = model.trim();
@@ -14013,7 +14804,7 @@ mod tests {
         assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
-    // ── Backstop: duplicate-compaction-trigger repair-and-retry (task 7.2) ──
+    // -- Backstop: duplicate-compaction-trigger repair-and-retry (task 7.2) --
     //
     // Mirrors the image-strip client pattern: a test ProviderClient that counts
     // calls, rejects the first attempt with the observed Bedrock Mantle 400 body,
@@ -14175,7 +14966,7 @@ mod tests {
         let mut request = compression_request(false);
         request.model = "adapter-model".to_string();
         // Even with duplicate triggers present, an unrelated 400 must not trip the
-        // duplicate-trigger arm — the guard requires the specific rejection phrase.
+        // duplicate-trigger arm � the guard requires the specific rejection phrase.
         request.messages = vec![
             Message {
                 role: "user".to_string(),
@@ -14348,7 +15139,7 @@ mod tests {
         );
     }
 
-    // ── Degenerate turns: reasoning with no answer and no tool call ──
+    // -- Degenerate turns: reasoning with no answer and no tool call --
     //
     // The failure these guard against: a provider (GLM in the field report)
     // finishes its thinking phase and stops. Handed back verbatim, the turn is
@@ -14666,7 +15457,7 @@ mod tests {
     }
 
     /// Only a leading block counts as thinking. Content that merely mentions the
-    /// tag — documentation or a code sample — must survive untouched.
+    /// tag � documentation or a code sample � must survive untouched.
     #[test]
     fn split_think_tags_ignores_mid_content_mentions() {
         let body = "Use `<think>` to open a reasoning block.";
@@ -14949,6 +15740,7 @@ mod tests {
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
             codex_search: None,
+            web_search: None,
             cache_aware_routing: Default::default(),
             reasoning_compat: Default::default(),
             webhooks: Default::default(),
@@ -16351,12 +17143,12 @@ mod tests {
 }
 
 // ------------------------------------------------------------------
-// Spec model-deprecation-alerts, Task 5 — runtime model-not-found
+// Spec model-deprecation-alerts, Task 5 � runtime model-not-found
 // detection + failover classification guard tests.
 // ------------------------------------------------------------------
 
 /// Guard (Req 6.1/6.3): a 404 model_not_found from the primary
-/// fails over to the healthy second provider — exactly one request to
+/// fails over to the healthy second provider � exactly one request to
 /// the dead model (no same-provider retry), a `model_not_found`
 /// ledger row, and a runtime-gone mark recorded for later candidate
 // selection.
@@ -16401,7 +17193,7 @@ async fn model_not_found_404_fails_over_with_gone_mark() {
 }
 
 /// Guard (Req 6.1 negative): a plain 404 without the model-not-found
-/// signature keeps today's terminal 4xx behavior — failover loop
+/// signature keeps today's terminal 4xx behavior � failover loop
 /// advance (that is the existing non-retryable 4xx semantics) but NO
 /// runtime-gone mark and NO `model_not_found` ledger class.
 #[tokio::test]
@@ -16439,7 +17231,7 @@ async fn plain_404_stays_terminally_classified_and_marks_nothing() {
 }
 
 /// Guard (Req 5.2): a `provider:model` marked runtime-gone is
-/// excluded from candidate selection for a subsequent request — the
+/// excluded from candidate selection for a subsequent request � the
 /// group's healthy second provider serves it without any request to
 /// the gone entry.
 #[tokio::test]
@@ -16473,7 +17265,7 @@ async fn gone_marked_model_is_skipped_for_subsequent_requests() {
 
 
     // ------------------------------------------------------------------
-    // Spec per-provider-tool-compression-toggle, Task 5 — strict
+    // Spec per-provider-tool-compression-toggle, Task 5 � strict
     // per-attempt original-tools restore in the dispatch loop.
     // ------------------------------------------------------------------
 
@@ -16561,7 +17353,7 @@ async fn gone_marked_model_is_skipped_for_subsequent_requests() {
             .to_string()
     }
 
-/// Applied=true + provider disabled → the upstream body carries the
+/// Applied=true + provider disabled ? the upstream body carries the
 /// ORIGINAL tools and the restore metric increments.
 #[tokio::test]
 async fn disabled_provider_attempt_restores_original_tools_and_counts_metric() {
@@ -16651,7 +17443,7 @@ async fn disabled_provider_attempt_restores_original_tools_and_counts_metric() {
         b.verify().await;
     }
 
-    /// Applied=false (middleware skip path) → never restored even for a
+    /// Applied=false (middleware skip path) ? never restored even for a
     /// disabled provider; the body already holds the originals.
     #[tokio::test]
     async fn skip_path_requests_are_never_restored() {
@@ -16683,7 +17475,7 @@ async fn disabled_provider_attempt_restores_original_tools_and_counts_metric() {
         );
     }
 
-    /// Empty disabled_providers → no change, no metric.
+    /// Empty disabled_providers ? no change, no metric.
     #[tokio::test]
     async fn empty_disabled_providers_leaves_tools_untouched() {
         let server = MockServer::start().await;
@@ -16704,7 +17496,7 @@ async fn disabled_provider_attempt_restores_original_tools_and_counts_metric() {
         let tools = bodies[0].get("tools").and_then(|t| t.as_array()).unwrap();
         assert_eq!(
             tools[0]["function"]["name"], "compressed_proxy",
-            "no disabled providers → compressed body forwarded"
+            "no disabled providers ? compressed body forwarded"
         );
     assert_eq!(restored_prometheus_count(&metrics, "provider"), "");
 }
@@ -16723,7 +17515,7 @@ async fn codex_search_round_restores_original_tools_on_disabled_provider() {
         .mount(&primary)
         .await;
     // First round: the model calls the gateway-injected codex_search
-    // tool (empty query → rejected locally, no search HTTP call).
+    // tool (empty query ? rejected locally, no search HTTP call).
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(search_call_response()))
@@ -16774,7 +17566,7 @@ async fn codex_search_round_restores_original_tools_on_disabled_provider() {
         vec!["get_weather".to_string(), "get_time".to_string()],
         "search round must restore original tools for the disabled provider"
     );
-    // Both attempts restored → metric counts 2.
+    // Both attempts restored ? metric counts 2.
     assert!(
         restored_prometheus_count(&router.metrics, "provider").ends_with(" 2"),
         "restore metric must be 2 (first attempt + search round), got: {}",
@@ -16919,9 +17711,9 @@ async fn codex_search_round_restores_original_tools_on_disabled_provider() {
         b.verify().await;
     }
 
-    // ────────────────────────────────────────────────────────────────────
+    // --------------------------------------------------------------------
     // ADR 0002: provider rate-limit accounting
-    // ────────────────────────────────────────────────────────────────────
+    // --------------------------------------------------------------------
 
     /// "primary" (rate limited) then "backup" (unlimited); one same-provider
     /// retry with no backoff.
@@ -17300,8 +18092,8 @@ extra: Default::default(),
         config.context.overflow_policy = "route_larger_context".to_string();
         let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
 
-        // ~3,000 padded turns ≈ 60k tokens: over the small budget (7,168) AND
-        // the large budget (32,768 − 1,638 = 31,130), so every candidate is
+        // ~3,000 padded turns � 60k tokens: over the small budget (7,168) AND
+        // the large budget (32,768 - 1,638 = 31,130), so every candidate is
         // gate-skipped and nothing dispatches.
         let mut request = compression_request(false);
         request.messages = (0..3_000)
@@ -17615,10 +18407,10 @@ extra: Default::default(),
         assert_eq!(chat_requests(&primary).await, 0);
     }
 
-    // ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+    // ����������������������������������������������������������������������������������������������������������������������������������������
     // Bounded Retry-After wait for the primary provider (Req 3.1-3.9,
     // retry-failover-core-overhaul)
-    // ————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+    // ����������������������������������������������������������������������������������������������������������������������������������������
 
     /// Config like [`rate_limited_config`] plus the Retry-After wait knob.
     fn retry_after_wait_config(
@@ -17647,7 +18439,7 @@ extra: Default::default(),
             .any(|a| a.error_class.as_deref() == Some("rate_limit_wait"))
     }
 
-    /// Req 3.1/3.6: primary 429 + small Retry-After —— the gateway waits,
+    /// Req 3.1/3.6: primary 429 + small Retry-After �� the gateway waits,
     /// retries the SAME provider, succeeds; a `rate_limit_wait` ledger row
     /// records the wait; the fallback is never hit.
     #[tokio::test]
@@ -17711,7 +18503,7 @@ extra: Default::default(),
     }
 
     /// Req 3.3: Retry-After larger than `upstream_retry_after_max_wait_ms`
-    /// —— no wait, cooldown, immediate failover; primary hit exactly once.
+    /// �� no wait, cooldown, immediate failover; primary hit exactly once.
     #[tokio::test]
     async fn oversized_retry_after_fails_over_without_waiting() {
         use wiremock::matchers::{method, path};
@@ -17753,7 +18545,7 @@ extra: Default::default(),
         assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
     }
 
-    /// Req 3.2: a non-primary 429 (primary failed 500 first) never waits —
+    /// Req 3.2: a non-primary 429 (primary failed 500 first) never waits �
     /// the request advances to the next candidate at once.
     #[tokio::test]
     async fn non_primary_429_does_not_wait() {
@@ -17816,7 +18608,7 @@ extra: Default::default(),
     /// dispatch-scoped. The streaming primary fails 500 and falls back into
     /// a FRESH buffered dispatch (`route_request_with_exclusions` with `a`
     /// excluded) where `b` is candidate 0; b's small-Retry-After 429 with
-    /// the knob on must NOT wait — the request already carries upstream
+    /// the knob on must NOT wait � the request already carries upstream
     /// attempt rows, so it is no longer on its primary. `max_retries=1`
     /// keeps the max-retries gate open so only the prior-attempts gate can
     /// block the wait.
@@ -17881,12 +18673,12 @@ extra: Default::default(),
         assert_eq!(
             chat_requests(&b).await,
             1,
-            "b hit exactly once — no waited retry"
+            "b hit exactly once � no waited retry"
         );
     }
 
     /// Req 3.2 (review finding R2): `max_retries_per_provider = 0`
-    /// disables the Retry-After wait — the waited retry would be a
+    /// disables the Retry-After wait � the waited retry would be a
     /// same-provider retry the config forbids, so the sleep is dead time.
     /// Primary 429 + small hint + knob on: immediate failover, no
     /// `rate_limit_wait` row, primary hit exactly once.
@@ -17930,7 +18722,7 @@ extra: Default::default(),
         assert_eq!(chat_requests(&primary).await, 1, "primary hit exactly once");
     }
 
-    /// Req 3.4: the waited retry gets a second 429 —— no second wait; the
+    /// Req 3.4: the waited retry gets a second 429 �� no second wait; the
     /// provider is cooled down and the request fails over.
     #[tokio::test]
     async fn second_429_after_wait_does_not_wait_again() {
@@ -17975,7 +18767,7 @@ extra: Default::default(),
     }
 
     /// Req 3.5: `upstream_retry_after_max_wait_ms = 0` (the default) is
-    /// byte-for-byte today's behavior — failover, no `rate_limit_wait` row.
+    /// byte-for-byte today's behavior � failover, no `rate_limit_wait` row.
     #[tokio::test]
     async fn zero_max_wait_keeps_todays_failover_behavior() {
         use wiremock::matchers::{method, path};
@@ -18018,7 +18810,7 @@ extra: Default::default(),
     }
 
     /// Req 3.1 (review finding R3): an explicit `retry-after-ms: 0` hint
-    /// maps to the documented "hint of 0 → cooldown + failover" behavior —
+    /// maps to the documented "hint of 0 ? cooldown + failover" behavior �
     /// no zero-second wait, no `rate_limit_wait` row, primary hit exactly
     /// once, the fallback serves the request.
     #[tokio::test]
@@ -18065,7 +18857,7 @@ extra: Default::default(),
     }
 
     /// Req 3.1 (review finding R4): a hint-less 429 (no Retry-After header
-    /// or body field) must NOT wait even with a generous knob — the
+    /// or body field) must NOT wait even with a generous knob � the
     /// `default_rate_limit_cooldown_seconds` fallback is not an upstream
     /// signal. Cooldown still applies; failover proceeds immediately.
     #[tokio::test]
@@ -18114,7 +18906,7 @@ extra: Default::default(),
     }
 
     /// Req 3.1 (streaming arm): primary pass-through 429 + small
-    /// Retry-After —— wait, then the same-provider pass-through retry
+    /// Retry-After �� wait, then the same-provider pass-through retry
     /// succeeds (no buffered hop).
     #[tokio::test]
     async fn streaming_primary_429_waits_and_retries_passthrough() {
@@ -18333,7 +19125,7 @@ extra: Default::default(),
         assert_eq!(chat_requests(&b).await, 0);
     }
 
-    /// Task 4: 429 classifies FailOver — the streaming pass-through never
+    /// Task 4: 429 classifies FailOver � the streaming pass-through never
     /// re-sends to the rate-limited provider; it cools down and fails over.
     #[tokio::test]
     async fn streaming_passthrough_429_fails_over_without_same_provider_retry() {
@@ -18617,7 +19409,7 @@ extra: Default::default(),
     }
 
     // ------------------------------------------------------------------
-    // Task 9 preservation — non-Bedrock pass-through keeps every trigger
+    // Task 9 preservation � non-Bedrock pass-through keeps every trigger
     // (clause 3.3). On the live path a trigger-bearing request to an
     // `openai`/`openai_compatible` provider never touches the Bedrock seam
     // (`normalize_mantle_compaction_triggers` is only reached from the Bedrock
@@ -18654,7 +19446,7 @@ extra: Default::default(),
         let removed = Router::sanitize_request_for_provider(&mut outgoing, "openai");
         assert_eq!(removed, 0, "openai sanitize must remove nothing");
 
-        // Count triggers across content parts — both must survive intact.
+        // Count triggers across content parts � both must survive intact.
         let trigger_count: usize = outgoing
             .messages
             .iter()
@@ -18676,7 +19468,7 @@ extra: Default::default(),
     }
 
     // ------------------------------------------------------------------
-    // Task 9 preservation — streaming transport decision for Bedrock
+    // Task 9 preservation � streaming transport decision for Bedrock
     // (clause 3.6). A streaming request to a `bedrock` provider must take the
     // buffered gate (task 8's structural `is_bedrock` early return), so it can
     // NEVER resolve to a `PassThrough` relay. The companion non-Bedrock case
@@ -18685,7 +19477,7 @@ extra: Default::default(),
     // The Bedrock buffered route dispatches through the real provider (the
     // Mantle base URL is derived from the region, not the config, so it cannot
     // be redirected to wiremock). The route therefore errors on the network,
-    // which `route_request_streaming` surfaces as `Err` — but the decisive fact
+    // which `route_request_streaming` surfaces as `Err` � but the decisive fact
     // is that the outcome is never `Ok(PassThrough { .. })`. That distinguishes
     // the buffered gate from the pass-through path structurally.
     // ------------------------------------------------------------------
@@ -18722,7 +19514,7 @@ extra: Default::default(),
 
         let outcome = router.route_request_streaming(&request, None, ToolCompressionRestore::default()).await;
         // The buffered gate fired: the result is either a Buffered response (if
-        // the upstream somehow answered) or an Err from the buffered route — but
+        // the upstream somehow answered) or an Err from the buffered route � but
         // NEVER a pass-through relay.
         match outcome {
             Ok(StreamingResponse::Buffered(_)) => {}
@@ -18730,7 +19522,7 @@ extra: Default::default(),
                 panic!("Bedrock streaming must not use the pass-through relay")
             }
             Err(_) => {
-                // Buffered route attempted and failed on the network — the
+                // Buffered route attempted and failed on the network � the
                 // buffered gate was still taken (a pass-through would have
                 // returned Ok(PassThrough) before any buffered dispatch).
             }
@@ -19660,7 +20452,7 @@ extra: Default::default(),
                     model: "gpt-4-turbo".to_string(),
                     cost_per_million_input_tokens: 10.0,
                     cost_per_million_output_tokens: 30.0,
-                    // Best (lowest) priority — the dated models must still
+                    // Best (lowest) priority � the dated models must still
                     // outrank it: version date is the DOMINANT ordering key
                     // when version_fallback_enabled (decided behavior).
                     priority: 1,
@@ -19752,7 +20544,7 @@ extra: Default::default(),
     }
 
     /// Req 2.3 (retry-failover-core-overhaul): seeded sampling must spread
-    /// across the jitter window, not cluster — both halves of the
+    /// across the jitter window, not cluster � both halves of the
     /// `base*(1-ratio) ..= base*(1+ratio)` window get hit over 200 draws.
     #[test]
     fn test_calculate_retry_delay_with_rng_distributes_across_window() {
@@ -20021,7 +20813,7 @@ extra: Default::default(),
     #[test]
     fn test_strip_image_content_if_unsupported_removes_nested_tool_result_images() {
         // Images nested inside a tool_result part's own content array
-        // must be stripped too — a top-level-only pass leaves them
+        // must be stripped too � a top-level-only pass leaves them
         // behind and the provider rejects the retry again.
         let mut request = OpenAIRequest {
             model: "no-vision".to_string(),
@@ -20157,7 +20949,7 @@ extra: Default::default(),
     fn test_strip_image_content_if_unsupported_redacts_data_url_inside_text_part() {
         // A data-URL image inside a text part is neutralized. The redaction
         // pass runs first and replaces the data URL in place (preserving the
-        // part structure) rather than deleting the whole part — a sibling real
+        // part structure) rather than deleting the whole part � a sibling real
         // text part is untouched. This preserves message shape for providers
         // that are strict about content-part arrays.
         let mut request = OpenAIRequest {
@@ -20305,7 +21097,7 @@ extra: Default::default(),
     #[test]
     fn test_strip_image_content_leaves_plain_text_mentioning_image_url() {
         // Prose that merely mentions `image_url` (not JSON) must be left
-        // exactly as-is — stripping it would corrupt legitimate content.
+        // exactly as-is � stripping it would corrupt legitimate content.
         let original = "To attach an image, set the image_url field in the request.";
         let mut request = OpenAIRequest {
             model: "no-vision".to_string(),
@@ -20502,7 +21294,7 @@ extra: Default::default(),
     #[test]
     fn test_strip_image_content_leaves_bare_json_string_scalar() {
         // A JSON string scalar (quoted text) that mentions a marker is data,
-        // not a content container — left untouched.
+        // not a content container � left untouched.
         let mut request = OpenAIRequest {
             model: "no-vision".to_string(),
             messages: vec![Message {
@@ -20752,11 +21544,11 @@ extra: Default::default(),
         let request = affinity_conversation();
         let cfg = crate::reasoning_compat::ReasoningCompatConfig::default();
 
-        // No entry for this prefix → miss → None (no source attribution).
+        // No entry for this prefix ? miss ? None (no source attribution).
         let router = affinity_router(Default::default());
         assert!(router.model_affinity_source(&request, &cfg).is_none());
 
-        // Affinity flag off → no lookup at all, even with a fresh entry.
+        // Affinity flag off ? no lookup at all, even with a fresh entry.
         let router = affinity_router(crate::reasoning_compat::ReasoningCompatConfig {
             conversation_model_affinity: false,
             ..Default::default()
@@ -21300,7 +22092,7 @@ extra: Default::default(),
 
     #[test]
     fn decision_terminal_error_maps_deterministic_classes_to_spec_shapes() {
-        // Upstream 413 → 413 terminal with resize guidance.
+        // Upstream 413 ? 413 terminal with resize guidance.
         match decision_terminal_error("laya-a", &SystemOneCallError::PayloadTooLarge)
             .expect("payload-too-large must be terminal")
         {
@@ -21317,7 +22109,7 @@ extra: Default::default(),
             other => panic!("expected provider 413, got {other:?}"),
         }
 
-        // Upstream 422 → 422 terminal passthrough with the provider's message.
+        // Upstream 422 ? 422 terminal passthrough with the provider's message.
         match decision_terminal_error(
             "laya-a",
             &SystemOneCallError::BadRequest {
@@ -21339,7 +22131,7 @@ extra: Default::default(),
             other => panic!("expected provider 422, got {other:?}"),
         }
 
-        // Upstream 400 (client Unavailable with the "HTTP 400" marker) →
+        // Upstream 400 (client Unavailable with the "HTTP 400" marker) ?
         // 400 terminal passthrough.
         match decision_terminal_error(
             "sys-a",
@@ -21483,8 +22275,8 @@ mod property_tests {
     ///
     /// For any model group with multiple providers, the router shall order providers by:
     /// (1) priority ascending, (2) cost ascending within same priority,
-    /// (3) latency ascending within similar costs (±10%),
-    /// (4) version date descending when version fallback is enabled — a
+    /// (3) latency ascending within similar costs (�10%),
+    /// (4) version date descending when version fallback is enabled � a
     ///     DOMINANT re-sort that overrides (1)-(3) (see
     ///     `test_version_fallback_sorting`). The generated model names carry
     ///     no `YYYY-MM-DD` suffix, so for the generated groups the priority /
@@ -21646,9 +22438,9 @@ mod property_tests {
         assert!(config2.model_groups[0].models[0].model.is_empty());
     }
 
-    // ────────────────────────────────────────────────────────────────────
+    // --------------------------------------------------------------------
     // Rate-limit detection & cooldown parsing
-    // ────────────────────────────────────────────────────────────────────
+    // --------------------------------------------------------------------
 
     #[test]
     fn test_is_rate_limited_status_429() {
@@ -22010,7 +22802,7 @@ mod property_tests {
             Some(7 * 24 * 60 * 60),
             7 * 24 * 60 * 60,
         );
-        // Should be ~1h, allow ±5s for clock skew during the test.
+        // Should be ~1h, allow �5s for clock skew during the test.
         assert!(cooldown > Duration::from_secs(3590));
         assert!(cooldown <= Duration::from_secs(3600));
     }
@@ -22114,9 +22906,9 @@ mod property_tests {
         assert!(cooldown <= Duration::from_secs(90));
     }
 
-    // ────────────────────────────────────────────────────────────────────
+    // --------------------------------------------------------------------
     // Pre-filter behavior of select_provider_order
-    // ────────────────────────────────────────────────────────────────────
+    // --------------------------------------------------------------------
 
     fn build_two_provider_group() -> (Config, ModelGroup) {
         let mut config = create_test_config();
@@ -22258,7 +23050,7 @@ mod property_tests {
         // cooldown but cannot wipe the metrics map (shared, durable).
         // The dashboard kept rendering "Pausing for ~23h (rate
         // limited)" while the router happily routed new traffic to the
-        // provider, which immediately 429'd again — exactly the user
+        // provider, which immediately 429'd again � exactly the user
         // bug report. The fix is for `select_provider_order` to also
         // consult the metrics-side cooldown.
         let (config, group) = build_two_provider_group();
@@ -22277,7 +23069,7 @@ mod property_tests {
             .unwrap_or(0);
         metrics.set_provider_cooldown(
             "primary",
-            "Rate limited by provider — pausing until the limit resets".to_string(),
+            "Rate limited by provider � pausing until the limit resets".to_string(),
             now_secs + 60 * 60 * 23,
         );
 
@@ -22285,7 +23077,7 @@ mod property_tests {
         // rate_limiters DashMap but leaves the metrics store intact.
         router.clear_rate_limiters();
 
-        // The cooldown must STILL be honored — primary stays out of the
+        // The cooldown must STILL be honored � primary stays out of the
         // candidate list. Without the metrics check, primary would be
         // reinstated here (None => true), and a request would be issued.
         let order = router.select_provider_order(&group).await;
@@ -22302,9 +23094,9 @@ mod property_tests {
         assert_eq!(order.len(), 2);
     }
 
-    // ────────────────────────────────────────────────────────────────────
+    // --------------------------------------------------------------------
     // provider_needs_transformation (task 5.1, Requirements: 3.8)
-    // ────────────────────────────────────────────────────────────────────
+    // --------------------------------------------------------------------
 
     fn make_provider_named(name: &str, provider_type: &str) -> Provider {
         Provider {
@@ -22378,7 +23170,7 @@ mod property_tests {
 
         // XML tool use is no longer inferred from the provider name: a GLM
         // provider streams optimistically (with or without tools) until the
-        // relay learns it emits XML — see `is_xml_tool_combo` learning below.
+        // relay learns it emits XML � see `is_xml_tool_combo` learning below.
         let glm = make_provider_named("glm-provider", "openai");
         assert!(!router.provider_needs_transformation(&glm, &request_with_tools(false)));
         assert!(!router.provider_needs_transformation(&glm, &request_with_tools(true)));
@@ -22428,7 +23220,7 @@ mod property_tests {
         assert!(!router.should_inject_tool_hint("lite", "claude-sonnet-4-5"));
         assert!(!router.should_inject_tool_hint("local", "llama3.1-8b"));
 
-        // Former built-in XML-prone families also start clean now — the
+        // Former built-in XML-prone families also start clean now � the
         // hint is demoted to learned combos only, with
         // `translate_xml_tool_calls` repairing any first XML-flavored
         // response transparently.
@@ -22437,7 +23229,7 @@ mod property_tests {
         assert!(!router.should_inject_tool_hint("x", "glm-4.6"));
         assert!(!router.should_inject_tool_hint("x", "deepseek-v3"));
 
-        // Learned combos get it regardless of family — and stay learned:
+        // Learned combos get it regardless of family � and stay learned:
         // the hint must not appear/disappear between conversation turns.
         router.mark_xml_tool_combo("weird-provider", "some-model");
         assert!(router.should_inject_tool_hint("weird-provider", "some-model"));
@@ -22473,7 +23265,7 @@ mod property_tests {
         };
 
         // With a system prompt present, the hint lands directly after the
-        // last system message — never at the tail after user/tool content.
+        // last system message � never at the tail after user/tool content.
         let mut messages = vec![msg("system"), msg("user"), msg("assistant"), msg("user")];
         Router::insert_tool_calling_hint(&mut messages);
         assert_eq!(messages.len(), 5);
@@ -22621,7 +23413,7 @@ mod property_tests {
                 .mount(&fallback)
                 .await;
 
-            // Expired copilot token on disk → Expired session state.
+            // Expired copilot token on disk ? Expired session state.
             let store = unique_store("expired");
             store
                 .save(&CopilotStoredCredentials {
@@ -22714,7 +23506,7 @@ mod property_tests {
             manager.load_existing_session().await.unwrap();
 
             let mut config = copilot_config(&copilot.uri(), "http://fallback.invalid");
-            // Rates configured on the copilot model — must still bill 0.
+            // Rates configured on the copilot model � must still bill 0.
             config.model_groups[0].models[0].cost_per_million_input_tokens = 10.0;
             config.model_groups[0].models[0].cost_per_million_output_tokens = 30.0;
 
@@ -22734,10 +23526,10 @@ mod property_tests {
                 response.extra.get("gateway_responded_model"),
                 Some(&serde_json::json!("gpt-5-copilot"))
             );
-            // Usage preserved (Req 9.3)…
+            // Usage preserved (Req 9.3)�
             assert_eq!(response.usage.prompt_tokens, 10);
             assert_eq!(response.usage.total_tokens, 15);
-            // …with zero cost reported to the client (Req 9.3).
+            // �with zero cost reported to the client (Req 9.3).
             assert_eq!(
                 response.extra.get("gateway_cost"),
                 Some(&serde_json::json!(0.0))
@@ -22746,10 +23538,10 @@ mod property_tests {
             assert!(handle.take_failed_attempts().is_empty());
         }
 
-        /// Req 4.3 (router side): upstream 401 on a Copilot attempt → ONE
+        /// Req 4.3 (router side): upstream 401 on a Copilot attempt ? ONE
         /// forced token refresh + ONE re-dispatch, then failover when the
         /// retry also auth-fails. The forced exchange is itself rejected 401
-        /// (entitlement missing → session Expired), so the re-dispatch fails
+        /// (entitlement missing ? session Expired), so the re-dispatch fails
         /// in bearer resolution without a second upstream POST.
         #[tokio::test]
         async fn copilot_upstream_401_refreshes_once_then_fails_over() {
@@ -22760,13 +23552,13 @@ mod property_tests {
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(401).set_body_string("token revoked"))
-                // First dispatch only: the forced exchange rejects 401 → the
-                // session flips Expired → the single re-dispatch short-circuits
+                // First dispatch only: the forced exchange rejects 401 ? the
+                // session flips Expired ? the single re-dispatch short-circuits
                 // in bearer resolution (no second upstream POST).
                 .expect(1)
                 .mount(&copilot)
                 .await;
-            // Forced-refresh exchange rejects with 401 — no real network: the
+            // Forced-refresh exchange rejects with 401 � no real network: the
             // rescue's force_refresh() must hit this wiremock endpoint.
             Mock::given(method("GET"))
                 .and(path("/copilot_internal/v2/token"))
@@ -22827,9 +23619,9 @@ mod property_tests {
 
         /// NFR Reliability: reload never clears Copilot auth state. Drives the
         /// same router-surface calls the gateway's real hot-reload entry
-        /// (`apply_runtime_config_update`) makes — smart-router reload, breaker
+        /// (`apply_runtime_config_update`) makes � smart-router reload, breaker
         /// / rate-limiter / sticky-cache / http-client / model-capability
-        /// clears, compression-runtime reload — with a config whose copilot
+        /// clears, compression-runtime reload � with a config whose copilot
         /// provider is RENAMED ("copilot-2"), then asserts from the router
         /// side: the SAME manager Arc stays attached, the session state
         /// survives, and a post-reload dispatch still authenticates and serves
@@ -22890,7 +23682,7 @@ mod property_tests {
             assert!(Arc::ptr_eq(&attached_before, &manager));
 
             // Publish the reloaded config: same shape but the copilot provider
-            // is RENAMED ("copilot-2") — a reload that drops/reconstructs auth
+            // is RENAMED ("copilot-2") � a reload that drops/reconstructs auth
             // state would lose the manager here.
             let mut reloaded = copilot_config(&copilot.uri(), &fallback.uri());
             reloaded.providers[0].name = "copilot-2".to_string();

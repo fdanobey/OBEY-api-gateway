@@ -113,6 +113,7 @@ fn codex_test_config() -> Config {
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
+        web_search: None,
         structured_output: None,
         memory: None,
         reasoning_compat: Default::default(),

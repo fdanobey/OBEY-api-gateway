@@ -37,4 +37,5 @@ pub mod tool_compression;
 #[cfg(feature = "tray")]
 pub mod tray;
 pub mod virtual_keys;
+pub mod web_search;
 pub mod webhooks;

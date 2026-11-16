@@ -48,6 +48,8 @@ pub enum StallReason {
     Buffering,
     /// Codex search agent loop round (web search + resubmission).
     CodexSearch,
+    /// Provider-agnostic web search agent loop round (search + resubmission).
+    WebSearch,
     /// Tool-disclosure synthetic call resolved locally, model resubmitted.
     ToolDisclosure,
     /// Same-provider continuation nudge after a reasoning-only turn.
@@ -72,6 +74,7 @@ impl StallReason {
             StallReason::MemoryRecall => "memory recall",
             StallReason::Buffering => "buffering",
             StallReason::CodexSearch => "codex search",
+            StallReason::WebSearch => "web search",
             StallReason::ToolDisclosure => "tool disclosure",
             StallReason::ReasoningNudge => "reasoning nudge",
             StallReason::RetryBackoff => "retry backoff",

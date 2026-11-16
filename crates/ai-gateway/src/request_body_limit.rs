@@ -208,6 +208,7 @@ mod tests {
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
             codex_search: None,
+            web_search: None,
             reasoning_compat: Default::default(),
             webhooks: Default::default(),
             opentelemetry: Default::default(),

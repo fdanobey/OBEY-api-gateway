@@ -16,15 +16,18 @@ const DEFAULT_TEMPLATE_HOST_LINE: &str = "  host: \"0.0.0.0\"";
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
 pub enum ValidationError {
-    #[error("Missing required field: {0}")]
-    MissingField(String),
+#[error("Missing required field: {0}")]
+MissingField(String),
 
-    #[error("Invalid value for field '{field}': {value}. Expected: {expected}")]
-    InvalidValue {
-        field: String,
-        value: String,
-        expected: String,
-    },
+#[error("{0}")]
+Raw(String),
+
+#[error("Invalid value for field '{field}': {value}. Expected: {expected}")]
+InvalidValue {
+field: String,
+value: String,
+expected: String,
+},
 
     #[error("Port number must be in range 1-65535, got: {0}")]
     InvalidPort(u16),
@@ -938,13 +941,22 @@ prefix stickiness is disabled and routing uses normal priority/cost/latency sort
                 .iter()
                 .any(|p| p.auth_method.as_deref() == Some("oauth") && p.provider_type == "openai");
 
-            if codex_search.effective_enabled(has_codex_provider) && !has_codex_provider {
-                tracing::warn!(
-    "codex_search.enabled is true but no Codex (oauth+openai) provider is configured — \
-    search tools will not be injected and no upstream search calls will be made"
-    );
-            }
+        if codex_search.effective_enabled(has_codex_provider) && !has_codex_provider {
+            tracing::warn!(
+                "codex_search.enabled is true but no Codex (oauth+openai) provider is configured — \
+                search tools will not be injected and no upstream search calls will be made"
+            );
         }
+    }
+
+if let Some(ref web_search) = self.web_search {
+if let Err(msg) = web_search.validate() {
+// The section's validator already produces field-level messages
+// (`web_search.<field> ...`); pass them through verbatim instead of
+// re-wrapping them against the section-level `web_search` field.
+errors.push(ValidationError::Raw(msg));
+}
+}
 
         // Validate admin auth env vars (21.5)
         if self.admin.auth.enabled {
@@ -1756,6 +1768,7 @@ mod property_tests {
             xhigh_models_allowlist: Default::default(),
             reasoning_models_allowlist: Default::default(),
             codex_search: None,
+            web_search: None,
             cache_aware_routing: Default::default(),
             reasoning_compat: Default::default(),
         webhooks: Default::default(),

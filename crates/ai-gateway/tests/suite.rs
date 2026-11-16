@@ -98,6 +98,7 @@ mod webhooks_admin;
 mod webhooks_provider_alerts;
 mod webhooks_reload;
 mod webhooks_vk_alerts;
+mod web_search_injection;
 mod xss_lint;
 
 /// Guard for `autotests = false`: a new `tests/*.rs` file that is neither

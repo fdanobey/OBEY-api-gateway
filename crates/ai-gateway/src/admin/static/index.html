@@ -544,6 +544,63 @@ body.sec-banner-active{padding-top:3.2rem}
 </div>
 </div>
 </fieldset>
+<fieldset><legend>Web Search</legend>
+<div class="form-check">
+<input type="checkbox" id="web-search-enabled">
+<label for="web-search-enabled">Enable provider-agnostic web search tool</label>
+<div class="hint">Injects a single web_search tool into requests routed to any provider and executes search calls server-side. Takes precedence over Codex Search above when enabled. Selecting a backend implies enabled.</div>
+</div>
+<div class="form-row">
+<div class="form-group">
+<label for="web-search-backend">Search Backend</label>
+<select id="web-search-backend" autocomplete="off" aria-describedby="web-search-backend-error">
+<option value="">-- not configured --</option>
+<option value="tavily">Tavily</option>
+<option value="brave">Brave</option>
+<option value="exa">Exa</option>
+<option value="searxng">SearXNG</option>
+<option value="codex">Codex (OAuth)</option>
+</select>
+<div class="error" id="web-search-backend-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="web-search-readiness">Backend Readiness</label>
+<span id="web-search-readiness" class="oauth-state-badge state-unauthenticated">Unknown</span>
+<div class="hint">Live backend readiness: ready, missing key, or OAuth inactive (codex). Refreshed on config load and save.</div>
+</div>
+</div>
+<div class="form-group">
+<label for="web-search-api-key-env">API Key <span class="hint-inline">(env var name or literal)</span></label>
+<input type="text" id="web-search-api-key-env" placeholder="TAVILY_API_KEY" autocomplete="off" aria-describedby="web-search-api-key-env-error">
+<div class="hint">Required for tavily/brave/exa. Accepts an environment variable name or a literal key; literal keys are masked after save.</div>
+<div class="error" id="web-search-api-key-env-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="web-search-base-url">Search Base URL <span class="hint-inline">(optional)</span></label>
+<input type="text" id="web-search-base-url" placeholder="http://localhost:8080/search" autocomplete="off" aria-describedby="web-search-base-url-error">
+<div class="hint">Required for searxng. Overrides the default endpoint for tavily/brave/exa.</div>
+<div class="error" id="web-search-base-url-error" role="alert"></div>
+</div>
+<div class="form-row">
+<div class="form-group">
+<label for="web-search-timeout">Search Timeout (seconds)</label>
+<input type="number" id="web-search-timeout" value="15" min="1" max="120" aria-describedby="web-search-timeout-error">
+<div class="hint">1–120, default 15</div>
+<div class="error" id="web-search-timeout-error" role="alert"></div>
+</div>
+<div class="form-group">
+<label for="web-search-iterations">Max Search Iterations</label>
+<input type="number" id="web-search-iterations" value="5" min="1" max="20" aria-describedby="web-search-iterations-error">
+<div class="hint">1–20 agent-loop iterations, default 5</div>
+<div class="error" id="web-search-iterations-error" role="alert"></div>
+</div>
+</div>
+<div class="form-check">
+<input type="checkbox" id="web-search-output-chat">
+<label for="web-search-output-chat">Output search results to chat</label>
+<div class="hint">Appends executed search results to the assistant message content so they persist in chat history instead of tool-call metadata. Recommended when using tool compression.</div>
+</div>
+</fieldset>
     <div class="actions">
       <button class="btn btn-primary" data-action="save">Save</button>
       <button class="btn btn-secondary" data-action="reset">Reset</button>
@@ -3829,20 +3886,74 @@ if (!validatePositiveInt(ct, 'Chunk timeout')) ok = false;
     return { enabled: enabled, max_retries: isNaN(maxRetries) ? 1 : maxRetries, retry_temperature: isNaN(retryTemp) ? 0 : retryTemp, passthrough_providers: passthrough };
   }
 
-  function validateStructuredOutputPage() {
-    clearAllErrors(document.getElementById('page-structured-output'));
-    var ok = true;
-    var mr = document.getElementById('so-max-retries');
-    var rt = document.getElementById('so-retry-temp');
-    if (!validateNonNegativeInt(mr, 'Max retries')) ok = false;
-    else if (parseInt(mr.value, 10) > 5) { showError(mr, 'Must be between 0 and 5'); ok = false; }
-    if (isNaN(parseFloat(rt.value))) { showError(rt, 'Retry temperature must be a number'); ok = false; }
-    else if (parseFloat(rt.value) < 0 || parseFloat(rt.value) > 2) { showError(rt, 'Must be between 0.0 and 2.0'); ok = false; }
-    var pp = document.getElementById('so-passthrough').value.split(',').map(function(s){return s.trim();}).filter(Boolean);
-    if (pp.length > 50) { showError(document.getElementById('so-passthrough'), 'Maximum 50 providers'); ok = false; }
-    pp.forEach(function(p){ if (p.length > 128) { showError(document.getElementById('so-passthrough'), 'Each provider name must be at most 128 characters'); ok = false; } });
-    return ok;
-  }
+function validateStructuredOutputPage() {
+clearAllErrors(document.getElementById('page-structured-output'));
+var ok = true;
+var mr = document.getElementById('so-max-retries');
+var rt = document.getElementById('so-retry-temp');
+if (!validateNonNegativeInt(mr, 'Max retries')) ok = false;
+else if (parseInt(mr.value, 10) > 5) { showError(mr, 'Must be between 0 and 5'); ok = false; }
+if (isNaN(parseFloat(rt.value))) { showError(rt, 'Retry temperature must be a number'); ok = false; }
+else if (parseFloat(rt.value) < 0 || parseFloat(rt.value) > 2) { showError(rt, 'Must be between 0.0 and 2.0'); ok = false; }
+var pp = document.getElementById('so-passthrough').value.split(',').map(function(s){return s.trim();}).filter(Boolean);
+if (pp.length > 50) { showError(document.getElementById('so-passthrough'), 'Maximum 50 providers'); ok = false; }
+pp.forEach(function(p){ if (p.length > 128) { showError(document.getElementById('so-passthrough'), 'Each provider name must be at most 128 characters'); ok = false; } });
+return ok;
+}
+
+// Web Search panel validation — mirrors WebSearchConfig::validate()
+// (web_search/config.rs) so the panel rejects invalid input with the
+// SAME field-level strings the backend loader produces.
+function validateWebSearchSection() {
+var ok = true;
+var backendInput = document.getElementById('web-search-backend');
+var backend = backendInput.value;
+var enabled = document.getElementById('web-search-enabled').checked || !!backend;
+var keyInput = document.getElementById('web-search-api-key-env');
+var key = keyInput.value.trim();
+var baseUrlInput = document.getElementById('web-search-base-url');
+var baseUrl = baseUrlInput.value.trim();
+var timeoutInput = document.getElementById('web-search-timeout');
+var timeout = parseInt(timeoutInput.value, 10);
+var iterInput = document.getElementById('web-search-iterations');
+var iterations = parseInt(iterInput.value, 10);
+
+if (!(timeout >= 1 && timeout <= 120)) {
+showError(timeoutInput, 'web_search.timeout_seconds must be between 1 and 120');
+ok = false;
+} else { clearError(timeoutInput); }
+if (!(iterations >= 1 && iterations <= 20)) {
+showError(iterInput, 'web_search.max_iterations must be between 1 and 20');
+ok = false;
+} else { clearError(iterInput); }
+if (baseUrl) {
+var validUrl = (baseUrl.indexOf('http://') === 0 && baseUrl.length > 7) ||
+(baseUrl.indexOf('https://') === 0 && baseUrl.length > 8);
+if (!validUrl) {
+showError(baseUrlInput, 'web_search.base_url must be an absolute HTTP or HTTPS URL with a host');
+ok = false;
+} else { clearError(baseUrlInput); }
+} else { clearError(baseUrlInput); }
+
+if (enabled) {
+if (!backend) {
+showError(backendInput, 'web_search.backend is required when web_search.enabled is true');
+ok = false;
+} else { clearError(backendInput); }
+if ((backend === 'tavily' || backend === 'brave' || backend === 'exa') && !key) {
+showError(keyInput, "web_search.api_key_env is required when web_search.backend is '" + backend + "'");
+ok = false;
+} else { clearError(keyInput); }
+if (backend === 'searxng' && !baseUrl) {
+showError(baseUrlInput, "web_search.base_url is required when web_search.backend is 'searxng'");
+ok = false;
+}
+} else {
+clearError(backendInput);
+clearError(keyInput);
+}
+return ok;
+}
 
     /** Map page id to its validator. */
     var pageValidators = {
@@ -3860,7 +3971,8 @@ if (!validatePositiveInt(ct, 'Chunk timeout')) ok = false;
 'page-guardrails': validateGuardrailsPage,
 'page-structured-output': validateStructuredOutputPage,
 'page-tracing': validateTracingPage,
-'page-model-deprecations': validateModelDeprecationsPage
+'page-model-deprecations': validateModelDeprecationsPage,
+'page-server': function() { var ok = validateServerPage(); if (!validateWebSearchSection()) ok = false; return ok; }
 };
 
   /** Validate the currently active page. Returns true if valid. */
@@ -5051,13 +5163,45 @@ function refreshReasoningProviderNames() {
 }
 
 // --- Load Config from API ---
-  function loadConfig() {
-    setStatus('Loading configuration…');
-    fetch(apiUrl('config'))
-      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(function(cfg) { config = cfg; populateFromConfig(cfg); setStatus('Configuration loaded'); })
-      .catch(function(err) { setStatus('Failed to load config: ' + err.message); });
-  }
+function loadConfig() {
+setStatus('Loading configuration…');
+fetch(apiUrl('config'))
+.then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+.then(function(cfg) { config = cfg; populateFromConfig(cfg); setStatus('Configuration loaded'); refreshWebSearchReadiness(); })
+.catch(function(err) { setStatus('Failed to load config: ' + err.message); });
+}
+
+// --- Web Search readiness badge (spec provider-agnostic-web-search-injection, Req 6.2) ---
+function refreshWebSearchReadiness() {
+fetch(apiUrl('web-search/status'))
+.then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+.then(function(body) {
+var badge = document.getElementById('web-search-readiness');
+if (!badge) return;
+var backend = body.backend || '';
+var stateClass;
+var label;
+if (!body.enabled) {
+stateClass = 'state-unauthenticated';
+label = 'Disabled';
+} else if (body.ready) {
+stateClass = 'state-authenticated';
+label = (backend ? backend.charAt(0).toUpperCase() + backend.slice(1) : 'Backend') + ' ready';
+} else if (backend === 'codex') {
+stateClass = 'state-unauthenticated';
+label = 'OAuth inactive';
+} else {
+stateClass = 'state-unauthenticated';
+label = 'Missing key';
+}
+badge.className = 'oauth-state-badge ' + stateClass;
+badge.textContent = label;
+})
+.catch(function() {
+var badge = document.getElementById('web-search-readiness');
+if (badge) { badge.className = 'oauth-state-badge state-unauthenticated'; badge.textContent = 'Unavailable'; }
+});
+}
 
   function populateFromConfig(cfg) {
     if (cfg.server) { document.getElementById('srv-host').value=cfg.server.host||'127.0.0.1'; document.getElementById('srv-port').value=cfg.server.port||3000; document.getElementById('srv-timeout').value=cfg.server.request_timeout_seconds||30; document.getElementById('srv-max-body').value=cfg.server.max_request_size_mb||10; }
@@ -5066,7 +5210,8 @@ function refreshReasoningProviderNames() {
     var dc=cfg.dashboard||{}; document.getElementById('dash-enabled').checked=dc.enabled!==false; document.getElementById('dash-path').value=dc.path||'/dashboard'; document.getElementById('dash-interval').value=dc.metrics_update_interval_seconds||1;
     var pc=cfg.prometheus||{}; document.getElementById('prom-enabled').checked=!!pc.enabled; document.getElementById('prom-path').value=pc.path||'/metrics';
     document.getElementById('codex-url').value=cfg.codex_instructions_url||'';
-var cs=cfg.codex_search||{}; document.getElementById('codex-search-enabled').checked=cs.enabled!==false; document.getElementById('codex-search-output-chat').checked=cs.output_to_chat!==false; document.getElementById('codex-search-base-url').value=cs.base_url||''; document.getElementById('codex-search-timeout').value=cs.timeout_seconds||15; document.getElementById('codex-search-iterations').value=cs.max_iterations||5;
+ var cs=cfg.codex_search||{}; document.getElementById('codex-search-enabled').checked=cs.enabled!==false; document.getElementById('codex-search-output-chat').checked=cs.output_to_chat!==false; document.getElementById('codex-search-base-url').value=cs.base_url||''; document.getElementById('codex-search-timeout').value=cs.timeout_seconds||15; document.getElementById('codex-search-iterations').value=cs.max_iterations||5;
+ var ws=cfg.web_search||{}; document.getElementById('web-search-enabled').checked=ws.enabled!==false&&!!ws.backend; document.getElementById('web-search-backend').value=ws.backend||''; document.getElementById('web-search-api-key-env').value=ws.api_key_env||''; document.getElementById('web-search-base-url').value=ws.base_url||''; document.getElementById('web-search-timeout').value=ws.timeout_seconds||15; document.getElementById('web-search-iterations').value=ws.max_iterations||5; document.getElementById('web-search-output-chat').checked=ws.output_to_chat!==false;
     var ec=cfg.exact_cache||{}; document.getElementById('ecache-enabled').checked=ec.enabled!==false; document.getElementById('ecache-max-entries').value=ec.max_entries||5000; document.getElementById('ecache-ttl').value=ec.ttl_seconds!=null?ec.ttl_seconds:3600; document.getElementById('ecache-temp-threshold').value=ec.temperature_threshold!=null?ec.temperature_threshold:0.15;
     provList.innerHTML=''; /* xss-audit: static */ if(cfg.providers){cfg.providers.forEach(function(p){addProviderCard(p);});}
     grpList.innerHTML=''; /* xss-audit: static */ if(cfg.model_groups){cfg.model_groups.forEach(function(g){addGroupCard(g);});}
@@ -5242,8 +5387,19 @@ function simulateSmartRouting(){var group=document.getElementById('smart-sim-gro
 var csSearch={enabled:document.getElementById('codex-search-enabled').checked,output_to_chat:document.getElementById('codex-search-output-chat').checked};
 var csBaseUrl=document.getElementById('codex-search-base-url').value.trim(); if(csBaseUrl){csSearch.base_url=csBaseUrl;}
 var csTimeout=parseInt(document.getElementById('codex-search-timeout').value,10); if(csTimeout){csSearch.timeout_seconds=csTimeout;}
-var csIter=parseInt(document.getElementById('codex-search-iterations').value,10); if(csIter){csSearch.max_iterations=csIter;}
-cfg.codex_search=csSearch;
+ var csIter=parseInt(document.getElementById('codex-search-iterations').value,10); if(csIter){csSearch.max_iterations=csIter;}
+ cfg.codex_search=csSearch;
+ var wsBackend=document.getElementById('web-search-backend').value;
+ if(wsBackend){
+ var wsSearch={backend:wsBackend,enabled:document.getElementById('web-search-enabled').checked,output_to_chat:document.getElementById('web-search-output-chat').checked};
+ var wsKey=document.getElementById('web-search-api-key-env').value.trim(); if(wsKey){wsSearch.api_key_env=wsKey;}
+ var wsBaseUrl=document.getElementById('web-search-base-url').value.trim(); if(wsBaseUrl){wsSearch.base_url=wsBaseUrl;}
+ var wsTimeout=parseInt(document.getElementById('web-search-timeout').value,10); if(wsTimeout){wsSearch.timeout_seconds=wsTimeout;}
+ var wsIter=parseInt(document.getElementById('web-search-iterations').value,10); if(wsIter){wsSearch.max_iterations=wsIter;}
+ cfg.web_search=wsSearch;
+ }else{
+ delete cfg.web_search;
+ }
     cfg.exact_cache={enabled:document.getElementById('ecache-enabled').checked,max_entries:parseInt(document.getElementById('ecache-max-entries').value,10)||5000,ttl_seconds:parseInt(document.getElementById('ecache-ttl').value,10)||3600,temperature_threshold:parseFloat(document.getElementById('ecache-temp-threshold').value)||0.15};
     var originalProviders = (config && config.providers) || [];
     cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,buffered_upstream_streaming:card.querySelector('.prov-buffered-upstream-streaming').checked,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),rate_limit_max_wait_ms:(function(v){return v?parseInt(v,10):null;})(card.querySelector('.prov-rate-max-wait').value.trim()),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};var budgetThreshold=card.querySelector('.prov-budget-threshold').value.trim();if(budgetThreshold)p.budget.alert_threshold_percent=parseInt(budgetThreshold,10);}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}if(p.type==='github-copilot'){p.auth_method=card.querySelector('.prov-copilot-auth-method')?card.querySelector('.prov-copilot-auth-method').value:'device-oauth';if(p.auth_method==='device-oauth'){p.api_key_env=null;}if(!p.base_url)p.base_url=null;}var uaVal=card.querySelector('.prov-user-agent').value.trim();if(uaVal)p.user_agent=uaVal;else delete p.user_agent;var hdrMap={};card.querySelectorAll('.prov-header-row').forEach(function(row){var hk=row.querySelector('.prov-header-name').value.trim();var hv=row.querySelector('.prov-header-value').value;if(hk)hdrMap[hk]=hv;});if(Object.keys(hdrMap).length)p.custom_headers=hdrMap;else delete p.custom_headers;p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
@@ -5300,7 +5456,7 @@ if(!validateAllPages()){setStatus('Validation failed — fix highlighted errors'
     setStatus('Saving…');
     fetch(apiUrl('config'),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg),signal:controller.signal})
       .then(function(r){return r.text().then(function(text){var data=null;try{data=text?JSON.parse(text):null;}catch(_){}if(!r.ok)throw new Error((data&&data.error&&((data.error.details||[]).join(' ')||data.error.message))||text||('HTTP '+r.status));return data;});})
-      .then(function(){config=cfg;setStatus('Configuration saved');showToast('Configuration saved to file');})
+      .then(function(){config=cfg;populateFromConfig(cfg);setStatus('Configuration saved');showToast('Configuration saved to file');refreshWebSearchReadiness();})
       .catch(function(err){var message=err.name==='AbortError'?'request timed out after 15 seconds':err.message;setStatus('Save failed: '+message);showToast('Save failed: '+message,true);})
       .finally(function(){clearTimeout(timeoutId);});
   }
@@ -5378,8 +5534,7 @@ document.getElementById('cb-reset-btn').addEventListener('click', function() {
       case 'save': saveConfig(); break;
       case 'reset': loadConfig(); break;
       case 'reload':
-        fetch(apiUrl('config/reload'),{method:'POST'}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);setStatus('Config reloaded');loadConfig();}).catch(function(err){setStatus('Reload failed: '+err.message);});
-        break;
+        fetch(apiUrl('config/reload'),{method:'POST'}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);setStatus('Config reloaded');loadConfig();}).catch(function(err){setStatus('Reload failed: '+err.message);});        break;
       case 'export':
         fetch(apiUrl('config/export')).then(function(r){return r.blob();}).then(function(b){var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='config.yaml';a.click();}).catch(function(err){setStatus('Export failed: '+err.message);});
         break;
@@ -5401,7 +5556,7 @@ document.getElementById('cb-reset-btn').addEventListener('click', function() {
         return data;
       });
     }).then(function(data){
-      config=data.config; populateFromConfig(config); setStatus('Config imported into form. Save to apply changes.'); showToast('Imported config loaded into the form. Save to apply it.');
+      config=data.config; populateFromConfig(config); setStatus('Config imported into form. Save to apply changes.'); showToast('Imported config loaded into the form. Save to apply it.'); refreshWebSearchReadiness();
     }).catch(function(err){setStatus('Import failed: '+err.message);showToast('Import failed: '+err.message,true);});
     this.value='';
   });

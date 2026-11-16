@@ -89,6 +89,7 @@ fn compat_config(compat: ReasoningCompatConfig, max_retries: u32) -> Config {
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
+        web_search: None,
     webhooks: Default::default(),
     opentelemetry: Default::default(),
     model_deprecations: Default::default(),

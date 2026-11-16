@@ -174,6 +174,7 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
         xhigh_models_allowlist: Default::default(),
         reasoning_models_allowlist: Default::default(),
         codex_search: None,
+        web_search: None,
         reasoning_compat: Default::default(),
         webhooks: Default::default(),
         opentelemetry: Default::default(),
