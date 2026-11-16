@@ -35,7 +35,7 @@ tiktoken-rs = "0.12"
 futures = "0.3"
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic"] }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
-sha2 = "0.10"
+sha2 = "0.11"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1.0"
