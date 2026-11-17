@@ -195,6 +195,7 @@ async fn abandoned_stream_outcome_row_carries_virtual_key_attribution() {
             model_access: None,
             expires_in: None,
             loop_detection: None,
+            priority: None,
         })
         .await
         .unwrap();

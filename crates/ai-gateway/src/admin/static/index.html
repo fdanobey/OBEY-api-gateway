@@ -2162,6 +2162,7 @@ body.sec-banner-active{padding-top:3.2rem}
             <th class="sortable" data-sort="spend" aria-sort="none" role="button" tabindex="0">Spend / Budget</th>
             <th class="sortable" data-sort="tokens" aria-sort="none" role="button" tabindex="0">Tokens / Token Budget</th>
             <th scope="col">Model Access</th>
+            <th class="sortable" data-sort="priority" aria-sort="none" role="button" tabindex="0">Priority</th>
             <th class="sortable" data-sort="expires_at" aria-sort="none" role="button" tabindex="0">Expiration</th>
             <th class="sortable" data-sort="last_used_at" aria-sort="none" role="button" tabindex="0">Last Used</th>
             <th scope="col">Actions</th>
@@ -2233,22 +2234,28 @@ body.sec-banner-active{padding-top:3.2rem}
               <select id="vk-f-expires"></select>
             </div>
           </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label for="vk-f-rpm">Requests / minute</label>
-              <input type="number" id="vk-f-rpm" min="1" max="100000" step="1" placeholder="Unlimited" aria-describedby="vk-f-rpm-error">
-              <div class="hint">1&ndash;100,000. Blank = unlimited.</div>
-              <div class="error" id="vk-f-rpm-error" role="alert"></div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="vk-f-rpm">Requests / minute</label>
+                <input type="number" id="vk-f-rpm" min="1" max="100000" step="1" placeholder="Unlimited" aria-describedby="vk-f-rpm-error">
+                <div class="hint">1&ndash;100,000. Blank = unlimited.</div>
+                <div class="error" id="vk-f-rpm-error" role="alert"></div>
+              </div>
+              <div class="form-group">
+                <label for="vk-f-tpm">Tokens / minute</label>
+                <input type="number" id="vk-f-tpm" min="1" max="10000000" step="1" placeholder="Unlimited" aria-describedby="vk-f-tpm-error">
+                <div class="hint">1&ndash;10,000,000. Blank = unlimited.</div>
+                <div class="error" id="vk-f-tpm-error" role="alert"></div>
+              </div>
+              <div class="form-group">
+                <label for="vk-f-priority">Priority</label>
+                <input type="number" id="vk-f-priority" min="0" max="1000" step="1" placeholder="0" aria-describedby="vk-f-priority-error">
+                <div class="hint">0&ndash;1000. Blank = 0.</div>
+                <div class="error" id="vk-f-priority-error" role="alert"></div>
+              </div>
             </div>
-            <div class="form-group">
-              <label for="vk-f-tpm">Tokens / minute</label>
-              <input type="number" id="vk-f-tpm" min="1" max="10000000" step="1" placeholder="Unlimited" aria-describedby="vk-f-tpm-error">
-              <div class="hint">1&ndash;10,000,000. Blank = unlimited.</div>
-              <div class="error" id="vk-f-tpm-error" role="alert"></div>
-            </div>
-          </div>
-          <div class="form-group">
-            <label for="vk-f-models">Model Access</label>
+<div class="form-group">
+<label for="vk-f-models">Model Access</label>
             <select id="vk-f-models" multiple aria-describedby="vk-f-models-hint"></select>
             <div class="hint" id="vk-f-models-hint">Select allowed model groups. Leave empty to allow all.</div>
           </div>
@@ -6727,6 +6734,7 @@ showToast('Failed to reset spend: ' + err.message, true);
     switch (key) {
       case 'spend': return Number(k.current_spend_usd || 0);
       case 'tokens': return Number(k.current_tokens_used || 0);
+      case 'priority': return Number(k.priority || 0);
       case 'expires_at': return k.expires_at ? new Date(k.expires_at).getTime() : Number.POSITIVE_INFINITY;
       case 'last_used_at': return k.last_used_at ? new Date(k.last_used_at).getTime() : 0;
       default: return String(k[key] == null ? '' : k[key]).toLowerCase();
@@ -6774,6 +6782,9 @@ showToast('Failed to reset spend: ' + err.message, true);
     // Model access scope
     var ma = k.model_access;
     tr.appendChild(vkTd(ma && ma.length ? ma.join(', ') : 'All'));
+
+    // Priority (0 = default, rendered like other default values e.g. Unlimited/Never)
+    tr.appendChild(vkTd(String(Number(k.priority || 0))));
 
     // Expiration (Req 12.8: warn when expiring within 7 days)
     var tdExp = document.createElement('td');
@@ -6892,6 +6903,7 @@ showToast('Failed to reset spend: ' + err.message, true);
       window: document.getElementById('vk-f-window'),
       rpm: document.getElementById('vk-f-rpm'),
       tpm: document.getElementById('vk-f-tpm'),
+      priority: document.getElementById('vk-f-priority'),
       models: document.getElementById('vk-f-models'),
       expires: document.getElementById('vk-f-expires'),
       loopEnabled: document.getElementById('vk-f-loop-enabled'),
@@ -6906,9 +6918,9 @@ showToast('Failed to reset spend: ' + err.message, true);
 
   /** Map a server error field name to its form input element. */
   function vkFieldEl(field) {
-    var map = { name: 'vk-f-name', budget_limit_usd: 'vk-f-budget', token_budget: 'vk-f-token-budget',
+      var map = { name: 'vk-f-name', budget_limit_usd: 'vk-f-budget', token_budget: 'vk-f-token-budget',
       budget_window: 'vk-f-window', requests_per_minute: 'vk-f-rpm', tokens_per_minute: 'vk-f-tpm',
-      model_access: 'vk-f-models', expires_in: 'vk-f-expires', loop_detection: 'vk-f-loop-enabled' };
+      priority: 'vk-f-priority', model_access: 'vk-f-models', expires_in: 'vk-f-expires', loop_detection: 'vk-f-loop-enabled' };
     return map[field] ? document.getElementById(map[field]) : null;
   }
 
@@ -6984,6 +6996,7 @@ showToast('Failed to reset spend: ' + err.message, true);
     f.window.value = d.budget_window || 'none';
     f.rpm.value = (d.requests_per_minute != null) ? d.requests_per_minute : '';
     f.tpm.value = (d.tokens_per_minute != null) ? d.tokens_per_minute : '';
+    f.priority.value = (d.priority != null && d.priority !== 0) ? d.priority : '';
     vkPopulateModels(d.model_access || []);
     vkPopulateLoopOverrides(d.loop_detection || null);
     // Expiration stays on "Keep current" unless the admin picks a new value.
@@ -7029,6 +7042,12 @@ showToast('Failed to reset spend: ' + err.message, true);
       if (!Number.isInteger(tpm) || tpm < 1 || tpm > 10000000) { showError(f.tpm, 'Tokens/minute must be an integer between 1 and 10,000,000'); ok = false; }
     }
 
+    var priorityRaw = f.priority.value.trim();
+    if (priorityRaw !== '') {
+      var pr = Number(priorityRaw);
+      if (!Number.isInteger(pr) || pr < 0 || pr > 1000) { showError(f.priority, 'Priority must be an integer between 0 and 1000'); ok = false; }
+    }
+
     if (!vkValidateLoopOverrides()) { ok = false; }
     return ok;
   }
@@ -7042,6 +7061,7 @@ showToast('Failed to reset spend: ' + err.message, true);
     var win = f.window.value;
     var rpmRaw = f.rpm.value.trim();
     var tpmRaw = f.tpm.value.trim();
+    var priorityRaw = f.priority.value.trim();
     var models = Array.prototype.slice.call(f.models.selectedOptions).map(function (o) { return o.value; });
     var expires = f.expires.value;
     var body = {};
@@ -7054,6 +7074,7 @@ showToast('Failed to reset spend: ' + err.message, true);
       if (win !== 'none') { body.budget_window = win; }
       if (rpmRaw !== '') { body.requests_per_minute = parseInt(rpmRaw, 10); }
       if (tpmRaw !== '') { body.tokens_per_minute = parseInt(tpmRaw, 10); }
+      if (priorityRaw !== '') { body.priority = Number(priorityRaw); }
       if (models.length) { body.model_access = models; }
       body.expires_in = (expires && expires !== 'never') ? expires : 'never';
       if (f.loopEnabled.checked) { body.loop_detection = vkCollectLoopOverrides(); }
@@ -7065,6 +7086,7 @@ showToast('Failed to reset spend: ' + err.message, true);
       body.budget_window = win !== 'none' ? win : null;
       body.requests_per_minute = rpmRaw !== '' ? parseInt(rpmRaw, 10) : null;
       body.tokens_per_minute = tpmRaw !== '' ? parseInt(tpmRaw, 10) : null;
+      body.priority = priorityRaw !== '' ? Number(priorityRaw) : null;
       body.model_access = models.length ? models : null;
       // Only send expires_in when the admin explicitly picked a new value.
       if (expires && expires !== 'keep') { body.expires_in = expires; }
@@ -7253,7 +7275,7 @@ showToast('Failed to reset spend: ' + err.message, true);
     if (bd) { bd.addEventListener('click', function (e) { if (e.target === bd) { vkHideModal(); } }); }
 
     // Clear inline errors as the admin corrects each field.
-    ['vk-f-name', 'vk-f-budget', 'vk-f-token-budget', 'vk-f-rpm', 'vk-f-tpm'].forEach(function (id) {
+    ['vk-f-name', 'vk-f-budget', 'vk-f-token-budget', 'vk-f-rpm', 'vk-f-tpm', 'vk-f-priority'].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) { el.addEventListener('input', function () { clearError(el); }); }
     });

@@ -16,8 +16,8 @@
 use chrono::Utc;
 
 use super::models::{
-    validate_name, ExpiresIn, KeyStatus, ListKeysParams, PaginatedKeys, UpdateKeyParams,
-    VirtualKeyInfo,
+    validate_name, validate_priority, ExpiresIn, KeyStatus, ListKeysParams, PaginatedKeys,
+    UpdateKeyParams, VirtualKeyInfo,
 };
 use super::store::{KeyUpdates, StoredVirtualKey};
 use super::{KeyError, ValidationErrors, VirtualKeyManager};
@@ -104,6 +104,7 @@ impl VirtualKeyManager {
             current_tokens_used: None,
             last_used_at: None,
             request_count: None,
+            priority: params.priority,
         };
 
         // 5. Persist.
@@ -246,6 +247,7 @@ pub(crate) fn stored_to_info(stored: &StoredVirtualKey) -> VirtualKeyInfo {
         model_access: stored.model_access_list.clone(),
         loop_detection: stored.loop_detection.clone(),
         request_count: stored.request_count,
+        priority: stored.priority,
         created_at: stored.created_at,
         expires_at: stored.expires_at,
         last_used_at: stored.last_used_at,
@@ -307,6 +309,12 @@ fn validate_update_params(params: &UpdateKeyParams) -> Result<(), KeyError> {
         }
     }
 
+ if let Some(Some(priority)) = params.priority {
+ if let Err(error) = validate_priority(priority) {
+ errors.push("priority", error.to_string());
+ }
+ }
+
     if let Some(Some(loop_detection)) = &params.loop_detection {
         if let Err(loop_errors) =
             loop_detection.merge(&crate::loop_detection::LoopDetectionConfig::default())
@@ -343,6 +351,7 @@ mod tests {
             model_access: None,
             expires_in: None,
             loop_detection: None,
+            priority: None,
         }
     }
 
@@ -479,10 +488,101 @@ mod tests {
         };
         let err = mgr.update_key(&created.id, params).await.unwrap_err();
 
+    let KeyError::Validation(errors) = err else {
+        panic!("expected validation error");
+    };
+    assert!(errors.errors.iter().any(|e| e.field == "budget_limit_usd"));
+    }
+
+    /// Priority-classes Req 1.1/1.5: PATCH with a priority reports it in the
+    /// update response and persists the value; list/get views include it too.
+    #[tokio::test]
+    async fn update_priority_round_trips_into_info_views() {
+        let (mgr, _tmp) = manager();
+        let created = mgr
+            .create_key(CreateKeyParams {
+                priority: Some(10),
+                ..create_defaults()
+            })
+            .await
+            .unwrap();
+
+        let info = mgr
+            .update_key(
+                &created.id,
+                UpdateKeyParams {
+                    priority: Some(Some(25)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.priority, 25);
+
+        let got = mgr.get_key(&created.id).await.unwrap();
+        assert_eq!(got.priority, 25);
+        let page = mgr
+            .list_keys(ListKeysParams { limit: 10, offset: 0 })
+            .await
+            .unwrap();
+        assert!(page.keys.iter().any(|k| k.id == created.id && k.priority == 25));
+    }
+
+    /// Priority-classes Req 1.4: PATCH "priority": null (deserialized to
+    /// `Some(None)`) resets the priority to the default class 0.
+    #[tokio::test]
+    async fn update_priority_null_resets_to_zero() {
+        let (mgr, _tmp) = manager();
+        let created = mgr
+            .create_key(CreateKeyParams {
+                priority: Some(50),
+                ..create_defaults()
+            })
+            .await
+            .unwrap();
+
+        // Simulate the JSON `{"priority": null}` PATCH body exactly: the double
+        // option deserializer maps null -> Some(None).
+        let params: UpdateKeyParams = serde_json::from_str(r#"{"priority": null}"#).unwrap();
+        assert_eq!(params.priority, Some(None));
+
+        let info = mgr.update_key(&created.id, params).await.unwrap();
+        assert_eq!(info.priority, 0);
+
+        let stored = mgr.store.get_key_by_id(&created.id).unwrap().unwrap();
+        assert_eq!(stored.priority, 0);
+    }
+
+    /// Priority-classes Req 1.3: an out-of-range PATCH priority is rejected
+    /// with a `priority`-field validation error and the stored value is intact.
+    #[tokio::test]
+    async fn update_priority_out_of_range_reports_field_error() {
+        let (mgr, _tmp) = manager();
+        let created = mgr
+            .create_key(CreateKeyParams {
+                priority: Some(10),
+                ..create_defaults()
+            })
+            .await
+            .unwrap();
+
+        let err = mgr
+            .update_key(
+                &created.id,
+                UpdateKeyParams {
+                    priority: Some(Some(1001)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
         let KeyError::Validation(errors) = err else {
             panic!("expected validation error");
         };
-        assert!(errors.errors.iter().any(|e| e.field == "budget_limit_usd"));
+        assert!(errors.errors.iter().any(|e| e.field == "priority"));
+
+        let stored = mgr.store.get_key_by_id(&created.id).unwrap().unwrap();
+        assert_eq!(stored.priority, 10);
     }
 
     /// Updating an unknown id returns not found (HTTP 404).

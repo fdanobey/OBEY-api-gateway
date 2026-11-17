@@ -407,11 +407,136 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        let errors = body["errors"].as_array().expect("errors array present");
-        assert!(errors
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let errors = body["errors"].as_array().expect("errors array present");
+    assert!(errors
+        .iter()
+        .any(|e| e["field"] == json!("budget_limit_usd")));
+    }
+
+    /// Priority-classes Req 1.1/1.2: POST with `priority` reports it in the
+    /// create response; POST without it reports the default 0, and GET/{id}
+    /// and the list rows include `priority`.
+    #[tokio::test]
+    async fn priority_round_trips_through_admin_api() {
+        let (mgr, _tmp) = manager();
+
+        let (status, created) = send(
+            app(&mgr),
+            "POST",
+            "/",
+            Some(json!({ "name": "prio", "priority": 10 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["priority"], json!(10));
+        let id = created["id"].as_str().unwrap().to_string();
+
+        // GET /{id} includes the stored priority (Req 1.1).
+        let (status, info) = send(app(&mgr), "GET", &format!("/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["priority"], json!(10));
+
+        // A key created without priority reports the default 0 (Req 1.2).
+        let (_, plain) = send(app(&mgr), "POST", "/", Some(json!({ "name": "plain" }))).await;
+        assert_eq!(plain["priority"], json!(0));
+
+        // Every list row includes priority (Req 1.5).
+        let (status, list) = send(app(&mgr), "GET", "/", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = list["keys"].as_array().unwrap();
+        assert!(rows
             .iter()
-            .any(|e| e["field"] == json!("budget_limit_usd")));
+            .any(|row| row["name"] == json!("prio") && row["priority"] == json!(10)));
+        assert!(rows
+            .iter()
+            .any(|row| row["name"] == json!("plain") && row["priority"] == json!(0)));
+    }
+
+    /// Priority-classes Req 1.4: PATCH `{"priority": null}` resets the key's
+    /// priority to 0; PATCH `{"priority": 25}` sets it (double-option semantics).
+    #[tokio::test]
+    async fn patch_priority_set_and_null_clear() {
+        let (mgr, _tmp) = manager();
+        let (id, _) = create_key(&mgr, json!({ "name": "clear-me", "priority": 10 })).await;
+
+        let (status, body) = send(
+            app(&mgr),
+            "PATCH",
+            &format!("/{id}"),
+            Some(json!({ "priority": 25 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["priority"], json!(25));
+
+        // JSON null resets to the default class 0.
+        let (status, body) = send(
+            app(&mgr),
+            "PATCH",
+            &format!("/{id}"),
+            Some(json!({ "priority": null })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["priority"], json!(0));
+
+        // Persisted reset confirmed by a fresh GET.
+        let (status, info) = send(app(&mgr), "GET", &format!("/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["priority"], json!(0));
+    }
+
+    /// Priority-classes Req 1.3: POST/PATCH with an out-of-range priority return
+    /// 400 with a `priority`-field error and no key is created or modified.
+    /// 1001 is a valid u16, so it passes JSON deserialization and is rejected
+    /// by `validate_priority` in the handler; values outside the u16 domain
+    /// (negative, fractional, > 65535) are rejected at deserialization.
+    #[tokio::test]
+    async fn priority_out_of_range_yields_priority_field_error() {
+     let (mgr, _tmp) = manager();
+
+     // POST path: no key is created.
+     let (status, body) = send(
+     app(&mgr),
+     "POST",
+     "/",
+     Some(json!({ "name": "rejected", "priority": 1001 })),
+     )
+     .await;
+     assert_eq!(status, StatusCode::BAD_REQUEST);
+     let errors = body["errors"].as_array().expect("errors array present");
+     assert!(
+     errors
+     .iter()
+     .any(|e| e["field"] == json!("priority") && e["message"].is_string()),
+     "expected a priority field error: {errors:?}"
+     );
+
+     // Nothing was created: the list has no `rejected` key.
+     let (_, list) = send(app(&mgr), "GET", "/", None).await;
+     let rows = list["keys"].as_array().unwrap();
+     assert!(!rows.iter().any(|row| row["name"] == json!("rejected")));
+
+     // PATCH path: existing key keeps its stored priority.
+     let (id, _) = create_key(&mgr, json!({ "name": "keep", "priority": 10 })).await;
+     let params = crate::virtual_keys::models::UpdateKeyParams {
+     priority: Some(Some(1001)),
+     ..Default::default()
+     };
+     let (status, body) = send(
+     app(&mgr),
+     "PATCH",
+     &format!("/{id}"),
+     Some(serde_json::to_value(&params).unwrap()),
+     )
+     .await;
+     assert_eq!(status, StatusCode::BAD_REQUEST);
+     let errors = body["errors"].as_array().expect("errors array present");
+     assert!(errors.iter().any(|e| e["field"] == json!("priority")));
+
+     let (_, info) = send(app(&mgr), "GET", &format!("/{id}"), None).await;
+     assert_eq!(info["priority"], json!(10));
     }
 
     /// Req 7.8 via Req 10.x: PATCH /{id} on a revoked key returns 409.

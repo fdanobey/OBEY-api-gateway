@@ -354,6 +354,7 @@ fn create_defaults() -> CreateKeyParams {
         model_access: None,
         expires_in: None,
         loop_detection: None,
+        priority: None,
     }
 }
 

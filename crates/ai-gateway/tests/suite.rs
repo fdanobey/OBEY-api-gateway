@@ -91,6 +91,7 @@ mod token_compression_e2e;
 mod token_compression_observability;
 mod token_compression_short_circuit_property;
 mod tray_integration;
+mod virtual_key_priority;
 mod virtual_keys_integration;
 mod model_deprecation_admin;
 mod model_deprecation_alerts;

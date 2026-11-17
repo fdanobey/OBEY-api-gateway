@@ -64,6 +64,8 @@ pub struct StoredVirtualKey {
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub request_count: u64,
+    /// Admission priority class (0-1000); 0 is the default class.
+    pub priority: u16,
 }
 
 /// Durable budget facts for one key, read without mutation for
@@ -103,6 +105,9 @@ pub struct KeyUpdates {
     pub current_tokens_used: Option<u64>,
     pub last_used_at: Option<Option<DateTime<Utc>>>,
     pub request_count: Option<u64>,
+    /// Priority class; `None` leaves it unchanged, `Some(None)` resets to 0,
+    /// `Some(Some(v))` sets it to `v`.
+    pub priority: Option<Option<u16>>,
 }
 
 impl KeyUpdates {
@@ -123,6 +128,7 @@ impl KeyUpdates {
             && self.current_tokens_used.is_none()
             && self.last_used_at.is_none()
             && self.request_count.is_none()
+            && self.priority.is_none()
     }
 }
 
@@ -186,7 +192,8 @@ impl KeyStore {
                 expires_at INTEGER,
                 created_at INTEGER NOT NULL,
                 last_used_at INTEGER,
-                request_count INTEGER NOT NULL DEFAULT 0
+                request_count INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_virtual_keys_key_hash ON virtual_keys(key_hash);
@@ -214,15 +221,19 @@ impl KeyStore {
     }
 
     fn migrate_schema(conn: &Connection) -> Result<(), KeyStoreError> {
-        let has_loop_detection = conn
+        let columns = conn
             .prepare("PRAGMA table_info(virtual_keys)")?
             .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?
-            .iter()
-            .any(|column| column == "loop_detection_json");
-        if !has_loop_detection {
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "loop_detection_json") {
             conn.execute(
                 "ALTER TABLE virtual_keys ADD COLUMN loop_detection_json TEXT",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "priority") {
+            conn.execute(
+                "ALTER TABLE virtual_keys ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
@@ -241,13 +252,15 @@ impl KeyStore {
                 budget_limit_usd, token_budget, budget_window,
                 current_spend_usd, current_tokens_used, window_start_timestamp,
                 requests_per_minute, tokens_per_minute, model_access_list,
-                loop_detection_json, expires_at, created_at, last_used_at, request_count
+                loop_detection_json, expires_at, created_at, last_used_at, request_count,
+                priority
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9,
                 ?10, ?11, ?12,
                 ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19, ?20
+                ?16, ?17, ?18, ?19, ?20,
+                ?21
             )",
             params![
                 key.id,
@@ -270,6 +283,7 @@ impl KeyStore {
                 key.created_at.timestamp(),
                 key.last_used_at.map(|t| t.timestamp()),
                 key.request_count as i64,
+                key.priority as i64,
             ],
         )?;
 
@@ -374,6 +388,11 @@ impl KeyStore {
         if let Some(count) = &updates.request_count {
             assignments.push(format!("request_count = ?{}", values.len() + 1));
             values.push(Box::new(*count as i64));
+        }
+        if let Some(priority) = &updates.priority {
+            assignments.push(format!("priority = ?{}", values.len() + 1));
+            // Some(None) clears the priority back to the default class 0.
+            values.push(Box::new(priority.unwrap_or(0) as i64));
         }
 
         let sql = format!(
@@ -627,10 +646,10 @@ pub fn list_key_budget_states(&self) -> Result<Vec<KeyBudgetState>, KeyStoreErro
 /// Column list shared by all `SELECT` statements, kept in sync with
 /// [`row_to_stored_key`].
 const SELECT_COLUMNS: &str = "id, key_hash, key_prefix, encrypted_key, name, status, \
-     budget_limit_usd, token_budget, budget_window, current_spend_usd, \
-      current_tokens_used, window_start_timestamp, requests_per_minute, \
-      tokens_per_minute, model_access_list, loop_detection_json, expires_at, created_at, \
-      last_used_at, request_count";
+       budget_limit_usd, token_budget, budget_window, current_spend_usd, \
+       current_tokens_used, window_start_timestamp, requests_per_minute, \
+       tokens_per_minute, model_access_list, loop_detection_json, expires_at, created_at, \
+       last_used_at, request_count, priority";
 
 /// Map a row (selected via [`SELECT_COLUMNS`]) into a [`StoredVirtualKey`].
 fn row_to_stored_key(row: &Row) -> rusqlite::Result<StoredVirtualKey> {
@@ -670,6 +689,11 @@ fn row_to_stored_key(row: &Row) -> rusqlite::Result<StoredVirtualKey> {
     let last_used_at_ts: Option<i64> = row.get(18)?;
     let current_tokens_used: i64 = row.get(10)?;
     let request_count: i64 = row.get(19)?;
+    let priority: i64 = row.get(20)?;
+    // The column is NOT NULL DEFAULT 0; clamp defensively so a corrupted
+    // row still maps into the validated 0-1000 domain instead of failing
+    // the read.
+    let priority = priority.clamp(0, 1000) as u16;
 
     Ok(StoredVirtualKey {
         id: row.get(0)?,
@@ -690,10 +714,11 @@ fn row_to_stored_key(row: &Row) -> rusqlite::Result<StoredVirtualKey> {
         loop_detection,
         expires_at: epoch_to_datetime_opt(expires_at_ts, 16)?,
         created_at: epoch_to_datetime(created_at_ts, 17)?,
-        last_used_at: epoch_to_datetime_opt(last_used_at_ts, 18)?,
-        request_count: request_count as u64,
-    })
-}
+            last_used_at: epoch_to_datetime_opt(last_used_at_ts, 18)?,
+            request_count: request_count as u64,
+            priority,
+        })
+    }
 
 fn epoch_to_datetime(secs: i64, col: usize) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::from_timestamp(secs, 0).ok_or_else(|| {
@@ -806,6 +831,7 @@ mod tests {
             created_at: ts(created_at),
             last_used_at: None,
             request_count: 0,
+            priority: 0,
         }
     }
 
@@ -816,26 +842,32 @@ mod tests {
             let conn = Connection::open(temp.path()).unwrap();
             conn.execute_batch(
                 "CREATE TABLE virtual_keys (
-                    id TEXT PRIMARY KEY,
-                    key_hash TEXT NOT NULL UNIQUE,
-                    key_prefix TEXT NOT NULL,
-                    encrypted_key TEXT NOT NULL,
-                    name TEXT,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    budget_limit_usd REAL,
-                    token_budget INTEGER,
-                    budget_window TEXT,
-                    current_spend_usd REAL NOT NULL DEFAULT 0.0,
-                    current_tokens_used INTEGER NOT NULL DEFAULT 0,
-                    window_start_timestamp INTEGER,
-                    requests_per_minute INTEGER,
-                    tokens_per_minute INTEGER,
-                    model_access_list TEXT,
-                    expires_at INTEGER,
-                    created_at INTEGER NOT NULL,
-                    last_used_at INTEGER,
-                    request_count INTEGER NOT NULL DEFAULT 0
-                );",
+                id TEXT PRIMARY KEY,
+                key_hash TEXT NOT NULL UNIQUE,
+                key_prefix TEXT NOT NULL,
+                encrypted_key TEXT NOT NULL,
+                name TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                budget_limit_usd REAL,
+                token_budget INTEGER,
+                budget_window TEXT,
+                current_spend_usd REAL NOT NULL DEFAULT 0.0,
+                current_tokens_used INTEGER NOT NULL DEFAULT 0,
+                window_start_timestamp INTEGER,
+                requests_per_minute INTEGER,
+                tokens_per_minute INTEGER,
+                model_access_list TEXT,
+                expires_at INTEGER,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER,
+                request_count INTEGER NOT NULL DEFAULT 0
+            );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO virtual_keys (id, key_hash, key_prefix, encrypted_key, created_at)
+                VALUES ('legacy', 'hash-legacy', 'vk_legacy', 'enc-legacy', 1700000000)",
+                [],
             )
             .unwrap();
         }
@@ -850,6 +882,134 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(columns.iter().any(|column| column == "loop_detection_json"));
+        assert!(columns.iter().any(|column| column == "priority"));
+        // Additive migration: the new column backfills existing rows with 0.
+        let default_priority: i64 = conn
+            .query_row(
+                "SELECT priority FROM virtual_keys WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(default_priority, 0);
+    }
+
+    /// Req 1.2 / Task 1: a key created without an explicit priority persists
+    /// as 0, and an explicit priority round-trips through the store.
+    #[test]
+    fn priority_round_trips_and_defaults_to_zero() {
+        let (store, _tmp) = temp_store();
+
+        let mut key = sample_key("id-prio", 1_700_000_800);
+        key.priority = 500;
+        store.create_key(&key).unwrap();
+        assert_eq!(store.get_key_by_id("id-prio").unwrap().unwrap().priority, 500);
+        assert_eq!(
+            store.get_key_by_hash("hash-id-prio").unwrap().unwrap().priority,
+            500
+        );
+
+        // Default 0 (Req 1.2).
+        store.create_key(&sample_key("id-prio0", 1_700_000_801)).unwrap();
+        assert_eq!(
+            store.get_key_by_id("id-prio0").unwrap().unwrap().priority,
+            0
+        );
+
+        // Boundary values 0 and 1000 round-trip (Req 1.3).
+        let mut bounded = sample_key("id-prio-bounds", 1_700_000_802);
+        bounded.priority = 1000;
+        store.create_key(&bounded).unwrap();
+        assert_eq!(
+            store.get_key_by_id("id-prio-bounds").unwrap().unwrap().priority,
+            1000
+        );
+
+        // Every list row carries its priority (Req 1.5).
+        let (page, total) = store.list_keys(10, 0).unwrap();
+        assert_eq!(total, 3);
+        let by_id: Vec<(&str, u16)> = page
+            .iter()
+            .map(|k| (k.id.as_str(), k.priority))
+            .collect();
+        assert!(by_id.contains(&("id-prio-bounds", 1000)));
+        assert!(by_id.contains(&("id-prio", 500)));
+        assert!(by_id.contains(&("id-prio0", 0)));
+    }
+
+    /// Req 1.4: update semantics for priority — set, clear-to-0
+    /// (`Some(None)`), and unchanged (`None`).
+    #[test]
+    fn priority_update_set_clear_and_unchanged() {
+        let (store, _tmp) = temp_store();
+        let mut key = sample_key("id-prio-upd", 1_700_000_900);
+        key.priority = 42;
+        store.create_key(&key).unwrap();
+
+        // Set a new value.
+        store
+            .update_key(
+                "id-prio-upd",
+                &KeyUpdates {
+                    priority: Some(Some(1000)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_key_by_id("id-prio-upd").unwrap().unwrap().priority,
+            1000
+        );
+
+        // Clear resets to the default class 0 (Some(None), Req 1.4).
+        store
+            .update_key(
+                "id-prio-upd",
+                &KeyUpdates {
+                    priority: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_key_by_id("id-prio-upd").unwrap().unwrap().priority,
+            0
+        );
+
+        // None leaves the priority unchanged: re-set a non-zero value
+        // first so a surviving 0 cannot pass vacuously.
+        store
+            .update_key(
+                "id-prio-upd",
+                &KeyUpdates {
+                    priority: Some(Some(1000)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .update_key(
+                "id-prio-upd",
+                &KeyUpdates {
+                    name: Some(Some("touched".to_string())),
+                    priority: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_key_by_id("id-prio-upd").unwrap().unwrap().priority,
+            1000
+        );
+        assert_eq!(
+            store
+                .get_key_by_id("id-prio-upd")
+                .unwrap()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("touched")
+        );
     }
 
     #[test]

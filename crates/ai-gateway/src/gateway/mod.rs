@@ -585,6 +585,9 @@ impl GatewayServer {
                 .map_err(|e| GatewayError::Database(e.to_string()))?;
             Arc::new(manager)
         };
+        // Priority-classes Task 4: the admission gate resolves the authenticated
+        // key's priority class through the shared manager (read-only).
+        router.set_virtual_key_manager(virtual_key_manager.clone());
 
         // --- VK alert restart seeding (budget-alerts-unified-webhooks, Task 6) ---
         // Mirrors the provider seeding above (design "Component 1", D11; Reqs

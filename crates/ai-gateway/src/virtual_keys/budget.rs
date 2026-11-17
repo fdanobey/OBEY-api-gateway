@@ -183,11 +183,12 @@ mod tests {
             window_start,
             requests_per_minute: None,
             tokens_per_minute: None,
-            model_access: None,
-            expires_at: None,
-            loop_detection: None,
-        }
+        model_access: None,
+        expires_at: None,
+        loop_detection: None,
+        priority: 0,
     }
+}
 
     // --- window_expired: daily -------------------------------------------------
 

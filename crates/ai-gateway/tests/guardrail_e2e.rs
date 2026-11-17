@@ -422,6 +422,7 @@ fn authed_key(id: &str) -> AuthenticatedKey {
         model_access: None,
         expires_at: None,
         loop_detection: None,
+        priority: 0,
     }
 }
 

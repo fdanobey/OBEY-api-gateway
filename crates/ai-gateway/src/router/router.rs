@@ -948,6 +948,11 @@ pub struct Router {
     /// Copilot usage tracker for `x-ratelimit-*` / premium-request headers
     /// (Req 7.1/7.2). Shared with the adapter dispatch path.
     copilot_usage_tracker: Option<Arc<crate::oauth::usage_tracker::UsageTracker>>,
+    /// Shared virtual-key manager (virtual-key-priority-classes, Task 4):
+    /// consulted at the ADR 0002 admission gate to resolve the
+    /// authenticated key's priority class for the bounded wait. `None` on
+    /// bare test routers — those keep the default class 0.
+    virtual_key_manager: Option<Arc<crate::virtual_keys::VirtualKeyManager>>,
     /// Per-provider decision-model clients (decisions-api spec, D2). Keyed by
     /// provider name; rebuilt on miss from the live config; cleared on
     /// hot-reload alongside `http_clients` so renamed/removed providers and
@@ -1387,6 +1392,7 @@ impl Router {
             copilot_manager: None,
             copilot_catalog: None,
             copilot_usage_tracker: None,
+        virtual_key_manager: None,
             decision_clients: Arc::new(DashMap::new()),
             decision_discovery: Arc::new(DashMap::new()),
             deprecation_state: None,
@@ -1445,12 +1451,67 @@ impl Router {
             copilot_manager: None,
             copilot_catalog: None,
             copilot_usage_tracker: None,
+        virtual_key_manager: None,
             decision_clients: Arc::new(DashMap::new()),
             decision_discovery: Arc::new(DashMap::new()),
             deprecation_state: None,
             deprecation_emission: None,
         }
     }
+
+    /// Attach the shared [`VirtualKeyManager`] so the ADR 0002 admission
+    /// gate can resolve the authenticated key's priority class
+    /// (virtual-key-priority-classes, Task 4). Called once at gateway
+    /// startup, mirroring [`Self::set_oauth_manager`]; config hot-reload
+    /// never reconstructs the manager.
+    pub fn set_virtual_key_manager(
+        &mut self,
+        manager: Arc<crate::virtual_keys::VirtualKeyManager>,
+    ) {
+        self.virtual_key_manager = Some(manager);
+    }
+
+    /// Resolve the request's admission priority class: the authenticated
+    /// virtual key's `priority` when one is known (class 0 default when the
+    /// manager is absent, e.g. bare test routers). Blocking `keys.db` read
+    /// parked on the blocking pool — mirrors `VirtualKeyManager::query_usage`.
+    async fn admission_priority(&self, active: Option<&ActiveRequestHandle>) -> u16 {
+        let (Some(manager), Some(handle)) = (&self.virtual_key_manager, active) else {
+            return 0;
+        };
+        // Clone the id out of the guard before the blocking-pool await so
+        // no std MutexGuard is held across an await point.
+        let key_id = handle
+            .0
+            .lock()
+            .ok()
+            .and_then(|info| info.virtual_key_id.clone());
+        let Some(key_id) = key_id else {
+            return 0;
+        };
+    let store = Arc::clone(&manager.store_for_priority());
+    let lookup_key_id = key_id.clone();
+    match tokio::task::spawn_blocking(move || store.get_key_by_id(&lookup_key_id)).await {
+        Ok(Ok(Some(stored))) => stored.priority,
+        Ok(Ok(None)) => 0,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                key_id = %key_id,
+                error = %err,
+                "virtual-key priority lookup failed; defaulting to class 0"
+            );
+            0
+        }
+        Err(err) => {
+            tracing::warn!(
+                key_id = %key_id,
+                error = %err,
+                "virtual-key priority lookup join failed; defaulting to class 0"
+            );
+            0
+        }
+    }
+}
 
     /// Attach an [`OAuthManager`](crate::oauth::OAuthManager) so providers
     /// configured with `auth_method: oauth` can resolve a Bearer access token
@@ -8988,7 +9049,19 @@ return Ok(response);
                 active.as_ref().filter(|_| !max_wait.is_zero()),
                 crate::active_requests::StallReason::RateLimitWait,
             );
-            let rate_limit_outcome = rate_limiter.acquire_within(max_wait).await;
+            // Priority-classes Req 2.1: the authenticated virtual key's class
+            // orders this waiter among contended acquire calls (default class 0
+            // when no key / no manager, identical to pre-feature behavior).
+            // The lookup is skipped on the zero-budget path: priority is unused
+            // there because `acquire_within_priority` try-acquires directly.
+            let priority = if max_wait.is_zero() {
+                0
+            } else {
+                self.admission_priority(active.as_ref()).await
+            };
+            let rate_limit_outcome = rate_limiter
+                .acquire_within_priority(priority, max_wait)
+            .await;
             drop(_rate_limit_stall);
             match rate_limit_outcome {
                 Ok(waited) if !waited.is_zero() => {

@@ -622,6 +622,7 @@ async fn x_api_key_credential_variant_is_accepted() {
             model_access: None,
             expires_in: None,
             loop_detection: None,
+            priority: None,
         })
         .await
         .unwrap();
@@ -747,6 +748,7 @@ async fn vk_denials_return_401_and_429() {
  model_access: None,
  expires_in: None,
  loop_detection: None,
+ priority: None,
  })
  .await
  .unwrap();
@@ -916,6 +918,7 @@ async fn count_tokens_accepts_x_api_key_under_required_enforcement() {
             model_access: None,
             expires_in: None,
             loop_detection: None,
+            priority: None,
         })
         .await
         .unwrap();

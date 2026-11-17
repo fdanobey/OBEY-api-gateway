@@ -117,6 +117,7 @@ fn authenticated_key(id: &str) -> AuthenticatedKey {
         model_access: None,
         expires_at: None,
         loop_detection: None,
+        priority: 0,
     }
 }
 
@@ -441,6 +442,7 @@ async fn required_auth_rejects_missing_key_and_accepts_valid_key() {
             model_access: None,
             expires_in: None,
             loop_detection: None,
+            priority: None,
         })
         .await
         .unwrap();

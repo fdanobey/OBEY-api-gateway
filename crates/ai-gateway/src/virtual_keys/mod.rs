@@ -32,8 +32,8 @@ use uuid::Uuid;
 
 use crate::secrets;
 use models::{
-    validate_name, AuthenticatedKey, BudgetWindow, CachedKey, CreateKeyParams, CreateKeyResponse,
-    KeyStatus, UsageAggregate, UsageQueryParams, UsageRecord,
+    validate_name, validate_priority, AuthenticatedKey, BudgetWindow, CachedKey, CreateKeyParams,
+    CreateKeyResponse, KeyStatus, UsageAggregate, UsageQueryParams, UsageRecord,
 };
 
 pub use access::AccessError;
@@ -115,6 +115,13 @@ impl VirtualKeyManager {
         &self.database_path
     }
 
+    /// Shared key-store handle for the router's admission-gate priority
+    /// lookup (virtual-key-priority-classes, Task 4). Read-only by-id
+    /// access; the caller owns blocking-pool parking.
+    pub fn store_for_priority(&self) -> &Arc<KeyStore> {
+        &self.store
+    }
+
     /// Generate, encrypt, and persist a new virtual key.
     ///
     /// Validates all constraint fields, generates a cryptographically secure
@@ -167,19 +174,21 @@ impl VirtualKeyManager {
             created_at: now,
             last_used_at: None,
             request_count: 0,
+            priority: params.priority.unwrap_or(0),
         };
 
         // Persist. On failure, no partial record exists (single INSERT).
         self.store.create_key(&stored)?;
 
-        Ok(CreateKeyResponse {
-            id: stored.id,
-            key: full_key,
-            name: stored.name,
-            status: KeyStatus::Active,
-            created_at: now,
-            expires_at,
-        })
+    Ok(CreateKeyResponse {
+        id: stored.id,
+        key: full_key,
+        name: stored.name,
+        status: KeyStatus::Active,
+        priority: stored.priority,
+        created_at: now,
+        expires_at,
+    })
     }
 
     /// Remove a cached authentication entry by its SHA-256 hash.
@@ -401,6 +410,12 @@ fn validate_create_params(params: &CreateKeyParams) -> Result<(), KeyError> {
         }
     }
 
+ if let Some(priority) = params.priority {
+ if let Err(error) = validate_priority(priority) {
+ errors.push("priority", error.to_string());
+ }
+ }
+
     if let Some(loop_detection) = &params.loop_detection {
         if let Err(loop_errors) =
             loop_detection.merge(&crate::loop_detection::LoopDetectionConfig::default())
@@ -437,6 +452,7 @@ mod tests {
             model_access: None,
             expires_in: None,
             loop_detection: None,
+            priority: None,
         }
     }
 
@@ -467,10 +483,13 @@ mod tests {
         assert!(stored.model_access_list.is_none());
         assert!(stored.expires_at.is_none());
         assert!(stored.window_start.is_none());
-        assert_eq!(stored.current_spend_usd, 0.0);
-        assert_eq!(stored.current_tokens_used, 0);
-        assert_eq!(stored.request_count, 0);
-        assert_eq!(stored.key_prefix, &resp.key[..8]);
+    assert_eq!(stored.current_spend_usd, 0.0);
+    assert_eq!(stored.current_tokens_used, 0);
+    assert_eq!(stored.request_count, 0);
+    // Default priority class is 0 (priority-classes Req 1.2).
+    assert_eq!(stored.priority, 0);
+    assert_eq!(resp.priority, 0);
+    assert_eq!(stored.key_prefix, &resp.key[..8]);
         assert_ne!(stored.encrypted_key, resp.key);
 
         // Hash lookup resolves to the same record.
@@ -547,6 +566,45 @@ mod tests {
         let b = mgr.create_key(defaults()).await.unwrap();
         assert_ne!(a.key, b.key);
         assert_ne!(a.id, b.id);
+    }
+
+    /// Priority-classes Req 1.1: a create with `priority` reports it in the
+    /// response and persists the same value.
+    #[tokio::test]
+    async fn create_key_with_priority_reports_and_persists_it() {
+        let (mgr, _tmp) = temp_manager();
+        let resp = mgr
+            .create_key(CreateKeyParams {
+                priority: Some(10),
+                ..defaults()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.priority, 10);
+        let stored = mgr.store.get_key_by_id(&resp.id).unwrap().unwrap();
+        assert_eq!(stored.priority, 10);
+    }
+
+    /// Priority-classes Req 1.3: an out-of-range create priority is rejected
+    /// with a `priority`-field validation error and nothing is persisted.
+    #[tokio::test]
+    async fn create_key_with_out_of_range_priority_reports_field_error() {
+        let (mgr, _tmp) = temp_manager();
+        let err = mgr
+            .create_key(CreateKeyParams {
+                priority: Some(1001),
+                ..defaults()
+            })
+            .await
+            .unwrap_err();
+        let KeyError::Validation(errors) = err else {
+            panic!("expected validation error, got {err:?}");
+        };
+        assert!(errors.errors.iter().any(|e| e.field == "priority"));
+
+        let (_, total) = mgr.store.list_keys(10, 0).unwrap();
+        assert_eq!(total, 0);
     }
 }
 

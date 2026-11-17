@@ -432,11 +432,12 @@ model_groups:
             window_start: None,
             requests_per_minute: None,
             tokens_per_minute: None,
-            model_access: Some(model_access.into_iter().map(String::from).collect()),
-            expires_at: None,
-            loop_detection: None,
-        }
+        model_access: Some(model_access.into_iter().map(String::from).collect()),
+        expires_at: None,
+        loop_detection: None,
+        priority: 0,
     }
+}
 
     // Virtual-key model_access restriction: an allowed group name expands
     // to its member models; everything else is hidden.

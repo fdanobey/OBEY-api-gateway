@@ -375,6 +375,7 @@ async fn get_model_returns_404_under_vk_model_access_restriction() {
             model_access: Some(vec![MODEL_B.to_string()]),
             expires_in: None,
             loop_detection: None,
+            priority: None,
         })
         .await
         .unwrap();

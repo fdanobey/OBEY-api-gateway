@@ -102,11 +102,12 @@ mod tests {
             window_start: None,
             requests_per_minute: None,
             tokens_per_minute: None,
-            model_access,
-            expires_at: None,
-            loop_detection: None,
-        }
+        model_access,
+        expires_at: None,
+        loop_detection: None,
+        priority: 0,
     }
+}
 
     fn manager() -> (VirtualKeyManager, tempfile::NamedTempFile) {
         let temp = tempfile::NamedTempFile::new().unwrap();

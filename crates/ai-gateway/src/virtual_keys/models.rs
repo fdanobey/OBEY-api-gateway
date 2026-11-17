@@ -77,6 +77,31 @@ pub fn validate_name(name: &str) -> Result<(), NameValidationError> {
     }
 }
 
+/// Minimum allowed value for a virtual key priority class.
+pub const PRIORITY_MIN: u16 = 0;
+/// Maximum allowed value for a virtual key priority class.
+pub const PRIORITY_MAX: u16 = 1000;
+
+/// Error returned when a virtual key priority fails range validation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("priority must be between 0 and 1000")]
+pub struct PriorityValidationError;
+
+/// Validate a virtual key `priority` against the 0-1000 inclusive rule.
+///
+/// Accepts values between [`PRIORITY_MIN`] and [`PRIORITY_MAX`] inclusive;
+/// rejects anything above 1000. Negative and non-integer values are rejected
+/// earlier, at deserialization time, because the field is typed `u16`.
+///
+/// _Requirements: 1.1, 1.3_
+pub fn validate_priority(priority: u16) -> Result<(), PriorityValidationError> {
+    if (PRIORITY_MIN..=PRIORITY_MAX).contains(&priority) {
+        Ok(())
+    } else {
+        Err(PriorityValidationError)
+    }
+}
+
 /// Budget window for periodic spend/token counter resets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +164,10 @@ pub struct CreateKeyParams {
     pub expires_in: Option<ExpiresIn>,
     #[serde(default)]
     pub loop_detection: Option<crate::loop_detection::VkLoopConfig>,
+ /// Admission priority class (0-1000); higher values are admitted first
+ /// when provider capacity is contended. Defaults to 0.
+ #[serde(default, skip_serializing_if = "Option::is_none")]
+ pub priority: Option<u16>,
 }
 
 /// Response from key creation (includes the plaintext key exactly once).
@@ -149,6 +178,8 @@ pub struct CreateKeyResponse {
     pub key: String,
     pub name: Option<String>,
     pub status: KeyStatus,
+    /// Admission priority class (0-1000); 0 is the default class.
+    pub priority: u16,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
 }
@@ -178,7 +209,30 @@ pub struct UpdateKeyParams {
     pub expires_in: Option<ExpiresIn>,
     #[serde(default)]
     pub loop_detection: Option<Option<crate::loop_detection::VkLoopConfig>>,
-}
+    /// Admission priority class (0-1000). `None` leaves it unchanged,
+    /// `Some(None)` (JSON `null`) resets it to 0, `Some(Some(v))` sets it
+    /// to `v`. Unlike the other nullable fields, this field uses a
+    /// double-option deserializer so JSON `null` is distinguishable from
+    /// an absent field (Req 1 AC 4).
+    #[serde(default, deserialize_with = "deserialize_priority_double_option")]
+    pub priority: Option<Option<u16>>,
+    }
+
+    /// Deserialize an `Option<Option<u16>>` with explicit three-state semantics:
+    /// an absent field yields `None` (unchanged), JSON `null` yields `Some(None)`
+    /// (reset to the default class 0), and a value yields `Some(Some(v))`.
+    ///
+    /// Used only by [`UpdateKeyParams::priority`] (Req 1 AC 4); the other
+    /// nullable update fields keep plain serde `Option<Option<T>>` behavior.
+    fn deserialize_priority_double_option<'de, D>(deserializer: D) -> Result<Option<Option<u16>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match Option::<u16>::deserialize(deserializer)? {
+            None => Some(None),
+            Some(value) => Some(Some(value)),
+        })
+    }
 
 /// Authenticated key loaded from cache/store, carried through the request
 /// pipeline for enforcement checks.
@@ -199,6 +253,8 @@ pub struct AuthenticatedKey {
     pub model_access: Option<Vec<String>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub loop_detection: Option<crate::loop_detection::VkLoopConfig>,
+    /// Admission priority class (0-1000); 0 is the default class.
+    pub priority: u16,
 }
 
 /// Cached key entry stored in the DashMap for fast authentication lookups.
@@ -272,6 +328,8 @@ pub struct VirtualKeyInfo {
     pub model_access: Option<Vec<String>>,
     pub loop_detection: Option<crate::loop_detection::VkLoopConfig>,
     pub request_count: u64,
+    /// Admission priority class (0-1000); 0 is the default class.
+    pub priority: u16,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
@@ -369,22 +427,98 @@ mod property_tests {
         assert!(validate_name(&"a".repeat(129)).is_err());
     }
 
+    /// Boundary priorities 0 and 1000 are accepted; 1001 is rejected
+    /// (Req 1.3). Negative and non-integer values are rejected at JSON
+    /// deserialization time by the `u16` field type, before validation runs.
+    #[test]
+    fn priority_range_boundaries() {
+        assert_eq!(validate_priority(0), Ok(()));
+        assert_eq!(validate_priority(1000), Ok(()));
+        assert_eq!(validate_priority(1001), Err(PriorityValidationError));
+        assert_eq!(validate_priority(u16::MAX), Err(PriorityValidationError));
+    }
+
+    /// `CreateKeyParams` rejects negative and non-integer `priority` values
+    /// at deserialization (Req 1.3: out-of-range/non-integer rejected with a
+    /// field-level error), and defaults the field to `None` when omitted
+    /// (Req 1.2).
+    #[test]
+    fn priority_deserialization_rejects_non_unsigned_integers() {
+        assert_eq!(
+            serde_json::from_str::<CreateKeyParams>(r#"{"priority": 10}"#)
+                .unwrap()
+                .priority,
+            Some(10)
+        );
+        // Omitted -> None (default 0 downstream).
+        assert_eq!(
+            serde_json::from_str::<CreateKeyParams>("{}").unwrap().priority,
+            None
+        );
+        // Negative rejected.
+        assert!(serde_json::from_str::<CreateKeyParams>(r#"{"priority": -1}"#).is_err());
+        // Non-integer rejected.
+        assert!(serde_json::from_str::<CreateKeyParams>(r#"{"priority": 10.5}"#).is_err());
+        assert!(serde_json::from_str::<CreateKeyParams>(r#"{"priority": "10"}"#).is_err());
+        // Above the u16 domain rejected at deserialization.
+        assert!(serde_json::from_str::<CreateKeyParams>(r#"{"priority": 65536}"#).is_err());
+    }
+
+    /// `UpdateKeyParams.priority` uses a double-option deserializer (unlike the
+    /// other nullable update fields): omitted yields `None` (unchanged), JSON
+    /// `null` yields `Some(None)` (reset to the default class 0, Req 1 AC 4),
+    /// and a value yields `Some(Some(v))`.
+    #[test]
+    fn priority_update_deserialization_states() {
+        assert_eq!(
+            serde_json::from_str::<UpdateKeyParams>("{}").unwrap().priority,
+            None
+        );
+        assert_eq!(
+            serde_json::from_str::<UpdateKeyParams>(r#"{"priority": null}"#)
+                .unwrap()
+                .priority,
+            Some(None)
+        );
+        assert_eq!(
+            serde_json::from_str::<UpdateKeyParams>(r#"{"priority": 25}"#)
+                .unwrap()
+                .priority,
+            Some(Some(25))
+        );
+        // Out-of-domain values are rejected at deserialization; 1001 is a
+        // valid u16 and deserializes fine — it is rejected later by
+        // `validate_priority` in the handler.
+        assert!(serde_json::from_str::<UpdateKeyParams>(r#"{"priority": -1}"#).is_err());
+        assert!(serde_json::from_str::<UpdateKeyParams>(r#"{"priority": 1001}"#).is_ok());
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 64,
             .. ProptestConfig::default()
         })]
 
-        // Feature: virtual-key-management, Property 4: Expiration Computation
-        //
-        // For any valid `ExpiresIn` variant (other than `Never`) and any
-        // creation timestamp, the computed expiration timestamp SHALL equal the
-        // creation timestamp plus the variant's fixed duration.
-        //
-        // **Validates: Requirements 1.5, 7.6**
+ // Feature: virtual-key-management, Property 4: Expiration Computation
+ //
+ // For any valid `ExpiresIn` variant (other than `Never`) and any
+ // creation timestamp, the computed expiration timestamp SHALL equal the
+ // creation timestamp plus the variant's fixed duration.
+ //
+ // **Validates: Requirements 1.5, 7.6**
 
-        /// `expires_at == created_at + variant.to_duration()` for every
-        /// non-`Never` variant across a wide range of creation timestamps.
+ /// Priority validation accepts the whole 0..=1000 domain and rejects
+ /// everything above it up to `u16::MAX` (Req 1.3).
+ #[test]
+ fn prop_priority_range(priority in 0u16..=u16::MAX) {
+ prop_assert_eq!(
+ validate_priority(priority).is_ok(),
+ (PRIORITY_MIN..=PRIORITY_MAX).contains(&priority)
+ );
+ }
+
+ /// `expires_at == created_at + variant.to_duration()` for every
+ /// non-`Never` variant across a wide range of creation timestamps.
         #[test]
         fn prop_expiration_computation(
             expires_in in arb_expires_in_with_duration(),

@@ -379,6 +379,7 @@ async fn create_virtual_key(
             model_access,
             expires_in: None,
             loop_detection: None,
+            priority: None,
         })
         .await
         .expect("virtual key created");
