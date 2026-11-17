@@ -1,10 +1,11 @@
 //! Secure installation and inspection of ONNX model/runtime assets.
 
 use std::{
-    io::Read,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+ fmt::Write,
+ io::Read,
+ path::{Path, PathBuf},
+ sync::Arc,
+ time::Duration,
 };
 
 use futures::StreamExt;
@@ -497,12 +498,17 @@ impl OnnxAssetManager {
                 path: destination.to_path_buf(),
                 source,
             })?;
-            drop(file);
-            if received != exact_size || format!("{:x}", digest.finalize()) != expected_sha256 {
-                return Err(OnnxAssetError::Integrity {
-                    asset: name.to_owned(),
-                });
-            }
+ drop(file);
+ let finalized = digest.finalize();
+ let mut received_sha256 = String::with_capacity(2 * finalized.len());
+ for byte in finalized.iter() {
+ let _ = write!(received_sha256, "{byte:02x}");
+ }
+ if received != exact_size || received_sha256 != expected_sha256 {
+ return Err(OnnxAssetError::Integrity {
+ asset: name.to_owned(),
+ });
+ }
             activate_temporary(&temporary, destination).await
         }
         .await;
