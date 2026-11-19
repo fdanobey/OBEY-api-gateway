@@ -6326,6 +6326,7 @@ async fn intercept_codex_search(
             &compression_disabled_providers,
             &self.metrics,
         );
+        crate::providers::openai_compatible::sanitize_strict_tool_formats(&mut codex_request);
 
 let search_enabled = codex_search_config.effective_enabled(true);
 let oauth_active = oauth.get_access_token().await.is_some();
@@ -6475,6 +6476,7 @@ if search_enabled && oauth_active {
             &compression_disabled_providers,
             &self.metrics,
         );
+        crate::providers::openai_compatible::sanitize_strict_tool_formats(&mut bedrock_request);
         drop(config);
             let context_reduction = match self
                 .enforce_context_budget(
@@ -6559,6 +6561,7 @@ if search_enabled && oauth_active {
             &compression_disabled_providers,
             &self.metrics,
         );
+        crate::providers::openai_compatible::sanitize_strict_tool_formats(&mut copilot_request);
             // Copilot rides stream:false buffered dispatch (Bedrock arm
             // precedent): this arm delegates to the adapter, which has no
             // upstream-streaming SSE reassembly, so a client stream:true
@@ -6762,6 +6765,7 @@ if search_enabled && oauth_active {
             &compression_disabled_providers,
             &self.metrics,
         );
+        crate::providers::openai_compatible::sanitize_strict_tool_formats(&mut outgoing);
         let mut stream_upstream = provider_cfg.effective_buffered_upstream_streaming()
             && !requires_non_streaming(&outgoing);
         outgoing.stream = stream_upstream;
@@ -12616,6 +12620,7 @@ if search_routing_active {
             &compression_disabled_providers,
             &self.metrics,
         );
+        crate::providers::openai_compatible::sanitize_strict_tool_formats(&mut outgoing);
         // Reasoning-compat per-attempt stage (reasoning-failover-compat
         // spec, Req 6.1/6.2), mirroring the buffered dispatch path: detect
         // carriers on the original request, strip/preserve for this
@@ -17505,6 +17510,52 @@ async fn disabled_provider_attempt_restores_original_tools_and_counts_metric() {
             restored_prometheus_count(&metrics, "provider")
         );
         server.verify().await;
+    }
+
+    /// Regression: restored original tools hit the router's own HTTP
+    /// dispatch, not `OpenAICompatibleProvider`. A strict tool carrying
+    /// `format: base64` made OpenAI reject the whole request, so the
+    /// dispatch body must drop unsupported strict formats.
+    #[tokio::test]
+    async fn restored_strict_tool_drops_unsupported_format_on_dispatch() {
+        let server = MockServer::start().await;
+        mount_streamed_turn(&server).await;
+        let (router, _metrics) =
+            restore_metrics_router(&server, vec!["provider".to_string()]);
+
+        let restore = ToolCompressionRestore {
+            original_tools: Some(Arc::new(vec![crate::tool_compression::ToolDefinition {
+                raw: serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": "upload",
+                        "strict": true,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "data": {"type": "string", "format": "base64"},
+                                "when": {"type": "string", "format": "date-time"}
+                            },
+                            "required": ["data", "when"],
+                            "additionalProperties": false
+                        }
+                    }
+                }),
+                name: "upload".to_string(),
+                content_hash: 3,
+            }])),
+            applied: true,
+        };
+        router
+            .route_request(&compressed_tools_request(), None, restore)
+            .await
+            .expect("request succeeds");
+
+        let bodies = received_chat_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        let props = &bodies[0]["tools"][0]["function"]["parameters"]["properties"];
+        assert!(props["data"].get("format").is_none(), "base64 format must be stripped");
+        assert_eq!(props["when"]["format"], "date-time");
     }
 
     /// Failover: disabled provider gets originals; the enabled fallback

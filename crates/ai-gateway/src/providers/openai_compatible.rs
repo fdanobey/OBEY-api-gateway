@@ -34,7 +34,7 @@ const STRICT_SUPPORTED_FORMATS: [&str; 9] = [
 /// `uri`) from the parameter schemas of `strict: true` function tools.
 /// Non-strict tools and every other schema keyword are left untouched.
 /// Returns the number of removed keywords.
-fn sanitize_strict_tool_formats(request: &mut OpenAIRequest) -> usize {
+pub(crate) fn sanitize_strict_tool_formats(request: &mut OpenAIRequest) -> usize {
     let Some(tools) = request
         .extra
         .get_mut("tools")
