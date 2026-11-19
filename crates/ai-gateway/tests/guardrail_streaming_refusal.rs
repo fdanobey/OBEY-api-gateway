@@ -105,6 +105,7 @@ fn two_provider_config(primary_uri: &str, backup_uri: &str, guardrails: Guardrai
             compression: None,
             memory: None,
             structured_output: None,
+            max_output_tokens: None,
             models: vec![
                 ProviderModel {
                     cache_support: None,

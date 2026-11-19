@@ -61,6 +61,44 @@ use tracing::{debug, info, warn};
 const PRECOMPRESSED_CACHE_MARKER_KEY: &str = "cache_control";
 const PRECOMPRESSED_CACHE_MARKER_TYPE: &str = "obey_precompressed_context";
 
+tokio::task_local! {
+    pub static REQUEST_OUTPUT_CAP: Option<u32>;
+    pub static REQUEST_OUTPUT_CAP_METADATA: Option<serde_json::Value>;
+}
+
+pub struct RequestOutputCapScope {
+    cap: Option<u32>,
+    metadata: Option<serde_json::Value>,
+}
+
+impl RequestOutputCapScope {
+    pub fn new(cap: Option<u32>) -> Self {
+        Self { cap, metadata: None }
+    }
+
+    pub fn with_metadata(mut self, metadata: Option<serde_json::Value>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub async fn scope<F>(self, fut: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        REQUEST_OUTPUT_CAP_METADATA.scope(self.metadata.clone(), async move {
+            REQUEST_OUTPUT_CAP.scope(self.cap, fut).await
+        }).await
+    }
+}
+
+pub fn current_request_output_cap() -> Option<u32> {
+    REQUEST_OUTPUT_CAP.try_with(|v| *v).ok().flatten()
+}
+
+pub fn current_request_output_cap_metadata() -> Option<serde_json::Value> {
+    REQUEST_OUTPUT_CAP_METADATA.try_with(|v| v.clone()).ok().flatten()
+}
+
 /// Per-request tool-compression restore context threaded from the HTTP
 /// handler into the dispatch seam (spec per-provider-tool-compression-toggle,
 /// Task 5). The compression middleware stores the originals in request
@@ -9444,7 +9482,10 @@ return Ok(response);
                     // 7.2). When `retry_on_truncation` is false we skip detection
                     // entirely and return the response as-is (prior behavior).
                     let is_truncated = retry_on_truncation
-                        && Self::is_suspicious_truncation(&response, request.max_tokens);
+                        && Self::is_suspicious_truncation(
+                            &response,
+                            request.max_tokens.or(current_request_output_cap()),
+                        );
 
                     if is_truncated {
                         let max_tokens = request.max_tokens.unwrap_or(0);
@@ -15895,6 +15936,7 @@ mod tests {
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models,
         }
     }
@@ -19829,6 +19871,7 @@ extra: Default::default(),
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
 
             models: vec![ProviderModel {
                 provider: "openai".to_string(),
@@ -19877,6 +19920,7 @@ extra: Default::default(),
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: vec![
                 ProviderModel {
                     provider: "provider-low-priority".to_string(),
@@ -19939,6 +19983,7 @@ extra: Default::default(),
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: vec![
                 ProviderModel {
                     provider: "expensive-provider".to_string(),
@@ -20001,6 +20046,7 @@ extra: Default::default(),
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: vec![
                 ProviderModel {
                     provider: "slow-provider".to_string(),
@@ -20479,6 +20525,7 @@ extra: Default::default(),
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: vec![
                 ProviderModel {
                     provider: "provider-1".to_string(),
@@ -20728,6 +20775,7 @@ extra: Default::default(),
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: providers.clone(),
         }];
         let router_metrics = test_metrics();
@@ -22302,6 +22350,7 @@ mod property_tests {
                 compression: None,
                 structured_output: None,
                 memory: None,
+                max_output_tokens: None,
                 models,
             })
     }
@@ -22447,6 +22496,7 @@ mod property_tests {
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: vec![ProviderModel {
                 provider: "".to_string(), // Invalid: empty provider
                 model: "gpt-4".to_string(),
@@ -22483,6 +22533,7 @@ mod property_tests {
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: vec![ProviderModel {
                 provider: "openai".to_string(),
                 model: "".to_string(), // Invalid: empty model
@@ -22685,6 +22736,24 @@ mod property_tests {
         let mut response = truncation_test_response(Some("length"), 0);
         response.usage = Usage::default();
         assert!(!Router::is_suspicious_truncation(&response, Some(4096)));
+    }
+
+#[test]
+fn test_request_output_cap_task_local_scoped() {
+    let response = truncation_test_response(Some("length"), 100);
+    let cap = Some(4096u32);
+    let fut = REQUEST_OUTPUT_CAP.scope(cap, async move {
+        assert_eq!(current_request_output_cap(), Some(4096));
+        let effective_max = None::<u32>.or(current_request_output_cap());
+        Router::is_suspicious_truncation(&response, effective_max)
+    });
+    assert!(futures::executor::block_on(fut));
+    assert_eq!(current_request_output_cap(), None);
+}
+
+    #[test]
+    fn test_request_output_cap_unset_reads_none() {
+        assert_eq!(current_request_output_cap(), None);
     }
 
     #[test]
@@ -23033,6 +23102,7 @@ mod property_tests {
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: vec![
                 ProviderModel {
                     provider: "primary".to_string(),

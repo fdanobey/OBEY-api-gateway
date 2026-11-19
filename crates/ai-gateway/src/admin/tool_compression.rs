@@ -303,6 +303,7 @@ mod disabled_providers_config_tests {
                 compression: None,
                 structured_output: None,
                 memory: None,
+                max_output_tokens: None,
                 models: vec![ProviderModel {
                     cache_support: None,
                     cache_min_tokens: None,

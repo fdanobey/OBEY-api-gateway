@@ -65,6 +65,7 @@ fn test_config() -> Config {
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: vec![ProviderModel {
                 provider: "test-provider".to_string(),
                 model: "gpt-4".to_string(),

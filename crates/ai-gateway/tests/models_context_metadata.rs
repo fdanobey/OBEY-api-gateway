@@ -137,6 +137,7 @@ fn base_config(enforcement: EnforcementMode) -> Config {
                 compression: None,
                 structured_output: None,
                 memory: None,
+                max_output_tokens: None,
                 models: vec![
                     group_model(MODEL_A, 128_000),
                     group_model(MODEL_B, 200_000),
@@ -148,6 +149,7 @@ fn base_config(enforcement: EnforcementMode) -> Config {
                 compression: None,
                 structured_output: None,
                 memory: None,
+                max_output_tokens: None,
                 models: vec![group_model("gpt-4o", 0)],
             },
         ],
@@ -372,6 +374,7 @@ async fn get_model_returns_404_under_vk_model_access_restriction() {
             budget_window: None,
             requests_per_minute: None,
             tokens_per_minute: None,
+            max_output_tokens: None,
             model_access: Some(vec![MODEL_B.to_string()]),
             expires_in: None,
             loop_detection: None,

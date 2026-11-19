@@ -483,6 +483,7 @@ fn default_create_params() -> CreateKeyParams {
         budget_window: None,
         requests_per_minute: None,
         tokens_per_minute: None,
+        max_output_tokens: None,
         model_access: None,
         expires_in: None,
         loop_detection: None,

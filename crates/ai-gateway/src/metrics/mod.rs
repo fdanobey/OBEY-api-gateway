@@ -187,10 +187,12 @@ pub struct Metrics {
     /// of the model group is disabled, keyed by model_group
     /// (per-provider-tool-compression-toggle, Task 3).
     tool_compression_skipped_disabled_total: Arc<DashMap<String, AtomicU64>>,
-    /// Tool compression per-attempt restores of the original tools when
-    /// routing to a disabled provider, keyed by provider
-    /// (per-provider-tool-compression-toggle, Task 3).
-    tool_compression_tools_restored_total: Arc<DashMap<String, AtomicU64>>,
+/// Tool compression per-attempt restores of the original tools when
+/// routing to a disabled provider, keyed by provider
+/// (per-provider-tool-compression-toggle, Task 3).
+tool_compression_tools_restored_total: Arc<DashMap<String, AtomicU64>>,
+/// Output caps applied counter, keyed by trace_id (response-output-caps, Task 5).
+output_caps_applied_total: Arc<DashMap<String, AtomicU64>>,
     /// Lazily allocated Smart Routing metrics. Disabled gateways retain no
     /// Smart Routing metric maps or counters.
     smart_routing: Mutex<Option<Arc<SmartRoutingMetricState>>>,
@@ -1099,6 +1101,7 @@ impl Metrics {
             tool_compression_feedback_adjustments: Arc::new(DashMap::new()),
             tool_compression_skipped_disabled_total: Arc::new(DashMap::new()),
             tool_compression_tools_restored_total: Arc::new(DashMap::new()),
+            output_caps_applied_total: Arc::new(DashMap::new()),
             smart_routing: Mutex::new(None),
             provider_budget_store: Mutex::new(None),
             budget_store_rows_cache: Mutex::new(None),
@@ -2428,16 +2431,27 @@ Total unicode_stego provider detections by category and phase\n",
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increment the counter of per-attempt restores of the original tools
-    /// when routing to a provider with tool compression disabled.
-    #[allow(dead_code)]
-    pub fn record_tool_compression_tools_restored(&self, provider: &str) {
-        let key = bounded_label(provider, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
-        self.tool_compression_tools_restored_total
-            .entry(key)
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
-    }
+/// Increment the counter of per-attempt restores of the original tools
+/// when routing to a provider with tool compression disabled.
+#[allow(dead_code)]
+pub fn record_tool_compression_tools_restored(&self, provider: &str) {
+    let key = bounded_label(provider, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
+    self.tool_compression_tools_restored_total
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment the output caps applied counter for a trace_id
+/// (response-output-caps spec, Task 5).
+#[allow(dead_code)]
+pub fn record_output_cap_applied(&self, trace_id: &str) {
+    let key = bounded_label(trace_id, MAX_COMPRESSION_PROVIDER_LABEL_LEN);
+    self.output_caps_applied_total
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
 
     /// Append tool compression metrics in Prometheus text exposition format.
     pub fn write_tool_compression_prometheus(&self, out: &mut String) {
@@ -2595,25 +2609,44 @@ Total unicode_stego provider detections by category and phase\n",
             }
         }
 
-        // Counter: obey_tool_compression_tools_restored_total
-        if !self.tool_compression_tools_restored_total.is_empty() {
-            let mut rows: Vec<(String, u64)> = self
-                .tool_compression_tools_restored_total
-                .iter()
-                .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
-                .collect();
-            rows.sort_by(|a, b| a.0.cmp(&b.0));
-            out.push_str("# HELP obey_tool_compression_tools_restored_total Tool compression restores of original tools when routing to a disabled provider\n");
-            out.push_str("# TYPE obey_tool_compression_tools_restored_total counter\n");
-            for (provider, value) in &rows {
-                out.push_str(&format!(
-                    "obey_tool_compression_tools_restored_total{{provider=\"{}\"}} {}\n",
-                    escape_prometheus_label(provider),
-                    value
-                ));
-            }
+// Counter: obey_tool_compression_tools_restored_total
+    if !self.tool_compression_tools_restored_total.is_empty() {
+        let mut rows: Vec<(String, u64)> = self
+            .tool_compression_tools_restored_total
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        out.push_str("# HELP obey_tool_compression_tools_restored_total Tool compression restores of original tools when routing to a disabled provider\n");
+        out.push_str("# TYPE obey_tool_compression_tools_restored_total counter\n");
+        for (provider, value) in &rows {
+            out.push_str(&format!(
+                "obey_tool_compression_tools_restored_total{{provider=\"{}\"}} {}\n",
+                escape_prometheus_label(provider),
+                value
+            ));
         }
     }
+
+    // Counter: gateway_output_caps_applied_total
+    if !self.output_caps_applied_total.is_empty() {
+        let mut rows: Vec<(String, u64)> = self
+            .output_caps_applied_total
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        out.push_str("# HELP gateway_output_caps_applied_total Output caps applied to requests\n");
+        out.push_str("# TYPE gateway_output_caps_applied_total counter\n");
+        for (trace_id, value) in &rows {
+            out.push_str(&format!(
+                "gateway_output_caps_applied_total{{trace_id=\"{}\"}} {}\n",
+                escape_prometheus_label(trace_id),
+                value
+            ));
+        }
+    }
+}
 
     fn write_tool_compression_histogram(
         &self,

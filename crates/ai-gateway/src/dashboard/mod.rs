@@ -1461,6 +1461,7 @@ mod tests {
                 compression: None,
                 structured_output: None,
                 memory: None,
+                max_output_tokens: None,
                 models: vec![ProviderModel {
                     cache_support: None,
                     cache_min_tokens: None,
@@ -1833,12 +1834,13 @@ mod tests {
                     input_tokens: None,
                     output_tokens: None,
                     virtual_key_id: None,
-                prompt_id: None,
-                prompt_version: None,
-                prompt_label: None,
-                })
-                .unwrap();
-        }
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
+            output_cap_metadata: None,
+        })
+        .unwrap();
+    }
 
         let response = server
             .build_router()
@@ -1906,10 +1908,11 @@ mod tests {
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
+            output_cap_metadata: None,
         })
         .unwrap();
 
-    let app = server.build_router();
+        let app = server.build_router();
         let response = app
             .oneshot(
                 Request::get("/dashboard/errors")
@@ -1967,11 +1970,12 @@ mod tests {
     input_tokens: None,
     output_tokens: None,
     virtual_key_id: None,
-    prompt_id: None,
-    prompt_version: None,
-    prompt_label: None,
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
+            output_cap_metadata: None,
+        }
     }
-}
 
     /// ADR 0002 guard: failed attempts of a request that later succeeded
     /// (local skips, timeouts, upstream errors) stay on the Errors tab no

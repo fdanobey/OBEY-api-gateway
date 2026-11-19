@@ -1051,6 +1051,7 @@ mod tests {
             compression: None,
             memory: None,
             structured_output: None,
+            max_output_tokens: None,
             models: vec![model(1.0, 1.0), model(10.0, 10.0)],
         };
         let pinned = PinnedRoutingContext::default();

@@ -339,6 +339,7 @@ async fn laya_classifier_high_answer_confidence_produces_decision() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: Vec::new(),
     };
     let pinned_context = ai_gateway::smart_routing::PinnedRoutingContext::default();
@@ -391,6 +392,7 @@ async fn laya_classifier_low_answer_confidence_falls_back() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: Vec::new(),
     };
     let pinned_context = ai_gateway::smart_routing::PinnedRoutingContext::default();
@@ -442,6 +444,7 @@ async fn laya_classifier_low_confidence_blend_policy_flags_blended_output() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: Vec::new(),
     };
     let pinned_context = ai_gateway::smart_routing::PinnedRoutingContext::default();

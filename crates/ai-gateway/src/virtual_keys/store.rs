@@ -58,6 +58,7 @@ pub struct StoredVirtualKey {
     pub window_start: Option<DateTime<Utc>>,
     pub requests_per_minute: Option<u32>,
     pub tokens_per_minute: Option<u64>,
+    pub max_output_tokens: Option<u32>,
     pub model_access_list: Option<Vec<String>>,
     pub loop_detection: Option<crate::loop_detection::VkLoopConfig>,
     pub expires_at: Option<DateTime<Utc>>,
@@ -97,6 +98,7 @@ pub struct KeyUpdates {
     pub budget_window: Option<Option<BudgetWindow>>,
     pub requests_per_minute: Option<Option<u32>>,
     pub tokens_per_minute: Option<Option<u64>>,
+    pub max_output_tokens: Option<Option<u32>>,
     pub model_access_list: Option<Option<Vec<String>>>,
     pub loop_detection: Option<Option<crate::loop_detection::VkLoopConfig>>,
     pub expires_at: Option<Option<DateTime<Utc>>>,
@@ -118,9 +120,10 @@ impl KeyUpdates {
             && self.budget_limit_usd.is_none()
             && self.token_budget.is_none()
             && self.budget_window.is_none()
-            && self.requests_per_minute.is_none()
-            && self.tokens_per_minute.is_none()
-            && self.model_access_list.is_none()
+        && self.requests_per_minute.is_none()
+        && self.tokens_per_minute.is_none()
+        && self.max_output_tokens.is_none()
+        && self.model_access_list.is_none()
             && self.loop_detection.is_none()
             && self.expires_at.is_none()
             && self.window_start.is_none()
@@ -173,22 +176,23 @@ impl KeyStore {
     fn create_schema(conn: &Connection) -> Result<(), KeyStoreError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS virtual_keys (
-                id TEXT PRIMARY KEY,
-                key_hash TEXT NOT NULL UNIQUE,
-                key_prefix TEXT NOT NULL,
-                encrypted_key TEXT NOT NULL,
-                name TEXT,
-                status TEXT NOT NULL DEFAULT 'active',
-                budget_limit_usd REAL,
-                token_budget INTEGER,
-                budget_window TEXT,
-                current_spend_usd REAL NOT NULL DEFAULT 0.0,
-                current_tokens_used INTEGER NOT NULL DEFAULT 0,
-                window_start_timestamp INTEGER,
-                requests_per_minute INTEGER,
-                tokens_per_minute INTEGER,
-                model_access_list TEXT,
-                loop_detection_json TEXT,
+ id TEXT PRIMARY KEY,
+ key_hash TEXT NOT NULL UNIQUE,
+ key_prefix TEXT NOT NULL,
+ encrypted_key TEXT NOT NULL,
+ name TEXT,
+ status TEXT NOT NULL DEFAULT 'active',
+ budget_limit_usd REAL,
+ token_budget INTEGER,
+ budget_window TEXT,
+ current_spend_usd REAL NOT NULL DEFAULT 0.0,
+ current_tokens_used INTEGER NOT NULL DEFAULT 0,
+ window_start_timestamp INTEGER,
+ requests_per_minute INTEGER,
+ tokens_per_minute INTEGER,
+ max_output_tokens INTEGER,
+ model_access_list TEXT,
+ loop_detection_json TEXT,
                 expires_at INTEGER,
                 created_at INTEGER NOT NULL,
                 last_used_at INTEGER,
@@ -231,13 +235,19 @@ impl KeyStore {
                 [],
             )?;
         }
-        if !columns.iter().any(|column| column == "priority") {
-            conn.execute(
-                "ALTER TABLE virtual_keys ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-        Ok(())
+ if !columns.iter().any(|column| column == "priority") {
+ conn.execute(
+ "ALTER TABLE virtual_keys ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+ [],
+ )?;
+ }
+ if !columns.iter().any(|column| column == "max_output_tokens") {
+ conn.execute(
+ "ALTER TABLE virtual_keys ADD COLUMN max_output_tokens INTEGER",
+ [],
+ )?;
+ }
+ Ok(())
     }
 
     /// Insert a new key row.
@@ -247,44 +257,45 @@ impl KeyStore {
         let conn = self.conn.lock().expect("keys.db mutex poisoned");
 
         conn.execute(
-            "INSERT INTO virtual_keys (
-                id, key_hash, key_prefix, encrypted_key, name, status,
-                budget_limit_usd, token_budget, budget_window,
-                current_spend_usd, current_tokens_used, window_start_timestamp,
-                requests_per_minute, tokens_per_minute, model_access_list,
-                loop_detection_json, expires_at, created_at, last_used_at, request_count,
-                priority
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6,
-                ?7, ?8, ?9,
-                ?10, ?11, ?12,
-                ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19, ?20,
-                ?21
-            )",
-            params![
-                key.id,
-                key.key_hash,
-                key.key_prefix,
-                key.encrypted_key,
-                key.name,
-                key_status_to_str(&key.status),
-                key.budget_limit_usd,
-                key.token_budget.map(|v| v as i64),
-                key.budget_window.as_ref().map(budget_window_to_str),
-                key.current_spend_usd,
-                key.current_tokens_used as i64,
-                key.window_start.map(|t| t.timestamp()),
-                key.requests_per_minute.map(|v| v as i64),
-                key.tokens_per_minute.map(|v| v as i64),
-                model_access_json,
-                loop_detection_json,
-                key.expires_at.map(|t| t.timestamp()),
-                key.created_at.timestamp(),
-                key.last_used_at.map(|t| t.timestamp()),
-                key.request_count as i64,
-                key.priority as i64,
-            ],
+ "INSERT INTO virtual_keys (
+ id, key_hash, key_prefix, encrypted_key, name, status,
+ budget_limit_usd, token_budget, budget_window,
+ current_spend_usd, current_tokens_used, window_start_timestamp,
+ requests_per_minute, tokens_per_minute, model_access_list,
+ loop_detection_json, expires_at, created_at, last_used_at, request_count,
+ priority, max_output_tokens
+ ) VALUES (
+ ?1, ?2, ?3, ?4, ?5, ?6,
+ ?7, ?8, ?9,
+ ?10, ?11, ?12,
+ ?13, ?14, ?15,
+ ?16, ?17, ?18, ?19, ?20,
+ ?21, ?22
+ )",
+ params![
+ key.id,
+ key.key_hash,
+ key.key_prefix,
+ key.encrypted_key,
+ key.name,
+ key_status_to_str(&key.status),
+ key.budget_limit_usd,
+ key.token_budget.map(|v| v as i64),
+ key.budget_window.as_ref().map(budget_window_to_str),
+ key.current_spend_usd,
+ key.current_tokens_used as i64,
+ key.window_start.map(|t| t.timestamp()),
+ key.requests_per_minute.map(|v| v as i64),
+ key.tokens_per_minute.map(|v| v as i64),
+ model_access_json,
+ loop_detection_json,
+ key.expires_at.map(|t| t.timestamp()),
+ key.created_at.timestamp(),
+ key.last_used_at.map(|t| t.timestamp()),
+ key.request_count as i64,
+ key.priority as i64,
+ key.max_output_tokens.map(|v| v as i64),
+ ],
         )?;
 
         Ok(())
@@ -353,11 +364,15 @@ impl KeyStore {
             assignments.push(format!("requests_per_minute = ?{}", values.len() + 1));
             values.push(Box::new(rpm.map(|v| v as i64)));
         }
-        if let Some(tpm) = &updates.tokens_per_minute {
-            assignments.push(format!("tokens_per_minute = ?{}", values.len() + 1));
-            values.push(Box::new(tpm.map(|v| v as i64)));
-        }
-        if let Some(model_access) = &updates.model_access_list {
+ if let Some(tpm) = &updates.tokens_per_minute {
+ assignments.push(format!("tokens_per_minute = ?{}", values.len() + 1));
+ values.push(Box::new(tpm.map(|v| v as i64)));
+ }
+ if let Some(max_output_tokens) = &updates.max_output_tokens {
+ assignments.push(format!("max_output_tokens = ?{}", values.len() + 1));
+ values.push(Box::new(max_output_tokens.map(|v| v as i64)));
+ }
+ if let Some(model_access) = &updates.model_access_list {
             assignments.push(format!("model_access_list = ?{}", values.len() + 1));
             values.push(Box::new(serialize_model_access(model_access)?));
         }
@@ -646,50 +661,51 @@ pub fn list_key_budget_states(&self) -> Result<Vec<KeyBudgetState>, KeyStoreErro
 /// Column list shared by all `SELECT` statements, kept in sync with
 /// [`row_to_stored_key`].
 const SELECT_COLUMNS: &str = "id, key_hash, key_prefix, encrypted_key, name, status, \
-       budget_limit_usd, token_budget, budget_window, current_spend_usd, \
-       current_tokens_used, window_start_timestamp, requests_per_minute, \
-       tokens_per_minute, model_access_list, loop_detection_json, expires_at, created_at, \
-       last_used_at, request_count, priority";
+budget_limit_usd, token_budget, budget_window, current_spend_usd, \
+current_tokens_used, window_start_timestamp, requests_per_minute, \
+tokens_per_minute, max_output_tokens, model_access_list, loop_detection_json, expires_at, created_at, \
+last_used_at, request_count, priority";
 
 /// Map a row (selected via [`SELECT_COLUMNS`]) into a [`StoredVirtualKey`].
 fn row_to_stored_key(row: &Row) -> rusqlite::Result<StoredVirtualKey> {
-    let status_str: String = row.get(5)?;
-    let status = key_status_from_str(&status_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, SqlType::Text, Box::new(e)))?;
+ let status_str: String = row.get(5)?;
+ let status = key_status_from_str(&status_str)
+ .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, SqlType::Text, Box::new(e)))?;
 
-    let budget_window_str: Option<String> = row.get(8)?;
-    let budget_window = match budget_window_str {
-        Some(s) => Some(budget_window_from_str(&s).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(8, SqlType::Text, Box::new(e))
-        })?),
-        None => None,
-    };
+ let budget_window_str: Option<String> = row.get(8)?;
+ let budget_window = match budget_window_str {
+ Some(s) => Some(budget_window_from_str(&s).map_err(|e| {
+ rusqlite::Error::FromSqlConversionFailure(8, SqlType::Text, Box::new(e))
+ })?),
+ None => None,
+ };
 
-    let model_access_json: Option<String> = row.get(14)?;
-    let model_access_list = match model_access_json {
-        Some(json) => Some(serde_json::from_str::<Vec<String>>(&json).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(14, SqlType::Text, Box::new(e))
-        })?),
-        None => None,
-    };
+ let model_access_json: Option<String> = row.get(15)?;
+ let model_access_list = match model_access_json {
+ Some(json) => Some(serde_json::from_str::<Vec<String>>(&json).map_err(|e| {
+ rusqlite::Error::FromSqlConversionFailure(15, SqlType::Text, Box::new(e))
+ })?),
+ None => None,
+ };
 
-    let loop_detection_json: Option<String> = row.get(15)?;
-    let loop_detection = match loop_detection_json {
-        Some(json) => Some(serde_json::from_str(&json).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(15, SqlType::Text, Box::new(error))
-        })?),
-        None => None,
-    };
-    let token_budget: Option<i64> = row.get(7)?;
-    let requests_per_minute: Option<i64> = row.get(12)?;
-    let tokens_per_minute: Option<i64> = row.get(13)?;
-    let window_start_ts: Option<i64> = row.get(11)?;
-    let expires_at_ts: Option<i64> = row.get(16)?;
-    let created_at_ts: i64 = row.get(17)?;
-    let last_used_at_ts: Option<i64> = row.get(18)?;
-    let current_tokens_used: i64 = row.get(10)?;
-    let request_count: i64 = row.get(19)?;
-    let priority: i64 = row.get(20)?;
+ let loop_detection_json: Option<String> = row.get(16)?;
+ let loop_detection = match loop_detection_json {
+ Some(json) => Some(serde_json::from_str(&json).map_err(|error| {
+ rusqlite::Error::FromSqlConversionFailure(16, SqlType::Text, Box::new(error))
+ })?),
+ None => None,
+ };
+ let token_budget: Option<i64> = row.get(7)?;
+ let requests_per_minute: Option<i64> = row.get(12)?;
+ let tokens_per_minute: Option<i64> = row.get(13)?;
+ let max_output_tokens: Option<i64> = row.get(14)?;
+ let window_start_ts: Option<i64> = row.get(11)?;
+ let expires_at_ts: Option<i64> = row.get(17)?;
+ let created_at_ts: i64 = row.get(18)?;
+ let last_used_at_ts: Option<i64> = row.get(19)?;
+ let current_tokens_used: i64 = row.get(10)?;
+ let request_count: i64 = row.get(20)?;
+ let priority: i64 = row.get(21)?;
     // The column is NOT NULL DEFAULT 0; clamp defensively so a corrupted
     // row still maps into the validated 0-1000 domain instead of failing
     // the read.
@@ -707,17 +723,18 @@ fn row_to_stored_key(row: &Row) -> rusqlite::Result<StoredVirtualKey> {
         budget_window,
         current_spend_usd: row.get(9)?,
         current_tokens_used: current_tokens_used as u64,
-        window_start: epoch_to_datetime_opt(window_start_ts, 11)?,
-        requests_per_minute: requests_per_minute.map(|v| v as u32),
-        tokens_per_minute: tokens_per_minute.map(|v| v as u64),
-        model_access_list,
-        loop_detection,
-        expires_at: epoch_to_datetime_opt(expires_at_ts, 16)?,
-        created_at: epoch_to_datetime(created_at_ts, 17)?,
-            last_used_at: epoch_to_datetime_opt(last_used_at_ts, 18)?,
-            request_count: request_count as u64,
-            priority,
-        })
+ window_start: epoch_to_datetime_opt(window_start_ts, 11)?,
+ requests_per_minute: requests_per_minute.map(|v| v as u32),
+ tokens_per_minute: tokens_per_minute.map(|v| v as u64),
+ max_output_tokens: max_output_tokens.map(|v| v as u32),
+ model_access_list,
+ loop_detection,
+ expires_at: epoch_to_datetime_opt(expires_at_ts, 17)?,
+ created_at: epoch_to_datetime(created_at_ts, 18)?,
+ last_used_at: epoch_to_datetime_opt(last_used_at_ts, 19)?,
+ request_count: request_count as u64,
+ priority,
+ })
     }
 
 fn epoch_to_datetime(secs: i64, col: usize) -> rusqlite::Result<DateTime<Utc>> {
@@ -823,9 +840,10 @@ mod tests {
             current_spend_usd: 0.0,
             current_tokens_used: 0,
             window_start: Some(ts(created_at)),
-            requests_per_minute: Some(60),
-            tokens_per_minute: Some(10_000),
-            model_access_list: Some(vec!["gpt-4".to_string(), "claude".to_string()]),
+ requests_per_minute: Some(60),
+ tokens_per_minute: Some(10_000),
+ max_output_tokens: Some(4_096),
+ model_access_list: Some(vec!["gpt-4".to_string(), "claude".to_string()]),
             loop_detection: None,
             expires_at: Some(ts(created_at + 86_400)),
             created_at: ts(created_at),
@@ -892,6 +910,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(default_priority, 0);
+    }
+
+    /// Output-caps: a database created before the `max_output_tokens` column
+    /// existed migrates additively, and the backfilled value reads as unset.
+    #[test]
+    fn migrates_existing_virtual_keys_table_with_max_output_tokens_column() {
+        let temp = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(temp.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE virtual_keys (
+                id TEXT PRIMARY KEY,
+                key_hash TEXT NOT NULL UNIQUE,
+                key_prefix TEXT NOT NULL,
+                encrypted_key TEXT NOT NULL,
+                name TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                budget_limit_usd REAL,
+                token_budget INTEGER,
+                budget_window TEXT,
+                current_spend_usd REAL NOT NULL DEFAULT 0.0,
+                current_tokens_used INTEGER NOT NULL DEFAULT 0,
+                window_start_timestamp INTEGER,
+                requests_per_minute INTEGER,
+                tokens_per_minute INTEGER,
+                model_access_list TEXT,
+                expires_at INTEGER,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 0
+            );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO virtual_keys (id, key_hash, key_prefix, encrypted_key, created_at)
+             VALUES ('legacy', 'hash-legacy2', 'vk_legacy', 'enc-legacy', 1700000000)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = KeyStore::new(temp.path()).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(virtual_keys)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "max_output_tokens"));
+        // The pre-existing row reads as unset (NULL).
+        let backfilled: Option<i64> = conn
+            .query_row(
+                "SELECT max_output_tokens FROM virtual_keys WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(backfilled.is_none());
     }
 
     /// Req 1.2 / Task 1: a key created without an explicit priority persists

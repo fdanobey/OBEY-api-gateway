@@ -155,6 +155,7 @@ fn base_config(provider_uri: &str) -> Config {
             compression: None,
             memory: None,
             structured_output: None,
+            max_output_tokens: None,
             models: vec![ProviderModel {
                 cache_support: None,
                 cache_min_tokens: None,

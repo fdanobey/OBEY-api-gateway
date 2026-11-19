@@ -279,6 +279,7 @@ async fn valid_reload_swaps_endpoint_set_for_new_events() {
         compression: None,
         structured_output: None,
         memory: None,
+        max_output_tokens: None,
         models: vec![expensive_model()],
     }];
     configure_webhook_receiver(&mut config, &old_receiver);
@@ -357,6 +358,7 @@ async fn reload_keeps_fired_state_no_duplicate_within_window() {
         compression: None,
         structured_output: None,
         memory: None,
+        max_output_tokens: None,
         models: vec![expensive_model()],
     }];
     configure_webhook_receiver(&mut config, &receiver);
@@ -475,6 +477,7 @@ async fn dormant_to_active_reload_activates_provider_evaluation() {
         compression: None,
         structured_output: None,
         memory: None,
+        max_output_tokens: None,
         models: vec![expensive_model()],
     }];
     // Start DORMANT: no endpoints configured (Req 3.3) — startup skips
@@ -557,6 +560,7 @@ async fn invalid_reload_payload_keeps_old_endpoint_set() {
         compression: None,
         structured_output: None,
         memory: None,
+        max_output_tokens: None,
         models: vec![expensive_model()],
     }];
     configure_webhook_receiver(&mut config, &receiver);

@@ -419,6 +419,7 @@ fn authed_key(id: &str) -> AuthenticatedKey {
         window_start: None,
         requests_per_minute: None,
         tokens_per_minute: None,
+        max_output_tokens: None,
         model_access: None,
         expires_at: None,
         loop_detection: None,

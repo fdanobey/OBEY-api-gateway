@@ -137,10 +137,11 @@ fn log_entry(trace_id: &str, compression: Option<CompressionLogMetadata>) -> Log
         input_tokens: None,
         output_tokens: None,
         virtual_key_id: None,
-    prompt_id: None,
-    prompt_version: None,
-    prompt_label: None,
-}
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
+        output_cap_metadata: None,
+    }
 }
 
 #[tokio::test]

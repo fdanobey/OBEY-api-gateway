@@ -442,14 +442,15 @@ fn write_decision_log(state: &AppState, trace_id: &str, row: DecisionLogRow) {
         context_reduction: None,
         client_protocol: None,
         claude_session_id: None,
-        input_tokens: row.input_tokens,
-        output_tokens: row.output_tokens,
-        virtual_key_id: row.virtual_key_id,
-    prompt_id: None,
-    prompt_version: None,
-    prompt_label: None,
-    };
-    if let Err(error) = state.logger.log(entry) {
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            virtual_key_id: row.virtual_key_id,
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
+            output_cap_metadata: None,
+        };
+        if let Err(error) = state.logger.log(entry) {
         tracing::warn!(%error, trace_id = %trace_id, "Failed to write request log entry");
     }
 }
@@ -539,13 +540,14 @@ fn log_decision_attempts(state: &AppState, trace_id: &str, attempts: &[ProviderA
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
-            error_class: Some(
-                attempt
-                    .error_class
-                    .clone()
-                    .unwrap_or_else(|| "other".to_string()),
-            ),
-        };
+                error_class: Some(
+                    attempt
+                        .error_class
+                        .clone()
+                        .unwrap_or_else(|| "other".to_string()),
+                ),
+                output_cap_metadata: None,
+            };
         if let Err(error) = state.logger.log(entry) {
             tracing::warn!(
                 error = %error,

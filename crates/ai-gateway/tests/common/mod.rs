@@ -118,6 +118,7 @@ pub fn budget_test_config(
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: vec![ProviderModel {
                 provider: "budget-provider".to_string(),
                 model: "gpt-4.1-nano".to_string(),
@@ -265,11 +266,12 @@ pub fn sample_log_entry(
         input_tokens: overrides.input_tokens,
         output_tokens: overrides.output_tokens,
         virtual_key_id: overrides.virtual_key_id,
-    prompt_id: None,
-    prompt_version: None,
-    prompt_label: None,
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
+            output_cap_metadata: None,
+        }
     }
-}
 
 /// Legacy pre-cost-reporting `requests` DDL (original columns only — no
 /// token/attribution columns and no indexes): the unmigrated-ledger shape
@@ -359,6 +361,7 @@ pub fn webhook_with_expensive_group(config: &mut Config) {
  compression: None,
  structured_output: None,
  memory: None,
+ max_output_tokens: None,
  models: vec![webhook_expensive_model()],
  }];
 }

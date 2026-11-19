@@ -166,9 +166,10 @@ impl VirtualKeyManager {
             current_spend_usd: 0.0,
             current_tokens_used: 0,
             window_start,
-            requests_per_minute: params.requests_per_minute,
-            tokens_per_minute: params.tokens_per_minute,
-            model_access_list: params.model_access.clone(),
+ requests_per_minute: params.requests_per_minute,
+ tokens_per_minute: params.tokens_per_minute,
+ max_output_tokens: params.max_output_tokens,
+ model_access_list: params.model_access.clone(),
             loop_detection: params.loop_detection.clone(),
             expires_at,
             created_at: now,
@@ -395,14 +396,23 @@ fn validate_create_params(params: &CreateKeyParams) -> Result<(), KeyError> {
         }
     }
 
-    if let Some(tpm) = params.tokens_per_minute {
-        if !(TPM_MIN..=TPM_MAX).contains(&tpm) {
-            errors.push(
-                "tokens_per_minute",
-                "tokens_per_minute must be between 1 and 10000000",
-            );
-        }
-    }
+ if let Some(tpm) = params.tokens_per_minute {
+ if !(TPM_MIN..=TPM_MAX).contains(&tpm) {
+ errors.push(
+ "tokens_per_minute",
+ "tokens_per_minute must be between 1 and 10000000",
+ );
+ }
+ }
+
+ if let Some(max_output_tokens) = params.max_output_tokens {
+ if max_output_tokens == 0 {
+ errors.push(
+ "max_output_tokens",
+ "max_output_tokens must be a positive integer",
+ );
+ }
+ }
 
     if let Some(model_access) = &params.model_access {
         if model_access.is_empty() {
@@ -441,20 +451,21 @@ mod tests {
         (mgr, temp)
     }
 
-    fn defaults() -> CreateKeyParams {
-        CreateKeyParams {
-            name: None,
-            budget_limit_usd: None,
-            token_budget: None,
-            budget_window: None,
-            requests_per_minute: None,
-            tokens_per_minute: None,
-            model_access: None,
-            expires_in: None,
-            loop_detection: None,
-            priority: None,
-        }
-    }
+ fn defaults() -> CreateKeyParams {
+ CreateKeyParams {
+ name: None,
+ budget_limit_usd: None,
+ token_budget: None,
+ budget_window: None,
+ requests_per_minute: None,
+ tokens_per_minute: None,
+ max_output_tokens: None,
+ model_access: None,
+ expires_in: None,
+ loop_detection: None,
+ priority: None,
+ }
+ }
 
     /// Req 1.6: omitting all optional fields yields an active key with no
     /// limits, no expiration, and all-model access, persisted and retrievable.
@@ -599,9 +610,36 @@ mod tests {
             .await
             .unwrap_err();
         let KeyError::Validation(errors) = err else {
-            panic!("expected validation error, got {err:?}");
+            panic!("expected validation error");
         };
         assert!(errors.errors.iter().any(|e| e.field == "priority"));
+
+        let (_, total) = mgr.store.list_keys(10, 0).unwrap();
+        assert_eq!(total, 0);
+    }
+
+    /// Output-caps Req 1.6: a zero create-time `max_output_tokens` is
+    /// rejected with a field-annotated validation error and nothing is
+    /// persisted.
+    #[tokio::test]
+    async fn create_key_with_zero_max_output_tokens_reports_field_error() {
+        let (mgr, _tmp) = temp_manager();
+        let err = mgr
+            .create_key(CreateKeyParams {
+                max_output_tokens: Some(0),
+                ..defaults()
+            })
+            .await
+            .unwrap_err();
+        let KeyError::Validation(errors) = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| e.field == "max_output_tokens")
+        );
 
         let (_, total) = mgr.store.list_keys(10, 0).unwrap();
         assert_eq!(total, 0);

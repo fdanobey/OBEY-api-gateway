@@ -972,19 +972,29 @@ errors.push(ValidationError::Raw(msg));
             }
         }
 
-        // Validate model groups (21.8)
-        for group in &self.model_groups {
-            if let Some(memory) = &group.memory {
-                self.validate_memory_config(
-                    &format!("model_groups.{}.memory", group.name),
-                    memory.validate(),
-                    &mut errors,
-                );
-            }
+ // Validate model groups (21.8)
+ for group in &self.model_groups {
+ if let Some(memory) = &group.memory {
+ self.validate_memory_config(
+ &format!("model_groups.{}.memory", group.name),
+ memory.validate(),
+ &mut errors,
+ );
+ }
 
-            if group.models.is_empty() {
-                errors.push(ValidationError::EmptyModelGroup(group.name.clone()));
-            }
+ // Output-cap bound (response-output-caps, Req 2.5): zero would
+ // clamp every request to an unusable completion, so require >= 1.
+ if group.max_output_tokens == Some(0) {
+ errors.push(ValidationError::InvalidValue {
+ field: format!("model_groups.{}.max_output_tokens", group.name),
+ value: "0".to_string(),
+ expected: "a positive integer".to_string(),
+ });
+ }
+
+ if group.models.is_empty() {
+ errors.push(ValidationError::EmptyModelGroup(group.name.clone()));
+ }
 
             if let Some(structured_output) = &group.structured_output {
                 let scope = format!("model_groups.{}.structured_output", group.name);
@@ -1718,13 +1728,14 @@ mod property_tests {
                 instructions_override: None,
                 max_rate_limit_cooldown_seconds: None,
             }],
-            model_groups: vec![ModelGroup {
-                name: "test-group".to_string(),
-                version_fallback_enabled: false,
-                compression: None,
-                memory: None,
-                structured_output: None,
-                models: vec![ProviderModel {
+ model_groups: vec![ModelGroup {
+ name: "test-group".to_string(),
+ version_fallback_enabled: false,
+ compression: None,
+ memory: None,
+ structured_output: None,
+ max_output_tokens: None,
+ models: vec![ProviderModel {
                     provider: "test-provider".to_string(),
                     model: "gpt-4".to_string(),
                     cost_per_million_input_tokens: 10.0,
@@ -5295,5 +5306,152 @@ fn model_deprecations_warn_days_before_bounds_validated() {
             "warn_days_before {warn_days_before} should be valid"
         );
     }
+}
+
+// --- Model-group output caps (response-output-caps, Req 2.1, 2.5, 2.6) ---
+
+#[test]
+fn model_group_max_output_tokens_yaml_absent_present_and_invalid() {
+    let base_yaml = r#"server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers:
+  - name: "openai"
+    type: "openai"
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "sk-test-12345678901234567890"
+    timeout_seconds: 30
+model_groups:
+  - name: "default"
+    version_fallback_enabled: false
+"#;
+
+    // Absent: parses to None (identical to pre-field configs).
+    let absent: Config = serde_yaml::from_str(&format!(
+        "{base_yaml}    models:\n      - provider: \"openai\"\n        model: \"gpt-4\"\n"
+    ))
+    .unwrap();
+    assert_eq!(absent.model_groups[0].max_output_tokens, None);
+    assert!(absent.validate().is_ok());
+
+    // Present: parses and validates.
+    let present: Config = serde_yaml::from_str(&format!(
+        "{base_yaml}    max_output_tokens: 4096\n    models:\n      - provider: \"openai\"\n        model: \"gpt-4\"\n"
+    ))
+    .unwrap();
+    assert_eq!(present.model_groups[0].max_output_tokens, Some(4096));
+    assert!(present.validate().is_ok());
+
+    // Invalid: 0 parses but is rejected by validation with the field name.
+    let zero: Config = serde_yaml::from_str(&format!(
+        "{base_yaml}    max_output_tokens: 0\n    models:\n      - provider: \"openai\"\n        model: \"gpt-4\"\n"
+    ))
+    .unwrap();
+    let errors = zero.validate().unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, value, expected }
+        if field == "model_groups.default.max_output_tokens"
+            && value == "0"
+            && expected == "a positive integer"
+    )));
+
+    // Invalid: a negative literal fails u32 deserialization outright.
+    let negative: Result<Config, _> = serde_yaml::from_str(&format!(
+        "{base_yaml}    max_output_tokens: -1\n    models:\n      - provider: \"openai\"\n        model: \"gpt-4\"\n"
+    ));
+    assert!(negative.is_err());
+}
+
+#[test]
+fn model_group_max_output_tokens_zero_rejected_on_load_and_reload() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("config.yaml");
+
+    // Initial load with a valid cap succeeds.
+    std::fs::write(
+        &path,
+        r#"server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers:
+  - name: "openai"
+    type: "openai"
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "sk-test-12345678901234567890"
+    timeout_seconds: 30
+model_groups:
+  - name: "default"
+    version_fallback_enabled: false
+    max_output_tokens: 2048
+    models:
+      - provider: "openai"
+        model: "gpt-4"
+"#,
+    )
+    .unwrap();
+    let config = load_and_validate_config(&path).unwrap();
+    assert_eq!(config.model_groups[0].max_output_tokens, Some(2048));
+
+    // Hot-reload path re-runs the same `Config::validate`, so an edited
+    // cap of 0 is rejected with the field-annotated error.
+    let reloaded: Config = serde_yaml::from_str(
+        &std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("max_output_tokens: 2048", "max_output_tokens: 0"),
+    )
+    .unwrap();
+    let errors = reloaded.validate().unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidValue { field, .. }
+        if field == "model_groups.default.max_output_tokens"
+    )));
+}
+
+#[test]
+fn model_group_max_output_tokens_reload_applies_new_cap_without_restart() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("config.yaml");
+
+    let base_yaml = r#"server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers:
+  - name: "openai"
+    type: "openai"
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "sk-test-12345678901234567890"
+    timeout_seconds: 30
+model_groups:
+  - name: "default"
+    version_fallback_enabled: false
+    max_output_tokens: 2048
+    models:
+      - provider: "openai"
+        model: "gpt-4"
+"#;
+
+    // Load → operator lowers the group cap → hot-reload reads the new
+    // value with no restart (R2.6): reload re-reads and re-validates the
+    // file, and the config value observed by subsequent requests changes.
+    std::fs::write(&path, base_yaml).unwrap();
+    let first = load_and_validate_config(&path).unwrap();
+    assert_eq!(first.model_groups[0].max_output_tokens, Some(2048));
+
+    std::fs::write(&path, base_yaml.replace("max_output_tokens: 2048", "max_output_tokens: 512"))
+        .unwrap();
+    let second = load_and_validate_config(&path).unwrap();
+    assert_eq!(second.model_groups[0].max_output_tokens, Some(512));
+    assert_ne!(
+        first.model_groups[0].max_output_tokens,
+        second.model_groups[0].max_output_tokens
+    );
 }
 }

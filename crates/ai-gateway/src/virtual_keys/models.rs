@@ -157,6 +157,9 @@ pub struct CreateKeyParams {
     /// Tokens-per-minute limit (1 - 10_000_000).
     #[serde(default)]
     pub tokens_per_minute: Option<u64>,
+    /// Per-request output-token ceiling (positive integer); `None` = no cap.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
     /// Permitted model/model-group names; `None` allows all.
     #[serde(default)]
     pub model_access: Option<Vec<String>>,
@@ -203,6 +206,10 @@ pub struct UpdateKeyParams {
     pub requests_per_minute: Option<Option<u32>>,
     #[serde(default)]
     pub tokens_per_minute: Option<Option<u64>>,
+    /// Per-request output-token ceiling; `None` leaves it unchanged,
+    /// `Some(None)` clears it, `Some(Some(v))` sets it (positive integer).
+    #[serde(default)]
+    pub max_output_tokens: Option<Option<u32>>,
     #[serde(default)]
     pub model_access: Option<Option<Vec<String>>>,
     #[serde(default)]
@@ -250,6 +257,8 @@ pub struct AuthenticatedKey {
     pub window_start: Option<DateTime<Utc>>,
     pub requests_per_minute: Option<u32>,
     pub tokens_per_minute: Option<u64>,
+    /// Per-request output-token ceiling; `None` = no cap.
+    pub max_output_tokens: Option<u32>,
     pub model_access: Option<Vec<String>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub loop_detection: Option<crate::loop_detection::VkLoopConfig>,
@@ -325,6 +334,8 @@ pub struct VirtualKeyInfo {
     pub current_tokens_used: u64,
     pub requests_per_minute: Option<u32>,
     pub tokens_per_minute: Option<u64>,
+    /// Per-request output-token ceiling; `None` = no cap.
+    pub max_output_tokens: Option<u32>,
     pub model_access: Option<Vec<String>>,
     pub loop_detection: Option<crate::loop_detection::VkLoopConfig>,
     pub request_count: u64,

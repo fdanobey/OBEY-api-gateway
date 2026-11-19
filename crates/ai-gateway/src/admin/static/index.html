@@ -1004,12 +1004,20 @@ body.sec-banner-active{padding-top:3.2rem}
             <label>Group Name</label>
             <input type="text" class="grp-name" placeholder="gpt4-equivalent" autocomplete="off">
           </div>
-          <div class="form-group">
-            <div class="form-check" style="margin-top:1.4rem">
-              <input type="checkbox" class="grp-version-fallback">
-              <label>Enable Version Fallback</label>
-            </div>
+        <div class="form-group">
+          <div class="form-check" style="margin-top:1.4rem">
+            <input type="checkbox" class="grp-version-fallback">
+            <label>Enable Version Fallback</label>
           </div>
+        </div>
+        </div>
+        <div class="form-row">
+        <div class="form-group">
+          <label>Max output tokens</label>
+          <input type="number" class="grp-max-output-tokens" min="1" step="1" placeholder="Unlimited">
+          <div class="hint">Per-request output-token cap. Blank = unlimited.</div>
+          <div class="error" role="alert"></div>
+        </div>
         </div>
         <details class="compression-override" id="grp-compression-override">
           <summary>Token Compression Override</summary>
@@ -2246,6 +2254,12 @@ body.sec-banner-active{padding-top:3.2rem}
                 <input type="number" id="vk-f-tpm" min="1" max="10000000" step="1" placeholder="Unlimited" aria-describedby="vk-f-tpm-error">
                 <div class="hint">1&ndash;10,000,000. Blank = unlimited.</div>
                 <div class="error" id="vk-f-tpm-error" role="alert"></div>
+              </div>
+              <div class="form-group">
+                <label for="vk-f-max-output">Max output tokens</label>
+                <input type="number" id="vk-f-max-output" min="1" step="1" placeholder="Unlimited" aria-describedby="vk-f-max-output-error">
+                <div class="hint">Per-request output-token cap. Blank = unlimited.</div>
+                <div class="error" id="vk-f-max-output-error" role="alert"></div>
               </div>
               <div class="form-group">
                 <label for="vk-f-priority">Priority</label>
@@ -3660,6 +3674,8 @@ function refreshModelGroupModels() {
       var nameIn = card.querySelector('.grp-name');
       if (!validateRequired(nameIn, 'Group name')) ok = false;
       if (!validateCompressionOverride(card, 'grp')) ok = false;
+      var moGroupIn = card.querySelector('.grp-max-output-tokens');
+      if (moGroupIn && moGroupIn.value.trim() && !validatePositiveInt(moGroupIn, 'Max output tokens')) ok = false;
   var modelRows = card.querySelectorAll('.models-container > .form-row');
   if (modelRows.length === 0) {
     showError(nameIn, 'Group must have at least one model');
@@ -4843,7 +4859,7 @@ if (provSel) {
     var nameInput = card.querySelector('.grp-name');
     var titleEl = card.querySelector('.group-title');
     setupCompressionOverrideIds(card, 'grp');
-    if (data) { nameInput.value = data.name || ''; titleEl.textContent = data.name || 'New Group'; card.querySelector('.grp-version-fallback').checked = !!data.version_fallback_enabled; }
+    if (data) { nameInput.value = data.name || ''; titleEl.textContent = data.name || 'New Group'; card.querySelector('.grp-version-fallback').checked = !!data.version_fallback_enabled; card.querySelector('.grp-max-output-tokens').value = (data.max_output_tokens != null) ? data.max_output_tokens : ''; }
     populateCompressionOverride(card, data && data.compression, 'grp');
     wireCompressionOverride(card, 'grp');
     nameInput.addEventListener('input', function() { titleEl.textContent = this.value || 'New Group'; });
@@ -5415,7 +5431,7 @@ var csTimeout=parseInt(document.getElementById('codex-search-timeout').value,10)
     var originalProviders = (config && config.providers) || [];
     cfg.providers=[]; document.querySelectorAll('#providers-list .item-card').forEach(function(card,providerIndex){var ttfbVal=card.querySelector('.prov-ttfb-timeout').value.trim();var totalVal=card.querySelector('.prov-total-timeout').value.trim();var originalProvider=findOriginalByName(originalProviders,card.querySelector('.prov-name').value.trim(),providerIndex);var p=originalProvider?JSON.parse(JSON.stringify(originalProvider)):{};Object.assign(p,{name:card.querySelector('.prov-name').value.trim(),type:card.querySelector('.prov-type').value,base_url:card.querySelector('.prov-url').value.trim(),api_key_env:card.querySelector('.prov-key-env').value.trim()||null,api_key_status:card.dataset.apiKeyStatus||'missing',api_key_configured:card.dataset.apiKeyConfigured==='true',timeout_seconds:parseInt(card.querySelector('.prov-timeout').value,10),ttfb_timeout_seconds:ttfbVal?parseInt(ttfbVal,10):null,total_timeout_seconds:totalVal?parseInt(totalVal,10):null,buffered_upstream_streaming:card.querySelector('.prov-buffered-upstream-streaming').checked,rate_limit_per_minute:parseInt(card.querySelector('.prov-rate').value,10),rate_limit_max_wait_ms:(function(v){return v?parseInt(v,10):null;})(card.querySelector('.prov-rate-max-wait').value.trim()),max_connections:parseInt(card.querySelector('.prov-max-conn').value,10),connection_pool:{max_idle_per_host:parseInt(card.querySelector('.prov-pool-max-idle').value,10),idle_timeout_seconds:parseInt(card.querySelector('.prov-pool-idle-timeout').value,10)}});var r=card.querySelector('.prov-region').value.trim();if(r)p.region=r;if(p.type==='bedrock'){var bedrockRegion=r||'us-east-1';p.base_url='https://bedrock-mantle.'+bedrockRegion+'.api.aws/v1';if(!p.region)p.region=bedrockRegion;}var budgetLimit=card.querySelector('.prov-budget-limit').value.trim();if(budgetLimit){p.budget={limit_usd:parseFloat(budgetLimit),reset_policy:card.querySelector('.prov-budget-reset').value};var budgetThreshold=card.querySelector('.prov-budget-threshold').value.trim();if(budgetThreshold)p.budget.alert_threshold_percent=parseInt(budgetThreshold,10);}else delete p.budget;var mm=card.querySelector('.prov-manual-models').value.split('\n').map(function(s){return s.trim();}).filter(Boolean);if(mm.length)p.manual_models=mm;else delete p.manual_models;if(p.type==='bedrock'){p.global_inference_profile=card.querySelector('.prov-global-inference').checked;p.cross_region_inference=card.querySelector('.prov-cross-region').checked;p.prompt_caching=card.querySelector('.prov-prompt-caching').checked;p.custom_vpc_endpoint=card.querySelector('.prov-custom-vpc').checked;p.reasoning=card.querySelector('.prov-reasoning').checked;}if(p.type==='openai_oauth'){p.type='openai';p.auth_method='oauth';p.base_url='https://api.openai.com/v1';p.api_key_env=null;}if(p.type==='github-copilot'){p.auth_method=card.querySelector('.prov-copilot-auth-method')?card.querySelector('.prov-copilot-auth-method').value:'device-oauth';if(p.auth_method==='device-oauth'){p.api_key_env=null;}if(!p.base_url)p.base_url=null;}var uaVal=card.querySelector('.prov-user-agent').value.trim();if(uaVal)p.user_agent=uaVal;else delete p.user_agent;var hdrMap={};card.querySelectorAll('.prov-header-row').forEach(function(row){var hk=row.querySelector('.prov-header-name').value.trim();var hv=row.querySelector('.prov-header-value').value;if(hk)hdrMap[hk]=hv;});if(Object.keys(hdrMap).length)p.custom_headers=hdrMap;else delete p.custom_headers;p.compression=collectCompressionOverride(card,'prov');if(p.compression===null)delete p.compression;cfg.providers.push(p);});
     var originalGroups = (config && config.model_groups) || [];
-    cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container > .form-row').forEach(function(row,modelIndex){var originalModel=(originalGroup&&originalGroup.models&&originalGroup.models[modelIndex])||{};var m=JSON.parse(JSON.stringify(originalModel));Object.assign(m,{provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});var mdlDepDateVal=(row.querySelector('.mdl-deprecation-date')||{}).value;var mdlReplacementVal=(row.querySelector('.mdl-replacement-model')||{}).value;m.deprecation_date=mdlDepDateVal&&mdlDepDateVal.trim()!==''?mdlDepDateVal.trim():null;m.replacement_model=mdlReplacementVal&&mdlReplacementVal.trim()!==''?mdlReplacementVal.trim():null;var mdlCacheReadVal=(row.querySelector('.mdl-cache-read')||{}).value;var mdlCacheWriteVal=(row.querySelector('.mdl-cache-write')||{}).value;var mdlCacheMinVal=(row.querySelector('.mdl-cache-min-tokens')||{}).value;var mdlCacheSupportVal=(row.querySelector('.mdl-cache-support')||{}).value||'none';m.cost_per_million_cache_read_input_tokens=mdlCacheReadVal!==''?parseFloat(mdlCacheReadVal):null;m.cost_per_million_cache_creation_input_tokens=mdlCacheWriteVal!==''?parseFloat(mdlCacheWriteVal):null;m.cache_min_tokens=mdlCacheMinVal!==''?parseInt(mdlCacheMinVal,10):null;m.cache_support=mdlCacheSupportVal==='explicit'?{type:'explicit',max_breakpoints:parseInt((row.querySelector('.mdl-cache-max-bp')||{}).value||'4',10)}:(mdlCacheSupportVal==='automatic'?{type:'automatic'}:null);var mdlReasoningFamilyVal=(row.querySelector('.mdl-reasoning-family')||{}).value||'';var mdlReasoningParamVal=(row.querySelector('.mdl-reasoning-param')||{}).value||'';var mdlReasoningCostVal=(row.querySelector('.mdl-reasoning-cost')||{}).value;m.reasoning_family=mdlReasoningFamilyVal!==''?mdlReasoningFamilyVal:null;m.reasoning_parameter=mdlReasoningParamVal!==''?mdlReasoningParamVal:null;m.cost_per_million_reasoning_tokens=mdlReasoningCostVal!==''?parseFloat(mdlReasoningCostVal):null;var mdlTierVal=(row.querySelector('.mdl-tier')||{}).value||'';m.tier=mdlTierVal!==''?mdlTierVal:null;var mdlContextVal=(row.querySelector('.mdl-context-window')||{}).value;m.context_window=mdlContextVal!==''&&mdlContextVal!=null?parseInt(mdlContextVal,10):0;m.specializations=Array.prototype.map.call(row.querySelectorAll('.mdl-spec:checked'),function(cb){return cb.value;});g.models.push(m);});cfg.model_groups.push(g);});
+    cfg.model_groups=[]; document.querySelectorAll('#groups-list .item-card').forEach(function(card,groupIndex){var originalGroup=findOriginalByName(originalGroups,card.querySelector('.grp-name').value.trim(),groupIndex);var g=originalGroup?JSON.parse(JSON.stringify(originalGroup)):{};var grpMaxOut=card.querySelector('.grp-max-output-tokens').value.trim();Object.assign(g,{name:card.querySelector('.grp-name').value.trim(),version_fallback_enabled:card.querySelector('.grp-version-fallback').checked,max_output_tokens:grpMaxOut?parseInt(grpMaxOut,10):null,compression:collectCompressionOverride(card,'grp'),models:[]});if(g.max_output_tokens===null)delete g.max_output_tokens;if(g.compression===null)delete g.compression;card.querySelectorAll('.models-container > .form-row').forEach(function(row,modelIndex){var originalModel=(originalGroup&&originalGroup.models&&originalGroup.models[modelIndex])||{};var m=JSON.parse(JSON.stringify(originalModel));Object.assign(m,{provider:(row.querySelector('.mdl-provider')||{}).value||'',model:(row.querySelector('.mdl-name')||{}).value||'',priority:parseInt((row.querySelector('.mdl-priority')||{}).value||'100',10),cost_per_million_input_tokens:parseFloat((row.querySelector('.mdl-cost-in')||{}).value||'0'),cost_per_million_output_tokens:parseFloat((row.querySelector('.mdl-cost-out')||{}).value||'0')});var mdlDepDateVal=(row.querySelector('.mdl-deprecation-date')||{}).value;var mdlReplacementVal=(row.querySelector('.mdl-replacement-model')||{}).value;m.deprecation_date=mdlDepDateVal&&mdlDepDateVal.trim()!==''?mdlDepDateVal.trim():null;m.replacement_model=mdlReplacementVal&&mdlReplacementVal.trim()!==''?mdlReplacementVal.trim():null;var mdlCacheReadVal=(row.querySelector('.mdl-cache-read')||{}).value;var mdlCacheWriteVal=(row.querySelector('.mdl-cache-write')||{}).value;var mdlCacheMinVal=(row.querySelector('.mdl-cache-min-tokens')||{}).value;var mdlCacheSupportVal=(row.querySelector('.mdl-cache-support')||{}).value||'none';m.cost_per_million_cache_read_input_tokens=mdlCacheReadVal!==''?parseFloat(mdlCacheReadVal):null;m.cost_per_million_cache_creation_input_tokens=mdlCacheWriteVal!==''?parseFloat(mdlCacheWriteVal):null;m.cache_min_tokens=mdlCacheMinVal!==''?parseInt(mdlCacheMinVal,10):null;m.cache_support=mdlCacheSupportVal==='explicit'?{type:'explicit',max_breakpoints:parseInt((row.querySelector('.mdl-cache-max-bp')||{}).value||'4',10)}:(mdlCacheSupportVal==='automatic'?{type:'automatic'}:null);var mdlReasoningFamilyVal=(row.querySelector('.mdl-reasoning-family')||{}).value||'';var mdlReasoningParamVal=(row.querySelector('.mdl-reasoning-param')||{}).value||'';var mdlReasoningCostVal=(row.querySelector('.mdl-reasoning-cost')||{}).value;m.reasoning_family=mdlReasoningFamilyVal!==''?mdlReasoningFamilyVal:null;m.reasoning_parameter=mdlReasoningParamVal!==''?mdlReasoningParamVal:null;m.cost_per_million_reasoning_tokens=mdlReasoningCostVal!==''?parseFloat(mdlReasoningCostVal):null;var mdlTierVal=(row.querySelector('.mdl-tier')||{}).value||'';m.tier=mdlTierVal!==''?mdlTierVal:null;var mdlContextVal=(row.querySelector('.mdl-context-window')||{}).value;m.context_window=mdlContextVal!==''&&mdlContextVal!=null?parseInt(mdlContextVal,10):0;m.specializations=Array.prototype.map.call(row.querySelectorAll('.mdl-spec:checked'),function(cb){return cb.value;});g.models.push(m);});cfg.model_groups.push(g);});
     var retryMax=parseInt(document.getElementById('retry-max').value,10);
     var retryBackoff=parseFloat(document.getElementById('retry-backoff').value);
     var retryMultiplier=parseFloat(document.getElementById('retry-multiplier').value);
@@ -6904,6 +6920,7 @@ showToast('Failed to reset spend: ' + err.message, true);
       window: document.getElementById('vk-f-window'),
       rpm: document.getElementById('vk-f-rpm'),
       tpm: document.getElementById('vk-f-tpm'),
+      maxOutput: document.getElementById('vk-f-max-output'),
       priority: document.getElementById('vk-f-priority'),
       models: document.getElementById('vk-f-models'),
       expires: document.getElementById('vk-f-expires'),
@@ -6920,8 +6937,8 @@ showToast('Failed to reset spend: ' + err.message, true);
   /** Map a server error field name to its form input element. */
   function vkFieldEl(field) {
       var map = { name: 'vk-f-name', budget_limit_usd: 'vk-f-budget', token_budget: 'vk-f-token-budget',
-      budget_window: 'vk-f-window', requests_per_minute: 'vk-f-rpm', tokens_per_minute: 'vk-f-tpm',
-      priority: 'vk-f-priority', model_access: 'vk-f-models', expires_in: 'vk-f-expires', loop_detection: 'vk-f-loop-enabled' };
+budget_window: 'vk-f-window', requests_per_minute: 'vk-f-rpm', tokens_per_minute: 'vk-f-tpm',
+priority: 'vk-f-priority', max_output_tokens: 'vk-f-max-output', model_access: 'vk-f-models', expires_in: 'vk-f-expires', loop_detection: 'vk-f-loop-enabled' };
     return map[field] ? document.getElementById(map[field]) : null;
   }
 
@@ -6997,6 +7014,7 @@ showToast('Failed to reset spend: ' + err.message, true);
     f.window.value = d.budget_window || 'none';
     f.rpm.value = (d.requests_per_minute != null) ? d.requests_per_minute : '';
     f.tpm.value = (d.tokens_per_minute != null) ? d.tokens_per_minute : '';
+    f.maxOutput.value = (d.max_output_tokens != null) ? d.max_output_tokens : '';
     f.priority.value = (d.priority != null && d.priority !== 0) ? d.priority : '';
     vkPopulateModels(d.model_access || []);
     vkPopulateLoopOverrides(d.loop_detection || null);
@@ -7043,6 +7061,12 @@ showToast('Failed to reset spend: ' + err.message, true);
       if (!Number.isInteger(tpm) || tpm < 1 || tpm > 10000000) { showError(f.tpm, 'Tokens/minute must be an integer between 1 and 10,000,000'); ok = false; }
     }
 
+    var moRaw = f.maxOutput.value.trim();
+    if (moRaw !== '') {
+      var mo = Number(moRaw);
+      if (!Number.isInteger(mo) || mo < 1) { showError(f.maxOutput, 'Max output tokens must be a positive integer'); ok = false; }
+    }
+
     var priorityRaw = f.priority.value.trim();
     if (priorityRaw !== '') {
       var pr = Number(priorityRaw);
@@ -7062,6 +7086,7 @@ showToast('Failed to reset spend: ' + err.message, true);
     var win = f.window.value;
     var rpmRaw = f.rpm.value.trim();
     var tpmRaw = f.tpm.value.trim();
+    var moRaw = f.maxOutput.value.trim();
     var priorityRaw = f.priority.value.trim();
     var models = Array.prototype.slice.call(f.models.selectedOptions).map(function (o) { return o.value; });
     var expires = f.expires.value;
@@ -7075,6 +7100,7 @@ showToast('Failed to reset spend: ' + err.message, true);
       if (win !== 'none') { body.budget_window = win; }
       if (rpmRaw !== '') { body.requests_per_minute = parseInt(rpmRaw, 10); }
       if (tpmRaw !== '') { body.tokens_per_minute = parseInt(tpmRaw, 10); }
+      if (moRaw !== '') { body.max_output_tokens = parseInt(moRaw, 10); }
       if (priorityRaw !== '') { body.priority = Number(priorityRaw); }
       if (models.length) { body.model_access = models; }
       body.expires_in = (expires && expires !== 'never') ? expires : 'never';
@@ -7087,6 +7113,7 @@ showToast('Failed to reset spend: ' + err.message, true);
       body.budget_window = win !== 'none' ? win : null;
       body.requests_per_minute = rpmRaw !== '' ? parseInt(rpmRaw, 10) : null;
       body.tokens_per_minute = tpmRaw !== '' ? parseInt(tpmRaw, 10) : null;
+      body.max_output_tokens = moRaw !== '' ? parseInt(moRaw, 10) : null;
       body.priority = priorityRaw !== '' ? Number(priorityRaw) : null;
       body.model_access = models.length ? models : null;
       // Only send expires_in when the admin explicitly picked a new value.
@@ -7276,7 +7303,7 @@ showToast('Failed to reset spend: ' + err.message, true);
     if (bd) { bd.addEventListener('click', function (e) { if (e.target === bd) { vkHideModal(); } }); }
 
     // Clear inline errors as the admin corrects each field.
-    ['vk-f-name', 'vk-f-budget', 'vk-f-token-budget', 'vk-f-rpm', 'vk-f-tpm', 'vk-f-priority'].forEach(function (id) {
+    ['vk-f-name', 'vk-f-budget', 'vk-f-token-budget', 'vk-f-rpm', 'vk-f-tpm', 'vk-f-max-output', 'vk-f-priority'].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) { el.addEventListener('input', function () { clearError(el); }); }
     });

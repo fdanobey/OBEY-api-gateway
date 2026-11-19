@@ -71,6 +71,7 @@ fn test_config() -> Config {
             compression: None,
             memory: None,
             structured_output: None,
+            max_output_tokens: None,
             models: vec![ProviderModel {
                 cache_support: None,
                 cache_min_tokens: None,
@@ -1883,6 +1884,7 @@ fn streaming_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![
             ProviderModel {
                 cache_support: None,
@@ -2515,6 +2517,7 @@ fn relay_failover_config(primary_uri: &str, backup_uri: &str) -> Config {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![
             ProviderModel {
                 cache_support: None,
@@ -3199,6 +3202,7 @@ fn truncation_config(primary_uri: &str, backup_uri: &str, retry_on_truncation: b
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![
             ProviderModel {
                 cache_support: None,

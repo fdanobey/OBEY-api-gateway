@@ -2265,6 +2265,7 @@ mod tests {
                 memory: None,
                 compression: None,
                 structured_output: None,
+                max_output_tokens: None,
                 models: vec![ProviderModel {
                     cache_support: None,
                     cache_min_tokens: None,
@@ -3311,14 +3312,15 @@ mod tests {
                                });
                            }
 
-                           model_groups.push(ModelGroup {
-                               name: format!("group-{}", g),
-                               version_fallback_enabled: false,
-                               memory: None,
-                               compression: None,
-                               structured_output: None,
-                               models,
-                           });
+ model_groups.push(ModelGroup {
+ name: format!("group-{}", g),
+ version_fallback_enabled: false,
+ memory: None,
+ compression: None,
+ structured_output: None,
+ max_output_tokens: None,
+ models,
+ });
                        }
 
                        let cfg = Config {
@@ -3921,13 +3923,14 @@ mod tests {
                                instructions_override: None,
                                max_rate_limit_cooldown_seconds: None,
                            }],
-                           model_groups: vec![ModelGroup {
-                               name: format!("group-{}", provider_suffix),
-                               version_fallback_enabled: false,
-                               memory: None,
-                               compression: None,
-                               structured_output: None,
-                               models: vec![ProviderModel {
+ model_groups: vec![ModelGroup {
+ name: format!("group-{}", provider_suffix),
+ version_fallback_enabled: false,
+ memory: None,
+ compression: None,
+ structured_output: None,
+ max_output_tokens: None,
+ models: vec![ProviderModel {
                                    cache_support: None,
                                    cache_min_tokens: None,
                                    cost_per_million_cache_read_input_tokens: None,

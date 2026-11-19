@@ -93,9 +93,10 @@ impl VirtualKeyManager {
             budget_limit_usd: params.budget_limit_usd,
             token_budget: params.token_budget,
             budget_window: params.budget_window.clone(),
-            requests_per_minute: params.requests_per_minute,
-            tokens_per_minute: params.tokens_per_minute,
-            model_access_list: params.model_access.clone(),
+ requests_per_minute: params.requests_per_minute,
+ tokens_per_minute: params.tokens_per_minute,
+ max_output_tokens: params.max_output_tokens,
+ model_access_list: params.model_access.clone(),
             loop_detection: params.loop_detection.clone(),
             expires_at,
             // Req 7.3: never touch usage counters or window start on update.
@@ -242,9 +243,10 @@ pub(crate) fn stored_to_info(stored: &StoredVirtualKey) -> VirtualKeyInfo {
         budget_window: stored.budget_window.clone(),
         current_spend_usd: stored.current_spend_usd,
         current_tokens_used: stored.current_tokens_used,
-        requests_per_minute: stored.requests_per_minute,
-        tokens_per_minute: stored.tokens_per_minute,
-        model_access: stored.model_access_list.clone(),
+ requests_per_minute: stored.requests_per_minute,
+ tokens_per_minute: stored.tokens_per_minute,
+ max_output_tokens: stored.max_output_tokens,
+ model_access: stored.model_access_list.clone(),
         loop_detection: stored.loop_detection.clone(),
         request_count: stored.request_count,
         priority: stored.priority,
@@ -294,14 +296,23 @@ fn validate_update_params(params: &UpdateKeyParams) -> Result<(), KeyError> {
         }
     }
 
-    if let Some(Some(tpm)) = params.tokens_per_minute {
-        if !(TPM_MIN..=TPM_UPDATE_MAX).contains(&tpm) {
-            errors.push(
-                "tokens_per_minute",
-                "tokens_per_minute must be between 1 and 100000000",
-            );
-        }
-    }
+ if let Some(Some(tpm)) = params.tokens_per_minute {
+ if !(TPM_MIN..=TPM_UPDATE_MAX).contains(&tpm) {
+ errors.push(
+ "tokens_per_minute",
+ "tokens_per_minute must be between 1 and 100000000",
+ );
+ }
+ }
+
+ if let Some(Some(max_output_tokens)) = params.max_output_tokens {
+ if max_output_tokens == 0 {
+ errors.push(
+ "max_output_tokens",
+ "max_output_tokens must be a positive integer",
+ );
+ }
+ }
 
     if let Some(Some(model_access)) = &params.model_access {
         if model_access.is_empty() {
@@ -340,20 +351,21 @@ mod tests {
         (mgr, tmp)
     }
 
-    fn create_defaults() -> CreateKeyParams {
-        CreateKeyParams {
-            name: None,
-            budget_limit_usd: None,
-            token_budget: None,
-            budget_window: None,
-            requests_per_minute: None,
-            tokens_per_minute: None,
-            model_access: None,
-            expires_in: None,
-            loop_detection: None,
-            priority: None,
-        }
-    }
+ fn create_defaults() -> CreateKeyParams {
+ CreateKeyParams {
+ name: None,
+ budget_limit_usd: None,
+ token_budget: None,
+ budget_window: None,
+ requests_per_minute: None,
+ tokens_per_minute: None,
+ max_output_tokens: None,
+ model_access: None,
+ expires_in: None,
+ loop_detection: None,
+ priority: None,
+ }
+ }
 
     /// Req 7.1: a partial update changes only the named field; omitted fields
     /// keep their previous values.
@@ -585,16 +597,94 @@ mod tests {
         assert_eq!(stored.priority, 10);
     }
 
-    /// Updating an unknown id returns not found (HTTP 404).
-    #[tokio::test]
-    async fn update_missing_key_not_found() {
-        let (mgr, _tmp) = manager();
-        let err = mgr
-            .update_key("does-not-exist", UpdateKeyParams::default())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, KeyError::NotFound(_)));
-    }
+/// Updating an unknown id returns not found (HTTP 404).
+#[tokio::test]
+async fn update_missing_key_not_found() {
+    let (mgr, _tmp) = manager();
+    let err = mgr
+        .update_key("does-not-exist", UpdateKeyParams::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, KeyError::NotFound(_)));
+}
+
+/// Output-caps Req 1.6: `max_output_tokens` round-trips through create,
+/// update, and info views, and `Some(None)` clears it back to unset.
+#[tokio::test]
+async fn max_output_tokens_round_trip_set_and_clear() {
+    let (mgr, _tmp) = manager();
+    let created = mgr
+        .create_key(CreateKeyParams {
+            max_output_tokens: Some(2_048),
+            ..create_defaults()
+        })
+        .await
+        .unwrap();
+
+    let got = mgr.get_key(&created.id).await.unwrap();
+    assert_eq!(got.max_output_tokens, Some(2_048));
+
+    let info = mgr
+        .update_key(
+            &created.id,
+            UpdateKeyParams {
+                max_output_tokens: Some(Some(4_096)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(info.max_output_tokens, Some(4_096));
+
+    // Clear (Some(None)) → unset.
+    let info = mgr
+        .update_key(
+            &created.id,
+            UpdateKeyParams {
+                max_output_tokens: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(info.max_output_tokens, None);
+
+    let stored = mgr.store.get_key_by_id(&created.id).unwrap().unwrap();
+    assert_eq!(stored.max_output_tokens, None);
+}
+
+/// Output-caps Req 1.6: a zero `max_output_tokens` in an update is rejected
+/// with a field-annotated validation error and the stored value is intact.
+#[tokio::test]
+async fn update_max_output_tokens_zero_reports_field_error() {
+    let (mgr, _tmp) = manager();
+    let created = mgr
+        .create_key(CreateKeyParams {
+            max_output_tokens: Some(512),
+            ..create_defaults()
+        })
+        .await
+        .unwrap();
+
+    let err = mgr
+        .update_key(
+            &created.id,
+            UpdateKeyParams {
+                max_output_tokens: Some(Some(0)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    let KeyError::Validation(errors) = err else {
+        panic!("expected validation error");
+    };
+    assert!(errors.errors.iter().any(|e| e.field == "max_output_tokens"));
+
+    let stored = mgr.store.get_key_by_id(&created.id).unwrap().unwrap();
+    assert_eq!(stored.max_output_tokens, Some(512));
+}
+
 
     // --- Task 10.2: list / get / revoke / delete ----------------------------
 

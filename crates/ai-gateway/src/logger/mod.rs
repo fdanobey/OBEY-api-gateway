@@ -304,11 +304,16 @@ pub struct LogEntry {
     /// NULL whenever `prompt_id` is NULL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_version: Option<i64>,
-    /// Content-free prompt label at resolution time (Req 4.4); the
-    /// label may have drifted since the row was written, so this is a
-    /// point-in-time snapshot, not a join key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_label: Option<String>,
+/// Content-free prompt label at resolution time (Req 4.4); the
+/// label may have drifted since the row was written, so this is a
+/// point-in-time snapshot, not a join key.
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub prompt_label: Option<String>,
+/// Content-free metadata describing output cap application when a cap
+/// was applied (response-output-caps spec, Task 5). Contains `applied_value`
+/// and `originals` fields without response content.
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub output_cap_metadata: Option<serde_json::Value>,
 }
 
 impl LogEntry {
@@ -631,6 +636,7 @@ impl RequestLogger {
         Self::ensure_column(conn, "prompt_id", "TEXT")?;
         Self::ensure_column(conn, "prompt_version", "INTEGER")?;
         Self::ensure_column(conn, "prompt_label", "TEXT")?;
+    Self::ensure_column(conn, "output_cap_metadata", "TEXT")?;
 
         // Create indexes for common query patterns
         conn.execute(
@@ -1076,19 +1082,19 @@ fn insert_entry(
 "INSERT INTO requests (
             trace_id, timestamp, method, path, model, provider,
             status_code, duration_ms, cost, request_body, response_body,
-            requested_model, responded_model, compression_metadata, compression_level,
-            memories_injected, memories_stored, injection_tokens, detected_project,
-            cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
-            reasoning_tokens, reasoning_compat_actions, error_class, reasoning_relayed_frames,
-            context_reduction, client_protocol, claude_session_id,
-            input_tokens, output_tokens, key_id,
-            prompt_id, prompt_version, prompt_label
-        ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-            ?29, ?30, ?31, ?32, ?33,
-            ?34, ?35, ?36
-        )",
+requested_model, responded_model, compression_metadata, compression_level,
+memories_injected, memories_stored, injection_tokens, detected_project,
+cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
+reasoning_tokens, reasoning_compat_actions, error_class, reasoning_relayed_frames,
+context_reduction, client_protocol, claude_session_id,
+input_tokens, output_tokens, key_id,
+prompt_id, prompt_version, prompt_label, output_cap_metadata
+) VALUES (
+?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+?29, ?30, ?31, ?32, ?33,
+?34, ?35, ?36, ?37
+)",
         params![
             entry.trace_id,
             entry.timestamp.timestamp(),
@@ -1123,10 +1129,11 @@ fn insert_entry(
 entry.input_tokens,
         entry.output_tokens,
         entry.virtual_key_id,
-        entry.prompt_id,
-        entry.prompt_version,
-        entry.prompt_label,
-    ],
+            entry.prompt_id,
+            entry.prompt_version,
+            entry.prompt_label,
+            entry.output_cap_metadata.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
+        ],
     )?;
 
     Ok(())
@@ -1134,7 +1141,7 @@ entry.input_tokens,
 
 /// Query log entries with optional filtering. Runs on the writer thread.
 fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
-    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class, context_reduction, client_protocol, claude_session_id, input_tokens, output_tokens, key_id, prompt_id, prompt_version, prompt_label FROM requests WHERE 1=1");
+    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class, context_reduction, client_protocol, claude_session_id, input_tokens, output_tokens, key_id, prompt_id, prompt_version, prompt_label, output_cap_metadata FROM requests WHERE 1=1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     if let Some(ref trace_id) = filter.trace_id {
@@ -1254,6 +1261,8 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
             prompt_id: row.get(31)?,
             prompt_version: row.get(32)?,
             prompt_label: row.get(33)?,
+            output_cap_metadata: row.get::<_, Option<String>>(34)?
+                .and_then(|s| serde_json::from_str(&s).ok()),
         })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1364,13 +1373,14 @@ mod tests {
 input_tokens: None,
         output_tokens: None,
         virtual_key_id: None,
-        prompt_id: None,
-        prompt_version: None,
-        prompt_label: None,
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
+            output_cap_metadata: None,
+        }
     }
-}
 
-fn sample_compression(level: CompressionLevel) -> CompressionLogMetadata {
+    fn sample_compression(level: CompressionLevel) -> CompressionLogMetadata {
         CompressionLogMetadata {
             compression_level: compression_level_label(level).to_owned(),
             original_tokens: 1_000,
@@ -2707,9 +2717,10 @@ fn logs_query_filters_by_prompt_attribution() {
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
-        prompt_id: None,
-        prompt_version: None,
-        prompt_label: None,
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
+            output_cap_metadata: None,
         };
 
         logger.log(entry.clone()).unwrap();
@@ -2891,9 +2902,10 @@ fn logs_query_filters_by_prompt_attribution() {
             input_tokens: None,
             output_tokens: None,
             virtual_key_id: None,
-        prompt_id: None,
-        prompt_version: None,
-        prompt_label: None,
+            prompt_id: None,
+            prompt_version: None,
+            prompt_label: None,
+            output_cap_metadata: None,
         };
 
         logger.log(old_entry).unwrap();
@@ -2934,9 +2946,10 @@ fn logs_query_filters_by_prompt_attribution() {
         prompt_id: None,
         prompt_version: None,
         prompt_label: None,
-        };
+        output_cap_metadata: None,
+    };
 
-        logger.log(recent_entry).unwrap();
+    logger.log(recent_entry).unwrap();
 
         // Cleanup should remove the old entry
         let deleted = logger.cleanup_old_logs().unwrap();
@@ -3024,6 +3037,7 @@ mod property_tests {
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
+            output_cap_metadata: None,
         }
     },
     )
@@ -3134,7 +3148,8 @@ mod property_tests {
         prompt_id: None,
         prompt_version: None,
         prompt_label: None,
-        };
+        output_cap_metadata: None,
+    };
 
             logger.log(entry.clone()).unwrap();
 
@@ -3219,7 +3234,8 @@ mod property_tests {
         prompt_id: None,
         prompt_version: None,
         prompt_label: None,
-        };
+        output_cap_metadata: None,
+    };
 
             logger.log(entry).unwrap();
 
@@ -3301,7 +3317,8 @@ mod property_tests {
         prompt_id: None,
         prompt_version: None,
         prompt_label: None,
-        };
+        output_cap_metadata: None,
+    };
 
             logger.log(entry).unwrap();
 
@@ -3381,7 +3398,8 @@ mod property_tests {
         prompt_id: None,
         prompt_version: None,
         prompt_label: None,
-        };
+        output_cap_metadata: None,
+    };
 
             logger.log(entry).unwrap();
 
@@ -3470,7 +3488,8 @@ mod property_tests {
         prompt_id: None,
         prompt_version: None,
         prompt_label: None,
-        };
+        output_cap_metadata: None,
+    };
 
             logger.log(entry).unwrap();
 

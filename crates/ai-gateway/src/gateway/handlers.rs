@@ -42,8 +42,10 @@ use crate::providers::Model;
 use crate::reasoning_relay::{
 classify_reasoning_frame, sse_data_payload, RelayFrame, RelayHandle,
 };
+use crate::router::output_caps::{apply_output_cap, resolve_output_cap, OutputCapApplication};
 use crate::router::router::{ProviderPassThroughEndpoint, ProviderPassThroughResponse};
 use crate::router::trace_id::generate_trace_id;
+use crate::router::router::RequestOutputCapScope;
 use crate::router::StreamingResponse;
 use crate::smart_routing::tier::{ClassifierUsed, RoutingDecision, SmartRoutingTier, TaskType};
 use crate::structured_output::validator::{
@@ -160,12 +162,15 @@ struct RequestLogContext {
 /// authorization material; extracted from the response choices.
 completion_text: Option<String>,
 /// Content-free prompt-library attribution (prompt-library-
-/// versioning spec, Req 4.4): the resolved template id/version/
-/// label for prompt-seeded requests; `None` for ordinary calls.
-/// Never carries template content or variable values.
-prompt_id: Option<String>,
-prompt_version: Option<i64>,
-prompt_label: Option<String>,
+    /// versioning spec, Req 4.4): the resolved template id/version/
+    /// label for prompt-seeded requests; `None` for ordinary calls.
+    /// Never carries template content or variable values.
+    prompt_id: Option<String>,
+    prompt_version: Option<i64>,
+    prompt_label: Option<String>,
+    /// Content-free output cap application metadata when a cap was applied
+    /// (response-output-caps spec, Task 5).
+    output_cap_metadata: Option<serde_json::Value>,
 }
 
 impl RequestLogContext {
@@ -382,15 +387,16 @@ fn with_prompt_meta(mut self, meta: Option<&PromptResolutionMeta>) -> Self {
             .then(|| i64::from(response.usage.prompt_tokens)),
         output_tokens: (response.usage.completion_tokens > 0)
             .then(|| i64::from(response.usage.completion_tokens)),
-            virtual_key_id: None,
-            completion_text: None,
-            prompt_id: None,
-            prompt_version: None,
-            prompt_label: None,
-        }
+        virtual_key_id: None,
+        completion_text: None,
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
+        output_cap_metadata: crate::router::router::current_request_output_cap_metadata(),
     }
+}
 
-    fn from_streaming_success(
+fn from_streaming_success(
         request: &OpenAIRequest,
         trace_id: String,
         duration_ms: u64,
@@ -432,15 +438,16 @@ fn with_prompt_meta(mut self, meta: Option<&PromptResolutionMeta>) -> Self {
             log_path: "/v1/chat/completions",
             input_tokens: None,
             output_tokens: None,
-            virtual_key_id: None,
-            completion_text: None,
-            prompt_id: None,
-            prompt_version: None,
-            prompt_label: None,
-        }
+        virtual_key_id: None,
+        completion_text: None,
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
+        output_cap_metadata: crate::router::router::current_request_output_cap_metadata(),
     }
+}
 
-    fn from_error(
+fn from_error(
         request: &OpenAIRequest,
         trace_id: String,
         duration_ms: u64,
@@ -501,13 +508,14 @@ fn with_prompt_meta(mut self, meta: Option<&PromptResolutionMeta>) -> Self {
             client_protocol: None,
             claude_session_id: None,
             log_path: "/v1/chat/completions",
-            prompt_id: None,
-            prompt_version: None,
-            prompt_label: None,
-        }
+        prompt_id: None,
+        prompt_version: None,
+        prompt_label: None,
+        output_cap_metadata: crate::router::router::current_request_output_cap_metadata(),
     }
+}
 
-    /// Tag this log context as originating from the Anthropic Messages
+/// Tag this log context as originating from the Anthropic Messages
     /// front door (`/v1/messages`): sets `client_protocol = "anthropic"`
     /// and records the Claude Code session/agent id (Req 5.5, 6.3).
     fn with_anthropic_protocol(mut self, claude_session_id: Option<String>) -> Self {
@@ -517,7 +525,6 @@ fn with_prompt_meta(mut self, meta: Option<&PromptResolutionMeta>) -> Self {
         self
     }
 }
-
 
 /// Write the terminal outcome row for a chat request: first drain the
 /// request's attempt ledger into `#attempt` rows, then write the outcome row,
@@ -792,6 +799,7 @@ fn write_request_log(
         prompt_id: context.prompt_id.clone(),
         prompt_version: context.prompt_version,
         prompt_label: context.prompt_label.clone(),
+        output_cap_metadata: context.output_cap_metadata.clone(),
     };
     logger.log_with_reasoning_relay(entry, context.reasoning_relayed_frames)
 }
@@ -873,13 +881,14 @@ fn log_failed_attempts(
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
-            error_class: Some(
-                attempt
-                    .error_class
-                    .clone()
-                    .unwrap_or_else(|| "other".to_string()),
-            ),
-        };
+                error_class: Some(
+                    attempt
+                        .error_class
+                        .clone()
+                        .unwrap_or_else(|| "other".to_string()),
+                ),
+                output_cap_metadata: None,
+            };
         if let Err(e) = logger.log(entry) {
             tracing::warn!(
                 error = %e,
@@ -2063,8 +2072,9 @@ impl AbandonLogger {
             .prompt_meta
             .as_ref()
             .and_then(|meta| meta.prompt_label.clone()),
-        error_class: Some(error_class.to_string()),
-    };
+                error_class: Some(error_class.to_string()),
+                output_cap_metadata: None,
+            };
         tracing::info!(
             trace_id = %trace_id,
             status_code,
@@ -2731,6 +2741,26 @@ fn merge_prompt_into_request(mut request: OpenAIRequest, rendered: Vec<Message>)
     request
 }
 
+/// Apply the effective key and model-group output cap, reporting injections and clamps.
+async fn apply_request_output_cap(
+    state: &AppState,
+    request: &mut OpenAIRequest,
+    authenticated_key: Option<&AuthenticatedKey>,
+) -> Option<OutputCapApplication> {
+    let key_cap = authenticated_key.and_then(|key| key.max_output_tokens);
+    let group = state.router.find_model_group(&request.model).await.ok();
+    let group_cap = group.and_then(|group| group.max_output_tokens);
+    let cap = resolve_output_cap(key_cap, group_cap)?;
+    let application = apply_output_cap(request, cap);
+
+    (application.originals.is_empty()
+        || application
+            .originals
+            .iter()
+            .any(|(_, original)| *original > application.applied_value))
+    .then_some(application)
+}
+
 /// Chat completions handler — streaming and non-streaming.
 ///
 /// The optional `Extension<AuthenticatedKey>` is inserted by the virtual-key
@@ -2752,14 +2782,32 @@ pub async fn chat_completions(
     // zero-overhead skip for prompt-free requests costs one map
     // lookup and rejected references never touch a provider.
     let PromptApplied {
-        body: request,
+        body: mut request,
         prompt_meta,
     } = match apply_prompt_template(&state, request).await {
         Ok(applied) => applied,
         Err(response) => return response,
     };
-    tracing::info!(model = %request.model, stream = request.stream, "Received chat completion request");
-    let trace_id = trace_id_from_headers(&headers);
+            let output_cap_application = apply_request_output_cap(
+                &state,
+                &mut request,
+                authenticated_key.as_ref().map(|Extension(key)| key),
+            )
+            .await;
+            let output_cap_applied_value = output_cap_application.as_ref().map(|a| a.applied_value);
+            let output_cap_metadata = output_cap_application.as_ref().map(|app| {
+                serde_json::json!({
+                    "applied_value": app.applied_value,
+                    "originals": app.originals.iter().map(|(field, value)| {
+                        (field.to_string(), value)
+                    }).collect::<Vec<_>>()
+                })
+            });
+            tracing::info!(model = %request.model, stream = request.stream, "Received chat completion request");
+            let trace_id = trace_id_from_headers(&headers);
+            if output_cap_application.is_some() {
+                state.metrics.record_output_cap_applied(&trace_id);
+            }
     let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
     let mode = memory_mode(&headers);
     // True when a synthetic drill-down resolution loop re-entered the
@@ -2783,34 +2831,39 @@ pub async fn chat_completions(
     // Inbound W3C context (Req 4): the header is only read when
     // telemetry is enabled; invalid values are ignored above.
     let inbound_telemetry =
-        super::telemetry_seam::extract_inbound_context(&headers, state.telemetry_snapshot.enabled());
-    if request.stream {
-        chat_completions_stream(
-            state,
-            request,
-            trace_id,
-            virtual_key_id,
-            mode,
-            tool_disclosure,
-            compression_restore,
-            inbound_telemetry,
-            prompt_meta,
-        )
+            super::telemetry_seam::extract_inbound_context(&headers, state.telemetry_snapshot.enabled());
+        RequestOutputCapScope::new(output_cap_applied_value)
+            .with_metadata(output_cap_metadata)
+            .scope(async {
+                if request.stream {
+                    chat_completions_stream(
+                    state,
+                    request,
+                    trace_id,
+                    virtual_key_id,
+                    mode,
+                    tool_disclosure,
+                    compression_restore,
+                    inbound_telemetry,
+                    prompt_meta,
+                )
+                .await
+            } else {
+                chat_completions_non_stream(
+                    state,
+                    request,
+                    trace_id,
+                    virtual_key_id,
+                    mode,
+                    tool_disclosure,
+                    compression_restore,
+                    inbound_telemetry,
+                    prompt_meta,
+                )
+                .await
+            }
+        })
         .await
-    } else {
-        chat_completions_non_stream(
-            state,
-            request,
-            trace_id,
-            virtual_key_id,
-            mode,
-            tool_disclosure,
-            compression_restore,
-            inbound_telemetry,
-            prompt_meta,
-        )
-        .await
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8440,9 +8493,9 @@ fn chat_deltas_from_chunk(chunk: &serde_json::Value) -> Vec<ChatDelta> {
 }
 
 /// Build the native-passthrough task-local scope (decision D2, Req 4.3): the
-/// exact client JSON plus the `anthropic-version` / comma-joined
-/// `anthropic-beta` header values, visible only to the Bedrock Mantle
-/// Messages adapter during dispatch.
+/// client JSON with any output-cap clamps and the `anthropic-version` /
+/// comma-joined `anthropic-beta` header values, visible only to the Bedrock
+/// Mantle Messages adapter during dispatch.
 fn anthropic_passthrough_scope(
     raw_body: &serde_json::Value,
     headers: &HeaderMap,
@@ -8545,7 +8598,6 @@ pub async fn anthropic_create(
  }
     let trace_id = trace_id_from_headers(&headers);
     let claude_session_id = claude_session_id_from(&headers, &request);
-    let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
     let memory_mode = memory_mode(&headers);
     let inbound_telemetry =
         super::telemetry_seam::extract_inbound_context(&headers, state.telemetry_snapshot.enabled());
@@ -8568,7 +8620,7 @@ pub async fn anthropic_create(
         return anthropic_not_found(format!("model: {} was not found", request.model));
     }
 
-    let (chat_request, request_stop_sequences, raw_body) = {
+    let (mut chat_request, request_stop_sequences, mut raw_body) = {
         let mut chat_request = match translate_anthropic(&request) {
             Ok(translated) => translated,
             Err(rejection) => {
@@ -8576,47 +8628,78 @@ pub async fn anthropic_create(
             }
         };
         chat_request.stream = request.stream;
-        // Verbatim passthrough context (decision D2, Req 4.3): the exact
-        // client JSON plus the client's anthropic-version/-beta headers.
-        // The translated chat request still runs unchanged through the
-        // whole dispatch pipeline; the stash travels out-of-band so no
-        // other provider's request body can ever carry a marker key.
+        // Preserve the client JSON for the native Messages adapter, including
+        // fields the translated request does not carry.
         let raw_body: serde_json::Value = serde_json::from_slice(&body)
             .unwrap_or_else(|_| serde_json::to_value(&request).unwrap_or_default());
         (chat_request, request.stop_sequences.clone(), raw_body)
     };
+        let output_cap_application = apply_request_output_cap(
+            &state,
+            &mut chat_request,
+            authenticated_key.as_ref().map(|Extension(key)| key),
+        )
+        .await;
+        if output_cap_application.is_some() {
+            state.metrics.record_output_cap_applied(&trace_id);
+        }
+        // Native Messages dispatch uses the raw body, so mirror any clamps there.
+if let (Some(application), Some(raw_fields)) =
+(&output_cap_application, raw_body.as_object_mut())
+{
+for &(field, original) in &application.originals {
+if original > application.applied_value {
+raw_fields.insert(field.to_owned(), serde_json::json!(application.applied_value));
+}
+}
+}
+        let output_cap_applied_value = output_cap_application.as_ref().map(|a| a.applied_value);
+        let output_cap_metadata = output_cap_application.as_ref().map(|app| {
+            serde_json::json!({
+                "applied_value": app.applied_value,
+                "originals": app.originals.iter().map(|(field, value)| {
+                    (field.to_string(), value)
+                }).collect::<Vec<_>>()
+            })
+        });
+        let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
 
- if request.stream {
- anthropic_create_stream(
- state,
- request,
- chat_request,
- request_stop_sequences,
- trace_id,
- claude_session_id,
- virtual_key_id,
- raw_body,
- headers,
- memory_mode,
- inbound_telemetry,
- )
- .await
- } else {
- anthropic_create_buffered(
- state,
- request,
- chat_request,
- request_stop_sequences,
- trace_id,
- claude_session_id,
- virtual_key_id,
- raw_body,
- headers,
- memory_mode,
- inbound_telemetry,
- )
- .await
- }
+        RequestOutputCapScope::new(output_cap_applied_value)
+            .with_metadata(output_cap_metadata)
+            .scope(async {
+            if request.stream {
+                anthropic_create_stream(
+                    state,
+                    request,
+                    chat_request,
+                    request_stop_sequences,
+                    trace_id,
+                    claude_session_id,
+                    virtual_key_id,
+                    raw_body,
+                    headers,
+                    memory_mode,
+                    inbound_telemetry,
+                )
+                .await
+            } else {
+                anthropic_create_buffered(
+                    state,
+                    request,
+                    chat_request,
+                    request_stop_sequences,
+                    trace_id,
+                    claude_session_id,
+                    virtual_key_id,
+                    raw_body,
+                    headers,
+                    memory_mode,
+                    inbound_telemetry,
+                )
+                .await
+            }
+        })
+        .await
 }
 
 /// Buffered (non-streaming) /v1/messages path.
@@ -12705,28 +12788,51 @@ pub async fn completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     authenticated_key: Option<Extension<AuthenticatedKey>>,
-    Json(request): Json<OpenAIRequest>,
+    Json(mut request): Json<OpenAIRequest>,
 ) -> Response {
-    // Reuse chat completions routing; the OpenAI completions format is close enough
-    // for provider pass-through. Full translation can be refined later.
-    let trace_id = trace_id_from_headers(&headers);
-    let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
-    let memory_mode = memory_mode(&headers);
-    let inbound_telemetry =
-        super::telemetry_seam::extract_inbound_context(&headers, state.telemetry_snapshot.enabled());
-    chat_completions_non_stream(
-        state,
-        request,
-        trace_id,
-        virtual_key_id,
-        memory_mode,
-        false,
-        crate::router::router::ToolCompressionRestore::default(),
-        inbound_telemetry,
-        // Legacy completions bodies carry no prompt-library field.
-        None,
-    )
-    .await
+// Reuse chat completions routing; the OpenAI completions format is close enough
+// for provider pass-through. Full translation can be refined later.
+let trace_id = trace_id_from_headers(&headers);
+let output_cap_application = apply_request_output_cap(
+&state,
+&mut request,
+authenticated_key.as_ref().map(|Extension(key)| key),
+)
+.await;
+        let output_cap_applied_value = output_cap_application.as_ref().map(|a| a.applied_value);
+        let output_cap_metadata = output_cap_application.as_ref().map(|app| {
+            serde_json::json!({
+                "applied_value": app.applied_value,
+                "originals": app.originals.iter().map(|(field, value)| {
+                    (field.to_string(), value)
+                }).collect::<Vec<_>>()
+            })
+        });
+        if output_cap_application.is_some() {
+            state.metrics.record_output_cap_applied(&trace_id);
+        }
+        let virtual_key_id = authenticated_key.map(|Extension(key)| key.id);
+        let memory_mode = memory_mode(&headers);
+        let inbound_telemetry =
+            super::telemetry_seam::extract_inbound_context(&headers, state.telemetry_snapshot.enabled());
+        RequestOutputCapScope::new(output_cap_applied_value)
+            .with_metadata(output_cap_metadata)
+            .scope(async {
+            chat_completions_non_stream(
+                state,
+                request,
+                trace_id,
+                virtual_key_id,
+                memory_mode,
+                false,
+                crate::router::router::ToolCompressionRestore::default(),
+                inbound_telemetry,
+                // Legacy completions bodies carry no prompt-library field.
+                None,
+            )
+            .await
+        })
+        .await
 }
 // ---------------------------------------------------------------------------
 // Provider pass-through endpoints (Req 2.3-2.5)
@@ -14846,7 +14952,7 @@ pub async fn responses_create(
             .await
         }
     } else {
-        let chat_request = {
+        let mut chat_request = {
             let history = if let Some(prev_id) = &request.previous_response_id {
                 match state.responses_store.get_response(&owner_id, prev_id) {
                     Ok(Some(stored)) => Some(StoredConversation {
@@ -14910,30 +15016,56 @@ pub async fn responses_create(
                 }
             }
         };
+let output_cap_application = apply_request_output_cap(
+&state,
+&mut chat_request,
+authenticated_key.as_ref().map(|Extension(key)| key),
+)
+.await;
+if output_cap_application.is_some() {
+// Translation duplicates max_tokens in extra, which can overwrite
+// the clamped typed field during serialization.
+chat_request.extra.remove("max_tokens");
+state.metrics.record_output_cap_applied(&trace_id);
+}
+        let output_cap_applied_value = output_cap_application.as_ref().map(|a| a.applied_value);
+        let output_cap_metadata = output_cap_application.as_ref().map(|app| {
+            serde_json::json!({
+                "applied_value": app.applied_value,
+                "originals": app.originals.iter().map(|(field, value)| {
+                    (field.to_string(), value)
+                }).collect::<Vec<_>>()
+            })
+        });
 
-        if request.stream {
-            responses_create_stream(
-                state,
-                request,
-                chat_request,
-                trace_id,
-                owner_id,
-                active_handle,
-                request_guard,
-            )
+        RequestOutputCapScope::new(output_cap_applied_value)
+            .with_metadata(output_cap_metadata)
+            .scope(async {
+                if request.stream {
+                    responses_create_stream(
+                        state,
+                        request,
+                        chat_request,
+                        trace_id,
+                        owner_id,
+                        active_handle,
+                        request_guard,
+                    )
+                    .await
+                } else {
+                    responses_create_buffered(
+                        state,
+                        request,
+                        chat_request,
+                        trace_id,
+                        owner_id,
+                        active_handle,
+                        request_guard,
+                    )
+                    .await
+                }
+            })
             .await
-        } else {
-            responses_create_buffered(
-                state,
-                request,
-                chat_request,
-                trace_id,
-                owner_id,
-                active_handle,
-                request_guard,
-            )
-            .await
-        }
     }
 }
 

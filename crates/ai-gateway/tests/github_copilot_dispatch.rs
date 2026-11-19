@@ -153,6 +153,7 @@ fn test_group(models: Vec<ProviderModel>) -> ModelGroup {
         compression: None,
         structured_output: None,
         memory: None,
+        max_output_tokens: None,
         models,
     }
 }

@@ -238,6 +238,7 @@ async fn same_prefix_requests_stick_to_serving_provider() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![
             model("primary", "m-primary", 1, 1.0, 1.0, None, None, None),
             model("backup", "m-backup", 2, 1.0, 1.0, None, None, None),
@@ -318,6 +319,7 @@ async fn cache_aware_cost_sort_prefers_read_discounted_provider() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![
             model(
                 "discounted",
@@ -363,6 +365,7 @@ async fn disabled_cache_sort_keeps_base_price_order() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![
             model(
                 "discounted",
@@ -408,6 +411,7 @@ async fn explicit_cache_provider_receives_breakpoint_markers() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![model(
             "anthropic-ish",
             "m-explicit",
@@ -454,6 +458,7 @@ async fn automatic_provider_gets_no_markers_and_discounted_cost() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![model(
             "openai-ish",
             "m-auto",
@@ -519,6 +524,7 @@ async fn metrics_snapshot_contains_cache_telemetry() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![model(
             "anthropic-ish",
             "m-auto",
@@ -577,6 +583,7 @@ async fn sqlite_request_log_persists_cache_fields() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![model(
             "anthropic-ish",
             "m-auto",
@@ -660,6 +667,7 @@ async fn successful_failover_repins_sticky_entry_and_increments_counter() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![
             model("primary", "m-primary", 1, 1.0, 1.0, None, None, None),
             model("backup", "m-backup", 2, 1.0, 1.0, None, None, None),
@@ -763,6 +771,7 @@ async fn same_provider_success_does_not_increment_repin_counter() {
         compression: None,
         memory: None,
         structured_output: None,
+        max_output_tokens: None,
         models: vec![model("solo", "m-solo", 1, 1.0, 1.0, None, None, None)],
     }];
     common::isolate_databases(&mut config);
@@ -809,6 +818,7 @@ async fn sticky_repin_writes_no_extra_ledger_rows() {
             compression: None,
             memory: None,
             structured_output: None,
+            max_output_tokens: None,
             models: vec![
                 model("primary", "m-primary", 1, 1.0, 1.0, None, None, None),
                 model("backup", "m-backup", 2, 1.0, 1.0, None, None, None),

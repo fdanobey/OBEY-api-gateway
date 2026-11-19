@@ -166,6 +166,7 @@ mod tests {
                 memory: None,
                 compression: None,
                 structured_output: None,
+                max_output_tokens: None,
                 models: vec![ProviderModel {
                     provider: "test".to_string(),
                     model: "gpt-4".to_string(),

@@ -1015,10 +1015,14 @@ pub struct ModelGroup {
     /// Optional model-group persistent-memory override.
     #[serde(default)]
     pub memory: Option<ModelGroupMemoryOverride>,
-    /// Optional model-group structured-output override.
-    #[serde(default)]
-    pub structured_output: Option<StructuredOutputOverride>,
-    pub models: Vec<ProviderModel>,
+ /// Optional model-group structured-output override.
+ #[serde(default)]
+ pub structured_output: Option<StructuredOutputOverride>,
+ /// Optional output-token ceiling for this group (response-output-caps,
+ /// Req 2.1). `None` = no group-level cap.
+ #[serde(default)]
+ pub max_output_tokens: Option<u32>,
+ pub models: Vec<ProviderModel>,
 }
 
 /// Provider model configuration

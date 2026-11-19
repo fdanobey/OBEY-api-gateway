@@ -203,9 +203,10 @@ fn stored_to_authenticated(stored: &StoredVirtualKey) -> AuthenticatedKey {
         current_spend_usd: stored.current_spend_usd,
         current_tokens_used: stored.current_tokens_used,
         window_start: stored.window_start,
-        requests_per_minute: stored.requests_per_minute,
-        tokens_per_minute: stored.tokens_per_minute,
-        model_access: stored.model_access_list.clone(),
+ requests_per_minute: stored.requests_per_minute,
+ tokens_per_minute: stored.tokens_per_minute,
+ max_output_tokens: stored.max_output_tokens,
+ model_access: stored.model_access_list.clone(),
         expires_at: stored.expires_at,
         loop_detection: stored.loop_detection.clone(),
         priority: stored.priority,
@@ -736,20 +737,21 @@ mod tests {
         (mgr, temp)
     }
 
-    fn defaults() -> CreateKeyParams {
-        CreateKeyParams {
-            name: None,
-            budget_limit_usd: None,
-            token_budget: None,
-            budget_window: None,
-            requests_per_minute: None,
-            tokens_per_minute: None,
-            model_access: None,
-            expires_in: None,
-            loop_detection: None,
-            priority: None,
-            }
-    }
+ fn defaults() -> CreateKeyParams {
+ CreateKeyParams {
+ name: None,
+ budget_limit_usd: None,
+ token_budget: None,
+ budget_window: None,
+ requests_per_minute: None,
+ tokens_per_minute: None,
+ max_output_tokens: None,
+ model_access: None,
+ expires_in: None,
+ loop_detection: None,
+ priority: None,
+ }
+ }
 
     /// A stored key authenticates successfully and carries its stored fields.
     #[tokio::test]
@@ -886,20 +888,57 @@ mod tests {
         let authed = mgr.authenticate(&created.key).await.unwrap();
         assert_eq!(authed.priority, 10);
 
-        // PATCH the priority to 50; the update invalidates the cache, so the
-        // next authentication refreshes the served priority without a restart.
-        mgr.update_key(
-            &created.id,
-            crate::virtual_keys::models::UpdateKeyParams {
-                priority: Some(Some(50)),
-                ..Default::default()
-            },
-        )
+    // PATCH the priority to 50; the update invalidates the cache, so the
+    // next authentication refreshes the served priority without a restart.
+    mgr.update_key(
+        &created.id,
+        crate::virtual_keys::models::UpdateKeyParams {
+            priority: Some(Some(50)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let authed = mgr.authenticate(&created.key).await.unwrap();
+    assert_eq!(authed.priority, 50);
+}
+
+/// Output-caps Req 1.7: authenticate serves the stored `max_output_tokens`
+/// on the slow path, the cached fast path, and after a PATCH refreshes it
+/// without a restart.
+#[tokio::test]
+async fn authenticated_key_carries_max_output_tokens_from_store() {
+    let (mgr, _tmp) = temp_manager();
+    let created = mgr
+        .create_key(CreateKeyParams {
+            max_output_tokens: Some(1_024),
+            ..defaults()
+        })
         .await
         .unwrap();
-        let authed = mgr.authenticate(&created.key).await.unwrap();
-        assert_eq!(authed.priority, 50);
-    }
+
+    // Slow path: fresh load from the store carries the cap.
+    let authed = mgr.authenticate(&created.key).await.unwrap();
+    assert_eq!(authed.max_output_tokens, Some(1_024));
+
+    // Fast path: the cached entry serves the same cap.
+    let authed = mgr.authenticate(&created.key).await.unwrap();
+    assert_eq!(authed.max_output_tokens, Some(1_024));
+
+    // PATCH the cap to 512; the update invalidates the cache, so the next
+    // authentication refreshes the served cap without a restart (Req 1.7).
+    mgr.update_key(
+        &created.id,
+        crate::virtual_keys::models::UpdateKeyParams {
+            max_output_tokens: Some(Some(512)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let authed = mgr.authenticate(&created.key).await.unwrap();
+    assert_eq!(authed.max_output_tokens, Some(512));
+}
 
     /// Encryption round-trip smoke check so `secrets` linkage is exercised.
     #[test]

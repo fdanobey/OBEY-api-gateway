@@ -192,6 +192,7 @@ async fn abandoned_stream_outcome_row_carries_virtual_key_attribution() {
             budget_window: None,
             requests_per_minute: None,
             tokens_per_minute: None,
+            max_output_tokens: None,
             model_access: None,
             expires_in: None,
             loop_detection: None,

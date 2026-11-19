@@ -265,6 +265,7 @@ async fn cost_attributed_request_persists_spend_to_store() {
         compression: None,
         structured_output: None,
         memory: None,
+        max_output_tokens: None,
         models: vec![expensive_model()],
     }];
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -321,6 +322,7 @@ async fn provider_budget_window_resets_lazily() {
         compression: None,
         structured_output: None,
         memory: None,
+        max_output_tokens: None,
         models: vec![expensive_model()],
     }];
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -413,6 +415,7 @@ async fn manual_policy_never_rolls_over() {
         compression: None,
         structured_output: None,
         memory: None,
+        max_output_tokens: None,
         models: vec![expensive_model()],
     }];
     let server = GatewayServer::new(config, None).await.unwrap();

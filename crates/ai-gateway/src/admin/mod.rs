@@ -3680,14 +3680,15 @@ mod tests {
             prop::bool::ANY,
             prop::collection::vec(arb_provider_model(provider_name), 1..=3),
         )
-            .prop_map(|(name, vf, models)| ModelGroup {
-                name,
-                version_fallback_enabled: vf,
-                compression: None,
-                structured_output: None,
-                memory: None,
-                models,
-            })
+ .prop_map(|(name, vf, models)| ModelGroup {
+ name,
+ version_fallback_enabled: vf,
+ compression: None,
+ structured_output: None,
+ memory: None,
+ max_output_tokens: None,
+ models,
+ })
     }
 
     fn arb_config() -> impl Strategy<Value = Config> {
@@ -4437,6 +4438,7 @@ retry:
                 compression: None,
                 structured_output: None,
                 memory: None,
+                max_output_tokens: None,
                 models: vec![ProviderModel {
                     cache_support: None,
                     cache_min_tokens: None,

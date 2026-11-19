@@ -185,6 +185,7 @@ impl ProviderSelectionFixture {
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models,
         }
     }
@@ -578,6 +579,7 @@ async fn provider_order_matches_reference_policy_fixed_scenarios() {
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: scenario.models.clone(),
         };
 
@@ -659,6 +661,7 @@ async fn provider_order_matches_reference_policy_generated_scenarios() {
             compression: None,
             structured_output: None,
             memory: None,
+            max_output_tokens: None,
             models: models.clone(),
         };
 
@@ -725,21 +728,22 @@ fn test_config() -> Config {
             instructions_override: None,
             max_rate_limit_cooldown_seconds: None,
         }],
-        model_groups: vec![ModelGroup {
-            name: "test-group".to_string(),
-            version_fallback_enabled: false,
-            compression: None,
-            memory: None,
-            structured_output: None,
-            models: vec![ProviderModel {
-                cache_support: None,
-                cache_min_tokens: None,
-                cost_per_million_cache_read_input_tokens: None,
-                cost_per_million_cache_creation_input_tokens: None,
-                provider: "test-provider".to_string(),
-                model: "gpt-4".to_string(),
-                cost_per_million_input_tokens: 30.0,
-                cost_per_million_output_tokens: 60.0,
+ model_groups: vec![ModelGroup {
+ name: "test-group".to_string(),
+ version_fallback_enabled: false,
+ compression: None,
+ memory: None,
+ structured_output: None,
+ max_output_tokens: None,
+ models: vec![ProviderModel {
+ cache_support: None,
+ cache_min_tokens: None,
+ cost_per_million_cache_read_input_tokens: None,
+ cost_per_million_cache_creation_input_tokens: None,
+ provider: "test-provider".to_string(),
+ model: "gpt-4".to_string(),
+ cost_per_million_input_tokens: 30.0,
+ cost_per_million_output_tokens: 60.0,
                 priority: 100,
                 structured_output_passthrough: None,
                 tier: None,
@@ -1540,6 +1544,7 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
                 compression: None,
                 structured_output: None,
                 memory: None,
+                max_output_tokens: None,
                 models,
             }
         })

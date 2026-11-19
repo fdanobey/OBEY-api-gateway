@@ -580,6 +580,7 @@ mod tests {
             compression: None,
             memory: None,
             structured_output: None,
+            max_output_tokens: None,
             models: Vec::new(),
         }
     }
