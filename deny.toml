@@ -49,6 +49,12 @@ ignore = [
 # `tray` feature (adwaita CSD decorations on Linux; on Windows winit uses
 # the Win32 backend and this path is dead code in the shipped binary).
 { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; only reachable via winit sctk-adwaita decorations for the optional tray feature; dead code in the Windows build; no fixed release exists" },
+# chrono (RUSTSEC-2026-0543): crate flagged unmaintained upstream. It is the
+# workspace's core date/time crate (config windows, budget windows, logging,
+# forecasting), equivalent to std::time plus timezone/NaiveDate support; no
+# fixed release exists and no maintained drop-in replacement covers NaiveDate
+# arithmetic. Revisit if the advisory is withdrawn or a fork ships.
+{ id = "RUSTSEC-2026-0543", reason = "chrono unmaintained upstream; core date/time crate across config/budget/logging/forecasting with no maintained drop-in replacement; no fixed release exists" },
 ]
 yanked = "deny"
 unmaintained = "all"
