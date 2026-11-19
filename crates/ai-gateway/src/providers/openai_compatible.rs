@@ -25,6 +25,75 @@ fn resolve_header_value(value: &str) -> String {
     }
 }
 
+/// `format` values accepted by OpenAI strict structured-output schemas.
+const STRICT_SUPPORTED_FORMATS: [&str; 9] = [
+    "date-time", "time", "date", "duration", "email", "hostname", "ipv4", "ipv6", "uuid",
+];
+
+/// Drop `format` keywords OpenAI strict mode rejects (e.g. `base64`, `int64`,
+/// `uri`) from the parameter schemas of `strict: true` function tools.
+/// Non-strict tools and every other schema keyword are left untouched.
+/// Returns the number of removed keywords.
+fn sanitize_strict_tool_formats(request: &mut OpenAIRequest) -> usize {
+    let Some(tools) = request
+        .extra
+        .get_mut("tools")
+        .and_then(|t| t.as_array_mut())
+    else {
+        return 0;
+    };
+    let mut removed = 0;
+    for tool in tools {
+        let strict_top = tool.get("strict").and_then(|s| s.as_bool()) == Some(true);
+        if let Some(func) = tool.get_mut("function") {
+            if strict_top || func.get("strict").and_then(|s| s.as_bool()) == Some(true) {
+                if let Some(params) = func.get_mut("parameters") {
+                    removed += strip_unsupported_formats(params);
+                }
+            }
+        } else if strict_top {
+            if let Some(params) = tool.get_mut("parameters") {
+                removed += strip_unsupported_formats(params);
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::debug!(
+            removed,
+            "Removed unsupported `format` keywords from strict tool schemas"
+        );
+    }
+    removed
+}
+
+fn strip_unsupported_formats(schema: &mut serde_json::Value) -> usize {
+    let mut removed = 0;
+    match schema {
+        serde_json::Value::Object(map) => {
+            // Only string values are keywords; a property named "format"
+            // holds an object schema and is kept.
+            if map
+                .get("format")
+                .and_then(|f| f.as_str())
+                .is_some_and(|f| !STRICT_SUPPORTED_FORMATS.contains(&f))
+            {
+                map.remove("format");
+                removed += 1;
+            }
+            for child in map.values_mut() {
+                removed += strip_unsupported_formats(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                removed += strip_unsupported_formats(child);
+            }
+        }
+        _ => {}
+    }
+    removed
+}
+
 /// OpenAI-compatible provider client
 /// Supports any provider that implements the OpenAI API format
 pub struct OpenAICompatibleProvider {
@@ -97,8 +166,9 @@ impl OpenAICompatibleProvider {
 impl ProviderClient for OpenAICompatibleProvider {
     async fn chat_completion(
         &self,
-        request: OpenAIRequest,
+        mut request: OpenAIRequest,
     ) -> Result<ProviderResponse, GatewayError> {
+        sanitize_strict_tool_formats(&mut request);
         let start = Instant::now();
         let url = format!("{}/chat/completions", self.base_url);
 
@@ -138,9 +208,10 @@ impl ProviderClient for OpenAICompatibleProvider {
 
     async fn chat_completion_stream(
         &self,
-        request: OpenAIRequest,
+        mut request: OpenAIRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError>
     {
+        sanitize_strict_tool_formats(&mut request);
         let url = format!("{}/chat/completions", self.base_url);
 
         let response = self
@@ -248,6 +319,42 @@ struct ModelsResponse {
 mod tests {
     use super::*;
     use crate::models::openai::Message;
+
+    #[test]
+    fn strict_tool_unsupported_formats_are_stripped_but_supported_and_non_strict_kept() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tools".into(),
+            serde_json::json!([
+                {"type":"function","function":{"name":"a","strict":true,"parameters":{
+                    "type":"object","properties":{
+                        "data":{"type":"string","format":"base64"},
+                        "when":{"type":"string","format":"date-time"},
+                        "format":{"type":"string"}
+                    }}}},
+                {"type":"function","function":{"name":"b","parameters":{
+                    "type":"object","properties":{"data":{"type":"string","format":"base64"}}}}}
+            ]),
+        );
+        let mut req = OpenAIRequest {
+            model: "m".into(),
+            messages: vec![],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            extra,
+        };
+        assert_eq!(sanitize_strict_tool_formats(&mut req), 1);
+        let tools = &req.extra["tools"];
+        let props = &tools[0]["function"]["parameters"]["properties"];
+        assert!(props["data"].get("format").is_none());
+        assert_eq!(props["when"]["format"], "date-time");
+        assert!(props.get("format").is_some());
+        assert_eq!(
+            tools[1]["function"]["parameters"]["properties"]["data"]["format"],
+            "base64"
+        );
+    }
 
     #[test]
     fn test_resolve_header_value_env_var() {
