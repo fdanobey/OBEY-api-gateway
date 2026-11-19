@@ -35,8 +35,17 @@ use rusqlite::Connection;
 
 use crate::cost_reporting::{
     GroupBy, KeyUsageTotals, LedgerTotals, ProviderSpendTotals, ReconciliationReport,
-    ReportRow, ValidatedCostReportParams, ValidatedRange,
+    ReportRow, TrailingSpendTotals, ValidatedCostReportParams, ValidatedRange,
 };
+
+/// Length of the manual-window pace horizon, in days — mirrors
+/// [`crate::metrics::forecast::MANUAL_HORIZON_DAYS`] without coupling the
+/// SQL layer to the projection module (spec: spend-pace-forecasting D4;
+/// the forecast module owns the constant's authoritative meaning).
+const TRAILING_HORIZON_DAYS: i64 = 30;
+
+/// Seconds in one day, for horizon arithmetic.
+const TRAILING_SECONDS_PER_DAY: i64 = 86_400;
 
 /// Error returned by [`fetch_report_async`]: the SQL failure or the
 /// blocking-task join failure. Callers map this to the admin 500 JSON
@@ -465,6 +474,98 @@ impl LedgerColumns {
             parts.join(" + ")
         }
     }
+}
+
+/// Trailing-spend aggregate for manual-window run rates (spec:
+/// spend-pace-forecasting, Task 4 / design D4): the ledger inputs of
+/// [`crate::metrics::forecast::forecast_manual`] — the trailing 30-day
+/// micro-USD spend and the UTC-day depth of covered history.
+///
+/// `history_days` counts DISTINCT UTC days with at least one matching
+/// non-attempt row inside the horizon (design D5's "ledger history
+/// inside the trailing 30-day horizon"), NOT the span from the earliest
+/// covered day: a single request 20 days ago followed by silence is one
+/// day of history, not twenty, and must not unlock a run rate.
+///
+/// `now_epoch` anchors the horizon: the window is
+/// `[now - 30 days, now)` (start inclusive, end exclusive, matching the
+/// report range semantics) derived from `now_epoch` so the aggregate is
+/// deterministic for a fixed clock.
+///
+/// Call discipline: run via `tokio::task::spawn_blocking` exactly like
+/// [`fetch_report_async`]; the connection is whatever the caller owns.
+/// Read-only, parameterized throughout.
+pub fn fetch_trailing_spend(
+    conn: &Connection,
+    scope: TrailingScope<'_>,
+    now_epoch: i64,
+) -> Result<TrailingSpendTotals, QueryError> {
+    let columns = LedgerColumns::probe(conn)?;
+    let start_secs = now_epoch - TRAILING_HORIZON_DAYS * TRAILING_SECONDS_PER_DAY;
+
+    let mut sql = format!(
+        "SELECT \
+{cost_micro_usd} AS cost_micro_usd, \
+COUNT(DISTINCT strftime('%Y-%m-%d', timestamp, 'unixepoch')) AS history_days \
+FROM requests \
+WHERE timestamp >= ?1 AND timestamp < ?2 AND path NOT LIKE '%#attempt'",
+        cost_micro_usd = columns.cost_micro_usd_sum(),
+    );
+    let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> =
+        vec![Box::new(start_secs), Box::new(now_epoch)];
+
+    match scope {
+        TrailingScope::Provider(provider) => {
+            sql.push_str(" AND provider = ?");
+            bind_values.push(Box::new(provider.to_string()));
+        }
+        TrailingScope::Key(key_id) => match columns.key_column() {
+            Some(column) if column == "key_id" && key_id != UNATTRIBUTED => {
+                // Raw column equality (NOT the COALESCE normalization the
+                // report grouping uses): a specific key id never matches
+                // NULL/blank anyway, and the direct form is sargable by
+                // the requests(key_id, timestamp) index the logger adds
+                // (design D6) — the normalized expression would force a
+                // full range scan of the horizon.
+                sql.push_str(&format!(" AND {column} = ?"));
+                bind_values.push(Box::new(key_id.to_string()));
+            }
+            Some(column) => {
+                sql.push_str(&format!(
+                    " AND COALESCE(NULLIF(TRIM(CAST({column} AS TEXT)), ''), '{UNATTRIBUTED}') = ?"
+                ));
+                bind_values.push(Box::new(key_id.to_string()));
+            }
+            None => {
+                if key_id == UNATTRIBUTED {
+                    // No key column: every row is unattributed by
+                    // definition — the filter narrows nothing.
+                } else {
+                    sql.push_str(" AND 1 = 0");
+                }
+            }
+        },
+    }
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> =
+        bind_values.iter().map(|value| value.as_ref()).collect();
+    let (cost_micro_usd, history_days): (i64, i64) = conn.query_row(&sql, param_refs.as_slice(), |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
+    let history_days = u32::try_from(history_days).unwrap_or(u32::MAX);
+    Ok(TrailingSpendTotals {
+        cost_micro_usd,
+        history_days,
+    })
+}
+
+/// Budget scope of a [`fetch_trailing_spend`] aggregate: one provider
+/// (the provider budget scopes) or one virtual-key attribution bucket
+/// (the VK budget scopes, `unattributed` included).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrailingScope<'a> {
+    Provider(&'a str),
+    Key(&'a str),
 }
 
 /// Build the `WHERE` clause shared by every grouping: range bounds on

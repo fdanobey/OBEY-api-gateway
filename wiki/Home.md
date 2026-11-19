@@ -115,6 +115,7 @@ See [Installation](Installation) for all setup options.
 - **[Structured Output](Structured-Output)** — JSON Schema validation with corrective retries
 - **[Persistent Memory](Persistent-Memory)** — Cross-session memory extraction and injection
 - **[Virtual Keys](Virtual-Keys)** — Multi-tenant key management
+- **[Spend Pace Forecasting](Spend-Pace-Forecasting)** — Projected end-of-window spend, exhaustion dates, and `budget.forecast.warning` alerts
 - **[Guardrail Pipelines](Guardrail-Pipelines)** — Policy enforcement and PII protection
 - **[OAuth & Codex](OAuth-and-Codex)** — OpenAI OAuth and Codex backend
 - **[Admin Panel & Dashboard](Admin-Panel-and-Dashboard)** — Web UIs, API, metrics

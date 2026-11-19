@@ -72,6 +72,11 @@ tbody tr:hover{background:rgba(59,130,246,.06)}
 .badge-alert-warning{background:rgba(245,158,11,.15);color:var(--warning)}
 .badge-alert-exhausted{background:rgba(239,68,68,.15);color:var(--danger)}
 .badge-alert-reset{background:rgba(34,197,94,.15);color:var(--success)}
+.badge-alert-forecast{background:rgba(139,92,246,.15);color:#a78bfa}
+
+/* Spend-pace forecast cells (spend-pace-forecasting, Task 6) */
+.forecast-insufficient{color:var(--text-muted);font-style:italic}
+.forecast-exhausts{color:var(--warning);font-weight:600}
 
 /* Client protocol badges (anthropic-messages-front-door Req 6.3) */
 .badge-protocol-anthropic{background:rgba(217,119,6,.18);color:#d97706}
@@ -241,6 +246,7 @@ body.sec-banner-active{padding-top:3.2rem}
 <th data-sort="last_success">Last Success <span class="sort-arrow"></span></th>
 <th data-sort="budget_spent">Budget Spent <span class="sort-arrow"></span></th>
 <th data-sort="budget_remaining">Budget Remaining <span class="sort-arrow"></span></th>
+<th data-sort="budget_forecast">Forecast <span class="sort-arrow"></span></th>
  <th data-sort="budget_next_reset">Resets In <span class="sort-arrow"></span></th>
 <th data-sort="budget_exhausted">Budget State <span class="sort-arrow"></span></th>
 <th data-sort="last_failure_reason">Last Failure Reason <span class="sort-arrow"></span></th>
@@ -250,6 +256,25 @@ body.sec-banner-active{padding-top:3.2rem}
       </table>
     </div>
     <div class="empty" id="provider-empty">No provider data yet</div>
+
+    <h2 class="section-title" style="margin-top:1.5rem">Virtual Key Budgets</h2>
+    <p class="section-note" id="vk-budget-note">Server-derived budget status and spend-pace projection per virtual key (durable key store; no key values). Same forecast semantics as provider budgets.</p>
+    <div class="table-wrap">
+      <table id="vk-budget-table" aria-label="Virtual key budget status">
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Budget Spent</th>
+            <th>Budget Remaining</th>
+            <th>Forecast</th>
+            <th>Resets In</th>
+            <th>Budget State</th>
+          </tr>
+        </thead>
+        <tbody id="vk-budget-tbody"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="vk-budget-empty">No virtual key budgets yet</div>
 
     <h2 class="section-title" style="margin-top:1.5rem">Per-Model Circuit Breakers</h2>
     <div class="table-wrap">
@@ -824,16 +849,18 @@ return;
 wrap.hidden = false;
 empty.style.display='none';
 
-var typeCls = {
-'budget.warning': 'badge-alert-warning',
-'budget.exhausted': 'badge-alert-exhausted',
-'budget.reset': 'badge-alert-reset'
-};
-var typeLabel = {
-'budget.warning': 'warning',
-'budget.exhausted': 'exhausted',
-'budget.reset': 'reset'
-};
+ var typeCls = {
+ 'budget.warning': 'badge-alert-warning',
+ 'budget.exhausted': 'badge-alert-exhausted',
+ 'budget.reset': 'badge-alert-reset',
+ 'budget.forecast.warning': 'badge-alert-forecast'
+ };
+ var typeLabel = {
+ 'budget.warning': 'warning',
+ 'budget.exhausted': 'exhausted',
+ 'budget.reset': 'reset',
+ 'budget.forecast.warning': 'forecast'
+ };
 var html='';
  alerts.forEach(function(a){
  var etype = String(a.event_type||'');
@@ -912,6 +939,84 @@ if(b.limit_usd==null) return '—';
 return fmtCost(b.remaining_usd!=null?b.remaining_usd:0);
 }
 
+// --- Spend-pace forecast cells (spend-pace-forecasting, Task 6) ---
+// All values are server-provided in the status payload's `forecast`
+// field; the JS renders, NEVER derives. Absent/null forecast or no
+// limit renders nothing misleading.
+var FORECAST_METHOD_LABELS={
+window_pace:'window pace (spend-to-date extrapolated to the window end)',
+trailing_run_rate:'trailing 30-day run rate from the request ledger'
+};
+function forecastMethodTooltip(method){
+var label=FORECAST_METHOD_LABELS[method]||method||'';
+if(method==='window_pace'){
+return 'Projected end-of-window spend. Formula: pace = spent / elapsed seconds; projected = spent + pace × remaining seconds. Method: '+label+'. Not enough data yet when the window is under 5% elapsed.';
+}
+return 'Projected 30-day-horizon spend (manual window: no reset to extrapolate to). Formula: pace = trailing 30-day spend / 30; projected = spent + pace × 30. Method: '+label+'. Not enough data yet when the ledger covers fewer than 7 days.';
+}
+function forecastTooltip(f){
+var tip='Spend-pace projection. '+forecastMethodTooltip(f.method);
+if(f.status==='exhausts_within_window'&&f.projected_exhaustion_date){
+tip+=' Projected to exhaust the limit on '+f.projected_exhaustion_date+' ('+f.days_remaining+' day(s) remaining).';
+}
+return tip;
+}
+function forecastHtml(b){
+if(!b||b.limit_usd==null) return '—';
+var f=b.forecast;
+if(!f) return '—';
+if(f.status==='insufficient_data'){
+return '<span class="forecast-insufficient" title="Not enough data yet for an honest projection. '+esc(forecastMethodTooltip(f.method))+'">not enough data yet</span>';
+}
+var proj='<span title="'+esc(forecastTooltip(f))+'">→ '+fmtCost(f.projected_usd)+'</span>';
+if(f.status==='exhausts_within_window'&&f.projected_exhaustion_date!=null){
+var days=f.days_remaining!=null?' ('+f.days_remaining+'d)':'';
+proj+=' <span class="forecast-exhausts" title="'+esc(forecastTooltip(f))+'">by '+esc(f.projected_exhaustion_date)+esc(days)+'</span>';
+}
+return proj;
+}
+
+// --- Virtual key budget cells (spend-pace-forecasting, Task 6) ---
+// Renders the snapshot's budget_status_by_virtual_key list; all values
+// server-derived (durable key store), JS renders only.
+function renderVkBudgets(statuses){
+var tbody = $('vk-budget-tbody');
+var empty = $('vk-budget-empty');
+var table = document.getElementById('vk-budget-table');
+var wrap = table ? table.parentElement : null;
+if(!statuses || !statuses.length){
+tbody.innerHTML=''; /* xss-audit: static */
+if(wrap) wrap.hidden = true;
+empty.style.display='block';
+return;
+}
+if(wrap) wrap.hidden = false;
+empty.style.display='none';
+var nowSec = Math.floor(Date.now()/1000);
+var html='';
+statuses.forEach(function(b){
+var label = b.name ? esc(b.name)+' ' : '';
+var idHtml = '<span title="'+esc(b.key_id)+'">'+label+'<code>'+esc(String(b.key_id).slice(0,8))+'</code></span>';
+var state;
+if(b.exhausted){
+state='<span class="badge badge-exhausted" title="Spend meets or exceeds the configured budget limit">&#9888; Exhausted</span>';
+}else if(b.limit_usd!=null){
+state='<span class="badge badge-ok" title="Spend is under the configured budget limit">&#10003; OK</span>';
+}else{
+state='<span class="badge badge-window-manual" title="No budget limit configured">No limit</span>';
+}
+html+='<tr>'
++'<td>'+idHtml+'</td>'
++'<td>'+budgetSpentHtml(b)+'</td>'
++'<td>'+budgetRemainingHtml(b)+'</td>'
++'<td>'+forecastHtml(b)+'</td>'
++'<td>'+budgetResetsHtml(b, nowSec)+'</td>'
++'<td>'+state+'</td>'
++'</tr>';
+});
+tbody.innerHTML=html; /* xss-audit: escaped via esc() in builder */
+}
+
 function budgetStateHtml(b){
 if(!b) return '—';
 if(b.exhausted){
@@ -942,6 +1047,7 @@ return '<span class="badge badge-window-manual" title="No budget limit configure
 case 'last_success':va=a.last_success_timestamp||0;vb=b.last_success_timestamp||0;break;
  case 'budget_spent':va=(a.budgetStatus&&a.budgetStatus.spent_usd)||0;vb=(b.budgetStatus&&b.budgetStatus.spent_usd)||0;break;
  case 'budget_remaining':va=(a.budgetStatus&&a.budgetStatus.remaining_usd!=null)?a.budgetStatus.remaining_usd:-1;vb=(b.budgetStatus&&b.budgetStatus.remaining_usd!=null)?b.budgetStatus.remaining_usd:-1;break;
+case 'budget_forecast':va=(a.budgetStatus&&a.budgetStatus.forecast&&a.budgetStatus.forecast.projected_usd!=null)?a.budgetStatus.forecast.projected_usd:-1;vb=(b.budgetStatus&&b.budgetStatus.forecast&&b.budgetStatus.forecast.projected_usd!=null)?b.budgetStatus.forecast.projected_usd:-1;break;
  case 'budget_exhausted':va=a.budgetStatus&&a.budgetStatus.exhausted?1:0;vb=b.budgetStatus&&b.budgetStatus.exhausted?1:0;break;
  case 'budget_next_reset':va=(a.budgetStatus&&a.budgetStatus.next_reset_epoch!=null)?a.budgetStatus.next_reset_epoch:-1;vb=(b.budgetStatus&&b.budgetStatus.next_reset_epoch!=null)?b.budgetStatus.next_reset_epoch:-1;break;
 case 'last_failure_reason':va=a.last_failure_reason||'';vb=b.last_failure_reason||'';break;
@@ -998,9 +1104,10 @@ html+='<tr><td>'+esc(displayName)+'</td>'
 +'<td>'+(p.cache_prompt_hit_rate!=null?fmtPct(p.cache_prompt_hit_rate):'—')+'</td>'
 +'<td title="'+(p.cache_savings_cents||0)+' cents vs uncached baseline">'+fmtCost((p.cache_savings_cents||0)/100)+'</td>'
 +'<td>'+fmtTime(p.last_success_timestamp)+'</td>'
- +'<td>'+budgetSpentHtml(p.budgetStatus)+'</td>'
- +'<td>'+budgetRemainingHtml(p.budgetStatus)+'</td>'
- +'<td>'+budgetResetsHtml(p.budgetStatus, nowSec)+'</td>'
++'<td>'+budgetSpentHtml(p.budgetStatus)+'</td>'
++'<td>'+budgetRemainingHtml(p.budgetStatus)+'</td>'
++'<td>'+forecastHtml(p.budgetStatus)+'</td>'
++'<td>'+budgetResetsHtml(p.budgetStatus, nowSec)+'</td>'
  +'<td>'+budgetStateHtml(p.budgetStatus)+'</td>'
 +'<td>'+reasonHtml+'</td></tr>';
     });
@@ -1314,6 +1421,7 @@ tbody.appendChild(row);
 if(msg.type==='metrics'&&msg.data){
 renderMetrics(msg.data);
 renderProviders(msg.data.provider_health, msg.data.budget_status_by_provider);
+renderVkBudgets(msg.data.budget_status_by_virtual_key);
 renderBudgetAlerts(msg.data.recent_budget_alerts);
 renderCircuitBreakers(msg.data.circuit_breaker_states);
 renderCosts(msg.data.cost_by_provider, msg.data.cumulative_cost);
@@ -1381,6 +1489,7 @@ var compressionLevel=$('f-compression-level').value; if(compressionLevel) params
 .then(function(data){
 renderMetrics(data);
 renderProviders(data.provider_health, data.budget_status_by_provider);
+renderVkBudgets(data.budget_status_by_virtual_key);
 renderBudgetAlerts(data.recent_budget_alerts);
 renderCircuitBreakers(data.circuit_breaker_states);
 renderCosts(data.cost_by_provider, data.cumulative_cost);

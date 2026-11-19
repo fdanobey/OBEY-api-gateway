@@ -8,6 +8,7 @@ use crate::structured_output::metrics::StructuredOutputMetrics;
 
 mod provider_attempt;
 use provider_attempt::ProviderAttemptFailureMetrics;
+pub mod forecast;
 pub mod provider_budget_store;
 pub mod telemetry;
 use dashmap::DashMap;
@@ -647,6 +648,14 @@ pub struct MetricsSnapshot {
     /// via WS snapshots and `GET /dashboard/metrics`.
     #[serde(default)]
     pub budget_status_by_provider: HashMap<String, ProviderBudgetStatus>,
+    /// Server-derived per-virtual-key budget status (spec:
+    /// spend-pace-forecasting, Task 6) — the VK twin of
+    /// `budget_status_by_provider`, keyed by virtual-key id. Populated
+    /// from the durable key store (alert-safe columns only) during
+    /// dashboard snapshot assembly; empty while no keys carry budget
+    /// facts.
+    #[serde(default)]
+    pub budget_status_by_virtual_key: Vec<VirtualKeyBudgetStatus>,
     /// Newest budget-alert events (budget-alerts-unified-webhooks,
     /// Task 9, Req 5.4): newest first, capped at 20 server-side.
     /// Populated from the webhook ledger's 1-second-TTL-cached read
@@ -709,6 +718,49 @@ pub struct ProviderBudgetStatus {
     pub next_reset_epoch: Option<i64>,
     /// Whether the provider is currently budget-exhausted (spent >= limit).
     pub exhausted: bool,
+    /// Spend-pace projection (spec: spend-pace-forecasting, Task 6):
+    /// server-derived from durable state — windowed policies project
+    /// window-to-date pace to the window end, manual policies project a
+    /// trailing 30-day ledger run rate. `None` when no limit is
+    /// configured (nothing to project against) or the trailing-ledger
+    /// input was unavailable this cycle. Joined by the dashboard
+    /// snapshot builder; the JS renders, never derives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<crate::metrics::forecast::Forecast>,
+}
+
+/// Server-derived per-virtual-key budget status (spec:
+/// spend-pace-forecasting, Task 6) — the VK twin of
+/// [`ProviderBudgetStatus`]. Assembled from the durable key store's
+/// alert-safe rows (id/name/limit/window/spend/anchor — never the key
+/// value) during dashboard snapshot assembly and serialized next to the
+/// provider statuses; forecast semantics identical to the provider
+/// surface (`None` without a configured limit).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualKeyBudgetStatus {
+    /// Virtual-key id (never the `vk_` value).
+    pub key_id: String,
+    /// Human-readable key name, when set.
+    pub name: Option<String>,
+    /// Configured USD budget limit; `None` = spend-only row.
+    pub limit_usd: Option<f64>,
+    /// Spend accrued in the current budget window (durable store value).
+    pub spent_usd: f64,
+    /// `limit - spent`; `None` when no limit is configured.
+    pub remaining_usd: Option<f64>,
+    /// Reset policy for the window (the VK `budget_window` mapped onto
+    /// the same snake_case labels; `manual` for keys without a window).
+    pub window: crate::config::BudgetResetPolicy,
+    /// UTC epoch seconds the current window opened at (`0` when the row
+    /// carries no anchor yet).
+    pub window_start_epoch: i64,
+    /// Next UTC reset boundary (epoch seconds); `None` without a window.
+    pub next_reset_epoch: Option<i64>,
+    /// Whether the key is currently budget-exhausted (spent >= limit).
+    pub exhausted: bool,
+    /// Spend-pace projection — see [`ProviderBudgetStatus::forecast`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<crate::metrics::forecast::Forecast>,
 }
 
 /// One recent budget-alert event for the dashboard feed
@@ -846,12 +898,16 @@ impl Metrics {
                     // A missing/zero/legacy anchor cannot yield a meaningful next
                     // boundary (the epoch-0 fallback would promise a reset at some
                     // 1970-derived instant) — emit `None` instead.
-                    next_reset_epoch: (window_start_epoch > 0)
-                        .then(|| next_reset_epoch(policy, window_start_epoch.max(now_epoch)))
-                        .flatten(),
-                    exhausted,
-                };
-                (provider, status)
+            next_reset_epoch: (window_start_epoch > 0)
+                .then(|| next_reset_epoch(policy, window_start_epoch.max(now_epoch)))
+                .flatten(),
+            exhausted,
+            // The projection is joined later by the dashboard snapshot
+            // builder (manual scopes need a spawn_blocking ledger read —
+            // impossible inside this sync derivation).
+            forecast: None,
+        };
+        (provider, status)
             })
             .collect()
     }
@@ -897,8 +953,12 @@ impl Metrics {
 /// Monday 00:00 UTC, first-of-month 00:00 UTC — the same boundary math
 /// the rollover check and `next_reset_epoch` use), or "now" for manual.
 /// This is the insert-time row anchor for a provider's first durable
-/// spend accrual.
-fn current_window_start_for_policy(policy: crate::config::BudgetResetPolicy) -> i64 {
+/// spend accrual, and the fallback anchor the dashboard forecast
+/// enrichment uses when a windowed row carries no durable anchor (same
+/// boundary math, so the projection agrees with `next_reset_epoch`).
+pub fn current_window_start_for_policy(
+    policy: crate::config::BudgetResetPolicy,
+) -> i64 {
     use chrono::Datelike as _;
     let now = chrono::Utc::now();
     let fallback = now.timestamp();
@@ -3011,6 +3071,7 @@ Total unicode_stego provider detections by category and phase\n",
             circuit_breaker_states: Vec::new(),
             active_requests_list: Vec::new(),
             budget_status_by_provider: self.budget_status_by_provider(),
+            budget_status_by_virtual_key: Vec::new(),
             recent_budget_alerts: Vec::new(),
         }
     }

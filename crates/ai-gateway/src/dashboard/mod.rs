@@ -656,6 +656,7 @@ async fn build_dashboard_snapshot(state: &AppState) -> crate::metrics::MetricsSn
     snapshot.circuit_breaker_states = cb_states.clone();
     snapshot.enrich_circuit_breaker_states(&cb_states);
     snapshot.active_requests_list = state.active_requests.snapshot();
+    enrich_budget_forecasts(&mut snapshot, state).await;
     let ledger = std::sync::Arc::clone(&state.webhook_ledger);
     // Recent budget alerts (budget-alerts-unified-webhooks, Task 9,
     // Req 5.4): served from the ledger's 1-second-TTL-cached read so
@@ -708,6 +709,318 @@ async fn build_dashboard_snapshot(state: &AppState) -> crate::metrics::MetricsSn
         }
     };
     snapshot
+}
+
+/// Forecast enrichment timeout: a slow trailing-ledger read degrades to
+/// a missing forecast line for one cycle, never a stalled snapshot
+/// (spec: spend-pace-forecasting, Error Handling #1).
+const FORECAST_ENRICH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Manual-scope trailing-read cooldown (finding: timeout pileup): after
+/// a timed-out trailing read, manual-scope enrichment pauses for this
+/// interval so a persistently slow ledger cannot make every poll spawn
+/// another blocking task + read-only connection. Windowed forecasts are
+/// pure math and keep enriching while paused.
+const MANUAL_TRAILING_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Epoch-millis timestamp until which manual-scope trailing enrichment
+/// is paused (0 = not paused). Module-level because the dashboard is a
+/// stateless router over `AppState` — the cooldown is process-wide.
+static MANUAL_TRAILING_PAUSED_UNTIL_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Join spend-pace forecasts into the snapshot's budget-status
+/// surfaces (spec: spend-pace-forecasting, Task 6 / Reqs 1.6, 2.1-2.4).
+///
+/// Windowed scopes (daily/weekly/monthly) are pure math over facts the
+/// status derivation already carries — zero SQL. Manual scopes project
+/// a trailing 30-day ledger run rate: exactly one indexed
+/// [`fetch_trailing_spend`] SELECT per manual scope per read, all
+/// inside ONE blocking task bounded by a timeout (design D7's
+/// per-read cost bound). Scopes without a configured limit get no
+/// forecast (Req 1.6: nothing to project against); a query failure
+/// skips that scope's forecast for this cycle, never blocks the
+/// snapshot. VK statuses are assembled here too — the durable
+/// alert-safe key rows read in the same blocking task (id/name/limit/
+/// window/spend/anchor only, never the key value).
+///
+/// The `now` anchor is captured once so provider and VK projections in
+/// one snapshot agree, and so a fixed clock yields deterministic
+/// forecasts (the pure module's durability contract).
+async fn enrich_budget_forecasts(snapshot: &mut crate::metrics::MetricsSnapshot, state: &AppState) {
+use crate::config::BudgetResetPolicy;
+use crate::metrics::forecast::forecast_manual;
+
+let now = chrono::Utc::now();
+
+// (scope id, key id or None for provider scopes) of every
+// manual-window budget needing the trailing aggregate.
+let mut manual_scopes: Vec<(String, Option<String>)> = Vec::new();
+
+ // Provider scopes: windowed policies are pure math over facts the
+ // status derivation already carries (zero SQL); manual policies
+ // queue exactly one trailing aggregate each. Iterate by reference
+ // over the scoped facts, then apply each projection through a
+ // targeted get_mut — no whole-map clone.
+ let provider_facts: Vec<(String, Option<crate::metrics::forecast::Forecast>)> =
+ snapshot
+ .budget_status_by_provider
+ .iter()
+ .filter_map(|(provider, status)| {
+ let limit_usd = status.limit_usd?;
+ if status.window == BudgetResetPolicy::Manual {
+ manual_scopes.push((provider.clone(), None));
+ return None;
+ }
+ // No durable anchor yet (row never spent): fall back to the
+ // same current-period boundary math the status derivation
+ // uses, so the projection's window agrees with its
+ // `next_reset_epoch`.
+ let start_epoch = if status.window_start_epoch > 0 {
+ status.window_start_epoch
+ } else {
+ crate::metrics::current_window_start_for_policy(status.window)
+ };
+ let forecast = project_windowed_status(
+ limit_usd,
+ status.spent_usd,
+ status.window,
+ start_epoch,
+ status.next_reset_epoch,
+ now,
+ );
+ Some((provider.clone(), forecast))
+ })
+ .collect();
+ for (provider, forecast) in provider_facts {
+ if let Some(forecast) = forecast {
+ if let Some(target) = snapshot.budget_status_by_provider.get_mut(&provider) {
+ target.forecast = Some(forecast);
+ }
+ }
+ }
+
+    // VK statuses from the durable key store: alert-safe columns only
+    // (id/name/limit/window/spend/anchor — never the key value), read
+    // on the blocking pool via the manager's shared store handle.
+    let vk_rows: Vec<crate::virtual_keys::store::KeyBudgetState> = match state
+        .virtual_key_manager
+        .all_key_budget_states()
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(error = %error, "dashboard: VK budget-status read failed");
+            Vec::new()
+        }
+    };
+    let mut vk_statuses: Vec<crate::metrics::VirtualKeyBudgetStatus> =
+        Vec::with_capacity(vk_rows.len());
+    for row in vk_rows {
+        let window = vk_policy(row.budget_window);
+        let window_start_epoch = row.window_start.map(|ws| ws.timestamp()).unwrap_or(0);
+        let next_reset_epoch = if window_start_epoch > 0 {
+            crate::metrics::next_reset_epoch(window, window_start_epoch.max(now.timestamp()))
+        } else {
+            None
+        };
+        let mut status = crate::metrics::VirtualKeyBudgetStatus {
+            key_id: row.key_id.clone(),
+            name: row.name.clone(),
+            limit_usd: row.budget_limit_usd,
+            spent_usd: row.current_spend_usd,
+            remaining_usd: row
+                .budget_limit_usd
+                .map(|limit| (limit - row.current_spend_usd).max(0.0)),
+            window,
+            window_start_epoch,
+            next_reset_epoch,
+            exhausted: row
+                .budget_limit_usd
+                .is_some_and(|limit| row.current_spend_usd >= limit),
+            forecast: None,
+        };
+        if let Some(limit_usd) = status.limit_usd {
+            if window == BudgetResetPolicy::Manual {
+                manual_scopes.push((row.key_id.clone(), Some(row.key_id.clone())));
+            } else {
+                let start_epoch = if window_start_epoch > 0 {
+                    window_start_epoch
+                } else {
+                    crate::metrics::current_window_start_for_policy(window)
+                };
+                if let Some(forecast) = project_windowed_status(
+                    limit_usd,
+                    status.spent_usd,
+                    window,
+                    start_epoch,
+                    status.next_reset_epoch,
+                    now,
+                ) {
+                    status.forecast = Some(forecast);
+                }
+            }
+        }
+        vk_statuses.push(status);
+    }
+
+ // One blocking task runs every trailing aggregate this read needs
+ // (one indexed SELECT per manual scope), bounded by the timeout.
+ // Cooldown (timeout pileup): while paused after a recent timeout,
+ // skip the trailing read entirely — windowed forecasts above still
+ // enrich; manual scopes degrade to no forecast for this cycle.
+ let manual_paused = {
+ let now_ms = now.timestamp_millis();
+ now_ms
+ < MANUAL_TRAILING_PAUSED_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
+ };
+ let mut trailing: Vec<Option<crate::cost_reporting::TrailingSpendTotals>> =
+ Vec::new();
+ if !manual_scopes.is_empty() && !manual_paused {
+ let logs_db = state.logger.database_path().to_string();
+ let scopes = manual_scopes.clone();
+ trailing = match tokio::time::timeout(
+ FORECAST_ENRICH_TIMEOUT,
+ tokio::task::spawn_blocking(move || {
+ let conn = match rusqlite::Connection::open_with_flags(
+ &logs_db,
+ rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+ | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+ ) {
+ Ok(conn) => conn,
+ Err(error) => {
+ tracing::warn!(%error, "dashboard: logs.db open failed for trailing forecast");
+ return Vec::new();
+ }
+ };
+ let now_epoch = chrono::Utc::now().timestamp();
+ scopes
+ .into_iter()
+ .map(|(scope, key)| {
+ let trailing_scope = match key.as_deref() {
+ Some(key_id) => {
+ crate::cost_reporting::query::TrailingScope::Key(key_id)
+ }
+ None => {
+ crate::cost_reporting::query::TrailingScope::Provider(&scope)
+ }
+ };
+ crate::cost_reporting::query::fetch_trailing_spend(
+ &conn,
+ trailing_scope,
+ now_epoch,
+ )
+ .ok()
+ })
+ .collect::<Vec<Option<crate::cost_reporting::TrailingSpendTotals>>>()
+ }),
+ )
+ .await
+ {
+ Ok(Ok(totals)) => totals,
+ Ok(Err(error)) => {
+ tracing::warn!(error = %error, "dashboard: trailing forecast task failed");
+ Vec::new()
+ }
+ Err(_) => {
+ tracing::warn!(
+ "dashboard: trailing forecast read timed out; pausing manual-scope enrichment for {:?}",
+ MANUAL_TRAILING_COOLDOWN
+ );
+ MANUAL_TRAILING_PAUSED_UNTIL_MS.store(
+ now.timestamp_millis()
+ + MANUAL_TRAILING_COOLDOWN.as_millis() as i64,
+ std::sync::atomic::Ordering::Relaxed,
+ );
+ Vec::new()
+ }
+ };
+ } else if manual_paused && !manual_scopes.is_empty() {
+ tracing::debug!(
+ "dashboard: manual-scope trailing enrichment paused by cooldown"
+ );
+ }
+ for (index, (scope, key)) in manual_scopes.iter().enumerate() {
+ let Some(totals) = trailing.get(index).and_then(|total| total.as_ref()) else {
+ continue;
+ };
+ let trailing_usd = totals.cost_micro_usd as f64 / 1_000_000.0;
+            match key.as_deref() {
+                Some(key_id) => {
+                    if let Some(status) = vk_statuses
+                        .iter_mut()
+                        .find(|status| status.key_id == key_id)
+                    {
+                        status.forecast = Some(forecast_manual(
+                            status.limit_usd.unwrap_or_default(),
+                            status.spent_usd,
+                            trailing_usd,
+                            totals.history_days,
+                            now,
+                        ));
+                    }
+                }
+ None => {
+ if let Some(status) = snapshot.budget_status_by_provider.get_mut(scope) {
+ status.forecast = Some(forecast_manual(
+ status.limit_usd.unwrap_or_default(),
+ status.spent_usd,
+ trailing_usd,
+ totals.history_days,
+ now,
+ ));
+ }
+ }
+ }
+ }
+
+ snapshot.budget_status_by_virtual_key = vk_statuses;
+}
+
+/// Windowed projection from carried status facts: reuses the
+/// [`crate::metrics::next_reset_epoch`] boundary (falling back to the
+/// current-period boundary when the status row carries no anchor) so
+/// the projection never extrapolates past the configured reset.
+/// `None` when the boundary math fails (degrade to no forecast).
+fn project_windowed_status(
+    limit_usd: f64,
+    spent_usd: f64,
+    window: crate::config::BudgetResetPolicy,
+    window_start_epoch: i64,
+    next_reset_epoch: Option<i64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<crate::metrics::forecast::Forecast> {
+    use crate::metrics::forecast::forecast_windowed;
+    if window == crate::config::BudgetResetPolicy::Manual {
+        return None;
+    }
+    let end_epoch = next_reset_epoch
+        .filter(|epoch| *epoch > window_start_epoch)
+        .or_else(|| {
+            crate::metrics::next_reset_epoch(window, window_start_epoch.max(now.timestamp()))
+        })?;
+    let start = chrono::DateTime::from_timestamp(window_start_epoch, 0)?;
+    let end = chrono::DateTime::from_timestamp(end_epoch, 0)?;
+    Some(forecast_windowed(limit_usd, spent_usd, start, end, now))
+}
+
+/// Map a VK `budget_window` onto the provider-policy labels (`manual`
+/// for keys without a window) — the same labels the JS badge renders.
+fn vk_policy(
+    window: Option<crate::virtual_keys::models::BudgetWindow>,
+) -> crate::config::BudgetResetPolicy {
+    match window {
+        Some(crate::virtual_keys::models::BudgetWindow::Daily) => {
+            crate::config::BudgetResetPolicy::Daily
+        }
+        Some(crate::virtual_keys::models::BudgetWindow::Weekly) => {
+            crate::config::BudgetResetPolicy::Weekly
+        }
+        Some(crate::virtual_keys::models::BudgetWindow::Monthly) => {
+            crate::config::BudgetResetPolicy::Monthly
+        }
+        None => crate::config::BudgetResetPolicy::Manual,
+    }
 }
 
 /// Newest `limit` error rows: final outcomes AND `#attempt` rows (failed

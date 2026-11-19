@@ -527,18 +527,65 @@ impl GatewayServer {
                         let Some(budget) = &provider.budget else {
                             continue;
                         };
-                        if let Ok(Some(row)) = store.get_spend_and_window(&provider.name) {
-                            let warn_pct = budget.alert_threshold_percent.unwrap_or(80);
-                            alerts_for_seed.seed_from_recovered(
-                                ScopeRef::Provider {
-                                    name: provider.name.clone(),
-                                },
-                                row.0,
-                                budget.limit_usd,
-                                warn_pct,
-                                row.1,
-                            );
-                        }
+if let Ok(Some(row)) = store.get_spend_and_window(&provider.name) {
+let warn_pct = budget.alert_threshold_percent.unwrap_or(80);
+// Spend-pace-forecasting Component 4: seed the
+// forecast flag from the same conservatively-derived
+// window-pace projection the accrual path computes.
+// Manual scopes have no window pace: seed from the
+// durable trailing aggregate (spawn_blocking ledger
+// read; failure downgrades to None — conservative-
+// safe, Req 3.7), keeping the seeding conservative.
+let policy = budget.reset_policy.unwrap_or(crate::config::BudgetResetPolicy::Manual);
+let forecast = if policy == crate::config::BudgetResetPolicy::Manual {
+let db_path = config.logging.database_path.clone();
+let provider_name = provider.name.clone();
+let limit_usd = budget.limit_usd;
+let spent_usd = row.0;
+let now_epoch = chrono::Utc::now().timestamp();
+tokio::task::spawn_blocking(move || -> Option<crate::metrics::forecast::Forecast> {
+let conn = rusqlite::Connection::open_with_flags(
+db_path,
+rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+| rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+)
+.ok()?;
+let totals = crate::cost_reporting::query::fetch_trailing_spend(
+&conn,
+crate::cost_reporting::query::TrailingScope::Provider(&provider_name),
+now_epoch,
+)
+.ok()?;
+Some(crate::metrics::forecast::forecast_manual(
+limit_usd,
+spent_usd,
+totals.cost_micro_usd as f64 / 1_000_000.0,
+totals.history_days,
+chrono::DateTime::from_timestamp(now_epoch, 0)?,
+))
+})
+.await
+.ok()
+.flatten()
+} else {
+crate::webhooks::provider_hook::seed_projection(
+policy,
+budget.limit_usd,
+row.0,
+row.1,
+)
+};
+alerts_for_seed.seed_from_recovered(
+ScopeRef::Provider {
+name: provider.name.clone(),
+},
+row.0,
+budget.limit_usd,
+warn_pct,
+row.1,
+forecast.as_ref(),
+);
+}
                     }
                 }
                 // Post-persist evaluation funnel: the closure spawns the async
@@ -608,24 +655,82 @@ impl GatewayServer {
         if !config.webhooks.endpoints.is_empty() {
             let alerts_for_seed = provider_budget_alerts.alert_state().clone();
             let manager_for_seed = virtual_key_manager.clone();
+let logs_db_path = config.logging.database_path.clone();
             tokio::spawn(async move {
                 match manager_for_seed.all_key_budget_states().await {
                     Ok(states) => {
-                        for state in states {
+                    for state in states {
                             let Some(limit) = state.budget_limit_usd else {
                                 continue;
                             };
-                            let anchor = state.window_start.map(|ws| ws.timestamp()).unwrap_or(0);
-                            alerts_for_seed.seed_from_recovered(
-                                ScopeRef::VirtualKey {
-                                    key_id: state.key_id.clone(),
-                                    name: state.name.clone().unwrap_or_default(),
-                                },
-                                state.current_spend_usd,
-                                limit,
-                                80,
-                                anchor,
-                            );
+let anchor = state.window_start.map(|ws| ws.timestamp()).unwrap_or(0);
+// Spend-pace-forecasting Component 4: same
+// conservatively-derived window-pace seed as the
+// provider path. Lifetime keys have no window pace:
+// seed from the durable trailing aggregate attributed
+// to the key (spawn_blocking ledger read; failure
+// downgrades to None — conservative-safe, Req 3.7).
+let policy = match state.budget_window {
+Some(crate::virtual_keys::models::BudgetWindow::Daily) => {
+crate::config::BudgetResetPolicy::Daily
+}
+Some(crate::virtual_keys::models::BudgetWindow::Weekly) => {
+crate::config::BudgetResetPolicy::Weekly
+}
+Some(crate::virtual_keys::models::BudgetWindow::Monthly) => {
+crate::config::BudgetResetPolicy::Monthly
+}
+None => crate::config::BudgetResetPolicy::Manual,
+};
+let forecast = if policy == crate::config::BudgetResetPolicy::Manual {
+let db_path = logs_db_path.clone();
+let key_id = state.key_id.clone();
+let limit_usd = limit;
+let spent_usd = state.current_spend_usd;
+let now_epoch = chrono::Utc::now().timestamp();
+tokio::task::spawn_blocking(move || -> Option<crate::metrics::forecast::Forecast> {
+let conn = rusqlite::Connection::open_with_flags(
+db_path,
+rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+| rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+)
+.ok()?;
+let totals = crate::cost_reporting::query::fetch_trailing_spend(
+&conn,
+crate::cost_reporting::query::TrailingScope::Key(&key_id),
+now_epoch,
+)
+.ok()?;
+Some(crate::metrics::forecast::forecast_manual(
+limit_usd,
+spent_usd,
+totals.cost_micro_usd as f64 / 1_000_000.0,
+totals.history_days,
+chrono::DateTime::from_timestamp(now_epoch, 0)?,
+))
+})
+.await
+.ok()
+.flatten()
+} else {
+crate::webhooks::provider_hook::seed_projection(
+policy,
+limit,
+state.current_spend_usd,
+anchor,
+)
+};
+                    alerts_for_seed.seed_from_recovered(
+                        ScopeRef::VirtualKey {
+                            key_id: state.key_id.clone(),
+                            name: state.name.clone().unwrap_or_default(),
+                        },
+                        state.current_spend_usd,
+                        limit,
+                        80,
+                        anchor,
+                        forecast.as_ref(),
+                    );
                         }
                     }
                     Err(error) => {

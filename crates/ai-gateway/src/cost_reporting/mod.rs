@@ -463,6 +463,22 @@ pub struct KeyUsageTotals {
     pub cost_micro_usd: i64,
 }
 
+/// Trailing 30-day ledger spend for one budget scope (spec:
+/// spend-pace-forecasting, Task 4) — the durable run-rate inputs of the
+/// manual-window projection, in integer micro-USD plus the UTC-day
+/// depth of covered history (design D4/D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TrailingSpendTotals {
+    /// Integer micro-USD spent inside the trailing 30-day horizon,
+    /// `#attempt` marker rows excluded; serialized as `cost_usd`.
+    #[serde(rename = "cost_usd", serialize_with = "ser_cost_usd")]
+    pub cost_micro_usd: i64,
+    /// DISTINCT UTC days with at least one matching ledger row inside
+    /// the horizon — the manual-window insufficient-data gate's input
+    /// (design D5).
+    pub history_days: u32,
+}
+
 /// Reconciliation report comparing the request log ledger against the
 /// provider budget store and virtual-key usage store for a window
 /// (Requirement 3). `difference_usd` is ledger minus provider spend,

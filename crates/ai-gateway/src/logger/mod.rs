@@ -673,6 +673,19 @@ impl RequestLogger {
             [],
         )?;
 
+        // Key-attribution-first time range: covers the virtual-key-scoped
+        // trailing-spend aggregate (spec: spend-pace-forecasting, design D6).
+        // EXPLAIN (Task 4): without it the VK sum runs as a plain
+        // idx_requests_timestamp range scan filtering key_id per row; with it
+        // the seek is constrained by both key_id=? AND the timestamp range.
+        // Guarded (IF NOT EXISTS) and additive: re-opening an existing
+        // database is a no-op, and per-row cost is confined to writes on a
+        // nullable column that is NULL for unauthenticated traffic.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_requests_key_id_timestamp ON requests(key_id, timestamp)",
+            [],
+        )?;
+
         Ok(())
     }
 

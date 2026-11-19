@@ -2730,6 +2730,7 @@ body.sec-banner-active{padding-top:3.2rem}
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-exhausted" value="budget.exhausted" disabled><label for="wh-f-event-exhausted">budget.exhausted</label></div>
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-reset" value="budget.reset" disabled><label for="wh-f-event-reset">budget.reset</label></div>
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-model-deprecated" value="model.deprecated" disabled><label for="wh-f-event-model-deprecated">model.deprecated</label></div>
+<div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-forecast" value="budget.forecast.warning" disabled><label for="wh-f-event-forecast">budget.forecast.warning</label></div>
 </div>
 </div>
 <div class="hint">Unchecking "All" enables per-event filtering. At least one event must be selected.</div>
@@ -8836,7 +8837,7 @@ document.getElementById('mem-qdrant-recreate').addEventListener('click', functio
   });
 
   // --- Webhooks UI Logic (budget-alerts-unified-webhooks, Req 5.1, 5.2, 5.5) ---
-var WH_EVENTS = ['budget.warning', 'budget.exhausted', 'budget.reset', 'model.deprecated'];
+var WH_EVENTS = ['budget.warning', 'budget.exhausted', 'budget.reset', 'model.deprecated', 'budget.forecast.warning'];
 
 // --- Tracing UI Logic (opentelemetry-trace-export, Req 8.1, 8.2, 7.3) ---
 // otelState.headers holds editor rows; a value left equal to the

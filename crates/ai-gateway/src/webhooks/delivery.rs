@@ -814,6 +814,7 @@ fn budget_event_type_name(event_type: &BudgetEventType) -> &'static str {
         BudgetEventType::BudgetExhausted => "budget.exhausted",
         BudgetEventType::BudgetReset => "budget.reset",
         BudgetEventType::ModelDeprecated => "model.deprecated",
+        BudgetEventType::BudgetForecastWarning => "budget.forecast.warning",
     }
 }
 
@@ -1134,6 +1135,7 @@ mod tests {
             window: Some("daily".to_string()),
             window_start: Some(1_735_689_600),
             reset_source: None,
+            forecast: None,
         })
     }
 

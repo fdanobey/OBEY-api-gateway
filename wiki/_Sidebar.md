@@ -24,6 +24,7 @@
 ### Access Control
 - [Virtual Keys](Virtual-Keys)
 - [Budgets & Alerts](Budgets-and-Alerts)
+- [Spend Pace Forecasting](Spend-Pace-Forecasting)
 - [Model Deprecation Alerts](Model-Deprecation-Alerts)
 - [Cost Reports](Cost-Reports)
 - [Guardrail Pipelines](Guardrail-Pipelines)

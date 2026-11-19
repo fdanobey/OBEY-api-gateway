@@ -424,7 +424,9 @@ tray:
 # Budget-alert webhooks (optional). Absent section or empty endpoints =
 # fully dormant (no enabled flag). Endpoints receive signed webhook
 # deliveries when provider budgets cross the warning threshold, hit
-# their limit, or reset. URLs must be https; plain http is allowed only
+# their limit, or reset, and when spend pace is forecast to exhaust a
+# budget inside its window (budget.forecast.warning). URLs must be https;
+# plain http is allowed only
 # for hosts listed in allowed_private_hosts (exact match — also permits
 # private/LAN addresses for those hosts).
 # Cost reports are read-only, zero-config, and documented at
@@ -433,7 +435,7 @@ tray:
 #   endpoints:
 #     - url: "https://hooks.example.com/budget-alerts"
 #       secret: "whsec_example" # Standard Webhooks HMAC key; omit for unsigned
-#       events: ["budget.warning", "budget.exhausted", "budget.reset"] # omit = all
+#       events: ["budget.warning", "budget.exhausted", "budget.reset", "budget.forecast.warning"] # omit = all
 #   allowed_private_hosts: [] # e.g. ["hooks.lan.local"]
 
 

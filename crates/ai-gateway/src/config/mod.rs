@@ -227,8 +227,9 @@ impl Default for SecurityConfig {
 /// event `type` strings receivers match on. The `webhook.test` type used
 /// for admin test sends is synthesized by the webhooks module and is not
 /// a configurable event filter value. `model.deprecated`
-/// (model-deprecation-alerts spec) rides the same filter; unset
-/// endpoint filters are default-on for it.
+/// (model-deprecation-alerts spec) and `budget.forecast.warning`
+/// (spend-pace-forecasting spec) ride the same filter; unset
+/// endpoint filters are default-on for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BudgetEventType {
     #[serde(rename = "budget.warning")]
@@ -239,6 +240,8 @@ pub enum BudgetEventType {
     BudgetReset,
     #[serde(rename = "model.deprecated")]
     ModelDeprecated,
+    #[serde(rename = "budget.forecast.warning")]
+    BudgetForecastWarning,
 }
 
 /// A single webhook receiver (budget-alerts-unified-webhooks, Req 3.1).

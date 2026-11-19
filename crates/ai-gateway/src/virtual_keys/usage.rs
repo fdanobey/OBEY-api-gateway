@@ -163,6 +163,21 @@ key_id: &str,
 match self.key_budget_state(key_id).await {
 Ok(Some(budget)) => {
 if budget.budget_limit_usd.is_some_and(|limit| limit > 0.0) {
+// Spend-pace-forecasting Component 4: derive the
+// VK projection from durable state alongside the
+// threshold facts, INSIDE the per-scope turnstile
+// the evaluation holds (same ordering guarantee as
+// the provider path; one turnstile implementation).
+// Windowed keys project by window pace to the
+// boundary `next_reset_epoch` computes for the
+// key's anchor; lifetime keys use the trailing
+// 30-day ledger run rate attributed to the key
+// (Req 3.7: a failed ledger read downgrades to
+// `None` — silent skip).
+let logs_db_path = {
+let guard = config.read().await;
+guard.logging.database_path.clone()
+};
 alerts
 .evaluate_virtual_key(
 config,
@@ -174,7 +189,8 @@ budget
 .window_start
 .map(|ws| ws.timestamp())
 .unwrap_or(0),
-vk_window_label(budget.budget_window.as_ref()),
+budget.budget_window.clone(),
+&logs_db_path,
 )
 .await;
 }
@@ -191,17 +207,88 @@ error = %error,
 }
 }
 
-/// Envelope `data.window` label for a virtual-key budget window.
-/// Keys without a periodic window accumulate for the key's lifetime
-/// (`lifetime`); the auth-front-door copy lives in `auth.rs` — this
-/// one serves the shared post-usage evaluation helper.
-fn vk_window_label(window: Option<&BudgetWindow>) -> &'static str {
-match window {
-Some(BudgetWindow::Daily) => "daily",
-Some(BudgetWindow::Weekly) => "weekly",
-Some(BudgetWindow::Monthly) => "monthly",
-None => "lifetime",
+/// Derive the virtual-key spend-pace projection from durable state
+/// (spend-pace-forecasting Component 4; Reqs 3.1, 3.7). Windowed keys
+/// are pure boundary math against the key's anchor — the same
+/// `next_reset_epoch` boundary math the rollover check uses. Keys
+/// without a periodic window use the trailing 30-day ledger aggregate
+/// attributed to the key through a `spawn_blocking` read-only ledger
+/// connection; any failure downgrades to `None` (silent skip,
+/// Req 3.7). The blocking ledger read is bounded by a 250 ms timeout
+/// (matching the dashboard's forecast bound) so the per-scope
+/// turnstile is never head-of-line blocked; a timeout is a silent
+/// skip. One `now_epoch` is captured up front and used for both the
+/// SQL horizon and the projection (single clock). A zero/absent
+/// window anchor cannot anchor a windowed projection; fall back to
+/// the policy's current window start (the dashboard guard) or
+/// `None` when even that is unknown.
+pub(crate) async fn virtual_key_forecast(
+window: Option<BudgetWindow>,
+limit_usd: f64,
+spent_usd: f64,
+window_anchor: i64,
+logs_db_path: &str,
+key_id: &str,
+) -> Option<(crate::metrics::forecast::Forecast, i64)> {
+use crate::metrics::forecast::{forecast_manual, forecast_windowed, MANUAL_HORIZON_DAYS};
+use crate::metrics::next_reset_epoch;
+let now = chrono::Utc::now();
+let policy = match window {
+Some(BudgetWindow::Daily) => crate::config::BudgetResetPolicy::Daily,
+Some(BudgetWindow::Weekly) => crate::config::BudgetResetPolicy::Weekly,
+Some(BudgetWindow::Monthly) => crate::config::BudgetResetPolicy::Monthly,
+None => crate::config::BudgetResetPolicy::Manual,
+};
+if policy == crate::config::BudgetResetPolicy::Manual {
+let now_epoch = now.timestamp();
+let key_id = key_id.to_string();
+let db_path = logs_db_path.to_string();
+let totals = match tokio::time::timeout(
+std::time::Duration::from_millis(250),
+tokio::task::spawn_blocking(move || -> Option<_> {
+let conn = rusqlite::Connection::open_with_flags(
+db_path,
+rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+| rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+)
+.ok()?;
+crate::cost_reporting::query::fetch_trailing_spend(
+&conn,
+crate::cost_reporting::query::TrailingScope::Key(&key_id),
+now_epoch,
+)
+.ok()
+})
+)
+.await
+{ Ok(Ok(Some(totals))) => totals, _ => return None };
+return Some((
+forecast_manual(
+limit_usd,
+spent_usd,
+totals.cost_micro_usd as f64 / 1_000_000.0,
+totals.history_days,
+now,
+),
+now_epoch + MANUAL_HORIZON_DAYS * 86_400,
+));
 }
+let anchor = if window_anchor <= 0 {
+crate::metrics::current_window_start_for_policy(policy)
+} else {
+window_anchor
+};
+if anchor <= 0 {
+return None;
+}
+let window_start = chrono::DateTime::from_timestamp(anchor, 0)?;
+let window_end_epoch =
+next_reset_epoch(policy, window_start.timestamp().max(now.timestamp()))?;
+let window_end = chrono::DateTime::from_timestamp(window_end_epoch, 0)?;
+Some((
+forecast_windowed(limit_usd, spent_usd, window_start, window_end, now),
+window_end_epoch,
+))
 }
 
 #[cfg(test)]

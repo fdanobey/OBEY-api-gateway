@@ -25,19 +25,17 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
-use wiremock::matchers::{method as wm_method, path as wm_path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::MockServer;
 
 use ai_gateway::config::*;
 use ai_gateway::gateway::GatewayServer;
 use ai_gateway::webhooks::events::{BudgetAlertEvent, Scope};
 
-const PROVIDER_NAME: &str = "budget-provider";
-const WEBHOOK_SECRET: &str = "whsec_test_secret";
-
-// ---------------------------------------------------------------------------
-// Config / plumbing helpers
-// ---------------------------------------------------------------------------
+use crate::common::{
+ configure_webhook_receiver, mount_ok_mock, mount_webhook_ok, post_chat,
+ verify_signature_and_parse, wait_for_deliveries, wait_for_store_spend, webhook_test_provider,
+ WEBHOOK_TEST_PROVIDER as PROVIDER_NAME,
+};
 
 fn base_config() -> Config {
     Config {
@@ -96,221 +94,6 @@ fn isolated_config(db_dir: &std::path::Path) -> Config {
     config
 }
 
-fn provider_with_budget(uri: &str, budget: Option<ProviderBudgetConfig>) -> Provider {
-    Provider {
-        name: PROVIDER_NAME.to_string(),
-        provider_type: "openai".to_string(),
-        base_url: Some(uri.to_string()),
-        api_key_env: None,
-        api_key_encrypted: None,
-        api_secret_env: None,
-        api_secret_encrypted: None,
-        auth_method: None,
-        resolved_api_key: None,
-        resolved_api_secret: None,
-        region: None,
-        timeout_seconds: 30,
-        ttfb_timeout_seconds: None,
-        total_timeout_seconds: None,
-        buffered_upstream_streaming: None,
-        rate_limit_max_wait_ms: None,
-        max_connections: 10,
-        rate_limit_per_minute: 0,
-        custom_headers: Default::default(),
-        user_agent: None,
-        connection_pool: ProviderConnectionPoolConfig::default(),
-        budget,
-        manual_models: vec![],
-        global_inference_profile: false,
-        cross_region_inference: false,
-        custom_vpc_endpoint: false,
-        prompt_caching: false,
-        compression: None,
-        reasoning: true,
-        codex_base_url_override: None,
-        codex_model_override: None,
-        instructions_override: None,
-        max_rate_limit_cooldown_seconds: None,
-        memory: None,
-    }
-}
-
-/// $1/M input, $2/M output → 1M prompt + 1M completion = $3.00 per call.
-fn expensive_model() -> ProviderModel {
-    ProviderModel {
-        provider: PROVIDER_NAME.to_string(),
-        model: "gpt-test".to_string(),
-        cost_per_million_input_tokens: 1.0,
-        cost_per_million_output_tokens: 2.0,
-        cost_per_million_cache_read_input_tokens: None,
-        cost_per_million_cache_creation_input_tokens: None,
-        cache_min_tokens: None,
-        cache_support: None,
-        structured_output_passthrough: None,
-        priority: 100,
-        tier: None,
-        context_window: 0,
-        specializations: vec![],
-        cost_per_million_reasoning_tokens: None,
-        reasoning_family: None,
-        reasoning_parameter: None,
-        deprecation_date: None,
-        replacement_model: None,
-    }
-}
-
-/// Point webhooks at the wiremock receiver: signed endpoint for every
-/// event type, with the receiver host allowlisted so the http URL
-/// passes config validation and the SSRF guard (Req 3.1, 4.5).
-fn configure_webhook_receiver(config: &mut Config, receiver: &MockServer) {
-    let url = receiver.uri();
-    let host = reqwest::Url::parse(&url)
-        .expect("wiremock url parses")
-        .host_str()
-        .expect("wiremock host")
-        .to_string();
-    config.webhooks = WebhooksConfig {
-        endpoints: vec![WebhookEndpoint {
-            url: format!("{url}/hook"),
-            secret: Some(WEBHOOK_SECRET.to_string()),
-            events: None,
-        }],
-        allowed_private_hosts: vec![host],
-    };
-}
-
-fn chat_body(turn: &str) -> Body {
-    Body::from(
-        serde_json::to_string(&serde_json::json!({
-            "model": "budget-group",
-            "messages": [{"role": "user", "content": format!("hello {turn}")}]
-        }))
-        .unwrap(),
-    )
-}
-
-/// Mount a mock chat-completions endpoint returning $3.00 of usage.
-async fn mount_ok_mock(upstream: &MockServer, expect: u64) {
-    let body = serde_json::json!({
-        "id": "chatcmpl-webhook-test",
-        "object": "chat.completion",
-        "created": 1700000000_i64,
-        "model": "gpt-test",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "ok"},
-            "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": 1_000_000,
-            "completion_tokens": 1_000_000,
-            "total_tokens": 2_000_000
-        }
-    });
-    Mock::given(wm_method("POST"))
-        .and(wm_path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(body))
-        .expect(expect)
-        .mount(upstream)
-        .await;
-}
-
-/// Mount the webhook receiver: 200 for every POST ( deliveries are
-/// one-shot in these tests — no retry backoff needed).
-async fn mount_webhook_ok(receiver: &MockServer) {
-    Mock::given(wm_method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(receiver)
-        .await;
-}
-
-async fn post_chat(app: axum::Router, turn: &str) -> StatusCode {
-    let req = Request::post("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(chat_body(turn))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    resp.status()
-}
-
-/// Poll until the receiver has at least `min` requests (off-path
-/// delivery is spawned; give the chain time to land).
-async fn wait_for_deliveries(receiver: &MockServer, min: usize) -> Vec<wiremock::Request> {
-    for _ in 0..200 {
-        let requests = receiver.received_requests().await.unwrap_or_default();
-        if requests.len() >= min {
-            return requests;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    panic!("webhook receiver never received {min} deliveries");
-}
-
-/// Poll the durable budget store until `provider`'s spend reaches at
-/// least `min_usd` (the accrual write is spawned off the response path).
-async fn wait_for_store_spend(server: &GatewayServer, provider: &str, min_usd: f64) {
-    let store = server
-        .state
-        .metrics
-        .provider_budget_store()
-        .expect("store attached");
-    for _ in 0..100 {
-        if let Ok(rows) = store.get_all() {
-            if let Some(row) = rows.iter().find(|row| row.provider == provider) {
-                if row.current_spend_usd >= min_usd {
-                    return;
-                }
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    panic!("durable spend for {provider} never reached {min_usd} USD");
-}
-
-/// Parse a delivered request into an event envelope + assert the
-/// Standard Webhooks signature over the exact body bytes (Req 3.4):
-/// `v1,base64(HMAC-SHA256(key, "{id}.{timestamp}.{body}"))` where the
-/// key is the base64-decoded secret (after the optional `whsec_`
-/// prefix strip).
-fn verify_signature_and_parse(request: &wiremock::Request) -> BudgetAlertEvent {
-    let headers = &request.headers;
-    let header_str = |name: &str| -> String {
-        headers
-            .get(name)
-            .unwrap_or_else(|| panic!("{name} header present"))
-            .to_str()
-            .expect("header value is ASCII")
-            .to_string()
-    };
-    let event_id = header_str("webhook-id");
-    let timestamp = header_str("webhook-timestamp");
-    let signature = header_str("webhook-signature");
-    let body = request.body.as_slice();
-
-    let key = ring::hmac::Key::new(
-        ring::hmac::HMAC_SHA256,
-        &ai_gateway::webhooks::delivery::signing_key(WEBHOOK_SECRET),
-    );
-    let mut payload = Vec::with_capacity(event_id.len() + timestamp.len() + body.len() + 2);
-    payload.extend_from_slice(event_id.as_bytes());
-    payload.push(b'.');
-    payload.extend_from_slice(timestamp.as_bytes());
-    payload.push(b'.');
-    payload.extend_from_slice(body);
-    let expected_tag = ring::hmac::sign(&key, &payload);
-    use base64::Engine as _;
-    let expected = format!(
-        "v1,{}",
-        base64::engine::general_purpose::STANDARD.encode(expected_tag.as_ref())
-    );
-    assert_eq!(
-        signature, expected,
-        "Standard Webhooks signature must verify over id.timestamp.body"
-    );
-
-    serde_json::from_slice(body).expect("body parses as a BudgetAlertEvent")
-}
-
 /// Poll the webhook ledger until it holds at least `min` events.
 async fn wait_for_ledger_events(server: &GatewayServer, min: usize) {
     for _ in 0..200 {
@@ -364,7 +147,7 @@ async fn spend_crossing_emits_signed_warning_then_exhausted() {
     let mut config = isolated_config(db_dir.path());
     // $5.00 limit: $3.00 (60%) then $6.00 (120% — warning + exhausted
     // cross on the same second accrual). Warn at the default 80% ($4).
-    config.providers = vec![provider_with_budget(
+    config.providers = vec![webhook_test_provider(
         &upstream.uri(),
         Some(ProviderBudgetConfig {
             limit_usd: 5.0,
@@ -372,14 +155,7 @@ async fn spend_crossing_emits_signed_warning_then_exhausted() {
             alert_threshold_percent: None,
         }),
     )];
-    config.model_groups = vec![ModelGroup {
-        name: "budget-group".to_string(),
-        version_fallback_enabled: false,
-        compression: None,
-        structured_output: None,
-        memory: None,
-        models: vec![expensive_model()],
-    }];
+    crate::common::webhook_with_expensive_group(&mut config);
     configure_webhook_receiver(&mut config, &receiver);
 
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -450,7 +226,7 @@ async fn no_refire_within_same_window_on_later_accrual() {
     // accrual of the warn line that must NOT re-fire (Req 1.5), #10
     // hits $30 = exhausted. Every request stays under the limit until
     // the last, so the router never budget-skips.
-    config.providers = vec![provider_with_budget(
+    config.providers = vec![webhook_test_provider(
         &upstream.uri(),
         Some(ProviderBudgetConfig {
             limit_usd: 30.0,
@@ -458,14 +234,7 @@ async fn no_refire_within_same_window_on_later_accrual() {
             alert_threshold_percent: None,
         }),
     )];
-    config.model_groups = vec![ModelGroup {
-        name: "budget-group".to_string(),
-        version_fallback_enabled: false,
-        compression: None,
-        structured_output: None,
-        memory: None,
-        models: vec![expensive_model()],
-    }];
+    crate::common::webhook_with_expensive_group(&mut config);
     configure_webhook_receiver(&mut config, &receiver);
 
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -522,7 +291,7 @@ async fn exhausted_window_rollover_emits_reset_with_new_anchor() {
     let budgets_db = db_dir.path().join("budgets.db");
 
     let mut config = isolated_config(db_dir.path());
-    config.providers = vec![provider_with_budget(
+    config.providers = vec![webhook_test_provider(
         &upstream.uri(),
         Some(ProviderBudgetConfig {
             limit_usd: 5.0,
@@ -530,14 +299,7 @@ async fn exhausted_window_rollover_emits_reset_with_new_anchor() {
             alert_threshold_percent: None,
         }),
     )];
-    config.model_groups = vec![ModelGroup {
-        name: "budget-group".to_string(),
-        version_fallback_enabled: false,
-        compression: None,
-        structured_output: None,
-        memory: None,
-        models: vec![expensive_model()],
-    }];
+    crate::common::webhook_with_expensive_group(&mut config);
     configure_webhook_receiver(&mut config, &receiver);
 
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -626,7 +388,7 @@ async fn admin_reset_emits_reset_event_with_admin_source() {
     let mut config = isolated_config(db_dir.path());
     // Manual window; no upstream needed — spend is accrued directly
     // into the store (the admin path only needs durable state).
-    config.providers = vec![provider_with_budget(
+    config.providers = vec![webhook_test_provider(
         "https://api.example.com/v1",
         Some(ProviderBudgetConfig {
             limit_usd: 5.0,
@@ -634,14 +396,7 @@ async fn admin_reset_emits_reset_event_with_admin_source() {
             alert_threshold_percent: None,
         }),
     )];
-    config.model_groups = vec![ModelGroup {
-        name: "budget-group".to_string(),
-        version_fallback_enabled: false,
-        compression: None,
-        structured_output: None,
-        memory: None,
-        models: vec![expensive_model()],
-    }];
+    crate::common::webhook_with_expensive_group(&mut config);
     configure_webhook_receiver(&mut config, &receiver);
 
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -689,15 +444,8 @@ async fn no_limit_provider_emits_no_events() {
     let mut config = isolated_config(db_dir.path());
     // Spend-only provider: accrual still persists (persistent budgets
     // Task 4), but no percentage thresholds exist (Req 1.9).
-    config.providers = vec![provider_with_budget(&upstream.uri(), None)];
-    config.model_groups = vec![ModelGroup {
-        name: "budget-group".to_string(),
-        version_fallback_enabled: false,
-        compression: None,
-        structured_output: None,
-        memory: None,
-        models: vec![expensive_model()],
-    }];
+    config.providers = vec![webhook_test_provider(&upstream.uri(), None)];
+    crate::common::webhook_with_expensive_group(&mut config);
     configure_webhook_receiver(&mut config, &receiver);
 
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -732,7 +480,7 @@ async fn dormant_config_emits_nothing_and_writes_no_ledger_rows() {
     // Same budget as the crossing test — but NO webhook endpoints. The
     // webhooks.db schema init is the dormancy contract's one allowed
     // artifact; no evaluation and no ledger rows may follow.
-    config.providers = vec![provider_with_budget(
+    config.providers = vec![webhook_test_provider(
         &upstream.uri(),
         Some(ProviderBudgetConfig {
             limit_usd: 5.0,
@@ -740,14 +488,7 @@ async fn dormant_config_emits_nothing_and_writes_no_ledger_rows() {
             alert_threshold_percent: None,
         }),
     )];
-    config.model_groups = vec![ModelGroup {
-        name: "budget-group".to_string(),
-        version_fallback_enabled: false,
-        compression: None,
-        structured_output: None,
-        memory: None,
-        models: vec![expensive_model()],
-    }];
+    crate::common::webhook_with_expensive_group(&mut config);
     config.webhooks = WebhooksConfig::default();
 
     let server = GatewayServer::new(config, None).await.unwrap();
@@ -802,7 +543,7 @@ async fn restart_parks_unfinished_delivery_chains() {
     let db_dir = tempfile::tempdir().expect("temp dir");
 
     let mut config = isolated_config(db_dir.path());
-    config.providers = vec![provider_with_budget(
+    config.providers = vec![webhook_test_provider(
         &upstream.uri(),
         Some(ProviderBudgetConfig {
             limit_usd: 5.0,
@@ -810,14 +551,7 @@ async fn restart_parks_unfinished_delivery_chains() {
             alert_threshold_percent: None,
         }),
     )];
-    config.model_groups = vec![ModelGroup {
-        name: "budget-group".to_string(),
-        version_fallback_enabled: false,
-        compression: None,
-        structured_output: None,
-        memory: None,
-        models: vec![expensive_model()],
-    }];
+    crate::common::webhook_with_expensive_group(&mut config);
     configure_webhook_receiver(&mut config, &receiver);
 
     let server = GatewayServer::new(config.clone(), None).await.unwrap();
@@ -900,7 +634,7 @@ async fn event_filtered_endpoint_skips_warning_delivery() {
     // $5 limit: request #1 = $3 (60%, nothing fires), request #2 → $6
     // (120%): warning AND exhausted both cross on the funnel — only
     // exhausted is subscribed.
-    config.providers = vec![provider_with_budget(
+    config.providers = vec![webhook_test_provider(
         &upstream.uri(),
         Some(ProviderBudgetConfig {
             limit_usd: 5.0,
@@ -908,14 +642,7 @@ async fn event_filtered_endpoint_skips_warning_delivery() {
             alert_threshold_percent: None,
         }),
     )];
-    config.model_groups = vec![ModelGroup {
-        name: "budget-group".to_string(),
-        version_fallback_enabled: false,
-        compression: None,
-        structured_output: None,
-        memory: None,
-        models: vec![expensive_model()],
-    }];
+    crate::common::webhook_with_expensive_group(&mut config);
     let url = receiver.uri();
     let host = reqwest::Url::parse(&url)
         .expect("wiremock url parses")
@@ -925,7 +652,7 @@ async fn event_filtered_endpoint_skips_warning_delivery() {
     config.webhooks = WebhooksConfig {
         endpoints: vec![WebhookEndpoint {
             url: format!("{url}/hook"),
-            secret: Some(WEBHOOK_SECRET.to_string()),
+            secret: Some(crate::common::WEBHOOK_TEST_SECRET.to_string()),
             events: Some(vec![BudgetEventType::BudgetExhausted]),
         }],
         allowed_private_hosts: vec![host],
@@ -998,7 +725,7 @@ async fn dashboard_snapshot_carries_recent_budget_alerts() {
     // crosses to $6 → warning + exhausted, exactly as the crossing
     // test — then a third request stays at 120% (no new rows, proving
     // the feed shows events, not accruals).
-    config.providers = vec![provider_with_budget(
+    config.providers = vec![webhook_test_provider(
         &upstream.uri(),
         Some(ProviderBudgetConfig {
             limit_usd: 5.0,
@@ -1006,14 +733,7 @@ async fn dashboard_snapshot_carries_recent_budget_alerts() {
             alert_threshold_percent: None,
         }),
     )];
-    config.model_groups = vec![ModelGroup {
-        name: "budget-group".to_string(),
-        version_fallback_enabled: false,
-        compression: None,
-        structured_output: None,
-        memory: None,
-        models: vec![expensive_model()],
-    }];
+    crate::common::webhook_with_expensive_group(&mut config);
     configure_webhook_receiver(&mut config, &receiver);
 
     let server = GatewayServer::new(config, None).await.unwrap();

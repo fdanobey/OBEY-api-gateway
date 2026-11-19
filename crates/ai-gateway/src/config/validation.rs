@@ -2109,9 +2109,54 @@ allowed_private_hosts: ["hooks.internal"]
 fn webhooks_unknown_event_name_rejected() {
     let yaml = r#"
 endpoints:
-  - url: "https://hooks.example.com/alerts"
-    events: ["budget.exploded"]
+ - url: "https://hooks.example.com/alerts"
+   events: ["budget.exploded"]
 "#;
+    assert!(serde_yaml::from_str::<WebhooksConfig>(yaml).is_err());
+}
+
+#[test]
+fn webhooks_forecast_event_in_default_filter_and_explicit_round_trip() {
+    // Unset endpoint filters subscribe to every event type, including
+    // budget.forecast.warning (spend-pace-forecasting, Req 3.1).
+    let yaml = r#"
+endpoints:
+ - url: "https://hooks.example.com/alerts"
+   events: ["budget.forecast.warning"]
+ - url: "https://hooks.example.com/all"
+    "#;
+    let webhooks: WebhooksConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(
+        webhooks.endpoints,
+        vec![
+            WebhookEndpoint {
+                url: "https://hooks.example.com/alerts".to_string(),
+                secret: None,
+                events: Some(vec![BudgetEventType::BudgetForecastWarning]),
+            },
+            WebhookEndpoint {
+                url: "https://hooks.example.com/all".to_string(),
+                secret: None,
+                events: None,
+            },
+        ]
+    );
+
+    // Round-trip: serialize → deserialize is identity, and the forecast
+    // event name serializes as the exact wire string receivers match on.
+    let serialized = serde_yaml::to_string(&webhooks).unwrap();
+    assert!(serialized.contains("budget.forecast.warning"));
+    let reparsed: WebhooksConfig = serde_yaml::from_str(&serialized).unwrap();
+    assert_eq!(reparsed, webhooks);
+}
+
+#[test]
+fn webhooks_unknown_forecast_event_variant_rejected() {
+    let yaml = r#"
+endpoints:
+ - url: "https://hooks.example.com/alerts"
+   events: ["budget.forecast.exhausted"]
+    "#;
     assert!(serde_yaml::from_str::<WebhooksConfig>(yaml).is_err());
 }
 
