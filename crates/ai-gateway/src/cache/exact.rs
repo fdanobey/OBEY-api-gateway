@@ -34,9 +34,10 @@ use crate::models::openai::OpenAIRequest;
 /// non-deterministic transport field like `user`, `request-id`, or trace
 /// metadata.
 const KEYED_EXTRA_FIELDS: &[&str] = &[
-    "tools",
-    "tool_choice",
-    "response_format",
+"tools",
+"tool_choice",
+"parallel_tool_calls",
+"response_format",
     "top_p",
     "frequency_penalty",
     "presence_penalty",
@@ -357,17 +358,32 @@ mod tests {
         assert!(c.get(&b).is_none());
     }
 
-    #[test]
-    fn unrelated_extra_fields_do_not_change_key() {
-        // user / request_id should not be part of the key
-        let c = ExactCache::new(&cfg());
-        let mut a = req(Some(0.0));
-        a.extra.insert("user".into(), serde_json::json!("alice"));
-        c.set(&a, "X".to_string());
-        let mut b = req(Some(0.0));
-        b.extra.insert("user".into(), serde_json::json!("bob"));
-        assert_eq!(c.get(&b).as_deref(), Some("X"));
-    }
+#[test]
+fn unrelated_extra_fields_do_not_change_key() {
+// user / request_id should not be part of the key
+let c = ExactCache::new(&cfg());
+let mut a = req(Some(0.0));
+a.extra.insert("user".into(), serde_json::json!("alice"));
+c.set(&a, "X".to_string());
+let mut b = req(Some(0.0));
+b.extra.insert("user".into(), serde_json::json!("bob"));
+assert_eq!(c.get(&b).as_deref(), Some("X"));
+}
+
+#[test]
+fn different_parallel_tool_calls_values_yield_different_keys() {
+// parallel_tool_calls changes generation behavior; a request that
+// differs only in that flag must never be served the other flag's
+// cached response.
+let c = ExactCache::new(&cfg());
+let mut a = req(Some(0.0));
+a.extra.insert("parallel_tool_calls".into(), serde_json::json!(true));
+let mut b = req(Some(0.0));
+b.extra.insert("parallel_tool_calls".into(), serde_json::json!(false));
+c.set(&a, "A".to_string());
+assert_eq!(c.get(&a).as_deref(), Some("A"));
+assert!(c.get(&b).is_none());
+}
 
     #[test]
     fn ineligible_request_neither_reads_nor_writes() {

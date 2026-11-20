@@ -130,10 +130,15 @@ impl<'a> ChatToResponsesTranslator<'a> {
                 .collect();
             env.insert("tools".to_string(), Value::Array(transformed));
         }
-        // tool_choice — forward unchanged (Req 2.7)
-        if let Some(tc) = req.extra.get("tool_choice") {
-            env.insert("tool_choice".to_string(), tc.clone());
-        }
+// tool_choice — forward unchanged (Req 2.7)
+if let Some(tc) = req.extra.get("tool_choice") {
+env.insert("tool_choice".to_string(), tc.clone());
+}
+// parallel_tool_calls — forward unchanged; the Responses API accepts
+// the same boolean shape Chat Completions does.
+if let Some(ptc) = req.extra.get("parallel_tool_calls") {
+env.insert("parallel_tool_calls".to_string(), ptc.clone());
+}
         // temperature — the Codex backend does NOT accept temperature on the
         // Responses API (returns "Unsupported parameter: temperature").
         // Strip it unconditionally for Codex dispatch.
@@ -722,14 +727,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn emit_reasoning_false_omits_reasoning_field() {
-        let mut t = translator();
-        t.emit_reasoning = false;
-        let req = req_with(vec![msg("user", json!("hi"))]);
-        let out = t.translate(&req).unwrap();
-        assert!(out.get("reasoning").is_none(), "reasoning leaked: {out:#}");
-    }
+#[test]
+fn emit_reasoning_false_omits_reasoning_field() {
+let mut t = translator();
+t.emit_reasoning = false;
+let req = req_with(vec![msg("user", json!("hi"))]);
+let out = t.translate(&req).unwrap();
+assert!(out.get("reasoning").is_none(), "reasoning leaked: {out:#}");
+}
+
+#[test]
+fn parallel_tool_calls_forwarded_unchanged() {
+// Chat Completions `parallel_tool_calls` maps 1:1 onto the Responses
+// API parameter of the same name — both `true` and `false` must reach
+// the envelope (a dropped flag silently changes tool-calling behavior).
+for value in [json!(true), json!(false)] {
+let mut req = req_with(vec![msg("user", json!("hi"))]);
+req.extra.insert("parallel_tool_calls".into(), value.clone());
+let out = translator().translate(&req).unwrap();
+assert_eq!(out["parallel_tool_calls"], value);
+}
+}
+
+#[test]
+fn parallel_tool_calls_absent_omits_field() {
+let req = req_with(vec![msg("user", json!("hi"))]);
+let out = translator().translate(&req).unwrap();
+assert!(
+out.get("parallel_tool_calls").is_none(),
+"parallel_tool_calls must not be invented when the client omitted it: {out:#}"
+);
+}
 
     #[test]
     fn emit_reasoning_true_includes_effort_and_summary() {
