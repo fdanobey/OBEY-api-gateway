@@ -30,11 +30,16 @@ const STRICT_SUPPORTED_FORMATS: [&str; 9] = [
     "date-time", "time", "date", "duration", "email", "hostname", "ipv4", "ipv6", "uuid",
 ];
 
-/// Drop `format` keywords OpenAI strict mode rejects (e.g. `base64`, `int64`,
-/// `uri`) from the parameter schemas of `strict: true` function tools.
-/// Non-strict tools and every other schema keyword are left untouched.
-/// Returns the number of removed keywords.
-pub(crate) fn sanitize_strict_tool_formats(request: &mut OpenAIRequest) -> usize {
+/// Drop `format` keywords outside OpenAI's strict-mode allowlist (e.g.
+/// `base64`, `int64`, `uri`) from every function tool's parameter schema.
+///
+/// Not gated on `strict: true`: OpenAI kept rejecting the whole request
+/// ("Invalid schema for 'tools[N].parameters': Unknown format: base64")
+/// when only strict-flagged tools were sanitized, so it validates formats
+/// for tools without the flag too. `format` is an annotation, so dropping
+/// it does not change which arguments the schema accepts. Returns the
+/// number of removed keywords.
+pub(crate) fn sanitize_tool_schema_formats(request: &mut OpenAIRequest) -> usize {
     let Some(tools) = request
         .extra
         .get_mut("tools")
@@ -44,23 +49,20 @@ pub(crate) fn sanitize_strict_tool_formats(request: &mut OpenAIRequest) -> usize
     };
     let mut removed = 0;
     for tool in tools {
-        let strict_top = tool.get("strict").and_then(|s| s.as_bool()) == Some(true);
-        if let Some(func) = tool.get_mut("function") {
-            if strict_top || func.get("strict").and_then(|s| s.as_bool()) == Some(true) {
-                if let Some(params) = func.get_mut("parameters") {
-                    removed += strip_unsupported_formats(params);
-                }
-            }
-        } else if strict_top {
-            if let Some(params) = tool.get_mut("parameters") {
-                removed += strip_unsupported_formats(params);
-            }
+        // Chat shape nests `parameters` under `function`; the flat Responses
+        // shape carries it on the tool itself.
+        let params = match tool.get_mut("function") {
+            Some(func) => func.get_mut("parameters"),
+            None => tool.get_mut("parameters"),
+        };
+        if let Some(params) = params {
+            removed += strip_unsupported_formats(params);
         }
     }
     if removed > 0 {
-        tracing::debug!(
+        tracing::info!(
             removed,
-            "Removed unsupported `format` keywords from strict tool schemas"
+            "Removed unsupported `format` keywords from tool schemas"
         );
     }
     removed
@@ -168,7 +170,7 @@ impl ProviderClient for OpenAICompatibleProvider {
         &self,
         mut request: OpenAIRequest,
     ) -> Result<ProviderResponse, GatewayError> {
-        sanitize_strict_tool_formats(&mut request);
+        sanitize_tool_schema_formats(&mut request);
         let start = Instant::now();
         let url = format!("{}/chat/completions", self.base_url);
 
@@ -211,7 +213,7 @@ impl ProviderClient for OpenAICompatibleProvider {
         mut request: OpenAIRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<SSEEvent, GatewayError>> + Send>>, GatewayError>
     {
-        sanitize_strict_tool_formats(&mut request);
+        sanitize_tool_schema_formats(&mut request);
         let url = format!("{}/chat/completions", self.base_url);
 
         let response = self
@@ -321,7 +323,7 @@ mod tests {
     use crate::models::openai::Message;
 
     #[test]
-    fn strict_tool_unsupported_formats_are_stripped_but_supported_and_non_strict_kept() {
+    fn unsupported_tool_formats_are_stripped_from_strict_and_non_strict_tools() {
         let mut extra = serde_json::Map::new();
         extra.insert(
             "tools".into(),
@@ -344,15 +346,17 @@ mod tests {
             max_tokens: None,
             extra,
         };
-        assert_eq!(sanitize_strict_tool_formats(&mut req), 1);
+        assert_eq!(sanitize_tool_schema_formats(&mut req), 2);
         let tools = &req.extra["tools"];
         let props = &tools[0]["function"]["parameters"]["properties"];
         assert!(props["data"].get("format").is_none());
         assert_eq!(props["when"]["format"], "date-time");
-        assert!(props.get("format").is_some());
-        assert_eq!(
-            tools[1]["function"]["parameters"]["properties"]["data"]["format"],
-            "base64"
+        assert!(props.get("format").is_some(), "property named `format` is kept");
+        assert!(
+            tools[1]["function"]["parameters"]["properties"]["data"]
+                .get("format")
+                .is_none(),
+            "tools without a strict flag are sanitized too"
         );
     }
 
