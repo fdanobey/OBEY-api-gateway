@@ -69,6 +69,14 @@ impl<'a> ChatToResponsesTranslator<'a> {
         }
 
         let input = convert_messages(&req.messages)?;
+        // System/developer messages are not input items, so a request that
+        // carries only those would reach the backend with an empty `input`,
+        // which it rejects. Fail here so the router fails over instead.
+        if input.is_empty() {
+            return Err(CodexError::Translation(
+                "request has no user, assistant or tool messages to send as input".to_string(),
+            ));
+        }
 
         let tool_count = req
             .extra
@@ -444,6 +452,12 @@ mod tests {
         assert_eq!(out["store"], json!(false));
         assert_eq!(out["stream"], json!(true));
         assert_eq!(out["include"], json!(["reasoning.encrypted_content"]));
+    }
+    #[test]
+    fn system_only_request_is_a_translation_error_not_empty_input() {
+        let req = req_with(vec![msg("system", json!("rules")), msg("developer", json!("more"))]);
+        let err = translator().translate(&req).unwrap_err();
+        assert!(matches!(err, CodexError::Translation(_)), "{err:?}");
     }
 
     #[test]
@@ -1087,13 +1101,12 @@ mod property_tests {
                 extra: Map::new(),
             };
 
-            let out = translator()
-                .translate(&req)
-                .expect("translate must succeed for the six legal shapes");
-            let input = out["input"]
-                .as_array()
-                .expect("envelope.input must be an array")
-                .clone();
+            // Exercise the message conversion directly: `translate` rejects
+            // a request whose input converts to nothing (e.g. only system
+            // shapes), which `system_only_request_is_a_translation_error_not_empty_input`
+            // covers.
+            let input = convert_messages(&req.messages)
+                .expect("conversion must succeed for the six legal shapes");
 
             // (a) No `id` field anywhere in the translated array (Req 3.8).
             prop_assert!(

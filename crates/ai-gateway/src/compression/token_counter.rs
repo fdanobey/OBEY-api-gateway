@@ -58,6 +58,13 @@ impl TokenCounter {
         total
     }
 
+    /// Counts the non-message part of `count_request`: model, top-level
+    /// tools, tool choice, other extension fields and reply priming.
+    pub fn count_skeleton(&self, request: &OpenAIRequest) -> u32 {
+        let bpe = self.for_model(&request.model);
+        Self::count_request_skeleton(bpe, &request.model, &request.extra)
+    }
+
     /// Counts tokens per message exactly like `count_request` on a clone of
     /// `request` keeping only that message, in a single pass over the message
     /// list with no whole-request clones.

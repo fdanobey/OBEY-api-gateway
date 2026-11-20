@@ -277,13 +277,12 @@ return ContextBudgetGate::reduce(request, &trim_options);
 
         match summary_result {
             Ok(summary_text) => {
-                let non_message_tokens = original_tokens
-                    .saturating_sub(ContextManager::estimate_tokens(&request.messages));
                 let target_budget = ((options.budget as u64
                     * context_config.summarize_target_percent as u64)
                     / 100)
                     .min(options.budget as u64) as u32;
-                let target_message_budget = target_budget.saturating_sub(non_message_tokens);
+                let target_message_budget =
+                    ContextManager::message_budget_for(request, original_tokens, target_budget);
 
                 // The summary replaces the removed older messages: trim
                 // oldest groups down to the target, then insert the summary
@@ -305,7 +304,11 @@ return ContextBudgetGate::reduce(request, &trim_options);
                 // the budget, trim further (never removes system messages,
                 // so the summary survives).
                 if !outcome.fits {
-                    let message_budget = options.budget.saturating_sub(non_message_tokens);
+                    let message_budget = ContextManager::message_budget_for(
+                        request,
+                        outcome.final_tokens,
+                        options.budget,
+                    );
                     let extra = apply_truncation_strategy(
                         &mut request.messages,
                         message_budget,

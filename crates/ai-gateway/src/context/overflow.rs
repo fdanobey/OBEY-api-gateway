@@ -198,9 +198,8 @@ impl ContextBudgetGate {
             return outcome;
         }
 
-        let non_message_tokens = original_tokens
-            .saturating_sub(ContextManager::estimate_tokens(&request.messages));
-        let message_budget = options.budget.saturating_sub(non_message_tokens);
+        let message_budget =
+            ContextManager::message_budget_for(request, original_tokens, options.budget);
 
         match options.strategy {
             ContextReductionStrategy::SlidingWindow => {
@@ -231,6 +230,10 @@ impl ContextBudgetGate {
         }
 
         if !outcome.fits {
+            // Recompute against the current messages: clearing tool results
+            // changed the heuristic-to-BPE ratio.
+            let message_budget =
+                ContextManager::message_budget_for(request, outcome.final_tokens, options.budget);
             let removed = apply_truncation_strategy(
                 &mut request.messages,
                 message_budget,
@@ -337,6 +340,65 @@ mod tests {
             });
             assert!(paired, "orphaned tool result {id} at index {index}");
         }
+    }
+
+    /// Regression: message fields the old heuristic skipped (here
+    /// `reasoning_content`) were charged to the non-message overhead, the
+    /// message budget hit zero, and reduction removed the whole
+    /// conversation. Reduction must keep a proportional share of history.
+    #[test]
+    fn reduce_keeps_history_when_messages_carry_uncounted_fields() {
+        let mut messages = vec![message("system", "You are a coding agent.")];
+        for i in 0..40 {
+            messages.push(message("user", &format!("step {i}: please continue the task")));
+            let mut reply = message("assistant", &format!("done with step {i}"));
+            reply.extra.insert(
+                "reasoning_content".to_string(),
+                serde_json::Value::String(format!("thinking about step {i} ").repeat(60)),
+            );
+            messages.push(reply);
+        }
+        let mut req = request(messages);
+        let total = TokenCounter::new().count_request(&req);
+        let budget = total / 2;
+
+        let outcome = ContextBudgetGate::reduce(
+            &mut req,
+            &options(ContextReductionStrategy::RemoveOldest, budget),
+        );
+
+        assert!(outcome.fits, "{outcome:?}");
+        let non_system = req.messages.iter().filter(|m| m.role != "system").count();
+        assert!(
+            non_system >= 20,
+            "about half of the 80 messages should survive, kept {non_system}"
+        );
+        assert_eq!(
+            req.messages.last().map(|m| m.content_as_text()),
+            Some("done with step 39".to_string())
+        );
+    }
+
+    /// When even the latest exchange does not fit, reduction must report
+    /// "does not fit" (so the provider is skipped) instead of dispatching a
+    /// request with no conversation.
+    #[test]
+    fn reduce_never_strips_the_latest_user_message() {
+        let mut req = request(vec![
+            message("system", "s"),
+            message("user", "old question"),
+            message("assistant", "old answer"),
+            message("user", &"latest question ".repeat(400)),
+        ]);
+
+        let outcome = ContextBudgetGate::reduce(
+            &mut req,
+            &options(ContextReductionStrategy::RemoveOldest, 50),
+        );
+
+        assert!(!outcome.fits);
+        assert!(req.messages.iter().any(|m| m.role == "user"
+            && m.content_as_text().starts_with("latest question")));
     }
 
     #[test]

@@ -136,27 +136,54 @@ impl ContextManager {
     }
 
     /// Estimate token count for a slice of messages
-    /// Uses a simple heuristic of ~4 characters per token
+    /// Uses a simple heuristic of ~4 characters per token over the same
+    /// parts `TokenCounter::count_request` encodes: string content, the JSON
+    /// of structured content, and every message extension field (tool calls,
+    /// tool_call_id, reasoning_content, ...).
     pub fn estimate_tokens(messages: &[Message]) -> u32 {
         let mut total = 0u32;
         for msg in messages {
             // Account for role prefix (~1 token)
-            total += 1;
-            // Count content tokens (rough estimate: 4 chars per token)
-            let content = msg.content_as_text();
-            total += (content.len() as u32 + 3) / 4;
-            // Account for tool_calls in assistant messages (function names + arguments)
-            if let Some(tool_calls) = msg.extra.get("tool_calls") {
-                let tc_str = tool_calls.to_string();
-                total += (tc_str.len() as u32 + 3) / 4;
-            }
-            // Account for tool_call_id in tool result messages
-            if let Some(tc_id) = msg.extra.get("tool_call_id") {
-                let id_str = tc_id.to_string();
-                total += (id_str.len() as u32 + 3) / 4;
+            total = total.saturating_add(1);
+            let content_len = match &msg.content {
+                serde_json::Value::Null => 0,
+                serde_json::Value::String(text) => text.len(),
+                structured => structured.to_string().len(),
+            };
+            total = total.saturating_add(Self::chars_to_tokens(content_len));
+            if !msg.extra.is_empty() {
+                let extra_len = serde_json::Value::Object(msg.extra.clone()).to_string().len();
+                total = total.saturating_add(Self::chars_to_tokens(extra_len));
             }
         }
         total
+    }
+
+    fn chars_to_tokens(len: usize) -> u32 {
+        len.div_ceil(4).min(u32::MAX as usize) as u32
+    }
+
+    /// Convert a whole-request budget in `TokenCounter` units into a message
+    /// budget in [`Self::estimate_tokens`] units, for the truncation loops.
+    ///
+    /// The old `budget - (bpe_total - heuristic_messages)` form charged every
+    /// message token the heuristic missed to the non-message overhead. On
+    /// long agent conversations that drove the message budget to zero, and
+    /// truncation removed the whole conversation. Here the skeleton is
+    /// counted exactly and the remaining budget is scaled by the
+    /// heuristic-to-BPE ratio of the current messages.
+    ///
+    /// `request_tokens` is `TokenCounter::count_request(request)`.
+    pub fn message_budget_for(request: &OpenAIRequest, request_tokens: u32, budget: u32) -> u32 {
+        let skeleton = TokenCounter::new().count_skeleton(request);
+        let allowed = budget.saturating_sub(skeleton);
+        let bpe_messages = request_tokens.saturating_sub(skeleton);
+        if bpe_messages == 0 {
+            return allowed;
+        }
+        let heuristic = Self::estimate_tokens(&request.messages);
+        (u64::from(allowed) * u64::from(heuristic) / u64::from(bpe_messages))
+            .min(u64::from(u32::MAX)) as u32
     }
 
     /// Estimate token count for a full request
@@ -193,9 +220,11 @@ impl ContextManager {
         };
 
         let effective_limit = Self::input_token_budget(request, context_window);
-        let non_message_tokens = Self::estimate_request_tokens(request)
-            .saturating_sub(Self::estimate_tokens(&request.messages));
-        let message_limit = effective_limit.saturating_sub(non_message_tokens);
+        let message_limit = Self::message_budget_for(
+            request,
+            Self::estimate_request_tokens(request),
+            effective_limit,
+        );
 
         apply_truncation_strategy(
             &mut request.messages,
@@ -479,7 +508,7 @@ mod tests {
                 create_test_message("system", "system"),
                 create_test_message("user", &"x".repeat(8_000)),
                 create_test_message("assistant", &"y".repeat(8_000)),
-                create_test_message("user", &"z".repeat(8_000)),
+                create_test_message("user", "the latest question"),
             ],
             stream: false,
             temperature: None,
@@ -496,6 +525,11 @@ mod tests {
         assert!(
             ContextManager::estimate_request_tokens(&request)
                 <= ContextManager::input_token_budget(&request, 5_000)
+        );
+        // Truncation never drops the latest user message.
+        assert_eq!(
+            request.messages.last().map(|m| m.content_as_text()),
+            Some("the latest question".to_string())
         );
     }
 

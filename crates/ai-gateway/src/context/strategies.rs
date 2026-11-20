@@ -94,32 +94,33 @@ fn truncate_remove_oldest(
     let mut removed = 0;
 
     while estimate_fn(messages) > max_tokens {
-        // Find the oldest non-system message
-        let Some(idx) = messages.iter().position(|m| m.role != "system") else {
-            break; // Only system messages left
+        // Never remove the latest user message or the final message group:
+        // without them the provider gets no conversation at all (the Codex
+        // backend rejects that with "One of input ... must be provided").
+        // When they alone exceed the budget, stop here; the caller's recount
+        // reports the request as not fitting.
+        let last_user = messages.iter().rposition(|m| m.role == "user");
+        let Some(idx) =
+            (0..messages.len()).find(|&i| messages[i].role != "system" && Some(i) != last_user)
+        else {
+            break;
         };
 
-        let msg = &messages[idx];
-
-        if msg.role == "assistant" && msg.extra.contains_key("tool_calls") {
-            // This is the start of a tool-use group.  Remove the assistant
-            // message AND all immediately following "tool" messages.
-            messages.remove(idx);
-            removed += 1;
-            while idx < messages.len() && messages[idx].role == "tool" {
-                messages.remove(idx);
-                removed += 1;
+        // An assistant `tool_calls` message starts a tool-use group: remove
+        // it together with its immediately following "tool" results. Orphan
+        // tool results and plain user/assistant messages go individually.
+        let mut end = idx + 1;
+        if messages[idx].role == "assistant" && messages[idx].extra.contains_key("tool_calls") {
+            while end < messages.len() && messages[end].role == "tool" {
+                end += 1;
             }
-        } else if msg.role == "tool" {
-            // Orphaned tool result (its assistant message was already removed
-            // or is missing).  Remove it.
-            messages.remove(idx);
-            removed += 1;
-        } else {
-            // Regular user/assistant message — safe to remove individually.
-            messages.remove(idx);
-            removed += 1;
         }
+        if !messages[end..].iter().any(|m| m.role != "system") {
+            break;
+        }
+
+        messages.drain(idx..end);
+        removed += end - idx;
     }
 
     removed
@@ -366,6 +367,31 @@ mod tests {
         assert!(messages.iter().any(|m| m.role == "system"));
         // System message should still be present
         assert_eq!(messages[0].role, "system");
+    }
+
+    #[test]
+    fn remove_oldest_keeps_latest_user_and_final_message() {
+        let mut messages = vec![
+            create_test_message("system", "You are helpful"),
+            create_test_message("user", "First message"),
+            create_test_message("assistant", "First response"),
+            create_test_message("user", "Second message"),
+            assistant_with_tool_call("call_1", "read"),
+            tool_result_message("call_1", "file contents"),
+            create_test_message("assistant", "Final response"),
+        ];
+
+        apply_truncation_strategy(
+            &mut messages,
+            0,
+            TruncationStrategy::RemoveOldest,
+            &simple_estimate,
+        );
+
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant"]);
+        assert_eq!(messages[1].content_as_text(), "Second message");
+        assert_eq!(messages[2].content_as_text(), "Final response");
     }
 
     #[test]
