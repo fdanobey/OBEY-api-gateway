@@ -68,14 +68,17 @@ impl<'a> ChatToResponsesTranslator<'a> {
             }
         }
 
-        let input = convert_messages(&req.messages)?;
-        // System/developer messages are not input items, so a request that
-        // carries only those would reach the backend with an empty `input`,
-        // which it rejects. Fail here so the router fails over instead.
+        let mut input = convert_messages(&req.messages)?;
+        // A request with only system/developer messages has no conversation
+        // to send; the backend rejects that. Fail here so the router fails
+        // over instead.
         if input.is_empty() {
             return Err(CodexError::Translation(
                 "request has no user, assistant or tool messages to send as input".to_string(),
             ));
+        }
+        if let Some(item) = client_instructions_item(&req.messages) {
+            input.insert(0, item);
         }
 
         let tool_count = req
@@ -223,6 +226,35 @@ fn translate_response_format(rf: &Value) -> Option<Value> {
     }
 }
 
+/// The client's system/developer messages as one leading user input item.
+///
+/// The Codex backend rejects system messages in `input` and requires its own
+/// prompt in `instructions`, so client system prompts (tool rules, agent
+/// instructions) were dropped entirely and the model never saw them. Codex
+/// CLI sends project instructions (AGENTS.md) the same way: a user message
+/// wrapped in `<user_instructions>` tags. Returns `None` when the request
+/// has no non-empty system or developer text.
+fn client_instructions_item(messages: &[Message]) -> Option<Value> {
+    let text = messages
+        .iter()
+        .filter(|m| matches!(m.role.as_str(), "system" | "developer"))
+        .map(|m| m.content_as_text())
+        .filter(|t| !t.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": format!("<user_instructions>\n{text}\n</user_instructions>"),
+        }],
+    }))
+}
+
 /// Walk the request messages in order and emit the matching Responses API
 /// `input` items per Req 3.1–3.10. Tracks emitted `function_call` ids in a
 /// `HashSet` so orphan `tool` messages can fall through to a user message
@@ -233,14 +265,11 @@ fn convert_messages(messages: &[Message]) -> Result<Vec<Value>, CodexError> {
 
     for msg in messages {
         match msg.role.as_str() {
-            // Req 3.1 — System/developer messages are NOT emitted as input items.
-            // The Codex backend rejects them with "System messages are not allowed".
-            // System-level context goes exclusively in the `instructions` field.
-            // Any client-supplied system messages are silently skipped here;
-            // the InstructionsStore already provides the Codex system prompt.
-            "system" | "developer" => {
-                // Skip — handled via the `instructions` envelope field.
-            }
+            // Req 3.1 — System/developer messages are NOT emitted as input items
+            // in place: the Codex backend rejects them with "System messages are
+            // not allowed". `translate` sends their text as one leading
+            // `<user_instructions>` user item (see `client_instructions_item`).
+            "system" | "developer" => {}
 
             // Req 3.2 / 3.3
             "user" => match &msg.content {
@@ -462,28 +491,31 @@ mod tests {
 
     #[test]
     fn system_user_assistant_message_shapes() {
-        // Post-integration behavior: system/developer messages are SKIPPED
-        // (not emitted as input items) because the Codex backend rejects them.
-        // Only user and assistant messages survive into `input`.
+        // The Codex backend rejects system messages in `input`, so client
+        // system/developer text becomes one leading `<user_instructions>`
+        // user item; user and assistant messages follow in order.
         let req = req_with(vec![
             msg("system", json!("rules")),
             msg("user", json!("hi")),
+            msg("developer", json!([{"type":"text","text":"more rules"}])),
             msg("assistant", json!("hello")),
         ]);
         let out = translator().translate(&req).unwrap();
         let input = out["input"].as_array().unwrap();
-        assert_eq!(
-            input.len(),
-            2,
-            "system message should be skipped: {input:#?}"
-        );
+        assert_eq!(input.len(), 3, "{input:#?}");
         assert_eq!(
             input[0],
+            json!({"type":"message","role":"user",
+                   "content":[{"type":"input_text",
+                     "text":"<user_instructions>\nrules\n\nmore rules\n</user_instructions>"}]})
+        );
+        assert_eq!(
+            input[1],
             json!({"type":"message","role":"user",
                    "content":[{"type":"input_text","text":"hi"}]})
         );
         assert_eq!(
-            input[1],
+            input[2],
             json!({"type":"message","role":"assistant",
                    "content":[{"type":"output_text","text":"hello"}]})
         );
@@ -886,9 +918,8 @@ out.get("parallel_tool_calls").is_none(),
 
     #[test]
     fn message_order_preserved_across_mixed_roles() {
-        // Post-integration behavior: system/developer messages are skipped
-        // entirely (handled via the `instructions` envelope field), so they
-        // do not appear in `input`. The remaining roles preserve order.
+        // The system message becomes the leading `<user_instructions>` user
+        // item; the remaining roles preserve order after it.
         let req = req_with(vec![
             msg("system", json!("s")),
             msg("user", json!("u1")),
@@ -896,13 +927,20 @@ out.get("parallel_tool_calls").is_none(),
             msg("user", json!("u2")),
         ]);
         let out = translator().translate(&req).unwrap();
-        let roles: Vec<&str> = out["input"]
-            .as_array()
+        let input = out["input"].as_array().unwrap();
+        let roles: Vec<&str> = input.iter().map(|i| i["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "user", "assistant", "user"]);
+        assert!(input[0]["content"][0]["text"]
+            .as_str()
             .unwrap()
-            .iter()
-            .map(|i| i["role"].as_str().unwrap())
-            .collect();
-        assert_eq!(roles, vec!["user", "assistant", "user"]);
+            .starts_with("<user_instructions>"));
+    }
+
+    #[test]
+    fn empty_system_messages_add_no_instructions_item() {
+        let req = req_with(vec![msg("system", json!("  ")), msg("user", json!("u"))]);
+        let out = translator().translate(&req).unwrap();
+        assert_eq!(out["input"].as_array().unwrap().len(), 1);
     }
 }
 
