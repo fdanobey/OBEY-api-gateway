@@ -60,6 +60,7 @@ Authenticate → Model Access → Budget Check → Rate Limit → Forward → Re
 | `tokens_per_minute` | Per-key TPM rolling 60s window | `429` + `Retry-After` |
 | `model_access` | Whitelist of model group names (omit = allow all) | `403` on denial |
 | `expires_in` | `never`, `1_year`, `6_months`, `3_months`, `1_month`, `2_weeks`, `1_week`, `3_days`, `1_day` | `401` after expiry |
+| `max_output_tokens` | Hard ceiling on output tokens per request (ceiling-only: lowers or injects, never raises) | Clamps request's output field |
 
 ---
 

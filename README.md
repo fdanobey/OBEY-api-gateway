@@ -72,6 +72,7 @@ OBEY API Gateway sits between your application and your AI providers. Point your
 - **Smart timeouts** — split TTFB / total timeouts with auto-detection of thinking models (o1, o3, DeepSeek-R1, Claude), plus a gateway-wide request deadline derived from the longest configured provider timeout that catches stalls no provider timeout covers (see [Global request deadline](#global-request-deadline))
 - **Smart model routing** — complexity-aware tier selection (Fast / Balanced / Powerful) with heuristic, ML (ONNX), LLM, JEV / Laya (TypeSafe & Convai "System One" typed decision models), or composite classifiers; cascade escalation, online optimization, A/B testing, budget limits, semantic routing cache, and per-model-group overrides (see [Smart Model Routing](#smart-model-routing))
 - **Prompt-cache-aware routing** — prefix-hash sticky provider selection, automatic Anthropic-style `cache_control` breakpoint injection and advancement, cached-token-aware cost sorting and billing, and per-provider cache hit-rate telemetry with OpenRouter session affinity (see [Prompt-Cache-Aware Routing](#prompt-cache-aware-routing))
+- **Output caps** — optional per-virtual-key and per-model-group `max_output_tokens` ceiling (ceiling-only: clamps or injects, never raises); covers `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, and `/v1/responses`; changes apply on next request or via hot-reload (see [Output Caps](https://github.com/fdanobey/OBEY-api-gateway/wiki/Output-Caps))
 
 ## Quick Start
 

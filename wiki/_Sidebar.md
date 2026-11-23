@@ -19,6 +19,7 @@
 - [Token Compression](Token-Compression)
 - [Tool Definition Compression](Tool-Definition-Compression)
 - [Structured Output](Structured-Output)
+- [Output Caps](Output-Caps)
 - [Web Search Injection](Web-Search-Injection)
 - [Persistent Memory](Persistent-Memory)
 ### Access Control

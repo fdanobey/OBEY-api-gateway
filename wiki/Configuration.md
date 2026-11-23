@@ -102,6 +102,7 @@ providers:
 model_groups:
   - name: "gpt-4-group"
     version_fallback_enabled: false   # Try older versions on failure
+    max_output_tokens: 4096           # Ceiling on output tokens per request (omit for no cap)
     models:
       - provider: "openai"
         model: "gpt-4"
@@ -109,6 +110,8 @@ model_groups:
         cost_per_million_output_tokens: 30.0
         priority: 100                 # Lower = higher priority
 ```
+
+`max_output_tokens` is ceiling-only: it lowers or injects the request's output-token field when absent or above the cap, and never raises a client's value. When both a virtual key and a model group set a cap, the lower value wins. See [Output Caps](Output-Caps) for dialect coverage and observability details.
 
 ### Circuit Breaker
 

@@ -208,7 +208,9 @@ pub struct UpdateKeyParams {
     pub tokens_per_minute: Option<Option<u64>>,
     /// Per-request output-token ceiling; `None` leaves it unchanged,
     /// `Some(None)` clears it, `Some(Some(v))` sets it (positive integer).
-    #[serde(default)]
+    /// Uses the double-option deserializer so JSON `null` clears the cap
+    /// instead of being read as an absent field.
+    #[serde(default, deserialize_with = "deserialize_output_cap_double_option")]
     pub max_output_tokens: Option<Option<u32>>,
     #[serde(default)]
     pub model_access: Option<Option<Vec<String>>>,
@@ -229,17 +231,33 @@ pub struct UpdateKeyParams {
     /// an absent field yields `None` (unchanged), JSON `null` yields `Some(None)`
     /// (reset to the default class 0), and a value yields `Some(Some(v))`.
     ///
-    /// Used only by [`UpdateKeyParams::priority`] (Req 1 AC 4); the other
-    /// nullable update fields keep plain serde `Option<Option<T>>` behavior.
-    fn deserialize_priority_double_option<'de, D>(deserializer: D) -> Result<Option<Option<u16>>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Ok(match Option::<u16>::deserialize(deserializer)? {
-            None => Some(None),
-            Some(value) => Some(Some(value)),
-        })
-    }
+/// Used only by [`UpdateKeyParams::priority`] (Req 1 AC 4); the other
+/// nullable update fields keep plain serde `Option<Option<T>>` behavior.
+fn deserialize_priority_double_option<'de, D>(deserializer: D) -> Result<Option<Option<u16>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<u16>::deserialize(deserializer)? {
+        None => Some(None),
+        Some(value) => Some(Some(value)),
+    })
+}
+
+/// Deserialize an `Option<Option<u32>>` with explicit three-state semantics:
+/// an absent field yields `None` (unchanged), JSON `null` yields `Some(None)`
+/// (clear the cap), and a value yields `Some(Some(v))`.
+///
+/// Used only by [`UpdateKeyParams::max_output_tokens`] so the admin API's
+/// `PATCH {"max_output_tokens": null}` clears the output cap.
+fn deserialize_output_cap_double_option<'de, D>(deserializer: D) -> Result<Option<Option<u32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<u32>::deserialize(deserializer)? {
+        None => Some(None),
+        Some(value) => Some(Some(value)),
+    })
+}
 
 /// Authenticated key loaded from cache/store, carried through the request
 /// pipeline for enforcement checks.
