@@ -2484,8 +2484,13 @@ body.sec-banner-active{padding-top:3.2rem}
 </fieldset>
 
 <fieldset><legend>Background Consolidation</legend>
-<p class="hint" style="margin-bottom:.75rem">Runs with the decay cycle: merges near-duplicates and supersedes contradictory memories via the configured provider.</p>
+<p class="hint" style="margin-bottom:.75rem">Runs with the decay cycle: merges near-duplicates and supersedes contradictory memories. Batches go through the router via the model group or provider/model below.</p>
 <div class="form-check" style="margin-bottom:1rem"><input type="checkbox" id="mem-consolidation-enabled"><label for="mem-consolidation-enabled">Enable Consolidation</label></div>
+<div class="form-group">
+<label for="mem-consolidation-model-group">Consolidation Model Group</label>
+<select id="mem-consolidation-model-group"><option value="">-- none: use provider/model below --</option></select>
+<div class="hint">When set, consolidation batches route through this group like normal requests (smart routing, failover, rate limits); provider/model below are ignored</div>
+</div>
 <div class="form-row">
 <div class="form-group">
 <label for="mem-consolidation-provider">Consolidation Provider</label>
@@ -8189,6 +8194,10 @@ document.getElementById('mem-extract-timeout').value = mem.auto_extract_timeout_
 document.getElementById('mem-consolidation-enabled').checked = !!mem.consolidation_enabled;
 document.getElementById('mem-consolidation-max-concurrent').value = mem.consolidation_max_concurrent_batches != null ? mem.consolidation_max_concurrent_batches : 2;
 document.getElementById('mem-consolidation-provider').value = mem.consolidation_provider || '';
+var consolGroup = mem.consolidation_model_group || '';
+var consolGroupNames = Array.prototype.map.call(document.querySelectorAll('#groups-list .grp-name'), function(i){return i.value.trim();}).filter(Boolean);
+if (consolGroup && consolGroupNames.indexOf(consolGroup) === -1) consolGroupNames.push(consolGroup);
+setSelectOptions(document.getElementById('mem-consolidation-model-group'), '-- none: use provider/model below --', consolGroupNames, consolGroup);
 var consolEffProv = mem.consolidation_provider || mem.auto_extract_provider || '';
 if (consolEffProv) {
 fetchModelsForProvider(consolEffProv, document.getElementById('mem-consolidation-model'), mem.consolidation_model || '');
@@ -8227,6 +8236,7 @@ auto_extract_timeout_seconds: parseInt(document.getElementById('mem-extract-time
 consolidation_enabled: document.getElementById('mem-consolidation-enabled').checked,
 consolidation_provider: document.getElementById('mem-consolidation-provider').value.trim(),
 consolidation_model: document.getElementById('mem-consolidation-model').value.trim(),
+consolidation_model_group: document.getElementById('mem-consolidation-model-group').value.trim(),
 consolidation_max_concurrent_batches: parseInt(document.getElementById('mem-consolidation-max-concurrent').value, 10) || 2,
       decay_schedule_hours: parseInt(document.getElementById('mem-decay-hours').value, 10) || 24,
       max_memories_per_namespace: parseInt(document.getElementById('mem-max-per-ns').value, 10) || 1000,

@@ -19,7 +19,7 @@ pub mod store;
 pub mod vector;
 
 pub use config::{
-    EffectiveMemoryConfig, MemoryConfig, MemoryConfigError, MemoryQdrantConfig,
+    ConsolidationRoute, EffectiveMemoryConfig, MemoryConfig, MemoryConfigError, MemoryQdrantConfig,
     MemoryValidationResult, ModelGroupMemoryOverride, ProviderMemoryOverride,
 };
 pub use consolidation::{
