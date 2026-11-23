@@ -52,6 +52,17 @@ pub enum ResponsesEvent {
         delta: String,
         sequence_number: u64,
     },
+    /// `response.output_item.done`: the finished item. For `function_call`
+    /// items `arguments` holds the complete argument string, which is
+    /// authoritative over the concatenated deltas.
+    OutputItemDone {
+        item_id: String,
+        kind: String,
+        call_id: Option<String>,
+        name: Option<String>,
+        arguments: Option<String>,
+        sequence_number: u64,
+    },
     Completed {
         response: CompletedPayload,
         sequence_number: u64,
@@ -310,6 +321,26 @@ fn dispatch_to_event(v: serde_json::Value) -> Result<ResponsesEvent, CodexError>
                 sequence_number,
             })
         }
+        "response.output_item.done" => {
+            // Lenient: this event was skipped as `Other` before it was
+            // decoded, so an unexpected shape keeps that behavior.
+            let item = v.get("item").cloned().unwrap_or_default();
+            let text = |key: &str| item.get(key).and_then(|x| x.as_str()).map(str::to_owned);
+            let Some(kind) = text("type") else {
+                return Ok(ResponsesEvent::Other {
+                    kind: event_type,
+                    sequence_number,
+                });
+            };
+            Ok(ResponsesEvent::OutputItemDone {
+                item_id: text("id").unwrap_or_default(),
+                kind,
+                call_id: text("call_id"),
+                name: text("name"),
+                arguments: text("arguments"),
+                sequence_number,
+            })
+        }
         "response.function_call_arguments.delta" => {
             let item_id = str_field(&v, "item_id", "function_call_arguments.delta")?;
             let delta = str_field(&v, "delta", "function_call_arguments.delta")?;
@@ -477,6 +508,30 @@ mod tests {
                 assert_eq!(sequence_number, 11);
             }
             other => panic!("expected OutputItemAdded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn output_item_done_function_call_decodes_with_arguments() {
+        let frame = b"data: {\"type\":\"response.output_item.done\",\
+                      \"sequence_number\":20,\"output_index\":1,\
+                      \"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\
+                      \"call_id\":\"call_abc\",\"name\":\"read\",\
+                      \"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}\n\n";
+        match feed_one(frame).expect("decode ok") {
+            ResponsesEvent::OutputItemDone {
+                item_id,
+                kind,
+                call_id,
+                arguments,
+                ..
+            } => {
+                assert_eq!(item_id, "fc_1");
+                assert_eq!(kind, "function_call");
+                assert_eq!(call_id.as_deref(), Some("call_abc"));
+                assert_eq!(arguments.as_deref(), Some("{\"path\":\"a.rs\"}"));
+            }
+            other => panic!("expected OutputItemDone, got {:?}", other),
         }
     }
 

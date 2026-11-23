@@ -16,9 +16,58 @@ use crate::codex::sse::{CompletedPayload, ResponsesEvent};
 /// Accumulates tool-call fragments across streaming deltas.
 #[derive(Debug, Clone)]
 struct ToolCallBuilder {
+    /// Responses output item id (`fc_...`); argument deltas reference it.
+    item_id: String,
+    /// Chat Completions tool-call id (the Responses `call_id`).
     id: String,
     name: String,
     arguments: String,
+}
+
+impl ResponseAccumulator {
+    /// The builder for a Responses item: matched by item id, else by call
+    /// id. Never matches on an empty id.
+    fn tool_call_position(&self, item_id: &str, call_id: Option<&str>) -> Option<usize> {
+        self.tool_calls
+            .iter()
+            .rposition(|tc| !item_id.is_empty() && tc.item_id == item_id)
+            .or_else(|| {
+                let call_id = call_id.filter(|c| !c.is_empty())?;
+                self.tool_calls.iter().rposition(|tc| tc.id == call_id)
+            })
+    }
+
+    /// Apply a finished `function_call` item: its complete `arguments` and
+    /// `name` replace the streamed values, or it becomes a new tool call
+    /// when no earlier event announced it.
+    fn apply_finished_tool_call(
+        &mut self,
+        item_id: &str,
+        call_id: Option<&str>,
+        name: Option<&str>,
+        arguments: Option<&str>,
+    ) {
+        match self.tool_call_position(item_id, call_id) {
+            Some(i) => {
+                let tc = &mut self.tool_calls[i];
+                if let Some(arguments) = arguments {
+                    tc.arguments = arguments.to_owned();
+                }
+                if let Some(name) = name.filter(|n| !n.is_empty()) {
+                    tc.name = name.to_owned();
+                }
+            }
+            None => self.tool_calls.push(ToolCallBuilder {
+                item_id: item_id.to_owned(),
+                id: call_id
+                    .filter(|c| !c.is_empty())
+                    .unwrap_or(item_id)
+                    .to_owned(),
+                name: name.unwrap_or_default().to_owned(),
+                arguments: arguments.unwrap_or_default().to_owned(),
+            }),
+        }
+    }
 }
 
 /// Final usage counters extracted from the `CompletedPayload`.
@@ -118,29 +167,41 @@ where
                 ..
             } if kind == "function_call" => {
                 acc.tool_calls.push(ToolCallBuilder {
-                    id: call_id.unwrap_or(item_id),
+                    id: call_id
+                        .filter(|c| !c.is_empty())
+                        .unwrap_or_else(|| item_id.clone()),
+                    item_id,
                     name: name.unwrap_or_default(),
                     arguments: String::new(),
                 });
             }
 
             ResponsesEvent::FunctionCallArgumentsDelta { item_id, delta, .. } => {
-                // Match by item_id — the tool call whose id matches,
-                // or fall back to the last one pushed (streaming order).
+                // Deltas reference the output item id, not the call id.
+                // Fall back to the latest call only when the id is unknown,
+                // so interleaved parallel calls never share arguments.
                 let idx = acc
-                    .tool_calls
-                    .iter()
-                    .rposition(|tc| tc.id == item_id)
-                    .or_else(|| {
-                        if acc.tool_calls.is_empty() {
-                            None
-                        } else {
-                            Some(acc.tool_calls.len() - 1)
-                        }
-                    });
+                    .tool_call_position(&item_id, None)
+                    .or_else(|| acc.tool_calls.len().checked_sub(1));
                 if let Some(i) = idx {
                     acc.tool_calls[i].arguments.push_str(&delta);
                 }
+            }
+
+            ResponsesEvent::OutputItemDone {
+                item_id,
+                kind,
+                call_id,
+                name,
+                arguments,
+                ..
+            } if kind == "function_call" => {
+                acc.apply_finished_tool_call(
+                    &item_id,
+                    call_id.as_deref(),
+                    name.as_deref(),
+                    arguments.as_deref(),
+                );
             }
 
             ResponsesEvent::Completed { response, .. } => {
@@ -178,21 +239,17 @@ where
                     }
                 }
 
-                // Backfill tool_calls from CompletedPayload if streaming
-                // didn't capture them (non-streaming path).
-                if acc.tool_calls.is_empty() {
-                    for item in &response.output {
-                        if item.kind == "function_call" {
-                            acc.tool_calls.push(ToolCallBuilder {
-                                id: item
-                                    .call_id
-                                    .clone()
-                                    .or_else(|| item.id.clone())
-                                    .unwrap_or_default(),
-                                name: item.name.clone().unwrap_or_default(),
-                                arguments: item.arguments.clone().unwrap_or_default(),
-                            });
-                        }
+                // The completed payload's function_call items are
+                // authoritative: they fill in calls the stream missed and
+                // replace streamed arguments with the final strings.
+                for item in &response.output {
+                    if item.kind == "function_call" {
+                        acc.apply_finished_tool_call(
+                            item.id.as_deref().unwrap_or_default(),
+                            item.call_id.as_deref(),
+                            item.name.as_deref(),
+                            item.arguments.as_deref(),
+                        );
                     }
                 }
 
@@ -216,8 +273,8 @@ where
             // OutputTextDone, Other (reasoning items, native tool calls) → skip (Req 4.8, 4.13)
             ResponsesEvent::OutputTextDone { .. } | ResponsesEvent::Other { .. } => {}
 
-            // OutputItemAdded for non-function_call kinds → skip
-            ResponsesEvent::OutputItemAdded { .. } => {}
+            // Output items of non-function_call kinds → skip
+            ResponsesEvent::OutputItemAdded { .. } | ResponsesEvent::OutputItemDone { .. } => {}
         }
     }
 
@@ -313,6 +370,9 @@ struct StreamTranslatorState {
     first_text_emitted: bool,
     tool_index_map: HashMap<String, u32>,
     next_tool_index: u32,
+    /// Arguments already sent downstream per tool-call index, so
+    /// `output_item.done` can send only what the deltas missed.
+    tool_args_emitted: HashMap<u32, String>,
     finished: bool,
     created_ts: u64,
 }
@@ -344,6 +404,7 @@ where
         first_text_emitted: false,
         tool_index_map: HashMap::new(),
         next_tool_index: 0,
+        tool_args_emitted: HashMap::new(),
         finished: false,
         created_ts,
     };
@@ -437,12 +498,70 @@ fn translate_event(
             vec![Ok(chunk)]
         }
 
+        ResponsesEvent::OutputItemDone {
+            item_id,
+            kind,
+            call_id,
+            name,
+            arguments,
+            ..
+        } if kind == "function_call" => {
+            let Some(full) = arguments else {
+                return vec![];
+            };
+            let Some(idx) = state.tool_index_map.get(&item_id).copied() else {
+                // Never announced: send the whole call in one chunk.
+                let idx = state.next_tool_index;
+                state.next_tool_index += 1;
+                state.tool_index_map.insert(item_id.clone(), idx);
+                state.tool_args_emitted.insert(idx, full.clone());
+                let delta = json!({
+                    "tool_calls": [{
+                        "index": idx,
+                        "id": call_id.filter(|c| !c.is_empty()).unwrap_or(item_id),
+                        "type": "function",
+                        "function": {
+                            "name": name.unwrap_or_default(),
+                            "arguments": full
+                        }
+                    }]
+                });
+                return vec![Ok(format_chunk(state, delta, serde_json::Value::Null, None))];
+            };
+            let emitted = state.tool_args_emitted.entry(idx).or_default();
+            let Some(missing) = full.strip_prefix(emitted.as_str()) else {
+                // Deltas already sent cannot be retracted.
+                tracing::warn!(
+                    tool_index = idx,
+                    "Codex tool-call arguments diverged from the streamed deltas"
+                );
+                return vec![];
+            };
+            if missing.is_empty() {
+                return vec![];
+            }
+            let missing = missing.to_owned();
+            emitted.push_str(&missing);
+            let delta_obj = json!({
+                "tool_calls": [{
+                    "index": idx,
+                    "function": {"arguments": missing}
+                }]
+            });
+            vec![Ok(format_chunk(state, delta_obj, serde_json::Value::Null, None))]
+        }
+
         ResponsesEvent::FunctionCallArgumentsDelta { item_id, delta, .. } => {
             let idx = state
                 .tool_index_map
                 .get(&item_id)
                 .copied()
                 .unwrap_or(state.next_tool_index.saturating_sub(1));
+            state
+                .tool_args_emitted
+                .entry(idx)
+                .or_default()
+                .push_str(&delta);
 
             let delta_obj = json!({
                 "tool_calls": [{
@@ -491,7 +610,8 @@ fn translate_event(
         // OutputTextDone, Other (reasoning, native tool calls), non-function_call OutputItemAdded → skip
         ResponsesEvent::OutputTextDone { .. }
         | ResponsesEvent::Other { .. }
-        | ResponsesEvent::OutputItemAdded { .. } => vec![],
+        | ResponsesEvent::OutputItemAdded { .. }
+        | ResponsesEvent::OutputItemDone { .. } => vec![],
     }
 }
 
@@ -905,5 +1025,161 @@ mod property_tests {
                 );
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_call_assembly_tests {
+    use super::*;
+    use crate::codex::sse::{CompletedPayload, OutputItem, ResponsesEvent};
+    use futures::stream;
+
+    fn added(item_id: &str, call_id: &str, name: &str) -> ResponsesEvent {
+        ResponsesEvent::OutputItemAdded {
+            item_id: item_id.into(),
+            kind: "function_call".into(),
+            call_id: Some(call_id.into()),
+            name: Some(name.into()),
+            sequence_number: 0,
+        }
+    }
+
+    fn delta(item_id: &str, delta: &str) -> ResponsesEvent {
+        ResponsesEvent::FunctionCallArgumentsDelta {
+            item_id: item_id.into(),
+            delta: delta.into(),
+            sequence_number: 0,
+        }
+    }
+
+    fn done(item_id: &str, call_id: &str, arguments: &str) -> ResponsesEvent {
+        ResponsesEvent::OutputItemDone {
+            item_id: item_id.into(),
+            kind: "function_call".into(),
+            call_id: Some(call_id.into()),
+            name: Some("read".into()),
+            arguments: Some(arguments.into()),
+            sequence_number: 0,
+        }
+    }
+
+    fn completed(output: Vec<OutputItem>) -> ResponsesEvent {
+        ResponsesEvent::Completed {
+            response: CompletedPayload {
+                id: "resp_1".into(),
+                model: "gpt".into(),
+                output,
+                usage: None,
+                incomplete_details: None,
+            },
+            sequence_number: 0,
+        }
+    }
+
+    fn arguments(body: &serde_json::Value) -> Vec<String> {
+        body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tc| tc["function"]["arguments"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Deltas reference the item id (`fc_*`), not the call id. Interleaved
+    /// parallel calls must not merge into one malformed argument string.
+    #[tokio::test]
+    async fn interleaved_parallel_call_deltas_stay_with_their_call() {
+        let body = accumulate(stream::iter(vec![
+            added("fc_1", "call_a", "read"),
+            added("fc_2", "call_b", "read"),
+            delta("fc_1", "{\"path\":"),
+            delta("fc_2", "{\"path\":"),
+            delta("fc_1", "\"a.rs\"}"),
+            delta("fc_2", "\"b.rs\"}"),
+            completed(vec![]),
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(arguments(&body), ["{\"path\":\"a.rs\"}", "{\"path\":\"b.rs\"}"]);
+        let ids: Vec<&str> = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tc| tc["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["call_a", "call_b"]);
+    }
+
+    #[tokio::test]
+    async fn output_item_done_arguments_replace_streamed_deltas() {
+        let body = accumulate(stream::iter(vec![
+            added("fc_1", "call_a", "read"),
+            delta("fc_1", "{\"path\":\"a.rs\""),
+            done("fc_1", "call_a", "{\"path\":\"a.rs\"}"),
+            completed(vec![]),
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(arguments(&body), ["{\"path\":\"a.rs\"}"]);
+    }
+
+    #[tokio::test]
+    async fn completed_payload_fills_a_call_the_stream_never_announced() {
+        let body = accumulate(stream::iter(vec![
+            added("fc_1", "call_a", "read"),
+            delta("fc_1", "{}"),
+            completed(vec![
+                OutputItem {
+                    kind: "function_call".into(),
+                    id: Some("fc_1".into()),
+                    call_id: Some("call_a".into()),
+                    name: Some("read".into()),
+                    arguments: Some("{}".into()),
+                    content: None,
+                },
+                OutputItem {
+                    kind: "function_call".into(),
+                    id: Some("fc_2".into()),
+                    call_id: Some("call_b".into()),
+                    name: Some("read".into()),
+                    arguments: Some("{\"path\":\"b.rs\"}".into()),
+                    content: None,
+                },
+            ]),
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(arguments(&body), ["{}", "{\"path\":\"b.rs\"}"]);
+    }
+
+    #[tokio::test]
+    async fn streaming_output_item_done_sends_only_the_missing_suffix() {
+        let chunks: Vec<String> = stream_translate(
+            stream::iter(vec![
+                added("fc_1", "call_a", "read"),
+                delta("fc_1", "{\"path\":"),
+                done("fc_1", "call_a", "{\"path\":\"a.rs\"}"),
+                completed(vec![]),
+            ]),
+            "gpt".into(),
+        )
+        .map(|c| c.unwrap())
+        .collect()
+        .await;
+
+        let streamed: String = chunks
+            .iter()
+            .filter_map(|c| c.strip_prefix("data: "))
+            .filter_map(|c| serde_json::from_str::<serde_json::Value>(c.trim()).ok())
+            .filter_map(|v| {
+                v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(streamed, "{\"path\":\"a.rs\"}");
     }
 }

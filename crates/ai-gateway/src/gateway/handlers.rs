@@ -14748,6 +14748,8 @@ fn codex_event_to_responses_sse(event: &CodexResponsesEvent) -> Vec<ResponsesSse
             tracing::trace!(kind, sequence_number, "Skipping non-standard Codex event");
             vec![]
         }
+        // Previously decoded as `Other`; the native relay still skips it.
+        CodexResponsesEvent::OutputItemDone { .. } => vec![],
     }
 }
 
