@@ -18,15 +18,24 @@ a:hover{text-decoration:underline}
 nav{width:220px;background:var(--nav-bg);color:var(--nav-text);padding:1rem 0;flex-shrink:0;display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
 nav h1{font-size:1rem;padding:0 1rem 1rem;border-bottom:1px solid rgba(255,255,255,.1);margin-bottom:.5rem;display:flex;align-items:center;gap:.5rem}
 nav h1 img{width:24px;height:24px;border-radius:4px}
-nav ul{list-style:none;flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.25) transparent;padding-bottom:.5rem}
-nav ul::-webkit-scrollbar{width:6px}
-nav ul::-webkit-scrollbar-thumb{background:rgba(255,255,255,.25);border-radius:3px}
-nav ul::-webkit-scrollbar-track{background:transparent}
+nav ul#nav-tabs{list-style:none;flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.25) transparent;padding-bottom:.5rem}
+nav ul#nav-tabs::-webkit-scrollbar{width:6px}
+nav ul#nav-tabs::-webkit-scrollbar-thumb{background:rgba(255,255,255,.25);border-radius:3px}
+nav ul#nav-tabs::-webkit-scrollbar-track{background:transparent}
 nav li{margin:0}
 nav button.nav-btn{display:block;width:100%;text-align:left;background:none;border:none;color:var(--nav-text);
 padding:.6rem 1rem;font-size:.875rem;cursor:pointer;transition:background .15s}
 nav button.nav-btn:hover,nav button.nav-btn:focus-visible{background:rgba(255,255,255,.08);outline:none}
 nav button.nav-btn[aria-selected="true"]{background:var(--nav-active);color:#fff;font-weight:600}
+nav .nav-group-header{display:block;width:100%;text-align:left;background:none;border:none;color:var(--nav-text);padding:.6rem 1rem;font-size:.875rem;font-weight:600;cursor:pointer;transition:background .15s}
+nav .nav-group-header:hover,nav .nav-group-header:focus-visible{background:rgba(255,255,255,.08);outline:none}
+nav .nav-group-header::before{content:"▸";display:inline-block;margin-right:.5rem;transition:transform .2s}
+nav .nav-group-header[aria-expanded="true"]::before{transform:rotate(90deg)}
+nav .nav-group-children{list-style:none;padding:0;margin:0}
+nav .nav-group-children[hidden]{display:none}
+nav .nav-group-item-indent .nav-btn{padding-left:1.75rem;font-weight:normal}
+nav .nav-group-header.has-active{color:#fff;box-shadow:inset 3px 0 0 var(--nav-active)}
+nav .nav-group-header:focus-visible{box-shadow:inset 0 0 0 2px rgba(255,255,255,.35)}
 nav .nav-footer{margin-top:auto;padding:1rem;border-top:1px solid rgba(255,255,255,.1);font-size:.75rem}
 nav .nav-footer a{color:var(--nav-text);opacity:.7}
 nav .nav-footer a:hover{opacity:1}
@@ -386,29 +395,64 @@ body.sec-banner-active{padding-top:3.2rem}
 
 <nav aria-label="Admin navigation">
   <h1><img src="menu_logo.jpg" alt="">OBEY-API Admin</h1>
-  <ul role="tablist" id="nav-tabs">
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="true" data-page="server" id="tab-server" aria-controls="page-server">Server Settings</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="providers" id="tab-providers" aria-controls="page-providers">Providers</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="model-groups" id="tab-model-groups" aria-controls="page-model-groups">Model Groups</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="routing" id="tab-routing" aria-controls="page-routing">Routing Settings</button></li>
-<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="smart-routing" id="tab-smart-routing" aria-controls="page-smart-routing">Smart Routing</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="circuit-breaker" id="tab-circuit-breaker" aria-controls="page-circuit-breaker">Circuit Breaker</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="logging" id="tab-logging" aria-controls="page-logging">Logging</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="caching" id="tab-caching" aria-controls="page-caching">Caching</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="compression" id="tab-compression-config" aria-controls="page-compression">Compression</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="context" id="tab-context" aria-controls="page-context">Context</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="streaming" id="tab-streaming" aria-controls="page-streaming">Streaming</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="loop-detection" id="tab-loop-detection" aria-controls="page-loop-detection">Loop Detection</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="virtual-keys" id="tab-virtual-keys" aria-controls="page-virtual-keys">Virtual Keys</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="guardrails" id="tab-guardrails" aria-controls="page-guardrails">Guardrails</button></li>
-    <li role="presentation"><button class="nav-btn" role="tab" type="button" data-page="structured-output" id="tab-structured-output" aria-controls="page-structured-output">Structured Output</button></li>
-<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="memory" id="tab-memory" aria-controls="page-memory">Persistent Memory</button></li>
-<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="webhooks" id="tab-webhooks" aria-controls="page-webhooks">Webhooks</button></li>
-<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="model-deprecations" id="tab-model-deprecations" aria-controls="page-model-deprecations">Model Deprecations</button></li>
-<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="tracing" id="tab-tracing" aria-controls="page-tracing">Tracing</button></li>
-<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="cost-reports" id="tab-cost-reports" aria-controls="page-cost-reports">Cost Reports</button></li>
-<li role="presentation"><button class="nav-btn" role="tab" aria-selected="false" data-page="prompts" id="tab-prompts" aria-controls="page-prompts">Prompts</button></li>
-</ul>
+  <ul id="nav-tabs">
+    <li class="nav-group" data-group="general">
+      <button type="button" class="nav-group-header" role="button" tabindex="0" aria-expanded="true" aria-controls="nav-group-general">General</button>
+      <ul class="nav-group-children" id="nav-group-general" role="group" aria-label="General">
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="true" data-page="server" id="tab-server" aria-controls="page-server">Server Settings</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="virtual-keys" id="tab-virtual-keys" aria-controls="page-virtual-keys">Virtual Keys</button></li>
+      </ul>
+    </li>
+    <li class="nav-group" data-group="providers">
+      <button type="button" class="nav-group-header" role="button" tabindex="0" aria-expanded="false" aria-controls="nav-group-providers">Providers &amp; Models</button>
+      <ul class="nav-group-children" id="nav-group-providers" role="group" aria-label="Providers & Models" hidden>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="providers" id="tab-providers" aria-controls="page-providers">Providers</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="model-groups" id="tab-model-groups" aria-controls="page-model-groups">Model Groups</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="model-deprecations" id="tab-model-deprecations" aria-controls="page-model-deprecations">Model Deprecations</button></li>
+      </ul>
+    </li>
+    <li class="nav-group" data-group="routing">
+      <button type="button" class="nav-group-header" role="button" tabindex="0" aria-expanded="false" aria-controls="nav-group-routing">Routing &amp; Reliability</button>
+      <ul class="nav-group-children" id="nav-group-routing" role="group" aria-label="Routing & Reliability" hidden>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="routing" id="tab-routing" aria-controls="page-routing">Routing Settings</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="smart-routing" id="tab-smart-routing" aria-controls="page-smart-routing">Smart Routing</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="circuit-breaker" id="tab-circuit-breaker" aria-controls="page-circuit-breaker">Circuit Breaker</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="loop-detection" id="tab-loop-detection" aria-controls="page-loop-detection">Loop Detection</button></li>
+      </ul>
+    </li>
+    <li class="nav-group" data-group="pipeline">
+      <button type="button" class="nav-group-header" role="button" tabindex="0" aria-expanded="false" aria-controls="nav-group-pipeline">Request Pipeline</button>
+      <ul class="nav-group-children" id="nav-group-pipeline" role="group" aria-label="Request Pipeline" hidden>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="context" id="tab-context" aria-controls="page-context">Context</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="streaming" id="tab-streaming" aria-controls="page-streaming">Streaming</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="compression" id="tab-compression-config" aria-controls="page-compression">Compression</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="caching" id="tab-caching" aria-controls="page-caching">Caching</button></li>
+      </ul>
+    </li>
+    <li class="nav-group" data-group="safety">
+      <button type="button" class="nav-group-header" role="button" tabindex="0" aria-expanded="false" aria-controls="nav-group-safety">Safety &amp; Validation</button>
+      <ul class="nav-group-children" id="nav-group-safety" role="group" aria-label="Safety & Validation" hidden>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="guardrails" id="tab-guardrails" aria-controls="page-guardrails">Guardrails</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" type="button" aria-selected="false" data-page="structured-output" id="tab-structured-output" aria-controls="page-structured-output">Structured Output</button></li>
+      </ul>
+    </li>
+    <li class="nav-group" data-group="observability">
+      <button type="button" class="nav-group-header" role="button" tabindex="0" aria-expanded="false" aria-controls="nav-group-observability">Observability</button>
+      <ul class="nav-group-children" id="nav-group-observability" role="group" aria-label="Observability" hidden>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="logging" id="tab-logging" aria-controls="page-logging">Logging</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="tracing" id="tab-tracing" aria-controls="page-tracing">Tracing</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="cost-reports" id="tab-cost-reports" aria-controls="page-cost-reports">Cost Reports</button></li>
+      </ul>
+    </li>
+    <li class="nav-group" data-group="integrations">
+      <button type="button" class="nav-group-header" role="button" tabindex="0" aria-expanded="false" aria-controls="nav-group-integrations">Integrations</button>
+      <ul class="nav-group-children" id="nav-group-integrations" role="group" aria-label="Integrations" hidden>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="memory" id="tab-memory" aria-controls="page-memory">Persistent Memory</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="webhooks" id="tab-webhooks" aria-controls="page-webhooks">Webhooks</button></li>
+        <li role="presentation" class="nav-group-item-indent"><button class="nav-btn" role="tab" aria-selected="false" data-page="prompts" id="tab-prompts" aria-controls="page-prompts">Prompts</button></li>
+      </ul>
+    </li>
+  </ul>
   <div class="nav-footer">
     <a href="/dashboard" id="dashboard-link">Open Dashboard &rarr;</a>
   </div>
@@ -3276,6 +3320,16 @@ body.sec-banner-active{padding-top:3.2rem}
   var basePath = window.location.pathname.replace(/\/?$/, '/');
   function apiUrl(endpoint) { return basePath + endpoint; }
 
+  var NAV_GROUPS = [
+    { id: 'general', label: 'General', tabs: ['server', 'virtual-keys'] },
+    { id: 'providers', label: 'Providers & Models', tabs: ['providers', 'model-groups', 'model-deprecations'] },
+    { id: 'routing', label: 'Routing & Reliability', tabs: ['routing', 'smart-routing', 'circuit-breaker', 'loop-detection'] },
+    { id: 'pipeline', label: 'Request Pipeline', tabs: ['context', 'streaming', 'compression', 'caching'] },
+    { id: 'safety', label: 'Safety & Validation', tabs: ['guardrails', 'structured-output'] },
+    { id: 'observability', label: 'Observability', tabs: ['logging', 'tracing', 'cost-reports'] },
+    { id: 'integrations', label: 'Integrations', tabs: ['memory', 'webhooks', 'prompts'] }
+  ];
+
   // --- Tab Navigation ---
   var tabs = document.querySelectorAll('[role="tab"]');
   var pages = document.querySelectorAll('.page');
@@ -3302,6 +3356,8 @@ if (pageId === 'cost-reports') { crOnOpen(); }
 if (pageId === 'prompts') { plOnOpen(); }
  if (pageId === 'circuit-breaker') { loadCircuitBreakerStates(); }
  if (pageId === 'providers') { refreshProvBudgetsBulk(); refreshCopilotStatuses(); }
+    updateActiveGroupIndicator(pageId);
+    expandGroupForPage(pageId);
 }
 
   /**
@@ -3328,7 +3384,7 @@ function refreshModelGroupModels() {
   tabs.forEach(function(tab) {
     tab.addEventListener('click', function() { switchPage(this.dataset.page); });
     tab.addEventListener('keydown', function(e) {
-      var items = Array.from(tabs);
+      var items = Array.from(tabs).filter(function(t) { var g = t.closest('.nav-group-children'); return !g || !g.hidden; });
       var idx = items.indexOf(this);
       if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
         e.preventDefault();
@@ -3341,6 +3397,112 @@ function refreshModelGroupModels() {
       }
     });
   });
+
+  // --- Nav Groups ---
+  var NAV_GROUPS_STORAGE_KEY = 'admin-nav-groups';
+
+  function toggleGroup(groupId, forceExpanded, skipSave) {
+    var header = document.querySelector('.nav-group-header[aria-controls="nav-group-' + groupId + '"]');
+    var children = document.getElementById('nav-group-' + groupId);
+    if (!header || !children) { return; }
+    var expanded = (typeof forceExpanded === 'boolean') ? forceExpanded : header.getAttribute('aria-expanded') !== 'true';
+    header.setAttribute('aria-expanded', String(expanded));
+    children.hidden = !expanded;
+    if (!skipSave) { saveGroupState(); }
+  }
+
+  function saveGroupState() {
+    try {
+      var state = {};
+      document.querySelectorAll('.nav-group-header').forEach(function(h) {
+        var id = (h.getAttribute('aria-controls') || '').replace(/^nav-group-/, '');
+        if (id) { state[id] = h.getAttribute('aria-expanded') === 'true'; }
+      });
+      localStorage.setItem(NAV_GROUPS_STORAGE_KEY, JSON.stringify(state));
+    } catch (e) { /* storage unavailable */ }
+  }
+
+  function loadGroupState() {
+    try {
+      var raw = localStorage.getItem(NAV_GROUPS_STORAGE_KEY);
+      if (!raw) { return null; }
+      var parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) { return parsed; }
+      return null;
+    } catch (e) { return null; }
+  }
+
+  function groupForPage(pageId) {
+    for (var i = 0; i < NAV_GROUPS.length; i++) {
+      if (NAV_GROUPS[i].tabs.indexOf(pageId) !== -1) { return NAV_GROUPS[i]; }
+    }
+    return null;
+  }
+
+  function updateActiveGroupIndicator(pageId) {
+    var active = groupForPage(pageId);
+    document.querySelectorAll('.nav-group-header').forEach(function(h) {
+      var id = (h.getAttribute('aria-controls') || '').replace(/^nav-group-/, '');
+      h.classList.toggle('has-active', !!(active && active.id === id));
+    });
+  }
+
+  function expandGroupForPage(pageId, skipSave) {
+    var g = groupForPage(pageId);
+    if (g) { toggleGroup(g.id, true, skipSave); }
+  }
+
+  function findTabByPage(pageId) {
+    var allTabs = document.querySelectorAll('nav [role="tab"]');
+    for (var i = 0; i < allTabs.length; i++) {
+      if (allTabs[i].dataset.page === pageId) { return allTabs[i]; }
+    }
+    return null;
+  }
+
+  function handleHashChange() {
+    var h = (window.location.hash || '').replace(/^#/, '');
+    if (!h) { return; }
+    var tab = findTabByPage(h);
+    if (!tab) { return; }
+    expandGroupForPage(tab.dataset.page);
+    switchPage(tab.dataset.page);
+  }
+
+  function restoreGroups() {
+    var hashH = (window.location.hash || '').replace(/^#/, '');
+    var hashTab = hashH ? findTabByPage(hashH) : null;
+    var hasHash = !!hashTab;
+    var saved = loadGroupState();
+    if (saved === null) {
+      NAV_GROUPS.forEach(function(g) { toggleGroup(g.id, g.id === 'general', true); });
+      if (!hasHash) { switchPage('server'); }
+    } else {
+      NAV_GROUPS.forEach(function(g) {
+        if (typeof saved[g.id] === 'boolean') { toggleGroup(g.id, saved[g.id], true); }
+      });
+    }
+    var activeTab = document.querySelector('[role="tab"][aria-selected="true"]');
+    if (activeTab) {
+      expandGroupForPage(activeTab.dataset.page, true);
+      updateActiveGroupIndicator(activeTab.dataset.page);
+    }
+    saveGroupState();
+  }
+
+  document.querySelectorAll('.nav-group-header').forEach(function(header) {
+    var groupId = (header.getAttribute('aria-controls') || '').replace(/^nav-group-/, '');
+    if (!groupId) { return; }
+    header.addEventListener('click', function() { toggleGroup(groupId); });
+    header.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        toggleGroup(groupId);
+      }
+    });
+  });
+
+  window.addEventListener('hashchange', handleHashChange);
 
   // --- Status Bar ---
   var statusEl = document.getElementById('status-msg');
@@ -10575,6 +10737,8 @@ plLogSearch(document.getElementById('log-prompt-id').value.trim() || null, versi
   }
 
   // --- Init: load config on startup ---
+  restoreGroups();
+  handleHashChange();
   initSecurityBanner();
   loadConfig();
 })();
