@@ -419,7 +419,7 @@ pub struct LogFilter {
     pub min_status_code: Option<u16>,
     pub compression_level: Option<String>,
     /// Exact-match `client_protocol` filter (`chat` | `responses` |
-    /// `anthropic`). Rows with a NULL `client_protocol` (legacy chat
+    /// `anthropic` | `memory_consolidation`). Rows with a NULL `client_protocol` (legacy chat
     /// traffic) never match, per SQL NULL semantics.
     pub client_protocol: Option<String>,
     /// Exact-match Claude session/agent identifier filter (Req 5.5).

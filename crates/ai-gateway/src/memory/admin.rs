@@ -1354,9 +1354,10 @@ mod tests {
             &self,
             _request: MemoryExtractionProviderRequest,
         ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
-            Err(MemoryExtractionProviderError {
-                message: "provider exploded with secret sk-xyz detail".to_owned(),
-            })
+            Err(
+                MemoryExtractionProviderError::new("provider exploded with secret sk-xyz detail")
+                    .with_error_class("upstream_http_502"),
+            )
         }
     }
 
@@ -1441,6 +1442,8 @@ mod tests {
         assert_eq!(body["counts"]["skipped_batches"], 0);
         assert_eq!(body["counts"]["provider_errors"], 0);
         assert!(body.get("error_summary").is_none());
+        assert!(body.get("provider_error_classes").is_none());
+        assert!(body.get("last_error_trace_id").is_none());
 
         let (status, stats) = request(app, "GET", "/stats", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -1541,6 +1544,13 @@ mod tests {
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0]["class"], "provider_error");
         assert_eq!(summary[0]["count"], 1);
+        let classes = body["provider_error_classes"]
+            .as_array()
+            .expect("provider error classes");
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0]["class"], "upstream_http_502");
+        assert_eq!(classes[0]["count"], 1);
+        assert!(body.get("last_error_trace_id").is_none());
         let serialized = serde_json::to_string(&body).unwrap();
         assert!(
             !serialized.contains("fly.io"),

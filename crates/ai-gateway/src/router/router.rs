@@ -64,6 +64,20 @@ const PRECOMPRESSED_CACHE_MARKER_TYPE: &str = "obey_precompressed_context";
 tokio::task_local! {
     pub static REQUEST_OUTPUT_CAP: Option<u32>;
     pub static REQUEST_OUTPUT_CAP_METADATA: Option<serde_json::Value>;
+    static INTERNAL_REQUEST_TAG: &'static str;
+}
+
+/// Runs `fut` as a gateway-internal LLM call (memory consolidation) tagged
+/// `tag`. Internal calls bypass memory side effects and prompt compression.
+pub async fn scope_internal_request<F: std::future::Future>(tag: &'static str, fut: F) -> F::Output {
+    INTERNAL_REQUEST_TAG.scope(tag, fut).await
+}
+
+/// Returns the tag of the enclosing gateway-internal LLM call, if any. Such
+/// calls (memory consolidation) bypass memory side effects and prompt
+/// compression.
+pub fn current_internal_request_tag() -> Option<&'static str> {
+    INTERNAL_REQUEST_TAG.try_with(|t| *t).ok()
 }
 
 pub struct RequestOutputCapScope {
@@ -1824,8 +1838,13 @@ pub async fn set_web_search_test_backend(
                 config.tool_compression.enabled,
             )
         };
-        let effective =
+        let mut effective =
             global_config.resolve(provider_override.as_ref(), model_group.compression.as_ref());
+        if current_internal_request_tag().is_some() {
+            // Gateway-internal calls (memory consolidation) were never compressed.
+            effective.enabled = false;
+            effective.caveman_output = false;
+        }
         let caveman_output = effective.caveman_output;
         let (pipeline, precompressed_manager) = {
             let runtime = self
@@ -1945,6 +1964,9 @@ pub async fn set_web_search_test_backend(
         after_request: &OpenAIRequest,
         request_id: &str,
     ) {
+        if current_internal_request_tag().is_some() {
+            return;
+        }
         let Some(handle) = &self.memory_system else {
             return;
         };
@@ -5273,8 +5295,13 @@ return Ok(response);
 /// compression so the injected definitions are never compressed away.
 /// When the generic `web_search` feature is active it wins exclusively:
 /// only the `web_search` tool is injected (plus client tools) and the
-/// legacy Codex tools are suppressed.
+/// legacy Codex tools are suppressed. Gateway-internal requests (memory
+/// consolidation) never get search tools: they must stay a single
+/// JSON-answer turn and their content must not reach a search backend.
 async fn maybe_inject_search_tools(&self, request: &mut OpenAIRequest) {
+        if current_internal_request_tag().is_some() {
+            return;
+        }
         match self.active_search_config().await {
             crate::web_search::coordinator::ActiveSearchConfig::Generic { .. } => {
                 let tools = request.extra.entry("tools".to_string()).or_insert_with(|| {
@@ -12101,6 +12128,82 @@ pub async fn route_request(
         .await
 }
 
+    /// Routes `request` to exactly one `provider`/`model`, used when the
+    /// operator pinned a single model (memory consolidation pair). The first
+    /// configured model group listing that entry supplies the group settings;
+    /// otherwise a synthetic one-model group named `provider/model` is used.
+    /// Rate limits, breakers, retries and the attempt ledger apply as for a
+    /// normal request; smart routing and the response cascade do not.
+pub async fn route_request_pinned(
+    &self,
+    request: &OpenAIRequest,
+    provider: &str,
+    model: &str,
+    active: Option<ActiveRequestHandle>,
+) -> Result<OpenAIResponse, GatewayError> {
+        let group = {
+            let config = self.config.read().await;
+            config.model_groups.iter().find_map(|group| {
+                group
+                    .models
+                    .iter()
+                    .find(|pm| pm.provider == provider && pm.model == model)
+                    .map(|pm| ModelGroup {
+                        models: vec![pm.clone()],
+                        ..group.clone()
+                    })
+            })
+        };
+        let group = group.unwrap_or_else(|| ModelGroup {
+            name: format!("{provider}/{model}"),
+            version_fallback_enabled: false,
+            compression: None,
+            memory: None,
+            structured_output: None,
+            max_output_tokens: None,
+            models: vec![ProviderModel {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                cost_per_million_input_tokens: 0.0,
+                cost_per_million_output_tokens: 0.0,
+                priority: 100,
+                structured_output_passthrough: None,
+                tier: None,
+                context_window: 0,
+                specializations: vec![],
+                cache_min_tokens: None,
+                cache_support: None,
+                cost_per_million_cache_read_input_tokens: None,
+                cost_per_million_cache_creation_input_tokens: None,
+                cost_per_million_reasoning_tokens: None,
+                reasoning_family: None,
+                reasoning_parameter: None,
+                deprecation_date: None,
+                replacement_model: None,
+            }],
+        });
+        if let Some(handle) = &active {
+            handle.set_group(&group.name);
+        }
+        let providers = self.select_provider_order(&group).await;
+        self.record_breaker_skips(&group, &providers, &[], active.as_ref())
+            .await;
+        if providers.is_empty() {
+            return Err(GatewayError::InvalidRequest(
+                "No available providers for model".to_string(),
+            ));
+        }
+        self.route_with_failover_for_group(
+            request,
+            &group,
+            providers,
+            active,
+            ActivePhase::Primary,
+            ToolCompressionRestore::default(),
+        )
+        .await
+}
+
     /// Like [`Self::route_request`], but removes any `provider:model` entry
     /// listed in `exclude` from the initial failover chain. Used by the
     /// streaming pass-through path so a provider that just returned a
@@ -16325,6 +16428,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_scope_skips_prompt_compression_and_memory_hook() {
+        let mut config = create_test_config();
+        config.compression = compression_config(CompressionLevel::Lite, 0);
+        config.compression.caveman_output = true;
+        let mut provider = test_provider("provider", "http://localhost".to_string());
+        provider.compression = Some(ProviderCompressionOverride {
+            enabled: Some(true),
+            level: Some(CompressionLevel::Standard),
+            auto_threshold_tokens: Some(0),
+            caveman_output: Some(true),
+        });
+        let provider_model = test_model("provider", 1);
+        let group = test_group(vec![provider_model.clone()]);
+        config.providers = vec![provider];
+        config.model_groups = vec![group.clone()];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let request = compression_request(false);
+
+        let compressed = router
+            .prepare_compressed_request(&request, &group, &provider_model, "outside")
+            .await;
+        assert_ne!(
+            serde_json::to_value(&compressed).unwrap(),
+            serde_json::to_value(&request).unwrap()
+        );
+        assert_eq!(current_internal_request_tag(), None);
+
+        let internal = scope_internal_request("memory_extraction", async {
+            assert_eq!(current_internal_request_tag(), Some("memory_extraction"));
+            router
+                .prepare_compressed_request(&request, &group, &provider_model, "inside")
+                .await
+        })
+        .await;
+        assert_eq!(
+            serde_json::to_value(internal).unwrap(),
+            serde_json::to_value(&request).unwrap()
+        );
+    }
+
+    /// The memory compression hook persists candidates outside the internal
+    /// scope and nothing inside it, with a real memory system attached.
+    #[tokio::test]
+    async fn internal_scope_skips_memory_hook_with_memory_system_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(
+            MemorySystem::new(
+                crate::memory::MemoryConfig {
+                    enabled: true,
+                    database_path: dir.path().join("memory.db").to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+        router.set_memory_system(Arc::new(RwLock::new(Some(memory.clone()))));
+        let message = |content: &str| Message {
+            role: "user".to_string(),
+            content: serde_json::json!(content),
+            extra: serde_json::Map::new(),
+        };
+        let mut before = compression_request(false);
+        before.messages = vec![message(
+            "We decided to keep the embedded SQLite storage layer for every gateway database going forward.",
+        )];
+        let mut after = before.clone();
+        after.messages = vec![message("ok")];
+
+        scope_internal_request(
+            crate::memory::MEMORY_EXTRACTION_INTERNAL_TAG,
+            router.run_memory_compression_hook(&before, &after, "inside"),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(memory.store.export_all().unwrap().is_empty());
+
+        // Control: the same input outside the scope does persist, so the
+        // empty store above is the scope's doing.
+        router
+            .run_memory_compression_hook(&before, &after, "outside")
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while memory.store.export_all().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "control run never persisted a compression candidate"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Search tools are injected for client requests and never inside the
+    /// internal scope.
+    #[tokio::test]
+    async fn internal_scope_skips_search_tool_injection() {
+        let primary = MockServer::start().await;
+        let (router, token_path) = codex_search_router(create_test_config(), &primary).await;
+
+        let mut outside = compression_request(false);
+        router.maybe_inject_search_tools(&mut outside).await;
+        assert!(outside.extra.contains_key("tools"), "control run injected nothing");
+
+        let mut inside = compression_request(false);
+        let original = serde_json::to_value(&inside).unwrap();
+        scope_internal_request(
+            crate::memory::MEMORY_EXTRACTION_INTERNAL_TAG,
+            router.maybe_inject_search_tools(&mut inside),
+        )
+        .await;
+        assert_eq!(serde_json::to_value(&inside).unwrap(), original);
+        let _ = std::fs::remove_file(&token_path);
+    }
+
+    #[tokio::test]
     async fn compression_auto_threshold_is_strictly_greater_than() {
         let mut config = create_test_config();
         let provider_model = test_model("provider", 1);
@@ -17069,6 +17290,123 @@ mod tests {
         );
     }
 
+    /// Two-provider group "test-group": p1 (priority 1, never called) and
+    /// p2 (priority 2, streams `STREAMED_TURN_SSE` exactly once).
+    async fn pinned_route_fixture(p2_rpm: u32) -> (Router, MockServer, MockServer) {
+        use wiremock::matchers::{body_partial_json, method, path};
+
+        let p1 = MockServer::start().await;
+        let p2 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion_response()))
+            .expect(0)
+            .mount(&p1)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "stream": true,
+                "stream_options": {"include_usage": true}
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
+            )
+            .expect(1)
+            .mount(&p2)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        let mut provider2 = test_provider("p2", p2.uri());
+        provider2.rate_limit_per_minute = p2_rpm;
+        config.providers = vec![test_provider("p1", p1.uri()), provider2];
+        config.model_groups = vec![test_group(vec![test_model("p1", 1), test_model("p2", 2)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        (router, p1, p2)
+    }
+
+    #[tokio::test]
+    async fn pinned_route_sends_only_to_pinned_provider_and_streams_upstream() {
+        let (router, p1, p2) = pinned_route_fixture(0).await;
+        let handle = ledger_handle();
+        let response = router
+            .route_request_pinned(
+                &compression_request(false),
+                "p2",
+                "upstream-model",
+                Some(handle.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.choices[0].message.content, serde_json::json!("Hello"));
+        {
+            let info = handle.0.lock().unwrap();
+            assert_eq!(info.model_group.as_deref(), Some("test-group"));
+            assert_eq!(info.provider.as_deref(), Some("p2"));
+        }
+        p1.verify().await;
+        p2.verify().await;
+    }
+
+    #[tokio::test]
+    async fn pinned_route_consumes_one_rate_token() {
+        let (router, _p1, p2) = pinned_route_fixture(6).await;
+        let before = tokens_left(&router, "p2").await;
+        router
+            .route_request_pinned(&compression_request(false), "p2", "upstream-model", None)
+            .await
+            .unwrap();
+        let consumed = before - tokens_left(&router, "p2").await;
+        let sent = chat_requests(&p2).await;
+        assert_eq!(sent, 1);
+        // 6/min refills 0.1 token/s: negligible over a sub-second request.
+        assert!(
+            (consumed - sent as f64).abs() < 0.1,
+            "consumed {consumed} tokens for {sent} upstream request"
+        );
+        p2.verify().await;
+    }
+
+    #[tokio::test]
+    async fn pinned_route_without_group_uses_synthetic_group() {
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        config.providers = vec![test_provider("solo", server.uri())];
+        let router = Router::new(Arc::new(RwLock::new(config)), test_metrics());
+        let handle = ledger_handle();
+        router
+            .route_request_pinned(
+                &compression_request(false),
+                "solo",
+                "some-model",
+                Some(handle.clone()),
+            )
+            .await
+            .unwrap();
+        {
+            let info = handle.0.lock().unwrap();
+            assert_eq!(info.model_group.as_deref(), Some("solo/some-model"));
+            assert_eq!(info.provider.as_deref(), Some("solo"));
+            assert_eq!(info.model.as_deref(), Some("some-model"));
+        }
+        server.verify().await;
+    }
+
     pub(super) fn ledger_handle() -> ActiveRequestHandle {
         crate::active_requests::ActiveRequestRegistry::new().register(
             crate::active_requests::ActiveRequestInfo {
@@ -17090,6 +17428,7 @@ mod tests {
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0),
                 kind: crate::active_requests::RequestKind::Chat,
+                origin: None,
                 smart_routing_logged: false,
                 failed_attempts: Vec::new(),
                 attempt_rows_total: 0,
@@ -19901,6 +20240,7 @@ extra: Default::default(),
             virtual_key_id: None,
             started_at_ms: 0,
             kind: crate::active_requests::RequestKind::Chat,
+            origin: None,
             smart_routing_logged: false,
             failed_attempts: Vec::new(),
             attempt_rows_total: 0,
@@ -20557,6 +20897,7 @@ extra: Default::default(),
                 virtual_key_id: None,
                 started_at_ms: 0,
                 kind: crate::active_requests::RequestKind::Stream,
+                origin: None,
                 smart_routing_logged: false,
                 failed_attempts: Vec::new(),
                 attempt_rows_total: 0,

@@ -766,8 +766,13 @@ fn write_request_log(
         // in the request log (prompt-library-versioning spec, Req 4.4:
         // "template content and variable values SHALL NOT be stored").
         // `None` wins even when request-body logging is enabled;
-        // attribution lives in the prompt_* columns.
-        request_body: if context.prompt_id.is_some() {
+        // attribution lives in the prompt_* columns. Memory consolidation
+        // rows drop the body too: it carries stored memory contents, which
+        // stay in memory.db only (the abandon row already logs `None`).
+        request_body: if context.prompt_id.is_some()
+            || context.client_protocol
+                == Some(crate::active_requests::RequestOrigin::MemoryConsolidation.log_protocol())
+        {
             None
         } else {
             serde_json::to_string(request).ok()
@@ -1955,23 +1960,47 @@ struct AbandonLogger {
     /// spec, Req 4.4) for the 499/504 outcome row; `None` for
     /// ordinary requests.
     prompt_meta: Option<PromptResolutionMeta>,
+    /// `client_protocol` for the 499/504 outcome row (`None` for client
+    /// requests; the request origin's log protocol for internal ones).
+    client_protocol: Option<&'static str>,
 }
 
 impl AbandonLogger {
     fn new(state: &super::AppState, handle: &crate::active_requests::ActiveRequestHandle) -> Self {
+        Self::from_parts(
+            state.logger.clone(),
+            handle,
+            state.runtime_limits.request_timeout_seconds(),
+        )
+    }
+
+    /// Build the logger from its parts, for internal requests that have no
+    /// `AppState` at hand.
+    fn from_parts(
+        logger: Arc<crate::logger::RequestLogger>,
+        handle: &crate::active_requests::ActiveRequestHandle,
+        deadline_secs: u64,
+    ) -> Self {
         let (requested_model, kind) = handle
             .0
             .lock()
             .map(|info| (info.requested_model.clone(), info.kind))
             .unwrap_or_else(|_| (String::new(), crate::active_requests::RequestKind::Chat));
         Self {
-            logger: state.logger.clone(),
+            logger,
             handle: handle.clone(),
             requested_model,
             kind,
-            deadline_secs: state.runtime_limits.request_timeout_seconds(),
+            deadline_secs,
             prompt_meta: None,
+            client_protocol: None,
         }
+    }
+
+    /// Set the `client_protocol` written on the abandoned-request row.
+    fn with_client_protocol(mut self, protocol: Option<&'static str>) -> Self {
+        self.client_protocol = protocol;
+        self
     }
 
     /// Attach prompt-library attribution (Req 4.4) so abandoned
@@ -2053,7 +2082,7 @@ impl AbandonLogger {
             reasoning_tokens: None,
             reasoning_compat_actions: None,
             context_reduction: None,
-            client_protocol: None,
+            client_protocol: self.client_protocol.map(str::to_string),
             claude_session_id: None,
         // Abandoned requests never reported usage; the key id
         // comes from the handle snapshot with the same
@@ -2556,6 +2585,7 @@ fn build_active_request_info(
         virtual_key_id: virtual_key_id.map(|s| s.to_string()),
         started_at_ms,
         kind,
+        origin: None,
         smart_routing_logged: false,
         failed_attempts: Vec::new(),
         attempt_rows_total: 0,
@@ -2563,6 +2593,165 @@ fn build_active_request_info(
         outcome_logged: false,
         breaker_skips_recorded: false,
         reasoning_relay: None,
+    }
+}
+
+/// Dispatch a gateway-internal chat request (memory consolidation) through
+/// the router with the same lifecycle as a buffered client request: an
+/// in-flight registry entry tagged with `origin`, request metrics, the
+/// attempt ledger drained into `#attempt` rows, one outcome row with
+/// `client_protocol = origin.log_protocol()`, and the 499/504 abandon row
+/// written by [`RequestCompleteGuard`] when the call is cancelled or hits
+/// the global gateway deadline.
+///
+/// Routing runs inside the router's internal-request scope, so prompt
+/// compression and the memory compression hook are skipped. No OTLP
+/// telemetry spans are emitted: the internal context carries no
+/// `AppState` telemetry handles.
+pub(crate) async fn dispatch_internal_chat(
+    ctx: &super::memory_dispatch::InternalDispatchContext,
+    mut request: OpenAIRequest,
+    route: crate::memory::ConsolidationRoute,
+    origin: crate::active_requests::RequestOrigin,
+) -> Result<OpenAIResponse, super::memory_dispatch::InternalDispatchFailure> {
+    use super::memory_dispatch::InternalDispatchFailure;
+    use crate::memory::ConsolidationRoute;
+
+    let Some(router) = ctx.router.upgrade() else {
+        return Err(InternalDispatchFailure {
+            error_class: "gateway_unavailable".to_string(),
+            message: "gateway router is no longer available".to_string(),
+            trace_id: None,
+        });
+    };
+    request.model = match &route {
+        ConsolidationRoute::ModelGroup(group) => group.clone(),
+        ConsolidationRoute::Pinned { model, .. } => model.clone(),
+    };
+    let trace_id = generate_trace_id(None);
+
+    ctx.metrics.start_request();
+    let start = Instant::now();
+    let mut info = build_active_request_info(
+        &trace_id,
+        &request.model,
+        None,
+        crate::active_requests::RequestKind::Chat,
+    );
+    info.origin = Some(origin);
+    let handle = ctx.active_requests.register(info);
+    let mut guard = RequestCompleteGuard::new(
+        ctx.metrics.clone(),
+        start,
+        Some((ctx.active_requests.clone(), trace_id.clone())),
+    )
+    .with_abandon_logger(
+        AbandonLogger::from_parts(
+            ctx.logger.clone(),
+            &handle,
+            ctx.runtime_limits.request_timeout_seconds(),
+        )
+        .with_client_protocol(Some(origin.log_protocol())),
+    );
+
+    let routing = crate::router::router::scope_internal_request(
+        crate::memory::MEMORY_EXTRACTION_INTERNAL_TAG,
+        async {
+            match &route {
+                ConsolidationRoute::ModelGroup(_) => {
+                    router
+                        .route_request(
+                            &request,
+                            Some(handle.clone()),
+                            crate::router::router::ToolCompressionRestore::default(),
+                        )
+                        .await
+                }
+                ConsolidationRoute::Pinned { provider, model } => {
+                    router
+                        .route_request_pinned(&request, provider, model, Some(handle.clone()))
+                        .await
+                }
+            }
+        },
+    );
+    // Same bound the HTTP request_timeout_middleware applies to buffered
+    // client requests.
+    let result = match ctx.runtime_limits.request_timeout() {
+        Some(deadline) => match tokio::time::timeout(deadline, routing).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    trace_id = %trace_id,
+                    timeout_seconds = deadline.as_secs(),
+                    "memory consolidation request exceeded the gateway deadline"
+                );
+                // The guard is deliberately left incomplete: its Drop writes
+                // the 504 `gateway_deadline` outcome row, exactly like an
+                // HTTP request cut by the deadline.
+                return Err(InternalDispatchFailure {
+                    error_class: "gateway_deadline".to_string(),
+                    message: format!("gateway deadline of {}s exceeded", deadline.as_secs()),
+                    trace_id: Some(trace_id),
+                });
+            }
+        },
+        None => routing.await,
+    };
+
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let mut log_context = match &result {
+        Ok(response) => {
+            RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, response)
+        }
+        Err(error) => RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, error),
+    };
+    log_context.client_protocol = Some(origin.log_protocol());
+    log_failed_attempts(
+        &ctx.logger,
+        &ctx.metrics,
+        &trace_id,
+        &handle.take_failed_attempts(),
+    );
+    if let Err(error) = write_request_log(&ctx.logger, &request, &log_context) {
+        tracing::warn!(%error, trace_id = %trace_id, "Failed to write internal request log entry");
+    }
+    handle.mark_outcome_logged();
+    guard.complete();
+
+    result.map_err(|error| InternalDispatchFailure {
+        error_class: crate::error::error_class_for(&error),
+        message: internal_failure_summary(&error),
+        trace_id: Some(trace_id),
+    })
+}
+
+/// Content-free summary of a routing failure for internal callers: attempt
+/// targets, classes and statuses only, never provider error bodies.
+fn internal_failure_summary(error: &GatewayError) -> String {
+    match error {
+        GatewayError::AllProvidersFailed(aggregate) => aggregate
+            .attempts
+            .iter()
+            .map(|attempt| {
+                let status = attempt
+                    .status_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                format!(
+                    "{}/{}: {} ({status})",
+                    attempt.provider,
+                    attempt.model,
+                    attempt.error_class.as_deref().unwrap_or("other"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+        other => format!(
+            "{} (status {})",
+            crate::error::error_class_for(other),
+            other.status_code().as_u16()
+        ),
     }
 }
 

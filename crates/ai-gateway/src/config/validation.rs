@@ -450,6 +450,17 @@ impl Config {
                 &mut errors,
             );
 
+            let consolidation_group = memory.consolidation_model_group.trim();
+            if !consolidation_group.is_empty()
+                && !configured_model_group_names.contains(consolidation_group)
+            {
+                errors.push(ValidationError::InvalidValue {
+                    field: "memory.consolidation_model_group".to_string(),
+                    value: memory.consolidation_model_group.clone(),
+                    expected: "the exact name of a configured model group".to_string(),
+                });
+            }
+
             if let Some(qdrant) = &memory.qdrant {
                 let embedding_provider = qdrant.embedding_provider.trim();
                 if !embedding_provider.is_empty()
@@ -2900,6 +2911,29 @@ model_groups:
             ValidationError::InvalidValue { field, value, .. }
                 if field == "memory.qdrant.embedding_provider" && value == "missing-embedding"
         )));
+    }
+
+    #[test]
+    fn memory_consolidation_model_group_must_name_a_configured_group() {
+        let mut config = minimal_valid_config();
+        config.memory = Some(crate::memory::MemoryConfig {
+            consolidation_enabled: true,
+            consolidation_model_group: "missing-group".to_string(),
+            ..Default::default()
+        });
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidValue { field, value, .. }
+                if field == "memory.consolidation_model_group" && value == "missing-group"
+        )));
+
+        config.memory = Some(crate::memory::MemoryConfig {
+            consolidation_enabled: true,
+            consolidation_model_group: "test-group".to_string(),
+            ..Default::default()
+        });
+        config.validate().unwrap();
     }
 
     #[test]

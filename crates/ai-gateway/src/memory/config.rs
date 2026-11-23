@@ -36,6 +36,10 @@ pub struct MemoryConfig {
     pub consolidation_enabled: bool,
     pub consolidation_provider: String,
     pub consolidation_model: String,
+    /// When non-empty, consolidation batches route through this model group
+    /// like a normal request (smart routing, failover, cascade, rate limits)
+    /// and the `consolidation_provider`/`consolidation_model` pair is ignored.
+    pub consolidation_model_group: String,
     /// Maximum number of consolidation batches processed concurrently
     /// during one pass. Range 1..=8.
     pub consolidation_max_concurrent_batches: u32,
@@ -45,6 +49,26 @@ pub struct MemoryConfig {
     pub qdrant: Option<MemoryQdrantConfig>,
     pub default_prompts: Vec<String>,
     pub custom_sensitive_patterns: Vec<String>,
+}
+
+/// Where consolidation batches are sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsolidationRoute {
+    /// Route through this model group like a normal request.
+    ModelGroup(String),
+    /// Send to exactly one provider:model.
+    Pinned { provider: String, model: String },
+}
+
+impl ConsolidationRoute {
+    /// Returns the `(provider, model)` request target. An empty provider
+    /// means "route `model` through normal model-group resolution".
+    pub fn request_target(&self) -> (String, String) {
+        match self {
+            Self::ModelGroup(group) => (String::new(), group.clone()),
+            Self::Pinned { provider, model } => (provider.clone(), model.clone()),
+        }
+    }
 }
 
 impl Default for MemoryConfig {
@@ -63,6 +87,7 @@ impl Default for MemoryConfig {
             consolidation_enabled: false,
             consolidation_provider: String::new(),
             consolidation_model: String::new(),
+            consolidation_model_group: String::new(),
             consolidation_max_concurrent_batches: 2,
             max_memories_per_namespace: 1_000,
             allow_sensitive_storage: false,
@@ -202,6 +227,20 @@ impl MemoryConfig {
         }
     }
 
+    /// Resolves where consolidation batches are sent.
+    ///
+    /// A non-empty `consolidation_model_group` wins; otherwise the
+    /// provider/model pair from [`Self::resolve_consolidation_pair`] is used as
+    /// a pinned single-model route. Returns `None` when neither resolves.
+    pub fn resolve_consolidation_route(&self) -> Option<ConsolidationRoute> {
+        let group = self.consolidation_model_group.trim();
+        if !group.is_empty() {
+            return Some(ConsolidationRoute::ModelGroup(group.to_owned()));
+        }
+        self.resolve_consolidation_pair()
+            .map(|(provider, model)| ConsolidationRoute::Pinned { provider, model })
+    }
+
     /// Validates local fields and resolves the auto-extraction provider name.
     ///
     /// The Wave 1 parent integration should pass every configured provider name
@@ -228,7 +267,10 @@ impl MemoryConfig {
             }
         }
 
-        if self.consolidation_enabled {
+        // With a consolidation model group the provider/model pair is ignored,
+        // so it is not validated; the group name is checked by the parent
+        // configuration against the configured model groups.
+        if self.consolidation_enabled && self.consolidation_model_group.trim().is_empty() {
             // Requirement 3.7: empty consolidation fields fall back to the
             // auto-extraction pair; validation fails only when the resolved
             // pair is incomplete or the provider is not configured.
@@ -1067,6 +1109,67 @@ consolidation_model: gpt-4.1-mini
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn consolidation_model_group_skips_pair_validation() {
+        let config = MemoryConfig {
+            consolidation_enabled: true,
+            consolidation_model_group: "consolidation".to_owned(),
+            ..MemoryConfig::default()
+        };
+        config.validate_with_provider_names(["openai"]).unwrap();
+    }
+
+    #[test]
+    fn consolidation_route_prefers_group_then_pair_then_none() {
+        let config = MemoryConfig {
+            consolidation_model_group: " consolidation ".to_owned(),
+            consolidation_provider: "openai".to_owned(),
+            consolidation_model: "gpt-4.1-mini".to_owned(),
+            ..MemoryConfig::default()
+        };
+        let route = config.resolve_consolidation_route().unwrap();
+        assert_eq!(route, ConsolidationRoute::ModelGroup("consolidation".to_owned()));
+        assert_eq!(
+            route.request_target(),
+            (String::new(), "consolidation".to_owned())
+        );
+
+        let config = MemoryConfig {
+            auto_extract_provider: "openai".to_owned(),
+            auto_extract_model: "gpt-4.1-mini".to_owned(),
+            ..MemoryConfig::default()
+        };
+        let route = config.resolve_consolidation_route().unwrap();
+        assert_eq!(
+            route,
+            ConsolidationRoute::Pinned {
+                provider: "openai".to_owned(),
+                model: "gpt-4.1-mini".to_owned(),
+            }
+        );
+        assert_eq!(
+            route.request_target(),
+            ("openai".to_owned(), "gpt-4.1-mini".to_owned())
+        );
+
+        assert_eq!(MemoryConfig::default().resolve_consolidation_route(), None);
+    }
+
+    #[test]
+    fn consolidation_model_group_deserializes_from_yaml() {
+        let config: MemoryConfig = serde_yaml::from_str(
+            r#"
+enabled: true
+consolidation_enabled: true
+consolidation_model_group: consolidation
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.consolidation_model_group, "consolidation");
+        config.validate_with_provider_names(["openai"]).unwrap();
+        assert!(MemoryConfig::default().consolidation_model_group.is_empty());
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub mod store;
 pub mod vector;
 
 pub use config::{
-    EffectiveMemoryConfig, MemoryConfig, MemoryConfigError, MemoryQdrantConfig,
+    ConsolidationRoute, EffectiveMemoryConfig, MemoryConfig, MemoryConfigError, MemoryQdrantConfig,
     MemoryValidationResult, ModelGroupMemoryOverride, ProviderMemoryOverride,
 };
 pub use consolidation::{
@@ -265,9 +265,9 @@ impl MemoryExtractionProvider for DisabledExtractionProvider {
         &self,
         _request: MemoryExtractionProviderRequest,
     ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
-        Err(MemoryExtractionProviderError {
-            message: "automatic memory extraction provider is disabled".to_owned(),
-        })
+        Err(MemoryExtractionProviderError::new(
+            "automatic memory extraction provider is disabled",
+        ))
     }
 }
 
@@ -373,6 +373,13 @@ pub struct ConsolidationJobStatus {
     pub error_summary: Vec<ConsolidationJobErrorClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counts: Option<ConsolidationCounts>,
+    /// Provider failures per content-free error class (e.g.
+    /// `upstream_http_502`, `consolidation_timeout`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub provider_error_classes: Vec<ConsolidationJobErrorClass>,
+    /// Trace id of the most recent provider failure that carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_trace_id: Option<String>,
 }
 
 /// One stable snake_case error class with its occurrence count (C10).
@@ -467,9 +474,7 @@ impl MemoryConsolidationRunner {
         if require_enabled && !config.consolidation_enabled {
             return None;
         }
-        let Some((provider_name, model)) = config.resolve_consolidation_pair() else {
-            return None;
-        };
+        let (provider_name, model) = config.resolve_consolidation_route()?.request_target();
         let vector_tier = self.vector_tier.read().await.clone();
         Some(ConsolidationContext {
             store: Arc::clone(&self.store),
@@ -480,7 +485,8 @@ impl MemoryConsolidationRunner {
             provider_name,
             model,
             maximum_concurrent_provider_calls: config.consolidation_max_concurrent_batches as usize,
-            provider_timeout: Duration::from_secs(120),
+            provider_timeout: (!self.provider.enforces_own_deadline())
+                .then(|| Duration::from_secs(120)),
             progress,
         })
     }
@@ -951,7 +957,7 @@ impl MemorySystem {
             .config
             .read()
             .await
-            .resolve_consolidation_pair()
+            .resolve_consolidation_route()
             .is_none()
         {
             return Err(MemoryError::Config(
@@ -1000,6 +1006,13 @@ impl MemorySystem {
                     })
                     .collect(),
                 counts: record.counts,
+                provider_error_classes: record
+                    .progress
+                    .provider_error_classes()
+                    .into_iter()
+                    .map(|(class, count)| ConsolidationJobErrorClass { class, count })
+                    .collect(),
+                last_error_trace_id: record.progress.last_provider_error_trace_id(),
             }
         })
     }

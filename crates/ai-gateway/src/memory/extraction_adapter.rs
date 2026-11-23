@@ -83,16 +83,17 @@ impl GatewayExtractionAdapter {
             .iter()
             .find(|p| p.name == provider_name)
             .cloned()
-            .ok_or_else(|| MemoryExtractionProviderError {
-                message: format!(
+            .ok_or_else(|| {
+                MemoryExtractionProviderError::new(format!(
                     "auto_extract_provider {:?} not found in configured providers",
                     provider_name
-                ),
+                ))
+                .with_error_class("provider_not_found")
             })
     }
 
     /// Build the outgoing request body as serde_json::Value.
-    fn build_request_body(model: &str, messages: &[ExtractionMessage]) -> serde_json::Value {
+    pub(crate) fn build_request_body(model: &str, messages: &[ExtractionMessage]) -> serde_json::Value {
         let consolidation = Self::is_consolidation_request(messages);
         let system_prompt = if consolidation { CONSOLIDATION_SYSTEM_PROMPT } else { EXTRACTION_SYSTEM_PROMPT };
         let mut chat_messages = Vec::with_capacity(messages.len() + 1);
@@ -123,7 +124,7 @@ impl GatewayExtractionAdapter {
         })
     }
 
-    fn is_consolidation_request(messages: &[ExtractionMessage]) -> bool {
+    pub(crate) fn is_consolidation_request(messages: &[ExtractionMessage]) -> bool {
         messages.len() == 1
             && messages[0].origin == ExtractionMessageOrigin::Injected
             && serde_json::from_str::<serde_json::Value>(&messages[0].content)
@@ -279,7 +280,7 @@ impl GatewayExtractionAdapter {
             _ => None,
         }
     }
-    fn parse_provider_payload(response_json: &serde_json::Value, consolidation: bool) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+    pub(crate) fn parse_provider_payload(response_json: &serde_json::Value, consolidation: bool) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
         let content = response_json
             .get("choices")
             .and_then(|choices| choices.get(0))
@@ -336,24 +337,24 @@ impl MemoryExtractionProvider for GatewayExtractionAdapter {
         let response = builder
             .send()
             .await
-            .map_err(|_| MemoryExtractionProviderError {
-                message: "extraction HTTP request failed".to_owned(),
+            .map_err(|_| {
+                MemoryExtractionProviderError::new("extraction HTTP request failed")
+                    .with_error_class("network_error")
             })?;
 
         let status = response.status();
         if !status.is_success() {
-            return Err(MemoryExtractionProviderError {
-                message: format!("extraction provider returned HTTP {}", status.as_u16()),
-            });
+            return Err(MemoryExtractionProviderError::new(format!(
+                "extraction provider returned HTTP {}",
+                status.as_u16()
+            ))
+            .with_error_class(format!("upstream_http_{}", status.as_u16())));
         }
 
-        let response_json: serde_json::Value =
-            response
-                .json()
-                .await
-                .map_err(|_| MemoryExtractionProviderError {
-                    message: "failed to parse extraction response body".to_owned(),
-                })?;
+        let response_json: serde_json::Value = response.json().await.map_err(|_| {
+            MemoryExtractionProviderError::new("failed to parse extraction response body")
+                .with_error_class("body_read_error")
+        })?;
 
         Self::parse_provider_payload(&response_json, Self::is_consolidation_request(&request.messages))
     }
