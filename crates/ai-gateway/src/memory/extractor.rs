@@ -167,6 +167,8 @@ pub struct CompressionExtractionInput<'a> {
 /// Provider call payload. The tag and bypass bit must be preserved by adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryExtractionProviderRequest {
+    /// Provider name. Empty means "route `model` through normal model-group
+    /// resolution" (the direct adapter answers class `provider_not_found`).
     pub provider: String,
     pub model: String,
     pub messages: Vec<ExtractionMessage>,

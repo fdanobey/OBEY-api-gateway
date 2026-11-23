@@ -107,6 +107,31 @@ pub enum RequestKind {
     Stream,
 }
 
+/// Gateway-internal source of an in-flight request (`None` on
+/// [`ActiveRequestInfo::origin`] means a normal client request).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestOrigin {
+    /// A background memory consolidation batch routed through the router.
+    MemoryConsolidation,
+}
+
+impl RequestOrigin {
+    /// Short human label for the dashboard pill.
+    pub fn label(&self) -> &'static str {
+        match self {
+            RequestOrigin::MemoryConsolidation => "memory consolidation",
+        }
+    }
+
+    /// Value written to the request log's `client_protocol` column.
+    pub fn log_protocol(&self) -> &'static str {
+        match self {
+            RequestOrigin::MemoryConsolidation => "memory_consolidation",
+        }
+    }
+}
+
 /// Snapshot of a single in-flight request, surfaced to the dashboard.
 ///
 /// Contains only operational metadata — never prompts, response bodies, or message
@@ -135,6 +160,10 @@ pub struct ActiveRequestInfo {
     /// Epoch milliseconds when the request started.
     pub started_at_ms: i64,
     pub kind: RequestKind,
+    /// Gateway-internal request source (e.g. memory consolidation);
+    /// `None` for a normal client request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<RequestOrigin>,
     /// The per-request Smart Routing decision line was already logged.
     #[serde(skip)]
     pub smart_routing_logged: bool,
@@ -506,6 +535,7 @@ mod tests {
                 .unwrap()
                 .as_millis() as i64,
         kind: RequestKind::Chat,
+        origin: None,
         smart_routing_logged: false,
         failed_attempts: Vec::new(),
         attempt_rows_total: 0,
@@ -635,6 +665,27 @@ fn stall_reason_round_trips_and_serializes() {
     // Serialized to the dashboard under the snake_case name.
     let json = serde_json::to_value(&snap[0]).unwrap();
     assert_eq!(json["stall_reason"], serde_json::json!("guardrail_scan"));
+}
+
+#[test]
+fn origin_is_omitted_for_client_requests_and_serialized_when_set() {
+    let reg = ActiveRequestRegistry::new();
+    reg.register(sample_info("trace-client"));
+    let json = serde_json::to_value(&reg.snapshot()[0]).unwrap();
+    assert!(json.get("origin").is_none());
+
+    let reg = ActiveRequestRegistry::new();
+    reg.register(ActiveRequestInfo {
+        origin: Some(RequestOrigin::MemoryConsolidation),
+        ..sample_info("trace-internal")
+    });
+    let json = serde_json::to_string(&reg.snapshot()[0]).unwrap();
+    assert!(json.contains("\"origin\":\"memory_consolidation\""));
+    assert_eq!(RequestOrigin::MemoryConsolidation.label(), "memory consolidation");
+    assert_eq!(
+        RequestOrigin::MemoryConsolidation.log_protocol(),
+        "memory_consolidation"
+    );
 }
 
 #[test]

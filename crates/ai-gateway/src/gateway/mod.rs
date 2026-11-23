@@ -1,5 +1,6 @@
 pub mod decisions;
 pub mod handlers;
+pub mod memory_dispatch;
 pub mod models_metadata;
 pub mod telemetry_seam;
 
@@ -26,7 +27,7 @@ use crate::config::{AdminSecurityMode, Config};
 use crate::error::GatewayError;
 use crate::guardrail::GuardrailEngine;
 use crate::logger::RequestLogger;
-use crate::memory::{GatewayExtractionAdapter, MemoryExtractionProvider, MemorySystem};
+use crate::memory::{MemoryExtractionProvider, MemorySystem};
 use crate::metrics::{Metrics, ProviderBudgetStore, ProviderBudgetStoreError};
 use crate::oauth::{OAuthManager, OAuthTokenStore};
 use crate::prompt_library::{build_prompt_library, PromptLibrary};
@@ -268,8 +269,17 @@ impl GatewayServer {
             };
         let compression_events = Arc::new(crate::dashboard::CompressionEventHub::new());
         let memory_events = Arc::new(crate::dashboard::MemoryEventHub::new());
+        // Filled right after AppState exists: the routed consolidation
+        // adapter needs the router, which is built after the memory system.
+        let memory_dispatch_cell = Arc::new(std::sync::OnceLock::new());
         let memory_system = Arc::new(RwLock::new(
-            build_memory_system(&config, config_arc.clone(), memory_events.clone()).await,
+            build_memory_system(
+                &config,
+                config_arc.clone(),
+                memory_events.clone(),
+                memory_dispatch_cell.clone(),
+            )
+            .await,
         ));
         // Prompt-library snapshot (prompt-library-versioning, Req 6.4 / 7.3):
         // open-or-create the store at startup; a failure degrades the feature
@@ -835,6 +845,7 @@ anchor,
             telemetry_exporter: telemetry_exporter.clone(),
             telemetry_snapshot: telemetry_snapshot.clone(),
         };
+        let _ = memory_dispatch_cell.set(memory_dispatch::InternalDispatchContext::from_state(&state));
 
         // Initial telemetry apply (Req 9 startup state): the config
         // values are cloned out (no lock is held across the await) and
@@ -1506,6 +1517,7 @@ async fn build_memory_system(
     config: &Config,
     config_arc: Arc<RwLock<Config>>,
     memory_events: Arc<crate::dashboard::MemoryEventHub>,
+    dispatch: Arc<std::sync::OnceLock<memory_dispatch::InternalDispatchContext>>,
 ) -> Option<Arc<MemorySystem>> {
     let memory_config = config.memory.as_ref()?.clone();
     if !memory_config.enabled {
@@ -1515,7 +1527,7 @@ async fn build_memory_system(
     // Always supply the extraction adapter so auto_extract can be toggled
     // via hot-reload without requiring a gateway restart.
     let extraction_provider: Arc<dyn MemoryExtractionProvider> =
-        Arc::new(GatewayExtractionAdapter::new(config_arc));
+        Arc::new(memory_dispatch::RoutedMemoryAdapter::new(config_arc, dispatch));
     match MemorySystem::new_with_vector(memory_config, None, Some(extraction_provider), vector_tier)
         .await
     {
@@ -1867,7 +1879,12 @@ state.router.clear_deprecations_for_reload(&provider_names);
         }
         (None, Some(config)) => {
             let extraction_provider: Arc<dyn MemoryExtractionProvider> =
-                Arc::new(GatewayExtractionAdapter::new(state.config.clone()));
+                Arc::new(memory_dispatch::RoutedMemoryAdapter::new(
+                    state.config.clone(),
+                    Arc::new(std::sync::OnceLock::from(
+                        memory_dispatch::InternalDispatchContext::from_state(state),
+                    )),
+                ));
             match MemorySystem::new_with_vector(
                 config,
                 None,

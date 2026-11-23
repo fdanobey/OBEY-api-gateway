@@ -474,9 +474,7 @@ impl MemoryConsolidationRunner {
         if require_enabled && !config.consolidation_enabled {
             return None;
         }
-        let Some((provider_name, model)) = config.resolve_consolidation_pair() else {
-            return None;
-        };
+        let (provider_name, model) = config.resolve_consolidation_route()?.request_target();
         let vector_tier = self.vector_tier.read().await.clone();
         Some(ConsolidationContext {
             store: Arc::clone(&self.store),
@@ -959,7 +957,7 @@ impl MemorySystem {
             .config
             .read()
             .await
-            .resolve_consolidation_pair()
+            .resolve_consolidation_route()
             .is_none()
         {
             return Err(MemoryError::Config(

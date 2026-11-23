@@ -287,6 +287,7 @@ fn ledger_handle() -> ai_gateway::active_requests::ActiveRequestHandle {
         virtual_key_id: None,
         started_at_ms: 0,
         kind: RequestKind::Chat,
+        origin: None,
         smart_routing_logged: false,
         failed_attempts: Vec::new(),
         attempt_rows_total: 0,

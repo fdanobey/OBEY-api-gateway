@@ -93,7 +93,7 @@ impl GatewayExtractionAdapter {
     }
 
     /// Build the outgoing request body as serde_json::Value.
-    fn build_request_body(model: &str, messages: &[ExtractionMessage]) -> serde_json::Value {
+    pub(crate) fn build_request_body(model: &str, messages: &[ExtractionMessage]) -> serde_json::Value {
         let consolidation = Self::is_consolidation_request(messages);
         let system_prompt = if consolidation { CONSOLIDATION_SYSTEM_PROMPT } else { EXTRACTION_SYSTEM_PROMPT };
         let mut chat_messages = Vec::with_capacity(messages.len() + 1);
@@ -124,7 +124,7 @@ impl GatewayExtractionAdapter {
         })
     }
 
-    fn is_consolidation_request(messages: &[ExtractionMessage]) -> bool {
+    pub(crate) fn is_consolidation_request(messages: &[ExtractionMessage]) -> bool {
         messages.len() == 1
             && messages[0].origin == ExtractionMessageOrigin::Injected
             && serde_json::from_str::<serde_json::Value>(&messages[0].content)
@@ -280,7 +280,7 @@ impl GatewayExtractionAdapter {
             _ => None,
         }
     }
-    fn parse_provider_payload(response_json: &serde_json::Value, consolidation: bool) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+    pub(crate) fn parse_provider_payload(response_json: &serde_json::Value, consolidation: bool) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
         let content = response_json
             .get("choices")
             .and_then(|choices| choices.get(0))
