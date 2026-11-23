@@ -265,9 +265,9 @@ impl MemoryExtractionProvider for DisabledExtractionProvider {
         &self,
         _request: MemoryExtractionProviderRequest,
     ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
-        Err(MemoryExtractionProviderError {
-            message: "automatic memory extraction provider is disabled".to_owned(),
-        })
+        Err(MemoryExtractionProviderError::new(
+            "automatic memory extraction provider is disabled",
+        ))
     }
 }
 
@@ -373,6 +373,13 @@ pub struct ConsolidationJobStatus {
     pub error_summary: Vec<ConsolidationJobErrorClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counts: Option<ConsolidationCounts>,
+    /// Provider failures per content-free error class (e.g.
+    /// `upstream_http_502`, `consolidation_timeout`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub provider_error_classes: Vec<ConsolidationJobErrorClass>,
+    /// Trace id of the most recent provider failure that carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_trace_id: Option<String>,
 }
 
 /// One stable snake_case error class with its occurrence count (C10).
@@ -480,7 +487,8 @@ impl MemoryConsolidationRunner {
             provider_name,
             model,
             maximum_concurrent_provider_calls: config.consolidation_max_concurrent_batches as usize,
-            provider_timeout: Duration::from_secs(120),
+            provider_timeout: (!self.provider.enforces_own_deadline())
+                .then(|| Duration::from_secs(120)),
             progress,
         })
     }
@@ -1000,6 +1008,13 @@ impl MemorySystem {
                     })
                     .collect(),
                 counts: record.counts,
+                provider_error_classes: record
+                    .progress
+                    .provider_error_classes()
+                    .into_iter()
+                    .map(|(class, count)| ConsolidationJobErrorClass { class, count })
+                    .collect(),
+                last_error_trace_id: record.progress.last_provider_error_trace_id(),
             }
         })
     }

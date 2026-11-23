@@ -179,6 +179,30 @@ pub struct MemoryExtractionProviderRequest {
 #[error("{message}")]
 pub struct MemoryExtractionProviderError {
     pub message: String,
+    /// Content-free failure class (e.g. `network_error`, `upstream_http_502`).
+    pub error_class: Option<String>,
+    /// Trace id of the gateway request that carried the call, when known.
+    pub trace_id: Option<String>,
+}
+
+impl MemoryExtractionProviderError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            error_class: None,
+            trace_id: None,
+        }
+    }
+
+    pub fn with_error_class(mut self, class: impl Into<String>) -> Self {
+        self.error_class = Some(class.into());
+        self
+    }
+
+    pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self
+    }
 }
 
 /// Internal, mockable provider boundary for structured fact extraction.
@@ -188,6 +212,12 @@ pub trait MemoryExtractionProvider: Send + Sync {
         &self,
         request: MemoryExtractionProviderRequest,
     ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError>;
+
+    /// When true the consolidation pass applies no outer timeout because the
+    /// provider bounds each call by the gateway request deadline itself.
+    fn enforces_own_deadline(&self) -> bool {
+        false
+    }
 }
 
 /// Owned input for an automatic extraction job.
@@ -885,9 +915,9 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match &self.response {
                 MockResponse::Candidates(candidates) => Ok(candidates.clone()),
-                MockResponse::Failure => Err(MemoryExtractionProviderError {
-                    message: "mock provider unavailable".to_owned(),
-                }),
+                MockResponse::Failure => Err(MemoryExtractionProviderError::new(
+                    "mock provider unavailable",
+                )),
                 MockResponse::Block => {
                     let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                     self.record_active(active);

@@ -2378,7 +2378,7 @@ async fn guard_consolidation_context(
         provider_name: "internal-provider".to_owned(),
         model: "consolidator-model".to_owned(),
         maximum_concurrent_provider_calls: max_concurrent_batches,
-        provider_timeout: Duration::from_secs(30),
+        provider_timeout: Some(Duration::from_secs(30)),
         progress: None,
     };
     (context, store)

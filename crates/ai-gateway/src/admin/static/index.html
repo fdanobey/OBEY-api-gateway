@@ -8684,6 +8684,12 @@ function memFormatJobSummary(job) {
     if (job.error_summary && job.error_summary.length) {
         parts += ', errors ' + job.error_summary.map(function(e) { return e.class + '×' + e.count; }).join(', ');
     }
+    if (job.provider_error_classes && job.provider_error_classes.length) {
+        parts += ', provider errors ' + job.provider_error_classes.map(function(e) { return e.class + '×' + e.count; }).join(', ');
+    }
+    if (job.last_error_trace_id) {
+        parts += ', last trace ' + job.last_error_trace_id;
+    }
     return parts;
 }
 function memRenderJobStatus(job) {

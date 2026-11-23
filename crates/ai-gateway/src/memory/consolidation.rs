@@ -102,9 +102,46 @@ pub struct ConsolidationProgress {
     batches_done: AtomicU64,
     provider_errors: AtomicU64,
     skipped_batches: AtomicU64,
+    /// Provider failures per content-free error class.
+    provider_error_classes: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Trace id of the most recent provider failure that carried one.
+    last_provider_error_trace_id: std::sync::Mutex<Option<String>>,
 }
 
 impl ConsolidationProgress {
+    /// Provider failure counts per error class, in class-name order.
+    pub fn provider_error_classes(&self) -> Vec<(String, u64)> {
+        self.provider_error_classes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(class, count)| (class.clone(), *count))
+            .collect()
+    }
+
+    /// Trace id of the most recent provider failure that carried one.
+    pub fn last_provider_error_trace_id(&self) -> Option<String> {
+        self.last_provider_error_trace_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn record_provider_error(&self, class: &str, trace_id: Option<&str>) {
+        *self
+            .provider_error_classes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(class.to_owned())
+            .or_insert(0) += 1;
+        if let Some(trace_id) = trace_id {
+            *self
+                .last_provider_error_trace_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(trace_id.to_owned());
+        }
+    }
+
     /// Content-free snapshot of the counters for status reporting.
     pub fn snapshot(&self) -> ConsolidationProgressSnapshot {
         ConsolidationProgressSnapshot {
@@ -312,7 +349,9 @@ pub struct ConsolidationContext {
     /// Maximum batches processed concurrently within one pass
     /// (requirement 4.1).
     pub maximum_concurrent_provider_calls: usize,
-    pub provider_timeout: Duration,
+    /// Outer timeout per provider call. `None` = no outer timeout, the
+    /// provider enforces its own deadline.
+    pub provider_timeout: Option<Duration>,
     /// Shared progress counters for the background-job status endpoint;
     /// `None` for direct callers that do not report progress.
     pub progress: Option<Arc<ConsolidationProgress>>,
@@ -339,7 +378,7 @@ pub async fn run_consolidation(
             "consolidation batch concurrency must be at least 1".to_owned(),
         ));
     }
-    if context.provider_timeout.is_zero() {
+    if context.provider_timeout.is_some_and(|timeout| timeout.is_zero()) {
         return Err(MemoryError::Config(
             "consolidation provider timeout must be greater than zero".to_owned(),
         ));
@@ -444,9 +483,10 @@ pub async fn run_consolidation(
                     progress.finish_batch(false, false);
                 }
             }
-            BatchOutcome::ProviderError => {
+            BatchOutcome::ProviderError { class, trace_id } => {
                 counts.provider_errors += 1;
                 if let Some(progress) = context.progress.as_ref() {
+                    progress.record_provider_error(&class, trace_id.as_deref());
                     progress.finish_batch(true, false);
                 }
             }
@@ -487,7 +527,10 @@ fn finish_namespace_outcome(
 
 enum BatchOutcome {
     Applied(AppliedCounts),
-    ProviderError,
+    ProviderError {
+        class: String,
+        trace_id: Option<String>,
+    },
     BatchSkipped,
 }
 
@@ -521,19 +564,42 @@ async fn process_batch(context: &ConsolidationContext, group: &[MemoryEntry]) ->
         bypass_memory: true,
     };
 
-    let provider_result = tokio::time::timeout(
-        context.provider_timeout,
-        context.provider.clone().extract(request),
-    )
-    .await;
+    let provider_call = context.provider.extract(request);
+    let provider_result = match context.provider_timeout {
+        Some(timeout) => tokio::time::timeout(timeout, provider_call).await,
+        None => Ok(provider_call.await),
+    };
     let raw_output = match provider_result {
         Err(_) => {
-            tracing::warn!("memory consolidation provider timed out");
-            return BatchOutcome::ProviderError;
+            let class = "consolidation_timeout";
+            tracing::warn!(
+                error_class = %class,
+                provider = %context.provider_name,
+                model = %context.model,
+                error = "provider call exceeded the consolidation timeout",
+                "memory consolidation provider failed"
+            );
+            return BatchOutcome::ProviderError {
+                class: class.to_owned(),
+                trace_id: None,
+            };
         }
-        Ok(Err(_error)) => {
-            tracing::warn!("memory consolidation provider failed");
-            return BatchOutcome::ProviderError;
+        Ok(Err(error)) => {
+            // The message is sanitized by contract: adapters never include
+            // conversation content.
+            let class = error.error_class.unwrap_or_else(|| "other".to_owned());
+            tracing::warn!(
+                error_class = %class,
+                trace_id = ?error.trace_id,
+                provider = %context.provider_name,
+                model = %context.model,
+                error = %error.message,
+                "memory consolidation provider failed"
+            );
+            return BatchOutcome::ProviderError {
+                class,
+                trace_id: error.trace_id,
+            };
         }
         Ok(Ok(candidates)) => candidates
             .into_iter()
@@ -1036,9 +1102,9 @@ mod tests {
             assert!(request.bypass_memory);
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
-                return Err(MemoryExtractionProviderError {
-                    message: "mock consolidation provider unavailable".to_owned(),
-                });
+                return Err(MemoryExtractionProviderError::new(
+                    "mock consolidation provider unavailable",
+                ));
             }
             let payload: serde_json::Value =
                 serde_json::from_str(&request.messages[0].content).unwrap();
@@ -1125,7 +1191,7 @@ mod tests {
             provider_name: "internal-provider".to_owned(),
             model: "consolidator-model".to_owned(),
             maximum_concurrent_provider_calls: max_concurrent_batches,
-            provider_timeout: Duration::from_secs(2),
+            provider_timeout: Some(Duration::from_secs(2)),
             progress: None,
         };
         (context, store)
@@ -1808,5 +1874,74 @@ impl MemoryExtractionProvider for OverlapConsolidationProvider {
 
         assert!(parallel_elapsed < sequential_elapsed,
         "parallel pass ({parallel_elapsed:?}) must be faster than sequential ({sequential_elapsed:?})");
+    }
+
+    /// Provider failing with a classified, traced error.
+    struct ClassifiedFailingProvider;
+
+    #[async_trait]
+    impl MemoryExtractionProvider for ClassifiedFailingProvider {
+        async fn extract(
+            &self,
+            _request: MemoryExtractionProviderRequest,
+        ) -> Result<Vec<StructuredMemoryCandidate>, MemoryExtractionProviderError> {
+            Err(MemoryExtractionProviderError::new("boom")
+                .with_error_class("upstream_http_502")
+                .with_trace_id("trace-x"))
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_class_and_trace_reach_progress() {
+        let (mut context, store) =
+            test_context_with_concurrency(Arc::new(ClassifiedFailingProvider), None, 1).await;
+        let progress = Arc::new(ConsolidationProgress::default());
+        context.progress = Some(progress.clone());
+        seed_near_duplicates(&store).await;
+
+        let counts = run_consolidation(context).await.unwrap();
+
+        assert_eq!(counts.provider_errors, 1);
+        assert_eq!(
+            progress.provider_error_classes(),
+            vec![("upstream_http_502".to_owned(), 1)]
+        );
+        assert_eq!(
+            progress.last_provider_error_trace_id().as_deref(),
+            Some("trace-x")
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_provider_is_classified_as_consolidation_timeout() {
+        let provider = Arc::new(DelayedConsolidationProvider::new(Duration::from_millis(500)));
+        let (mut context, store) = test_context_with_concurrency(provider, None, 1).await;
+        context.provider_timeout = Some(Duration::from_millis(50));
+        let progress = Arc::new(ConsolidationProgress::default());
+        context.progress = Some(progress.clone());
+        seed_near_duplicates(&store).await;
+
+        let counts = run_consolidation(context).await.unwrap();
+
+        assert_eq!(counts.provider_errors, 1);
+        assert_eq!(
+            progress.provider_error_classes(),
+            vec![("consolidation_timeout".to_owned(), 1)]
+        );
+        assert_eq!(progress.last_provider_error_trace_id(), None);
+    }
+
+    #[tokio::test]
+    async fn no_outer_timeout_lets_a_delayed_provider_complete() {
+        let provider = Arc::new(DelayedConsolidationProvider::new(Duration::from_millis(50)));
+        let (mut context, store) =
+            test_context_with_concurrency(provider.clone(), None, 1).await;
+        context.provider_timeout = None;
+        seed_near_duplicates(&store).await;
+
+        let counts = run_consolidation(context).await.unwrap();
+
+        assert_eq!(counts.provider_errors, 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 }

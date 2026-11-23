@@ -83,11 +83,12 @@ impl GatewayExtractionAdapter {
             .iter()
             .find(|p| p.name == provider_name)
             .cloned()
-            .ok_or_else(|| MemoryExtractionProviderError {
-                message: format!(
+            .ok_or_else(|| {
+                MemoryExtractionProviderError::new(format!(
                     "auto_extract_provider {:?} not found in configured providers",
                     provider_name
-                ),
+                ))
+                .with_error_class("provider_not_found")
             })
     }
 
@@ -336,24 +337,24 @@ impl MemoryExtractionProvider for GatewayExtractionAdapter {
         let response = builder
             .send()
             .await
-            .map_err(|_| MemoryExtractionProviderError {
-                message: "extraction HTTP request failed".to_owned(),
+            .map_err(|_| {
+                MemoryExtractionProviderError::new("extraction HTTP request failed")
+                    .with_error_class("network_error")
             })?;
 
         let status = response.status();
         if !status.is_success() {
-            return Err(MemoryExtractionProviderError {
-                message: format!("extraction provider returned HTTP {}", status.as_u16()),
-            });
+            return Err(MemoryExtractionProviderError::new(format!(
+                "extraction provider returned HTTP {}",
+                status.as_u16()
+            ))
+            .with_error_class(format!("upstream_http_{}", status.as_u16())));
         }
 
-        let response_json: serde_json::Value =
-            response
-                .json()
-                .await
-                .map_err(|_| MemoryExtractionProviderError {
-                    message: "failed to parse extraction response body".to_owned(),
-                })?;
+        let response_json: serde_json::Value = response.json().await.map_err(|_| {
+            MemoryExtractionProviderError::new("failed to parse extraction response body")
+                .with_error_class("body_read_error")
+        })?;
 
         Self::parse_provider_payload(&response_json, Self::is_consolidation_request(&request.messages))
     }
