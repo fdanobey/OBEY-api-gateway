@@ -3622,6 +3622,7 @@ mod tests {
                     ttfb_timeout_seconds: None,
                     total_timeout_seconds: None,
                     buffered_upstream_streaming: None,
+                    disable_parallel_tool_calls: false,
                     rate_limit_max_wait_ms: None,
                     max_connections: max_conn,
                     rate_limit_per_minute: rate_limit,
@@ -4412,6 +4413,7 @@ retry:
                 ttfb_timeout_seconds: None,
                 total_timeout_seconds: None,
                 buffered_upstream_streaming: None,
+                disable_parallel_tool_calls: false,
                 rate_limit_max_wait_ms: None,
                 max_connections: 10,
                 rate_limit_per_minute: 0,
@@ -5931,8 +5933,10 @@ retry:
         let mut config = smart_routing_response_json(response).await;
         // Unset by default: the effective value comes from the provider type.
         assert!(config["providers"][0]["buffered_upstream_streaming"].is_null());
+        assert_eq!(config["providers"][0]["disable_parallel_tool_calls"], json!(false));
 
         config["providers"][0]["buffered_upstream_streaming"] = json!(false);
+        config["providers"][0]["disable_parallel_tool_calls"] = json!(true);
         let response = tower::ServiceExt::oneshot(
             server.build_router(),
             smart_routing_json_request("PUT", "/admin/config", config),
@@ -5946,6 +5950,7 @@ retry:
         let saved: Config =
             serde_yaml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(saved.providers[0].buffered_upstream_streaming, Some(false));
+        assert!(saved.providers[0].disable_parallel_tool_calls);
 
         let response = tower::ServiceExt::oneshot(server.build_router(), get())
             .await
@@ -5955,6 +5960,7 @@ retry:
             config["providers"][0]["buffered_upstream_streaming"],
             json!(false)
         );
+        assert_eq!(config["providers"][0]["disable_parallel_tool_calls"], json!(true));
 
         let _ = std::fs::remove_dir_all(&config_dir);
     }

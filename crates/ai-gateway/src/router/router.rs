@@ -153,6 +153,26 @@ impl ToolCompressionRestore {
     }
 }
 
+/// Per-attempt `disable_parallel_tool_calls` policy: when the provider has it
+/// set and the request carries tools, force `parallel_tool_calls: false`
+/// (overriding the client). Requests without tools are left alone because
+/// OpenAI rejects `parallel_tool_calls` when no tools are specified.
+fn apply_parallel_tool_calls_policy(outgoing: &mut OpenAIRequest, provider_cfg: &Provider) {
+    if !provider_cfg.disable_parallel_tool_calls {
+        return;
+    }
+    let has_tools = outgoing
+        .extra
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|t| !t.is_empty());
+    if has_tools {
+        outgoing
+            .extra
+            .insert("parallel_tool_calls".to_string(), serde_json::Value::Bool(false));
+    }
+}
+
 /// Adapter that lets the Codex Search agent loop resubmit through the
 /// normal dispatch pipeline (`attempt_with_retry`) for any provider.
 /// Resubmissions reuse the same model rewrite, retry, and translation
@@ -6327,6 +6347,7 @@ async fn intercept_codex_search(
             &self.metrics,
         );
         crate::providers::openai_compatible::sanitize_tool_schema_formats(&mut codex_request);
+        apply_parallel_tool_calls_policy(&mut codex_request, &provider_cfg);
 
 let search_enabled = codex_search_config.effective_enabled(true);
 let oauth_active = oauth.get_access_token().await.is_some();
@@ -6477,6 +6498,7 @@ if search_enabled && oauth_active {
             &self.metrics,
         );
         crate::providers::openai_compatible::sanitize_tool_schema_formats(&mut bedrock_request);
+        apply_parallel_tool_calls_policy(&mut bedrock_request, &provider_cfg);
         drop(config);
             let context_reduction = match self
                 .enforce_context_budget(
@@ -6562,6 +6584,7 @@ if search_enabled && oauth_active {
             &self.metrics,
         );
         crate::providers::openai_compatible::sanitize_tool_schema_formats(&mut copilot_request);
+        apply_parallel_tool_calls_policy(&mut copilot_request, &provider_cfg);
             // Copilot rides stream:false buffered dispatch (Bedrock arm
             // precedent): this arm delegates to the adapter, which has no
             // upstream-streaming SSE reassembly, so a client stream:true
@@ -6766,6 +6789,7 @@ if search_enabled && oauth_active {
             &self.metrics,
         );
         crate::providers::openai_compatible::sanitize_tool_schema_formats(&mut outgoing);
+        apply_parallel_tool_calls_policy(&mut outgoing, &provider_cfg);
         let mut stream_upstream = provider_cfg.effective_buffered_upstream_streaming()
             && !requires_non_streaming(&outgoing);
         outgoing.stream = stream_upstream;
@@ -12621,6 +12645,7 @@ if search_routing_active {
             &self.metrics,
         );
         crate::providers::openai_compatible::sanitize_tool_schema_formats(&mut outgoing);
+        apply_parallel_tool_calls_policy(&mut outgoing, &provider_cfg);
         // Reasoning-compat per-attempt stage (reasoning-failover-compat
         // spec, Req 6.1/6.2), mirroring the buffered dispatch path: detect
         // carriers on the original request, strip/preserve for this
@@ -15885,6 +15910,7 @@ mod tests {
             ttfb_timeout_seconds: Some(5),
             total_timeout_seconds: Some(5),
             buffered_upstream_streaming: None,
+            disable_parallel_tool_calls: false,
             rate_limit_max_wait_ms: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
@@ -17555,6 +17581,50 @@ async fn disabled_provider_attempt_restores_original_tools_and_counts_metric() {
         let props = &bodies[0]["tools"][0]["function"]["parameters"]["properties"];
         assert!(props["data"].get("format").is_none(), "base64 format must be stripped");
         assert_eq!(props["when"]["format"], "date-time");
+    }
+
+    /// `disable_parallel_tool_calls` overrides the client's
+    /// `parallel_tool_calls: true` on a request that carries tools.
+    #[tokio::test]
+    async fn disable_parallel_tool_calls_forces_false_on_dispatch() {
+        let server = MockServer::start().await;
+        mount_streamed_turn(&server).await;
+        let metrics = test_metrics();
+        let mut config = create_test_config();
+        config.retry.max_retries_per_provider = 0;
+        let mut provider = test_provider("provider", server.uri());
+        provider.disable_parallel_tool_calls = true;
+        config.providers = vec![provider];
+        config.model_groups = vec![test_group(vec![test_model("provider", 1)])];
+        let router = Router::new(Arc::new(RwLock::new(config)), metrics);
+
+        let mut request = compressed_tools_request();
+        request
+            .extra
+            .insert("parallel_tool_calls".to_string(), serde_json::json!(true));
+        router
+            .route_request(&request, None, ToolCompressionRestore::default())
+            .await
+            .expect("request succeeds");
+
+        let bodies = received_chat_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["parallel_tool_calls"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn parallel_tool_calls_policy_leaves_tool_free_requests_alone() {
+        let mut provider = test_provider("provider", "http://unused".to_string());
+        provider.disable_parallel_tool_calls = true;
+        let mut request = compressed_tools_request();
+        request.extra.remove("tools");
+        apply_parallel_tool_calls_policy(&mut request, &provider);
+        assert!(!request.extra.contains_key("parallel_tool_calls"));
+
+        provider.disable_parallel_tool_calls = false;
+        let mut request = compressed_tools_request();
+        apply_parallel_tool_calls_policy(&mut request, &provider);
+        assert!(!request.extra.contains_key("parallel_tool_calls"));
     }
 
     /// Same guarantee on the pass-through streaming dispatch path.
@@ -20815,6 +20885,7 @@ extra: Default::default(),
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            disable_parallel_tool_calls: false,
             rate_limit_max_wait_ms: None,
             max_connections: 10,
             rate_limit_per_minute: 0,
@@ -23161,6 +23232,7 @@ fn test_request_output_cap_task_local_scoped() {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            disable_parallel_tool_calls: false,
             rate_limit_max_wait_ms: None,
             max_connections: 10,
             // Tight bucket so check_available() trivially returns false
@@ -23348,6 +23420,7 @@ fn test_request_output_cap_task_local_scoped() {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            disable_parallel_tool_calls: false,
             rate_limit_max_wait_ms: None,
             max_connections: 10,
             rate_limit_per_minute: 0,

@@ -94,6 +94,7 @@ fn test_provider(name: &str, base_url: String) -> Provider {
         ttfb_timeout_seconds: Some(5),
         total_timeout_seconds: Some(5),
         buffered_upstream_streaming: None,
+        disable_parallel_tool_calls: false,
         rate_limit_max_wait_ms: None,
         max_connections: 10,
         rate_limit_per_minute: 0,

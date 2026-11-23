@@ -663,6 +663,12 @@ pub struct Provider {
     /// own dispatch). Set `false` to restore plain `stream: false` requests.
     #[serde(default)]
     pub buffered_upstream_streaming: Option<bool>,
+    /// Send `parallel_tool_calls: false` on every request to this provider
+    /// that carries tools, so the model emits at most one tool call per
+    /// turn. Overrides the client's value. Default: `false` (client value,
+    /// if any, is forwarded unchanged).
+    #[serde(default)]
+    pub disable_parallel_tool_calls: bool,
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
     #[serde(default)]
@@ -2422,6 +2428,7 @@ model_groups:
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            disable_parallel_tool_calls: false,
             rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
@@ -2470,6 +2477,7 @@ mod runtime_resolution_tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            disable_parallel_tool_calls: false,
             rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
@@ -2514,6 +2522,7 @@ mod runtime_resolution_tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            disable_parallel_tool_calls: false,
             rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
@@ -2562,6 +2571,7 @@ mod runtime_resolution_tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            disable_parallel_tool_calls: false,
             rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
@@ -2610,6 +2620,7 @@ mod runtime_resolution_tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            disable_parallel_tool_calls: false,
             rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
@@ -2707,6 +2718,7 @@ mod runtime_resolution_tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            disable_parallel_tool_calls: false,
             rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
@@ -2752,6 +2764,7 @@ mod runtime_resolution_tests {
             ttfb_timeout_seconds: None,
             total_timeout_seconds: None,
             buffered_upstream_streaming: None,
+            disable_parallel_tool_calls: false,
             rate_limit_max_wait_ms: None,
             max_connections: 100,
             rate_limit_per_minute: 0,
