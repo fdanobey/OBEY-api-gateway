@@ -2,6 +2,7 @@ pub mod cache_cost;
 pub mod cache_inject;
 pub mod circuit_breaker;
 pub mod latency_tracker;
+pub mod model_slots;
 pub mod output_caps;
 pub mod rate_limiter;
 pub mod retry_budget;

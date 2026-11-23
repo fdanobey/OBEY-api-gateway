@@ -24,6 +24,9 @@ use crate::model_deprecations::hook::{
     is_model_not_found, note_runtime_gone, MODEL_NOT_FOUND_CLASS,
 };
 use crate::model_deprecations::state::DeprecationState;
+use crate::router::model_slots::{
+    cooldown_deadline, is_model_slots_exceeded, ModelSlotCooldowns, MODEL_SLOTS_EXCEEDED_CLASS,
+};
 use crate::memory::{
     CompressionExtractionInput, CompressionMessageSnapshot, CompressionRemovalReport,
     ExtractionPolicy, MemorySystem, ResolvedNamespace,
@@ -1053,6 +1056,11 @@ pub struct Router {
         Arc<crate::logger::RequestLogger>,
         Arc<crate::webhooks::delivery::WebhookNotifier>,
     )>,
+    /// Per-`provider:model` cooldowns from Electron Hub DevPass
+    /// `model_slots_exceeded` refusals (see [`crate::router::model_slots`]).
+    /// Kept across config hot-reload: the refusal is an upstream account
+    /// state that a local config save does not change.
+    model_slot_cooldowns: Arc<ModelSlotCooldowns>,
 }
 
 /// Result of [`Router::route_request_streaming`].
@@ -1469,6 +1477,7 @@ impl Router {
             decision_discovery: Arc::new(DashMap::new()),
             deprecation_state: None,
             deprecation_emission: None,
+            model_slot_cooldowns: Arc::new(ModelSlotCooldowns::default()),
         }
     }
 
@@ -1528,6 +1537,7 @@ impl Router {
             decision_discovery: Arc::new(DashMap::new()),
             deprecation_state: None,
             deprecation_emission: None,
+            model_slot_cooldowns: Arc::new(ModelSlotCooldowns::default()),
         }
     }
 
@@ -1686,6 +1696,38 @@ Arc::clone(notifier),
 );
 }
 }
+
+    /// Record an Electron Hub DevPass `model_slots_exceeded` refusal: keep
+    /// this `provider:model` out of candidate selection until the
+    /// upstream hint (Retry-After header or body reset field) or, without
+    /// one, the next headroom reset. Logs the provider's error text so the
+    /// exact refusal body is visible in the router log.
+    fn note_model_slots_exceeded(
+        &self,
+        provider: &str,
+        model: &str,
+        headers: Option<&reqwest::header::HeaderMap>,
+        body: &str,
+    ) {
+        let hint = headers
+            .and_then(Self::cooldown_from_headers)
+            .or_else(|| Self::cooldown_from_body(body));
+        let until = cooldown_deadline(
+            chrono::Utc::now(),
+            hint,
+            body,
+            crate::router::rate_limiter::MAX_COOLDOWN,
+        );
+        self.model_slot_cooldowns.mark(provider, model, until);
+        warn!(
+            provider,
+            model,
+            cooldown_until = %until.to_rfc3339(),
+            upstream_hint = hint.is_some(),
+            provider_error = %body.chars().take(300).collect::<String>(),
+            "Provider refused the model for lack of concurrent slots (model_slots_exceeded) — skipping this provider:model until the cooldown ends"
+        );
+    }
 
 /// Success-side re-arm (model-deprecation-alerts spec, Req 4.4):
 /// a successful dispatch proves the `(provider, model)` serves, so
@@ -2679,7 +2721,15 @@ let deprecation_ok = self
 .map(|state| !state.is_gone_at(&m.provider, &m.model, chrono::Utc::now()))
 .unwrap_or(true);
 
-        if cb_ok && cooldown_ok && deprecation_ok {
+            // DevPass `model_slots_exceeded` cooldown: per provider:model,
+            // so other models on the same key stay eligible.
+            let slots_ok = !self.model_slot_cooldowns.is_cooling_at(
+                &m.provider,
+                &m.model,
+                chrono::Utc::now(),
+            );
+
+        if cb_ok && cooldown_ok && deprecation_ok && slots_ok {
             filtered.push(m.clone());
         }
         }
@@ -7804,6 +7854,21 @@ return Ok(response);
                 self.emit_deprecation_events(state);
             }
             record_try(&err, Some(MODEL_NOT_FOUND_CLASS), None, request_start);
+            return Err(err);
+        }
+
+        // DevPass `model_slots_exceeded` (403): the model cannot run until
+        // the headroom resets, but the provider's other models still can.
+        // Cool down this provider:model only and fail over without a
+        // same-provider retry.
+        if is_model_slots_exceeded(status_code, &body_text) {
+            self.note_model_slots_exceeded(
+                provider_name,
+                &provider_model.model,
+                Some(&response_headers),
+                &body_text,
+            );
+            record_try(&err, Some(MODEL_SLOTS_EXCEEDED_CLASS), None, request_start);
             return Err(err);
         }
 
@@ -13129,6 +13194,8 @@ if search_routing_active {
             Some(CONTEXT_WINDOW_EXCEEDED_CLASS)
         } else if is_model_not_found(status_code, &body_text) {
             Some(MODEL_NOT_FOUND_CLASS)
+        } else if is_model_slots_exceeded(status_code, &body_text) {
+            Some(MODEL_SLOTS_EXCEEDED_CLASS)
         } else {
             None
         };
@@ -13161,6 +13228,28 @@ if search_routing_active {
                 // (fire-and-forget; no-op on bare routers).
                 self.emit_deprecation_events(state);
             }
+            drop(concurrency_permit.take());
+            return self
+                .passthrough_fallback_excluding(
+                    request,
+                    exclude,
+                    active,
+                    &provider_model,
+                    err,
+                    compression_restore.clone(),
+                )
+                .await;
+        }
+        // DevPass `model_slots_exceeded` (streaming arm): cool down this
+        // provider:model only and fall back with it excluded. The ledger row
+        // was recorded above with the `model_slots_exceeded` class.
+        if is_model_slots_exceeded(status_code, &body_text) {
+            self.note_model_slots_exceeded(
+                &provider_model.provider,
+                &provider_model.model,
+                Some(&response_headers),
+                &body_text,
+            );
             drop(concurrency_permit.take());
             return self
                 .passthrough_fallback_excluding(
@@ -17750,6 +17839,56 @@ async fn gone_marked_model_is_skipped_for_subsequent_requests() {
 
 
     // ------------------------------------------------------------------
+    // DevPass `model_slots_exceeded` guard: fails over with a
+    // `model_slots_exceeded` ledger row, cools down only that
+    // provider:model, and keeps it out of the next request's candidates.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn model_slots_exceeded_cools_down_provider_model_and_skips_it() {
+        use wiremock::matchers::{method, path};
+        let a = MockServer::start().await;
+        // One hit total: the second request must not reach `a`.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"error":{"message":"Heavy model needs 3 slots","type":"error","param":null,"code":"model_slots_exceeded"}}"#,
+            ))
+            .expect(1)
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(STREAMED_TURN_SSE),
+            )
+            .expect(2)
+            .mount(&b)
+            .await;
+        let router = failover_pair_router(&a, &b);
+        let handle = ledger_handle();
+        router
+            .route_request(&compression_request(false), Some(handle.clone()), ToolCompressionRestore::default())
+            .await
+            .expect("provider b answers after a refuses for lack of slots");
+        let ledger = handle.take_failed_attempts();
+        assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+        assert_eq!(ledger[0].provider, "a");
+        assert_eq!(ledger[0].status_code, Some(403));
+        assert_eq!(ledger[0].error_class.as_deref(), Some("model_slots_exceeded"));
+        let now = chrono::Utc::now();
+        assert!(router.model_slot_cooldowns.is_cooling_at("a", "upstream-model", now));
+        assert!(!router.model_slot_cooldowns.is_cooling_at("b", "upstream-model", now));
+        router
+            .route_request(&compression_request(false), None, ToolCompressionRestore::default())
+            .await
+            .expect("provider b serves while a's model cools down");
+        a.verify().await;
+        b.verify().await;
+    }
+    // ------------------------------------------------------------------
     // Spec per-provider-tool-compression-toggle, Task 5 — strict
     // per-attempt original-tools restore in the dispatch loop.
     // ------------------------------------------------------------------
@@ -19768,6 +19907,46 @@ extra: Default::default(),
         assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
         assert_eq!(ledger[0].provider, "a");
         assert_eq!(ledger[0].status_code, Some(429));
+        a.verify().await;
+        b.verify().await;
+    }
+
+    /// Streaming arm: a DevPass 403 `model_slots_exceeded` cools down only
+    /// that provider:model and falls back to the next candidate without a
+    /// second send to the refused one.
+    #[tokio::test]
+    async fn streaming_passthrough_model_slots_exceeded_cools_down_and_falls_back() {
+        use wiremock::matchers::{method, path};
+
+        let a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": {"message": "Heavy model needs 3 slots", "code": "model_slots_exceeded"}
+            })))
+            .expect(1)
+            .mount(&a)
+            .await;
+        let b = MockServer::start().await;
+        mount_streamed_turn(&b).await;
+        let router = failover_pair_router(&a, &b);
+        let handle = ledger_handle();
+
+        router
+            .route_request_streaming(&compression_request(true), Some(handle.clone()), ToolCompressionRestore::default())
+            .await
+            .expect("buffered fallback is served by b");
+
+        let ledger = handle.take_failed_attempts();
+        assert_eq!(ledger.len(), 1, "ledger: {ledger:?}");
+        assert_eq!(ledger[0].provider, "a");
+        assert_eq!(ledger[0].error_class.as_deref(), Some("model_slots_exceeded"));
+        let now = chrono::Utc::now();
+        assert!(router.model_slot_cooldowns.is_cooling_at("a", "upstream-model", now));
+        assert!(router
+            .metrics
+            .provider_cooldown_remaining_secs("a")
+            .is_none(), "provider-wide cooldown must stay clear");
         a.verify().await;
         b.verify().await;
     }
