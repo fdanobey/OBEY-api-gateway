@@ -766,8 +766,13 @@ fn write_request_log(
         // in the request log (prompt-library-versioning spec, Req 4.4:
         // "template content and variable values SHALL NOT be stored").
         // `None` wins even when request-body logging is enabled;
-        // attribution lives in the prompt_* columns.
-        request_body: if context.prompt_id.is_some() {
+        // attribution lives in the prompt_* columns. Memory consolidation
+        // rows drop the body too: it carries stored memory contents, which
+        // stay in memory.db only (the abandon row already logs `None`).
+        request_body: if context.prompt_id.is_some()
+            || context.client_protocol
+                == Some(crate::active_requests::RequestOrigin::MemoryConsolidation.log_protocol())
+        {
             None
         } else {
             serde_json::to_string(request).ok()

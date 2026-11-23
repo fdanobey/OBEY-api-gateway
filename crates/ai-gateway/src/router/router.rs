@@ -5295,8 +5295,13 @@ return Ok(response);
 /// compression so the injected definitions are never compressed away.
 /// When the generic `web_search` feature is active it wins exclusively:
 /// only the `web_search` tool is injected (plus client tools) and the
-/// legacy Codex tools are suppressed.
+/// legacy Codex tools are suppressed. Gateway-internal requests (memory
+/// consolidation) never get search tools: they must stay a single
+/// JSON-answer turn and their content must not reach a search backend.
 async fn maybe_inject_search_tools(&self, request: &mut OpenAIRequest) {
+        if current_internal_request_tag().is_some() {
+            return;
+        }
         match self.active_search_config().await {
             crate::web_search::coordinator::ActiveSearchConfig::Generic { .. } => {
                 let tools = request.extra.entry("tools".to_string()).or_insert_with(|| {
@@ -16461,6 +16466,83 @@ mod tests {
             serde_json::to_value(internal).unwrap(),
             serde_json::to_value(&request).unwrap()
         );
+    }
+
+    /// The memory compression hook persists candidates outside the internal
+    /// scope and nothing inside it, with a real memory system attached.
+    #[tokio::test]
+    async fn internal_scope_skips_memory_hook_with_memory_system_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(
+            MemorySystem::new(
+                crate::memory::MemoryConfig {
+                    enabled: true,
+                    database_path: dir.path().join("memory.db").to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut router = Router::new(Arc::new(RwLock::new(create_test_config())), test_metrics());
+        router.set_memory_system(Arc::new(RwLock::new(Some(memory.clone()))));
+        let message = |content: &str| Message {
+            role: "user".to_string(),
+            content: serde_json::json!(content),
+            extra: serde_json::Map::new(),
+        };
+        let mut before = compression_request(false);
+        before.messages = vec![message(
+            "We decided to keep the embedded SQLite storage layer for every gateway database going forward.",
+        )];
+        let mut after = before.clone();
+        after.messages = vec![message("ok")];
+
+        scope_internal_request(
+            crate::memory::MEMORY_EXTRACTION_INTERNAL_TAG,
+            router.run_memory_compression_hook(&before, &after, "inside"),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(memory.store.export_all().unwrap().is_empty());
+
+        // Control: the same input outside the scope does persist, so the
+        // empty store above is the scope's doing.
+        router
+            .run_memory_compression_hook(&before, &after, "outside")
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while memory.store.export_all().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "control run never persisted a compression candidate"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Search tools are injected for client requests and never inside the
+    /// internal scope.
+    #[tokio::test]
+    async fn internal_scope_skips_search_tool_injection() {
+        let primary = MockServer::start().await;
+        let (router, token_path) = codex_search_router(create_test_config(), &primary).await;
+
+        let mut outside = compression_request(false);
+        router.maybe_inject_search_tools(&mut outside).await;
+        assert!(outside.extra.contains_key("tools"), "control run injected nothing");
+
+        let mut inside = compression_request(false);
+        let original = serde_json::to_value(&inside).unwrap();
+        scope_internal_request(
+            crate::memory::MEMORY_EXTRACTION_INTERNAL_TAG,
+            router.maybe_inject_search_tools(&mut inside),
+        )
+        .await;
+        assert_eq!(serde_json::to_value(&inside).unwrap(), original);
+        let _ = std::fs::remove_file(&token_path);
     }
 
     #[tokio::test]

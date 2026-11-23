@@ -193,6 +193,7 @@ mod tests {
         config.retry.max_retries_per_provider = 0;
         config.retry.backoff_sequence_seconds = vec![0];
         config.retry.jitter_enabled = false;
+        config.logging.request_body_logging = true;
         let mut memory = MemoryConfig {
             enabled: true,
             database_path: dir.path().join("memory.db").to_string_lossy().into_owned(),
@@ -387,6 +388,56 @@ mod tests {
             outcomes[0].client_protocol.as_deref(),
             Some("memory_consolidation")
         );
+        // Body logging is on, but the batch body (memory contents) is not
+        // copied into logs.db.
+        let stored = h
+            .server
+            .state
+            .logger
+            .query(crate::logger::LogFilter {
+                trace_id: Some(outcomes[0].trace_id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!stored.is_empty());
+        assert!(stored.iter().all(|row| row.request_body.is_none()), "{stored:?}");
+    }
+
+    #[tokio::test]
+    async fn consolidation_batch_past_gateway_deadline_logs_abandon_row() {
+        let primary = MockServer::start().await;
+        let backup = MockServer::start().await;
+        let h = harness(&primary, &backup, 0, Target::Group).await;
+        h.server.state.runtime_limits.set_request_timeout_seconds(1);
+        let ids = seed_near_duplicates(&h.memory);
+        streamed_chat()
+            .respond_with(sse_success(&ids).set_delay(Duration::from_secs(3)))
+            .mount(&primary)
+            .await;
+
+        let status = run_job(&h.memory).await;
+
+        assert!(
+            status
+                .provider_error_classes
+                .iter()
+                .any(|class| class.class == "gateway_deadline"),
+            "{:?}",
+            status.provider_error_classes
+        );
+        let trace_id = status.last_error_trace_id.clone().expect("trace id");
+        let rows = poll_logs(&h.server, |rows| {
+            outcome_rows(rows).iter().any(|row| row.trace_id == trace_id)
+        })
+        .await;
+        let outcome = outcome_rows(&rows)
+            .into_iter()
+            .find(|row| row.trace_id == trace_id)
+            .unwrap_or_else(|| panic!("no abandon row for {trace_id}: {rows:?}"));
+        assert_eq!(outcome.status_code, 504);
+        assert_eq!(outcome.error_class.as_deref(), Some("gateway_deadline"));
+        assert_eq!(outcome.client_protocol.as_deref(), Some("memory_consolidation"));
+        assert!(h.server.state.active_requests.snapshot().is_empty());
     }
 
     #[tokio::test]

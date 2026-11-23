@@ -2503,6 +2503,7 @@ body.sec-banner-active{padding-top:3.2rem}
 <div class="hint">Empty falls back to the auto-extract model; list shows the effective (fallback) provider's models</div>
 </div>
 </div>
+<div class="hint" style="margin-bottom:1rem">Provider/model mode applies that provider's rate limit with no fallback: a batch that cannot get a rate-limit token within the provider's max wait is skipped. For providers with tight per-minute limits, pick a model group instead.</div>
 <div class="form-group">
 <label for="mem-consolidation-max-concurrent">Max Concurrent Batches</label>
 <input type="number" id="mem-consolidation-max-concurrent" value="2" min="1" max="8" style="max-width:200px">

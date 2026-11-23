@@ -545,6 +545,17 @@ fn saturating_count(count: usize) -> u32 {
     count.min(u32::MAX as usize) as u32
 }
 
+/// Route kind and target for the provider-failure warn line. Group mode has
+/// no provider of its own (the router picks one per attempt), so it logs the
+/// group name; the attempted providers are in the error summary.
+fn log_route(context: &ConsolidationContext) -> (&'static str, String) {
+    if context.provider_name.is_empty() {
+        ("model_group", context.model.clone())
+    } else {
+        ("pinned", format!("{}/{}", context.provider_name, context.model))
+    }
+}
+
 /// Ask the provider for decisions on one batch and apply them.
 ///
 /// The provider returns raw decision JSON through its candidate contents (the
@@ -572,10 +583,11 @@ async fn process_batch(context: &ConsolidationContext, group: &[MemoryEntry]) ->
     let raw_output = match provider_result {
         Err(_) => {
             let class = "consolidation_timeout";
+            let (route, target) = log_route(context);
             tracing::warn!(
                 error_class = %class,
-                provider = %context.provider_name,
-                model = %context.model,
+                route,
+                target = %target,
                 error = "provider call exceeded the consolidation timeout",
                 "memory consolidation provider failed"
             );
@@ -588,11 +600,12 @@ async fn process_batch(context: &ConsolidationContext, group: &[MemoryEntry]) ->
             // The message is sanitized by contract: adapters never include
             // conversation content.
             let class = error.error_class.unwrap_or_else(|| "other".to_owned());
+            let (route, target) = log_route(context);
             tracing::warn!(
                 error_class = %class,
                 trace_id = ?error.trace_id,
-                provider = %context.provider_name,
-                model = %context.model,
+                route,
+                target = %target,
                 error = %error.message,
                 "memory consolidation provider failed"
             );

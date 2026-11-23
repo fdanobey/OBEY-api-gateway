@@ -86,6 +86,12 @@ impl RuntimeLimits {
     pub fn request_timeout_seconds(&self) -> u64 {
         self.request_timeout_seconds.load(Ordering::Relaxed)
     }
+    /// Override the deadline below the provider-derived floor, so tests can
+    /// hit it in about a second.
+    #[cfg(test)]
+    pub(crate) fn set_request_timeout_seconds(&self, seconds: u64) {
+        self.request_timeout_seconds.store(seconds, Ordering::Relaxed);
+    }
 }
 
 /// Resolve the enforced global request ceiling for `config`.
