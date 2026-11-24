@@ -67,6 +67,7 @@ fn cache_config(cache: CacheAwareRouting) -> Config {
         webhooks: Default::default(),
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
+        performance_alerts: Default::default(),
     }
 }
 

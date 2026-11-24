@@ -93,6 +93,7 @@ fn compat_config(compat: ReasoningCompatConfig, max_retries: u32) -> Config {
     webhooks: Default::default(),
     opentelemetry: Default::default(),
     model_deprecations: Default::default(),
+    performance_alerts: Default::default(),
     }
 }
 

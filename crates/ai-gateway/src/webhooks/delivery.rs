@@ -813,9 +813,10 @@ fn budget_event_type_name(event_type: &BudgetEventType) -> &'static str {
         BudgetEventType::BudgetWarning => "budget.warning",
         BudgetEventType::BudgetExhausted => "budget.exhausted",
         BudgetEventType::BudgetReset => "budget.reset",
-        BudgetEventType::ModelDeprecated => "model.deprecated",
-        BudgetEventType::BudgetForecastWarning => "budget.forecast.warning",
-    }
+BudgetEventType::ModelDeprecated => "model.deprecated",
+BudgetEventType::BudgetForecastWarning => "budget.forecast.warning",
+BudgetEventType::PerformanceAnomaly => "performance.anomaly",
+}
 }
 
 /// Ledger `scope_label` (design ledger schema): provider name, or

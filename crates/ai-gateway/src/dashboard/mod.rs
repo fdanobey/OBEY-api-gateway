@@ -681,22 +681,36 @@ async fn build_dashboard_snapshot(state: &AppState) -> crate::metrics::MetricsSn
             // excludes `webhook.test` rows BEFORE the limit so admin
             // test sends can never crowd out real alert history.
             .filter(|row| row.event_type != "webhook.test")
-            .map(|row| crate::metrics::AlertSummary {
-                threshold_percent: serde_json::from_str::<serde_json::Value>(
+            .map(|row| {
+                // Payload parsed once; every optional field is extracted
+                // the same tolerant way `threshold_percent` is (missing
+                // key ⇒ None; budget/deprecation rows simply carry no
+                // performance keys).
+                let payload = serde_json::from_str::<serde_json::Value>(
                     &row.payload_json,
                 )
-                .ok()
-                .and_then(|payload| {
-                    payload
-                        .get("data")
+                .ok();
+                let data = payload.as_ref().and_then(|p| p.get("data"));
+                crate::metrics::AlertSummary {
+                    threshold_percent: data
                         .and_then(|data| data.get("percent"))
                         .and_then(|percent| percent.as_u64())
-                        .and_then(|percent| u8::try_from(percent).ok())
-                }),
-                event_type: row.event_type,
-                scope: row.scope,
-                scope_label: row.scope_label,
-                fired_at: row.created_at,
+                        .and_then(|percent| u8::try_from(percent).ok()),
+                    signal: data
+                        .and_then(|data| data.get("signal"))
+                        .and_then(|signal| signal.as_str())
+                        .map(|signal| signal.to_string()),
+                    observed_value: data
+                        .and_then(|data| data.get("observed_value"))
+                        .and_then(|value| value.as_f64()),
+                    baseline_value: data
+                        .and_then(|data| data.get("baseline_value"))
+                        .and_then(|value| value.as_f64()),
+                    event_type: row.event_type,
+                    scope: row.scope,
+                    scope_label: row.scope_label,
+                    fired_at: row.created_at,
+                }
             })
             .collect(),
         Ok(Err(error)) => {
@@ -1503,6 +1517,7 @@ mod tests {
         webhooks: Default::default(),
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
+        performance_alerts: Default::default(),
             tool_compression: Default::default(),
             smart_routing: Default::default(),
             memory: None,
@@ -2109,10 +2124,138 @@ panic!(
 snapshot.recent_budget_alerts
 )
 });
-assert_eq!(row.scope_label, "model:test-provider/gpt-4");
-        assert!(
-            row.threshold_percent.is_none(),
-            "deprecation rows carry no percent — threshold_percent must tolerate None"
-        );
-    }
+ assert_eq!(row.scope_label, "model:test-provider/gpt-4");
+ assert!(
+ row.threshold_percent.is_none(),
+ "deprecation rows carry no percent — threshold_percent must tolerate None"
+ );
+ }
+
+ /// Performance-anomaly rows in the recent-alerts feed
+ /// (performance-alerts, Task 6): a `performance.anomaly` ledger
+ /// row surfaces in `recent_budget_alerts` with signal,
+ /// observed_value and baseline_value extracted from the ledger
+ /// payload the same way `threshold_percent` is; sibling budget
+ /// rows keep the new fields `None` (and serialize without the
+ /// new keys via `skip_serializing_if`).
+#[tokio::test]
+async fn dashboard_snapshot_feed_includes_performance_anomaly_rows() {
+let mut config = test_config();
+// Unique temp DIRECTORY (not a named file): the sibling webhooks.db
+// derivation places webhooks.db next to the logs database, so a
+// shared-parent named file can collide across parallel dashboard
+// tests — one directory per test keeps the sibling store isolated.
+let directory = tempfile::tempdir().unwrap();
+config.logging.database_path = directory
+.path()
+.join("logs.db")
+.to_string_lossy()
+.into_owned();
+let server = GatewayServer::new(config, None).await.unwrap();
+
+ // Fresh UUIDs: the sibling webhooks.db derivation can collide
+ // across parallel dashboard tests sharing one temp dir.
+ let perf_id = uuid::Uuid::new_v4().to_string();
+ let payload = serde_json::json!({
+ "id": perf_id,
+ "type": "performance.anomaly",
+ "created_at": "2026-11-23T06:00:00Z",
+ "signed": false,
+ "data": {
+ "signal": "spend",
+ "scope": "provider",
+ "name": "openai",
+ "observed_value": 84.2,
+ "baseline_value": 24.8,
+ "unit": "usd",
+ "evaluated_day": "2026-11-22",
+ "threshold": ">=3x baseline and >=$50 over"
+ }
+ });
+ server
+ .state
+ .webhook_ledger
+ .insert_event(
+ &perf_id,
+ "performance.anomaly",
+ "provider",
+ "openai",
+ &payload.to_string(),
+ chrono::Utc::now().timestamp(),
+ )
+ .unwrap();
+ let budget_id = uuid::Uuid::new_v4().to_string();
+ let budget_payload = serde_json::json!({
+ "id": budget_id,
+ "type": "budget.warning",
+ "created_at": "2026-11-23T06:01:00Z",
+ "signed": false,
+ "data": {
+ "scope": "provider",
+ "name": "openai",
+ "limit_usd": 100.0,
+ "spent_usd": 85.0,
+ "percent": 80,
+ "window": "daily"
+ }
+ });
+ server
+ .state
+ .webhook_ledger
+ .insert_event(
+ &budget_id,
+ "budget.warning",
+ "provider",
+ "openai",
+ &budget_payload.to_string(),
+ chrono::Utc::now().timestamp(),
+ )
+ .unwrap();
+
+ let snapshot = build_dashboard_snapshot(&server.state).await;
+ let perf = snapshot
+ .recent_budget_alerts
+ .iter()
+.find(|alert| alert.event_type == "performance.anomaly" && alert.scope_label == "openai")
+.unwrap_or_else(|| {
+panic!(
+"performance.anomaly for the seeded scope missing from recent-alerts feed: {:?}",
+snapshot.recent_budget_alerts
+)
+});
+assert_eq!(perf.scope_label, "openai");
+assert_eq!(perf.signal.as_deref(), Some("spend"));
+assert_eq!(perf.observed_value, Some(84.2));
+assert_eq!(perf.baseline_value, Some(24.8));
+assert!(perf.threshold_percent.is_none());
+
+// The serialized performance entry carries all three performance
+// fields (signal, observed_value, baseline_value) for the seeded
+// scope — the feed contract the dashboard JS renders verbatim.
+let perf_serialized = serde_json::to_string(perf).unwrap();
+assert!(perf_serialized.contains("\"signal\":\"spend\""));
+assert!(perf_serialized.contains("\"observed_value\":84.2"));
+assert!(perf_serialized.contains("\"baseline_value\":24.8"));
+
+ let budget = snapshot
+ .recent_budget_alerts
+ .iter()
+.find(|alert| alert.event_type == "budget.warning" && alert.scope_label == "openai")
+.unwrap_or_else(|| {
+panic!(
+"budget.warning for the seeded scope missing from recent-alerts feed: {:?}",
+snapshot.recent_budget_alerts
+)
+});
+ assert_eq!(budget.threshold_percent, Some(80));
+ assert!(budget.signal.is_none());
+ assert!(budget.observed_value.is_none());
+ assert!(budget.baseline_value.is_none());
+
+ // Budget rows serialize without the new keys (skip_serializing_if).
+ let serialized = serde_json::to_string(budget).unwrap();
+ assert!(!serialized.contains("\"signal\""));
+ assert!(!serialized.contains("\"observed_value\""));
+ assert!(!serialized.contains("\"baseline_value\""));
+ }
 }

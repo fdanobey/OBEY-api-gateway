@@ -366,7 +366,7 @@ pub struct QueryError(#[from] rusqlite::Error);
 /// query and read with their real values; columns the database predates
 /// read as zero-default / `unattributed` (Requirement 8.3).
 #[derive(Debug, Clone, Copy)]
-struct LedgerColumns {
+pub(crate) struct LedgerColumns {
     input_tokens: bool,
     output_tokens: bool,
     cache_read_tokens: bool,
@@ -377,7 +377,7 @@ struct LedgerColumns {
 }
 
 impl LedgerColumns {
-    fn probe(conn: &Connection) -> Result<Self, rusqlite::Error> {
+    pub(crate) fn probe(conn: &Connection) -> Result<Self, rusqlite::Error> {
         let mut stmt = conn.prepare("PRAGMA table_info(requests)")?;
         let names = stmt
             .query_map([], |row| row.get::<_, String>(1))?
@@ -433,7 +433,7 @@ impl LedgerColumns {
     /// zero-default so empty windows read 0 (Requirement 6.2). Shared by
     /// the report aggregate and the reconcile ledger leg — one expression,
     /// one place.
-    fn cost_micro_usd_sum(&self) -> &'static str {
+    pub(crate) fn cost_micro_usd_sum(&self) -> &'static str {
         "COALESCE(SUM(CAST(ROUND(cost * 1000000) AS INTEGER)), 0)"
     }
 

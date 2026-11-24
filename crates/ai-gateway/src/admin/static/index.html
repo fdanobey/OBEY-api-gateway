@@ -2800,6 +2800,7 @@ body.sec-banner-active{padding-top:3.2rem}
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-reset" value="budget.reset" disabled><label for="wh-f-event-reset">budget.reset</label></div>
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-model-deprecated" value="model.deprecated" disabled><label for="wh-f-event-model-deprecated">model.deprecated</label></div>
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-forecast" value="budget.forecast.warning" disabled><label for="wh-f-event-forecast">budget.forecast.warning</label></div>
+<div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-performance" value="performance.anomaly" disabled><label for="wh-f-event-performance">performance.anomaly</label></div>
 </div>
 </div>
 <div class="hint">Unchecking "All" enables per-event filtering. At least one event must be selected.</div>
@@ -2856,6 +2857,14 @@ body.sec-banner-active{padding-top:3.2rem}
 </table>
 </div>
 <div class="wh-empty" id="wh-deliveries-empty">No deliveries recorded.</div>
+</fieldset>
+
+<fieldset><legend>Performance Alerts</legend>
+<div class="form-check">
+<input type="checkbox" id="pa-enabled" checked>
+<label for="pa-enabled">Enable performance alerts</label>
+</div>
+<div class="hint" style="margin-top:-.5rem;margin-left:1.5rem">Daily anomaly detection (spend, traffic, latency, error rate) against a 7-day baseline. Findings deliver as performance.anomaly webhook events. Saved with the main config Save button.</div>
 </fieldset>
 
 <div class="actions">
@@ -5439,6 +5448,7 @@ populateMemory(cfg.memory);
 populateTelemetry(cfg.opentelemetry);
 var mdCfg=cfg.model_deprecations||{};
 populateNonNegativeInt('md-warn-days',mdCfg.warn_days_before,30);
+document.getElementById('pa-enabled').checked=(cfg.performance_alerts||{}).enabled!==false;
 }
 
   function populateSmartRouting(value){
@@ -5628,6 +5638,7 @@ cfg.reasoning_compat=collectReasoningCompat();
 cfg.opentelemetry=collectTelemetry();
 var mdWarnDays=parseInt(document.getElementById('md-warn-days').value,10);
 cfg.model_deprecations={warn_days_before:(Number.isFinite(mdWarnDays)&&mdWarnDays>=1&&mdWarnDays<=365)?mdWarnDays:30};
+cfg.performance_alerts={enabled:document.getElementById('pa-enabled').checked};
 return cfg;
   }
 
@@ -9049,7 +9060,7 @@ document.getElementById('mem-qdrant-recreate').addEventListener('click', functio
   });
 
   // --- Webhooks UI Logic (budget-alerts-unified-webhooks, Req 5.1, 5.2, 5.5) ---
-var WH_EVENTS = ['budget.warning', 'budget.exhausted', 'budget.reset', 'model.deprecated', 'budget.forecast.warning'];
+var WH_EVENTS = ['budget.warning', 'budget.exhausted', 'budget.reset', 'model.deprecated', 'budget.forecast.warning', 'performance.anomaly'];
 
 // --- Tracing UI Logic (opentelemetry-trace-export, Req 8.1, 8.2, 7.3) ---
 // otelState.headers holds editor rows; a value left equal to the
@@ -9407,12 +9418,15 @@ function whOpenForm(index) {
  hint.textContent = 'Standard Webhooks HMAC key. Blank = unsigned delivery.';
  removeCheck.hidden = true;
  }
- var selected = (ep.events && ep.events.length) ? ep.events : null;
- all.checked = !selected;
- checks.forEach(function(c) {
- c.disabled = all.checked;
- c.checked = !!(selected && selected.indexOf(c.value) !== -1);
- });
+var selected = (ep.events && ep.events.length) ? ep.events : null;
+all.checked = !selected;
+checks.forEach(function(c) {
+c.disabled = all.checked;
+// Unset filter = "All": every event checkbox renders checked so
+// the default subscription is visible; explicit lists reflect
+// their exact contents.
+c.checked = all.checked || selected.indexOf(c.value) !== -1;
+});
  } else {
  document.getElementById('wh-form-title').textContent = 'Add Endpoint';
  document.getElementById('wh-form-save').textContent = 'Add Endpoint';
@@ -9423,8 +9437,10 @@ function whOpenForm(index) {
  hint.textContent = 'Standard Webhooks HMAC key. Blank = unsigned delivery.';
  document.getElementById('wh-f-secret-remove').hidden = true;
  document.getElementById('wh-f-secret-remove').checked = false;
- all.checked = true;
- checks.forEach(function(c) { c.disabled = true; c.checked = false; });
+all.checked = true;
+// Add form = default "All" subscription: checkboxes render checked
+// (disabled) to match the unset-filter display.
+checks.forEach(function(c) { c.disabled = true; c.checked = true; });
  }
  form.hidden = false;
  urlIn.focus();

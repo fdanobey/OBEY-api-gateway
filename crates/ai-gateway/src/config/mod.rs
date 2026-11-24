@@ -172,8 +172,13 @@ pub struct Config {
     /// Model deprecation detection and alerting. Absent section applies
     /// [`ModelDeprecationsConfig::default`] (30-day warning window). See
     /// the `model-deprecation-alerts` spec.
-    #[serde(default)]
-    pub model_deprecations: ModelDeprecationsConfig,
+#[serde(default)]
+pub model_deprecations: ModelDeprecationsConfig,
+/// Performance anomaly detection. Absent section applies
+/// [`PerformanceAlertsConfig::default`] (enabled). See the
+/// `performance-alerts` spec.
+#[serde(default)]
+pub performance_alerts: PerformanceAlertsConfig,
 }
 
 /// `model_deprecations:` configuration section root
@@ -188,11 +193,31 @@ pub struct ModelDeprecationsConfig {
 }
 
 impl Default for ModelDeprecationsConfig {
-    fn default() -> Self {
-        Self {
-            warn_days_before: 30,
-        }
-    }
+fn default() -> Self {
+Self {
+warn_days_before: 30,
+}
+}
+}
+
+/// `performance_alerts:` configuration section root
+/// (performance-alerts, Req 4.1). Absent section applies defaults
+/// (enabled); thresholds, baseline window, grace, and cadence are fixed
+/// constants. Unknown keys are rejected (`deny_unknown_fields`) so
+/// typos fail at write time instead of silently no-opping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PerformanceAlertsConfig {
+/// Master switch for performance anomaly detection and emission.
+pub enabled: bool,
+}
+
+impl Default for PerformanceAlertsConfig {
+fn default() -> Self {
+Self {
+enabled: true,
+}
+}
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -227,21 +252,24 @@ impl Default for SecurityConfig {
 /// event `type` strings receivers match on. The `webhook.test` type used
 /// for admin test sends is synthesized by the webhooks module and is not
 /// a configurable event filter value. `model.deprecated`
-/// (model-deprecation-alerts spec) and `budget.forecast.warning`
-/// (spend-pace-forecasting spec) ride the same filter; unset
-/// endpoint filters are default-on for them.
+/// (model-deprecation-alerts spec), `budget.forecast.warning`
+/// (spend-pace-forecasting spec), and `performance.anomaly`
+/// (performance-alerts spec) ride the same filter; unset endpoint
+/// filters are default-on for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BudgetEventType {
-    #[serde(rename = "budget.warning")]
-    BudgetWarning,
-    #[serde(rename = "budget.exhausted")]
-    BudgetExhausted,
-    #[serde(rename = "budget.reset")]
-    BudgetReset,
-    #[serde(rename = "model.deprecated")]
-    ModelDeprecated,
-    #[serde(rename = "budget.forecast.warning")]
-    BudgetForecastWarning,
+#[serde(rename = "budget.warning")]
+BudgetWarning,
+#[serde(rename = "budget.exhausted")]
+BudgetExhausted,
+#[serde(rename = "budget.reset")]
+BudgetReset,
+#[serde(rename = "model.deprecated")]
+ModelDeprecated,
+#[serde(rename = "budget.forecast.warning")]
+BudgetForecastWarning,
+#[serde(rename = "performance.anomaly")]
+PerformanceAnomaly,
 }
 
 /// A single webhook receiver (budget-alerts-unified-webhooks, Req 3.1).

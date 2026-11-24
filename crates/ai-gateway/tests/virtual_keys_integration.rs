@@ -193,6 +193,7 @@ fn test_config(mock_uri: &str, enforcement: EnforcementMode, db_path: String) ->
         webhooks: Default::default(),
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
+        performance_alerts: Default::default(),
     }
 }
 

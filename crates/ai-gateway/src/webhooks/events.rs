@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::BudgetEventType;
 use crate::metrics::forecast::ForecastMethod;
+use crate::performance_alerts::state::{Signal, Unit};
 
 /// What the alert is about: a provider budget or a virtual key's budget.
 ///
@@ -120,6 +121,35 @@ pub struct BudgetForecastEventData {
     pub projected_exhaustion_date: NaiveDate,
     /// Discriminator: always `"forecast"` (design Data Models).
     pub threshold_kind: String,
+}
+
+/// Typed `data` body of a `performance.anomaly` event
+/// (performance-alerts design "Event payload", fields verbatim):
+/// the finding that fired for one (scope, signal, day) against the
+/// 7-day rolling baseline. `signal` and `unit` reuse the evaluation
+/// core's enums (their snake_case serde forms match the design
+/// strings byte-for-byte); `threshold` is the human-readable fixed
+/// condition (e.g. `">=3x baseline and >=$50 over"`). The struct
+/// carries only aggregates — no key ids, no request bodies — so the
+/// no-secret invariant holds by construction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerformanceAnomalyData {
+    /// Signal that fired: `spend` | `traffic` | `error_rate` | `latency`.
+    pub signal: Signal,
+    /// `"gateway"` | `"provider"` | `"model_group"`.
+    pub scope: String,
+    /// Provider or model-group name; `"gateway"` for gateway scope.
+    pub name: String,
+    /// Observed day's value for the signal.
+    pub observed_value: f64,
+    /// 7-day rolling baseline value at evaluation time.
+    pub baseline_value: f64,
+    /// `usd` | `requests` | `ratio` | `ms`.
+    pub unit: Unit,
+    /// UTC day the finding evaluated (ISO `YYYY-MM-DD`).
+    pub evaluated_day: NaiveDate,
+    /// Human-readable fixed condition that fired.
+    pub threshold: String,
 }
 
 /// The webhook event envelope (design "Event envelope"). Field names are
@@ -506,4 +536,104 @@ fn forecast_envelope_windowed_carries_window_end() {
     assert_eq!(forecast["projected_usd"], serde_json::json!(120.0));
 }
 
+/// Anomaly payload: exact field set and names (signal, scope, name,
+/// observed_value, baseline_value, unit, evaluated_day, threshold),
+/// `evaluated_day` rendered ISO `YYYY-MM-DD`. Byte-stable like every
+/// other payload — any drift here is a receiver-visible wire break.
+// Validates: performance-alerts design "Event payload"
+#[test]
+fn anomaly_payload_serializes_to_exact_json() {
+    let data = PerformanceAnomalyData {
+        signal: Signal::Spend,
+        scope: "provider".to_string(),
+        name: "openai".to_string(),
+        observed_value: 180.0,
+        baseline_value: 40.0,
+        unit: Unit::Usd,
+        evaluated_day: NaiveDate::from_ymd_opt(2025, 11, 22).expect("valid date"),
+        threshold: ">=3x baseline and >=$50 over".to_string(),
+    };
+    let json = serde_json::to_string(&data).expect("serializes");
+    let expected = concat!(
+        r#"{"signal":"spend","scope":"provider","name":"openai","#,
+        r#""observed_value":180.0,"baseline_value":40.0,"unit":"usd","#,
+        r#""evaluated_day":"2025-11-22","threshold":">=3x baseline and >=$50 over"}"#
+    );
+    assert_eq!(json, expected);
+}
+
+/// Anomaly payload round-trips through serde (receiver side deserializes
+/// the exact wire bytes back to the same value).
+// Validates: performance-alerts design "Event payload"
+#[test]
+fn anomaly_payload_round_trips() {
+    let data = PerformanceAnomalyData {
+        signal: Signal::ErrorRate,
+        scope: "model_group".to_string(),
+        name: "gpt-4o-family".to_string(),
+        observed_value: 0.06,
+        baseline_value: 0.01,
+        unit: Unit::Ratio,
+        evaluated_day: NaiveDate::from_ymd_opt(2026, 1, 5).expect("valid date"),
+        threshold: ">=3x baseline and >=2pp over".to_string(),
+    };
+    let json = serde_json::to_string(&data).expect("serializes");
+    let back: PerformanceAnomalyData = serde_json::from_str(&json).expect("deserializes");
+    assert_eq!(back, data);
+}
+
+    /// No-secret invariant: the payload's serialized JSON carries no
+    /// key-secret or request-body material — the struct has no field
+    /// capable of carrying them (aggregates and names only), so the
+    /// invariant holds by construction and this asserts the bytes.
+    /// Worst-case strings in the free-form fields (`name`, `threshold`)
+    /// cannot smuggle secrets or add payload fields: the serialized
+    /// key set stays exactly the fixed eight-key wire contract, so a
+    /// future field addition (the smuggling route) fails here first.
+    // Validates: performance-alerts design "Event payload" (NFR security)
+    #[test]
+    fn anomaly_payload_carries_no_secrets() {
+        let data = PerformanceAnomalyData {
+            signal: Signal::Traffic,
+            scope: "gateway".to_string(),
+            name: "gateway".to_string(),
+            observed_value: 12000.0,
+            baseline_value: 1000.0,
+            unit: Unit::Requests,
+            evaluated_day: NaiveDate::from_ymd_opt(2025, 11, 23).expect("valid date"),
+            threshold: ">=10x baseline and >=1000 requests over".to_string(),
+        };
+        let json = serde_json::to_string(&data).expect("serializes");
+        for marker in ["vk_", "sk-", "Bearer ", "api_key", "authorization"] {
+            assert!(
+                !json.to_ascii_lowercase().contains(
+                    marker.to_ascii_lowercase().as_str()
+                ),
+                "payload JSON must not contain {marker:?}: {json}"
+            );
+        }
+
+        let hostile = PerformanceAnomalyData {
+            name: "vk_test123 sk-abc Bearer api_key authorization".to_string(),
+            threshold: "vk_ prefix sk- Bearer api_key authorization".to_string(),
+            ..data
+        };
+        let value = serde_json::to_value(&hostile).expect("serializes");
+        let object = value.as_object().expect("object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "baseline_value",
+                "evaluated_day",
+                "name",
+                "observed_value",
+                "scope",
+                "signal",
+                "threshold",
+                "unit",
+            ]
+        );
+    }
 }

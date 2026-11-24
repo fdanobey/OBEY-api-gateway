@@ -3736,6 +3736,7 @@ mod tests {
                     webhooks: Default::default(),
                     opentelemetry: Default::default(),
                     model_deprecations: Default::default(),
+                    performance_alerts: Default::default(),
                 })
             })
         })
@@ -4488,6 +4489,7 @@ retry:
             webhooks: Default::default(),
             opentelemetry: Default::default(),
             model_deprecations: Default::default(),
+            performance_alerts: Default::default(),
             reasoning_compat: Default::default(),
         };
         config.logging.database_path = storage_dir.join("logs.db").to_string_lossy().into_owned();

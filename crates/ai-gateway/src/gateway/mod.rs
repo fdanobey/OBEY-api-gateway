@@ -146,11 +146,20 @@ pub deprecation_state: Arc<crate::model_deprecations::state::DeprecationState>,
 /// instance — one built-once HTTP client, one single-flight
 /// guard, one last-scan view.
 pub deprecation_scanner: Arc<crate::model_deprecations::scanner::ModelMetadataScanner>,
-/// The shared notifier behind `provider_budget_alerts` (same
+    /// The shared notifier behind `provider_budget_alerts` (same
     /// construction, same Arc) — held separately so the admin
     /// test-send route reuses the built-once client instead of
     /// constructing a new notifier per request.
     pub webhook_notifier: Arc<WebhookNotifier>,
+    /// Performance-alerts emission state (performance-alerts spec,
+    /// Task 5): the daily-drift evaluation orchestrator over the
+    /// requests ledger, sharing the config / logger / ledger /
+    /// notifier Arcs. The hourly background loop is spawned ONLY in
+    /// [`GatewayServer::start_with_shutdown`] — never here — so
+    /// `GatewayServer::new` stays test-safe (no timers firing in
+    /// oneshot tests).
+    pub performance_alert_state:
+        Arc<crate::performance_alerts::emission::PerformanceAlertState>,
     /// OTLP trace exporter (opentelemetry-trace-export spec, task
     /// 6). Dormant until `apply_config` sees an enabled section;
     /// span emission runs at the request-completion seams in
@@ -312,8 +321,20 @@ impl GatewayServer {
         // `start_with_shutdown`, never here — `GatewayServer::new`
         // must stay test-safe (no timers firing 15 s after
         // construction in oneshot tests).
-        let logger_arc = Arc::new(logger);
-        let deprecation_scanner =
+    let logger_arc = Arc::new(logger);
+    // Performance-alerts emission state (Task 5): built once on the
+    // same config / logger / ledger / notifier Arcs AppState holds.
+    // No timers start here — the hourly loop lives in
+    // `start_with_shutdown` (the deprecation-scanner discipline).
+    let performance_alert_state = Arc::new(
+        crate::performance_alerts::emission::PerformanceAlertState::new(
+            config_arc.clone(),
+            logger_arc.clone(),
+            webhook_ledger.clone(),
+            webhook_notifier.clone(),
+        ),
+    );
+    let deprecation_scanner =
             Arc::new(crate::model_deprecations::scanner::ModelMetadataScanner::with_emission(
                 config_arc.clone(),
                 deprecation_state.clone(),
@@ -839,9 +860,10 @@ anchor,
             runtime_limits: Arc::new(crate::runtime_limits::RuntimeLimits::from_config(&config)),
  webhook_ledger,
  provider_budget_alerts,
- deprecation_state,
- deprecation_scanner,
- webhook_notifier,
+        deprecation_state,
+        deprecation_scanner,
+        performance_alert_state,
+        webhook_notifier,
             telemetry_exporter: telemetry_exporter.clone(),
             telemetry_snapshot: telemetry_snapshot.clone(),
         };
@@ -1290,15 +1312,24 @@ anchor,
  shutdown.await;
  let _ = shutdown_signal_tx.send(true);
  });
- let scanner_shutdown_rx = shutdown_signal_rx.clone();
- let https_shutdown_rx = shutdown_signal_rx.clone();
- let http_shutdown_rx = shutdown_signal_rx;
- // Model-deprecation scanner background loop (Req 1.1/1.1a):
- // startup scan after 15 s, then every 24 h, stopping with the
- // shutdown signal above.
- self.state
- .deprecation_scanner
- .spawn_background(scanner_shutdown_rx);
+let scanner_shutdown_rx = shutdown_signal_rx.clone();
+let https_shutdown_rx = shutdown_signal_rx.clone();
+let performance_alert_shutdown_rx = shutdown_signal_rx.clone();
+let http_shutdown_rx = shutdown_signal_rx;
+// Model-deprecation scanner background loop (Req 1.1/1.1a):
+// startup scan after 15 s, then every 24 h, stopping with the
+// shutdown signal above.
+self.state
+    .deprecation_scanner
+    .spawn_background(scanner_shutdown_rx);
+// Performance-alerts emission loop (performance-alerts Task 5,
+// design D7): first tick immediate (restart catch-up after the
+// ledger dedup seed), then hourly; the `last_evaluated_day`
+// short-circuit keeps repeated ticks of an already-evaluated
+// day query-free. Stops with the same shutdown fan-out.
+self.state
+    .performance_alert_state
+    .spawn_background(performance_alert_shutdown_rx);
 
         if let Some(rustls_config) = rustls_config {
             // Req 36.1: HTTPS only when TLS enabled
@@ -2331,6 +2362,7 @@ mod tests {
             webhooks: Default::default(),
             opentelemetry: Default::default(),
             model_deprecations: Default::default(),
+            performance_alerts: Default::default(),
         }
     }
 
@@ -3385,6 +3417,7 @@ mod tests {
         webhooks: Default::default(),
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
+        performance_alerts: Default::default(),
     };
 
     let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -3997,6 +4030,7 @@ mod tests {
         webhooks: Default::default(),
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
+        performance_alerts: Default::default(),
     };
 
     // Write new config to disk

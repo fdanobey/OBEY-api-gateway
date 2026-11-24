@@ -69,6 +69,7 @@ mod models_context_metadata;
 mod output_caps;
 mod pass_through_routes;
 mod performance;
+mod performance_alerts_emission;
 mod prompt_cache_routing;
 mod prompt_library_admin;
 mod prompt_library_api;

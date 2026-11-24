@@ -1794,10 +1794,11 @@ mod property_tests {
             web_search: None,
             cache_aware_routing: Default::default(),
             reasoning_compat: Default::default(),
-        webhooks: Default::default(),
-        opentelemetry: Default::default(),
-        model_deprecations: Default::default(),
-    }
+            webhooks: Default::default(),
+            opentelemetry: Default::default(),
+            model_deprecations: Default::default(),
+            performance_alerts: Default::default(),
+        }
 }
 
     #[test]
@@ -5344,7 +5345,170 @@ fn model_deprecations_warn_days_before_bounds_validated() {
     }
 }
 
-// --- Model-group output caps (response-output-caps, Req 2.1, 2.5, 2.6) ---
+ // --- Performance alerts config validation (performance-alerts,
+ // Req 4.1) ---
+
+ #[test]
+ fn performance_alerts_absent_section_applies_defaults_and_validates() {
+ // Absent section default: enabled (Req 4.1).
+ let config = minimal_valid_config();
+ assert!(config.performance_alerts.enabled);
+ assert!(config.validate().is_ok());
+
+ // Explicit section parses.
+ let yaml = "enabled: false";
+ let section: PerformanceAlertsConfig = serde_yaml::from_str(yaml).unwrap();
+ assert!(!section.enabled);
+
+ // Empty section applies defaults.
+ let empty: PerformanceAlertsConfig = serde_yaml::from_str("{}").unwrap();
+ assert_eq!(empty, PerformanceAlertsConfig::default());
+ }
+
+ #[test]
+ fn performance_alerts_section_serde_round_trips() {
+ for enabled in [true, false] {
+ let section = PerformanceAlertsConfig { enabled };
+ let serialized = serde_yaml::to_string(&section).unwrap();
+ assert_eq!(serialized, format!("enabled: {enabled}\n"));
+ let reparsed: PerformanceAlertsConfig =
+ serde_yaml::from_str(&serialized).unwrap();
+ assert_eq!(reparsed, section);
+ }
+ }
+
+ #[test]
+ fn performance_alerts_absent_section_defaults_through_real_load() {
+ // The real entry point shared by startup and hot-reload
+ // (`load_and_validate_config`) deserializes the full document, so
+ // a complete config without a `performance_alerts` section loads
+ // with the absent-section default enabled (Req 4.1).
+ let tempdir = tempfile::tempdir().unwrap();
+ let path = tempdir.path().join("config.yaml");
+ std::fs::write(
+ &path,
+ r#"server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers:
+  - name: "openai"
+    type: "openai"
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "sk-test-12345678901234567890"
+    timeout_seconds: 30
+model_groups:
+  - name: "default"
+    version_fallback_enabled: false
+    models:
+      - provider: "openai"
+        model: "gpt-4"
+"#,
+ )
+ .unwrap();
+ let config = load_and_validate_config(&path).unwrap();
+ assert!(config.performance_alerts.enabled);
+ }
+
+ #[test]
+ fn performance_alerts_unknown_key_rejected_naming_the_field() {
+ // Through the same real load path (hot-reload deserializes this way
+ // too): an unknown key under `performance_alerts` is rejected by
+ // `deny_unknown_fields` with the field named, so typos fail at
+ // write time instead of silently no-opping.
+ let tempdir = tempfile::tempdir().unwrap();
+ let path = tempdir.path().join("config.yaml");
+ std::fs::write(
+ &path,
+ r#"server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers:
+  - name: "openai"
+    type: "openai"
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "sk-test-12345678901234567890"
+    timeout_seconds: 30
+model_groups:
+  - name: "default"
+    version_fallback_enabled: false
+    models:
+      - provider: "openai"
+        model: "gpt-4"
+performance_alerts:
+  performence: true
+"#,
+ )
+ .unwrap();
+ let error = load_and_validate_config(&path)
+ .expect_err("unknown key must be rejected");
+ assert!(
+ error.contains("performence"),
+ "error should name the unknown field: {error}"
+ );
+ }
+
+ #[test]
+ fn performance_alerts_default_filter_includes_performance_anomaly() {
+ // Default endpoint filters are `events` absent = all types, so
+ // `performance.anomaly` rides default-on (Req 4.1): None subscribes
+ // to every variant, and the wire name round-trips through the
+ // serde rename receivers match on.
+ let endpoint = WebhookEndpoint {
+ url: "https://hooks.example.com/all".to_string(),
+ secret: None,
+ events: None,
+ };
+ assert!(endpoint.events.is_none());
+
+ // An explicit filter naming the variant parses and round-trips
+ // as the exact wire string.
+ let yaml = r#"
+ endpoints:
+ - url: "https://hooks.example.com/alerts"
+   events: ["performance.anomaly"]
+ - url: "https://hooks.example.com/all"
+ "#;
+ let webhooks: WebhooksConfig = serde_yaml::from_str(yaml).unwrap();
+ assert_eq!(
+ webhooks.endpoints[0].events,
+ Some(vec![BudgetEventType::PerformanceAnomaly])
+ );
+ assert_eq!(webhooks.endpoints[1].events, None);
+ let serialized = serde_yaml::to_string(&webhooks).unwrap();
+ assert!(serialized.contains("performance.anomaly"));
+ let reparsed: WebhooksConfig = serde_yaml::from_str(&serialized).unwrap();
+ assert_eq!(reparsed, webhooks);
+ }
+
+ #[test]
+ fn performance_alerts_explicit_filter_excluding_it_unchanged() {
+ // An explicit filter list without performance.anomaly keeps parsing
+ // unchanged (explicit lists are respected as-is).
+ let yaml = r#"
+ endpoints:
+ - url: "https://hooks.example.com/alerts"
+   events: ["budget.warning", "budget.exhausted"]
+ "#;
+ let webhooks: WebhooksConfig = serde_yaml::from_str(yaml).unwrap();
+ assert_eq!(
+ webhooks.endpoints[0].events,
+ Some(vec![
+ BudgetEventType::BudgetWarning,
+ BudgetEventType::BudgetExhausted,
+ ])
+ );
+ assert!(!webhooks.endpoints[0]
+ .events
+ .as_ref()
+ .unwrap()
+ .contains(&BudgetEventType::PerformanceAnomaly));
+ }
+
+ // --- Model-group output caps (response-output-caps, Req 2.1, 2.5, 2.6) ---
 
 #[test]
 fn model_group_max_output_tokens_yaml_absent_present_and_invalid() {

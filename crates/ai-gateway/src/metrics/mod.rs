@@ -779,11 +779,25 @@ pub struct AlertSummary {
     pub scope_label: String,
     /// UTC epoch seconds the event fired at.
     pub fired_at: i64,
-    /// Warn threshold crossed (warning events only, design Component 5:
-    /// "threshold kind"); extracted from the ledger payload. Absent
-    /// for exhausted/reset rows.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub threshold_percent: Option<u8>,
+/// Warn threshold crossed (warning events only, design Component 5:
+/// "threshold kind"); extracted from the ledger payload. Absent
+/// for exhausted/reset rows.
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub threshold_percent: Option<u8>,
+/// Signal that fired (`spend` | `traffic` | `error_rate` |
+/// `latency`) — `performance.anomaly` rows only, extracted from
+/// the ledger payload like `threshold_percent`. Absent for
+/// budget/deprecation rows.
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub signal: Option<String>,
+/// Observed day's value (`performance.anomaly` rows only),
+/// extracted from the ledger payload. Absent otherwise.
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub observed_value: Option<f64>,
+/// 7-day rolling baseline value (`performance.anomaly` rows
+/// only), extracted from the ledger payload. Absent otherwise.
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub baseline_value: Option<f64>,
 }
 
 /// Next UTC reset boundary for a windowed policy, anchored on the row's

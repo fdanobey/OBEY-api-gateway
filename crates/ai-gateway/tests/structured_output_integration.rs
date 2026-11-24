@@ -239,6 +239,7 @@ fn base_config(provider_uri: &str) -> Config {
         webhooks: Default::default(),
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
+        performance_alerts: Default::default(),
     }
 }
 

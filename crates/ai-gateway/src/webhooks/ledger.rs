@@ -31,6 +31,13 @@ use rusqlite::{params, Connection, Row};
 /// burden (design, ledger schema).
 const EVENT_RETENTION_LIMIT: i64 = 500;
 
+/// Age bound of the `performance.anomaly` prune-tail exemption:
+/// anomaly rows are excepted from the 500-row prune tail only while
+/// younger than this many seconds. Restart dedup needs at most the
+/// newest row of the current day-set, so a month covers many days
+/// of re-evaluation cycles; older anomaly rows prune normally.
+const ANOMALY_RETENTION_EXEMPTION_SECS: i64 = 30 * 24 * 60 * 60;
+
 /// TTL of the cached recent-events rows served to dashboard snapshots;
 /// mirror of `BUDGET_STORE_ROWS_TTL` in the metrics module.
 const RECENT_EVENTS_CACHE_TTL: Duration = Duration::from_secs(1);
@@ -69,9 +76,12 @@ pub struct AlertEventRow {
     pub id: String,
     /// Event type, e.g. `budget.warning`.
     pub event_type: String,
-    /// `provider` | `virtual_key`.
+    /// `provider` | `virtual_key` | `model` | `gateway` |
+    /// `model_group` (budget / virtual-key, model-deprecation, and
+    /// performance-alert emissions respectively).
     pub scope: String,
-    /// Provider name or `key:<id>:<name>`.
+    /// Provider name, `key:<id>:<name>`, `model:<provider>/<model>`,
+    /// the model-group name, or the literal `gateway`.
     pub scope_label: String,
     /// Serialized event payload at emit time.
     pub payload_json: String,
@@ -441,15 +451,60 @@ result.map_err(WebhookLedgerError::Database)
             }
         };
     rows
-}
+    }
 
-/// [`Self::recent_events`] with an optional SQL-level `webhook.test`
+    /// All events of `event_type` created at or after `since_epoch`,
+    /// newest first. Unlike the dashboard reads this RETURNS the
+    /// error instead of degrading to empty: the performance-alerts
+    /// dedup (design D5) must fail its cycle on a broken ledger
+    /// rather than re-fire already-reported alerts.
+    pub fn events_of_type_since(
+        &self,
+        event_type: &str,
+        since_epoch: i64,
+    ) -> Result<Vec<AlertEventRow>, WebhookLedgerError> {
+        let conn = self.conn.lock().expect("webhooks.db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, type, scope, scope_label, payload_json, created_at
+            FROM alert_events
+            WHERE type = ?1 AND created_at >= ?2
+            ORDER BY created_at DESC, rowid DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![event_type, since_epoch], row_to_alert_event)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The newest event of `event_type`, if any (performance-alerts
+    /// restart seed, design D5). Result-returning like
+    /// [`Self::events_of_type_since`]: the seed downgrade on failure
+    /// is the caller's decision.
+    pub fn newest_event_of_type(
+        &self,
+        event_type: &str,
+    ) -> Result<Option<AlertEventRow>, WebhookLedgerError> {
+        let conn = self.conn.lock().expect("webhooks.db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, type, scope, scope_label, payload_json, created_at
+            FROM alert_events
+            WHERE type = ?1
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1",
+        )?;
+        let mut rows = stmt
+            .query_map(params![event_type], row_to_alert_event)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.pop())
+    }
+
+    /// [`Self::recent_events`] with an optional SQL-level `webhook.test`
 /// exclusion applied BEFORE the limit — the dashboard feed (design
 /// Component 5) shows budget events only, so admin test sends can
 /// never crowd out real alert history within the newest-20 window.
 fn recent_events_filtered(&self, limit: u32, exclude_tests: bool) -> Vec<AlertEventRow> {
-    let conn = self.conn.lock().expect("webhooks.db mutex poisoned");
-    let mut stmt = match conn.prepare(
+let conn = self.conn.lock().expect("webhooks.db mutex poisoned");
+let mut stmt = match conn.prepare(
         "SELECT id, type, scope, scope_label, payload_json, created_at
         FROM alert_events
         WHERE CASE WHEN ?2 THEN type != 'webhook.test' ELSE 1 END
@@ -685,48 +740,70 @@ pub fn recent_deliveries_per_endpoint(
 /// `event_id` foreign key. Only events with no non-terminal delivery
 /// can fall out of the 500-newest window.
 fn insert_event_with_retention(
-conn: &mut Connection,
-id: &str,
-event_type: &str,
-scope: &str,
-scope_label: &str,
-payload_json: &str,
-created_at: i64,
+    conn: &mut Connection,
+    id: &str,
+    event_type: &str,
+    scope: &str,
+    scope_label: &str,
+    payload_json: &str,
+    created_at: i64,
 ) -> Result<(), rusqlite::Error> {
-let tx = conn.transaction()?;
-tx.execute(
+    let tx = conn.transaction()?;
+    // performance.anomaly rows carry their own scope identity in the
+    // payload (`data.scope` + `data.name` — the envelope is the
+    // source of truth): the scope column gains the `gateway` and
+    // `model_group` values, and the scope label is the scope's NAME
+    // (the literal `gateway` for the gateway scope). The D9
+    // value-envelope path cannot derive these — its scope column is
+    // the generic `model` — so the ledger renders them here.
+    let (scope, scope_label) = if event_type == "performance.anomaly" {
+        performance_anomaly_scope(payload_json).unwrap_or((scope.to_string(), scope_label.to_string()))
+    } else {
+        (scope.to_string(), scope_label.to_string())
+    };
+    tx.execute(
 "INSERT INTO alert_events (id, type, scope, scope_label, payload_json, created_at)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
 params![id, event_type, scope, scope_label, payload_json, created_at],
 )?;
-// Newest EVENT_RETENTION_LIMIT events stay (unfinished chains'
-// events excepted); deliveries of the pruned tail go first so the
-// FK never sees an orphan. The LEFT JOIN keeps events that have ANY
-// inflight delivery row out of the pruned sub-select entirely.
-tx.execute(
-"DELETE FROM deliveries WHERE event_id IN (
-SELECT pruned.id FROM (
-SELECT id FROM alert_events
-ORDER BY created_at DESC, rowid DESC
-LIMIT -1 OFFSET ?1
-) AS pruned
-LEFT JOIN deliveries AS d
-ON d.event_id = pruned.id AND d.outcome = 'inflight'
-WHERE d.event_id IS NULL)",
-params![EVENT_RETENTION_LIMIT],
-)?;
-tx.execute(
-"DELETE FROM alert_events WHERE id IN (
-SELECT pruned.id FROM (
-SELECT id FROM alert_events
-ORDER BY created_at DESC, rowid DESC
-LIMIT -1 OFFSET ?1
-) AS pruned
-LEFT JOIN deliveries AS d
-ON d.event_id = pruned.id AND d.outcome = 'inflight'
-WHERE d.event_id IS NULL)",
-params![EVENT_RETENTION_LIMIT],
-)?;
+    // Newest EVENT_RETENTION_LIMIT events stay (unfinished chains'
+    // events excepted, plus `performance.anomaly` rows younger than
+    // 30 days — restart dedup needs at most the newest row of the
+    // current day-set, so a month covers many days of re-evaluation
+    // cycles); deliveries of the pruned tail go first so the FK
+    // never sees an orphan. The LEFT JOIN keeps events that have ANY
+    // inflight delivery row out of the pruned sub-select entirely.
+    let exemption_floor = now_epoch() - ANOMALY_RETENTION_EXEMPTION_SECS;
+    tx.execute(
+        "DELETE FROM deliveries WHERE event_id IN (
+            SELECT pruned.id FROM (
+                SELECT id, type, created_at FROM alert_events
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT -1 OFFSET ?1
+            ) AS pruned
+            LEFT JOIN deliveries AS d
+            ON d.event_id = pruned.id AND d.outcome = 'inflight'
+            WHERE d.event_id IS NULL AND NOT (
+                pruned.type = 'performance.anomaly' AND pruned.created_at >= ?2
+            )
+        )",
+        params![EVENT_RETENTION_LIMIT, exemption_floor],
+    )?;
+    tx.execute(
+        "DELETE FROM alert_events WHERE id IN (
+            SELECT pruned.id FROM (
+                SELECT id, type, created_at FROM alert_events
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT -1 OFFSET ?1
+            ) AS pruned
+            LEFT JOIN deliveries AS d
+            ON d.event_id = pruned.id AND d.outcome = 'inflight'
+            WHERE d.event_id IS NULL AND NOT (
+                pruned.type = 'performance.anomaly' AND pruned.created_at >= ?2
+            )
+        )",
+        params![EVENT_RETENTION_LIMIT, exemption_floor],
+    )?;
 tx.commit()?;
 Ok(())
 }
@@ -782,6 +859,18 @@ fn row_to_alert_event(row: &Row) -> Result<AlertEventRow, rusqlite::Error> {
         payload_json: row.get(4)?,
         created_at: row.get(5)?,
     })
+}
+
+/// Scope identity of a `performance.anomaly` payload: the envelope's
+/// `data.scope` (`gateway` | `provider` | `model_group`) plus
+/// `data.name`. A malformed payload keeps the caller-supplied fields.
+fn performance_anomaly_scope(payload_json: &str) -> Option<(String, String)> {
+    let payload = serde_json::from_str::<serde_json::Value>(payload_json).ok()?;
+    let data = payload.get("data")?.as_object()?;
+    Some((
+        data.get("scope")?.as_str()?.to_string(),
+        data.get("name")?.as_str()?.to_string(),
+    ))
 }
 
 fn row_to_delivery(row: &Row) -> Result<DeliveryRow, rusqlite::Error> {
@@ -1175,6 +1264,57 @@ assert_eq!(rows[0].outcome, "success");
 }
 
 #[test]
+fn retention_prunes_old_anomaly_rows_but_keeps_fresh_ones() {
+    let (store, _tmp) = temp_store();
+    let now = now_epoch();
+    // An anomaly row older than the 30-day exemption falls out of the
+    // 500-newest window and prunes like any budget row (bounded
+    // exemption, D5 deviation note).
+    store
+        .insert_event(
+            "evt-anomaly-old",
+            "performance.anomaly",
+            "provider",
+            "openai",
+            "{}",
+            now - ANOMALY_RETENTION_EXEMPTION_SECS - 60,
+        )
+        .unwrap();
+    // A fresh anomaly row (inside 30 days) stays even in the tail.
+    store
+        .insert_event(
+            "evt-anomaly-fresh",
+            "performance.anomaly",
+            "provider",
+            "openai",
+            "{}",
+            now - 60,
+        )
+        .unwrap();
+    for n in 1..=EVENT_RETENTION_LIMIT {
+        store
+            .insert_event(
+                &format!("evt-{n:03}"),
+                "budget.warning",
+                "provider",
+                "openai",
+                "{}",
+                now + n,
+            )
+            .unwrap();
+    }
+    let events = store.recent_events(1000);
+    assert!(
+        events.iter().all(|row| row.id != "evt-anomaly-old"),
+        "anomaly row older than 30 days prunes normally"
+    );
+    assert!(
+        events.iter().any(|row| row.id == "evt-anomaly-fresh"),
+        "fresh anomaly row kept by the age-bounded exemption"
+    );
+}
+
+#[test]
 fn retention_keeps_events_of_inflight_chains() {
 let (store, _tmp) = temp_store();
 let url = "https://hooks.example.com/a";
@@ -1223,12 +1363,12 @@ events.iter().all(|row| row.id != "evt-inflight-old"),
 );
 }
 
-    #[test]
-    fn recent_events_cached_serves_rows_within_ttl_and_refreshes_after() {
-        let (store, _tmp) = temp_store();
-        store
-            .insert_event("evt-1", "budget.warning", "provider", "openai", "{}", 1000)
-            .unwrap();
+#[test]
+fn recent_events_cached_serves_rows_within_ttl_and_refreshes_after() {
+    let (store, _tmp) = temp_store();
+    store
+        .insert_event("evt-1", "budget.warning", "provider", "openai", "{}", 1000)
+        .unwrap();
 
         let first = store.recent_events_cached(20);
         assert_eq!(first.len(), 1);

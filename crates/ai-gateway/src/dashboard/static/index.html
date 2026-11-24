@@ -73,6 +73,9 @@ tbody tr:hover{background:rgba(59,130,246,.06)}
 .badge-alert-exhausted{background:rgba(239,68,68,.15);color:var(--danger)}
 .badge-alert-reset{background:rgba(34,197,94,.15);color:var(--success)}
 .badge-alert-forecast{background:rgba(139,92,246,.15);color:#a78bfa}
+.badge-alert-perf{background:rgba(236,72,153,.15);color:#ec4899}
+/* Performance-anomaly detail text (performance-alerts, Task 6) */
+.perf-detail{margin-left:.5rem;color:var(--text-muted);font-size:.8rem}
 
 /* Spend-pace forecast cells (spend-pace-forecasting, Task 6) */
 .forecast-insufficient{color:var(--text-muted);font-style:italic}
@@ -864,13 +867,15 @@ empty.style.display='none';
  'budget.warning': 'badge-alert-warning',
  'budget.exhausted': 'badge-alert-exhausted',
  'budget.reset': 'badge-alert-reset',
- 'budget.forecast.warning': 'badge-alert-forecast'
+ 'budget.forecast.warning': 'badge-alert-forecast',
+ 'performance.anomaly': 'badge-alert-perf'
  };
  var typeLabel = {
  'budget.warning': 'warning',
  'budget.exhausted': 'exhausted',
  'budget.reset': 'reset',
- 'budget.forecast.warning': 'forecast'
+ 'budget.forecast.warning': 'forecast',
+ 'performance.anomaly': 'anomaly'
  };
 var html='';
  alerts.forEach(function(a){
@@ -881,11 +886,26 @@ var html='';
  // "type, scope_label, threshold kind, fired_at").
  var suffix = (etype==='budget.warning' && a.threshold_percent!=null)
  ? ' ' + a.threshold_percent + '%' : '';
+// Performance rows render the server-provided observed/baseline
+// pair plus the signal; JS renders only, never derives (no
+// client-side ratio math). Missing fields degrade to label-only
+// (spec: handle missing gracefully).
+var detail = '';
+if(etype==='performance.anomaly'){
+var sig = a.signal!=null ? String(a.signal) : '';
+if(a.observed_value!=null && a.baseline_value!=null){
+detail = (sig?sig+' ':'')
++ '(observed '+Number(a.observed_value)+' vs baseline '+Number(a.baseline_value)+')';
+} else if(sig){
+detail = sig;
+}
+}
  var fired = a.fired_at ? fmtTime(a.fired_at) : '—';
  var rel = a.fired_at ? relTime(a.fired_at) : '';
  var when = rel ? '<span title="'+esc(fired)+'">'+esc(rel)+'</span>' : '—';
  html += '<tr>'
- + '<td><span class="badge '+cls+'">'+esc(label+suffix)+'</span></td>'
+ + '<td><span class="badge '+cls+'">'+esc(label+suffix)+'</span>'
+ + (detail ? '<span class="perf-detail">'+esc(detail)+'</span>' : '') + '</td>'
  + '<td>'+esc(a.scope_label||'—')+'</td>'
  + '<td>'+when+'</td>'
  + '</tr>';

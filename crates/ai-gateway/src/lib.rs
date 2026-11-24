@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod model_deprecations;
 pub mod models;
 pub mod oauth;
+pub mod performance_alerts;
 pub mod providers;
 pub mod prompt_library;
 pub mod reasoning_compat;

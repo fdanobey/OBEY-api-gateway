@@ -446,4 +446,12 @@ tray:
 # delivered as model.deprecated events. Documented at
 # https://github.com/fdanobey/OBEY-api-gateway/wiki/Model-Deprecation-Alerts.
 # model_deprecations:
-#  warn_days_before: 30 # days before retirement to alert; 1..=365, default 30
+#   warn_days_before: 30 # days before retirement to alert; 1..=365, default 30
+
+# Performance anomaly alerts (optional). The last complete UTC day is
+# compared against a 7-day rolling baseline per scope (gateway, provider,
+# model group) and signal (spend, traffic, error rate, latency); findings
+# are delivered as performance.anomaly webhook events. Thresholds,
+# baseline window, grace, and cadence are fixed constants.
+# performance_alerts:
+#   enabled: true # default; hot-reloadable

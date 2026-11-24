@@ -837,7 +837,7 @@ The admin panel's **Virtual Keys** section provides a searchable/sortable key ta
 
 Provider budgets and virtual-key budgets can notify you before and when they hit their limits. With at least one webhook endpoint configured, the gateway emits `budget.warning` (default 80% of the limit, per-provider `alert_threshold_percent` override), `budget.exhausted` (fixed 100% — the enforcement line), and `budget.reset` (window rollover or admin reset) events as Standard Webhooks-signed JSON, with bounded retries (4 attempts: immediate, 30 s, 2 m, 10 m), a durable delivery ledger, and an admin-panel test send.
 
-Providers are budget-skipped at 100% (routing fails over); virtual-key callers get a `429`. Full enforcement semantics, event payloads, and the signature verification recipe: see the [Budgets & Alerts](https://github.com/fdanobey/OBEY-api-gateway/wiki) wiki page.
+Providers are budget-skipped at 100% (routing fails over); virtual-key callers get a `429`. Full enforcement semantics, event payloads, and the signature verification recipe: see the [Budgets & Alerts](https://github.com/fdanobey/OBEY-api-gateway/wiki) wiki page. The gateway also emits `performance.anomaly` alerts — a daily observed-vs-7-day-baseline comparison of spend, traffic, latency, and error rate per gateway/provider/model; see the [Performance Alerts](https://github.com/fdanobey/OBEY-api-gateway/wiki/Performance-Alerts) wiki page.
 
 ```yaml
 webhooks:
