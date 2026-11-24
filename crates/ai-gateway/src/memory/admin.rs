@@ -18,7 +18,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use super::{
-    spawn_store_task, validate_namespace, AdminCreateError, MemoryError, MemorySystem, MemoryType,
+    spawn_store_task, validate_namespace, AdminCreateError, MemoryError, MemorySort,
+    MemorySortField, MemorySystem, MemoryType,
 };
 
 const DEFAULT_LIMIT: usize = 50;
@@ -86,6 +87,8 @@ struct ListQuery {
     limit: usize,
     #[serde(default)]
     offset: usize,
+    sort: Option<String>,
+    order: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +102,8 @@ struct SearchQuery {
     limit: usize,
     #[serde(default)]
     offset: usize,
+    sort: Option<String>,
+    order: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -122,6 +127,27 @@ fn clamp_pagination(limit: usize, offset: usize) -> Result<(usize, usize), Respo
         )));
     }
     Ok((limit, offset))
+}
+
+/// Parses the optional `sort` column and `order` (`asc`/`desc`, default
+/// `asc`) query pair; unknown values answer 400 instead of being ignored.
+fn parse_sort(sort: Option<&str>, order: Option<&str>) -> Result<Option<MemorySort>, Response> {
+    let descending = match order.map(str::trim).filter(|value| !value.is_empty()) {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("asc") => false,
+        Some(value) if value.eq_ignore_ascii_case("desc") => true,
+        Some(_) => return Err(bad_request("order must be asc or desc")),
+    };
+    let Some(sort) = sort.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(field) = MemorySortField::parse(sort) else {
+        return Err(bad_request(&format!(
+            "sort must be one of {}",
+            MemorySortField::NAMES
+        )));
+    };
+    Ok(Some(MemorySort { field, descending }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +198,10 @@ async fn list_entries(
         Ok(bounds) => bounds,
         Err(response) => return response,
     };
+    let sort = match parse_sort(query.sort.as_deref(), query.order.as_deref()) {
+        Ok(sort) => sort,
+        Err(response) => return response,
+    };
     let include_superseded = query.include_superseded;
     let system = match resolve_system(&state).await {
         Ok(system) => system,
@@ -181,7 +211,7 @@ async fn list_entries(
         let store = Arc::clone(&system.store);
         let namespace = namespace.clone();
         match spawn_store_task(move || {
-            store.list_entries_with_superseded(&namespace, limit, offset, include_superseded)
+            store.list_entries_sorted(&namespace, limit, offset, include_superseded, sort)
         })
         .await
         {
@@ -222,6 +252,10 @@ async fn search(
         Ok(bounds) => bounds,
         Err(response) => return response,
     };
+    let sort = match parse_sort(query.sort.as_deref(), query.order.as_deref()) {
+        Ok(sort) => sort,
+        Err(response) => return response,
+    };
     let include_superseded = query.include_superseded;
     let system = match resolve_system(&state).await {
         Ok(system) => system,
@@ -233,13 +267,14 @@ async fn search(
         let namespace = query.namespace.clone();
         let memory_type = query.memory_type.clone();
         match spawn_store_task(move || {
-            store.search_entries(
+            store.search_entries_sorted(
                 &query_text,
                 namespace.as_deref(),
                 memory_type.as_deref(),
                 include_superseded,
                 limit,
                 offset,
+                sort,
             )
         })
         .await
@@ -846,6 +881,60 @@ mod tests {
         assert_eq!(page["limit"], 1);
         assert_eq!(page["offset"], 1);
         assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_and_search_sort_by_requested_column() {
+        let app = routes(system().await);
+        for content in ["bravo sortable fact", "alpha sortable fact", "Charlie sortable fact"] {
+            let (status, _) = request(
+                app.clone(),
+                "POST",
+                "/entries",
+                Some(entry("user::sorted", content, "fact")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        let contents = |page: &Value| -> Vec<String> {
+            page["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["content"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let (status, page) = request(
+            app.clone(),
+            "GET",
+            "/entries?namespace=user%3A%3Asorted&sort=content&order=asc",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            contents(&page),
+            ["alpha sortable fact", "bravo sortable fact", "Charlie sortable fact"]
+        );
+        let (status, page) = request(
+            app.clone(),
+            "GET",
+            "/search?q=sortable&sort=content&order=desc&limit=2&offset=1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["total_count"], 3);
+        assert_eq!(contents(&page), ["bravo sortable fact", "alpha sortable fact"]);
+        for uri in [
+            "/entries?namespace=user%3A%3Asorted&sort=content%3B%20DROP%20TABLE%20memories",
+            "/entries?namespace=user%3A%3Asorted&sort=content&order=sideways",
+            "/search?q=sortable&sort=actions",
+        ] {
+            let (status, body) = request(app.clone(), "GET", uri, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "uri: {uri}");
+            assert_eq!(body["error"]["type"], "invalid_request");
+        }
     }
 
     #[tokio::test]

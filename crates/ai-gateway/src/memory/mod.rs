@@ -50,7 +50,8 @@ pub use sensitive::{
     SensitiveScanError, SensitiveScanOptions, SensitiveScanResult,
 };
 pub use store::{
-    MemoryEntryInput, MemoryEntryPage, MemoryNamespace, MemoryStats, MemoryStore, NewMemoryEntry,
+    MemoryEntryInput, MemoryEntryPage, MemoryNamespace, MemorySort, MemorySortField, MemoryStats,
+    MemoryStore, NewMemoryEntry,
 };
 pub use vector::{MemoryVectorTier, QdrantMemoryVectorTier, VectorMatch};
 

@@ -63,6 +63,76 @@ pub struct MemoryEntryPage {
     pub offset: usize,
 }
 
+/// Column an admin listing can be ordered by.
+///
+/// Each variant maps to a fixed SQL column, so a client-chosen sort never
+/// reaches SQL as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemorySortField {
+    Content,
+    MemoryType,
+    RelevanceScore,
+    Namespace,
+    CreatedAt,
+    UpdatedAt,
+    LastAccessedAt,
+    AccessCount,
+    SourceRequestId,
+}
+
+impl MemorySortField {
+    /// Every accepted `sort` query value, for actionable 400 messages.
+    pub const NAMES: &'static str = "content, memory_type, relevance_score, namespace, \
+        created_at, updated_at, last_accessed_at, access_count, source_request_id";
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "content" => Self::Content,
+            "memory_type" => Self::MemoryType,
+            "relevance_score" => Self::RelevanceScore,
+            "namespace" => Self::Namespace,
+            "created_at" => Self::CreatedAt,
+            "updated_at" => Self::UpdatedAt,
+            "last_accessed_at" => Self::LastAccessedAt,
+            "access_count" => Self::AccessCount,
+            "source_request_id" => Self::SourceRequestId,
+            _ => return None,
+        })
+    }
+
+    fn column(self) -> &'static str {
+        match self {
+            Self::Content => "m.content COLLATE NOCASE",
+            Self::MemoryType => "m.memory_type",
+            Self::RelevanceScore => "m.relevance_score",
+            Self::Namespace => "m.namespace",
+            Self::CreatedAt => "m.created_at",
+            Self::UpdatedAt => "m.updated_at",
+            Self::LastAccessedAt => "m.last_accessed_at",
+            Self::AccessCount => "m.access_count",
+            Self::SourceRequestId => "m.source_request_id",
+        }
+    }
+}
+
+/// Requested ordering for admin listings and searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemorySort {
+    pub field: MemorySortField,
+    pub descending: bool,
+}
+
+impl MemorySort {
+    /// `ORDER BY` body; NULLs (never-edited, no source request) sort last in
+    /// both directions and `m.id` keeps pages stable across ties.
+    fn order_by(self) -> String {
+        let direction = if self.descending { "DESC" } else { "ASC" };
+        format!("{} {direction} NULLS LAST, m.id ASC", self.field.column())
+    }
+}
+
+const DEFAULT_LIST_ORDER: &str = "m.created_at DESC, m.id ASC";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryStats {
     pub total_count: u64,
@@ -414,7 +484,7 @@ impl MemoryStore {
         limit: usize,
         offset: usize,
     ) -> Result<MemoryEntryPage, MemoryError> {
-        self.list_entries_internal(namespace, limit, offset, false)
+        self.list_entries_internal(namespace, limit, offset, false, None)
     }
 
     /// List entries in a namespace, optionally including superseded entries.
@@ -428,7 +498,19 @@ impl MemoryStore {
         offset: usize,
         include_superseded: bool,
     ) -> Result<MemoryEntryPage, MemoryError> {
-        self.list_entries_internal(namespace, limit, offset, include_superseded)
+        self.list_entries_internal(namespace, limit, offset, include_superseded, None)
+    }
+
+    /// Admin listing with an optional column sort; `None` keeps newest-first.
+    pub fn list_entries_sorted(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+        include_superseded: bool,
+        sort: Option<MemorySort>,
+    ) -> Result<MemoryEntryPage, MemoryError> {
+        self.list_entries_internal(namespace, limit, offset, include_superseded, sort)
     }
 
     fn list_entries_internal(
@@ -437,6 +519,7 @@ impl MemoryStore {
         limit: usize,
         offset: usize,
         include_superseded: bool,
+        sort: Option<MemorySort>,
     ) -> Result<MemoryEntryPage, MemoryError> {
         validate_namespace(namespace)?;
         let limit = limit.min(MAX_LIST_LIMIT);
@@ -449,14 +532,15 @@ impl MemoryStore {
             AND (?2 = 1 OR superseded_by IS NULL)",
             params![namespace, if include_superseded { 1 } else { 0 }],
         )?;
-        let mut statement = conn.prepare(
-            "SELECT id, namespace, content, memory_type, relevance_score,
-            created_at, last_accessed_at, access_count, source_request_id,
-            updated_at, superseded_by
-            FROM memories WHERE namespace = ?1
-            AND (?2 = 1 OR superseded_by IS NULL)
-            ORDER BY created_at DESC, id ASC LIMIT ?3 OFFSET ?4",
-        )?;
+        let order_by = sort.map_or_else(|| DEFAULT_LIST_ORDER.to_owned(), MemorySort::order_by);
+        let mut statement = conn.prepare(&format!(
+            "SELECT m.id, m.namespace, m.content, m.memory_type, m.relevance_score,
+            m.created_at, m.last_accessed_at, m.access_count, m.source_request_id,
+            m.updated_at, m.superseded_by
+            FROM memories m WHERE m.namespace = ?1
+            AND (?2 = 1 OR m.superseded_by IS NULL)
+            ORDER BY {order_by} LIMIT ?3 OFFSET ?4"
+        ))?;
         let entries = statement
             .query_map(
                 params![
@@ -501,6 +585,30 @@ pub fn search_entries(
     limit: usize,
     offset: usize,
 ) -> Result<MemoryEntryPage, MemoryError> {
+    self.search_entries_sorted(
+        query,
+        namespace_filter,
+        memory_type_filter,
+        include_superseded,
+        limit,
+        offset,
+        None,
+    )
+}
+
+/// [`MemoryStore::search_entries`] with an optional column sort. `None`
+/// keeps bm25 relevance order for text queries and newest-first otherwise.
+#[allow(clippy::too_many_arguments)]
+pub fn search_entries_sorted(
+    &self,
+    query: &str,
+    namespace_filter: Option<&str>,
+    memory_type_filter: Option<&str>,
+    include_superseded: bool,
+    limit: usize,
+    offset: usize,
+    sort: Option<MemorySort>,
+) -> Result<MemoryEntryPage, MemoryError> {
     if let Some(namespace) = namespace_filter {
         validate_namespace(namespace)?;
     }
@@ -535,7 +643,9 @@ pub fn search_entries(
         ],
         )
         .map_err(map_fts_match_error)?;
-        let mut statement = conn.prepare(
+        let order_by =
+            sort.map_or_else(|| "raw_rank ASC, m.rowid ASC".to_owned(), MemorySort::order_by);
+        let mut statement = conn.prepare(&format!(
             "SELECT m.id, m.namespace, m.content, m.memory_type, m.relevance_score,
             m.created_at, m.last_accessed_at, m.access_count, m.source_request_id,
             m.updated_at, m.superseded_by,
@@ -546,9 +656,9 @@ pub fn search_entries(
             AND (?2 IS NULL OR m.namespace = ?2)
             AND (?3 IS NULL OR m.memory_type = ?3)
             AND (?4 = 1 OR m.superseded_by IS NULL)
-            ORDER BY raw_rank ASC, m.rowid ASC
-            LIMIT ?5 OFFSET ?6",
-        ).map_err(map_fts_match_error)?;
+            ORDER BY {order_by}
+            LIMIT ?5 OFFSET ?6"
+        )).map_err(map_fts_match_error)?;
         let entries = statement
             .query_map(
                 params![
@@ -575,7 +685,8 @@ pub fn search_entries(
             AND (?3 = 1 OR m.superseded_by IS NULL)",
             params![namespace_filter, memory_type_filter, superseded_flag],
         )?;
-        let mut statement = conn.prepare(
+        let order_by = sort.map_or_else(|| DEFAULT_LIST_ORDER.to_owned(), MemorySort::order_by);
+        let mut statement = conn.prepare(&format!(
             "SELECT m.id, m.namespace, m.content, m.memory_type, m.relevance_score,
             m.created_at, m.last_accessed_at, m.access_count, m.source_request_id,
             m.updated_at, m.superseded_by
@@ -583,9 +694,9 @@ pub fn search_entries(
             WHERE (?1 IS NULL OR m.namespace = ?1)
             AND (?2 IS NULL OR m.memory_type = ?2)
             AND (?3 = 1 OR m.superseded_by IS NULL)
-            ORDER BY m.created_at DESC, m.id ASC
-            LIMIT ?4 OFFSET ?5",
-        )?;
+            ORDER BY {order_by}
+            LIMIT ?4 OFFSET ?5"
+        ))?;
         let entries = statement
             .query_map(
                 params![

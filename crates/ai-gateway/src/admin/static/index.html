@@ -195,11 +195,11 @@ table.vk-table td{white-space:normal}
 table.vk-table td.vk-key-prefix{white-space:nowrap}
 table.vk-table td.vk-row-actions{white-space:normal;padding:.45rem .55rem}
 table.vk-table th{background:var(--bg);font-weight:600}
-table.vk-table th.sortable{cursor:pointer;user-select:none}
-table.vk-table th.sortable:hover,table.vk-table th.sortable:focus-visible{color:var(--primary);outline:none}
-table.vk-table th.sortable:focus-visible{box-shadow:inset 0 0 0 2px var(--primary)}
-table.vk-table th[aria-sort="ascending"]::after{content:" \25B2";font-size:.7em}
-table.vk-table th[aria-sort="descending"]::after{content:" \25BC";font-size:.7em}
+table.vk-table th.sortable,table.mem-table th.sortable{cursor:pointer;user-select:none}
+table.vk-table th.sortable:hover,table.vk-table th.sortable:focus-visible,table.mem-table th.sortable:hover,table.mem-table th.sortable:focus-visible{color:var(--primary);outline:none}
+table.vk-table th.sortable:focus-visible,table.mem-table th.sortable:focus-visible{box-shadow:inset 0 0 0 2px var(--primary)}
+table.vk-table th[aria-sort="ascending"]::after,table.mem-table th[aria-sort="ascending"]::after{content:" \25B2";font-size:.7em}
+table.vk-table th[aria-sort="descending"]::after,table.mem-table th[aria-sort="descending"]::after{content:" \25BC";font-size:.7em}
 table.vk-table tbody tr:hover{background:rgba(13,110,253,.04)}
 .vk-key-prefix{font-family:monospace}
 .vk-empty{padding:2rem 1rem;text-align:center;color:var(--text-muted)}
@@ -2675,23 +2675,37 @@ body.sec-banner-active{padding-top:3.2rem}
 </div>
 <div id="mem-entries-wrap" style="display:none">
 <div style="overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)">
-<table style="width:100%;border-collapse:collapse;font-size:.8rem" aria-label="Memory entries">
+<table class="mem-table" id="mem-entries-table" style="width:100%;border-collapse:collapse;font-size:.8rem" aria-label="Memory entries">
 <thead><tr>
-<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Content</th>
-<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Type</th>
-<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Score</th>
-<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Namespace</th>
-<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Created</th>
-<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Updated</th>
-<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Accessed</th>
-<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Hits</th>
-<th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Source Req</th>
+<th class="sortable" data-sort="content" data-first-order="asc" aria-sort="none" role="button" tabindex="0" style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Content</th>
+<th class="sortable" data-sort="memory_type" data-first-order="asc" aria-sort="none" role="button" tabindex="0" style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Type</th>
+<th class="sortable" data-sort="relevance_score" data-first-order="desc" aria-sort="none" role="button" tabindex="0" style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Score</th>
+<th class="sortable" data-sort="namespace" data-first-order="asc" aria-sort="none" role="button" tabindex="0" style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Namespace</th>
+<th class="sortable" data-sort="created_at" data-first-order="desc" aria-sort="none" role="button" tabindex="0" style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Created</th>
+<th class="sortable" data-sort="updated_at" data-first-order="desc" aria-sort="none" role="button" tabindex="0" style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Updated</th>
+<th class="sortable" data-sort="last_accessed_at" data-first-order="desc" aria-sort="none" role="button" tabindex="0" style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Accessed</th>
+<th class="sortable" data-sort="access_count" data-first-order="desc" aria-sort="none" role="button" tabindex="0" style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Hits</th>
+<th class="sortable" data-sort="source_request_id" data-first-order="asc" aria-sort="none" role="button" tabindex="0" style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Source Req</th>
 <th style="padding:.4rem .5rem;background:var(--bg);font-weight:600;text-align:left">Actions</th>
 </tr></thead>
 <tbody id="mem-entries-tbody"></tbody>
 </table>
 </div>
-<div style="font-size:.75rem;color:var(--text-muted);margin-top:.5rem" id="mem-entries-info"></div>
+<div class="vk-pagination" style="flex-wrap:wrap;margin-top:.5rem">
+<button type="button" class="btn btn-secondary btn-sm" id="mem-page-first" disabled title="First page">&laquo; First</button>
+<button type="button" class="btn btn-secondary btn-sm" id="mem-page-prev" disabled>&larr; Prev</button>
+<span class="vk-page-info" id="mem-page-label" aria-live="polite"></span>
+<button type="button" class="btn btn-secondary btn-sm" id="mem-page-next" disabled>Next &rarr;</button>
+<button type="button" class="btn btn-secondary btn-sm" id="mem-page-last" disabled title="Last page">Last &raquo;</button>
+<label for="mem-page-size" class="vk-page-info" style="margin-left:auto">Per page</label>
+<select id="mem-page-size" style="width:auto">
+<option value="25">25</option>
+<option value="50" selected>50</option>
+<option value="100">100</option>
+<option value="200">200</option>
+</select>
+<span class="vk-page-info" id="mem-entries-info"></span>
+</div>
 </div>
 <div id="mem-entries-empty" style="text-align:center;padding:1rem;color:var(--text-muted);font-size:.85rem">Enter a namespace or search to browse memories</div>
 </fieldset>
@@ -8521,6 +8535,72 @@ document.getElementById('mem-stat-consolidation').textContent = '—';
 // Filled in by the last entries/search listing so per-row actions can refresh
 // the same view (search vs namespace browse) after edit/supersede/delete.
 var memLastListUrl = null;
+// Server-side paging and column sort for the browser. `mode` is 'entries'
+// (namespace browse) or 'search'; `params` holds that mode's filters.
+var memListState = { mode: null, params: null, offset: 0, limit: 50, sort: null, order: null, total: 0 };
+// Entry timestamps arrive as RFC 3339 strings (created_at, last_accessed_at)
+// or epoch seconds (updated_at); accept both and never render "Invalid Date".
+function memFmtTs(value) {
+if (value == null || value === '' || value === 0) return '\u2014';
+var d = typeof value === 'number' ? new Date(value < 1e12 ? value * 1000 : value) : new Date(value);
+return isNaN(d.getTime()) ? String(value) : d.toLocaleString();
+}
+function memListUrl() {
+var params = new URLSearchParams(memListState.params || {});
+params.set('limit', String(memListState.limit));
+params.set('offset', String(memListState.offset));
+if (memListState.sort) { params.set('sort', memListState.sort); params.set('order', memListState.order || 'asc'); }
+return memApiUrl(memListState.mode) + '?' + params.toString();
+}
+function memShowListError(err) {
+document.getElementById('mem-entries-wrap').style.display = 'none';
+document.getElementById('mem-entries-empty').textContent = 'Error: ' + err.message;
+document.getElementById('mem-entries-empty').style.display = 'block';
+}
+function memFetchList(onError) {
+if (!memListState.mode) return;
+var url = memListUrl();
+memLastListUrl = url;
+fetch(url)
+.then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
+.then(function(data) {
+if (url !== memLastListUrl) return; // a newer page/sort request superseded this one
+var total = data.total_count || 0;
+// The current page emptied (delete, consolidation): step back to the last page.
+if (!(data.entries || []).length && memListState.offset > 0 && total > 0) {
+memListState.offset = Math.max(0, Math.floor((total - 1) / memListState.limit) * memListState.limit);
+memFetchList(onError);
+return;
+}
+memRenderEntries(data);
+})
+.catch(onError || memShowListError);
+}
+function memStartList(mode, params) {
+memListState.mode = mode;
+memListState.params = params;
+memListState.offset = 0;
+memFetchList();
+}
+function memRenderPager() {
+var s = memListState;
+var pages = Math.max(1, Math.ceil(s.total / s.limit));
+var page = Math.floor(s.offset / s.limit) + 1;
+document.getElementById('mem-page-label').textContent = 'Page ' + page + ' of ' + pages;
+document.getElementById('mem-page-first').disabled = s.offset <= 0;
+document.getElementById('mem-page-prev').disabled = s.offset <= 0;
+document.getElementById('mem-page-next').disabled = s.offset + s.limit >= s.total;
+document.getElementById('mem-page-last').disabled = s.offset + s.limit >= s.total;
+}
+function memGoToOffset(offset) {
+memListState.offset = Math.max(0, offset);
+memFetchList();
+}
+function memRenderSortHeaders() {
+document.querySelectorAll('#mem-entries-table th.sortable').forEach(function(th) {
+th.setAttribute('aria-sort', th.dataset.sort === memListState.sort ? (memListState.order === 'desc' ? 'descending' : 'ascending') : 'none');
+});
+}
 
 function memRenderEntries(data) {
 var entries = data.entries || [];
@@ -8534,7 +8614,11 @@ return;
 }
 document.getElementById('mem-entries-wrap').style.display = 'block';
 document.getElementById('mem-entries-empty').style.display = 'none';
-document.getElementById('mem-entries-info').textContent = 'Showing ' + entries.length + ' of ' + (data.total_count || entries.length) + ' entries';
+memListState.total = data.total_count || entries.length;
+var first = memListState.offset + 1;
+document.getElementById('mem-entries-info').textContent = 'Showing ' + first + '\u2013' + (first + entries.length - 1) + ' of ' + memListState.total + ' entries';
+memRenderPager();
+memRenderSortHeaders();
 entries.forEach(function(entry) {
 var row = document.createElement('tr');
 var td1 = document.createElement('td'); td1.style.padding = '.4rem .5rem'; td1.style.maxWidth = '300px'; td1.style.overflow = 'hidden'; td1.title = entry.content;
@@ -8553,9 +8637,9 @@ row.appendChild(td1);
 var td2 = document.createElement('td'); td2.textContent = entry.memory_type || '—'; td2.style.padding = '.4rem .5rem'; row.appendChild(td2);
 var td3 = document.createElement('td'); td3.textContent = entry.relevance_score != null ? entry.relevance_score.toFixed(3) : '—'; td3.style.padding = '.4rem .5rem'; row.appendChild(td3);
 var tdNs = document.createElement('td'); tdNs.textContent = entry.namespace || '—'; tdNs.style.padding = '.4rem .5rem'; tdNs.style.maxWidth = '160px'; tdNs.style.overflow = 'hidden'; tdNs.style.textOverflow = 'ellipsis'; tdNs.style.whiteSpace = 'nowrap'; tdNs.title = entry.namespace || ''; tdNs.style.fontFamily = 'monospace'; tdNs.style.fontSize = '.75rem'; row.appendChild(tdNs);
-var tdCr = document.createElement('td'); tdCr.textContent = entry.created_at ? new Date(entry.created_at * 1000).toLocaleString() : '—'; tdCr.style.padding = '.4rem .5rem'; tdCr.style.fontSize = '.75rem'; row.appendChild(tdCr);
-var tdUp = document.createElement('td'); tdUp.textContent = entry.updated_at ? new Date(entry.updated_at * 1000).toLocaleString() : '—'; tdUp.style.padding = '.4rem .5rem'; tdUp.style.fontSize = '.75rem'; row.appendChild(tdUp);
-var tdAc = document.createElement('td'); var accTs = entry.last_accessed_at; tdAc.textContent = accTs ? new Date(typeof accTs === 'number' ? accTs * 1000 : accTs).toLocaleString() : '—'; tdAc.style.padding = '.4rem .5rem'; tdAc.style.fontSize = '.75rem'; row.appendChild(tdAc);
+var tdCr = document.createElement('td'); tdCr.textContent = memFmtTs(entry.created_at); tdCr.style.padding = '.4rem .5rem'; tdCr.style.fontSize = '.75rem'; row.appendChild(tdCr);
+var tdUp = document.createElement('td'); tdUp.textContent = memFmtTs(entry.updated_at); tdUp.style.padding = '.4rem .5rem'; tdUp.style.fontSize = '.75rem'; row.appendChild(tdUp);
+var tdAc = document.createElement('td'); tdAc.textContent = memFmtTs(entry.last_accessed_at); tdAc.style.padding = '.4rem .5rem'; tdAc.style.fontSize = '.75rem'; row.appendChild(tdAc);
 var tdHits = document.createElement('td'); tdHits.textContent = entry.access_count != null ? entry.access_count : '—'; tdHits.style.padding = '.4rem .5rem'; row.appendChild(tdHits);
 var tdSrc = document.createElement('td'); tdSrc.textContent = entry.source_request_id ? String(entry.source_request_id).slice(0, 8) + '…' : '—'; tdSrc.title = entry.source_request_id || ''; tdSrc.style.padding = '.4rem .5rem'; tdSrc.style.fontFamily = 'monospace'; tdSrc.style.fontSize = '.75rem'; row.appendChild(tdSrc);
 var tdAct = document.createElement('td'); tdAct.style.padding = '.4rem .5rem'; tdAct.style.whiteSpace = 'nowrap';
@@ -8589,12 +8673,7 @@ tbody.appendChild(row);
 }
 
 function memRefreshList() {
-if (memLastListUrl) {
-fetch(memLastListUrl)
-.then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
-.then(memRenderEntries)
-.catch(function(err) { showToast('Refresh failed: ' + err.message, true); });
-}
+memFetchList(function(err) { showToast('Refresh failed: ' + err.message, true); });
 }
 
 function memInspectEntry(id) {
@@ -8619,16 +8698,7 @@ function memBrowseEntries() {
 var ns = document.getElementById('mem-browse-ns').value.trim();
 if (!ns) { document.getElementById('mem-entries-empty').textContent = 'Enter a namespace'; return; }
 var includeSuperseded = document.getElementById('mem-search-include-superseded').checked;
-var url = memApiUrl('entries') + '?namespace=' + encodeURIComponent(ns) + '&limit=50&include_superseded=' + (includeSuperseded ? 'true' : 'false');
-memLastListUrl = url;
-fetch(url)
-.then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
-.then(memRenderEntries)
-.catch(function(err) {
-document.getElementById('mem-entries-wrap').style.display = 'none';
-document.getElementById('mem-entries-empty').textContent = 'Error: ' + err.message;
-document.getElementById('mem-entries-empty').style.display = 'block';
-});
+memStartList('entries', { namespace: ns, include_superseded: includeSuperseded ? 'true' : 'false' });
 }
 
 function memSearchEntries() {
@@ -8640,17 +8710,7 @@ if (ns) { params.set('namespace', ns); }
 var memType = document.getElementById('mem-search-type').value;
 if (memType) { params.set('memory_type', memType); }
 if (document.getElementById('mem-search-include-superseded').checked) { params.set('include_superseded', 'true'); }
-params.set('limit', '50');
-var url = memApiUrl('search') + '?' + params.toString();
-memLastListUrl = url;
-fetch(url)
-.then(function(r) { if (!r.ok) return r.json().then(function(e) { throw new Error((e.error && e.error.message) || 'HTTP ' + r.status); }); return r.json(); })
-.then(memRenderEntries)
-.catch(function(err) {
-document.getElementById('mem-entries-wrap').style.display = 'none';
-document.getElementById('mem-entries-empty').textContent = 'Error: ' + err.message;
-document.getElementById('mem-entries-empty').style.display = 'block';
-});
+memStartList('search', Object.fromEntries(params));
 }
 
 function memClearSearch() {
@@ -8800,7 +8860,7 @@ document.getElementById('mem-prompt-body').appendChild(input);
       confirmLabel: 'Delete',
       onConfirm: function() {
         fetch(memApiUrl('entries/' + id), { method: 'DELETE' })
-          .then(function(r) { if (!r.ok && r.status !== 204) throw new Error('HTTP ' + r.status); showToast('Entry deleted'); memBrowseEntries(); })
+          .then(function(r) { if (!r.ok && r.status !== 204) throw new Error('HTTP ' + r.status); showToast('Entry deleted'); memRefreshList(); })
           .catch(function(err) { showToast('Delete failed: ' + err.message, true); });
       }
     });
@@ -8841,6 +8901,30 @@ document.getElementById('mem-create-btn').addEventListener('click', memCreateEnt
 document.getElementById('mem-search-btn').addEventListener('click', memSearchEntries);
 document.getElementById('mem-search-clear-btn').addEventListener('click', memClearSearch);
 document.getElementById('mem-search-q').addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); memSearchEntries(); } });
+document.getElementById('mem-page-first').addEventListener('click', function() { memGoToOffset(0); });
+document.getElementById('mem-page-prev').addEventListener('click', function() { memGoToOffset(memListState.offset - memListState.limit); });
+document.getElementById('mem-page-next').addEventListener('click', function() { memGoToOffset(memListState.offset + memListState.limit); });
+document.getElementById('mem-page-last').addEventListener('click', function() { memGoToOffset(Math.floor((memListState.total - 1) / memListState.limit) * memListState.limit); });
+document.getElementById('mem-page-size').addEventListener('change', function(e) {
+memListState.limit = parseInt(e.target.value, 10) || 50;
+memGoToOffset(0);
+});
+// Column sort runs server-side so it orders the whole result set, not just
+// the visible page. Clicks cycle: first direction, reversed, then back to the
+// default order (newest first, or relevance for a text search).
+document.querySelectorAll('#mem-entries-table th.sortable').forEach(function(th) {
+function doSort() {
+var key = th.dataset.sort;
+var firstOrder = th.dataset.firstOrder || 'asc';
+if (memListState.sort !== key) { memListState.sort = key; memListState.order = firstOrder; }
+else if (memListState.order === firstOrder) { memListState.order = firstOrder === 'asc' ? 'desc' : 'asc'; }
+else { memListState.sort = null; memListState.order = null; }
+memRenderSortHeaders();
+memGoToOffset(0);
+}
+th.addEventListener('click', doSort);
+th.addEventListener('keydown', function(e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); doSort(); } });
+});
 document.getElementById('mem-export-btn').addEventListener('click', function() {
 setStatus('Exporting memories…');
 fetch(memApiUrl('export'))
