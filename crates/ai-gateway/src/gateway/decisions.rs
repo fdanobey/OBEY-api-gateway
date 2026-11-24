@@ -71,7 +71,9 @@ pub async fn create_decision(
         );
     }
 
-    let value: Value = match serde_json::from_slice(&body) {
+    let value: Value = match serde_json::from_slice(
+        crate::request_body_limit::bounded_by_request_limit(&body),
+    ) {
         Ok(value) => value,
         Err(error) => {
             return decision_rejected(

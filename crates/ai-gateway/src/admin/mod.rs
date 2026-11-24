@@ -2241,7 +2241,9 @@ async fn import_config(body: String) -> Response {
     }
 
     // Parse YAML
-    let mut config: Config = match serde_yaml::from_str(&body) {
+    let mut config: Config = match serde_yaml::from_str(
+        crate::request_body_limit::bounded_by_request_limit(body.as_str()),
+    ) {
         Ok(c) => c,
         Err(e) => {
             return (

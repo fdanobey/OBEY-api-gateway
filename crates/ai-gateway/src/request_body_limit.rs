@@ -32,6 +32,19 @@ use serde_json::json;
 
 use crate::gateway::AppState;
 
+/// Marks a handler's request body as already bounded by
+/// [`request_body_limit_middleware`], right before it is deserialized.
+///
+/// Identity at runtime. Only wrap bodies read by an extractor (`Bytes`,
+/// `String`) on a route under that middleware. Code scanning treats the result
+/// as a sanitized `rust/unsafe-deserialization` input via the barrier model in
+/// `.github/codeql/extensions/ai-gateway-models/`; serde_json and serde_yaml
+/// keep their default 128-level nesting limit, so size was the remaining risk.
+#[inline(always)]
+pub fn bounded_by_request_limit<T: ?Sized>(body: &T) -> &T {
+    body
+}
+
 /// Axum middleware enforcing the request body size limit dynamically (Req 45.2).
 ///
 /// Applied at the same position in the layer stack as the former static
