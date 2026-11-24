@@ -8773,7 +8773,9 @@ pub async fn anthropic_create(
     } else {
         return anthropic_invalid_request("anthropic-version header is required");
     }
- let request: AnthropicRequest = match serde_json::from_slice(&body) {
+ let request: AnthropicRequest = match serde_json::from_slice(
+ crate::request_body_limit::bounded_by_request_limit(&body),
+ ) {
  Ok(r) => r,
  Err(e) => {
  return anthropic_invalid_request(format!("invalid JSON body: {e}"));
@@ -8819,8 +8821,9 @@ pub async fn anthropic_create(
         chat_request.stream = request.stream;
         // Preserve the client JSON for the native Messages adapter, including
         // fields the translated request does not carry.
-        let raw_body: serde_json::Value = serde_json::from_slice(&body)
-            .unwrap_or_else(|_| serde_json::to_value(&request).unwrap_or_default());
+        let raw_body: serde_json::Value =
+            serde_json::from_slice(crate::request_body_limit::bounded_by_request_limit(&body))
+                .unwrap_or_else(|_| serde_json::to_value(&request).unwrap_or_default());
         (chat_request, request.stop_sequences.clone(), raw_body)
     };
         let output_cap_application = apply_request_output_cap(
@@ -9978,7 +9981,9 @@ pub async fn anthropic_count_tokens(
     if headers.get("anthropic-version").is_none() {
         return anthropic_invalid_request("anthropic-version header is required");
     }
- let request: AnthropicRequest = match serde_json::from_slice(&body) {
+ let request: AnthropicRequest = match serde_json::from_slice(
+ crate::request_body_limit::bounded_by_request_limit(&body),
+ ) {
  Ok(r) => r,
  Err(e) => {
  return anthropic_invalid_request(format!("invalid JSON body: {e}"));
@@ -13028,8 +13033,9 @@ authenticated_key.as_ref().map(|Extension(key)| key),
 // ---------------------------------------------------------------------------
 
 fn json_model(body: &[u8]) -> Result<String, GatewayError> {
-    let value: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|error| GatewayError::InvalidRequest(format!("Invalid JSON body: {}", error)))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(crate::request_body_limit::bounded_by_request_limit(body))
+            .map_err(|error| GatewayError::InvalidRequest(format!("Invalid JSON body: {}", error)))?;
     value
         .get("model")
         .and_then(serde_json::Value::as_str)

@@ -1,0 +1,9 @@
+# Request bodies wrapped in bounded_by_request_limit were read under
+# request_body_limit_middleware (server.max_request_size_mb), so their
+# deserialization is size-bounded. See crates/ai-gateway/src/request_body_limit.rs.
+extensions:
+  - addsTo:
+      pack: codeql/rust-all
+      extensible: barrierModel
+    data:
+      - ["ai_gateway::request_body_limit::bounded_by_request_limit", "ReturnValue", "unsafe-deserialization", "manual"]
